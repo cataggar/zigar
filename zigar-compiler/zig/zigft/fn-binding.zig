@@ -1,4 +1,5 @@
 const std = @import("std");
+const reify = @import("../reify.zig");
 const expect = std.testing.expect;
 const expectEqualSlices = std.testing.expectEqualSlices;
 const expectEqual = std.testing.expectEqual;
@@ -217,7 +218,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                 .alignment = 0,
             };
         }
-        break :init @Type(.{
+        break :init reify.Reify(.{
             .@"struct" = .{
                 .is_tuple = true,
                 .layout = .auto,
@@ -1069,7 +1070,7 @@ pub fn BoundFnWithCallConv(comptime T: type, comptime CT: type, cc: ?std.builtin
     new_f.params = &new_params;
     new_f.is_generic = false;
     if (cc) |c| new_f.calling_convention = c;
-    return @Type(.{ .@"fn" = new_f });
+    return reify.Reify(.{ .@"fn" = new_f });
 }
 
 /// Return type of bind(), create(), etc.
@@ -1766,7 +1767,7 @@ const Instruction = switch (builtin.target.cpu.arch) {
         pub fn decode(bytes: [*]const u8) std.meta.Tuple(&.{ @This(), Attributes, usize }) {
             var i: usize = 0;
             var instr: @This() = .{};
-            if (std.meta.intToEnum(Prefix, bytes[i]) catch null) |prefix| {
+            if (std.enums.fromInt(Prefix, bytes[i])) |prefix| {
                 i += 1;
                 instr.prefix = prefix;
             }
@@ -2425,6 +2426,9 @@ test "InstructionEncoder" {
 
 /// Duplicate of std.heap.PageAllocator that allocates pages with EXEC flag set.
 pub const ExecutablePageAllocator = struct {
+    // `std.heap.next_mmap_addr_hint` was removed in Zig 0.16; keep a local hint.
+    var next_mmap_addr_hint: ?[*]align(page_size_min) u8 = null;
+
     const vtable: std.mem.Allocator.VTable = .{
         .alloc = alloc,
         .remap = std.heap.PageAllocator.vtable.remap,
@@ -2438,51 +2442,68 @@ pub const ExecutablePageAllocator = struct {
         const alignment_bytes = alignment.toByteUnits();
 
         if (native_os == .windows) {
-            // According to official documentation, VirtualAlloc aligns to page
-            // boundary, however, empirically it reserves pages on a 64K boundary.
-            // Since it is very likely the requested alignment will be honored,
-            // this logic first tries a call with exactly the size requested,
-            // before falling back to the loop below.
-            // https://devblogs.microsoft.com/oldnewthing/?p=42223
-            const addr = windows.VirtualAlloc(
-                null,
-                // VirtualAlloc will round the length to a multiple of page size.
-                // "If the lpAddress parameter is NULL, this value is rounded up to
-                // the next page boundary".
-                n,
-                windows.MEM_COMMIT | windows.MEM_RESERVE,
-                windows.PAGE_EXECUTE_READWRITE,
-            ) catch return null;
+            // Zig 0.16 removed the high-level VirtualAlloc/VirtualFree wrappers
+            // and the MEM_*/PAGE_* constants from std.os.windows; use the ntdll
+            // NtAllocateVirtualMemory/NtFreeVirtualMemory APIs directly (mirroring
+            // std.heap.PageAllocator) but with executable protection.
+            const ntdll = windows.ntdll;
+            const current_process = windows.GetCurrentProcess();
+            var base_addr: ?*anyopaque = null;
+            var size: windows.SIZE_T = n;
 
-            if (mem.isAligned(@intFromPtr(addr), alignment_bytes))
-                return @ptrCast(addr);
+            var status = ntdll.NtAllocateVirtualMemory(current_process, @ptrCast(&base_addr), 0, &size, .{ .COMMIT = true, .RESERVE = true }, .{ .EXECUTE_READWRITE = true });
 
-            // Fallback: reserve a range of memory large enough to find a
-            // sufficiently aligned address, then free the entire range and
-            // immediately allocate the desired subset. Another thread may have won
-            // the race to map the target range, in which case a retry is needed.
-            windows.VirtualFree(addr, 0, windows.MEM_RELEASE);
+            if (status == .SUCCESS and mem.isAligned(@intFromPtr(base_addr), alignment_bytes)) {
+                return @ptrCast(base_addr);
+            }
+
+            if (status == .SUCCESS) {
+                var region_size: windows.SIZE_T = 0;
+                _ = ntdll.NtFreeVirtualMemory(current_process, @ptrCast(&base_addr), &region_size, .{ .RELEASE = true });
+            }
 
             const overalloc_len = n + alignment_bytes - page_size;
-            const aligned_len = mem.alignForward(usize, n, page_size);
+            const page_aligned_len = mem.alignForward(usize, n, page_size);
 
-            while (true) {
-                const reserved_addr = windows.VirtualAlloc(
-                    null,
-                    overalloc_len,
-                    windows.MEM_RESERVE,
-                    windows.PAGE_NOACCESS,
-                ) catch return null;
-                const aligned_addr = mem.alignForward(usize, @intFromPtr(reserved_addr), alignment_bytes);
-                windows.VirtualFree(reserved_addr, 0, windows.MEM_RELEASE);
-                const ptr = windows.VirtualAlloc(
-                    @ptrFromInt(aligned_addr),
-                    aligned_len,
-                    windows.MEM_COMMIT | windows.MEM_RESERVE,
-                    windows.PAGE_READWRITE,
-                ) catch continue;
-                return @ptrCast(ptr);
+            base_addr = null;
+            size = overalloc_len;
+
+            status = ntdll.NtAllocateVirtualMemory(current_process, @ptrCast(&base_addr), 0, &size, .{ .RESERVE = true, .RESERVE_PLACEHOLDER = true }, .{ .NOACCESS = true });
+
+            if (status != .SUCCESS) return null;
+
+            const placeholder_addr = @intFromPtr(base_addr);
+            const aligned_addr = mem.alignForward(usize, placeholder_addr, alignment_bytes);
+            const prefix_size = aligned_addr - placeholder_addr;
+
+            if (prefix_size > 0) {
+                var prefix_base = base_addr;
+                var prefix_size_param: windows.SIZE_T = prefix_size;
+                _ = ntdll.NtFreeVirtualMemory(current_process, @ptrCast(&prefix_base), &prefix_size_param, .{ .RELEASE = true, .PRESERVE_PLACEHOLDER = true });
             }
+
+            const suffix_start = aligned_addr + page_aligned_len;
+            const suffix_size = (placeholder_addr + overalloc_len) - suffix_start;
+            if (suffix_size > 0) {
+                var suffix_base = @as(?*anyopaque, @ptrFromInt(suffix_start));
+                var suffix_size_param: windows.SIZE_T = suffix_size;
+                _ = ntdll.NtFreeVirtualMemory(current_process, @ptrCast(&suffix_base), &suffix_size_param, .{ .RELEASE = true, .PRESERVE_PLACEHOLDER = true });
+            }
+
+            base_addr = @ptrFromInt(aligned_addr);
+            size = page_aligned_len;
+
+            status = ntdll.NtAllocateVirtualMemory(current_process, @ptrCast(&base_addr), 0, &size, .{ .COMMIT = true }, .{ .EXECUTE_READWRITE = true });
+
+            if (status == .SUCCESS) {
+                return @ptrCast(base_addr);
+            }
+
+            base_addr = @as(?*anyopaque, @ptrFromInt(aligned_addr));
+            size = page_aligned_len;
+            _ = ntdll.NtFreeVirtualMemory(current_process, @ptrCast(&base_addr), &size, .{ .RELEASE = true });
+
+            return null;
         }
 
         const aligned_len = mem.alignForward(usize, n, page_size);
@@ -2491,7 +2512,7 @@ pub const ExecutablePageAllocator = struct {
             aligned_len
         else
             mem.alignForward(usize, aligned_len + max_drop_len, page_size);
-        const hint = @atomicLoad(@TypeOf(std.heap.next_mmap_addr_hint), &std.heap.next_mmap_addr_hint, .unordered);
+        const hint = @atomicLoad(@TypeOf(next_mmap_addr_hint), &next_mmap_addr_hint, .unordered);
         var map_flags: std.posix.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
         if (builtin.target.os.tag.isDarwin()) {
             // set MAP_JIT
@@ -2502,7 +2523,7 @@ pub const ExecutablePageAllocator = struct {
         const slice = posix.mmap(
             hint,
             overalloc_len,
-            posix.PROT.READ | posix.PROT.WRITE | std.posix.PROT.EXEC,
+            .{ .READ = true, .WRITE = true, .EXEC = true },
             map_flags,
             -1,
             0,
@@ -2516,7 +2537,7 @@ pub const ExecutablePageAllocator = struct {
         const remaining_len = overalloc_len - drop_len;
         if (remaining_len > aligned_len) posix.munmap(@alignCast(result_ptr[aligned_len..remaining_len]));
         const new_hint: [*]align(page_size_min) u8 = @alignCast(result_ptr + aligned_len);
-        _ = @cmpxchgStrong(@TypeOf(std.heap.next_mmap_addr_hint), &std.heap.next_mmap_addr_hint, hint, new_hint, .monotonic, .monotonic);
+        _ = @cmpxchgStrong(@TypeOf(next_mmap_addr_hint), &next_mmap_addr_hint, hint, new_hint, .monotonic, .monotonic);
         return result_ptr;
     }
 

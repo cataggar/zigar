@@ -1,4 +1,5 @@
 const std = @import("std");
+const reify = @import("../reify.zig");
 const expectEqual = std.testing.expectEqual;
 const builtin = @import("builtin");
 
@@ -54,7 +55,7 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
                     new_fields[i].default_value_ptr = @ptrCast(&@as(field.type, .{}));
                 }
             }
-            break :init @Type(.{
+            break :init reify.Reify(.{
                 .@"struct" = .{
                     .layout = .auto,
                     .fields = &new_fields,
@@ -273,7 +274,7 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
                 .is_noalias = false,
                 .type = PorG,
             };
-            return @Type(.{
+            return reify.Reify(.{
                 .@"fn" = .{
                     .calling_convention = fn_info.calling_convention,
                     .is_generic = false,
@@ -343,10 +344,10 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
                     else => {},
                 }
             }
-            break :init @Type(.{
+            break :init reify.Reify(.{
                 .@"union" = .{
                     .layout = .auto,
-                    .tag_type = @Type(.{
+                    .tag_type = reify.Reify(.{
                         .@"enum" = .{
                             .tag_type = if (count <= 256) u8 else u16,
                             .fields = enum_fields[0..count],

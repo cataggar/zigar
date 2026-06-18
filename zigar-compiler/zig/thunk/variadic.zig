@@ -1,4 +1,5 @@
 const std = @import("std");
+const reify = @import("../reify.zig");
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const expectEqualSlices = std.testing.expectEqualSlices;
@@ -41,7 +42,7 @@ pub fn call(
             }
             break :define list;
         };
-        const F = @Type(.{
+        const F = reify.Reify(.{
             .@"fn" = .{
                 .calling_convention = f.calling_convention,
                 .is_generic = false,
@@ -1302,7 +1303,7 @@ const Abi = struct {
             .callee => .unsigned,
             .caller => .signed,
         } else .unsigned;
-        const IntType = @Type(.{ .int = .{
+        const IntType = reify.Reify(.{ .int = .{
             .bits = value_bits,
             .signedness = signedness,
         } });
@@ -1311,7 +1312,7 @@ const Abi = struct {
             .float => |float| float.bits,
             else => @sizeOf(T) * 8,
         };
-        const BigIntType = @Type(.{ .int = .{
+        const BigIntType = reify.Reify(.{ .int = .{
             .bits = retval_bits,
             .signedness = signedness,
         } });
@@ -1330,7 +1331,7 @@ const Abi = struct {
                     if (@sizeOf(@TypeOf(value)) == size * count) {
                         break :get std.mem.toBytes(value);
                     } else {
-                        const BigInt = @Type(.{
+                        const BigInt = reify.Reify(.{
                             .int = .{
                                 .bits = size * count * 8,
                                 .signedness = .signed,
@@ -1456,7 +1457,7 @@ fn callWithArgs(
         }
         break :define params;
     };
-    const F = @Type(.{
+    const F = reify.Reify(.{
         .@"fn" = .{
             .calling_convention = cc,
             .is_generic = false,
@@ -1490,7 +1491,7 @@ fn callWithArgs(
         }
         break :define fields;
     };
-    const Args = @Type(.{
+    const Args = reify.Reify(.{
         .@"struct" = .{
             .is_tuple = true,
             .layout = .auto,

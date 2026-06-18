@@ -1,4 +1,5 @@
 const std = @import("std");
+const reify = @import("../reify.zig");
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const builtin = @import("builtin");
@@ -78,7 +79,7 @@ pub const TypeData = struct {
             return null;
         }
         return switch (@typeInfo(self.type)) {
-            .null, .undefined, .@"fn" => 0,
+            .null, .undefined, .@"fn", .type, .comptime_int, .comptime_float, .enum_literal => 0,
             .@"opaque" => null,
             .error_set => @sizeOf(anyerror),
             else => return @sizeOf(self.type),
@@ -93,7 +94,7 @@ pub const TypeData = struct {
 
     pub fn getBitSize(comptime self: @This()) ?usize {
         return switch (@typeInfo(self.type)) {
-            .null, .undefined, .@"fn" => 0,
+            .null, .undefined, .@"fn", .type, .comptime_int, .comptime_float, .enum_literal => 0,
             .@"opaque" => null,
             .error_set => @bitSizeOf(anyerror),
             else => return @bitSizeOf(self.type),
@@ -463,7 +464,7 @@ pub const TypeData = struct {
 
     pub fn shouldIgnoreDecls(comptime self: @This()) bool {
         return switch (self.type) {
-            std.fs.File, std.fs.Dir => true,
+            std.Io.File, std.Io.Dir => true,
             else => util.getInternalType(self.type) != null,
         };
     }
@@ -847,8 +848,10 @@ pub const TypeDataCollector = struct {
                         xxhash.update(field.name);
                         xxhash.update(": ");
                         xxhash.update(std.mem.asBytes(&self.getSignature(field.type)));
-                        if (field.alignment != @alignOf(field.type)) {
-                            xxhash.update(std.fmt.comptimePrint(" align({d})\n", .{field.alignment}));
+                        if (field.alignment) |alignment| {
+                            if (alignment != @alignOf(field.type)) {
+                                xxhash.update(std.fmt.comptimePrint(" align({d})\n", .{alignment}));
+                            }
                         }
                         xxhash.update(", ");
                     }
@@ -870,8 +873,10 @@ pub const TypeDataCollector = struct {
                     xxhash.update(field.name);
                     xxhash.update(": ");
                     xxhash.update(std.mem.asBytes(&self.getSignature(field.type)));
-                    if (field.alignment != @alignOf(field.type)) {
-                        xxhash.update(std.fmt.comptimePrint(" align({d})", .{field.alignment}));
+                    if (field.alignment) |alignment| {
+                        if (alignment != @alignOf(field.type)) {
+                            xxhash.update(std.fmt.comptimePrint(" align({d})", .{alignment}));
+                        }
                     }
                     xxhash.update(", ");
                 }
@@ -1160,7 +1165,7 @@ test {
     _ = TypeDataCollector;
 }
 
-const ErrorInt = @Type(.{
+const ErrorInt = reify.Reify(.{
     .int = .{
         .signedness = .unsigned,
         .bits = @bitSizeOf(anyerror),

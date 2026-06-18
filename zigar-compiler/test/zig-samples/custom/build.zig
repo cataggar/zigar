@@ -6,7 +6,7 @@ const cfg = @import("build.cfg.zig");
 const extra = @import("build.extra.zig");
 
 pub fn build(b: *std.Build) !void {
-    if (builtin.zig_version.major != 0 or builtin.zig_version.minor != 15) {
+    if (builtin.zig_version.major != 0 or builtin.zig_version.minor != 16) {
         @compileError("Unsupported Zig version");
     }
     const target = b.standardTargetOptions(.{});
@@ -65,7 +65,7 @@ pub fn build(b: *std.Build) !void {
     };
     for (extra_c_files) |file| {
         const path = try std.fs.path.resolve(b.allocator, &.{ cfg.module_dir, file });
-        lib.addCSourceFile(.{ .file = .{ .cwd_relative = path } });
+        lib.root_module.addCSourceFile(.{ .file = .{ .cwd_relative = path } });
     }
     const extra_include_paths: []const []const u8 = switch (@hasDecl(extra, "getIncludePaths")) {
         true => @call(.always_inline, extra.getIncludePaths, .{ b, .{
@@ -78,10 +78,10 @@ pub fn build(b: *std.Build) !void {
     };
     for (extra_include_paths) |inc_path| {
         const path = try std.fs.path.resolve(b.allocator, &.{ cfg.module_dir, inc_path });
-        lib.addIncludePath(.{ .file = .{ .cwd_relative = path } });
+        lib.root_module.addIncludePath(.{ .cwd_relative = path });
     }
     if (cfg.use_libc) {
-        lib.linkLibC();
+        lib.root_module.link_libc = true;
     }
     if (cfg.is_wasm) {
         // WASM needs to be compiled as exe
@@ -95,7 +95,7 @@ pub fn build(b: *std.Build) !void {
         lib.stack_size = cfg.stack_size;
         lib.max_memory = cfg.max_memory;
     } else if (cfg.use_redirection) {
-        lib.addCSourceFile(.{ .file = .{ .cwd_relative = cfg.zigar_src_path ++ "host/native/hooks.c" } });
+        lib.root_module.addCSourceFile(.{ .file = .{ .cwd_relative = cfg.zigar_src_path ++ "host/native/hooks.c" } });
     }
     const options = b.addOptions();
     options.addOption(comptime_int, "eval_branch_quota", cfg.eval_branch_quota);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const reify = @import("reify.zig");
 const builtin = @import("builtin");
 
 const meta = @import("meta.zig");
@@ -62,8 +63,8 @@ fn Factory(comptime host: type, comptime module: type) type {
         pub fn getStructurePurpose(comptime td: TypeData) StructurePurpose {
             return switch (td.type) {
                 std.mem.Allocator => .allocator,
-                std.fs.File => .file,
-                std.fs.Dir => .directory,
+                std.Io.File => .file,
+                std.Io.Dir => .directory,
                 else => get: {
                     if (td.isIterator()) break :get .iterator;
                     if (util.getInternalType(td.type)) |it| break :get switch (it) {
@@ -1256,7 +1257,7 @@ fn ComptimeFree(comptime T: type) type {
                     .alignment = if (st.layout != .@"packed") @alignOf(FT) else 0,
                 };
             }
-            break :derive @Type(.{
+            break :derive reify.Reify(.{
                 .@"struct" = .{
                     .layout = st.layout,
                     .fields = &new_fields,
@@ -1275,7 +1276,7 @@ fn ComptimeFree(comptime T: type) type {
                     .alignment = @alignOf(FT),
                 };
             }
-            break :derive @Type(.{
+            break :derive reify.Reify(.{
                 .@"union" = .{
                     .layout = un.layout,
                     .tag_type = un.tag_type,

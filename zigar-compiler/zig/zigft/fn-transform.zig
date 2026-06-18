@@ -1,4 +1,5 @@
 const std = @import("std");
+const reify = @import("../reify.zig");
 const expectEqual = std.testing.expectEqual;
 const expect = std.testing.expect;
 
@@ -29,7 +30,7 @@ pub fn SpreadFn(comptime T: type, comptime conv: ?std.builtin.CallingConvention)
             .is_noalias = false,
         };
     }
-    return @Type(.{
+    return reify.Reify(.{
         .@"fn" = .{
             .params = &params,
             .is_generic = false,
@@ -415,7 +416,7 @@ test "uninline" {
 pub fn Uninlined(comptime FT: type) type {
     const f = @typeInfo(FT).@"fn";
     if (f.calling_convention != .@"inline") return FT;
-    return @Type(.{
+    return reify.Reify(.{
         .@"fn" = .{
             .calling_convention = .auto,
             .is_generic = f.is_generic,

@@ -1,4 +1,5 @@
 const std = @import("std");
+const reify = @import("../reify.zig");
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const expectError = std.testing.expectError;
@@ -158,7 +159,7 @@ fn CallHandler(comptime BFT: type) type {
     };
     var new_f = f;
     new_f.params = &new_params;
-    return @Type(.{ .@"fn" = new_f });
+    return reify.Reify(.{ .@"fn" = new_f });
 }
 
 fn getJscallHandler(comptime host: type, comptime BFT: type) CallHandler(BFT) {

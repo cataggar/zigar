@@ -1,4 +1,5 @@
 const std = @import("std");
+const reify = @import("../reify.zig");
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const builtin = @import("builtin");
@@ -7,7 +8,7 @@ pub fn IntFor(comptime n: comptime_int) type {
     comptime var bits = 8;
     const signedness = if (n < 0) .signed else .unsigned;
     return inline while (true) : (bits *= 2) {
-        const T = @Type(.{ .int = .{ .signedness = signedness, .bits = bits } });
+        const T = reify.Reify(.{ .int = .{ .signedness = signedness, .bits = bits } });
         if (std.math.minInt(T) <= n and n <= std.math.maxInt(T)) {
             break T;
         }
@@ -42,8 +43,8 @@ pub fn removeSentinel(comptime ptr: anytype) retval_type: {
     var pt = @typeInfo(PT).pointer;
     var ar = @typeInfo(pt.child).array;
     ar.sentinel_ptr = null;
-    pt.child = @Type(.{ .array = ar });
-    break :retval_type @Type(.{ .pointer = pt });
+    pt.child = reify.Reify(.{ .array = ar });
+    break :retval_type reify.Reify(.{ .pointer = pt });
 } {
     return @ptrCast(ptr);
 }

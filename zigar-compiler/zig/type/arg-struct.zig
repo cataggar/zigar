@@ -1,4 +1,5 @@
 const std = @import("std");
+const reify = @import("../reify.zig");
 const expectEqualSlices = std.testing.expectEqualSlices;
 const expectEqual = std.testing.expectEqual;
 
@@ -39,7 +40,7 @@ pub fn ArgStruct(comptime T: type) type {
             arg_index += 1;
         }
     }
-    return @Type(.{
+    return reify.Reify(.{
         .@"struct" = .{
             .layout = .auto,
             .decls = &.{},

@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) !void {
-    if (builtin.zig_version.major != 0 or builtin.zig_version.minor != 15) {
+    if (builtin.zig_version.major != 0 or builtin.zig_version.minor != 16) {
         @compileError("Unsupported Zig version");
     }
     const target = b.standardTargetOptions(.{});
@@ -21,15 +21,15 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
         }),
     });
-    lib.addIncludePath(b.path("./src"));
-    lib.addIncludePath(b.path("../node-api-headers/include"));
-    lib.addIncludePath(b.path("./node_modules/node-api-headers/include"));
+    lib.root_module.addIncludePath(b.path("./src"));
+    lib.root_module.addIncludePath(b.path("../node-api-headers/include"));
+    lib.root_module.addIncludePath(b.path("./node_modules/node-api-headers/include"));
     switch (os) {
-        .windows => lib.linkSystemLibrary("dbghelp"),
+        .windows => lib.root_module.linkSystemLibrary("dbghelp"),
         .macos => lib.linker_allow_shlib_undefined = true,
         else => {},
     }
-    lib.linkLibC();
+    lib.root_module.link_libc = true;
     const wf = b.addUpdateSourceFiles();
     wf.addCopyFileToSource(lib.getEmittedBin(), output_path);
     wf.step.dependOn(&lib.step);
