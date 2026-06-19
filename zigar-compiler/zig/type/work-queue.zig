@@ -302,7 +302,7 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
         }
 
         const def_allocator = switch (builtin.target.cpu.arch.isWasm()) {
-            true => std.heap.wasm_allocator,
+            true => @import("../host/wasm/allocator.zig").wasm_allocator,
             false => std.heap.c_allocator,
         };
         const Status = enum {
