@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const reify = @import("../reify.zig");
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
@@ -161,7 +162,7 @@ pub const TypeData = struct {
             .@"union" => |un| un.tag_type orelse debug_tag: {
                 if (runtime_safety) {
                     if (un.layout != .@"extern" and un.layout != .@"packed") {
-                        break :debug_tag util.IntFor(un.fields.len);
+                        break :debug_tag util.IntFor(compat.fields(un).len);
                     }
                 }
                 break :debug_tag null;
@@ -195,7 +196,7 @@ pub const TypeData = struct {
         return switch (@typeInfo(self.type)) {
             .@"union" => get: {
                 const TT = self.getSelectorType().?;
-                const fields = @typeInfo(self.type).@"union".fields;
+                const fields = compat.fields(@typeInfo(self.type).@"union");
                 // selector comes first unless content needs larger align
                 comptime var offset = 0;
                 inline for (fields) |field| {
@@ -261,7 +262,7 @@ pub const TypeData = struct {
 
     pub fn isConst(comptime self: @This()) bool {
         return switch (@typeInfo(self.type)) {
-            .pointer => |pt| pt.is_const,
+            .pointer => |pt| pt.attrs.@"const",
             else => false,
         };
     }
@@ -320,8 +321,8 @@ pub const TypeData = struct {
     pub fn isMethodOf(comptime self: @This(), comptime T: type) bool {
         switch (@typeInfo(self.type)) {
             .@"fn" => |f| {
-                if (f.params.len > 0) {
-                    if (f.params[0].type) |PT| {
+                if (compat.params(f).len > 0) {
+                    if (compat.params(f)[0].type) |PT| {
                         return (PT == T) or switch (@typeInfo(PT)) {
                             .pointer => |pt| pt.child == T,
                             else => false,
@@ -357,8 +358,8 @@ pub const TypeData = struct {
     pub fn isExpectingInstanceOf(comptime self: @This(), comptime T: type) bool {
         switch (@typeInfo(self.type)) {
             .@"fn" => |f| {
-                if (f.params.len > 0) {
-                    if (f.params[0].type) |PT| {
+                if (compat.params(f).len > 0) {
+                    if (compat.params(f)[0].type) |PT| {
                         return PT == T;
                     }
                 }
@@ -415,7 +416,7 @@ pub const TypeData = struct {
 
     pub fn isVariadic(comptime self: @This()) bool {
         return switch (@typeInfo(self.type)) {
-            .@"fn" => |f| f.is_var_args,
+            .@"fn" => |f| compat.isVarArgs(f),
             else => false,
         };
     }
@@ -425,7 +426,7 @@ pub const TypeData = struct {
     }
 
     pub fn isThrowing(comptime self: @This()) bool {
-        return inline for (@typeInfo(self.type).@"struct".fields, 0..) |field, i| {
+        return inline for (comptime compat.fields(@typeInfo(self.type).@"struct"), 0..) |field, i| {
             if (i == 0) {
                 // retval
                 if (@typeInfo(field.type) == .error_union) break true;
@@ -579,7 +580,7 @@ pub const TypeDataCollector = struct {
             },
             .@"fn" => |f| {
                 if (!f.is_generic) {
-                    inline for (f.params) |param| {
+                    inline for (comptime compat.params(f)) |param| {
                         if (param.type) |PT| {
                             if (PT != std.mem.Allocator) {
                                 self.add(PT);
@@ -596,7 +597,7 @@ pub const TypeDataCollector = struct {
                 self.add(ar.child);
             },
             inline .@"struct", .@"union" => |st, Tag| {
-                inline for (st.fields) |field| {
+                inline for (comptime compat.fields(st)) |field| {
                     self.add(field.type);
                     if (Tag == .@"struct" and field.is_comptime) {
                         // deal with comptime fields
@@ -611,10 +612,10 @@ pub const TypeDataCollector = struct {
             // add decls
             switch (@typeInfo(T)) {
                 inline .@"struct", .@"union", .@"enum", .@"opaque" => |st| {
-                    inline for (st.decls) |decl| {
+                    inline for (compat.decls(st)) |decl| {
                         // decls are accessed through pointers
                         const PT = @TypeOf(&@field(T, decl.name));
-                        if (@typeInfo(PT).pointer.is_const) {
+                        if (@typeInfo(PT).pointer.attrs.@"const") {
                             const decl_value = @field(T, decl.name);
                             self.addTypeOf(decl_value);
                         }
@@ -649,10 +650,10 @@ pub const TypeDataCollector = struct {
                     .parent_type = T,
                     .attrs = .{
                         .is_arguments = true,
-                        .is_variadic = f.is_var_args,
+                        .is_variadic = compat.isVarArgs(f),
                     },
                 });
-                if (f.calling_convention == .@"inline") {
+                if (compat.callingConvention(f) == .@"inline") {
                     self.add(fn_transform.Uninlined(T));
                 }
             },
@@ -675,7 +676,7 @@ pub const TypeDataCollector = struct {
             .@"union" => |un| {
                 if (un.tag_type) |TT| {
                     const active_tag: TT = value;
-                    inline for (un.fields) |field| {
+                    inline for (comptime compat.fields(un)) |field| {
                         if (active_tag == @field(TT, field.name)) {
                             self.addTypeOf(@field(value, field.name));
                             break;
@@ -683,7 +684,7 @@ pub const TypeDataCollector = struct {
                     }
                 }
             },
-            .@"struct" => |st| inline for (st.fields) |field| self.addTypeOf(@field(value, field.name)),
+            .@"struct" => |st| inline for (comptime compat.fields(st)) |field| self.addTypeOf(@field(value, field.name)),
             .array => inline for (value) |element| self.addTypeOf(element),
             // add function to the list so we can create its arg struct later
             .@"fn" => self.functions = self.functions.concat(T),
@@ -776,7 +777,7 @@ pub const TypeDataCollector = struct {
                     std.Options => false,
                     else => true,
                 };
-                inline for (st.fields) |field| {
+                inline for (comptime compat.fields(st)) |field| {
                     if (!field.is_comptime) {
                         const field_attrs = self.getAttributes(field.type);
                         if (!field_attrs.is_supported or field_attrs.has_unsupported) {
@@ -793,7 +794,7 @@ pub const TypeDataCollector = struct {
             },
             .@"union" => |un| {
                 td.attrs.is_supported = true;
-                inline for (un.fields) |field| {
+                inline for (comptime compat.fields(un)) |field| {
                     const field_attrs = self.getAttributes(field.type);
                     if (field_attrs.is_comptime_only) {
                         td.attrs.is_comptime_only = true;
@@ -804,7 +805,7 @@ pub const TypeDataCollector = struct {
                 }
             },
             .@"fn" => |f| {
-                td.attrs.is_supported = inline for (f.params) |param| {
+                td.attrs.is_supported = inline for (comptime compat.params(f)) |param| {
                     if (param.is_generic) break false;
                     if (param.type == null) break false;
                 } else inline for (.{1}) |_| {
@@ -843,7 +844,7 @@ pub const TypeDataCollector = struct {
                     xxhash.update(")");
                 }
                 xxhash.update(" {");
-                for (st.fields) |field| {
+                for (compat.fields(st)) |field| {
                     if (!field.is_comptime) {
                         xxhash.update(field.name);
                         xxhash.update(": ");
@@ -869,7 +870,7 @@ pub const TypeDataCollector = struct {
                     xxhash.update(")");
                 }
                 xxhash.update(" {");
-                for (un.fields) |field| {
+                for (compat.fields(un)) |field| {
                     xxhash.update(field.name);
                     xxhash.update(": ");
                     xxhash.update(std.mem.asBytes(&self.getSignature(field.type)));
@@ -905,9 +906,9 @@ pub const TypeDataCollector = struct {
                     xxhash.update("anyerror");
                 } else {
                     xxhash.update("error{");
-                    if (es) |errors| {
-                        inline for (errors) |err| {
-                            xxhash.update(err.name);
+                    if (es.error_names) |names| {
+                        inline for (names) |name| {
+                            xxhash.update(name);
                             xxhash.update(",");
                         }
                     }
@@ -929,17 +930,17 @@ pub const TypeDataCollector = struct {
                     .one => "",
                     else => "]",
                 });
-                if (pt.is_const) {
+                if (pt.attrs.@"const") {
                     xxhash.update("const ");
                 }
-                if (pt.is_allowzero) {
+                if (pt.attrs.@"allowzero") {
                     xxhash.update("allowzero ");
                 }
                 xxhash.update(std.mem.asBytes(&self.getSignature(pt.child)));
             },
             .@"fn" => |f| {
                 xxhash.update("fn (");
-                for (f.params) |param| {
+                for (compat.params(f)) |param| {
                     if (param.is_noalias) {
                         xxhash.update("noalias ");
                     }
@@ -950,13 +951,13 @@ pub const TypeDataCollector = struct {
                     }
                     xxhash.update(", ");
                 }
-                if (f.is_var_args) {
+                if (compat.isVarArgs(f)) {
                     xxhash.update("...");
                 }
                 xxhash.update(") ");
-                if (f.calling_convention != .auto) {
+                if (compat.callingConvention(f) != .auto) {
                     xxhash.update("callconv(.");
-                    xxhash.update(@tagName(f.calling_convention));
+                    xxhash.update(@tagName(compat.callingConvention(f)));
                     xxhash.update(") ");
                 }
                 if (f.return_type) |RT| {

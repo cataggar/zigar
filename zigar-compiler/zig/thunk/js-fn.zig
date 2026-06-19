@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const reify = @import("../reify.zig");
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
@@ -82,7 +83,7 @@ pub fn createThunkController(comptime host: type, comptime BFT: type) ThunkContr
                             return @call(.never_inline, handler, ch_args);
                         }
                     };
-                    ptr.* = &fn_transform.spreadArgs(ns.call, ch.calling_convention);
+                    ptr.* = &fn_transform.spreadArgs(ns.call, compat.callingConvention(ch));
                 }
                 break :init array;
             };
@@ -143,23 +144,26 @@ test "createThunkController" {
 
 fn CallHandler(comptime BFT: type) type {
     const f = @typeInfo(BFT).@"fn";
-    var new_params: [f.params.len + 2]std.builtin.Type.Fn.Param = undefined;
-    for (f.params, 0..) |param, index| {
+    var new_params: [compat.params(f).len + 2]reify.Param = undefined;
+    for (compat.params(f), 0..) |param, index| {
         new_params[index] = param;
     }
-    new_params[f.params.len] = .{
+    new_params[compat.params(f).len] = .{
         .type = ?*anyopaque,
         .is_generic = false,
         .is_noalias = false,
     };
-    new_params[f.params.len + 1] = .{
+    new_params[compat.params(f).len + 1] = .{
         .type = usize,
         .is_generic = false,
         .is_noalias = false,
     };
-    var new_f = f;
-    new_f.params = &new_params;
-    return reify.Reify(.{ .@"fn" = new_f });
+    return reify.Reify(.{ .@"fn" = .{
+        .calling_convention = compat.callingConvention(f),
+        .is_var_args = compat.isVarArgs(f),
+        .return_type = f.return_type,
+        .params = &new_params,
+    } });
 }
 
 fn getJscallHandler(comptime host: type, comptime BFT: type) CallHandler(BFT) {
@@ -171,12 +175,12 @@ fn getJscallHandler(comptime host: type, comptime BFT: type) CallHandler(BFT) {
             @setEvalBranchQuota(1000000);
             // fill the argument struct
             var arg_s: ArgStruct(BFT) = undefined;
-            inline for (0..ch.params.len - 2) |arg_index| {
+            inline for (0..compat.params(ch).len - 2) |arg_index| {
                 const name = std.fmt.comptimePrint("{d}", .{arg_index});
                 @field(arg_s, name) = args[arg_index];
             }
             // the last two arguments are the context pointer and the function id
-            const fn_id = args[ch.params.len - 1];
+            const fn_id = args[compat.params(ch).len - 1];
             const result = host.handleJscall(fn_id, &arg_s, @sizeOf(@TypeOf(arg_s)));
             switch (result) {
                 .SUCCESS => {},
@@ -199,7 +203,7 @@ fn getJscallHandler(comptime host: type, comptime BFT: type) CallHandler(BFT) {
             return arg_s.retval;
         }
     };
-    return fn_transform.spreadArgs(ns.call, ch.calling_convention);
+    return fn_transform.spreadArgs(ns.call, compat.callingConvention(ch));
 }
 
 test "getJscallHandler" {

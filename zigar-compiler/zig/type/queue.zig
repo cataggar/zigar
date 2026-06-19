@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const expectEqual = std.testing.expectEqual;
 
 const LinkedList = @import("linked-list.zig").LinkedList;

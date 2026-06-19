@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const reify = @import("../reify.zig");
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
@@ -28,12 +29,12 @@ pub fn call(
     const arg_bytes: [*]u8 = @ptrCast(arg_ptr);
     const arg_attrs = @as([*]const ArgAttributes, @ptrCast(@alignCast(attr_ptr)))[0..arg_count];
     if (comptime builtin.target.cpu.arch.isWasm()) {
-        const param_count = f.params.len + 1;
-        const params: [param_count]std.builtin.Type.Fn.Param = define: {
-            comptime var list: [param_count]std.builtin.Type.Fn.Param = undefined;
+        const param_count = compat.params(f).len + 1;
+        const params: [param_count]reify.Param = define: {
+            comptime var list: [param_count]reify.Param = undefined;
             inline for (&list, 0..) |*p, index| {
-                if (index < f.params.len) {
-                    p.* = f.params[index];
+                if (index < compat.params(f).len) {
+                    p.* = compat.params(f)[index];
                 } else {
                     p.is_generic = false;
                     p.is_noalias = false;
@@ -44,7 +45,7 @@ pub fn call(
         };
         const F = reify.Reify(.{
             .@"fn" = .{
-                .calling_convention = f.calling_convention,
+                .calling_convention = compat.callingConvention(f),
                 .is_generic = false,
                 .is_var_args = false,
                 .return_type = f.return_type,
@@ -52,15 +53,15 @@ pub fn call(
             },
         });
         var args: std.meta.ArgsTuple(F) = undefined;
-        const vararg_offset = switch (arg_count > f.params.len) {
+        const vararg_offset = switch (arg_count > compat.params(f).len) {
             // use the offset of the first vararg arg
-            true => arg_attrs[f.params.len].offset,
+            true => arg_attrs[compat.params(f).len].offset,
             // just point it to the end of the struct
             false => @sizeOf(@TypeOf(ArgStruct(FT))),
         };
         const vararg_ptr: [*]const u8 = arg_bytes[vararg_offset..];
-        inline for (0..f.params.len + 1) |index| {
-            if (index < f.params.len) {
+        inline for (0..compat.params(f).len + 1) |index| {
+            if (index < compat.params(f).len) {
                 const name = std.fmt.comptimePrint("{d}", .{index});
                 args[index] = @field(arg_s.*, name);
             } else {
@@ -88,7 +89,7 @@ pub fn call(
                 const variadic_ints = alloc.getVariadicInts(max_variadic_int_count + stack_count);
                 break callWithArgs(
                     f.return_type.?,
-                    f.calling_convention,
+                    compat.callingConvention(f),
                     function,
                     fixed_floats.*,
                     fixed_ints.*,
@@ -835,15 +836,16 @@ test "parameter passing ([*:0]const u8, f32, f32, f32, f32, f32, f32, f32, f32, 
 }
 
 fn createSprintfTest(fmt: []const u8, tuple: anytype) type {
-    const c = @cImport({
-        @cInclude("stdio.h");
-    });
+    // Zig 0.17 removed @cImport; declare libc sprintf directly.
+    const c = struct {
+        extern fn sprintf(noalias buffer: [*:0]u8, noalias format: [*:0]const u8, ...) c_int;
+    };
     const FT = @TypeOf(c.sprintf);
     const f = @typeInfo(FT).@"fn";
     const Args = ArgStruct(FT);
     comptime var current_offset: u16 = @sizeOf(Args);
-    comptime var offsets: [f.params.len + tuple.len]u16 = undefined;
-    inline for (f.params, 0..) |param, index| {
+    comptime var offsets: [compat.params(f).len + tuple.len]u16 = undefined;
+    inline for (comptime compat.params(f), 0..) |param, index| {
         const offset = std.mem.alignForward(usize, current_offset, @alignOf(param.type.?));
         offsets[index] = offset;
         current_offset = offset + @sizeOf(param.type.?);
@@ -851,21 +853,21 @@ fn createSprintfTest(fmt: []const u8, tuple: anytype) type {
     inline for (tuple, 0..) |value, index| {
         const T = @TypeOf(value);
         const offset = std.mem.alignForward(usize, current_offset, @alignOf(T));
-        offsets[f.params.len + index] = offset;
+        offsets[compat.params(f).len + index] = offset;
         current_offset = offset + @sizeOf(T);
     }
     const arg_size = current_offset;
     return struct {
         pub fn run() !void {
             var arg_bytes: [arg_size]u8 align(@alignOf(Args)) = undefined;
-            var attrs: [f.params.len + tuple.len]ArgAttributes = undefined;
+            var attrs: [compat.params(f).len + tuple.len]ArgAttributes = undefined;
             var buffer1 = std.mem.zeroes([1024]u8);
             inline for (&attrs, 0..) |*p, index| {
                 const offset = offsets[index];
                 const value = switch (index) {
                     0 => @as([*c]u8, @ptrCast(&buffer1)),
                     1 => @as([*c]const u8, @ptrCast(fmt)),
-                    else => tuple[index - f.params.len],
+                    else => tuple[index - compat.params(f).len],
                 };
                 const T = @TypeOf(value);
                 p.* = .{
@@ -885,20 +887,20 @@ fn createSprintfTest(fmt: []const u8, tuple: anytype) type {
             }
             // call sprintf() directly
             var buffer2 = std.mem.zeroes([256]u8);
-            comptime var arg_types: [f.params.len + tuple.len]type = undefined;
-            inline for (f.params, 0..) |param, index| {
+            comptime var arg_types: [compat.params(f).len + tuple.len]type = undefined;
+            inline for (comptime compat.params(f), 0..) |param, index| {
                 arg_types[index] = param.type.?;
             }
             inline for (tuple, 0..) |value, index| {
-                arg_types[f.params.len + index] = @TypeOf(value);
+                arg_types[compat.params(f).len + index] = @TypeOf(value);
             }
-            const ArgTuple = std.meta.Tuple(&arg_types);
+            const ArgTuple = @Tuple(&arg_types);
             var arg_tuple: ArgTuple = undefined;
             inline for (&arg_tuple, 0..) |*a, index| {
                 a.* = switch (index) {
                     0 => @ptrCast(&buffer2),
                     1 => @ptrCast(fmt),
-                    else => tuple[index - f.params.len],
+                    else => tuple[index - compat.params(f).len],
                 };
             }
             const retval2: isize = @call(.auto, c.sprintf, arg_tuple);
@@ -1447,7 +1449,7 @@ fn callWithArgs(
     const Int = @typeInfo(@TypeOf(fixed_ints)).array.child;
     const fixed_arg_count = fixed_floats.len + fixed_ints.len;
     const params = define: {
-        comptime var params: [fixed_arg_count]std.builtin.Type.Fn.Param = undefined;
+        comptime var params: [fixed_arg_count]reify.Param = undefined;
         inline for (&params, 0..) |*p, index| {
             p.* = .{
                 .is_generic = false,
@@ -1469,7 +1471,7 @@ fn callWithArgs(
     const total_arg_count = fixed_arg_count + variadic_floats.len + variadic_ints.len;
     const fields = define: {
         @setEvalBranchQuota(1000000);
-        comptime var fields: [total_arg_count]std.builtin.Type.StructField = undefined;
+        comptime var fields: [total_arg_count]reify.StructField = undefined;
         inline for (&fields, 0..) |*f, index| {
             const T = switch (index < fixed_arg_count) {
                 true => switch (index < fixed_floats.len) {
@@ -1568,7 +1570,7 @@ test "callWithArgs (i64...i64, f64)" {
     };
     const result2 = callWithArgs(
         f.return_type.?,
-        f.calling_convention,
+        compat.callingConvention(f),
         @ptrCast(&ns.function),
         fixed_floats,
         fixed_ints,
@@ -1584,7 +1586,7 @@ test "callWithArgs (i64...i64, f64)" {
     // call with extra args
     const result3 = callWithArgs(
         f.return_type.?,
-        f.calling_convention,
+        compat.callingConvention(f),
         @ptrCast(&ns.function),
         fixed_floats,
         fixed_ints,
@@ -1618,7 +1620,7 @@ test "callWithArgs (i64...i64, i32, i32)" {
     const variadic_ints = abi.toWords(Int, @as(i64, 7)) ++ abi.toWords(Int, @as(i32, -5)) ++ abi.toWords(Int, @as(i32, -2));
     const result2 = callWithArgs(
         f.return_type.?,
-        f.calling_convention,
+        compat.callingConvention(f),
         @ptrCast(&ns.function),
         fixed_floats,
         fixed_ints,
@@ -1652,7 +1654,7 @@ test "callWithArgs (i64...i32, i32, i32)" {
     const variadic_ints = abi.toWords(Int, @as(i32, 7)) ++ abi.toWords(Int, @as(i32, -5)) ++ abi.toWords(Int, @as(i32, -2));
     const result2 = callWithArgs(
         f.return_type.?,
-        f.calling_convention,
+        compat.callingConvention(f),
         @ptrCast(&ns.function),
         fixed_floats,
         fixed_ints,
@@ -1695,7 +1697,7 @@ test "callWithArgs (i64...i32, f32, f32)" {
     };
     const result2 = callWithArgs(
         f.return_type.?,
-        f.calling_convention,
+        compat.callingConvention(f),
         @ptrCast(&ns.function),
         fixed_floats,
         fixed_ints,
@@ -1733,7 +1735,7 @@ test "callWithArgs (i64...i16, i16)" {
     };
     const result2 = callWithArgs(
         f.return_type.?,
-        f.calling_convention,
+        compat.callingConvention(f),
         @ptrCast(&ns.function),
         fixed_floats,
         fixed_ints,
@@ -1771,7 +1773,7 @@ test "callWithArgs (i64...i8, i8)" {
     };
     const result2 = callWithArgs(
         f.return_type.?,
-        f.calling_convention,
+        compat.callingConvention(f),
         @ptrCast(&ns.function),
         fixed_floats,
         fixed_ints,
@@ -1809,7 +1811,7 @@ test "callWithArgs (i64...i128)" {
     const variadic_ints = alignment_ints ++ abi.toWords(Int, @as(i128, -2));
     const result2 = callWithArgs(
         f.return_type.?,
-        f.calling_convention,
+        compat.callingConvention(f),
         @ptrCast(&ns.function),
         fixed_floats,
         fixed_ints,
@@ -1827,8 +1829,8 @@ const ArgAttributes = extern struct {
     is_float: bool,
     is_signed: bool,
 
-    fn init(comptime Arg: type) [@typeInfo(Arg).@"struct".fields.len - 1]@This() {
-        const fields = @typeInfo(Arg).@"struct".fields;
+    fn init(comptime Arg: type) [compat.fields(@typeInfo(Arg).@"struct").len - 1]@This() {
+        const fields = compat.fields(@typeInfo(Arg).@"struct");
         var attrs: [fields.len - 1]@This() = undefined;
         inline for (fields, 0..) |field, index| {
             if (index == 0) {
@@ -1869,7 +1871,7 @@ fn ArgAllocation(comptime abi: Abi, comptime FT: type) type {
         const fixed = calc: {
             var int_offset: usize = 0;
             var float_offset: usize = 0;
-            for (f.params) |param| {
+            for (compat.params(f)) |param| {
                 const T = param.type.?;
                 alloc: {
                     if (@typeInfo(T) == .float and abi.float.available_registers > 0) {
@@ -1909,11 +1911,11 @@ fn ArgAllocation(comptime abi: Abi, comptime FT: type) type {
                 .{
                     .kind = .fixed,
                     .start = 0,
-                    .end = f.params.len,
+                    .end = compat.params(f).len,
                 },
                 .{
                     .kind = .variadic,
-                    .start = f.params.len,
+                    .start = compat.params(f).len,
                     .end = arg_attrs.len,
                 },
             };

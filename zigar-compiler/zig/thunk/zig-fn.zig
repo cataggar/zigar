@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 
@@ -10,7 +11,7 @@ pub const Thunk = *const fn (*const anyopaque, *anyopaque) anyerror!void;
 pub const VariadicThunk = *const fn (*const anyopaque, *anyopaque, *const anyopaque, usize) anyerror!void;
 
 pub fn ThunkType(comptime FT: type) type {
-    return switch (@typeInfo(FT).@"fn".is_var_args) {
+    return switch (compat.isVarArgs(@typeInfo(FT).@"fn")) {
         false => Thunk,
         true => VariadicThunk,
     };
@@ -28,7 +29,7 @@ pub fn createThunk(comptime FT: type) ThunkType(FT) {
             // extract arguments from argument struct
             const arg_s: *ArgStruct(FT) = @ptrCast(@alignCast(arg_ptr));
             var arg_t: std.meta.ArgsTuple(FT) = undefined;
-            inline for (comptime std.meta.fields(@TypeOf(arg_t))) |field| {
+            inline for (comptime compat.fieldsOf(@TypeOf(arg_t))) |field| {
                 @field(arg_t, field.name) = @field(arg_s, field.name);
             }
             const function: *const FT = @ptrCast(@alignCast(fn_ptr));
@@ -43,7 +44,7 @@ pub fn createThunk(comptime FT: type) ThunkType(FT) {
             return variadic.call(FT, fn_ptr, arg_ptr, attr_ptr, arg_count);
         }
     };
-    const ns = switch (f.is_var_args) {
+    const ns = switch (compat.isVarArgs(f)) {
         false => ns_regular,
         true => ns_variadic,
     };
@@ -56,8 +57,8 @@ test "createThunk" {
         .pointer => |pt| {
             switch (@typeInfo(pt.child)) {
                 .@"fn" => |f| {
-                    try expectEqual(3, f.params.len);
-                    try expectEqual(std.builtin.CallingConvention.c, f.calling_convention);
+                    try expectEqual(3, compat.params(f).len);
+                    try expectEqual(std.builtin.CallingConvention.c, compat.callingConvention(f));
                 },
                 else => try expect(false),
             }
@@ -71,8 +72,8 @@ test "createThunk" {
         .pointer => |pt| {
             switch (@typeInfo(pt.child)) {
                 .@"fn" => |f| {
-                    try expectEqual(5, f.params.len);
-                    try expectEqual(std.builtin.CallingConvention.c, f.calling_convention);
+                    try expectEqual(5, compat.params(f).len);
+                    try expectEqual(std.builtin.CallingConvention.c, compat.callingConvention(f));
                 },
                 else => try expect(false),
             }

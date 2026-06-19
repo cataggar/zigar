@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const wasm_allocator = std.heap.wasm_allocator;
 const E = std.os.wasi.errno_t;
 const builtin = @import("builtin");
@@ -16,9 +17,12 @@ pub const PromiseOf = @import("../type/promise.zig").PromiseOf;
 pub const PromiseArgOf = @import("../type/promise.zig").PromiseArgOf;
 const util = @import("../type/util.zig");
 
-const stdio_h = @cImport({
-    @cInclude("stdio.h");
-});
+// Zig 0.17 removed @cImport; declare the few libc symbols we use directly.
+const stdio_h = struct {
+    const FILE = opaque {};
+    extern var stdout: *FILE;
+    extern fn fflush(stream: ?*FILE) c_int;
+};
 
 pub fn WorkQueue(ns: type) type {
     return @import("../type/work-queue.zig").WorkQueue(ns, struct {});
@@ -359,7 +363,7 @@ extern "env" fn _displayPanic(bytes: [*]const u8, len: usize) void;
 comptime {
     if (exporter.options.use_pthread_emulation) {
         const pthread = @import("wasm/pthread.zig");
-        for (std.meta.declarations(pthread)) |decl| {
+        for (compat.declarations(pthread)) |decl| {
             @export(&@field(pthread, decl.name), .{ .name = decl.name, .visibility = .hidden });
         }
     }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const reify = @import("../reify.zig");
 const expectEqualSlices = std.testing.expectEqualSlices;
 const expectEqual = std.testing.expectEqual;
@@ -7,7 +8,7 @@ pub fn ArgStruct(comptime T: type) type {
     const f = @typeInfo(T).@"fn";
     const count = get: {
         var count = 1;
-        for (f.params) |param| {
+        for (compat.params(f)) |param| {
             if (param.type != null) {
                 count += 1;
             }
@@ -18,7 +19,7 @@ pub fn ArgStruct(comptime T: type) type {
         noreturn => void,
         else => RT,
     } else void;
-    var fields: [count]std.builtin.Type.StructField = undefined;
+    var fields: [count]reify.StructField = undefined;
     fields[0] = .{
         .name = "retval",
         .type = RT,
@@ -27,7 +28,7 @@ pub fn ArgStruct(comptime T: type) type {
         .default_value_ptr = null,
     };
     var arg_index = 0;
-    for (f.params) |param| {
+    for (compat.params(f)) |param| {
         if (param.type != null) {
             const name = std.fmt.comptimePrint("{d}", .{arg_index});
             fields[arg_index + 1] = .{
@@ -66,17 +67,17 @@ test "ArgStruct" {
         }
     };
     const ArgA = ArgStruct(@TypeOf(ns.A));
-    const fieldsA = std.meta.fields(ArgA);
+    const fieldsA = compat.fieldsOf(ArgA);
     try expectEqual(3, fieldsA.len);
     try expectEqualSlices(u8, "retval", fieldsA[0].name);
     try expectEqualSlices(u8, "0", fieldsA[1].name);
     try expectEqualSlices(u8, "1", fieldsA[2].name);
     const ArgB = ArgStruct(@TypeOf(ns.B));
-    const fieldsB = std.meta.fields(ArgB);
+    const fieldsB = compat.fieldsOf(ArgB);
     try expectEqual(2, fieldsB.len);
     try expectEqualSlices(u8, "retval", fieldsB[0].name);
     try expectEqualSlices(u8, "0", fieldsB[1].name);
     const ArgC = ArgStruct(@TypeOf(ns.C));
-    const fieldsC = std.meta.fields(ArgC);
+    const fieldsC = compat.fieldsOf(ArgC);
     try expectEqual(4, fieldsC.len);
 }

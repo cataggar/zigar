@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const expectEqual = std.testing.expectEqual;
 const E = std.os.wasi.errno_t;
 const builtin = @import("builtin");
@@ -320,7 +321,7 @@ pub fn redirectSyscall(call: *hooks.Syscall) std.c.E {
         false => .FAULT,
     };
     // translate from WASI enum to the current system's
-    return inline for (std.meta.fields(E)) |field| {
+    return inline for (comptime compat.fieldsOf(E)) |field| {
         const wasi_enum = @field(E, field.name);
         if (wasi_enum == result) {
             break switch (@hasField(std.c.E, field.name)) {
@@ -343,7 +344,7 @@ pub fn isRedirecting(comptime literal: @TypeOf(.enum_literal)) bool {
     var mask: hooks.Syscall.Mask = undefined;
     if (imports.get_syscall_mask(instance, &mask) != .SUCCESS) return false;
     if (literal == .any) {
-        return inline for (std.meta.fields(hooks.Syscall.Mask)) |field| {
+        return inline for (comptime compat.fieldsOf(hooks.Syscall.Mask)) |field| {
             if (@field(mask, field.name)) break true;
         } else false;
     } else {

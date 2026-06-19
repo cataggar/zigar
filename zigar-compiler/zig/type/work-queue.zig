@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const reify = @import("../reify.zig");
 const expectEqual = std.testing.expectEqual;
 const builtin = @import("builtin");
@@ -12,7 +13,7 @@ const Queue = @import("queue.zig").Queue;
 const util = @import("util.zig");
 
 pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
-    const decls = std.meta.declarations(ns);
+    const decls = compat.declarations(ns);
     return struct {
         queue: Queue(WorkItem) = undefined,
         thread_count: usize = 0,
@@ -40,7 +41,7 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
         };
         pub const Error = std.mem.Allocator.Error || error{Unexpected};
         pub const Options = init: {
-            const fields = std.meta.fields(struct {
+            const fields = compat.fieldsOf(struct {
                 allocator: std.mem.Allocator = def_allocator,
                 stack_size: usize = if (builtin.target.cpu.arch.isWasm()) 262144 else std.Thread.SpawnConfig.default_stack_size,
                 n_jobs: usize = 1,
@@ -48,7 +49,7 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
                 thread_end_params: ThreadEndParams,
             });
             // there're no start or end params, provide a default value
-            var new_fields: [fields.len]std.builtin.Type.StructField = undefined;
+            var new_fields: [fields.len]reify.StructField = undefined;
             for (fields, 0..) |field, i| {
                 new_fields[i] = field;
                 if (@sizeOf(field.type) == 0) {
@@ -145,8 +146,8 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
                 else => {
                     // see if we can do initialize automatically
                     const can_auto_init = check: {
-                        if (std.meta.fields(ThreadStartParams).len > 0) break :check false;
-                        if (std.meta.fields(ThreadEndParams).len > 0) break :check false;
+                        if (compat.fieldsOf(ThreadStartParams).len > 0) break :check false;
+                        if (compat.fieldsOf(ThreadEndParams).len > 0) break :check false;
                         if (self.status != .uninitialized) break :check false;
                         break :check true;
                     };
@@ -187,7 +188,7 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
             const AsyncArgs = std.meta.ArgsTuple(AFT);
             const async_fn_info = @typeInfo(AFT).@"fn";
             const AsyncRT = async_fn_info.return_type.?;
-            const cc = async_fn_info.calling_convention;
+            const cc = compat.callingConvention(async_fn_info);
             const async_ns = struct {
                 fn push(async_args: AsyncArgs) AsyncRT {
                     var args: Args = undefined;
@@ -226,10 +227,10 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
                 .enum_literal => {
                     switch (func) {
                         .startup, .startup1 => {
-                            if (std.meta.fields(ThreadStartParams).len > 0) {
+                            if (compat.fieldsOf(ThreadStartParams).len > 0) {
                                 @compileError("Cannot generate function due to onThreadStart() requiring arguments");
                             }
-                            if (std.meta.fields(ThreadEndParams).len > 0) {
+                            if (compat.fieldsOf(ThreadEndParams).len > 0) {
                                 @compileError("Cannot generate function due to onThreadEnd() requiring arguments");
                             }
                             const f_ns = switch (func == .startup) {
@@ -266,8 +267,8 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
         pub fn Asyncified(comptime FT: type) type {
             const PorG = PromiseOrGenerator(FT);
             const fn_info = @typeInfo(FT).@"fn";
-            const org_params = fn_info.params;
-            var params: [org_params.len + 1]std.builtin.Type.Fn.Param = undefined;
+            const org_params = compat.params(fn_info);
+            var params: [org_params.len + 1]reify.Param = undefined;
             inline for (org_params, 0..) |org_param, i| params[i] = org_param;
             params[params.len - 1] = .{
                 .is_generic = false,
@@ -276,7 +277,7 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
             };
             return reify.Reify(.{
                 .@"fn" = .{
-                    .calling_convention = fn_info.calling_convention,
+                    .calling_convention = compat.callingConvention(fn_info),
                     .is_generic = false,
                     .is_var_args = false,
                     .params = &params,
@@ -315,8 +316,8 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
             else => ThreadStartError!void,
         };
         const WorkItem = init: {
-            var enum_fields: [decls.len]std.builtin.Type.EnumField = undefined;
-            var union_fields: [decls.len]std.builtin.Type.UnionField = undefined;
+            var enum_fields: [decls.len]reify.EnumField = undefined;
+            var union_fields: [decls.len]reify.UnionField = undefined;
             var count = 0;
             for (decls) |decl| {
                 const DT = @TypeOf(@field(ns, decl.name));
@@ -436,7 +437,7 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
 
         fn invokeFunction(item: WorkItem) void {
             const un = @typeInfo(WorkItem).@"union";
-            inline for (un.fields) |field| {
+            inline for (comptime compat.fields(un)) |field| {
                 const key = @field(WorkItemEnum, field.name);
                 if (item == key) {
                     const func = @field(ns, field.name);

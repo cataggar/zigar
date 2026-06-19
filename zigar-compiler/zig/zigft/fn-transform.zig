@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const reify = @import("../reify.zig");
 const expectEqual = std.testing.expectEqual;
 const expect = std.testing.expect;
@@ -22,7 +23,7 @@ pub fn spreadArgs(func: anytype, comptime conv: ?std.builtin.CallingConvention) 
 pub fn SpreadFn(comptime T: type, comptime conv: ?std.builtin.CallingConvention) type {
     const fields = getTupleFields(T);
     const f = @typeInfo(T).@"fn";
-    var params: [fields.len]std.builtin.Type.Fn.Param = undefined;
+    var params: [fields.len]reify.Param = undefined;
     inline for (fields, 0..) |field, index| {
         params[index] = .{
             .type = field.type,
@@ -36,7 +37,7 @@ pub fn SpreadFn(comptime T: type, comptime conv: ?std.builtin.CallingConvention)
             .is_generic = false,
             .is_var_args = false,
             .return_type = f.return_type.?,
-            .calling_convention = conv orelse f.calling_convention,
+            .calling_convention = conv orelse compat.callingConvention(f),
         },
     });
 }
@@ -68,7 +69,7 @@ test "spreadArgs" {
             return spreadArgs(ns.call, null);
         }
 
-        fn sum(args: std.meta.Tuple(&.{ i32, i32, i32 })) i32 {
+        fn sum(args: @Tuple(&.{ i32, i32, i32 })) i32 {
             var n: i32 = 0;
             inline for (args) |arg| {
                 n += arg;
@@ -96,7 +97,7 @@ fn getPyramid(func: anytype, comptime conv: ?std.builtin.CallingConvention) type
     };
     const f = @typeInfo(@TypeOf(func)).@"fn";
     const RT = f.return_type.?;
-    const cc = conv orelse f.calling_convention;
+    const cc = conv orelse compat.callingConvention(f);
     return struct {
         fn call0() callconv(cc) RT {
             return func(.{});
@@ -360,11 +361,11 @@ fn getPyramid(func: anytype, comptime conv: ?std.builtin.CallingConvention) type
     };
 }
 
-fn getTupleFields(comptime FT: type) []const std.builtin.Type.StructField {
+fn getTupleFields(comptime FT: type) []const reify.StructField {
     const valid = switch (@typeInfo(FT)) {
         .@"fn" => |f| is_tuple: {
-            if (f.params.len == 1) {
-                if (f.params[0].type) |PT| {
+            if (compat.params(f).len == 1) {
+                if (compat.params(f)[0].type) |PT| {
                     switch (@typeInfo(PT)) {
                         .@"struct" => |st| break :is_tuple st.is_tuple,
                         else => {},
@@ -378,15 +379,15 @@ fn getTupleFields(comptime FT: type) []const std.builtin.Type.StructField {
     if (!valid) {
         @compileError("Function accepting a tuple as argument expected");
     }
-    const Tuple = @typeInfo(FT).@"fn".params[0].type.?;
-    return @typeInfo(Tuple).@"struct".fields;
+    const Tuple = compat.params(@typeInfo(FT).@"fn")[0].type.?;
+    return compat.fields(@typeInfo(Tuple).@"struct");
 }
 
 /// Take an inline function create a regular function
 pub fn uninline(func: anytype) Uninlined(@TypeOf(func)) {
     const FT = @TypeOf(func);
     const f = @typeInfo(FT).@"fn";
-    if (f.calling_convention != .@"inline") return func;
+    if (compat.callingConvention(f) != .@"inline") return func;
     const ns = struct {
         inline fn call(args: std.meta.ArgsTuple(FT)) f.return_type.? {
             return @call(.auto, func, args);
@@ -408,21 +409,21 @@ test "uninline" {
         const new_a = uninline(a);
         const new_b = uninline(b);
     };
-    try expectEqual(.auto, @typeInfo(@TypeOf(ns.new_a)).@"fn".calling_convention);
+    try expectEqual(.auto, compat.callingConvention(@typeInfo(@TypeOf(ns.new_a)).@"fn"));
     try expectEqual(ns.b, ns.new_b);
 }
 
 /// Return type of uninline().
 pub fn Uninlined(comptime FT: type) type {
     const f = @typeInfo(FT).@"fn";
-    if (f.calling_convention != .@"inline") return FT;
+    if (compat.callingConvention(f) != .@"inline") return FT;
     return reify.Reify(.{
         .@"fn" = .{
             .calling_convention = .auto,
             .is_generic = f.is_generic,
-            .is_var_args = f.is_var_args,
+            .is_var_args = compat.isVarArgs(f),
             .return_type = f.return_type,
-            .params = f.params,
+            .params = compat.params(f),
         },
     });
 }

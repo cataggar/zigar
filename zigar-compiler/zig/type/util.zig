@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const reify = @import("../reify.zig");
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
@@ -86,7 +87,7 @@ test "IteratorPayload" {
 
 pub fn hasDefaultFields(comptime T: type) bool {
     return switch (@typeInfo(T)) {
-        .@"struct" => |st| inline for (st.fields) |field| {
+        .@"struct" => |st| inline for (comptime compat.fields(st)) |field| {
             if (field.default_value_ptr == null) break false;
         } else true,
         else => false,
@@ -118,7 +119,7 @@ fn NextMethodReturnValue(comptime FT: type, comptime T: type) ?type {
         var alloc_count = 0;
         var struct_count = 0;
         var other_count = 0;
-        for (f.params, 0..) |param, i| {
+        for (compat.params(f), 0..) |param, i| {
             const PT = param.type orelse break :check false;
             if (i == 0 and PT == *T) {
                 self_count += 1;
@@ -218,7 +219,7 @@ pub fn isIteratorAllocating(comptime T: type) bool {
         .@"struct", .@"union", .@"opaque" => if (@hasDecl(T, "next")) {
             const next = @field(T, "next");
             const FT = @TypeOf(next);
-            return inline for (@typeInfo(FT).@"fn".params) |param| {
+            return inline for (comptime compat.params(@typeInfo(FT).@"fn")) |param| {
                 if (param.type == std.mem.Allocator) break true;
             } else false;
         },
@@ -267,9 +268,9 @@ pub fn Function(comptime arg: anytype) type {
 pub fn isValidCallback(comptime FT: type, comptime AT: type, comptime RT: type) bool {
     switch (@typeInfo(FT)) {
         .@"fn" => |f| {
-            if (f.params.len == 2 and f.return_type == RT) {
-                if (f.params[0].type != null and f.params[1].type == AT) {
-                    comptime var T = f.params[0].type.?;
+            if (compat.params(f).len == 2 and f.return_type == RT) {
+                if (compat.params(f)[0].type != null and compat.params(f)[1].type == AT) {
+                    comptime var T = compat.params(f)[0].type.?;
                     if (@typeInfo(T) == .optional) T = @typeInfo(T).optional.child;
                     if (@typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .one) return true;
                 }
@@ -300,7 +301,7 @@ test "isValidCallback" {
 pub fn getCallback(comptime FT: type, cb: anytype) *const FT {
     const CBT = @TypeOf(cb);
     const f = @typeInfo(FT).@"fn";
-    if (comptime !isValidCallback(CBT, f.params[1].type.?, f.return_type.?)) {
+    if (comptime !isValidCallback(CBT, compat.params(f)[1].type.?, f.return_type.?)) {
         @compileError("Expecting " ++ @typeName(FT) ++ ", received: " ++ @typeName(CBT));
     }
     const fn_ptr = switch (@typeInfo(CBT)) {

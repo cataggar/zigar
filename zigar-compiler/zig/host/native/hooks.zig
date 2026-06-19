@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../../compat.zig");
 const reify = @import("../../reify.zig");
 const c_allocator = std.heap.c_allocator;
 const POLL = std.c.POLL;
@@ -17,26 +18,15 @@ const builtin = @import("builtin");
 
 const fn_transform = @import("../../zigft/fn-transform.zig");
 
-const dirent_h = @cImport({
-    @cInclude("dirent.h");
-});
-const errno_h = @cImport({
-    @cInclude("errno.h");
-});
-const stdio_h = @cImport({
-    @cInclude("stdio.h");
-    @cInclude("string.h");
-});
-const stat_h = @cImport({
-    @cDefine("_GNU_SOURCE", "1");
-    @cInclude("sys/stat.h");
-});
-const windows_h = @cImport({
-    // Zig 0.16's Windows cImport does not define MinGW's 32-bit arch guard here.
-    if (builtin.target.cpu.arch == .x86) @cDefine("_X86_", "1");
-    @cInclude("windows.h");
-    @cInclude("winternl.h");
-});
+// Zig 0.17 removed @cImport; these are translated via build-system translate-c
+// modules wired up in build.zig. The wrapper headers carry any needed defines
+// (e.g. _GNU_SOURCE, _X86_). They are imported lazily and only resolved on the
+// native targets where hooks.zig's code is actually reached.
+const dirent_h = @import("dirent_h");
+const errno_h = @import("errno_h");
+const stdio_h = @import("stdio_h");
+const stat_h = @import("stat_h");
+const windows_h = @import("windows_h");
 const timespec_t = switch (builtin.target.os.tag) {
     // Zig 0.16 makes std.c.time_t void on Windows, so std.c.timespec is unusable there.
     .windows => extern struct { sec: c_longlong, nsec: c_long },
@@ -509,11 +499,11 @@ fn getCwdAllocCompat(allocator: std.mem.Allocator) ![:0]u8 {
     if (os == .windows) {
         const len = windows_h.GetCurrentDirectoryA(buf.len, &buf);
         if (len == 0 or len > buf.len) return error.CurrentWorkingDirectoryUnlinked;
-        return allocator.dupeZ(u8, buf[0..len]);
+        return allocator.dupeSentinel(u8, buf[0..len], 0);
     } else {
         const ptr = std.c.getcwd(&buf, buf.len) orelse return error.CurrentWorkingDirectoryUnlinked;
         const slice = std.mem.span(@as([*:0]u8, @ptrCast(ptr)));
-        return allocator.dupeZ(u8, slice);
+        return allocator.dupeSentinel(u8, slice, 0);
     }
 }
 
@@ -1002,7 +992,7 @@ pub fn SyscallRedirector(comptime ModuleHost: type) type {
                         true => (name_offset - src_name_offset) * (len / 64),
                         false => 0,
                     };
-                    var stb = std.heap.stackFallback(1024 * 8, c_allocator);
+                    var stb = compat.stackFallback(1024 * 8, c_allocator);
                     const allocator = stb.get();
                     const src_buffer = allocator.alloc(u8, len - diff) catch {
                         result.* = intFromError(.NOMEM);
@@ -1242,7 +1232,7 @@ pub fn SyscallRedirector(comptime ModuleHost: type) type {
                 }
             } else true;
             if (all_private) {
-                var stb = std.heap.stackFallback(1024, c_allocator);
+                var stb = compat.stackFallback(1024, c_allocator);
                 const allocator = stb.get();
                 const timer_count: usize = if (timeout >= 0) 1 else 0;
                 var actual_fd_count: usize = 0;
@@ -1879,7 +1869,7 @@ pub fn SyscallRedirector(comptime ModuleHost: type) type {
         }
 
         const PathResolver = struct {
-            sfa: std.heap.StackFallbackAllocator(max_buffer_size),
+            sfa: compat.StackFallbackAllocator(max_buffer_size),
             allocator: std.mem.Allocator,
             dirfd: c_int,
             buffer: ?[]u8,
@@ -1891,7 +1881,7 @@ pub fn SyscallRedirector(comptime ModuleHost: type) type {
                 var self: @This() = undefined;
                 const len = std.mem.len(path);
                 const path_s = path[0..len];
-                self.sfa = std.heap.stackFallback(max_buffer_size, c_allocator);
+                self.sfa = compat.stackFallback(max_buffer_size, c_allocator);
                 self.allocator = self.sfa.get();
                 try self._init(dirfd, @ptrCast(path_s));
                 return self;
@@ -1918,7 +1908,7 @@ pub fn SyscallRedirector(comptime ModuleHost: type) type {
                 } else {
                     self.dirfd = if (dirfd == fd_cwd) fd_root else dirfd;
                     if (backslashes) {
-                        const buf = try self.allocator.dupeZ(u8, path);
+                        const buf = try self.allocator.dupeSentinel(u8, path, 0);
                         self.buffer = buf;
                         self.path = buf.ptr;
                     } else {
@@ -2373,8 +2363,8 @@ pub fn PosixSubstitute(comptime redirector: type) type {
         }
 
         fn StdHook(comptime Func: type) type {
-            const params = @typeInfo(Func).@"fn".params;
-            var new_params: [params.len - 1]std.builtin.Type.Fn.Param = undefined;
+            const params = compat.params(@typeInfo(Func).@"fn");
+            var new_params: [params.len - 1]reify.Param = undefined;
             for (&new_params, 0..) |*ptr, index| ptr.* = params[index];
             const RPtrT = params[params.len - 1].type.?;
             const RT = @typeInfo(RPtrT).pointer.child;
@@ -3494,7 +3484,7 @@ pub fn LibcSubstituteWindows(comptime redirector: type) type {
         fn getPath(filespec: [*:0]const u8) !?[:0]const u8 {
             const len = std.mem.len(filespec);
             if (std.mem.endsWith(u8, filespec[0..len], "\\*")) {
-                return try c_allocator.dupeZ(u8, filespec[0 .. len - 2]);
+                return try c_allocator.dupeSentinel(u8, filespec[0 .. len - 2], 0);
             }
             return null;
         }
@@ -4165,7 +4155,7 @@ pub fn Win32Substitute(comptime redirector: type) type {
                     _ = redirector.lseek64(dirfd, 0, std.c.SEEK.SET, &seek_result);
                     if (seek_result != 0) return .INVALID_HANDLE;
                 }
-                var stb = std.heap.stackFallback(1024 * 8, c_allocator);
+                var stb = compat.stackFallback(1024 * 8, c_allocator);
                 const allocator = stb.get();
                 const src_buffer = allocator.alloc(u8, length) catch return .NO_MEMORY;
                 defer allocator.free(src_buffer);
@@ -4740,7 +4730,7 @@ pub fn Win32Substitute(comptime redirector: type) type {
             return @intCast(value);
         }
 
-        fn decodePath(path: []const u8) std.meta.Tuple(&.{ []const u8, c_int }) {
+        fn decodePath(path: []const u8) @Tuple(&.{ []const u8, c_int }) {
             if (std.mem.startsWith(u8, path, fd_path_prefix)) |index| {
                 const subpath = path[index..];
                 const slash_index = std.mem.indexOfScalar(u8, subpath, '\\') orelse subpath.len;
@@ -4784,7 +4774,7 @@ pub fn Win32Substitute(comptime redirector: type) type {
                 .dirfd = dirfd,
                 .is_dir = is_dir,
                 .buffer = buffer,
-                .path = try c_allocator.dupeZ(u8, path[0..std.mem.len(path)]),
+                .path = try c_allocator.dupeSentinel(u8, path[0..std.mem.len(path)], 0),
             });
             return fromDescriptor(fd);
         }
@@ -5140,7 +5130,7 @@ pub fn Win32SubstituteNonIO(comptime redirector: type) type {
 }
 
 const Wtf8Converter = struct {
-    sfa: std.heap.StackFallbackAllocator(buffer_size),
+    sfa: compat.StackFallbackAllocator(buffer_size),
     arena: std.heap.ArenaAllocator,
     allocator: std.mem.Allocator,
     save_error: bool,
@@ -5155,7 +5145,7 @@ const Wtf8Converter = struct {
 
     pub inline fn init(options: Options) @This() {
         var self: @This() = undefined;
-        self.sfa = std.heap.stackFallback(buffer_size, c_allocator);
+        self.sfa = compat.stackFallback(buffer_size, c_allocator);
         self.arena = .init(self.sfa.get());
         self.allocator = self.arena.allocator();
         self.save_error = options.save_error;
@@ -5188,7 +5178,7 @@ const Wtf8Converter = struct {
                 slice = slice[4..];
                 if (std.mem.startsWith(u8, slice, "UNC\\")) {
                     slice = slice[2..];
-                    if (T == u8) slice = try self.allocator.dupeZ(u8, slice[2..]);
+                    if (T == u8) slice = try self.allocator.dupeSentinel(u8, slice[2..], 0);
                     slice[0] = '\\';
                 }
             }
@@ -5211,15 +5201,15 @@ pub const HandlerVTable = init: {
     const redirector = SyscallRedirector(void);
     const len = count: {
         var count: usize = 0;
-        for (std.meta.declarations(redirector)) |decl| {
+        for (compat.declarations(redirector)) |decl| {
             const T = @TypeOf(@field(redirector, decl.name));
             if (@typeInfo(T) == .@"fn") count += 1;
         }
         break :count count;
     };
-    var fields: [len]std.builtin.Type.StructField = undefined;
+    var fields: [len]reify.StructField = undefined;
     var index: usize = 0;
-    for (std.meta.declarations(redirector)) |decl| {
+    for (compat.declarations(redirector)) |decl| {
         const T = @TypeOf(@field(redirector, decl.name));
         if (@typeInfo(T) == .@"fn") {
             fields[index] = .{
@@ -5245,7 +5235,7 @@ pub const HandlerVTable = init: {
 pub fn getHandlerVtable(comptime Host: type) HandlerVTable {
     var vtable: HandlerVTable = undefined;
     const redirector = SyscallRedirector(Host);
-    inline for (std.meta.declarations(redirector)) |decl| {
+    inline for (compat.declarations(redirector)) |decl| {
         const T = @TypeOf(@field(redirector, decl.name));
         if (@typeInfo(T) == .@"fn") {
             @field(vtable, decl.name) = &@field(redirector, decl.name);
@@ -5299,12 +5289,12 @@ pub fn getHookTable(comptime Host: type, comptime redirect_io: bool) std.StaticS
     const len = init: {
         var total: usize = extra;
         inline for (list) |Sub| {
-            const decls = std.meta.declarations(Sub.Original);
+            const decls = compat.declarations(Sub.Original);
             total += decls.len;
         }
         break :init total;
     };
-    var table: [len]std.meta.Tuple(&.{ []const u8, Entry }) = undefined;
+    var table: [len]@Tuple(&.{ []const u8, Entry }) = undefined;
     if (redirect_io) {
         // make vtable available through the hook table
         table[0] = .{ "__sc_vtable", .{
@@ -5314,13 +5304,13 @@ pub fn getHookTable(comptime Host: type, comptime redirect_io: bool) std.StaticS
     }
     var index: usize = extra;
     inline for (list) |Sub| {
-        const decls = std.meta.declarations(Sub.Original);
+        const decls = compat.declarations(Sub.Original);
         inline for (decls) |decl| {
             const w_suffix = std.mem.endsWith(u8, decl.name, "_orig");
             const name = if (w_suffix) decl.name[0 .. decl.name.len - 5] else decl.name;
             const handler_name = if (w_suffix) name ++ "_hook" else name;
             const HandlerType = @TypeOf(@field(Sub, handler_name));
-            const handle_cc = @typeInfo(HandlerType).@"fn".calling_convention;
+            const handle_cc = compat.callingConvention(@typeInfo(HandlerType).@"fn");
             if (std.meta.activeTag(handle_cc) != std.meta.activeTag(Sub.calling_convention)) {
                 @compileError("Handler with wrong calling convention: " ++ handler_name);
             }

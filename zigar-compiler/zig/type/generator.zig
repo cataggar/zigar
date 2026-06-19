@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const expectEqual = std.testing.expectEqual;
 const expectError = std.testing.expectError;
 
@@ -141,7 +142,7 @@ pub fn GeneratorOf(comptime arg: anytype) type {
 pub fn GeneratorArgOf(comptime arg: anytype) type {
     const FT = util.Function(arg);
     const f = @typeInfo(FT).@"fn";
-    return inline for (f.params) |param| {
+    return inline for (comptime compat.params(f)) |param| {
         if (util.getInternalType(param.type) == .generator) break param.type.?;
     } else @compileError("No generator argument: " ++ @typeName(FT));
 }

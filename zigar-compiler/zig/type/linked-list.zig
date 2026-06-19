@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 

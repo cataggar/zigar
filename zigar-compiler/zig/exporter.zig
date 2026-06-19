@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const reify = @import("reify.zig");
 const builtin = @import("builtin");
 
@@ -124,11 +125,11 @@ fn Factory(comptime host: type, comptime module: type) type {
                     .is_size = td.type == usize or td.type == isize,
                 },
                 .@"struct" => |st| init: {
-                    const has_object = inline for (st.fields) |field| {
+                    const has_object = inline for (comptime compat.fields(st)) |field| {
                         const field_td = tdb.get(field.type);
                         if (field_td.isObject()) break true;
                     } else false;
-                    const has_slot = inline for (st.fields) |field| {
+                    const has_slot = inline for (comptime compat.fields(st)) |field| {
                         const field_td = tdb.get(field.type);
                         if (field_td.isObject() or field_td.isComptimeOnly() or field.is_comptime) break true;
                     } else false;
@@ -136,12 +137,12 @@ fn Factory(comptime host: type, comptime module: type) type {
                         .has_object = has_object,
                         .has_slot = has_slot,
                         .has_pointer = td.hasPointer(),
-                        .has_options = inline for (st.fields) |field| {
+                        .has_options = inline for (comptime compat.fields(st)) |field| {
                             const field_td = tdb.get(field.type);
                             if (getStructurePurpose(field_td).isOptional()) break true;
                         } else false,
                         .is_throwing = td.isThrowing(),
-                        .is_async = inline for (st.fields) |field| {
+                        .is_async = inline for (comptime compat.fields(st)) |field| {
                             const field_td = tdb.get(field.type);
                             switch (getStructurePurpose(field_td)) {
                                 .promise, .generator => break true,
@@ -168,11 +169,11 @@ fn Factory(comptime host: type, comptime module: type) type {
                     };
                 },
                 .@"union" => |un| init: {
-                    const has_object = inline for (un.fields) |field| {
+                    const has_object = inline for (comptime compat.fields(un)) |field| {
                         const field_td = tdb.get(field.type);
                         if (field_td.isObject()) break true;
                     } else false;
-                    const has_slot = inline for (un.fields) |field| {
+                    const has_slot = inline for (comptime compat.fields(un)) |field| {
                         const field_td = tdb.get(field.type);
                         if (field_td.isObject() or field_td.isComptimeOnly()) break true;
                     } else false;
@@ -205,10 +206,10 @@ fn Factory(comptime host: type, comptime module: type) type {
                     };
                 },
                 .@"enum" => |en| .{
-                    .is_open_ended = !en.is_exhaustive,
+                    .is_open_ended = !compat.isExhaustive(en),
                 },
                 .error_set => |es| .{
-                    .is_global = es == null,
+                    .is_global = es.error_names == null,
                 },
                 .array => |ar| init: {
                     const child_td = tdb.get(ar.child);
@@ -238,10 +239,10 @@ fn Factory(comptime host: type, comptime module: type) type {
                         .@"fn" => false,
                         else => true,
                     },
-                    .is_const = pt.is_const,
+                    .is_const = pt.attrs.@"const",
                     .is_single = pt.size == .one or pt.size == .c,
                     .is_multiple = pt.size != .one,
-                    .is_nullable = pt.is_allowzero or pt.child == anyopaque,
+                    .is_nullable = pt.attrs.@"allowzero" or pt.child == anyopaque,
                 },
                 .@"opaque" => .{},
                 .@"fn" => .{},
@@ -256,7 +257,7 @@ fn Factory(comptime host: type, comptime module: type) type {
                 .@"struct" => |st| switch (td.isArguments()) {
                     true => comptime req_arg_count: {
                         var len = 0;
-                        for (st.fields, 0..) |field, index| {
+                        for (compat.fields(st), 0..) |field, index| {
                             // first field is retval
                             if (index > 0) {
                                 const field_td = tdb.get(field.type);
@@ -267,7 +268,7 @@ fn Factory(comptime host: type, comptime module: type) type {
                         break :req_arg_count len;
                     },
                     false => switch (st.is_tuple) {
-                        true => st.fields.len,
+                        true => compat.fields(st).len,
                         false => null,
                     },
                 },
@@ -491,7 +492,7 @@ fn Factory(comptime host: type, comptime module: type) type {
             // check if FT is used as a function pointer
             const PT = *const FT;
             const as_ptr = comptime tdb.has(PT) and tdb.get(PT).isInUse() and !td.isVariadic();
-            inline for (std.meta.fields(td.type), 0..) |field, index| {
+            inline for (comptime compat.fieldsOf(td.type), 0..) |field, index| {
                 const field_td = tdb.get(field.type);
                 const can_be_string = comptime (as_ptr and index > 0) and canBeString(field.type);
                 // first field is retval, hence the subtraction
@@ -523,7 +524,7 @@ fn Factory(comptime host: type, comptime module: type) type {
 
         fn addStructMembers(self: @This(), list: Value, comptime td: TypeData) !void {
             const FieldEnum = std.meta.FieldEnum(td.type);
-            inline for (std.meta.fields(td.type), 0..) |field, index| {
+            inline for (comptime compat.fieldsOf(td.type), 0..) |field, index| {
                 const field_td = tdb.get(field.type);
                 const field_enum = comptime std.meta.stringToEnum(FieldEnum, field.name).?;
                 // comptime fields are not actually stored in the struct
@@ -573,7 +574,7 @@ fn Factory(comptime host: type, comptime module: type) type {
 
         fn addUnionMembers(self: @This(), list: Value, comptime td: TypeData) !void {
             const FieldEnum = std.meta.FieldEnum(td.type);
-            inline for (std.meta.fields(td.type), 0..) |field, index| {
+            inline for (comptime compat.fieldsOf(td.type), 0..) |field, index| {
                 const field_td = tdb.get(field.type);
                 const field_enum = comptime std.meta.stringToEnum(FieldEnum, field.name).?;
                 const can_be_string = comptime canBeString(field.type);
@@ -650,7 +651,7 @@ fn Factory(comptime host: type, comptime module: type) type {
             });
             // don't export inferred error sets that are essentially anyerror as separate sets
             comptime var ES = @typeInfo(td.type).error_union.error_set;
-            if (@typeInfo(ES).error_set == null) {
+            if (@typeInfo(ES).error_set.error_names == null) {
                 ES = anyerror;
             }
             const error_td = tdb.get(ES);
@@ -687,7 +688,7 @@ fn Factory(comptime host: type, comptime module: type) type {
                     if (@sizeOf(td.type) > 0) {
                         const default_values = comptime init: {
                             var values: td.type = undefined;
-                            for (st.fields) |field| {
+                            for (compat.fields(st)) |field| {
                                 if (!field.is_comptime) {
                                     if (field.default_value_ptr) |opaque_ptr| {
                                         const default_value_ptr: *const field.type = @ptrCast(@alignCast(opaque_ptr));
@@ -699,7 +700,7 @@ fn Factory(comptime host: type, comptime module: type) type {
                         };
                         memory = try self.exportPointerTarget(&default_values, false);
                     }
-                    inline for (st.fields, 0..) |field, index| {
+                    inline for (comptime compat.fields(st), 0..) |field, index| {
                         if (field.default_value_ptr) |opaque_ptr| {
                             const field_td = tdb.get(field.type);
                             const comptime_only = field.is_comptime or field_td.isComptimeOnly();
@@ -742,7 +743,7 @@ fn Factory(comptime host: type, comptime module: type) type {
             switch (@typeInfo(td.type)) {
                 .@"struct", .@"union", .@"enum", .@"opaque" => if (comptime !td.isArguments() and !td.isSlice()) {
                     const DeclEnum = std.meta.DeclEnum(td.type);
-                    inline for (comptime std.meta.declarations(td.type), 0..) |decl, index| {
+                    inline for (comptime compat.declarations(td.type), 0..) |decl, index| {
                         if (comptime std.mem.startsWith(u8, decl.name, "meta(")) continue;
                         const decl_enum = comptime std.meta.stringToEnum(DeclEnum, decl.name).?;
                         const decl_ptr = &@field(td.type, decl.name);
@@ -796,7 +797,7 @@ fn Factory(comptime host: type, comptime module: type) type {
             switch (@typeInfo(td.type)) {
                 .@"enum" => |en| {
                     // add fields as static members
-                    inline for (en.fields, 0..) |field, index| {
+                    inline for (comptime compat.fields(en), 0..) |field, index| {
                         try appendList(list, .{
                             .name = field.name,
                             .type = MemberType.object,
@@ -806,10 +807,10 @@ fn Factory(comptime host: type, comptime module: type) type {
                         });
                     }
                 },
-                .error_set => |es| if (es) |errors| {
-                    inline for (errors, 0..) |err_rec, index| {
+                .error_set => |es| if (es.error_names) |errors| {
+                    inline for (errors, 0..) |err_name, index| {
                         try appendList(list, .{
-                            .name = err_rec.name,
+                            .name = err_name,
                             .type = MemberType.object,
                             .flags = MemberFlags{ .is_part_of_set = true },
                             .slot = index,
@@ -828,7 +829,7 @@ fn Factory(comptime host: type, comptime module: type) type {
             var slots: ?Value = null;
             switch (@typeInfo(td.type)) {
                 .@"struct", .@"union", .@"enum", .@"opaque" => if (comptime !td.isArguments()) {
-                    inline for (comptime std.meta.declarations(td.type), 0..) |decl, index| {
+                    inline for (comptime compat.declarations(td.type), 0..) |decl, index| {
                         if (comptime std.mem.startsWith(u8, decl.name, "meta(")) continue;
                         const decl_ptr = &@field(td.type, decl.name);
                         const decl_ptr_td = tdb.get(@TypeOf(decl_ptr));
@@ -845,7 +846,7 @@ fn Factory(comptime host: type, comptime module: type) type {
                             } else false;
                             if (should_export) {
                                 const target_ptr = comptime switch (@typeInfo(DT)) {
-                                    .@"fn" => |f| switch (f.calling_convention) {
+                                    .@"fn" => |f| switch (compat.callingConvention(f)) {
                                         .@"inline" => &fn_transform.uninline(decl_value),
                                         else => decl_ptr,
                                     },
@@ -863,16 +864,16 @@ fn Factory(comptime host: type, comptime module: type) type {
             }
             switch (@typeInfo(td.type)) {
                 .@"enum" => |en| {
-                    inline for (en.fields, 0..) |field, index| {
+                    inline for (comptime compat.fields(en), 0..) |field, index| {
                         const value = @field(td.type, field.name);
                         const value_obj = try self.exportPointerTarget(&value, true);
                         if (slots == null) slots = try host.createObject();
                         try host.setSlotValue(slots.?, offset + index, value_obj);
                     }
                 },
-                .error_set => |es| if (es) |errors| {
-                    inline for (errors, 0..) |err_rec, index| {
-                        const err = @field(anyerror, err_rec.name);
+                .error_set => |es| if (es.error_names) |errors| {
+                    inline for (errors, 0..) |err_name, index| {
+                        const err = @field(anyerror, err_name);
                         const value_obj = try self.exportError(err, td);
                         if (slots == null) slots = try host.createObject();
                         try host.setSlotValue(slots.?, offset + index, value_obj);
@@ -900,7 +901,7 @@ fn Factory(comptime host: type, comptime module: type) type {
                     .@"fn" => |f| {
                         var has_abort_signal = false;
                         var has_promise = false;
-                        for (f.params) |param| {
+                        for (compat.params(f)) |param| {
                             const param_td = tdb.get(param.type.?);
                             switch (getStructurePurpose((param_td))) {
                                 .abort_signal => has_abort_signal = true,
@@ -945,7 +946,7 @@ fn Factory(comptime host: type, comptime module: type) type {
                 .array => |pt| pt.child == u8 or pt.child == u16,
                 .optional => |op| canBeString(op.child),
                 .error_union => |eu| canBeString(eu.payload),
-                .@"fn" => |f| inline for (f.params) |param| {
+                .@"fn" => |f| inline for (comptime compat.params(f)) |param| {
                     if (param.type) |PT| {
                         if (comptime util.getInternalType(PT)) |internal_type| {
                             if (internal_type == .promise or internal_type == .generator) {
@@ -968,7 +969,7 @@ fn Factory(comptime host: type, comptime module: type) type {
                 .@"struct", .@"union", .array, .vector, .@"enum" => true,
                 .optional => |op| canBePlain(op.child),
                 .error_union => |eu| canBePlain(eu.payload),
-                .@"fn" => |f| inline for (f.params) |param| {
+                .@"fn" => |f| inline for (comptime compat.params(f)) |param| {
                     if (param.type) |PT| {
                         if (comptime util.getInternalType(PT)) |internal_type| {
                             if (internal_type == .promise or internal_type == .generator) {
@@ -984,7 +985,7 @@ fn Factory(comptime host: type, comptime module: type) type {
         fn canBeTypedArray(comptime T: type) bool {
             return switch (@typeInfo(T)) {
                 .pointer => canBeTypedArray(tdb.get(T).getTargetType()),
-                .@"fn" => |f| inline for (f.params) |param| {
+                .@"fn" => |f| inline for (comptime compat.params(f)) |param| {
                     if (param.type) |PT| {
                         if (comptime util.getInternalType(PT)) |internal_type| {
                             if (internal_type == .promise or internal_type == .generator) {
@@ -1001,7 +1002,7 @@ fn Factory(comptime host: type, comptime module: type) type {
         fn canBeClampedArray(comptime T: type) bool {
             return switch (@typeInfo(T)) {
                 .pointer => canBeClampedArray(tdb.get(T).getTargetType()),
-                .@"fn" => |f| inline for (f.params) |param| {
+                .@"fn" => |f| inline for (comptime compat.params(f)) |param| {
                     if (param.type) |PT| {
                         if (comptime util.getInternalType(PT)) |internal_type| {
                             if (internal_type == .promise or internal_type == .generator) {
@@ -1028,7 +1029,7 @@ fn Factory(comptime host: type, comptime module: type) type {
                     break :ptr ptr;
                 }
             };
-            const is_comptime = comptime pt.is_const and !target_td.isFunction() and !target_td.hasPointer();
+            const is_comptime = comptime pt.attrs.@"const" and !target_td.isFunction() and !target_td.hasPointer();
             const export_handle = if (!is_comptime) host.getExportHandle(ptr) else null;
             if (casting) {
                 const structure = try self.getStructure(target_td.type);
@@ -1082,7 +1083,7 @@ fn Factory(comptime host: type, comptime module: type) type {
                     const obj = try self.exportComptimeValue(element);
                     try host.setSlotValue(slots, index, obj);
                 },
-                .@"struct" => |st| inline for (st.fields, 0..) |field, index| {
+                .@"struct" => |st| inline for (comptime compat.fields(st), 0..) |field, index| {
                     const field_td = tdb.get(field.type);
                     if (field_td.isComptimeOnly()) {
                         const field_value = @field(value, field.name);
@@ -1092,7 +1093,7 @@ fn Factory(comptime host: type, comptime module: type) type {
                 },
                 .@"union" => |un| if (un.tag_type) |Tag| {
                     const tag: Tag = value;
-                    inline for (un.fields, 0..) |field, index| {
+                    inline for (comptime compat.fields(un), 0..) |field, index| {
                         if (@field(Tag, field.name) == tag) {
                             const field_td = tdb.get(field.type);
                             if (field_td.isComptimeOnly()) {
@@ -1117,7 +1118,7 @@ fn Factory(comptime host: type, comptime module: type) type {
         }
 
         fn setProperties(object: Value, initializers: anytype) !void {
-            inline for (std.meta.fields(@TypeOf(initializers))) |field| {
+            inline for (comptime compat.fieldsOf(@TypeOf(initializers))) |field| {
                 if (try createValue(@field(initializers, field.name))) |value| {
                     try host.setProperty(object, field.name, value);
                 }
@@ -1246,8 +1247,8 @@ fn ComptimeFree(comptime T: type) type {
         => void,
         .array => |ar| [ar.len]ComptimeFree(ar.child),
         .@"struct" => |st| derive: {
-            var new_fields: [st.fields.len]std.builtin.Type.StructField = undefined;
-            inline for (st.fields, 0..) |field, index| {
+            var new_fields: [compat.fields(st).len]reify.StructField = undefined;
+            inline for (comptime compat.fields(st), 0..) |field, index| {
                 const FT = if (field.is_comptime) void else ComptimeFree(field.type);
                 new_fields[index] = .{
                     .name = field.name,
@@ -1267,8 +1268,8 @@ fn ComptimeFree(comptime T: type) type {
             });
         },
         .@"union" => |un| derive: {
-            var new_fields: [un.fields.len]std.builtin.Type.UnionField = undefined;
-            inline for (un.fields, 0..) |field, index| {
+            var new_fields: [compat.fields(un).len]reify.UnionField = undefined;
+            inline for (comptime compat.fields(un), 0..) |field, index| {
                 const FT = ComptimeFree(field.type);
                 new_fields[index] = .{
                     .name = field.name,
@@ -1312,7 +1313,7 @@ fn removeComptimeValues(comptime value: anytype) ComptimeFree(@TypeOf(value)) {
             }
         },
         .@"struct" => |st| {
-            inline for (st.fields) |field| {
+            inline for (comptime compat.fields(st)) |field| {
                 @field(result, field.name) = removeComptimeValues(@field(value, field.name));
             }
         },

@@ -6,7 +6,7 @@ const cfg = @import("build.cfg.zig");
 const extra = @import("build.extra.zig");
 
 pub fn build(b: *std.Build) !void {
-    if (builtin.zig_version.major != 0 or builtin.zig_version.minor != 16) {
+    if (builtin.zig_version.major != 0 or builtin.zig_version.minor != 17) {
         @compileError("Unsupported Zig version");
     }
     const target = b.standardTargetOptions(.{});
@@ -48,6 +48,28 @@ pub fn build(b: *std.Build) !void {
     });
     mod.addIncludePath(.{ .cwd_relative = cfg.module_dir });
     lib.root_module.addImport("module", mod);
+    if (!cfg.is_wasm) {
+        const c_dir = cfg.zigar_src_path ++ "host/native/cimport/";
+        const addTC = struct {
+            fn add(bb: *std.Build, root: *std.Build.Module, name: []const u8, header: []const u8, tgt: std.Build.ResolvedTarget, opt: std.builtin.OptimizeMode) void {
+                const tc = bb.addTranslateC(.{
+                    .root_source_file = .{ .cwd_relative = header },
+                    .target = tgt,
+                    .optimize = opt,
+                    .link_libc = true,
+                });
+                root.addImport(name, tc.createModule());
+            }
+        }.add;
+        addTC(b, lib.root_module, "errno_h", c_dir ++ "errno.h", target, optimize);
+        addTC(b, lib.root_module, "stdio_h", c_dir ++ "stdio.h", target, optimize);
+        if (target.result.os.tag == .windows) {
+            addTC(b, lib.root_module, "windows_h", c_dir ++ "windows.h", target, optimize);
+        } else {
+            addTC(b, lib.root_module, "dirent_h", c_dir ++ "dirent.h", target, optimize);
+            addTC(b, lib.root_module, "stat_h", c_dir ++ "stat.h", target, optimize);
+        }
+    }
     const extra_c_files: []const []const u8 = switch (@hasDecl(extra, "getCSourceFiles")) {
         true => @call(.always_inline, extra.getCSourceFiles, .{ b, .{
             .library = lib,

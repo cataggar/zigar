@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 
 const module = @import("module");
 
@@ -9,7 +10,7 @@ pub fn call(comptime name: []const u8, comptime args: anytype) bool {
             if (@hasDecl(meta, name)) break :find meta;
             switch (@typeInfo(meta)) {
                 inline .@"struct", .@"union", .@"opaque", .@"enum" => |st| {
-                    if (st.decls.len == 0) @compileError("meta(zigar) has no public declarations");
+                    if (compat.decls(st).len == 0) @compileError("meta(zigar) has no public declarations");
                 },
                 else => {},
             }
