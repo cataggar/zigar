@@ -1,6 +1,6 @@
 //! Thread-safe general-purpose allocator for WebAssembly.
 //!
-//! Zig 0.16's `std.heap.WasmAllocator` is `@compileError("unimplemented")` for
+//! Zig's `std.heap.WasmAllocator` is `@compileError("unimplemented")` for
 //! non-single-threaded wasm (it wraps `BrkAllocator`, which itself bails out
 //! with `@compileError("unsupported")` unless `builtin.single_threaded`). That
 //! leaves multi-threaded wasm with no usable `std.heap` allocator, because
