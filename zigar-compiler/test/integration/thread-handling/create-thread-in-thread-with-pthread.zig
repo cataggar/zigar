@@ -2,9 +2,7 @@ const std = @import("std");
 
 const zigar = @import("zigar");
 
-const c = @cImport({
-    @cInclude("pthread.h");
-});
+const c = @import("c");
 const pthread_t = c.pthread_t;
 
 pub fn spawn() !void {

@@ -2,10 +2,7 @@ const std = @import("std");
 const allocator = std.heap.c_allocator;
 const builtin = @import("builtin");
 
-const c = @cImport({
-    @cInclude("dirent.h");
-    @cInclude("sys/stat.h");
-});
+const c = @import("c");
 
 const darwin = struct {
     // translate-c currently doesn't handle the __DARWIN_INODE64 macro

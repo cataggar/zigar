@@ -1,8 +1,6 @@
 const std = @import("std");
 
-const stdio = @cImport({
-    @cInclude("stdio.h");
-});
+const stdio = @import("c");
 
 var file: *stdio.FILE = undefined;
 

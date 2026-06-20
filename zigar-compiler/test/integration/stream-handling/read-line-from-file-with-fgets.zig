@@ -2,12 +2,8 @@ const std = @import("std");
 
 const zigar = @import("zigar");
 
-const stdio_h = @cImport({
-    @cInclude("stdio.h");
-});
-const fcntl_h = @cImport({
-    @cInclude("fcntl.h");
-});
+const stdio_h = @import("c");
+const fcntl_h = @import("c");
 
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 

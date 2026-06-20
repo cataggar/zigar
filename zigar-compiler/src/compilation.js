@@ -145,9 +145,9 @@ class MissingModule extends Error {
 export function formatProjectConfig(config) {
   const lines = [];
   const fields = [
-    'moduleName', 'modulePath', 'moduleDir', 'outputPath', 'pdbPath', 'zigarSrcPath', 'useLibc', 
-    'useLLVM', 'usePthreadEmulation', 'useRedirection', 'isWASM', 'multithreaded', 'stackSize', 
-    'maxMemory', 'evalBranchQuota', 'omitFunctions', 'omitVariables',
+    'moduleName', 'modulePath', 'moduleDir', 'cImportHeaderPath', 'outputPath', 'pdbPath',
+    'zigarSrcPath', 'useLibc', 'useLLVM', 'usePthreadEmulation', 'useRedirection', 'isWASM',
+    'multithreaded', 'stackSize', 'maxMemory', 'evalBranchQuota', 'omitFunctions', 'omitVariables',
   ];
   for (const [ name, value ] of Object.entries(config)) {
     if (fields.includes(name)) {
@@ -309,6 +309,17 @@ export async function createConfig(srcPath, modPath, options = {}) {
   }
   // add path to build.extra.zig if it exists
   const extraFilePath = await findModuleFile(moduleDir, 'build.extra.zig');
+  // Zig 0.17 removed the @cImport builtin; user C imports are translated via the
+  // build system instead. By convention, if a header named "<source>.cimport.h"
+  // (or "cimport.h") sits next to the module, zigar wires a translate-c module
+  // for it under the fixed import name "c", so user code does `@import("c")`.
+  let cImportHeaderPath;
+  if (src.name && src.name !== '?') {
+    cImportHeaderPath = await findModuleFile(moduleDir, `${src.name}.cimport.h`);
+  }
+  if (!cImportHeaderPath) {
+    cImportHeaderPath = await findModuleFile(moduleDir, 'cimport.h');
+  }
   // add package manager manifest
   const packageConfigPath = await findModuleFile(moduleDir, 'build.zig.zon');
   return {
@@ -318,6 +329,7 @@ export async function createConfig(srcPath, modPath, options = {}) {
     moduleName,
     modulePath,
     moduleDir,
+    cImportHeaderPath,
     moduleBuildDir,
     zigarSrcPath,
     buildDir,

@@ -1,8 +1,6 @@
 const std = @import("std");
 
-const windows_h = @cImport({
-    @cInclude("windows.h");
-});
+const windows_h = @import("c");
 
 pub fn remove(name: [*:0]const u8) !void {
     if (windows_h.RemoveDirectoryA(name) == 0) return error.UnableToRemoveDirectory;

@@ -48,6 +48,21 @@ pub fn build(b: *std.Build) !void {
     });
     mod.addIncludePath(.{ .cwd_relative = cfg.module_dir });
     lib.root_module.addImport("module", mod);
+    // Zig 0.17 removed @cImport; user modules import translated C via @import("c").
+    // When a "<source>.cimport.h" / "cimport.h" header sits next to the module,
+    // src/compilation.js records its path here so we can wire a translate-c module
+    // onto the user module under the import name "c".
+    if (@TypeOf(cfg.c_import_header_path) != @TypeOf(null)) {
+        const tc = b.addTranslateC(.{
+            .root_source_file = .{ .cwd_relative = cfg.c_import_header_path },
+            .target = target,
+            .optimize = optimize,
+            .link_libc = cfg.use_libc,
+        });
+        // resolve #include "..." relative to the module directory
+        tc.addIncludePath(.{ .cwd_relative = cfg.module_dir });
+        mod.addImport("c", tc.createModule());
+    }
     // Zig 0.17 removed @cImport; host/native/hooks.zig instead imports C headers
     // translated via the build system. These modules are only reached on native
     // targets, so they are wired up per-target here.

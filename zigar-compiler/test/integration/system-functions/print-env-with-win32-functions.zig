@@ -1,9 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const windows_h = @cImport({
-    @cInclude("windows.h");
-});
+const windows_h = @import("c");
 
 pub fn print() !void {
     const p = windows_h.GetEnvironmentStringsA();

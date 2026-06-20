@@ -1,8 +1,6 @@
 const std = @import("std");
 
-const windows_h = @cImport({
-    @cInclude("windows.h");
-});
+const windows_h = @import("c");
 
 pub fn save(path: [*:0]const u8, data: []const u8) !usize {
     const handle = windows_h.CreateFileA(path, windows_h.GENERIC_WRITE, 0, null, windows_h.CREATE_ALWAYS, 0, null);

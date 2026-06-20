@@ -1,8 +1,6 @@
 const std = @import("std");
 
-const windows_h = @cImport({
-    @cInclude("windows.h");
-});
+const windows_h = @import("c");
 
 pub fn print(file: std.fs.File) !void {
     var info: windows_h.BY_HANDLE_FILE_INFORMATION = undefined;

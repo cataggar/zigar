@@ -1,8 +1,6 @@
 const std = @import("std");
 
-const windows_h = @cImport({
-    @cInclude("windows.h");
-});
+const windows_h = @import("c");
 
 pub fn read(allocator: std.mem.Allocator, path: [:0]const u16, offset: usize, len: usize) ![]u8 {
     const handle = windows_h.CreateFileW(

@@ -3,9 +3,7 @@ const builtin = @import("builtin");
 
 const zigar = @import("zigar");
 
-const c = @cImport({
-    @cInclude("pthread.h");
-});
+const c = @import("c");
 const pthread_t = c.pthread_t;
 const pthread_once_t = c.pthread_once_t;
 

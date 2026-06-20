@@ -3,9 +3,7 @@ const builtin = @import("builtin");
 
 const zigar = @import("zigar");
 
-const stdio = @cImport({
-    @cInclude("stdio.h");
-});
+const stdio = @import("c");
 
 const os = switch (builtin.target.os.tag) {
     .linux => .linux,
