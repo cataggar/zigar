@@ -1,6 +1,9 @@
 const std = @import("std");
 const compat = @import("../compat.zig");
-const wasm_allocator = std.heap.wasm_allocator;
+// Use a thread-safe wasm allocator. In single-threaded builds this resolves to
+// std.heap.wasm_allocator; in multi-threaded builds it is a locked allocator
+// over @wasmMemoryGrow (std.heap.WasmAllocator is unavailable there).
+const wasm_allocator = @import("wasm/allocator.zig").wasm_allocator;
 const E = std.os.wasi.errno_t;
 const builtin = @import("builtin");
 
