@@ -1,5 +1,5 @@
 const std = @import("std");
-const wasm_allocator = std.heap.wasm_allocator;
+const wasm_allocator = @import("allocator.zig").wasm_allocator;
 const builtin = @import("builtin");
 
 const LinkedList = @import("../../type/linked-list.zig").LinkedList;
