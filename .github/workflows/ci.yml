@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [zig17]
+  pull_request:
+    branches: [zig17]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  zigar-compiler:
+    name: zigar-compiler (Zig 0.17 / Node 22)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: zigar-compiler
+    env:
+      # Pinned cataggar/zig 0.17 dev toolchain the zig17 branch is built against.
+      ZIG_VERSION: 0.17.0-dev.892+54537285c
+      # Match the env baked into the package.json "test" script.
+      DEV: '1'
+      TARGET: wasm
+      BITS: '32'
+      MIXIN: track
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: zigar-compiler/package-lock.json
+
+      - name: Install pinned Zig toolchain (cataggar/zig)
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euxo pipefail
+          url="https://github.com/cataggar/zig/releases/download/v${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -fsSL -o /tmp/zig.tar.xz "$url"
+          mkdir -p "$HOME/zig"
+          tar -xJf /tmp/zig.tar.xz -C "$HOME/zig" --strip-components=1
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+
+      - name: Zig version
+        run: zig version
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Enforced: the currently-passing surface. A failure here is a real
+      # regression and fails the build. The 32-bit Windows build (which exercises
+      # the bufPrintZ fix) runs inside compilation.test.js. Excluded from the
+      # enforced grep:
+      #   * "compile code for Windows" (x86_64) — blocked upstream (see below).
+      #   * "should fail when directory is illegal" — asserts a lock on "/" is
+      #     rejected; environment-dependent and hangs on the CI runner.
+      - name: Test (enforced — currently-passing surface)
+        run: >
+          npx mocha
+          test/configuration.test.js
+          test/code-generation.test.js
+          test/utility-functions.test.js
+          test/wasm-decoding.test.js
+          test/compilation.test.js
+          --grep "compile code for Windows$|should fail when directory is illegal$"
+          --invert
+
+      # Non-blocking: runs the complete suite for visibility. It currently
+      # surfaces known upstream-blocked failures that are NOT zigar bugs:
+      #   * compilation: x86_64-windows translate-c of windows.h hits an unknown
+      #     Clang builtin in bundled AVX512 headers (cataggar/zigar#6).
+      #   * transpilation: multi-threaded wasm bottoms out at std.heap.WasmAllocator
+      #     via std's Io.Threaded (futex) path.
+      # Flip individual cases back into the enforced step as they are fixed.
+      - name: Full suite (non-blocking — surfaces known upstream-blocked failures)
+        continue-on-error: true
+        run: npm test
