@@ -4084,7 +4084,7 @@ pub fn Win32Substitute(comptime redirector: type) type {
                                 const path_wtf8 = converter.convertTo(path) catch return .NO_MEMORY;
                                 const fd = toDescriptor(handle);
                                 var fd_path_buf: [128]u8 = undefined;
-                                const fd_path = std.fmt.bufPrintZ(&fd_path_buf, fd_format_string, .{fd}) catch unreachable;
+                                const fd_path = std.fmt.bufPrintSentinel(&fd_path_buf, fd_format_string, .{fd}, 0) catch unreachable;
                                 var result: c_int = undefined;
                                 if (redirector.symlink(path_wtf8, fd_path, &result) and result >= 0) {
                                     return .SUCCESS;
@@ -4282,7 +4282,7 @@ pub fn Win32Substitute(comptime redirector: type) type {
                             const struct_size = @sizeOf(@TypeOf(info.*));
                             if (length > struct_size) {
                                 var wtf8_buf: [128]u8 = undefined;
-                                const n = std.fmt.bufPrintZ(&wtf8_buf, fd_format_string, .{fd}) catch unreachable;
+                                const n = std.fmt.bufPrintSentinel(&wtf8_buf, fd_format_string, .{fd}, 0) catch unreachable;
                                 // copy it if it fits
                                 if (n.len <= length - struct_size) break :get n;
                             }
@@ -4309,7 +4309,7 @@ pub fn Win32Substitute(comptime redirector: type) type {
                             const struct_size = @sizeOf(@TypeOf(info.*));
                             if (length > struct_size) {
                                 var wtf8_buf: [128]u8 = undefined;
-                                const n = std.fmt.bufPrintZ(&wtf8_buf, fd_format_string, .{fd}) catch unreachable;
+                                const n = std.fmt.bufPrintSentinel(&wtf8_buf, fd_format_string, .{fd}, 0) catch unreachable;
                                 // copy it if it fits
                                 if (n.len <= length - struct_size) break :get n;
                             }
@@ -4345,7 +4345,7 @@ pub fn Win32Substitute(comptime redirector: type) type {
                 switch (object_information_class) {
                     .ObjectNameInformation => {
                         var wtf8_buf: [128]u8 = undefined;
-                        const name = std.fmt.bufPrintZ(&wtf8_buf, fd_format_string, .{fd}) catch unreachable;
+                        const name = std.fmt.bufPrintSentinel(&wtf8_buf, fd_format_string, .{fd}, 0) catch unreachable;
                         const name_offset = @sizeOf(OBJECT_NAME_INFORMATION);
                         if (object_information_length > @sizeOf(OBJECT_NAME_INFORMATION)) {
                             const info: *OBJECT_NAME_INFORMATION = @ptrCast(@alignCast(object_information));
