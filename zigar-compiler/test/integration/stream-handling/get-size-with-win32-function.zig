@@ -1,8 +1,6 @@
 const std = @import("std");
 
-const windows_h = @cImport({
-    @cInclude("windows.h");
-});
+const windows_h = @import("c");
 
 pub fn get(file: std.fs.File) !u64 {
     var size_high: windows_h.DWORD = undefined;

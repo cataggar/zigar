@@ -3,10 +3,7 @@ const builtin = @import("builtin");
 
 const zigar = @import("zigar");
 
-const c = @cImport({
-    @cInclude("pthread.h");
-    @cInclude("time.h");
-});
+const c = @import("c");
 const pthread_t = c.pthread_t;
 const pthread_rwlock_t = c.pthread_rwlock_t;
 const clock_id = switch (builtin.target.os.tag) {

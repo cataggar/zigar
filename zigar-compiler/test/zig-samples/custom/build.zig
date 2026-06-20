@@ -54,6 +54,16 @@ pub fn build(b: *std.Build) !void {
     });
     mod.addIncludePath(.{ .cwd_relative = cfg.module_dir });
     lib.root_module.addImport("module", mod);
+    if (@TypeOf(cfg.c_import_header_path) != @TypeOf(null)) {
+        const tc = b.addTranslateC(.{
+            .root_source_file = .{ .cwd_relative = cfg.c_import_header_path },
+            .target = target,
+            .optimize = optimize,
+            .link_libc = cfg.use_libc,
+        });
+        tc.addIncludePath(.{ .cwd_relative = cfg.module_dir });
+        mod.addImport("c", tc.createModule());
+    }
     if (!cfg.is_wasm) {
         const c_dir = cfg.zigar_src_path ++ "host/native/cimport/";
         const addTC = struct {

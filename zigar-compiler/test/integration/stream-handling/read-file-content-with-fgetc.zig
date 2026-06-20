@@ -1,11 +1,7 @@
 const std = @import("std");
 
-const stdio_h = @cImport({
-    @cInclude("stdio.h");
-});
-const fcntl_h = @cImport({
-    @cInclude("fcntl.h");
-});
+const stdio_h = @import("c");
+const fcntl_h = @import("c");
 
 pub fn print(f: std.fs.File) !void {
     const fd = switch (@typeInfo(@TypeOf(f.handle))) {

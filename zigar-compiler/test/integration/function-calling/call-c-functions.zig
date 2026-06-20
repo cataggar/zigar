@@ -1,7 +1,5 @@
 const std = @import("std");
-const c = @cImport({
-    @cInclude("stdio.h");
-});
+const c = @import("c");
 
 const enum_fn = if (@hasField(std.builtin.Type, "Fn")) .Fn else .@"fn";
 

@@ -1,7 +1,5 @@
 const std = @import("std");
-const c = @cImport({
-    @cInclude("./return-c-pointer.c");
-});
+const c = @import("c");
 pub const Object = extern struct {
     a: i32,
     b: i32,

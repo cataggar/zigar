@@ -1,8 +1,6 @@
 const std = @import("std");
 
-const fcntl_h = @cImport({
-    @cInclude("fcntl.h");
-});
+const fcntl_h = @import("c");
 
 extern fn scan_file_with_fscanf(c_int) void;
 

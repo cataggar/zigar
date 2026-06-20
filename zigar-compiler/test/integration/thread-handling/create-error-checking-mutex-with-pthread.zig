@@ -2,9 +2,7 @@ const std = @import("std");
 
 const zigar = @import("zigar");
 
-const c = @cImport({
-    @cInclude("pthread.h");
-});
+const c = @import("c");
 const pthread_t = c.pthread_t;
 const pthread_mutex_t = c.pthread_mutex_t;
 const pthread_mutex_attr_t = c.pthread_mutexattr_t;

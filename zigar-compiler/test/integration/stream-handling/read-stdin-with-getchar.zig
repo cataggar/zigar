@@ -1,8 +1,6 @@
 const std = @import("std");
 
-const stdio = @cImport({
-    @cInclude("stdio.h");
-});
+const stdio = @import("c");
 
 pub fn print() !void {
     while (true) {

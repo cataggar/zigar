@@ -1,6 +1,4 @@
-const c = @cImport({
-    @cInclude("stdio.h");
-});
+const c = @import("c");
 
 pub const fprintf = c.fprintf;
 pub const fopen = c.fopen;
