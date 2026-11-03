@@ -18,6 +18,7 @@ void scan_file_with_fscanf(int fd) {
         }
     } while (count > 0);
     fclose(file);
+    fflush(stdout);
 }
 
 void scan_stdin_with_scanf() {

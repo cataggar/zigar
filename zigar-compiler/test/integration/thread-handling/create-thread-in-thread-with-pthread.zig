@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const c = @import("c");
 const pthread_t = c.pthread_t;
@@ -15,7 +16,9 @@ fn run1(_: ?*anyopaque) callconv(.c) ?*anyopaque {
     if (c.pthread_create(&thread_id, null, run2, null) != 0) return null;
     var retval: ?*anyopaque = undefined;
     if (c.pthread_join(thread_id, &retval) != 0) return null;
-    if (c.pthread_detach(thread_id) == 0) return null;
+    if (builtin.target.cpu.arch.isWasm()) {
+        if (c.pthread_detach(thread_id) == 0) return null;
+    }
     const address = if (retval) |ptr| @intFromPtr(ptr) else 0;
     std.debug.print("retval = {x}\n", .{address});
     return null;

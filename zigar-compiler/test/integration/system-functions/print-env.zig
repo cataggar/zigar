@@ -1,11 +1,23 @@
 const std = @import("std");
-pub const get = std.process.getEnvVarOwned;
 
 var gpa = std.heap.DebugAllocator(.{}).init;
 const allocator = gpa.allocator();
 
+fn getEnviron() std.process.Environ {
+    const block: std.process.Environ.Block = switch (std.process.Environ.Block) {
+        std.process.Environ.GlobalBlock => .global,
+        std.process.Environ.PosixBlock => .{ .slice = @ptrCast(std.mem.sliceTo(std.c.environ, null)) },
+        else => @compileError("Unexpected"),
+    };
+    return .{ .block = block };
+}
+
+pub fn get(a: std.mem.Allocator, key: []const u8) ![]u8 {
+    return getEnviron().getAlloc(a, key);
+}
+
 pub fn print() !void {
-    var env = try std.process.getEnvMap(allocator);
+    var env = try getEnviron().createMap(allocator);
     defer env.deinit();
     var iter = env.iterator();
     while (iter.next()) |entry| {

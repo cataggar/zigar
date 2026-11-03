@@ -137,7 +137,7 @@ test "createThunkController" {
     const host = struct {
         fn handleJscall(fn_id: usize, arg_ptr: *anyopaque, arg_size: usize) E {
             if (arg_size == @sizeOf(ArgStruct(BFT))) {
-                @as(*ArgStruct, @ptrCast(@alignCast(arg_ptr))).retval = fn_id;
+                @as(*ArgStruct(BFT), @ptrCast(@alignCast(arg_ptr))).retval = fn_id;
                 return .SUCCESS;
             } else {
                 return .FAULT;

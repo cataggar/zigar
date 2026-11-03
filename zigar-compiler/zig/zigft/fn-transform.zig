@@ -399,7 +399,7 @@ test "uninline" {
         const new_a = uninline(a);
         const new_b = uninline(b);
     };
-    try expectEqual(.auto, @typeInfo(@TypeOf(ns.new_a)).@"fn".@"callconv");
+    try expectEqual(.auto, @typeInfo(@TypeOf(ns.new_a)).@"fn".attrs.@"callconv");
     try expectEqual(ns.b, ns.new_b);
 }
 

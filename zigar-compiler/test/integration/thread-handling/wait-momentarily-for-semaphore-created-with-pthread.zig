@@ -48,6 +48,7 @@ fn run1(_: ?*anyopaque) callconv(.c) ?*anyopaque {
 }
 
 fn run2(_: ?*anyopaque) callconv(.c) ?*anyopaque {
+    std.Io.sleep(io, .fromMilliseconds(10), .real) catch unreachable;
     std.debug.print("Thread 2 acquiring semaphore\n", .{});
     var time: std.c.timespec = undefined;
     _ = std.c.clock_gettime(clock_id, &time);
@@ -68,6 +69,7 @@ fn run2(_: ?*anyopaque) callconv(.c) ?*anyopaque {
 }
 
 fn run3(_: ?*anyopaque) callconv(.c) ?*anyopaque {
+    std.Io.sleep(io, .fromMilliseconds(20), .real) catch unreachable;
     std.debug.print("Thread 3 acquiring semaphore\n", .{});
     var time: std.c.timespec = undefined;
     _ = std.c.clock_gettime(clock_id, &time);

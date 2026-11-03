@@ -185,38 +185,28 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
     const arg_mapping = getArgumentMapping(FT, CT);
     const ctx_mapping = getContextMapping(FT, CT);
     const BFArgsTuple = std.meta.ArgsTuple(BFT);
-    const ArgsStruct = init: {
+    const ArgsTuple = init: {
         const f = @typeInfo(FT).@"fn";
         const len = f.param_types.len;
-        var field_names: [len][]const u8 = undefined;
         var field_types: [len]type = undefined;
-        var field_attrs: [len]std.lang.Type.Struct.FieldAttributes = undefined;
         inline for (f.param_types, 0..) |param_type, i| {
             const name = std.fmt.comptimePrint("{d}", .{i});
-            const var_type: ?type, const var_def_ptr: ?*const anyopaque = find: {
+            const var_type: ?type = find: {
                 // find the variable bound to this param, if any
                 inline for (ctx_mapping) |m| {
                     if (std.mem.eql(u8, name, m.dest)) {
-                        // find the type (and default value) from the bound variable
+                        // find the type from the bound variable
                         const ctx_info = @typeInfo(CT).@"struct";
                         inline for (ctx_info.field_names, 0..) |field_name, j| {
                             if (std.mem.eql(u8, m.src, field_name))
-                                break :find .{
-                                    ctx_info.field_types[j],
-                                    ctx_info.field_attrs[j].default_value_ptr,
-                                };
+                                break :find ctx_info.field_types[j];
                         }
                     }
-                } else break :find .{ null, null };
+                } else break :find null;
             };
-            field_names[i] = name;
             field_types[i] = var_type orelse param_type.?;
-            field_attrs[i] = .{
-                .@"comptime" = var_def_ptr != null,
-                .default_value_ptr = var_def_ptr,
-            };
         }
-        break :init @Struct(.auto, null, &field_names, &field_types, &field_attrs);
+        break :init @Tuple(&field_types);
     };
 
     return struct {
@@ -270,7 +260,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
         pub fn getComptime(comptime func: anytype, comptime vars: anytype) *const BFT {
             const ns = struct {
                 inline fn call(bf_args: BFArgsTuple) @typeInfo(BFT).@"fn".return_type.? {
-                    var args: ArgsStruct = undefined;
+                    var args: ArgsTuple = undefined;
                     inline for (arg_mapping) |m| @field(args, m.dest) = @field(bf_args, m.src);
                     inline for (ctx_mapping) |m| @field(args, m.dest) = @field(vars, m.src);
                     return @call(.auto, func, args);
@@ -290,7 +280,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                     // insert nop x 3 so we can find the displacement for target in the instruction stream
                     insertNOPs(&target);
                     const ctx_ptr: *const CT = @ptrFromInt(target[0]);
-                    var args: std.meta.ArgsTuple(@TypeOf(func)) = undefined;
+                    var args: ArgsTuple = undefined;
                     inline for (arg_mapping) |m| @field(args, m.dest) = @field(bf_args, m.src);
                     inline for (ctx_mapping) |m| @field(args, m.dest) = @field(ctx_ptr.*, m.src);
                     switch (@typeInfo(@TypeOf(func))) {
@@ -864,7 +854,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                                     registers[31] = 0;
                                 }
                             } else if (match(Instruction.BL, instr)) |bl| {
-                                if (builtin.mode == .release_small) {
+                                if (builtin.mode == .small) {
                                     // jump to outlined section (happen only when optimizing for size)
                                     if (prev_index != null) break;
                                     const old_pc: isize = @bitCast(@intFromPtr(&instrs[i]));
@@ -875,7 +865,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                                     i = 0;
                                 }
                             } else if (match(Instruction.RET, instr)) |_| {
-                                if (builtin.mode == .release_small) {
+                                if (builtin.mode == .small) {
                                     // return from outlined section
                                     if (prev_index == null) break;
                                     instrs = @ptrCast(@alignCast(ptr));
@@ -905,12 +895,12 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                                 const amount: isize = addi.imm12;
                                 registers[addi.rd] = registers[addi.rs] + amount;
                             } else if (match(Instruction.AUIPC, instr)) |auipc| {
-                                if (builtin.mode == .release_small) {
+                                if (builtin.mode == .small) {
                                     const pc: isize = @bitCast(@intFromPtr(&instrs[i - 1]));
                                     registers[auipc.rd] = pc + (@as(isize, auipc.imm20) << 12);
                                 }
                             } else if (match(Instruction.JALR, instr)) |jalr| {
-                                if (builtin.mode == .release_small) {
+                                if (builtin.mode == .small) {
                                     // jump to outlined section (happen only when optimizing for size)
                                     if (prev_index != null) break;
                                     const new_pc: usize = @bitCast(registers[jalr.rs] + jalr.imm12);
@@ -949,7 +939,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                                 const amount: isize = @bitCast(int);
                                 registers[sp] = registers[sp] + amount;
                             } else if (match(Instruction.JALR.C, instr)) |_| {
-                                if (builtin.mode == .release_small) {
+                                if (builtin.mode == .small) {
                                     // return from outlined section
                                     // this check need to happen before the one for ADD.C since
                                     // JALR.C looks like ADD.C with rs = 0
