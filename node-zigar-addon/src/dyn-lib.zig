@@ -50,7 +50,7 @@ pub const DynLib = struct {
                     null,
                 );
                 if (len > 0) {
-                    defer c.LocalFree(msg);
+                    defer _ = c.LocalFree(msg);
                     return allocator.dupeSentinel(u8, std.mem.sliceTo(msg, 0), 0) catch null;
                 }
             },

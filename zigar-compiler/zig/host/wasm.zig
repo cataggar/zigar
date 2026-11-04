@@ -3,7 +3,10 @@ const wasm_allocator = std.heap.wasm_allocator;
 const E = std.os.wasi.errno_t;
 const builtin = @import("builtin");
 
-const c = @import("c");
+const c = struct {
+    extern "c" var stdout: ?*anyopaque;
+    extern "c" fn fflush(?*anyopaque) c_int;
+};
 
 const exporter = @import("../export.zig");
 const Value = exporter.Value;

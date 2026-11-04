@@ -47,11 +47,11 @@ export function addTests(importModule, options) {
         if (runtimeSafety) {
           expect(fail).to.throw(WebAssembly.RuntimeError)
             .with.property('stack')
-              .that.contains('error-trace.fail')
-              .and.contains('error-trace.a')
-              .and.contains('error-trace.b')
-              .and.contains('error-trace.c')
-              .and.contains('error-trace.d');
+              .that.contains('return-trace.fail')
+              .and.contains('return-trace.a')
+              .and.contains('return-trace.b')
+              .and.contains('return-trace.c')
+              .and.contains('return-trace.d');
         } else {
           expect(fail).to.not.throw();
         }

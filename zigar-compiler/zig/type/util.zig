@@ -190,8 +190,8 @@ pub fn isIteratorAllocating(comptime T: type) bool {
         .@"struct", .@"union", .@"opaque" => if (@hasDecl(T, "next")) {
             const next = @field(T, "next");
             const FT = @TypeOf(next);
-            return inline for (@typeInfo(FT).@"fn".params) |param| {
-                if (param.type == std.mem.Allocator) break true;
+            return inline for (@typeInfo(FT).@"fn".param_types) |param_type| {
+                if (param_type == std.mem.Allocator) break true;
             } else false;
         },
         .error_union => |eu| return isIteratorAllocating(eu.payload),

@@ -48,6 +48,13 @@ fn MarkedPointer(comptime T: type) type {
         pub fn exchange(self: *@This(), expected: PtrState, new: PtrState, comptime order: std.builtin.AtomicOrder) bool {
             return self.ptr_state.cmpxchgWeak(expected, new, order, .monotonic) == null;
         }
+
+        pub fn setState(self: *@This(), s: State, comptime order: std.builtin.AtomicOrder) void {
+            while (true) {
+                const current = self.load(.monotonic);
+                if (self.exchange(current, current.change(s), order)) break;
+            }
+        }
     };
 }
 
@@ -73,9 +80,9 @@ pub fn LinkedList(comptime T: type) type {
             while (true) {
                 var candidate_node: ?*Node = null;
                 var tail_ptr = &self.head;
-                var current = self.head.load(.unordered);
+                var current = self.head.load(.acquire);
                 while (!current.isNull()) {
-                    const next = current.ptr().next.load(.unordered);
+                    const next = current.ptr().next.load(.acquire);
                     if (next.state() == .previous_free) {
                         // this node is free
                         if (candidate_node == null) {
@@ -93,12 +100,12 @@ pub fn LinkedList(comptime T: type) type {
                 }
                 if (candidate_node) |node| {
                     // set the next pointer's state to .previous_allocated first, then copy the payload
-                    const next = node.next.load(.unordered);
+                    const next = node.next.load(.acquire);
                     if (next.state() == .previous_free) {
-                        if (node.next.exchange(next, next.change(.previous_allocated), .monotonic)) {
+                        if (node.next.exchange(next, next.change(.previous_allocated), .acquire)) {
                             node.payload = payload;
                             // mark the node as in-use
-                            node.next.store(next.change(.previous_in_use), .release);
+                            node.next.setState(.previous_in_use, .release);
                             return &node.payload;
                         }
                     }
@@ -108,7 +115,7 @@ pub fn LinkedList(comptime T: type) type {
                     const new_node = try self.allocator.create(Node);
                     new_node.* = .{ .payload = payload };
                     while (true) {
-                        const next = tail_ptr.load(.unordered);
+                        const next = tail_ptr.load(.acquire);
                         if (next.isNull()) {
                             if (tail_ptr.exchange(next, .init(new_node, next.state()), .release)) {
                                 return &new_node.payload;
@@ -127,19 +134,19 @@ pub fn LinkedList(comptime T: type) type {
         pub fn shift(self: *@This()) ?T {
             var attempt: usize = 1;
             while (true) {
-                var current = self.head.load(.unordered);
+                var current = self.head.load(.acquire);
                 while (!current.isNull()) {
                     const current_node = current.ptr();
                     const next = current_node.next.load(.acquire);
                     if (next.state() == .previous_in_use) {
                         // this node is in use; change its next pointer's state to .previous_selected first
-                        if (!current_node.next.exchange(next, next.change(.previous_selected), .monotonic)) {
+                        if (!current_node.next.exchange(next, next.change(.previous_selected), .acquire)) {
                             // start over, since the exchange failure could be spurious
                             break;
                         }
                         const payload = current_node.payload;
                         // we can free the node now
-                        current_node.next.store(next.change(.previous_free), .monotonic);
+                        current_node.next.setState(.previous_free, .release);
                         return payload;
                     }
                     current = next;
@@ -158,7 +165,7 @@ pub fn LinkedList(comptime T: type) type {
         pub fn findReturnPtr(self: *@This(), comptime match_fn: anytype, arg: anytype) ?*const T {
             while (true) {
                 var has_selected = false;
-                var current = self.head.load(.unordered);
+                var current = self.head.load(.acquire);
                 while (!current.isNull()) {
                     const current_node = current.ptr();
                     const next = current_node.next.load(.acquire);
@@ -179,24 +186,24 @@ pub fn LinkedList(comptime T: type) type {
         }
 
         pub fn remove(self: *@This(), comptime match_fn: anytype, arg: anytype) ?T {
-            var current = self.head.load(.unordered);
             while (true) {
+                var current = self.head.load(.acquire);
                 while (!current.isNull()) {
                     const current_node = current.ptr();
                     const next = current_node.next.load(.acquire);
                     if (next.state() == .previous_in_use) {
-                        if (!current_node.next.exchange(next, next.change(.previous_selected), .monotonic)) {
+                        if (!current_node.next.exchange(next, next.change(.previous_selected), .acquire)) {
                             // start over, since the exchange failure could be spurious
                             break;
                         }
                         if (check(match_fn, current_node.payload, arg)) {
                             // copy payload
                             const payload = current_node.payload;
-                            current_node.next.store(next.change(.previous_free), .monotonic);
+                            current_node.next.setState(.previous_free, .release);
                             return payload;
                         } else {
                             // change it back
-                            current_node.next.store(next.change(.previous_in_use), .monotonic);
+                            current_node.next.setState(.previous_in_use, .release);
                         }
                     }
                     current = next;

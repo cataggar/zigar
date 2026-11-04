@@ -3,9 +3,10 @@ const std = @import("std");
 const Error = error{some_error};
 
 pub fn fail() void {
-    @call(.never_inline, a, .{}) catch {};
-    const trace = @errorReturnTrace() orelse return;
-    std.debug.dumpErrorReturnTrace(trace);
+    @call(.never_inline, a, .{}) catch {
+        const trace = @errorReturnTrace() orelse return;
+        std.debug.dumpErrorReturnTrace(trace);
+    };
 }
 
 fn a() !void {
