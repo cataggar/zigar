@@ -11342,7 +11342,7 @@ function stripUnused(binary, options = {}) {
   const blacklist = [
     /^getFactoryThunk$/,
     /^getModuleAttributes$/,
-    /^exporter\.getFactoryThunk/,
+    /^export(?:er)?\.getFactoryThunk/,
   ];
 
   function getSection(type) {
@@ -11430,14 +11430,17 @@ function stripUnused(binary, options = {}) {
   for (const fn of functions) {
     if (fn.name && blacklist.some(re => re.test(fn.name))) {
       fn.using = false;
-      if (fn.name === 'getFactoryThunk' && functionNames.length === 0) {
+      if (fn.name === 'getFactoryThunk') {
         // when compiled for ReleaseSmall, we don't get the name section
         // therefore unable to remove the factory function by name
         // we know that getFactoryThunk loads its address, however
         // and that a function pointer is just an index into table 0
         const ops = fn.instructions;
-        if (ops.length === 2 && ops[0].opcode === 0x41 && ops[1].opcode === 0x0B) {
+        const isConstEnd = (ops.length === 2 && ops[0].opcode === 0x41 && ops[1].opcode === 0x0B)
+          || (ops.length === 3 && ops[0].opcode === 0x41 && ops[1].opcode === 0x0F && ops[2].opcode === 0x0B);
+        if (isConstEnd) {
           // 0x41 is i32.const
+          // 0x0F is return
           // 0x0B is end
           const elemIndex = ops[0].operand;
           const elemSection = getSection(SectionType.Element);

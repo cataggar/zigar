@@ -10,7 +10,10 @@ const page_size_min = std.heap.page_size_min;
 const builtin = @import("builtin");
 const native_os = builtin.os.tag;
 
-const c = @import("c");
+const c = switch (native_os) {
+    .macos, .windows => @import("c"),
+    else => struct {},
+};
 
 const fn_transform = @import("fn-transform.zig");
 
