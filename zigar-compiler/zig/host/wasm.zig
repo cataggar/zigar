@@ -4,7 +4,6 @@ const E = std.os.wasi.errno_t;
 const builtin = @import("builtin");
 
 const c = struct {
-    extern "c" var stdout: ?*anyopaque;
     extern "c" fn fflush(?*anyopaque) c_int;
 };
 
@@ -152,7 +151,7 @@ export fn runThunk(
     const fn_ptr: *anyopaque = @ptrFromInt(fn_address);
     const arg_ptr: *anyopaque = if (arg_address != 0) @ptrFromInt(arg_address) else empty_ptr;
     thunk(fn_ptr, arg_ptr) catch return false;
-    if (builtin.link_libc) _ = c.fflush(c.stdout);
+    if (builtin.link_libc) _ = c.fflush(null);
     return true;
 }
 
@@ -168,7 +167,7 @@ export fn runVariadicThunk(
     const arg_ptr: *anyopaque = if (arg_address != 0) @ptrFromInt(arg_address) else empty_ptr;
     const attr_ptr: *anyopaque = if (arg_address != 0) @ptrFromInt(attr_address) else empty_ptr;
     thunk(fn_ptr, arg_ptr, attr_ptr, arg_count) catch return false;
-    if (builtin.link_libc) _ = c.fflush(c.stdout);
+    if (builtin.link_libc) _ = c.fflush(null);
     return true;
 }
 

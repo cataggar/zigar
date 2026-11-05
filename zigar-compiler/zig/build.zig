@@ -31,6 +31,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
         .single_threaded = !cfg.multithreaded,
+        .link_libc = if (cfg.is_wasm) cfg.use_libc else null,
         .imports = root_imports,
     });
     const lib = b.addLibrary(.{
@@ -49,11 +50,16 @@ pub fn build(b: *std.Build) !void {
             .root_source_file = .{ .cwd_relative = cfg.c_header_path },
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
         false => {},
     };
     const c_import: []const Import = switch (use_c_header) {
-        true => &.{.{ .name = "c", .module = translate_c.createModule() }},
+        true => init: {
+            const c_mod = translate_c.createModule();
+            c_mod.link_libc = cfg.use_libc;
+            break :init &.{.{ .name = "c", .module = c_mod }};
+        },
         false => &.{},
     };
     const extra_imports: []const Import = switch (@hasDecl(extra, "getImports")) {
