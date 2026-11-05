@@ -102,6 +102,55 @@ describe('Compilation', function() {
       const config = await createConfig(srcPath, modPath, options);
       expect(config.outputPath).to.equal(join(modPath, 'freebsd.arm64.so'));
     })
+    it('should use direct build-exe for standard WASM builds', async function() {
+      const srcPath = absolute('./zig-samples/basic/integers.zig');
+      const options = {
+        optimize: 'ReleaseSmall',
+        platform: 'wasi',
+        arch: 'wasm32',
+        isWASM: true,
+      };
+      const modPath = getModuleCachePath(srcPath, options);
+      const config = await createConfig(srcPath, modPath, options);
+      expect(config.useBuildExe).to.be.true;
+      expect(config.zigArgs[0]).to.equal('build-exe');
+      expect(config.zigArgs).to.include('--cache-dir');
+      expect(config.zigArgs).to.include('.zig-cache');
+      expect(config.zigArgs).to.include('-mexec-model=reactor');
+      expect(config.relOutputPath).to.equal(join('ReleaseSmall', 'integers.wasm'));
+      expect(config.translateCArgs).to.be.null;
+    })
+    it('should prepare translateCArgs for WASM builds with build.extra.h', async function() {
+      const srcPath = absolute('./zig-samples/c-import/print.zig');
+      const options = {
+        optimize: 'Debug',
+        platform: 'wasi',
+        arch: 'wasm32',
+        isWASM: true,
+      };
+      const modPath = getModuleCachePath(srcPath, options);
+      const config = await createConfig(srcPath, modPath, options);
+      expect(config.useBuildExe).to.be.true;
+      expect(config.translateCArgs).to.be.an('array');
+      expect(config.translateCArgs[0]).to.equal('translate-c');
+      expect(config.translateCArgs).to.include(join('src', 'build.extra.h'));
+      expect(config.zigArgs).to.include('-Mc=c.zig');
+    })
+    it('should fall back to zig build when useBuildExe is false or custom build files exist', async function() {
+      const intPath = absolute('./zig-samples/basic/integers.zig');
+      const customPath = absolute('./zig-samples/custom/custom.zig');
+      const extraPath = absolute('./zig-samples/extra/extra.zig');
+      const wasmOpts = { optimize: 'Debug', platform: 'wasi', arch: 'wasm32', isWASM: true };
+      const cfgDisabled = await createConfig(intPath, null, { ...wasmOpts, useBuildExe: false });
+      expect(cfgDisabled.useBuildExe).to.be.false;
+      expect(cfgDisabled.zigArgs[0]).to.equal('build');
+      const cfgCustom = await createConfig(customPath, null, wasmOpts);
+      expect(cfgCustom.useBuildExe).to.be.false;
+      expect(cfgCustom.zigArgs[0]).to.equal('build');
+      const cfgExtra = await createConfig(extraPath, null, wasmOpts);
+      expect(cfgExtra.useBuildExe).to.be.false;
+      expect(cfgExtra.zigArgs[0]).to.equal('build');
+    })
   })
   describe('compile', function() {
     it('should compile zig source code for C addon', async function() {
@@ -378,6 +427,48 @@ describe('Compilation', function() {
       const modPath = getModuleCachePath(srcPath, options);
       await expect(compile(srcPath, modPath, options)).to.eventually.be.fulfilled;
     })
+    it('should compile pure-Zig WASM module via direct build-exe with wazig', async function() {
+      const zigPath = await getWazigPath();
+      for (const sample of [ './zig-samples/basic/integers.zig', './zig-samples/basic/console.zig' ]) {
+        const srcPath = absolute(sample);
+        const options = { optimize: 'ReleaseSmall', arch: 'wasm32', platform: 'wasi', isWASM: true, zigPath };
+        const modPath = getModuleCachePath(srcPath, options);
+        const { outputPath } = await compile(srcPath, modPath, options);
+        const { size } = await stat(outputPath);
+        expect(size).to.be.at.least(1000);
+      }
+    })
+    it('should track sibling imports and C header in sourcePaths for WASM build-exe', async function() {
+      const zigPath = await getWazigPath();
+      const srcPath = absolute('./zig-samples/c-import/print.zig');
+      const options = { optimize: 'Debug', arch: 'wasm32', platform: 'wasi', isWASM: true, zigPath };
+      const modPath = getModuleCachePath(srcPath, options);
+      const { sourcePaths } = await compile(srcPath, modPath, options);
+      expect(sourcePaths.some(p => p.includes('print.zig'))).to.be.true;
+      expect(sourcePaths.some(p => p.includes('hello.zig'))).to.be.true;
+      expect(sourcePaths.some(p => p.includes('build.extra.h'))).to.be.true;
+      expect(sourcePaths.some(p => p.includes('export.zig'))).to.be.true;
+    })
+    it('should compile WASM module with useLibc enabled via build-exe', async function() {
+      const zigPath = await getWazigPath();
+      const srcPath = absolute('./zig-samples/c-allocator/dupe.zig');
+      const options = { optimize: 'ReleaseSmall', arch: 'wasm32', platform: 'wasi', isWASM: true, useLibc: true, zigPath };
+      const modPath = getModuleCachePath(srcPath, options);
+      const { outputPath } = await compile(srcPath, modPath, options);
+      const { size } = await stat(outputPath);
+      expect(size).to.be.at.least(1000);
+    })
+    it('should compile WASM module with build.extra.h via translate-c and build-exe', async function() {
+      const zigPath = await getWazigPath();
+      const srcPath = absolute('./integration/function-calling/return-c-pointer.zig');
+      const options = { optimize: 'ReleaseSmall', arch: 'wasm32', platform: 'wasi', isWASM: true, zigPath };
+      const modPath = getModuleCachePath(srcPath, options);
+      const { outputPath, sourcePaths } = await compile(srcPath, modPath, options);
+      const { size } = await stat(outputPath);
+      expect(size).to.be.at.least(1000);
+      expect(sourcePaths.some(p => p.includes('return-c-pointer.zig'))).to.be.true;
+      expect(sourcePaths.some(p => p.includes('build.extra.h'))).to.be.true;
+    })
   })
   describe('test', function() {
     it('should run zig test cases', async function() {
@@ -393,4 +484,14 @@ describe('Compilation', function() {
 
 function absolute(relpath) {
   return fileURLToPath(new URL(relpath, import.meta.url));
+}
+
+async function getWazigPath() {
+  const candidate = '/d/zig-worktrees/issue-143/wazig/bin/wazig';
+  try {
+    await stat(candidate);
+    return candidate;
+  } catch {
+    return 'zig';
+  }
 }
