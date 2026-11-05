@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import fs, { open, readdir, lstat, rmdir, unlink, readFile, stat, mkdir, writeFile, chmod, realpath } from 'node:fs/promises';
+import fs, { open, stat, mkdir, readFile, writeFile, chmod, readdir, lstat, rmdir, unlink, realpath } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import { sep, dirname, join, resolve, relative, parse, basename, isAbsolute } from 'node:path';
@@ -790,10 +790,10 @@ const execFileAsync = promisify(execFile);
 
 async function test(srcPath, options) {
   const { silent = false, extraArgs = [] } = options;
-  const config = await createConfig(srcPath, '', { ...options, useRedirection: false });
+  const config = await createConfig(srcPath, '', { ...options, useRedirection: false, useBuildExe: false });
   const { zigPath, moduleBuildDir } = config;
   // create config file
-  await createProject(config);
+  await createProject(config, moduleBuildDir);
   const cwd = moduleBuildDir;
   const stdio = (silent) ? 'pipe' : 'inherit';
   const child = spawn(zigPath, [ 'build', 'test', ...extraArgs ], { cwd, stdio, windowsHide: true });
@@ -831,8 +831,19 @@ async function compile(srcPath, modPath, options) {
         const { onStart, onEnd } = options;
         // create config file
         await createProject(config);
+        if (config.useBuildExe && config.translateCArgs) {
+          const cCode = await runCompiler(zigPath, config.translateCArgs, { cwd: moduleBuildDir });
+          await writeFile(join(moduleBuildDir, 'c.zig'), cCode);
+        }
         // then run the compiler
         await runCompiler(zigPath, zigArgs, { cwd: moduleBuildDir, onStart, onEnd });
+        if (config.useBuildExe) {
+          const builtWasmPath = join(moduleBuildDir, config.relOutputPath);
+          if (builtWasmPath !== outputPath) {
+            await createDirectory(dirname(outputPath));
+            await copyFile(outputPath, builtWasmPath);
+          }
+        }
       }
     } catch(err) {
       if (err.code === 'ENOENT') {
@@ -844,7 +855,7 @@ async function compile(srcPath, modPath, options) {
       }
     } finally {
       // get list of files involved in build
-      sourcePaths = await findSourcePaths(moduleBuildDir);
+      sourcePaths = await findSourcePaths(moduleBuildDir, config);
       if (config.clean) {
         await deleteDirectory(moduleBuildDir);
       }
@@ -883,7 +894,22 @@ async function runCompiler(path, args, options) {
   const unlock = await getLock();
   try {
     onStart?.();
-    await execFileAsync(path, args, { cwd, windowsHide: true });
+    const useLocalCacheEnv = args[0] === 'build-exe' || args[0] === 'translate-c';
+    const env = useLocalCacheEnv ? {
+      ...process.env,
+      ZIG_GLOBAL_CACHE_DIR: '.zig-cache',
+      ZIG_LOCAL_CACHE_DIR: '.zig-cache',
+    } : process.env;
+    if (useLocalCacheEnv && basename(path).startsWith('wazig')) {
+      delete env.ZIG_LIB_DIR;
+    }
+    const { stdout } = await execFileAsync(path, args, {
+      cwd,
+      env,
+      windowsHide: true,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return stdout;
   } catch (err) {
     throw new CompilationError(path, args, cwd, err);
     /* c8 ignore next */
@@ -935,23 +961,73 @@ function formatProjectConfig(config) {
   return lines.join('\n') + '\n';
 }
 
-async function createProject(config) {
-  const dir = config.moduleBuildDir;
+function formatOptionsZig(config) {
+  return [
+    `pub const eval_branch_quota: comptime_int = ${config.evalBranchQuota};`,
+    `pub const omit_functions: bool = ${Boolean(config.omitFunctions)};`,
+    `pub const omit_variables: bool = ${Boolean(config.omitVariables)};`,
+    `pub const use_redirection: bool = ${Boolean(config.useRedirection)};`,
+    `pub const use_pthread_emulation: bool = ${Boolean(config.usePthreadEmulation)};`,
+    `pub const persistent: bool = ${Boolean(config.persistent)};`,
+    `pub const module_path: [:0]const u8 = ${JSON.stringify(config.modulePath ?? '')};`,
+    '',
+  ].join('\n');
+}
+
+async function stageDirectory(srcDir, dstDir, filterFn) {
+  await createDirectory(dstDir);
+  const entries = await readdir(srcDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const srcPath = join(srcDir, entry.name);
+    const dstPath = join(dstDir, entry.name);
+    if (!filterFn(entry.name, entry.isDirectory())) {
+      continue;
+    }
+    if (entry.isDirectory()) {
+      await stageDirectory(srcPath, dstPath, filterFn);
+    } else if (entry.isFile()) {
+      await copyFile(dstPath, srcPath);
+    }
+  }
+}
+
+async function createProject(config, dir = config.moduleBuildDir) {
   await createDirectory(dir);
   const content = formatProjectConfig(config);
   const cfgFilePath = join(dir, 'build.cfg.zig');
   await writeFile(cfgFilePath, content);
-  const buildFilePath = join(dir, 'build.zig');
-  await copyFile(buildFilePath, config.buildFilePath);
-  const extraFilePath = join(dir, 'build.extra.zig');
-  if (config.extraFilePath) {
-    await copyFile(extraFilePath, config.extraFilePath);
+  if (config.useBuildExe) {
+    const optionsFilePath = join(dir, 'options.zig');
+    await writeFile(optionsFilePath, formatOptionsZig(config));
+    await stageDirectory(config.zigarSrcPath, join(dir, 'zig'), (name, isDir) => {
+      if (isDir) {
+        return !['.zig-cache', 'zig-cache', 'zig-out', 'node_modules'].includes(name);
+      }
+      if (name === 'build.zig' || name === 'build.extra.zig' || name === 'options.zig') {
+        return false;
+      }
+      return name.endsWith('.zig') || name.endsWith('.h');
+    });
+    await stageDirectory(config.moduleDir, join(dir, 'src'), (name, isDir) => {
+      if (isDir) {
+        return !['.zig-cache', 'zig-cache', 'zig-out', 'node_modules'].includes(name) && !name.endsWith('.zigar');
+      }
+      return name.endsWith('.zig') || name.endsWith('.h') || name.endsWith('.c');
+    });
+    await createDirectory(join(dir, config.optimize));
   } else {
-    await writeFile(extraFilePath, '');
-  }
-  if (config.packageConfigPath) {
-    const packageConfigPath = join(dir, 'build.zig.zon');
-    await copyZonFile(config.packageConfigPath, packageConfigPath);
+    const buildFilePath = join(dir, 'build.zig');
+    await copyFile(buildFilePath, config.buildFilePath);
+    const extraFilePath = join(dir, 'build.extra.zig');
+    if (config.extraFilePath) {
+      await copyFile(extraFilePath, config.extraFilePath);
+    } else {
+      await writeFile(extraFilePath, '');
+    }
+    if (config.packageConfigPath) {
+      const packageConfigPath = join(dir, 'build.zig.zon');
+      await copyZonFile(config.packageConfigPath, packageConfigPath);
+    }
   }
 }
 
@@ -1007,6 +1083,7 @@ async function createConfig(srcPath, modPath, options = {}) {
     omitFunctions = false,
     omitVariables = false,
     ignoreBuildFile = false,
+    useBuildExe: useBuildExeOption,
   } = options;
   const src = parse(srcPath ?? '');
   const mod = parse(modPath ?? '');
@@ -1029,52 +1106,9 @@ async function createConfig(srcPath, modPath, options = {}) {
   if (platform === 'win32') {
     pdbPath = join(dirname(outputPath), `${platform}.${arch}.pdb`);
   }
-  const zigArgs = zigArgsStr.split(/\s+/).filter(s => !!s);
-  if (!zigArgs.find(s => /^[^-]/.test(s))) {
-    zigArgs.unshift('build');
-  }
-  if (!zigArgs.find(s => /^\-Doptimize=/.test(s))) {
-    zigArgs.push(`-Doptimize=${optimize}`);
-  }
-  if (!zigArgs.find(s => /^\-Dtarget=/.test(s))) {
-    // translate from names used by Node to those used by Zig
-    const cpuArchs = {
-      arm: 'arm',
-      arm64: 'aarch64',
-      ia32: 'x86',
-      loong64: 'loong64',
-      mips: 'mips',
-      mipsel: 'mipsel',
-      ppc: 'powerpc',
-      ppc64: 'powerpc64le',
-      s390: undefined,
-      riscv64: 'riscv64',
-      s390x: 's390x',
-      x64: 'x86_64',
-    };
-    const osTags = {
-      aix: 'aix',
-      darwin: 'macos',
-      freebsd: 'freebsd',
-      linux: 'linux-gnu',
-      openbsd: 'openbsd',
-      sunos: 'solaris',
-      win32: 'windows',
-    };
-    const cpuArch = cpuArchs[arch] ?? arch;
-    const osTag = osTags[platform] ?? platform;
-    zigArgs.push(`-Dtarget=${cpuArch}-${osTag}`);
-  }
-  if (isWASM && !zigArgs.find(s => /^\-Dcpu=/.test(s))) {
-    if (multithreaded) {
-      // we need support for atomic operations, among other things
-      zigArgs.push(`-Dcpu=generic+atomics+bulk_memory`);
-    } else {
-      zigArgs.push(`-Dcpu=generic`);
-    }
-  }
   const zigarSrcPath = fileURLToPath(new URL('../zig/', import.meta.url));
   let buildFilePath = join(zigarSrcPath, `build.zig`);
+  let hasCustomBuildFile = false;
   if (!ignoreBuildFile) {
     // use custom build file if one is found
     const customBuildFilePath = await findModuleFile(moduleDir, 'build.zig');
@@ -1083,6 +1117,7 @@ async function createConfig(srcPath, modPath, options = {}) {
       const remaining = code.replace(/\/\/.*/g, '').trim();
       if (remaining) {
         buildFilePath = customBuildFilePath;
+        hasCustomBuildFile = true;
       }
     }
   }
@@ -1092,6 +1127,126 @@ async function createConfig(srcPath, modPath, options = {}) {
   const cHeaderPath = await findModuleFile(moduleDir, 'build.extra.h');
   // add package manager manifest
   const packageConfigPath = await findModuleFile(moduleDir, 'build.zig.zon');
+  const useBuildExe = Boolean(
+    modulePath && (useBuildExeOption ?? (isWASM && !hasCustomBuildFile && !extraFilePath && !packageConfigPath && !zigArgsStr.trim()))
+  );
+  // translate from names used by Node to those used by Zig
+  const cpuArchs = {
+    arm: 'arm',
+    arm64: 'aarch64',
+    ia32: 'x86',
+    loong64: 'loong64',
+    mips: 'mips',
+    mipsel: 'mipsel',
+    ppc: 'powerpc',
+    ppc64: 'powerpc64le',
+    s390: undefined,
+    riscv64: 'riscv64',
+    s390x: 's390x',
+    x64: 'x86_64',
+  };
+  const osTags = {
+    aix: 'aix',
+    darwin: 'macos',
+    freebsd: 'freebsd',
+    linux: 'linux-gnu',
+    openbsd: 'openbsd',
+    sunos: 'solaris',
+    win32: 'windows',
+  };
+  const cpuArch = cpuArchs[arch] ?? arch;
+  const osTag = osTags[platform] ?? platform;
+  const target = `${cpuArch}-${osTag}`;
+  const cpu = multithreaded ? 'generic+atomics+bulk_memory' : 'generic';
+  const relOutputPath = join(optimize, `${src.name}.wasm`);
+  let zigArgs;
+  let translateCArgs = null;
+  if (useBuildExe) {
+    zigArgs = [
+      'build-exe',
+      '--cache-dir', '.zig-cache',
+      '--global-cache-dir', '.zig-cache',
+      '-fno-entry',
+      '--stack', `${stackSize}`,
+      multithreaded ? '-fno-single-threaded' : '-fsingle-threaded',
+      `-O${optimize}`,
+      '-target', target,
+      '-mcpu', cpu,
+    ];
+    if (useLLVM !== null) {
+      zigArgs.push(useLLVM ? '-fllvm' : '-fno-llvm');
+    }
+    if (useLibc) {
+      zigArgs.push('-lc');
+    }
+    zigArgs.push(
+      '--name', moduleName,
+      '-static',
+      '-rdynamic',
+      multithreaded ? '--import-memory' : '--import-table',
+    );
+    if (maxMemory !== undefined) {
+      zigArgs.push(`--max-memory=${maxMemory}`);
+    }
+    zigArgs.push(
+      '-mexec-model=reactor',
+      '--dep', 'module',
+      '--dep', 'options.zig',
+      `-Mroot=${join('zig', 'stub.zig')}`,
+      '-O' + optimize,
+      '-target', target,
+      '-mcpu', cpu,
+      '-I', 'src',
+      '--dep', 'zigar',
+    );
+    if (cHeaderPath) {
+      zigArgs.push('--dep', 'c');
+    }
+    zigArgs.push(
+      `-Mmodule=${join('src', basename(modulePath))}`,
+      '-Moptions.zig=options.zig',
+      '-O' + optimize,
+      '-target', target,
+      '-mcpu', cpu,
+      `-Mzigar=${join('zig', 'zigar.zig')}`,
+    );
+    if (cHeaderPath) {
+      zigArgs.push(
+        '-O' + optimize,
+        '-target', target,
+        '-mcpu', cpu,
+        ...(useLibc ? ['-lc'] : []),
+        '-Mc=c.zig',
+      );
+    }
+    zigArgs.push(`-femit-bin=${relOutputPath}`);
+    if (cHeaderPath) {
+      translateCArgs = [
+        'translate-c',
+        '--cache-dir', '.zig-cache',
+        '--global-cache-dir', '.zig-cache',
+        '-lc',
+        '-target', target,
+        `-O${optimize}`,
+        '-I', 'src',
+        join('src', basename(cHeaderPath)),
+      ];
+    }
+  } else {
+    zigArgs = zigArgsStr.split(/\s+/).filter(s => !!s);
+    if (!zigArgs.find(s => /^[^-]/.test(s))) {
+      zigArgs.unshift('build');
+    }
+    if (!zigArgs.find(s => /^\-Doptimize=/.test(s))) {
+      zigArgs.push(`-Doptimize=${optimize}`);
+    }
+    if (!zigArgs.find(s => /^\-Dtarget=/.test(s))) {
+      zigArgs.push(`-Dtarget=${target}`);
+    }
+    if (isWASM && !zigArgs.find(s => /^\-Dcpu=/.test(s))) {
+      zigArgs.push(`-Dcpu=${cpu}`);
+    }
+  }
   return {
     platform,
     arch,
@@ -1106,11 +1261,14 @@ async function createConfig(srcPath, modPath, options = {}) {
     buildFilePath,
     packageConfigPath,
     outputPath,
+    relOutputPath,
     cHeaderPath,
     pdbPath,
     clean,
     zigPath,
     zigArgs,
+    translateCArgs,
+    useBuildExe,
     useLibc,
     useLLVM,
     useRedirection,
@@ -1146,7 +1304,7 @@ async function getManifestLists(buildPath) {
   return names.filter(n => /^\w{32}$/.test(n)).map(n => join(dirPath, n));
 }
 
-async function findSourcePaths(buildPath) {
+async function findSourcePaths(buildPath, config) {
   const realBuildPath = await realpath(buildPath);
   const manifestPaths = await getManifestLists(realBuildPath);
   const involved = {};
@@ -1156,10 +1314,23 @@ async function findSourcePaths(buildPath) {
       let offset = 41;
       while (offset < data.length) {
         const si = offset;
-        while (data[offset] !== 0) offset++;
+        while (data[offset] !== 0 && offset < data.length) offset++;
         const ei = offset;
         const pathBytes = data.subarray(si, ei);
-        const srcPath = pathBytes.toString('utf-8');
+        let srcPath = pathBytes.toString('utf-8');
+        if (config?.useBuildExe) {
+          let rel = srcPath;
+          if (rel.startsWith(realBuildPath + sep)) {
+            rel = rel.slice(realBuildPath.length + 1);
+          } else if (rel.startsWith('./') || rel.startsWith('.\\')) {
+            rel = rel.slice(2);
+          }
+          if (rel.startsWith('src/') || rel.startsWith('src\\')) {
+            srcPath = config.moduleDir ? join(config.moduleDir, rel.slice(4)) : srcPath;
+          } else if (rel.startsWith('zig/') || rel.startsWith('zig\\')) {
+            srcPath = config.zigarSrcPath ? join(config.zigarSrcPath, rel.slice(4)) : srcPath;
+          }
+        }
         if(isAbsolute(srcPath) && !srcPath.startsWith(realBuildPath) && !srcPath.includes('/.cache/zig/')) {
           try {
             await stat(srcPath);
@@ -1171,6 +1342,45 @@ async function findSourcePaths(buildPath) {
       }
       /* c8 ignore next 2 */
     } catch (err) {
+    }
+  }
+  if (config?.useBuildExe) {
+    if (config.cHeaderPath) {
+      try {
+        await stat(config.cHeaderPath);
+        involved[config.cHeaderPath] = true;
+      } catch {}
+    }
+    const queue = [
+      config.modulePath,
+      config.zigarSrcPath ? join(config.zigarSrcPath, 'stub.zig') : null,
+      config.zigarSrcPath ? join(config.zigarSrcPath, 'zigar.zig') : null,
+    ].filter(Boolean);
+    const visited = new Set();
+    while (queue.length > 0) {
+      const filePath = queue.shift();
+      if (visited.has(filePath)) continue;
+      visited.add(filePath);
+      try {
+        await stat(filePath);
+        involved[filePath] = true;
+        if (filePath.endsWith('.zig')) {
+          const content = await readFile(filePath, 'utf-8');
+          const dir = dirname(filePath);
+          const regex = /@(?:import|embedFile)\(\s*"([^"]+)"\s*\)/g;
+          let match;
+          while ((match = regex.exec(content)) !== null) {
+            const spec = match[1];
+            if (spec === 'options.zig') continue;
+            if (spec.endsWith('.zig') || spec.startsWith('.') || spec.includes('/')) {
+              const resolved = resolve(dir, spec);
+              if (!visited.has(resolved)) {
+                queue.push(resolved);
+              }
+            }
+          }
+        }
+      } catch {}
     }
   }
   return Object.keys(involved);
