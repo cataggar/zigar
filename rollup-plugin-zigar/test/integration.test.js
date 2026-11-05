@@ -34,6 +34,10 @@ async function importModule(url, options) {
     omitFunctions = false,
     omitVariables = false,
     maxMemory = undefined,
+    useWazig = (process.env.USE_WAZIG !== undefined)
+      ? (process.env.USE_WAZIG !== '0' && process.env.USE_WAZIG !== 'false')
+      : undefined,
+    zigPath = process.env.ZIG_PATH || undefined,
   } = options;
   if (currentModule) {
     await currentModule.__zigar?.abandon();
@@ -47,7 +51,7 @@ async function importModule(url, options) {
     currentModule = null;
   }
   const path = fileURLToPath(url);
-  const hash = sha1(path + JSON.stringify(options));
+  const hash = sha1(path + JSON.stringify({ ...options, useWazig, zigPath }));
   const jsPath = join(tmpdir(), 'rollup-integration-test', optimize, `${hash}.mjs`);
   const inputOptions = {
     input: path,
@@ -65,6 +69,8 @@ async function importModule(url, options) {
         omitFunctions,
         omitVariables,
         maxMemory,
+        ...(useWazig !== undefined ? { useWazig } : {}),
+        ...(zigPath !== undefined ? { zigPath } : {}),
       }),
       NodeResolve({
         modulePaths: [ resolve(`../node_modules`) ],

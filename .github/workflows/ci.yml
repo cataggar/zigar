@@ -1,0 +1,271 @@
+name: CI & Wazig Benchmarks
+
+on:
+  push:
+    branches: [main, wazig]
+  pull_request:
+    branches: [main, wazig]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GHR_VERSION: v0.10.2
+  WASMTIME_VERSION: v50.0.1
+  WAZIG_VERSION: v0.17.0-wazig.3
+  ZIG_VERSION: v0.17.0
+
+jobs:
+  zigar-runtime:
+    name: zigar-runtime
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies and run tests
+        run: cd zigar-runtime && npm ci && npm test
+
+  zigar-compiler-wazig:
+    name: zigar-compiler (USE_WAZIG=1)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install ghr, wasmtime, wazig, and zig
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! command -v zstd >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y zstd
+          fi
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://github.com/cataggar/ghr/releases/download/${GHR_VERSION}/ghr-${GHR_VERSION#v}-linux-x64.tar.gz" \
+            | tar -xzf - --strip-components=2 -C "$HOME/.local/bin" "ghr-${GHR_VERSION#v}-linux-x64/bin/ghr"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          ghr version
+          ghr install --skip-attestation "bytecodealliance/wasmtime@${WASMTIME_VERSION}"
+          ghr install --skip-attestation "cataggar/zig@${WAZIG_VERSION}"
+          ghr install --skip-attestation "cataggar/zig@${ZIG_VERSION}"
+          wasmtime --version
+          wazig version
+          zig version
+
+      - name: Install npm dependencies and link workspace packages
+        run: |
+          set -euo pipefail
+          (cd zigar-runtime && npm ci)
+          (cd zigar-compiler && npm ci)
+          (
+            cd rollup-plugin-zigar
+            npm ci
+            rm -rf node_modules/zigar-compiler node_modules/zigar-runtime
+            ln -s ../../zigar-compiler node_modules/zigar-compiler
+            ln -s ../../zigar-runtime node_modules/zigar-runtime
+          )
+
+      - name: Run zigar-compiler tests (USE_WAZIG=1)
+        env:
+          USE_WAZIG: '1'
+          DEV: '1'
+          TARGET: 'wasm'
+          BITS: '32'
+          MIXIN: 'track'
+        run: |
+          cd zigar-compiler
+          npx mocha --timeout 600000 \
+            test/configuration.test.js \
+            test/code-generation.test.js \
+            test/utility-functions.test.js \
+            test/wasm-decoding.test.js \
+            test/transpilation.test.js \
+            test/compilation.test.js \
+            --grep "compile code for Windows$|should fail when directory is illegal$" \
+            --invert
+
+      - name: Run rollup-plugin-zigar tests (USE_WAZIG=1)
+        env:
+          USE_WAZIG: '1'
+        run: |
+          cd rollup-plugin-zigar
+          npx mocha --no-warnings --timeout 600000 test/index.test.js
+
+  zigar-compiler-zig:
+    name: zigar-compiler (USE_WAZIG=0)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install ghr, zig, wasmtime, and wazig
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! command -v zstd >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y zstd
+          fi
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://github.com/cataggar/ghr/releases/download/${GHR_VERSION}/ghr-${GHR_VERSION#v}-linux-x64.tar.gz" \
+            | tar -xzf - --strip-components=2 -C "$HOME/.local/bin" "ghr-${GHR_VERSION#v}-linux-x64/bin/ghr"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          ghr version
+          ghr install --skip-attestation "bytecodealliance/wasmtime@${WASMTIME_VERSION}"
+          ghr install --skip-attestation "cataggar/zig@${WAZIG_VERSION}"
+          ghr install --skip-attestation "cataggar/zig@${ZIG_VERSION}"
+          wasmtime --version
+          wazig version
+          zig version
+
+      - name: Install npm dependencies and link workspace packages
+        run: |
+          set -euo pipefail
+          (cd zigar-runtime && npm ci)
+          (cd zigar-compiler && npm ci)
+          (
+            cd rollup-plugin-zigar
+            npm ci
+            rm -rf node_modules/zigar-compiler node_modules/zigar-runtime
+            ln -s ../../zigar-compiler node_modules/zigar-compiler
+            ln -s ../../zigar-runtime node_modules/zigar-runtime
+          )
+
+      - name: Apply wasi-thread.patch required by standard zig for multithreaded WASM
+        run: |
+          set -euo pipefail
+          ZIG_REAL_BIN="$(realpath "$(which zig)")"
+          ZIG_LIB_DIR="$(dirname "$ZIG_REAL_BIN")/lib"
+          patch -p0 -N -d "$ZIG_LIB_DIR" < zigar-compiler/wasi-thread.patch
+
+      - name: Run zigar-compiler tests (USE_WAZIG=0)
+        env:
+          USE_WAZIG: '0'
+          DEV: '1'
+          TARGET: 'wasm'
+          BITS: '32'
+          MIXIN: 'track'
+        run: |
+          cd zigar-compiler
+          npx mocha --timeout 600000 \
+            test/configuration.test.js \
+            test/code-generation.test.js \
+            test/utility-functions.test.js \
+            test/wasm-decoding.test.js \
+            test/transpilation.test.js \
+            test/compilation.test.js \
+            --grep "compile code for Windows$|should fail when directory is illegal$" \
+            --invert
+
+      - name: Run rollup-plugin-zigar tests (USE_WAZIG=0)
+        env:
+          USE_WAZIG: '0'
+        run: |
+          cd rollup-plugin-zigar
+          npx mocha --no-warnings --timeout 600000 test/index.test.js
+
+  benchmarks:
+    name: Wazig vs Zig Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install and time toolchains (wazig vs zig)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! command -v zstd >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y zstd
+          fi
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://github.com/cataggar/ghr/releases/download/${GHR_VERSION}/ghr-${GHR_VERSION#v}-linux-x64.tar.gz" \
+            | tar -xzf - --strip-components=2 -C "$HOME/.local/bin" "ghr-${GHR_VERSION#v}-linux-x64/bin/ghr"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          ghr version
+
+          WASM_START_MS=$(date +%s%3N)
+          ghr install --skip-attestation "bytecodealliance/wasmtime@${WASMTIME_VERSION}"
+          WASM_END_MS=$(date +%s%3N)
+          WASMTIME_INSTALL_MS=$((WASM_END_MS - WASM_START_MS))
+
+          WAZIG_START_MS=$(date +%s%3N)
+          ghr install --skip-attestation "cataggar/zig@${WAZIG_VERSION}"
+          WAZIG_END_MS=$(date +%s%3N)
+          WAZIG_INSTALL_MS=$((WAZIG_END_MS - WAZIG_START_MS))
+
+          ZIG_START_MS=$(date +%s%3N)
+          ghr install --skip-attestation "cataggar/zig@${ZIG_VERSION}"
+          ZIG_END_MS=$(date +%s%3N)
+          ZIG_INSTALL_MS=$((ZIG_END_MS - ZIG_START_MS))
+
+          wasmtime --version
+          wazig version
+          zig version
+
+          WAZIG_UNIT_SIZE=$(du -sh "$HOME/.local/share/ghr/tools/_v2/units/u-cataggar/u-zig/u-wazig/_unit" | cut -f1)
+          ZIG_UNIT_SIZE=$(du -sh "$HOME/.local/share/ghr/tools/_v2/units/u-cataggar/u-zig/_unit" | cut -f1)
+
+          {
+            echo "## CI Toolchain Download & Install Comparison"
+            echo ""
+            echo "| Toolchain | Release | Install Time (ms) | Installed Size |"
+            echo "| --- | --- | ---: | ---: |"
+            echo "| \`wazig\` | \`cataggar/zig@${WAZIG_VERSION}\` | ${WAZIG_INSTALL_MS} ms | ${WAZIG_UNIT_SIZE} |"
+            echo "| \`wasmtime\` (runtime) | \`bytecodealliance/wasmtime@${WASMTIME_VERSION}\` | ${WASMTIME_INSTALL_MS} ms | - |"
+            echo "| \`zig\` (native x86_64-linux) | \`cataggar/zig@${ZIG_VERSION}\` | ${ZIG_INSTALL_MS} ms | ${ZIG_UNIT_SIZE} |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install npm dependencies and link workspace packages
+        run: |
+          set -euo pipefail
+          (cd zigar-runtime && npm ci)
+          (cd zigar-compiler && npm ci)
+          (
+            cd rollup-plugin-zigar
+            npm ci
+            rm -rf node_modules/zigar-compiler node_modules/zigar-runtime
+            ln -s ../../zigar-compiler node_modules/zigar-compiler
+            ln -s ../../zigar-runtime node_modules/zigar-runtime
+          )
+
+      - name: Run Wazig vs Zig benchmarks
+        run: |
+          set -euo pipefail
+          node benchmarks/wazig-benchmark.js --quick --markdown /tmp/bench-results.md --json /tmp/bench-results.json
+          cat /tmp/bench-results.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wazig-benchmark-results
+          path: |
+            /tmp/bench-results.md
+            /tmp/bench-results.json

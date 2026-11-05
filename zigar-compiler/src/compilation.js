@@ -1,8 +1,8 @@
 import { execFile, spawn } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { accessSync, constants as fsConstants, writeFileSync } from 'node:fs';
 import fs, { readdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
-import { basename, dirname, isAbsolute, join, parse, resolve, sep } from 'node:path';
+import { basename, delimiter, dirname, isAbsolute, join, parse, resolve, sep } from 'node:path';
 import { fileURLToPath, URL } from 'node:url';
 import { promisify } from 'node:util';
 import {
@@ -11,6 +11,28 @@ import {
 } from './utility-functions.js';
 
 const execFileAsync = promisify(execFile);
+
+let cachedWazigPathEnv;
+let cachedHasWazig;
+
+export function hasWazigCommand() {
+  const pathEnv = process.env.PATH ?? '';
+  if (pathEnv === cachedWazigPathEnv && cachedHasWazig !== undefined) {
+    return cachedHasWazig;
+  }
+  cachedWazigPathEnv = pathEnv;
+  const binName = process.platform === 'win32' ? 'wazig.exe' : 'wazig';
+  cachedHasWazig = pathEnv.split(delimiter).some(dir => {
+    if (!dir) return false;
+    try {
+      accessSync(join(dir, binName), fsConstants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  return cachedHasWazig;
+}
 
 export async function test(srcPath, options) {
   const { silent = false, extraArgs = [] } = options;
@@ -55,12 +77,23 @@ export async function compile(srcPath, modPath, options) {
         const { onStart, onEnd } = options;
         // create config file
         await createProject(config);
+        const canShareCache = config.useBuildExe && !config.clean && config.buildDirSize > 0;
+        const sharedCacheDir = canShareCache
+          ? join(config.buildDir, `.zig-cache-${sha1(config.zigPath).slice(0, 8)}`)
+          : null;
+        const localCacheDir = join(moduleBuildDir, '.zig-cache');
+        if (sharedCacheDir) {
+          await syncCacheDir(sharedCacheDir, localCacheDir);
+        }
         if (config.useBuildExe && config.translateCArgs) {
           const cCode = await runCompiler(zigPath, config.translateCArgs, { cwd: moduleBuildDir });
           await writeFile(join(moduleBuildDir, 'c.zig'), cCode);
         }
         // then run the compiler
         await runCompiler(zigPath, zigArgs, { cwd: moduleBuildDir, onStart, onEnd });
+        if (sharedCacheDir) {
+          await syncCacheDir(localCacheDir, sharedCacheDir);
+        }
         if (config.useBuildExe) {
           const builtWasmPath = join(moduleBuildDir, config.relOutputPath);
           if (builtWasmPath !== outputPath) {
@@ -118,13 +151,16 @@ export async function runCompiler(path, args, options) {
   const unlock = await getLock();
   try {
     onStart?.();
+    const isWazig = basename(path).startsWith('wazig');
     const useLocalCacheEnv = args[0] === 'build-exe' || args[0] === 'translate-c';
-    const env = useLocalCacheEnv ? {
+    const env = {
       ...process.env,
-      ZIG_GLOBAL_CACHE_DIR: '.zig-cache',
       ZIG_LOCAL_CACHE_DIR: '.zig-cache',
-    } : process.env;
-    if (useLocalCacheEnv && basename(path).startsWith('wazig')) {
+      ...(useLocalCacheEnv ? {
+        ZIG_GLOBAL_CACHE_DIR: '.zig-cache',
+      } : {}),
+    };
+    if (isWazig) {
       delete env.ZIG_LIB_DIR;
     }
     const { stdout } = await execFileAsync(path, args, {
@@ -172,7 +208,7 @@ export function formatProjectConfig(config) {
   const lines = [];
   const fields = [
     'moduleName', 'modulePath', 'moduleDir', 'outputPath', 'pdbPath', 'zigarSrcPath',
-    'cHeaderPath', 'useLibc', 'useLLVM', 'usePthreadEmulation', 'useRedirection', 'isWASM',
+    'cHeaderPath', 'useLibc', 'useLLVM', 'useWazig', 'usePthreadEmulation', 'useRedirection', 'isWASM',
     'multithreaded', 'persistent', 'stackSize', 'maxMemory', 'evalBranchQuota', 'omitFunctions',
     'omitVariables',
   ];
@@ -211,6 +247,44 @@ async function stageDirectory(srcDir, dstDir, filterFn) {
       await stageDirectory(srcPath, dstPath, filterFn);
     } else if (entry.isFile()) {
       await copyFile(dstPath, srcPath);
+    }
+  }
+}
+
+async function syncCacheDir(srcDir, dstDir, isManifestDir = false) {
+  let entries;
+  try {
+    entries = await readdir(srcDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  await createDirectory(dstDir);
+  for (const entry of entries) {
+    if (entry.name === 'tmp') continue;
+    const srcPath = join(srcDir, entry.name);
+    const dstPath = join(dstDir, entry.name);
+    if (entry.isDirectory()) {
+      await syncCacheDir(srcPath, dstPath, entry.name === 'h');
+    } else if (entry.isFile()) {
+      try {
+        await fs.link(srcPath, dstPath);
+      } catch (err) {
+        if (err.code === 'EEXIST') {
+          if (isManifestDir) {
+            try {
+              const [srcStat, dstStat] = await Promise.all([stat(srcPath), stat(dstPath)]);
+              if (srcStat.ino !== dstStat.ino && srcStat.mtimeMs > dstStat.mtimeMs) {
+                await deleteFile(dstPath);
+                await fs.link(srcPath, dstPath);
+              }
+            } catch {}
+          }
+        } else {
+          try {
+            await copyFile(dstPath, srcPath);
+          } catch {}
+        }
+      }
     }
   }
 }
@@ -297,8 +371,9 @@ export async function createConfig(srcPath, modPath, options = {}) {
     clean = false,
     buildDir = join(os.tmpdir(), 'zigar-build'),
     buildDirSize = 4294967296,
-    zigPath = 'zig',
+    zigPath: zigPathOption,
     zigArgs: zigArgsStr = '',
+    useWazig: useWazigOption,
     multithreaded = (isWASM) ? false : true,
     persistent = false,
     stackSize = 256 * 1024,
@@ -352,8 +427,29 @@ export async function createConfig(srcPath, modPath, options = {}) {
   // add package manager manifest
   const packageConfigPath = await findModuleFile(moduleDir, 'build.zig.zon');
   const useBuildExe = Boolean(
-    modulePath && (useBuildExeOption ?? (isWASM && !hasCustomBuildFile && !extraFilePath && !packageConfigPath && !zigArgsStr.trim()))
+    modulePath && (useBuildExeOption ?? (isWASM && !hasCustomBuildFile && !extraFilePath && !packageConfigPath && !zigArgsStr.trim() && useLLVM !== true))
   );
+  let useWazig;
+  let zigPath;
+  if (zigPathOption !== undefined) {
+    zigPath = zigPathOption;
+    useWazig = Boolean(useWazigOption ?? basename(zigPath).startsWith('wazig'));
+  } else if (useWazigOption !== undefined) {
+    useWazig = Boolean(useWazigOption);
+    zigPath = useWazig ? (process.env.WA_ZIG_PATH || 'wazig') : (process.env.ZIG_PATH || 'zig');
+  } else if (process.env.ZIG_PATH) {
+    zigPath = process.env.ZIG_PATH;
+    useWazig = basename(zigPath).startsWith('wazig');
+  } else if (process.env.USE_WAZIG !== undefined && process.env.USE_WAZIG !== '') {
+    useWazig = !['0', 'false', 'no'].includes(process.env.USE_WAZIG.toLowerCase());
+    zigPath = useWazig ? 'wazig' : 'zig';
+  } else if (isWASM && useBuildExe && useLLVM !== true && hasWazigCommand()) {
+    useWazig = true;
+    zigPath = 'wazig';
+  } else {
+    useWazig = false;
+    zigPath = 'zig';
+  }
   // translate from names used by Node to those used by Zig
   const cpuArchs = {
     arm: 'arm',
@@ -493,6 +589,7 @@ export async function createConfig(srcPath, modPath, options = {}) {
     zigArgs,
     translateCArgs,
     useBuildExe,
+    useWazig,
     useLibc,
     useLLVM,
     useRedirection,

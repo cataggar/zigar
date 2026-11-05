@@ -32,6 +32,10 @@ export const optionsForCompile = {
     type: 'boolean',
     title: 'Use LLVM as compiler backend',
   },
+  useWazig: {
+    type: 'boolean',
+    title: 'Use wazig WebAssembly Zig compiler',
+  },
   useRedirection: {
     type: 'boolean',
     title: 'Redirect IO operations to JavaScript handlers',

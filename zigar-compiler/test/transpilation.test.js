@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url';
 
 use(chaiAsPromised);
 
-import { stat, writeFile } from 'fs/promises';
+import { writeFile } from 'fs/promises';
 import { transpile } from '../src/transpilation.js';
 
 describe('Transpilation', function() {
@@ -134,16 +134,14 @@ describe('Transpilation', function() {
       expect(code).to.contain('"spawn"');
     })
     it('should transpile pure-Zig WASM module using wazig build-exe', async function() {
-      const zigPath = await getWazigPath();
       const path = getSamplePath('console');
-      const { code, sourcePaths } = await transpile(path, { optimize: 'ReleaseSmall', zigPath });
+      const { code, sourcePaths } = await transpile(path, { optimize: 'ReleaseSmall', useWazig: true });
       expect(code).to.contain('"hello"');
       expect(sourcePaths.some(p => p.includes('console.zig'))).to.be.true;
     })
     it('should transpile WASM module with relative sibling import and C header using wazig', async function() {
-      const zigPath = await getWazigPath();
       const printPath = fileURLToPath(new URL('./zig-samples/c-import/print.zig', import.meta.url));
-      const { code: printCode, sourcePaths } = await transpile(printPath, { optimize: 'ReleaseSmall', zigPath });
+      const { code: printCode, sourcePaths } = await transpile(printPath, { optimize: 'ReleaseSmall', useWazig: true });
       expect(printCode).to.contain('"printZig"');
       expect(printCode).to.contain('"printC"');
       expect(sourcePaths.some(p => p.includes('print.zig'))).to.be.true;
@@ -153,7 +151,7 @@ describe('Transpilation', function() {
       const prevDev = process.env.DEV;
       delete process.env.DEV;
       try {
-        const { code: cPtrCode } = await transpile(cPtrPath, { optimize: 'ReleaseSmall', zigPath });
+        const { code: cPtrCode } = await transpile(cPtrPath, { optimize: 'ReleaseSmall', useWazig: true });
         expect(cPtrCode).to.contain('"getString"');
         expect(cPtrCode).to.contain('"getPointer"');
       } finally {
@@ -161,21 +159,10 @@ describe('Transpilation', function() {
       }
     })
     it('should transpile WASM module with useLibc enabled using wazig', async function() {
-      const zigPath = await getWazigPath();
       const dupePath = fileURLToPath(new URL('./zig-samples/c-allocator/dupe.zig', import.meta.url));
-      const { code } = await transpile(dupePath, { optimize: 'ReleaseSmall', useLibc: true, zigPath });
+      const { code } = await transpile(dupePath, { optimize: 'ReleaseSmall', useLibc: true, useWazig: true });
       expect(code).to.contain('"dupe"');
     })
 
   })
 })
-
-async function getWazigPath() {
-  const candidate = '/d/zig-worktrees/issue-143/wazig/bin/wazig';
-  try {
-    await stat(candidate);
-    return candidate;
-  } catch {
-    return 'zig';
-  }
-}

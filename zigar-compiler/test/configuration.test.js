@@ -46,6 +46,13 @@ describe('Configuration', function() {
         embedWASM: true,
       });
     })
+    it('should extract useWazig option from query string', function() {
+      const { searchParams } = new URL('file:///home/someone/hello.zig?use-wazig=1');
+      const options = extractOptions(searchParams, optionsForCompile);
+      expect(options).to.eql({
+        useWazig: true,
+      });
+    })
     it('should extract numeric options', function() {
       const { searchParams } = new URL('file:///home/someone/hello.zig?boo=100');
       const fakeOptions = {

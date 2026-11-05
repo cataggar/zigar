@@ -19,7 +19,14 @@ import * as ThreadHandling from './thread-handling/tests.js';
 import * as TypeHandling from './type-handling/tests.js';
 
 export function addTests(importModule, options) {
-  const compilerVersion = execSync('zig version').toString().trim();
+  const isWasm = options?.target === 'wasm32' || process.env.TARGET === 'wasm';
+  const zigCmd = process.env.ZIG_PATH || ((process.env.USE_WAZIG === '0' || process.env.USE_WAZIG === 'false') ? 'zig' : ((isWasm || process.env.USE_WAZIG === '1' || process.env.USE_WAZIG === 'true') ? 'wazig' : 'zig'));
+  let compilerVersion;
+  try {
+    compilerVersion = execSync(`${zigCmd} version`, { stdio: [ 'pipe', 'pipe', 'ignore' ] }).toString().trim();
+  } catch {
+    compilerVersion = execSync('zig version').toString().trim();
+  }
   options = { ...options, compilerVersion };
   BugFixes.addTests(importModule, options);
   BenchmarksGame.addTests(importModule, options);
