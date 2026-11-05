@@ -1815,7 +1815,8 @@ async function createConfig(srcPath, modPath, options = {}) {
     zigPath = process.env.ZIG_PATH;
     useWazig = basename(zigPath).startsWith('wazig');
   } else if (process.env.USE_WAZIG !== undefined && process.env.USE_WAZIG !== '') {
-    useWazig = !['0', 'false', 'no'].includes(process.env.USE_WAZIG.toLowerCase());
+    const envUseWazig = !['0', 'false', 'no'].includes(process.env.USE_WAZIG.toLowerCase());
+    useWazig = Boolean(envUseWazig && isWASM && useBuildExe && useLLVM !== true);
     zigPath = useWazig ? 'wazig' : 'zig';
   } else if (isWASM && useBuildExe && useLLVM !== true && hasWazigCommand()) {
     useWazig = true;

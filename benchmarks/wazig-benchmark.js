@@ -480,8 +480,9 @@ async function benchmarkCompilationPerformance(quick, wazigLibDir) {
       }
       await mergeCacheInto(seedCacheDir, masterDir);
     }
+    await rm(seedBuildDir, { recursive: true, force: true });
     warmCacheTemplateDirs[zigCmd] = {
-      cacheDir: seedCacheDir,
+      cacheDir: masterDir,
       dupeColdMs: Number(seedColdMs.toFixed(1)),
     };
   }
@@ -528,8 +529,9 @@ async function benchmarkCompilationPerformance(quick, wazigLibDir) {
         seedColdMs = performance.now() - tSeed0;
         await mergeCacheInto(seedMtCacheDir, masterMtDir);
       }
+      await rm(seedMtBuildDir, { recursive: true, force: true });
       warmMtCacheTemplateDirs[zigCmd] = {
-        cacheDir: seedMtCacheDir,
+        cacheDir: masterMtDir,
         atomicColdMs: Number(seedColdMs.toFixed(1)),
       };
     } finally {
@@ -822,14 +824,10 @@ async function benchmarkCompilationPerformance(quick, wazigLibDir) {
           zigPath: mode.zigPath,
           useBuildExe: mode.useBuildExe,
           buildDir: warmSharedBuildDir,
+          buildDirSize: 0,
           recompile: true,
         });
         const warmSharedMs = performance.now() - tWarmShared0;
-
-        if (mode.useBuildExe && template && existsSync(warmZigCache)) {
-          await mergeCacheInto(warmZigCache, template);
-          await mergeCacheInto(warmZigCache, join(MASTER_CACHE_ROOT, mode.zigPath));
-        }
 
         // 2. Warm incremental rebuild (after source edit in the same moduleBuildDir)
         await appendFile(stagedSrcPath, `\n// incremental rebuild ${mode.key}\n`);
@@ -843,6 +841,7 @@ async function benchmarkCompilationPerformance(quick, wazigLibDir) {
           zigPath: mode.zigPath,
           useBuildExe: mode.useBuildExe,
           buildDir: warmSharedBuildDir,
+          buildDirSize: 0,
           recompile: true,
         });
         const warmIncrementalMs = performance.now() - tWarmInc0;
@@ -887,6 +886,7 @@ async function benchmarkCompilationPerformance(quick, wazigLibDir) {
             zigPath: mode.zigPath,
             useBuildExe: mode.useBuildExe,
             buildDir: coldBuildDir,
+            buildDirSize: 0,
             recompile: true,
           });
           const wasmColdPlusWarmTranslateCMs = performance.now() - tCold0;
@@ -906,6 +906,7 @@ async function benchmarkCompilationPerformance(quick, wazigLibDir) {
             zigPath: mode.zigPath,
             useBuildExe: mode.useBuildExe,
             buildDir: coldBuildDir,
+            buildDirSize: 0,
             recompile: true,
           });
           coldMs = performance.now() - tCold0;
@@ -929,13 +930,17 @@ async function benchmarkCompilationPerformance(quick, wazigLibDir) {
           requiresManualStdPatch: Boolean(mod.options.multithreaded && mode.zigPath === 'zig'),
         };
       } finally {
+        await rm(modeBuildRoot, { recursive: true, force: true });
         if (prevZigLib === undefined) delete process.env.ZIG_LIB_DIR;
         else process.env.ZIG_LIB_DIR = prevZigLib;
       }
     }
 
+    await rm(srcStageDir, { recursive: true, force: true });
     moduleResults.push(entry);
   }
+
+  await rm(compRoot, { recursive: true, force: true });
 
   const moduleColdMs = {};
   for (const m of moduleResults) {
@@ -1079,10 +1084,11 @@ async function benchmarkBinarySizes(quick, compRootCache) {
             useLLVM: cfg.useLLVM,
             useBuildExe: true,
             buildDir,
+            buildDirSize: 0,
             recompile: true,
           });
 
-          if (existsSync(targetZigCache)) {
+          if (mod.id === 'integers' && existsSync(targetZigCache)) {
             await mergeCacheInto(targetZigCache, masterCacheDir);
           }
 
@@ -1098,6 +1104,8 @@ async function benchmarkBinarySizes(quick, compRootCache) {
         } catch (cErr) {
           compileError =
             cErr.message.split('\n').find(l => l.includes('error:'))?.trim() || cErr.message;
+        } finally {
+          await rm(buildDir, { recursive: true, force: true });
         }
 
         modEntry.byOptimize[opt][cfg.key] = {
@@ -1111,6 +1119,7 @@ async function benchmarkBinarySizes(quick, compRootCache) {
     results.push(modEntry);
   }
 
+  await rm(sizeRoot, { recursive: true, force: true });
   return {
     optimizeModes,
     compilerConfigs: compilerConfigs.map(({ key, label }) => ({ key, label })),
@@ -1157,6 +1166,7 @@ async function benchmarkRuntimePerformance(quick) {
     const { code } = await transpile(srcPath, {
       optimize,
       buildDir,
+      buildDirSize: 0,
       useBuildExe: true,
       nodeCompat: true,
       embedWASM: false,
@@ -1168,9 +1178,7 @@ async function benchmarkRuntimePerformance(quick) {
       ...compileOpts,
     });
 
-    if (existsSync(modZigCache)) {
-      await mergeCacheInto(modZigCache, masterCacheDir);
-    }
+    await rm(buildDir, { recursive: true, force: true });
 
     const patchedCode = code.replace(
       `from ${JSON.stringify(RUNTIME_DIST_DIR)}`,

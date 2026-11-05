@@ -188,6 +188,10 @@ describe('Compilation', function() {
         const cfgEnvUseWazigTrue = await createConfig(srcPath, null, wasmOpts);
         expect(cfgEnvUseWazigTrue.useWazig).to.be.true;
         expect(cfgEnvUseWazigTrue.zigPath).to.equal('wazig');
+
+        const cfgEnvUseWazigNative = await createConfig(srcPath, modPath, nativeOpts);
+        expect(cfgEnvUseWazigNative.useWazig).to.be.false;
+        expect(cfgEnvUseWazigNative.zigPath).to.equal('zig');
       } finally {
         if (prevZigPath !== undefined) process.env.ZIG_PATH = prevZigPath;
         else delete process.env.ZIG_PATH;

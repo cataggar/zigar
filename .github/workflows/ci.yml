@@ -257,15 +257,17 @@ jobs:
           )
 
       - name: Run Wazig vs Zig benchmarks
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          node benchmarks/wazig-benchmark.js --quick --markdown /tmp/bench-results.md --json /tmp/bench-results.json
-          cat /tmp/bench-results.md >> "$GITHUB_STEP_SUMMARY"
+          node benchmarks/wazig-benchmark.js --quick --markdown "${RUNNER_TEMP}/bench-results.md" --json "${RUNNER_TEMP}/bench-results.json"
+          cat "${RUNNER_TEMP}/bench-results.md" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wazig-benchmark-results
           path: |
-            /tmp/bench-results.md
-            /tmp/bench-results.json
+            ${{ runner.temp }}/bench-results.md
+            ${{ runner.temp }}/bench-results.json
