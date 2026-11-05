@@ -1,6 +1,6 @@
 import { expect, use } from 'chai';
 import chaiAsPromised from 'chai-as-promised';
-import { readdir, stat } from 'fs/promises';
+import { readdir, readFile, stat } from 'fs/promises';
 import os, { tmpdir } from 'os';
 import { join, sep } from 'path';
 import { fileURLToPath } from 'url';
@@ -119,6 +119,26 @@ describe('Compilation', function() {
       const { outputPath } = await compile(srcPath, modPath, options);
       const { size } = await stat(outputPath);
       expect(size).to.be.at.least(1000);
+    })
+    it('should not link libc on pure-Zig WASM32 builds', async function() {
+      for (const relPath of [ './zig-samples/basic/console.zig', './integration/function-calling/return-c-pointer.zig' ]) {
+        const srcPath = absolute(relPath);
+        const options = { optimize: 'ReleaseSmall', arch: 'wasm32', platform: 'wasi', isWASM: true, useLibc: false };
+        const modPath = getModuleCachePath(srcPath, options);
+        const { outputPath } = await compile(srcPath, modPath, options);
+        const wasmMod = await WebAssembly.compile(await readFile(outputPath));
+        const exportNames = WebAssembly.Module.exports(wasmMod).map(e => e.name);
+        expect(exportNames).to.not.include('initializeLibc');
+      }
+    })
+    it('should link libc on WASM32 builds when useLibc is true', async function() {
+      const srcPath = absolute('./zig-samples/basic/console.zig');
+      const options = { optimize: 'ReleaseSmall', arch: 'wasm32', platform: 'wasi', isWASM: true, useLibc: true };
+      const modPath = getModuleCachePath(srcPath, options);
+      const { outputPath } = await compile(srcPath, modPath, options);
+      const wasmMod = await WebAssembly.compile(await readFile(outputPath));
+      const exportNames = WebAssembly.Module.exports(wasmMod).map(e => e.name);
+      expect(exportNames).to.include('initializeLibc');
     })
     it('should compile code for Linux', async function() {
       const srcPath = absolute('./zig-samples/basic/integers.zig');
