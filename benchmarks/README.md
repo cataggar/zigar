@@ -119,3 +119,20 @@ jobs:
 | **Libc `-lc` Reactor Linking (`dupe.zig`)** | `-fno-llvm` **fails** (`libc.a: undefined function: __main_argc_argv`); LLVM compiles ~400 C files | **Works out-of-the-box** across all 4 optimize modes via pure-Zig `libzigc.a` | **Pure-Zig `libzigc.a` without Clang/LLVM** |
 | **`Debug` `.wasm` Binary Size** | `1,804–3,535 KiB` raw / `232–288 KiB` stripped (`-lc`) | **`226–737 KiB` raw / `147–186 KiB` stripped** | **4.8x–8.0x smaller raw**, **23%–37% smaller stripped** |
 | **`ReleaseSmall` Stripped vs `zig -fno-llvm`** | `152–549 KiB` stripped (fails to inline `getFactoryThunk`; crashes `stripUnused()` in other modes) | **`93–129 KiB` stripped** (MIR + post-link dead-code & RLE compaction) | **1.6x–4.27x smaller stripped** than upstream `stage2_wasm` |
+
+---
+
+## V8 Stack Switching Benchmarks (`--experimental-wasm-growable-stacks` & `--experimental-wasm-wasmfx`)
+
+In addition to the `wazig` vs `zig` toolchain suite, `benchmarks/` includes two reproducible benchmark & prototype suites for V8 WebAssembly stack switching (require Node.js 24+ / V8 13.6+):
+
+```sh
+# 1. V8 --experimental-wasm-growable-stacks vs fixed 984 KB JSPI stacks benchmark
+node benchmarks/wasm-stack-switching-benchmark.js
+
+# 2. V8 --experimental-wasm-wasmfx, Wasmtime 50.0.1 stack-switching, and dual-stack global[0] prototype
+node benchmarks/wasmfx-prototype.js
+```
+
+See [**`benchmarks/STACK-SWITCHING-RESULTS.md`**](./STACK-SWITCHING-RESULTS.md) for the complete empirical report, memory/latency tables, and `zigar-runtime` / `wazig` architectural analysis.
+

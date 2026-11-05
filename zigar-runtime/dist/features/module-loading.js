@@ -1,6 +1,6 @@
 import { PosixError } from '../constants.js';
 import { mixin } from '../environment.js';
-import { decodeText, isPromise, empty, defineProperty, defineValue } from '../utils.js';
+import { decodeText, empty, defineProperty, defineValue, isPromise } from '../utils.js';
 
 const WA = WebAssembly;
 
@@ -20,6 +20,13 @@ var moduleLoading = mixin({
       this.initialTableLength = 0;
       this.exportedFunctions = null;
       this.customWASI = null;
+      this.useJSPI = false;
+      this.continuationStackSize = 65536;
+      this.continuationStackPool = [];
+      this.activeContinuation = null;
+      this.suspendedContinuationCount = 0;
+      this.stackPointerGlobal = null;
+      this.initialStackPointer = 0;
     }
   },
   abandonModule() {
@@ -71,19 +78,192 @@ var moduleLoading = mixin({
       if (!fn) {
         return () => {};
       }
-      return (...args) => {
+      const wrapper = (...args) => {
         args = args.map((arg, i) => this.fromWebAssembly(argType.charAt(i), arg));
         const retval = fn.apply(this, args);
-        const retval2 = this.toWebAssembly(returnType, retval);
-        return retval2;
+        return isPromise(retval)
+        ? retval.then(v => this.toWebAssembly(returnType, v))
+        : this.toWebAssembly(returnType, retval);
       };
+      return (this.useJSPI && name === 'handleJscall') ? this.wrapSuspending(wrapper) : wrapper;
     },
     importFunction(fn, argType = '', returnType = '') {
       return (...args) => {
         args = args.map((arg, i) => this.toWebAssembly(argType.charAt(i), arg));
         const retval = fn.apply(this, args);
-        return this.fromWebAssembly(returnType, retval);
+        return isPromise(retval)
+        ? retval.then(v => this.fromWebAssembly(returnType, v))
+        : this.fromWebAssembly(returnType, retval);
       };
+    },
+    wrapSuspending(fn) {
+      const hasSuspending = typeof WA.Suspending === 'function';
+      const wrapper = (...args) => {
+        const cont = this.activeContinuation;
+        const spGlobal = this.stackPointerGlobal;
+        const savedSp = spGlobal ? spGlobal.value : 0;
+        if (cont && spGlobal) {
+          cont.sp = savedSp;
+        }
+        let res;
+        try {
+          res = fn(...args);
+        } catch (err) {
+          this.activeContinuation = cont;
+          if (cont && spGlobal) {
+            spGlobal.value = savedSp;
+          }
+          throw err;
+        }
+        if (isPromise(res) || (cont && hasSuspending)) {
+          if (cont) {
+            cont.sp = savedSp;
+            if (!cont.suspended) {
+              cont.suspended = true;
+              this.suspendedContinuationCount++;
+            }
+          }
+          if (spGlobal) {
+            spGlobal.value = cont ? cont.parentSp : this.initialStackPointer;
+          }
+          this.activeContinuation = cont ? cont.parentContinuation : null;
+          if (cont) {
+            cont.parentContinuation = null;
+            cont.parentSp = this.initialStackPointer;
+          }
+          const resumeContinuation = () => {
+            if (this.activeContinuation && this.activeContinuation !== cont && !this.activeContinuation.suspended) {
+              this.activeContinuation.finish?.();
+            }
+            if (cont) {
+              if (cont.suspended) {
+                cont.suspended = false;
+                this.suspendedContinuationCount--;
+              }
+              cont.parentSp = spGlobal ? spGlobal.value : this.initialStackPointer;
+              cont.parentContinuation = null;
+              if (spGlobal) {
+                spGlobal.value = cont.sp;
+              }
+            }
+            this.activeContinuation = cont;
+          };
+          const promise = isPromise(res) ? res : Promise.resolve(res);
+          return promise.then((val) => {
+            resumeContinuation();
+            return val;
+          }, (err) => {
+            resumeContinuation();
+            throw err;
+          });
+        }
+        this.activeContinuation = cont;
+        if (cont && spGlobal) {
+          spGlobal.value = savedSp;
+        }
+        return res;
+      };
+      return hasSuspending ? new WA.Suspending(wrapper) : wrapper;
+    },
+    allocateContinuationStack() {
+      if (this.continuationStackPool.length > 0) {
+        return this.continuationStackPool.pop();
+      }
+      const size = (this.continuationStackSize + 15) & -16;
+      const address = this.allocateScratchMemory(size, 16);
+      if (!address) {
+        throw new Error('Out of memory');
+      }
+      if (this.memory && address + 4 <= this.memory.buffer.byteLength) {
+        const dv = new DataView(this.memory.buffer, address, 4);
+        dv.setUint32(0, 0xdeadbeef, true);
+      }
+      return { address, size };
+    },
+    freeContinuationStack(stack) {
+      if (this.memory && stack.address + 4 <= this.memory.buffer.byteLength) {
+        const dv = new DataView(this.memory.buffer, stack.address, 4);
+        if (dv.getUint32(0, true) !== 0xdeadbeef) {
+          this.freeScratchMemory?.(stack.address, stack.size, 16);
+          throw new Error('Stack overflow');
+        }
+      }
+      if (this.continuationStackPool.length < 16) {
+        this.continuationStackPool.push(stack);
+      } else {
+        this.freeScratchMemory?.(stack.address, stack.size, 16);
+      }
+    },
+    runWithContinuation(fn) {
+      const spGlobal = this.stackPointerGlobal;
+      if (!spGlobal && this.suspendedContinuationCount > 0) {
+        throw new Error('Concurrent JSPI calls require __stack_pointer export');
+      }
+      const prevCont = this.activeContinuation;
+      if (prevCont && spGlobal) {
+        prevCont.sp = spGlobal.value;
+      }
+      const stack = (spGlobal && this.allocateScratchMemory) ? this.allocateContinuationStack() : null;
+      const stackTop = stack ? stack.address + stack.size : 0;
+      let finished = false;
+      const cont = {
+        stack,
+        sp: stackTop,
+        parentSp: spGlobal ? spGlobal.value : 0,
+        parentContinuation: prevCont,
+        suspended: false,
+        finish: null,
+      };
+      const finish = cont.finish = () => {
+        if (finished) return;
+        finished = true;
+        if (cont.suspended) {
+          cont.suspended = false;
+          this.suspendedContinuationCount--;
+        }
+        let overflowError = null;
+        if (stack) {
+          try {
+            this.freeContinuationStack(stack);
+          } catch (err) {
+            overflowError = err;
+          }
+        }
+        if (this.activeContinuation === cont) {
+          this.activeContinuation = cont.parentContinuation;
+          if (spGlobal) {
+            spGlobal.value = cont.parentSp;
+          }
+        }
+        if (overflowError) {
+          throw overflowError;
+        }
+      };
+      this.activeContinuation = cont;
+      if (stack && spGlobal) {
+        spGlobal.value = stackTop;
+      }
+      let res;
+      try {
+        res = fn();
+      } catch (err) {
+        finish();
+        throw err;
+      }
+      if (!cont.suspended) {
+        finish();
+      }
+      if (isPromise(res)) {
+        return res.then((val) => {
+          finish();
+          return val;
+        }, (err) => {
+          finish();
+          throw err;
+        });
+      }
+      finish();
+      return res;
     },
     exportFunctions() {
       const imports = {};
@@ -99,13 +279,34 @@ var moduleLoading = mixin({
       if (!this.memory) {
         this.memory = exports.memory;
       }
+      if (exports.__stack_pointer) {
+        this.stackPointerGlobal = exports.__stack_pointer;
+        this.initialStackPointer = exports.__stack_pointer.value;
+        if (!this.options?.continuationStackSize && this.initialStackPointer > 0) {
+          this.continuationStackSize = (this.initialStackPointer + 15) & -16;
+        }
+      }
       for (const [ name, { argType, returnType } ] of Object.entries(this.imports)) {
-        const fn = exports[name];
+        let fn = exports[name];
         if (fn) {
+          if (this.useJSPI && (name === 'runThunk' || name === 'runVariadicThunk') && typeof WA.promising === 'function') {
+            defineProperty(this, `${name}Sync`, defineValue(this.importFunction(fn, argType, returnType)));
+            this.destructors.push(() => this[`${name}Sync`] = throwError);
+            const promisingFn = WA.promising(fn);
+            fn = (...args) => this.runWithContinuation(() => promisingFn(...args));
+          }
           defineProperty(this, name, defineValue(this.importFunction(fn, argType, returnType)));
           this.destructors.push(() => this[name] = throwError);
         }
       }
+      this.destructors.push(() => {
+        for (const { address, size } of this.continuationStackPool) {
+          exports.freeScratchMemory?.(address, size, 16);
+        }
+        this.continuationStackPool.length = 0;
+        this.activeContinuation = null;
+        this.suspendedContinuationCount = 0;
+      });
     },
     async instantiateWebAssembly(source, options) {
       const {
@@ -113,7 +314,13 @@ var moduleLoading = mixin({
         memoryMax,
         tableInitial,
         multithreaded,
+        useJSPI = false,
+        continuationStackSize,
       } = this.options = options;
+      this.useJSPI = Boolean(useJSPI && typeof WA.Suspending === 'function' && typeof WA.promising === 'function');
+      if (continuationStackSize) {
+        this.continuationStackSize = (continuationStackSize + 15) & -16;
+      }
       const res = await source;
       const suffix = (res[Symbol.toStringTag] === 'Response') ? 'Streaming' : '';
       const f = WA['compile' + suffix];
@@ -163,10 +370,14 @@ var moduleLoading = mixin({
     },
     getWASIHandler(name) {
       const nameCamelized = name.replace(/_./g, m => m.charAt(1).toUpperCase());
-      const handler = this[nameCamelized]?.bind?.(this);
+      const method = this[nameCamelized];
+      const handler = method?.bind?.(this);
       const eventName = this[nameCamelized + 'Event'];
-      return (...args) => {
-        const result = handler?.(...args) ?? PosixError.ENOTSUP;
+      const fn = (...args) => {
+        const callArgs = (this.activeContinuation && method && args.length < method.length)
+        ? [ ...args, true ]
+        : args;
+        const result = handler?.(...callArgs) ?? PosixError.ENOTSUP;
         const onResult = (result) => {
           if (result === PosixError.ENOTSUP || result === PosixError.ENOTCAPABLE) {
             // the handler has is either missing or has declined to deal with it, 
@@ -187,6 +398,7 @@ var moduleLoading = mixin({
         };
         return isPromise(result) ? result.then(onResult) : onResult(result);
       };
+      return (this.useJSPI && name !== 'proc_exit') ? this.wrapSuspending(fn) : fn;
     },
     setCustomWASI(wasi) {
       this.customWASI = wasi;
