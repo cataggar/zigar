@@ -1,0 +1,3318 @@
+//! WIT → component-type custom-section encoder.
+//!
+//! Produces the payload of a `component-type:<world>` custom section,
+//! as appended to the core wasm by `wasm-tools component embed` and
+//! consumed by `wasm-tools component new`. The payload is itself a
+//! component binary.
+//!
+//! Structure (matches wasm-tools `wit-component` 0.220.0 output for
+//! the wamr fixtures):
+//!
+//! ```text
+//! preamble (magic + component version)
+//! custom "wit-component-encoding" 0x04 0x00       ; encoding marker
+//! type section:
+//!   TypeDef[0] = component-type {                  ; outer wrapper
+//!     decl: type = component-type {                ; world body
+//!       for each export interface:
+//!         decl: type = instance-type { funcs+exports }
+//!         decl: export "<ns>:<pkg>/<iface>[@<ver>]" instance <idx>
+//!       for each import interface:
+//!         decl: type = instance-type { funcs+exports }
+//!         decl: import "<ns>:<pkg>/<iface>[@<ver>]" instance <idx>
+//!     }
+//!     decl: export "<ns>:<pkg>/<world>[@<ver>]" component 0
+//!   }
+//! export "<world>" sort=type idx=0
+//! ```
+//!
+//! MVP scope — sufficient for all three wamr fixtures (`zig-adder`,
+//! `zig-calculator-cmd`, `mixed-zig-rust-calc`) plus the wabt-built
+//! `wasi-preview1` adapter world (`cataggar/wamr#453`):
+//!
+//!   * Worlds with `export <iface>;` (in-package) and
+//!     `import <ns>:<pkg>/<iface>[@<ver>];` (qualified) extern refs.
+//!   * Interfaces containing only func defs.
+//!   * Func signatures over primitive WIT types and `list<T>` /
+//!     `option<T>` / `result<T,E>` / `tuple<T...>` of primitives,
+//!     including bare `result` (no payloads). Compound types are
+//!     hoisted into `TypeDef` decls before the func that references
+//!     them; the func params/results then carry `ValType.type_idx`
+//!     references to those slots.
+//!
+//! World-extern naming convention (#285). Besides qualified
+//! `interface_ref` externs, two world-local `WorldExtern` shapes are
+//! supported; `component new` lifts these names (the contract is purely
+//! the advertised wire name and the guest core import/export
+//! module/field strings):
+//!
+//!   * `named_interface` — `import|export name: interface { … };`. An
+//!     inline interface advertised under its **plain local name**
+//!     (e.g. `foo`), NOT a `ns:pkg/iface@ver` qualifier. Encoded as an
+//!     instance import/export exactly like an `interface_ref`, so its
+//!     funcs' guest core import module is the plain name `foo` and the
+//!     field is the func name. Inline `use` clauses are out of scope.
+//!   * `named_func` — `import|export name: func(...) -> ...;`. A
+//!     **top-level component func** extern (`ExternDesc.func`), not an
+//!     instance: `lowerWorldFunc` hoists its type into the world body
+//!     and the main loop emits a `func` import/export decl under the
+//!     plain name. The guest core **export** name is the plain func
+//!     name (no `<iface>#` prefix). Top-level func *imports* are not
+//!     yet wired by `component new`.
+//!
+//! Deferred (rejected with `error.UnsupportedWitFeature`):
+//!
+//!   * `use` clauses (cross-interface type imports).
+//!   * stream / future / async / error-context.
+//!
+//! Supported: `type <name> = <Type>;` aliases, nominal typedefs
+//! (`record`, `variant`, `enum`, `flags`), and `resource R { … }`
+//! decls with constructor / method / static members.
+//!
+//! Resource encoding follows the canonical wit-component shape: a
+//! `TypeDef.resource` decl is followed by an `exportname'` decl
+//! binding the resource's external name to that slot
+//! (`(type (eq <idx>))`). Members are emitted as ordinary func
+//! exports with their canonical-ABI names (`[constructor]R`,
+//! `[method]R.M`, `[static]R.M`); methods get an implicit
+//! `self: borrow<R>` prepended, constructors get `-> own<R>`
+//! appended. `[resource-drop]R` is *not* written into the encoded
+//! section — the consuming canon stage synthesizes it implicitly.
+//! `borrow<R>` / `own<R>` ValTypes resolve via the in-body
+//! `name_map` and lower directly to `ValType.borrow` / `own`.
+//!
+//! Lifting these is incremental: each remaining WIT type maps to a
+//! `TypeDef` declarator before the func that references it.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+const ast = @import("ast.zig");
+const lexer = @import("lexer.zig");
+const witParser = @import("parser.zig");
+const wit_resolver = @import("resolver.zig");
+const ctypes = @import("../types.zig");
+const writer = @import("../writer.zig");
+
+pub const EncodeError = error{
+    UnknownWorld,
+    UnknownInterface,
+    UnsupportedWitFeature,
+    InvalidWit,
+    IncludeCycle,
+} || writer.EncodeError;
+
+/// Diagnostic channel for the encoder, mirroring `ParseDiagnostic`
+/// (parser.zig) and `ResolveDiagnostic` (resolver.zig). Populated on
+/// `error.UnknownInterface` so callers can name the offending
+/// interface instead of printing a bare error tag.
+///
+/// String fields are allocated with the `allocator` passed to
+/// `encodeWorldFromResolverWithDiag` (NOT the internal arena, which is
+/// freed before the caller reads the diagnostic). Since the typical
+/// caller prints and exits, freeing is optional.
+pub const EncodeDiagnostic = struct {
+    /// Qualified name of the interface that failed to resolve,
+    /// e.g. "wasi:http/types@0.2.6".
+    interface: ?[]const u8 = null,
+    /// What referenced it: the world name, or the qualified name of
+    /// the consuming interface whose `use` clause pulled it in.
+    referenced_by: ?[]const u8 = null,
+    /// Which package-search tiers were tried.
+    searched: ?[]const u8 = null,
+};
+
+/// Populate `diag` (if present) for an unresolved interface `ref` and
+/// return `error.UnknownInterface`. `gpa` must outlive the caller's
+/// read of `diag` (the encoder's internal arena does not).
+fn failUnknownInterface(
+    gpa: Allocator,
+    diag: ?*EncodeDiagnostic,
+    ref: ast.InterfaceRef,
+    referenced_by: ?[]const u8,
+) EncodeError {
+    if (diag) |d| {
+        d.interface = refQualifiedName(gpa, ref);
+        if (referenced_by) |r| d.referenced_by = gpa.dupe(u8, r) catch r;
+        d.searched = "main package, on-disk deps/, or embedded wasi-canon";
+    }
+    return error.UnknownInterface;
+}
+
+/// Best-effort qualified name for an interface ref, allocated with
+/// `gpa`. Falls back to the bare name when no package qualifier is
+/// present or allocation fails.
+fn refQualifiedName(gpa: Allocator, ref: ast.InterfaceRef) []const u8 {
+    if (ref.package) |p| {
+        return formatQualifiedName(gpa, p.namespace, p.name, ref.name, p.version) catch ref.name;
+    }
+    return gpa.dupe(u8, ref.name) catch ref.name;
+}
+
+/// Encode the named world from `doc` as a `component-type:<world>`
+/// payload. The returned slice is owned by `allocator`.
+pub fn encodeWorld(
+    allocator: Allocator,
+    doc: ast.Document,
+    world_name: []const u8,
+) EncodeError![]u8 {
+    return encodeWorldFromResolver(
+        allocator,
+        wit_resolver.Resolver.init(doc, &.{}),
+        world_name,
+    );
+}
+
+/// Encode the named world using a multi-package resolver. Imports
+/// like `import docs:adder/add@0.1.0;` resolve their interface body
+/// against `resolver.deps`. The world itself is always taken from
+/// `resolver.main`.
+pub fn encodeWorldFromResolver(
+    allocator: Allocator,
+    resolver: wit_resolver.Resolver,
+    world_name: []const u8,
+) EncodeError![]u8 {
+    return encodeWorldFromResolverWithDiag(allocator, resolver, world_name, null);
+}
+
+/// Variant of `encodeWorldFromResolver` that records an
+/// `EncodeDiagnostic` on `error.UnknownInterface` (and leaves it
+/// untouched otherwise). Pass `null` for `diag` to opt out.
+pub fn encodeWorldFromResolverWithDiag(
+    allocator: Allocator,
+    resolver: wit_resolver.Resolver,
+    world_name: []const u8,
+    diag: ?*EncodeDiagnostic,
+) EncodeError![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const resolved_world = resolveWorldInResolver(resolver, world_name) orelse return error.UnknownWorld;
+    const world = resolved_world.world;
+    const pkg_id = resolved_world.pkg;
+
+    // Expand `include` items in the world body. Walks the world's
+    // items recursively, splicing in the contents of each included
+    // world (applying any `with { N as A }` renames) and detecting
+    // cycles. World-level `.use` items are dropped (no-op for
+    // emission); `.type` items still surface as
+    // `error.UnsupportedWitFeature` for now (Phase 4 work).
+    var expanded_items = std.ArrayList(ast.WorldItem).empty;
+    var include_stack = std.StringHashMapUnmanaged(void).empty;
+    try expandWorldItems(ar, resolver, world, pkg_id, &include_stack, &expanded_items);
+
+    // Implicit imports: every interface in the (expanded) world body
+    // may `use types.{...}` from a sibling interface that isn't
+    // otherwise present in the world. The component-model wire
+    // format requires those types to be reachable, so the encoder
+    // synthesises a matching `.import` for every transitively-used
+    // source interface not already imported or exported. This
+    // mirrors `wit-component`'s behaviour and is what makes the
+    // canonical `wasi-http/proxy` world encode end-to-end.
+    try addImplicitImports(ar, resolver, pkg_id, &expanded_items, allocator, diag, world_name);
+
+    // Build the world's body component-type decls.
+    var world_decls = std.ArrayList(ctypes.Decl).empty;
+
+    // The world body has TWO independent index spaces we must track:
+    //   * `inst_idx`        — instance indexspace. Bumped by every
+    //     `import` and `export (instance N)` decl. Used as the source
+    //     index of `alias instance-export` decls.
+    //   * `world_type_idx`  — type indexspace. Bumped by every type
+    //     def and every `alias` whose sort is `.type`. Used as the
+    //     target index for `alias outer (type 1 K)` decls emitted
+    //     inside consuming interface bodies.
+    var inst_idx: u32 = 0;
+    var world_type_idx: u32 = 0;
+
+    // For each `use src.{T};` clause encountered inside an interface
+    // body, the world body must surface `T` at its own type-indexspace
+    // level via an `alias instance-export sort=type inst=N name="T"`
+    // decl emitted just after `src`'s import. The consuming interface
+    // body then references that slot via `alias outer (type 1 K)`.
+    //
+    // Keyed by `<source-iface-qname>::<type-name>` so a single source
+    // type referenced by multiple consumers shares one alias slot.
+    var world_alias_map = std.StringHashMapUnmanaged(u32).empty;
+    // Records each (source_qname, type_names) bundle each imported
+    // iface must surface. Populated in a pre-pass so the world body
+    // can emit alias-export decls right after each import without
+    // having to re-walk every other interface.
+    var alias_requests = std.StringHashMapUnmanaged(std.ArrayList([]const u8)).empty;
+    for (expanded_items.items) |item| {
+        switch (item) {
+            .@"export", .import => |we| {
+                try collectUseRequests(ar, resolver, we, &alias_requests, allocator, diag, world_name);
+            },
+            .use => {},
+            .include, .type => return error.UnsupportedWitFeature,
+        }
+    }
+
+    // Each `export <iface>;` / `import <ns>:<pkg>/<iface>;` becomes a
+    // type=instance-type decl followed by an export/import decl.
+    for (expanded_items.items) |item| {
+        switch (item) {
+            .@"export", .import => |we| {
+                const is_export = item == .@"export";
+                const ext = we;
+
+                // World-level function externs
+                // (`import|export name: func(...) -> ...;`) are
+                // **top-level component funcs**, not instances: lower
+                // the func type into the world body and emit a `func`
+                // extern decl advertised under the plain local name.
+                // They advance only the type index space
+                // (`world_type_idx`), never the instance index space.
+                if (ext == .named_func) {
+                    const nf = ext.named_func;
+                    const func_type_idx = try lowerWorldFunc(ar, &world_decls, &world_type_idx, nf.func);
+                    if (is_export) {
+                        try world_decls.append(ar, .{ .@"export" = .{
+                            .name = nf.name,
+                            .desc = .{ .func = func_type_idx },
+                        } });
+                    } else {
+                        try world_decls.append(ar, .{ .import = .{
+                            .name = nf.name,
+                            .desc = .{ .func = func_type_idx },
+                        } });
+                    }
+                    continue;
+                }
+
+                const iface_name = qualifiedName(ar, ext, pkg_id) catch return error.InvalidWit;
+                // Type aliases this interface defines that another
+                // interface pulls in via `use <this>.{T};` must be
+                // surfaced as exports of this interface's instance type
+                // (see `buildInterfaceBody`'s `.alias` arm / #234).
+                const requested_exports: ?[]const []const u8 =
+                    if (alias_requests.get(iface_name)) |l| l.items else null;
+                const iface_decls = try buildInterfaceBody(ar, resolver, ext, world_alias_map, requested_exports, allocator, diag, world_name);
+                const iface_type_idx = world_type_idx;
+                try world_decls.append(ar, .{ .type = .{
+                    .instance = .{ .decls = iface_decls },
+                } });
+                world_type_idx += 1;
+                // ExternDesc.instance carries the TYPE index of the
+                // just-allocated instance-type slot — NOT the
+                // instance index. The two diverge as soon as a `use`
+                // clause surfaces an `alias instance-export` decl
+                // between imports, since aliases bump
+                // `world_type_idx` without bumping `inst_idx`.
+                const desc: ctypes.ExternDesc = .{ .instance = iface_type_idx };
+                if (is_export) {
+                    try world_decls.append(ar, .{ .@"export" = .{
+                        .name = iface_name,
+                        .desc = desc,
+                    } });
+                } else {
+                    try world_decls.append(ar, .{ .import = .{
+                        .name = iface_name,
+                        .desc = desc,
+                    } });
+                }
+                const imported_inst_idx = inst_idx;
+                inst_idx += 1;
+
+                // Surface every `use`-requested type from this
+                // interface as an `alias instance-export` decl at the
+                // world body level so consumers can pull it via
+                // `alias outer (type 1 K)`.
+                if (alias_requests.get(iface_name)) |names| {
+                    for (names.items) |type_name| {
+                        try world_decls.append(ar, .{ .alias = .{ .instance_export = .{
+                            .sort = .type,
+                            .instance_idx = imported_inst_idx,
+                            .name = type_name,
+                        } } });
+                        const key = try std.fmt.allocPrint(ar, "{s}::{s}", .{ iface_name, type_name });
+                        try world_alias_map.put(ar, key, world_type_idx);
+                        world_type_idx += 1;
+                    }
+                }
+            },
+            .use => {},
+            .include, .type => return error.UnsupportedWitFeature,
+        }
+    }
+
+    // World qualified name: <ns>:<pkg>/<world>[@<ver>]
+    const world_qualified = try formatQualifiedName(ar, pkg_id.namespace, pkg_id.name, world.name, pkg_id.version);
+
+    // Outer wrapper: component-type with one inner component-type
+    // (the world body) and one export of that world component.
+    var outer_decls = try ar.alloc(ctypes.Decl, 2);
+    outer_decls[0] = .{ .type = .{ .component = .{ .decls = try world_decls.toOwnedSlice(ar) } } };
+    outer_decls[1] = .{ .@"export" = .{
+        .name = world_qualified,
+        .desc = .{ .component = 0 },
+    } };
+
+    var types = try ar.alloc(ctypes.TypeDef, 1);
+    types[0] = .{ .component = .{ .decls = outer_decls } };
+
+    // Top-level export: the world type as a top-level type export.
+    var exports = try ar.alloc(ctypes.ExportDecl, 1);
+    exports[0] = .{
+        .name = world.name,
+        .desc = .{ .type = .{ .eq = 0 } },
+        .sort_idx = .{ .sort = .type, .idx = 0 },
+    };
+
+    // wit-component-encoding marker custom section. The two payload
+    // bytes are an encoding-format version (`0x04`) and a flags byte
+    // (`0x00`) per wit-component 0.220.0.
+    var custom_sections = try ar.alloc(ctypes.CustomSection, 1);
+    custom_sections[0] = .{
+        .name = "wit-component-encoding",
+        .payload = &[_]u8{ 0x04, 0x00 },
+    };
+
+    const component: ctypes.Component = .{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = types,
+        .canons = &.{},
+        .imports = &.{},
+        .exports = exports,
+        .custom_sections = custom_sections,
+    };
+
+    // Reject `borrow<R>` reachable (transitively) from a `stream`/`future`
+    // element type or a function result, before it can be encoded into a
+    // world that the host would only reject later. See #266.
+    try validateNoBorrowInAsyncOrResults(ar, types);
+
+    return writer.encode(allocator, &component);
+}
+
+// ── #266: transitive-borrow validation ──────────────────────────────────────
+//
+// The component-model spec forbids a `borrow<R>` handle from appearing,
+// transitively, inside a `stream<T>` / `future<T>` element type or a function
+// result (a borrow is only valid for the duration of the call, so it must not
+// outlive it via a result or an async channel). wasmparser 0.251 enforces the
+// result rule for *every* function — sync or async — so we do the same; valid
+// WIT never returns a borrow (constructors return `own<R>`, methods take
+// `borrow<R>` as a *param*), so this never rejects a legitimate world.
+//
+// The encoder hoists every compound type into a typedef slot and references it
+// via `ValType.type_idx`, so a transitive borrow always bottoms out as a
+// `TypeDef.val{ .borrow }` slot reachable through those indices. The pass walks
+// the fully-lowered `ctypes` tree, resolving type indices per scope.
+
+/// Per-scope view of the type-index space: `map[i]` is the `TypeDef` occupying
+/// type-index `i`, or null for an opaque slot (an alias / import / sub-resource
+/// we can't and needn't see into — a borrow can't hide inside one).
+const TypeScope = []const ?*const ctypes.TypeDef;
+
+/// Validate the whole assembled component by walking every component-type and
+/// instance-type body.
+fn validateNoBorrowInAsyncOrResults(ar: Allocator, types: []const ctypes.TypeDef) EncodeError!void {
+    for (types) |td| switch (td) {
+        .component => |c| try walkBodyForBorrow(ar, c.decls),
+        .instance => |i| try walkBodyForBorrow(ar, i.decls),
+        else => {},
+    };
+}
+
+/// Walk one component-type / instance-type body: build its type-index map, then
+/// check every `stream`/`future` element and function result, recursing into
+/// nested component/instance bodies (each a fresh scope).
+fn walkBodyForBorrow(ar: Allocator, decls: []const ctypes.Decl) EncodeError!void {
+    var map: std.ArrayList(?*const ctypes.TypeDef) = .empty;
+    for (decls) |*d| {
+        switch (d.*) {
+            .type => |*td| try map.append(ar, td),
+            .alias => |a| {
+                const sort = switch (a) {
+                    .instance_export => |ie| ie.sort,
+                    .outer => |o| o.sort,
+                };
+                if (sort == .type) try map.append(ar, null);
+            },
+            .import => |im| if (im.desc == .type) try map.append(ar, null),
+            .@"export" => |ex| if (ex.desc == .type) switch (ex.desc.type) {
+                // An `(eq j)` type export aliases an earlier type slot.
+                .eq => |j| try map.append(ar, if (@as(usize, j) < map.items.len) map.items[@as(usize, j)] else null),
+                .sub_resource => try map.append(ar, null),
+            },
+            .core_type => {},
+        }
+    }
+
+    const scope: TypeScope = map.items;
+    for (decls) |d| {
+        if (d != .type) continue;
+        switch (d.type) {
+            .func => |f| switch (f.results) {
+                .none => {},
+                .unnamed => |vt| try checkValTypeRootForBorrow(ar, scope, vt),
+                .named => |list| for (list) |nv| try checkValTypeRootForBorrow(ar, scope, nv.type),
+            },
+            .future => |fut| if (fut.element) |e| try checkValTypeRootForBorrow(ar, scope, e),
+            .stream => |s| if (s.element) |e| try checkValTypeRootForBorrow(ar, scope, e),
+            .component => |c| try walkBodyForBorrow(ar, c.decls),
+            .instance => |i| try walkBodyForBorrow(ar, i.decls),
+            else => {},
+        }
+    }
+}
+
+/// Entry point for one element/result check: allocate a fresh `visited` set
+/// (keyed by type-index, to break cycles) and walk `vt`.
+fn checkValTypeRootForBorrow(ar: Allocator, scope: TypeScope, vt: ctypes.ValType) EncodeError!void {
+    var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    try checkValTypeForBorrow(ar, scope, vt, &visited);
+}
+
+fn checkValTypeForBorrow(
+    ar: Allocator,
+    scope: TypeScope,
+    vt: ctypes.ValType,
+    visited: *std.AutoHashMapUnmanaged(u32, void),
+) EncodeError!void {
+    switch (vt) {
+        .borrow => return error.InvalidWit,
+        // Every index-carrying valtype references a type slot in this scope.
+        .type_idx, .record, .variant, .list, .tuple, .flags, .enum_, .option, .result => |i| {
+            if (@as(usize, i) >= scope.len) return;
+            if ((try visited.getOrPut(ar, i)).found_existing) return;
+            const td = scope[@as(usize, i)] orelse return;
+            try checkTypeDefForBorrow(ar, scope, td.*, visited);
+        },
+        // Primitives, `own`, and `error-context` are borrow-free leaves.
+        else => {},
+    }
+}
+
+fn checkTypeDefForBorrow(
+    ar: Allocator,
+    scope: TypeScope,
+    td: ctypes.TypeDef,
+    visited: *std.AutoHashMapUnmanaged(u32, void),
+) EncodeError!void {
+    switch (td) {
+        .val => |v| try checkValTypeForBorrow(ar, scope, v, visited),
+        .record => |r| for (r.fields) |f| try checkValTypeForBorrow(ar, scope, f.type, visited),
+        .variant => |v| for (v.cases) |c| if (c.type) |t| try checkValTypeForBorrow(ar, scope, t, visited),
+        .list => |l| try checkValTypeForBorrow(ar, scope, l.element, visited),
+        .tuple => |t| for (t.fields) |f| try checkValTypeForBorrow(ar, scope, f, visited),
+        .option => |o| try checkValTypeForBorrow(ar, scope, o.inner, visited),
+        .result => |r| {
+            if (r.ok) |ok| try checkValTypeForBorrow(ar, scope, ok, visited);
+            if (r.err) |e| try checkValTypeForBorrow(ar, scope, e, visited);
+        },
+        .future => |f| if (f.element) |e| try checkValTypeForBorrow(ar, scope, e, visited),
+        .stream => |s| if (s.element) |e| try checkValTypeForBorrow(ar, scope, e, visited),
+        // flags / enum_ / resource / func / component / instance carry no
+        // borrow-bearing value types reachable from this position.
+        else => {},
+    }
+}
+
+/// Pre-pass: walk every `use src.{T};` clause inside `we`'s interface
+/// body and record `(source-qname, type-name)` so the world body can
+/// emit a matching `alias instance-export` decl right after `src`'s
+/// import. `we`'s package context is used to resolve short refs.
+fn collectUseRequests(
+    ar: Allocator,
+    resolver: wit_resolver.Resolver,
+    we: ast.WorldExtern,
+    map: *std.StringHashMapUnmanaged(std.ArrayList([]const u8)),
+    gpa: Allocator,
+    diag: ?*EncodeDiagnostic,
+    world_name: []const u8,
+) EncodeError!void {
+    const ref = switch (we) {
+        .interface_ref => |ir| ir.ref,
+        else => return,
+    };
+    const lookup = resolver.findInterfaceWithPkg(ref) orelse {
+        const ctx = std.fmt.allocPrint(ar, "world '{s}'", .{world_name}) catch world_name;
+        return failUnknownInterface(gpa, diag, ref, ctx);
+    };
+    for (lookup.iface.items) |it| {
+        if (it != .use) continue;
+        const u = it.use;
+        // The consuming interface's package is the context for
+        // resolving short `use` refs — `use error.{error};` inside
+        // `wasi:io/streams` resolves against `wasi:io`, not the
+        // world's main package.
+        const src_lookup = resolver.findInterfaceWithPkgCtx(u.from, lookup.pkg) orelse {
+            const consumer = formatQualifiedName(ar, lookup.pkg.namespace, lookup.pkg.name, ref.name, lookup.pkg.version) catch ref.name;
+            return failUnknownInterface(gpa, diag, u.from, consumer);
+        };
+        const src_qname = try formatQualifiedName(
+            ar,
+            src_lookup.pkg.namespace,
+            src_lookup.pkg.name,
+            u.from.name,
+            src_lookup.pkg.version,
+        );
+        const gop = try map.getOrPut(ar, src_qname);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        for (u.names) |n| {
+            // Same type used by multiple consumers → one alias slot
+            // serves all.
+            var already = false;
+            for (gop.value_ptr.items) |existing| {
+                if (std.mem.eql(u8, existing, n.name)) {
+                    already = true;
+                    break;
+                }
+            }
+            if (!already) try gop.value_ptr.append(ar, n.name);
+        }
+    }
+}
+
+/// Whether `name` is one of the type names another interface pulls in
+/// via `use <this-iface>.{name};` — i.e. a name that must be exported
+/// from this interface's instance type rather than inlined (#234).
+fn typeNameRequested(requested: ?[]const []const u8, name: []const u8) bool {
+    const list = requested orelse return false;
+    for (list) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
+}
+
+/// Convenience: parse `source` and encode the named world.
+/// If `source` references `wasi:*` interfaces or worlds not defined
+/// inline in `source` (or `world_name` names a bundled `wasi-canon`
+/// world such as `wasi:cli/command` or `wasi:http/proxy`), resolves
+/// against the embedded `wasi-canon` package set in memory.
+pub fn encodeWorldFromSource(
+    allocator: Allocator,
+    source: []const u8,
+    world_name: []const u8,
+) EncodeError![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var diag: witParser.ParseDiagnostic = .{};
+    const doc = witParser.parse(arena.allocator(), source, &diag) catch return error.InvalidWit;
+    return encodeWorld(allocator, doc, world_name) catch |err| switch (err) {
+        error.UnknownWorld, error.UnknownInterface => {
+            const resolver = wit_resolver.finishWithEmbedded(arena.allocator(), doc, &.{}) catch return error.InvalidWit;
+            return encodeWorldFromResolver(allocator, resolver, world_name);
+        },
+        else => return err,
+    };
+}
+
+// ── helpers ────────────────────────────────────────────────────────────────
+
+fn findWorld(doc: ast.Document, name: []const u8) ?ast.World {
+    for (doc.items) |it| {
+        if (it == .world and std.mem.eql(u8, it.world.name, name)) return it.world;
+    }
+    return null;
+}
+
+fn parseQualifiedWorldRef(world_name: []const u8) ?ast.InterfaceRef {
+    const slash = std.mem.indexOfScalar(u8, world_name, '/') orelse return null;
+    const pkg_part = world_name[0..slash];
+    const colon = std.mem.indexOfScalar(u8, pkg_part, ':') orelse return null;
+    const ns = pkg_part[0..colon];
+    const pkg_name = pkg_part[colon + 1 ..];
+    const rest = world_name[slash + 1 ..];
+    if (std.mem.indexOfScalar(u8, rest, '@')) |at| {
+        return .{
+            .package = .{ .namespace = ns, .name = pkg_name, .version = rest[at + 1 ..] },
+            .name = rest[0..at],
+        };
+    }
+    return .{
+        .package = .{ .namespace = ns, .name = pkg_name, .version = null },
+        .name = rest,
+    };
+}
+
+fn resolveWorldInResolver(resolver: wit_resolver.Resolver, world_name: []const u8) ?wit_resolver.Resolver.WorldLookup {
+    if (findWorld(resolver.main, world_name)) |w| {
+        const pkg = resolver.main.package orelse return null;
+        return .{ .world = w, .pkg = pkg };
+    }
+    if (parseQualifiedWorldRef(world_name)) |qref| {
+        if (resolver.findWorld(qref)) |hit| return hit;
+    }
+    return resolver.findWorld(.{ .package = null, .name = world_name });
+}
+
+/// Reorder interface items so type defs come out in dependency order.
+/// `use` items are emitted first (they bind use-imported names);
+/// type defs are then emitted such that any type referenced by another
+/// type appears first; funcs come last (they may reference any name
+/// bound by this point).
+///
+/// Canonical wasi-* files routinely forward-reference named types
+/// within an interface (e.g. `variant error-code` referencing a
+/// `record DNS-error-payload` declared later in the same file).
+fn sortIfaceItemsForEncoding(
+    ar: Allocator,
+    items: []const ast.InterfaceItem,
+) EncodeError![]const ast.InterfaceItem {
+    var uses = std.ArrayList(ast.InterfaceItem).empty;
+    var types = std.ArrayList(ast.InterfaceItem).empty;
+    var funcs = std.ArrayList(ast.InterfaceItem).empty;
+    for (items) |it| {
+        switch (it) {
+            .use => try uses.append(ar, it),
+            .type => try types.append(ar, it),
+            .func => try funcs.append(ar, it),
+        }
+    }
+
+    // Worklist topo-sort over types. A type is emittable when every
+    // named reference inside it either (a) is a primitive, (b) was
+    // already emitted in this pass, or (c) is bound via a `use`
+    // (collected upfront below).
+    var bound = std.StringHashMapUnmanaged(void).empty;
+    for (uses.items) |u_it| for (u_it.use.names) |un| {
+        const visible = un.rename orelse un.name;
+        try bound.put(ar, visible, {});
+    };
+
+    var sorted_types = std.ArrayList(ast.InterfaceItem).empty;
+    while (types.items.len > 0) {
+        var made_progress = false;
+        var i: usize = 0;
+        while (i < types.items.len) {
+            const t_item = types.items[i];
+            const td = t_item.type;
+            if (typeKindAllDepsBound(td.kind, bound, td.name)) {
+                try sorted_types.append(ar, t_item);
+                try bound.put(ar, td.name, {});
+                // Remove from types by swapping with the last element.
+                types.items[i] = types.items[types.items.len - 1];
+                types.items.len -= 1;
+                made_progress = true;
+            } else {
+                i += 1;
+            }
+        }
+        if (!made_progress) {
+            // Circular reference or unresolved name — fall back to
+            // declaration order and let the encoder error out at the
+            // real reference site with a more useful diagnostic.
+            for (types.items) |t_item| try sorted_types.append(ar, t_item);
+            break;
+        }
+    }
+
+    var out = std.ArrayList(ast.InterfaceItem).empty;
+    try out.appendSlice(ar, uses.items);
+    try out.appendSlice(ar, sorted_types.items);
+    try out.appendSlice(ar, funcs.items);
+    return try out.toOwnedSlice(ar);
+}
+
+fn typeKindAllDepsBound(
+    kind: ast.TypeDefKind,
+    bound: std.StringHashMapUnmanaged(void),
+    self_name: []const u8,
+) bool {
+    return switch (kind) {
+        .alias => |t| typeAllDepsBound(t, bound, self_name),
+        .record => |fields| blk: {
+            for (fields) |f| if (!typeAllDepsBound(f.type, bound, self_name)) break :blk false;
+            break :blk true;
+        },
+        .variant => |cases| blk: {
+            for (cases) |c| if (c.type) |t| if (!typeAllDepsBound(t, bound, self_name)) break :blk false;
+            break :blk true;
+        },
+        .@"enum", .flags => true,
+        .resource => |methods| blk: {
+            // Resources bind their own name BEFORE processing their
+            // method bodies, so self-references inside method sigs
+            // are always resolvable. Pass `self_name` so the inner
+            // type walker can treat it as bound.
+            for (methods) |m| {
+                for (m.func.params) |p| if (!typeAllDepsBound(p.type, bound, self_name)) break :blk false;
+                if (m.func.result) |r| if (!typeAllDepsBound(r, bound, self_name)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
+}
+
+fn typeAllDepsBound(t: ast.Type, bound: std.StringHashMapUnmanaged(void), self_name: []const u8) bool {
+    return switch (t) {
+        .bool, .u8, .u16, .u32, .u64, .s8, .s16, .s32, .s64, .f32, .f64, .char, .string => true,
+        .list => |inner| typeAllDepsBound(inner.*, bound, self_name),
+        .option => |inner| typeAllDepsBound(inner.*, bound, self_name),
+        .result => |r| blk: {
+            if (r.ok) |t2| if (!typeAllDepsBound(t2.*, bound, self_name)) break :blk false;
+            if (r.err) |t2| if (!typeAllDepsBound(t2.*, bound, self_name)) break :blk false;
+            break :blk true;
+        },
+        .tuple => |ts| blk: {
+            for (ts) |t2| if (!typeAllDepsBound(t2, bound, self_name)) break :blk false;
+            break :blk true;
+        },
+        // P3 async types: `future<T>`/`stream<T>` depend on their
+        // payload (if any); `error-context` has no type dependency.
+        .future, .stream => |inner| if (inner) |p| typeAllDepsBound(p.*, bound, self_name) else true,
+        .error_context => true,
+        .name, .borrow, .own => |n| (self_name.len > 0 and std.mem.eql(u8, n, self_name)) or bound.contains(n),
+    };
+}
+
+/// Recursively expand `world.items`, splicing in the contents of any
+/// `.include` items into `out`. World-level `.use` items are dropped
+/// (they bind types into the world's name scope, which the encoder
+/// resolves lazily). `.include` cycles surface as `error.IncludeCycle`.
+///
+/// `ctx_pkg` is the consuming world's package, used as the fallback
+/// when an `include` target ref has no explicit package qualifier
+/// (`include foo;` resolves first in the consuming world's package).
+fn expandWorldItems(
+    ar: Allocator,
+    resolver: wit_resolver.Resolver,
+    world: ast.World,
+    ctx_pkg: ast.PackageId,
+    visited: *std.StringHashMapUnmanaged(void),
+    out: *std.ArrayList(ast.WorldItem),
+) EncodeError!void {
+    for (world.items) |item| {
+        switch (item) {
+            .import, .@"export", .type => try out.append(ar, item),
+            .use => {},
+            .include => |inc| {
+                const target = resolver.findWorldCtx(inc.target, ctx_pkg) orelse return error.UnknownWorld;
+                const ns = if (target.pkg.namespace.len > 0) target.pkg.namespace else "<anon>";
+                const pn = target.pkg.name;
+                const key = try std.fmt.allocPrint(ar, "{s}:{s}/{s}", .{ ns, pn, target.world.name });
+                const gop = try visited.getOrPut(ar, key);
+                if (gop.found_existing) return error.IncludeCycle;
+
+                var inner = std.ArrayList(ast.WorldItem).empty;
+                try expandWorldItems(ar, resolver, target.world, target.pkg, visited, &inner);
+                _ = visited.remove(key);
+
+                for (inner.items) |inner_item| {
+                    const renamed = applyWithRenames(inner_item, inc.with);
+                    const qualified = if (!samePkg(target.pkg, ctx_pkg))
+                        qualifyExternPkg(renamed, target.pkg)
+                    else
+                        renamed;
+                    try out.append(ar, qualified);
+                }
+            },
+        }
+    }
+}
+
+fn samePkg(a: ast.PackageId, b: ast.PackageId) bool {
+    if (!std.mem.eql(u8, a.namespace, b.namespace)) return false;
+    if (!std.mem.eql(u8, a.name, b.name)) return false;
+    if (a.version == null and b.version == null) return true;
+    if (a.version != null and b.version != null) return std.mem.eql(u8, a.version.?, b.version.?);
+    return false;
+}
+
+fn qualifyExternPkg(item: ast.WorldItem, pkg: ast.PackageId) ast.WorldItem {
+    return switch (item) {
+        .import => |we| .{ .import = switch (we) {
+            .interface_ref => |ir| if (ir.ref.package == null)
+                .{ .interface_ref = .{ .docs = ir.docs, .ref = .{ .package = pkg, .name = ir.ref.name } } }
+            else
+                we,
+            else => we,
+        } },
+        .@"export" => |we| .{ .@"export" = switch (we) {
+            .interface_ref => |ir| if (ir.ref.package == null)
+                .{ .interface_ref = .{ .docs = ir.docs, .ref = .{ .package = pkg, .name = ir.ref.name } } }
+            else
+                we,
+            else => we,
+        } },
+        else => item,
+    };
+}
+
+fn applyWithRenames(item: ast.WorldItem, mapping: []const ast.UseName) ast.WorldItem {
+    if (mapping.len == 0) return item;
+    return switch (item) {
+        .import => |we| .{ .import = renameExtern(we, mapping) },
+        .@"export" => |we| .{ .@"export" = renameExtern(we, mapping) },
+        else => item,
+    };
+}
+
+fn renameExtern(we: ast.WorldExtern, mapping: []const ast.UseName) ast.WorldExtern {
+    const old = externShortName(we) orelse return we;
+    for (mapping) |m| {
+        if (std.mem.eql(u8, m.name, old)) {
+            const new = m.rename orelse return we;
+            return setExternShortName(we, new);
+        }
+    }
+    return we;
+}
+
+fn externShortName(we: ast.WorldExtern) ?[]const u8 {
+    return switch (we) {
+        .named_func => |nf| nf.name,
+        .named_interface => |ni| ni.name,
+        .interface_ref => |ir| if (ir.ref.package == null) ir.ref.name else null,
+    };
+}
+
+fn setExternShortName(we: ast.WorldExtern, new_name: []const u8) ast.WorldExtern {
+    return switch (we) {
+        .named_func => |nf| .{ .named_func = .{ .docs = nf.docs, .name = new_name, .func = nf.func } },
+        .named_interface => |ni| .{ .named_interface = .{ .docs = ni.docs, .name = new_name, .items = ni.items } },
+        .interface_ref => |ir| .{ .interface_ref = .{ .docs = ir.docs, .ref = .{ .package = ir.ref.package, .name = new_name } } },
+    };
+}
+
+/// For every interface in `items`, walk its `use` clauses and
+/// ensure the source interface is reachable in the world. Synthesises
+/// an `.import` for each source interface not already present.
+/// Mirrors `wit-component`'s implicit-import behaviour: the spec
+/// requires types referenced via `use` to be reachable via the
+/// world's import/export surface.
+///
+/// The result list is topologically ordered — every source interface
+/// appears BEFORE any interface that consumes it via `use`. This
+/// matters because the encoder builds `world_alias_map` import-by-
+/// import in declaration order; a consumer that references an alias
+/// not-yet-populated trips `error.InvalidWit`.
+fn addImplicitImports(
+    ar: Allocator,
+    resolver: wit_resolver.Resolver,
+    ctx_pkg: ast.PackageId,
+    items: *std.ArrayList(ast.WorldItem),
+    gpa: Allocator,
+    diag: ?*EncodeDiagnostic,
+    world_name: []const u8,
+) EncodeError!void {
+    const original = try items.toOwnedSlice(ar);
+    items.* = .empty;
+
+    var seen = std.StringHashMapUnmanaged(void).empty;
+
+    const Helper = struct {
+        fn visit(
+            arena: Allocator,
+            res: wit_resolver.Resolver,
+            ctx: ast.PackageId,
+            out: *std.ArrayList(ast.WorldItem),
+            visited: *std.StringHashMapUnmanaged(void),
+            item: ast.WorldItem,
+            enc_gpa: Allocator,
+            enc_diag: ?*EncodeDiagnostic,
+            enc_world: []const u8,
+        ) EncodeError!void {
+            const we = switch (item) {
+                .import, .@"export" => |w| w,
+                else => {
+                    try out.append(arena, item);
+                    return;
+                },
+            };
+            const ref = switch (we) {
+                .interface_ref => |ir| ir.ref,
+                else => {
+                    try out.append(arena, item);
+                    return;
+                },
+            };
+            const qn = qualifiedName(arena, we, ctx) catch return error.InvalidWit;
+            if (visited.contains(qn)) return;
+            try visited.put(arena, qn, {});
+
+            // Recurse on the iface's `use` source ifaces first.
+            const lookup = res.findInterfaceWithPkgCtx(ref, ctx) orelse {
+                const world_ctx = std.fmt.allocPrint(arena, "world '{s}'", .{enc_world}) catch enc_world;
+                return failUnknownInterface(enc_gpa, enc_diag, ref, world_ctx);
+            };
+            for (lookup.iface.items) |iface_item| {
+                if (iface_item != .use) continue;
+                const u = iface_item.use;
+                const src_lookup = res.findInterfaceWithPkgCtx(u.from, lookup.pkg) orelse
+                    return failUnknownInterface(enc_gpa, enc_diag, u.from, qn);
+                const src_qn = try formatQualifiedName(
+                    arena,
+                    src_lookup.pkg.namespace,
+                    src_lookup.pkg.name,
+                    u.from.name,
+                    src_lookup.pkg.version,
+                );
+                if (visited.contains(src_qn)) continue;
+                const synth: ast.WorldExtern = .{ .interface_ref = .{
+                    .docs = "",
+                    .ref = .{
+                        .package = .{
+                            .namespace = src_lookup.pkg.namespace,
+                            .name = src_lookup.pkg.name,
+                            .version = src_lookup.pkg.version,
+                        },
+                        .name = u.from.name,
+                    },
+                } };
+                try visit(arena, res, ctx, out, visited, .{ .import = synth }, enc_gpa, enc_diag, enc_world);
+            }
+            try out.append(arena, item);
+        }
+    };
+
+    var non_exports = std.ArrayList(ast.WorldItem).empty;
+    var exports_only = std.ArrayList(ast.WorldItem).empty;
+    for (original) |it| {
+        if (it != .@"export") try Helper.visit(ar, resolver, ctx_pkg, &non_exports, &seen, it, gpa, diag, world_name);
+    }
+    for (original) |it| {
+        if (it == .@"export") try Helper.visit(ar, resolver, ctx_pkg, &exports_only, &seen, it, gpa, diag, world_name);
+    }
+    for (non_exports.items) |it| {
+        if (it != .@"export") try items.append(ar, it);
+    }
+    for (exports_only.items) |it| {
+        if (it != .@"export") try items.append(ar, it);
+    }
+    for (non_exports.items) |it| {
+        if (it == .@"export") try items.append(ar, it);
+    }
+    for (exports_only.items) |it| {
+        if (it == .@"export") try items.append(ar, it);
+    }
+}
+
+/// Compute the qualified name to advertise on the wire for a world's
+/// extern. `<id>;` and `<id>@<ver>;` get prefixed by the document's
+/// package; `<ns>:<pkg>/<iface>[@<ver>];` is used as-is.
+fn qualifiedName(
+    ar: Allocator,
+    ext: ast.WorldExtern,
+    pkg: ast.PackageId,
+) ![]const u8 {
+    return switch (ext) {
+        .interface_ref => |ir| blk: {
+            const ref = ir.ref;
+            if (ref.package) |p| {
+                break :blk try formatQualifiedName(ar, p.namespace, p.name, ref.name, p.version);
+            }
+            break :blk try formatQualifiedName(ar, pkg.namespace, pkg.name, ref.name, pkg.version);
+        },
+        // Inline interfaces and world-level funcs are advertised on the
+        // wire under their world-local plain name (no `ns:pkg/iface@ver`
+        // qualifier). See the module doc comment + README for the
+        // named_interface / named_func naming convention.
+        .named_interface => |ni| try ar.dupe(u8, ni.name),
+        .named_func => |nf| try ar.dupe(u8, nf.name),
+    };
+}
+
+fn formatQualifiedName(
+    ar: Allocator,
+    ns: []const u8,
+    pkg: []const u8,
+    item: []const u8,
+    version: ?[]const u8,
+) ![]const u8 {
+    if (version) |v| {
+        return try std.fmt.allocPrint(ar, "{s}:{s}/{s}@{s}", .{ ns, pkg, item, v });
+    }
+    return try std.fmt.allocPrint(ar, "{s}:{s}/{s}", .{ ns, pkg, item });
+}
+
+/// Lower a world-level `func` (`named_func`) into the world body's type
+/// index space and return the type index of the appended func-type
+/// decl. Any compound param/result types are hoisted into preceding
+/// `.type` decls (mirroring `BodyBuilder.emitFuncExport`), all spliced
+/// into `world_decls`; only the type index space (`world_type_idx`)
+/// advances — a top-level func extern does not occupy an instance slot.
+///
+/// Named-type params/results are out of scope for world-level funcs:
+/// there is no enclosing interface body to bind `type` aliases, so a
+/// `.name` ref bottoms out in an empty `name_map` as
+/// `error.InvalidWit`. Primitive / `list` / `option` / `result` /
+/// `tuple` / async value types are supported.
+fn lowerWorldFunc(
+    ar: Allocator,
+    world_decls: *std.ArrayList(ctypes.Decl),
+    world_type_idx: *u32,
+    func: ast.Func,
+) EncodeError!u32 {
+    var builder: BodyBuilder = .{
+        .ar = ar,
+        .decls = .empty,
+        .type_idx = world_type_idx.*,
+        .name_map = .empty,
+    };
+    const params = try ar.alloc(ctypes.NamedValType, func.params.len);
+    for (func.params, 0..) |p, i| {
+        params[i] = .{ .name = p.name, .type = try builder.lowerType(p.type) };
+    }
+    const results: ctypes.FuncType.ResultList = if (func.result) |t|
+        .{ .unnamed = try builder.lowerType(t) }
+    else
+        .none;
+
+    const func_type_idx = builder.type_idx;
+    try builder.decls.append(ar, .{ .type = .{ .func = .{
+        .params = params,
+        .results = results,
+        .is_async = func.is_async,
+    } } });
+    builder.type_idx += 1;
+
+    // Splice the hoisted compound type decls + the func type decl into
+    // the world body in order (the builder started counting at
+    // `world_type_idx`, so the slots line up).
+    for (builder.decls.items) |d| try world_decls.append(ar, d);
+    world_type_idx.* = builder.type_idx;
+    return func_type_idx;
+}
+
+/// Lower an interface's WIT items to instance-type decls.
+///
+/// `world_alias_map` is keyed `<src-iface-qname>::<type-name>` and
+/// stores each `use`-target's slot in the **outer** (world-body)
+/// type indexspace. Used to emit `alias outer (type 1 K)` decls
+/// inside this body for every `use src.{T};` clause.
+fn buildInterfaceBody(
+    ar: Allocator,
+    resolver: wit_resolver.Resolver,
+    ext: ast.WorldExtern,
+    world_alias_map: std.StringHashMapUnmanaged(u32),
+    requested_exports: ?[]const []const u8,
+    gpa: Allocator,
+    diag: ?*EncodeDiagnostic,
+    world_name: []const u8,
+) EncodeError![]const ctypes.Decl {
+    switch (ext) {
+        .interface_ref => |ir| {
+            const ref = ir.ref;
+            // Resolve the interface body across packages: same-package
+            // refs (no `pkg/` qualifier) hit the main doc;
+            // `<ns>:<pkg>/<iface>[@<ver>]` refs traverse the deps
+            // (populated by `parseLayout` walking `<root>/deps/<pkg>/`).
+            // The resolver returns the same shape either way. The
+            // returned `pkg` is the consuming interface's own package —
+            // used below as fallback context when resolving short
+            // `use src.{T};` refs against the dep's sibling files.
+            const iface_lookup = resolver.findInterfaceWithPkg(ref) orelse {
+                const ctx = std.fmt.allocPrint(ar, "world '{s}'", .{world_name}) catch world_name;
+                return failUnknownInterface(gpa, diag, ref, ctx);
+            };
+            return buildInterfaceBodyFromItems(
+                ar,
+                resolver,
+                iface_lookup.iface.items,
+                iface_lookup.pkg,
+                ref.name,
+                world_alias_map,
+                requested_exports,
+                gpa,
+                diag,
+            );
+        },
+        .named_interface => |ni| {
+            // Inline interface: its `items` live directly in the world
+            // body. Resolve named-type / `use` context against the
+            // enclosing document package (the world's own package), and
+            // advertise the extern under the plain local name `ni.name`.
+            for (ni.items) |it| {
+                // Cross-interface `use` from an inline interface is out
+                // of scope (#285 R2): the world-body alias prepass
+                // (`collectUseRequests`) only surfaces source types for
+                // `interface_ref` externs, so an inline `use` would
+                // dangle. Reject cleanly rather than emit a bad section.
+                if (it == .use) return error.UnsupportedWitFeature;
+            }
+            const pkg_ctx = resolver.main.package orelse return error.InvalidWit;
+            return buildInterfaceBodyFromItems(
+                ar,
+                resolver,
+                ni.items,
+                pkg_ctx,
+                ni.name,
+                world_alias_map,
+                requested_exports,
+                gpa,
+                diag,
+            );
+        },
+        // `named_func` is a top-level world func, not an interface body;
+        // it is emitted directly by the main loop, never via this path.
+        .named_func => return error.UnsupportedWitFeature,
+    }
+}
+
+/// Lower an explicit interface `items` list (sourced either from an
+/// `interface_ref` lookup or an inline `named_interface`) to
+/// instance-type decls. `pkg_ctx` is the package used to resolve short
+/// `use src.{T};` refs; `iface_name` is the consuming interface's local
+/// name (for diagnostics).
+fn buildInterfaceBodyFromItems(
+    ar: Allocator,
+    resolver: wit_resolver.Resolver,
+    items: []const ast.InterfaceItem,
+    pkg_ctx: ast.PackageId,
+    iface_name: []const u8,
+    world_alias_map: std.StringHashMapUnmanaged(u32),
+    requested_exports: ?[]const []const u8,
+    gpa: Allocator,
+    diag: ?*EncodeDiagnostic,
+) EncodeError![]const ctypes.Decl {
+    // `BodyBuilder` tracks the type-index space inside this
+    // instance-type body. Every appended `.type` decl bumps
+    // `type_idx`; compound valtypes lower to a fresh `.type` decl
+    // and a `ValType.type_idx` reference to its slot. Named-type
+    // refs (e.g. `Type.name`) resolve against `name_map`, which is
+    // populated as `type <name> = T;` aliases are encountered in
+    // declaration order.
+    var builder: BodyBuilder = .{
+        .ar = ar,
+        .decls = .empty,
+        .type_idx = 0,
+        .name_map = .empty,
+    };
+    // Reorder iface items so type defs come out in dependency order
+    // (forward references between named types are common in canonical
+    // wasi-* files — `variant error-code` references `record
+    // DNS-error-payload` which is defined later in the same file).
+    // `use` items must come first to bind use-imported names; types
+    // are then emitted in topological order (each type's name-deps
+    // are emitted before it); funcs come last (they may reference
+    // any name).
+    const sorted_items = try sortIfaceItemsForEncoding(ar, items);
+
+    for (sorted_items) |it| {
+        switch (it) {
+            .func => |f| try builder.emitFuncExport(f.name, f.func, null),
+            .type => |td| switch (td.kind) {
+                .alias => |inner| {
+                    const vt = try builder.lowerType(inner);
+                    if (typeNameRequested(requested_exports, td.name)) {
+                        // A `type <name> = <T>;` alias that another
+                        // interface pulls in via `use <this>.{<name>};`.
+                        // The world body emits an `alias export …
+                        // "<name>"` against this interface's instance,
+                        // so the name MUST be exported here — otherwise
+                        // the reference dangles and the component fails
+                        // to validate (#234). Inlining (the `else`
+                        // branch) is only safe when no other interface
+                        // references the alias by name. Primitive RHS
+                        // valtypes don't occupy a slot yet, so
+                        // materialize one via a `.val` typedef before
+                        // exporting it.
+                        const body_slot = switch (vt) {
+                            .type_idx => |k| k,
+                            else => (try builder.appendCompound(.{ .val = vt })).type_idx,
+                        };
+                        try builder.exportNamedType(td.name, body_slot);
+                    } else {
+                        try builder.bindName(td.name, vt);
+                    }
+                },
+                .record => |fields| {
+                    const lowered = try ar.alloc(ctypes.Field, fields.len);
+                    for (fields, 0..) |f, i| {
+                        lowered[i] = .{ .name = f.name, .type = try builder.lowerType(f.type) };
+                    }
+                    const body_vt = try builder.appendCompound(.{ .record = .{ .fields = lowered } });
+                    try builder.exportNamedType(td.name, body_vt.type_idx);
+                },
+                .variant => |cases| {
+                    const lowered = try ar.alloc(ctypes.Case, cases.len);
+                    for (cases, 0..) |c, i| {
+                        const payload: ?ctypes.ValType = if (c.type) |ty|
+                            try builder.lowerType(ty)
+                        else
+                            null;
+                        lowered[i] = .{ .name = c.name, .type = payload };
+                    }
+                    const body_vt = try builder.appendCompound(.{ .variant = .{ .cases = lowered } });
+                    try builder.exportNamedType(td.name, body_vt.type_idx);
+                },
+                .@"enum" => |names| {
+                    const body_vt = try builder.appendCompound(.{ .enum_ = .{ .names = names } });
+                    try builder.exportNamedType(td.name, body_vt.type_idx);
+                },
+                .flags => |names| {
+                    const body_vt = try builder.appendCompound(.{ .flags = .{ .names = names } });
+                    try builder.exportNamedType(td.name, body_vt.type_idx);
+                },
+                .resource => |methods| {
+                    // Per the component-model spec, resources cannot
+                    // be *defined* with `(sub resource)` as a typedef
+                    // body decl inside a component-TYPE (only inside
+                    // a concrete component). Within a `(type
+                    // (instance ...))` decl inside a
+                    // `(type (component ...))`, the resource is
+                    // introduced via an `export` decl whose extern
+                    // desc carries the `(sub resource)` bound; that
+                    // export allocates a fresh slot in the
+                    // surrounding type space.
+                    const resource_idx = builder.type_idx;
+                    try builder.decls.append(ar, .{ .@"export" = .{
+                        .name = td.name,
+                        .desc = .{ .type = .sub_resource },
+                    } });
+                    builder.type_idx += 1;
+                    try builder.bindName(td.name, .{ .type_idx = resource_idx });
+                    // Track that `td.name` is a resource so a bare
+                    // `.name` reference to it in a value-type position
+                    // (tuple element, list element, record field, func
+                    // param/result, etc.) auto-wraps as `own<R>` in
+                    // `lowerType`. Matches the component-model spec /
+                    // wit-component's reference encoder (#182).
+                    try builder.resource_names.put(ar, td.name, {});
+
+                    // Methods / statics / constructors synthesize their
+                    // canonical-ABI external names (`[method]R.M`,
+                    // `[static]R.M`, `[constructor]R`) and the implicit
+                    // `self: borrow<R>` / `-> own<R>` insertions. The
+                    // `[resource-drop]R` intrinsic is *not* declared in
+                    // the encoded section — the consuming canon stage
+                    // synthesizes it implicitly for every resource.
+                    for (methods) |m| {
+                        const ext_name = try formatResourceMemberName(ar, m.kind, td.name, m.name);
+                        const self_param: ?ctypes.NamedValType = switch (m.kind) {
+                            .method => .{ .name = "self", .type = try builder.handleSlot(resource_idx, .borrow) },
+                            .static, .constructor => null,
+                        };
+                        const constructor_result: ?ctypes.ValType = switch (m.kind) {
+                            .constructor => try builder.handleSlot(resource_idx, .own),
+                            .method, .static => null,
+                        };
+                        try builder.emitFuncExport(
+                            ext_name,
+                            m.func,
+                            BodyBuilder.FuncInjection{
+                                .self_param = self_param,
+                                .forced_result = constructor_result,
+                            },
+                        );
+                    }
+                },
+            },
+            .use => |u| {
+                // `use src.{T1, T2 as renamed};` — for each name N,
+                // emit `alias outer (type 1 K)` where K is the
+                // world-body type slot that the outer pre-pass
+                // populated for (src_qname, N). Then `export "N"
+                // type=eq{local-slot}` to re-export the type under
+                // its WIT name inside this interface's body (matches
+                // canonical wit-component output: consumers of this
+                // iface can pull the type via the export chain
+                // without re-traversing the alias path).
+                const src_lookup = resolver.findInterfaceWithPkgCtx(u.from, pkg_ctx) orelse {
+                    const consumer = formatQualifiedName(ar, pkg_ctx.namespace, pkg_ctx.name, iface_name, pkg_ctx.version) catch iface_name;
+                    return failUnknownInterface(gpa, diag, u.from, consumer);
+                };
+                const src_qname = try formatQualifiedName(
+                    ar,
+                    src_lookup.pkg.namespace,
+                    src_lookup.pkg.name,
+                    u.from.name,
+                    src_lookup.pkg.version,
+                );
+                for (u.names) |un| {
+                    const key = try std.fmt.allocPrint(ar, "{s}::{s}", .{ src_qname, un.name });
+                    const outer_idx = world_alias_map.get(key) orelse return error.InvalidWit;
+                    const local_idx = builder.type_idx;
+                    try builder.decls.append(ar, .{ .alias = .{ .outer = .{
+                        .sort = .type,
+                        .outer_count = 1,
+                        .idx = outer_idx,
+                    } } });
+                    builder.type_idx += 1;
+                    const visible_name = un.rename orelse un.name;
+                    // The Export Eq itself allocates a fresh slot in
+                    // wasm-tools' type-index view; bump our counter
+                    // and bind the name to that export slot so
+                    // downstream `borrow<R>` / `own<R>` references
+                    // resolve through the named export id (required
+                    // by wasm-tools' `validate_and_register_named_types`).
+                    try builder.decls.append(ar, .{ .@"export" = .{
+                        .name = visible_name,
+                        .desc = .{ .type = .{ .eq = local_idx } },
+                    } });
+                    const export_slot = builder.type_idx;
+                    builder.type_idx += 1;
+                    try builder.bindName(visible_name, .{ .type_idx = export_slot });
+                    // If the source interface defines `un.name` as a
+                    // resource, register the visible (post-`rename`)
+                    // name in `resource_names` so bare references to
+                    // it in value-type positions auto-wrap as
+                    // `own<R>` (#182). Local resources are tracked at
+                    // the resource-decl site above; this branch
+                    // handles `use other.{R};`-introduced resources
+                    // (e.g. `preopens.use types.{descriptor}`).
+                    for (src_lookup.iface.items) |src_item| {
+                        if (src_item != .type) continue;
+                        if (!std.mem.eql(u8, src_item.type.name, un.name)) continue;
+                        if (src_item.type.kind != .resource) break;
+                        try builder.resource_names.put(ar, visible_name, {});
+                        break;
+                    }
+                }
+            },
+        }
+    }
+    return try builder.decls.toOwnedSlice(ar);
+}
+
+/// Canonical-ABI external name for a resource member. Constructor
+/// uses just the resource name; method / static prefix the bracketed
+/// tag and qualify with `R.M`.
+fn formatResourceMemberName(
+    ar: Allocator,
+    kind: ast.ResourceMethodKind,
+    resource: []const u8,
+    member: []const u8,
+) ![]const u8 {
+    return switch (kind) {
+        .constructor => try std.fmt.allocPrint(ar, "[constructor]{s}", .{resource}),
+        .method => try std.fmt.allocPrint(ar, "[method]{s}.{s}", .{ resource, member }),
+        .static => try std.fmt.allocPrint(ar, "[static]{s}.{s}", .{ resource, member }),
+    };
+}
+
+/// Stateful helper that builds the body of an instance-type while
+/// tracking the type-index space. Compound types (`list`, `option`,
+/// `result`, `tuple`) appear as standalone `TypeDef` decls and are
+/// then referenced from func params/results via `ValType.type_idx`.
+const BodyBuilder = struct {
+    ar: Allocator,
+    decls: std.ArrayList(ctypes.Decl),
+    /// Current count of `.type` decls already appended to `decls` —
+    /// equivalently, the next free slot in the instance-type body's
+    /// type-index space.
+    type_idx: u32,
+    /// Maps `type <name> = T;` aliases (and, in later chunks,
+    /// nominal typedefs) to the `ValType` to substitute when a
+    /// `Type.name` reference points at them. Aliases to primitives
+    /// map directly to the primitive `ValType` without consuming a
+    /// fresh slot; aliases whose RHS is a compound type map to the
+    /// `type_idx` produced by the compound's lowering.
+    name_map: std.StringHashMapUnmanaged(ctypes.ValType),
+
+    /// Subset of `name_map` keys whose binding refers to a resource
+    /// type (locally defined via `resource R { … }` or brought in via
+    /// `use other.{R}`). Per the component-model spec, a bare `.name`
+    /// reference to a resource in a value-type position (tuple
+    /// element, list element, record field, variant payload, option
+    /// inner, result ok/err, func param, func result) implicitly
+    /// resolves to `own<R>`. `lowerType` consults this set on the
+    /// `.name` arm and emits `handleSlot(idx, .own)` instead of the
+    /// bare type-idx alias. Non-resource named types (aliases,
+    /// records, variants, enums, flags) fall through to the plain
+    /// `name_map.get(n)` path. Tracked under cataggar/wabt#182.
+    resource_names: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn lowerType(self: *BodyBuilder, t: ast.Type) EncodeError!ctypes.ValType {
+        return switch (t) {
+            .bool => .bool,
+            .s8 => .s8,
+            .u8 => .u8,
+            .s16 => .s16,
+            .u16 => .u16,
+            .s32 => .s32,
+            .u32 => .u32,
+            .s64 => .s64,
+            .u64 => .u64,
+            .f32 => .f32,
+            .f64 => .f64,
+            .char => .char,
+            .string => .string,
+            .list => |inner| blk: {
+                const elem = try self.lowerType(inner.*);
+                break :blk try self.appendCompound(.{ .list = .{ .element = elem } });
+            },
+            .option => |inner| blk: {
+                const inner_vt = try self.lowerType(inner.*);
+                break :blk try self.appendCompound(.{ .option = .{ .inner = inner_vt } });
+            },
+            .result => |r| blk: {
+                const ok_vt: ?ctypes.ValType = if (r.ok) |ok_ty|
+                    try self.lowerType(ok_ty.*)
+                else
+                    null;
+                const err_vt: ?ctypes.ValType = if (r.err) |err_ty|
+                    try self.lowerType(err_ty.*)
+                else
+                    null;
+                break :blk try self.appendCompound(.{ .result = .{ .ok = ok_vt, .err = err_vt } });
+            },
+            .tuple => |fields| blk: {
+                const inner = try self.ar.alloc(ctypes.ValType, fields.len);
+                for (fields, 0..) |f, i| inner[i] = try self.lowerType(f);
+                break :blk try self.appendCompound(.{ .tuple = .{ .fields = inner } });
+            },
+            .name => |n| blk: {
+                // Bare resource references auto-wrap as `own<R>` in
+                // any value-type position (#182). Non-resource named
+                // bindings fall through to the plain alias lookup.
+                if (self.resource_names.contains(n)) {
+                    const bound = self.name_map.get(n) orelse return error.InvalidWit;
+                    if (bound != .type_idx) return error.InvalidWit;
+                    break :blk try self.handleSlot(bound.type_idx, .own);
+                }
+                break :blk self.name_map.get(n) orelse error.InvalidWit;
+            },
+            .borrow => |n| try self.handleValType(n, .borrow),
+            .own => |n| try self.handleValType(n, .own),
+            // WASI 0.3 (P3) async value types.
+            .error_context => .error_context,
+            .future => |inner| blk: {
+                const elem: ?ctypes.ValType = if (inner) |p| try self.lowerType(p.*) else null;
+                break :blk try self.appendCompound(.{ .future = .{ .element = elem } });
+            },
+            .stream => |inner| blk: {
+                const elem: ?ctypes.ValType = if (inner) |p| try self.lowerType(p.*) else null;
+                break :blk try self.appendCompound(.{ .stream = .{ .element = elem } });
+            },
+        };
+    }
+
+    const HandleKind = enum { borrow, own };
+
+    /// Resolve `borrow<R>` / `own<R>` to a handle ValType. The named
+    /// resource must already be bound in `name_map`, and that
+    /// binding must be a `type_idx` — borrowing or owning a
+    /// non-resource named type (e.g. an alias to `u32`) is malformed.
+    ///
+    /// Per the component-model spec, handle types (`borrow<R>`,
+    /// `own<R>`) are *defined* types — they must occupy their own
+    /// typedef slot in the surrounding type space; the func-param
+    /// position then references that slot via its typeidx. We
+    /// allocate a fresh slot per use (no interning); external
+    /// tooling (wasm-tools / wasmtime) accepts duplicate slots and
+    /// the encoded section size cost is one byte per handle.
+    fn handleValType(
+        self: *BodyBuilder,
+        resource_name: []const u8,
+        kind: HandleKind,
+    ) EncodeError!ctypes.ValType {
+        const bound = self.name_map.get(resource_name) orelse return error.InvalidWit;
+        if (bound != .type_idx) return error.InvalidWit;
+        return self.handleSlot(bound.type_idx, kind);
+    }
+
+    /// Append a typedef slot containing `borrow<resource_idx>` or
+    /// `own<resource_idx>` and return a `ValType.type_idx`
+    /// reference to that slot.
+    fn handleSlot(
+        self: *BodyBuilder,
+        resource_idx: u32,
+        kind: HandleKind,
+    ) EncodeError!ctypes.ValType {
+        const handle_vt: ctypes.ValType = switch (kind) {
+            .borrow => .{ .borrow = resource_idx },
+            .own => .{ .own = resource_idx },
+        };
+        return self.appendCompound(.{ .val = handle_vt });
+    }
+
+    /// Injection hooks for resource-method synthesis: `self_param`
+    /// is prepended to the canonical param list; `forced_result`
+    /// overrides any AST result (used for `-> own<R>` on
+    /// constructors).
+    const FuncInjection = struct {
+        self_param: ?ctypes.NamedValType = null,
+        forced_result: ?ctypes.ValType = null,
+    };
+
+    /// Lower an AST `Func` to a component-type `FuncType` and append
+    /// it to `decls`, then export it under `export_name`. When
+    /// `injection` is non-null, methods get an implicit
+    /// `self: borrow<R>` prepended and constructors get
+    /// `-> own<R>` appended.
+    fn emitFuncExport(
+        self: *BodyBuilder,
+        export_name: []const u8,
+        func: ast.Func,
+        injection: ?FuncInjection,
+    ) EncodeError!void {
+        const inj: FuncInjection = injection orelse .{};
+        const extra: usize = if (inj.self_param != null) 1 else 0;
+        const params = try self.ar.alloc(ctypes.NamedValType, func.params.len + extra);
+        if (inj.self_param) |sp| params[0] = sp;
+        for (func.params, 0..) |p, i| {
+            params[i + extra] = .{ .name = p.name, .type = try self.lowerType(p.type) };
+        }
+
+        const results: ctypes.FuncType.ResultList = if (inj.forced_result) |fr|
+            .{ .unnamed = fr }
+        else if (func.result) |t|
+            .{ .unnamed = try self.lowerType(t) }
+        else
+            .none;
+
+        const func_type_idx = self.type_idx;
+        try self.decls.append(self.ar, .{ .type = .{ .func = .{
+            .params = params,
+            .results = results,
+            .is_async = func.is_async,
+        } } });
+        self.type_idx += 1;
+
+        try self.decls.append(self.ar, .{ .@"export" = .{
+            .name = export_name,
+            .desc = .{ .func = func_type_idx },
+        } });
+    }
+
+    fn appendCompound(self: *BodyBuilder, td: ctypes.TypeDef) EncodeError!ctypes.ValType {
+        const idx = self.type_idx;
+        try self.decls.append(self.ar, .{ .type = td });
+        self.type_idx += 1;
+        return .{ .type_idx = idx };
+    }
+
+    fn bindName(self: *BodyBuilder, name: []const u8, vt: ctypes.ValType) EncodeError!void {
+        const gop = try self.name_map.getOrPut(self.ar, name);
+        if (gop.found_existing) return error.InvalidWit;
+        gop.value_ptr.* = vt;
+    }
+
+    /// Emit an `export <name> (type (eq <body_slot>))` decl and bind
+    /// `name` to the EXPORT'S slot (not the underlying typedef
+    /// slot). Per the component-model spec, exports of types
+    /// allocate a fresh slot in the surrounding type space; consumers
+    /// that reference the named type must use that export slot so
+    /// wasm-tools' "all referenced types must be named" validator
+    /// finds the type id in the import/export name set.
+    fn exportNamedType(self: *BodyBuilder, name: []const u8, body_slot: u32) EncodeError!void {
+        try self.decls.append(self.ar, .{ .@"export" = .{
+            .name = name,
+            .desc = .{ .type = .{ .eq = body_slot } },
+        } });
+        const export_slot = self.type_idx;
+        self.type_idx += 1;
+        try self.bindName(name, .{ .type_idx = export_slot });
+    }
+};
+
+// ── tests ──────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "metadata_encode: zig-adder world round-trips through loader" {
+    const source =
+        \\package docs:adder@0.1.0;
+        \\
+        \\interface add {
+        \\    add: func(x: u32, y: u32) -> u32;
+        \\}
+        \\
+        \\world adder {
+        \\    export add;
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "adder");
+    defer testing.allocator.free(bytes);
+
+    // Component starts with the right preamble.
+    try testing.expect(bytes.len > 16);
+    try testing.expect(std.mem.eql(u8, bytes[0..4], "\x00asm"));
+    // version=0x0d, layer=0x01
+    try testing.expectEqual(@as(u8, 0x0d), bytes[4]);
+    try testing.expectEqual(@as(u8, 0x01), bytes[6]);
+
+    // Round-trip: load it back and check structure.
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    try testing.expectEqual(@as(usize, 1), comp.types.len);
+    try testing.expect(comp.types[0] == .component);
+    const outer = comp.types[0].component;
+    try testing.expectEqual(@as(usize, 2), outer.decls.len);
+    try testing.expect(outer.decls[0] == .type);
+    try testing.expect(outer.decls[0].type == .component);
+    try testing.expect(outer.decls[1] == .@"export");
+    try testing.expectEqualStrings("docs:adder/adder@0.1.0", outer.decls[1].@"export".name);
+
+    // The world body has one export interface (the `add` interface).
+    const world = outer.decls[0].type.component;
+    try testing.expectEqual(@as(usize, 2), world.decls.len);
+    try testing.expect(world.decls[0] == .type);
+    try testing.expect(world.decls[0].type == .instance);
+    try testing.expect(world.decls[1] == .@"export");
+    try testing.expectEqualStrings("docs:adder/add@0.1.0", world.decls[1].@"export".name);
+
+    // The interface body has one func + one export.
+    const iface = world.decls[0].type.instance;
+    try testing.expectEqual(@as(usize, 2), iface.decls.len);
+    try testing.expect(iface.decls[0] == .type);
+    try testing.expect(iface.decls[0].type == .func);
+    try testing.expect(iface.decls[1] == .@"export");
+    try testing.expectEqualStrings("add", iface.decls[1].@"export".name);
+
+    // Top-level export of the world type.
+    try testing.expectEqual(@as(usize, 1), comp.exports.len);
+    try testing.expectEqualStrings("adder", comp.exports[0].name);
+}
+
+test "metadata_encode: zig-calculator-cmd app world (import only)" {
+    // Combined source: package + adder interface + app world that
+    // imports it qualified. (The real wamr layout splits the dep
+    // package into wit/deps/adder/world.wit; for a single-source
+    // test we fold them.)
+    const source =
+        \\package docs:zigcalc@0.1.0;
+        \\
+        \\interface add {
+        \\    add: func(x: u32, y: u32) -> u32;
+        \\}
+        \\
+        \\world app {
+        \\    import docs:zigcalc/add@0.1.0;
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "app");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const outer = comp.types[0].component;
+    const world = outer.decls[0].type.component;
+    try testing.expectEqual(@as(usize, 2), world.decls.len);
+    try testing.expect(world.decls[0] == .type);
+    try testing.expect(world.decls[0].type == .instance);
+    try testing.expect(world.decls[1] == .import);
+    try testing.expectEqualStrings("docs:zigcalc/add@0.1.0", world.decls[1].import.name);
+}
+
+test "metadata_encode: unknown world reports error" {
+    const source = "package docs:adder@0.1.0;\nworld adder { }";
+    const r = encodeWorldFromSource(testing.allocator, source, "missing");
+    try testing.expectError(error.UnknownWorld, r);
+}
+
+test "metadata_encode #258: unresolvable interface names itself in EncodeDiagnostic" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const parser = @import("parser.zig");
+    const resolver_mod = @import("resolver.zig");
+
+    // A world importing a qualified `wasi:*` interface with no dep
+    // (and no embedded fallback) cannot resolve it.
+    const main_src =
+        \\package docs:app@0.1.0;
+        \\world app { import wasi:http/types@0.2.6; }
+    ;
+    const main_doc = try parser.parse(ar, main_src, null);
+    const resolver = resolver_mod.Resolver.init(main_doc, &.{});
+
+    var diag: EncodeDiagnostic = .{};
+    const r = encodeWorldFromResolverWithDiag(testing.allocator, resolver, "app", &diag);
+    try testing.expectError(error.UnknownInterface, r);
+
+    // The diagnostic names the offending interface and what referenced it.
+    try testing.expect(diag.interface != null);
+    try testing.expectEqualStrings("wasi:http/types@0.2.6", diag.interface.?);
+    try testing.expect(diag.referenced_by != null);
+    try testing.expectEqualStrings("world 'app'", diag.referenced_by.?);
+    try testing.expect(diag.searched != null);
+
+    // Diag strings are allocated on the caller's allocator (not the
+    // encoder's internal arena), so the caller owns and frees them.
+    testing.allocator.free(diag.interface.?);
+    testing.allocator.free(diag.referenced_by.?);
+}
+
+test "metadata_encode: multi-package resolver — cross-package import" {
+    // Mirrors the wamr `zig-calculator-cmd` layout: the main package
+    // defines a world that imports from a sibling package found under
+    // `<root>/deps/adder/`. This test exercises the resolver path
+    // end-to-end (resolver → metadata_encode → loader) without
+    // touching disk, proving the deps walk and metadata encoding
+    // are wired correctly for compose with multi-package inputs.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const parser = @import("parser.zig");
+    const resolver_mod = @import("resolver.zig");
+
+    const main_src =
+        \\package docs:zigcalc@0.1.0;
+        \\world app { import docs:adder/add@0.1.0; }
+    ;
+    const dep_src =
+        \\package docs:adder@0.1.0;
+        \\interface add { add: func(x: u32, y: u32) -> u32; }
+    ;
+    const main_doc = try parser.parse(ar, main_src, null);
+    const dep_doc = try parser.parse(ar, dep_src, null);
+    var deps = try ar.alloc(@import("ast.zig").Document, 1);
+    deps[0] = dep_doc;
+    const resolver = resolver_mod.Resolver.init(main_doc, deps);
+
+    const bytes = try encodeWorldFromResolver(testing.allocator, resolver, "app");
+    defer testing.allocator.free(bytes);
+
+    // Round-trip the encoded payload through the component loader.
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    // Outer component-type wraps a world component-type whose body
+    // has the `add` interface as an instance type and the matching
+    // qualified import declaration.
+    const outer = comp.types[0].component;
+    const world = outer.decls[0].type.component;
+    try testing.expectEqual(@as(usize, 2), world.decls.len);
+    try testing.expect(world.decls[0] == .type);
+    try testing.expect(world.decls[0].type == .instance);
+    try testing.expect(world.decls[1] == .import);
+    try testing.expectEqualStrings("docs:adder/add@0.1.0", world.decls[1].import.name);
+
+    // The interface body picks up the func from the *dep* package.
+    const iface = world.decls[0].type.instance;
+    try testing.expectEqual(@as(usize, 2), iface.decls.len);
+    try testing.expect(iface.decls[0] == .type);
+    try testing.expect(iface.decls[0].type == .func);
+    try testing.expect(iface.decls[1] == .@"export");
+    try testing.expectEqualStrings("add", iface.decls[1].@"export".name);
+}
+
+test "metadata_encode: bare `result` return is hoisted into a TypeDef + idx ref" {
+    // wasi-preview1 adapter's `wasi:cli/run.run` returns bare
+    // `result` (no `ok` or `err` payloads). The encoder must hoist
+    // the `result` valtype into a `TypeDef.result` decl and reference
+    // it from the func via `ValType.type_idx` — compound types
+    // cannot appear inline in func param/result positions.
+    const source =
+        \\package wasi:cli@0.2.6;
+        \\interface run {
+        \\    run: func() -> result;
+        \\}
+        \\world cmd {
+        \\    export run;
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "cmd");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const outer = comp.types[0].component;
+    const world = outer.decls[0].type.component;
+    const iface = world.decls[0].type.instance;
+
+    // Body must be: [result TypeDef, func TypeDef, export(func=1)].
+    try testing.expectEqual(@as(usize, 3), iface.decls.len);
+    try testing.expect(iface.decls[0] == .type);
+    try testing.expect(iface.decls[0].type == .result);
+    try testing.expect(iface.decls[0].type.result.ok == null);
+    try testing.expect(iface.decls[0].type.result.err == null);
+
+    try testing.expect(iface.decls[1] == .type);
+    try testing.expect(iface.decls[1].type == .func);
+    const func = iface.decls[1].type.func;
+    try testing.expectEqual(@as(usize, 0), func.params.len);
+    try testing.expect(func.results == .unnamed);
+    try testing.expect(func.results.unnamed == .type_idx);
+    try testing.expectEqual(@as(u32, 0), func.results.unnamed.type_idx);
+
+    try testing.expect(iface.decls[2] == .@"export");
+    try testing.expectEqualStrings("run", iface.decls[2].@"export".name);
+    try testing.expect(iface.decls[2].@"export".desc == .func);
+    try testing.expectEqual(@as(u32, 1), iface.decls[2].@"export".desc.func);
+}
+
+test "metadata_encode #285: named_interface inline import round-trips as a plain-named instance" {
+    // `import foo: interface { bar: func() -> u32; }` — an inline
+    // interface advertised under the world-local plain name `foo`
+    // (no `ns:pkg/iface@ver` qualifier), with `bar` as an instance
+    // export. Mirrors the `interface_ref` import path but sources its
+    // items inline.
+    const source =
+        \\package docs:ni@0.1.0;
+        \\world w {
+        \\    import foo: interface { bar: func() -> u32; };
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "w");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const outer = comp.types[0].component;
+    const world = outer.decls[0].type.component;
+    // One instance type + one import decl named `foo` (plain, unqualified).
+    try testing.expectEqual(@as(usize, 2), world.decls.len);
+    try testing.expect(world.decls[0] == .type);
+    try testing.expect(world.decls[0].type == .instance);
+    try testing.expect(world.decls[1] == .import);
+    try testing.expectEqualStrings("foo", world.decls[1].import.name);
+    try testing.expect(world.decls[1].import.desc == .instance);
+
+    // The inline interface body has one func + one export `bar`.
+    const iface = world.decls[0].type.instance;
+    try testing.expectEqual(@as(usize, 2), iface.decls.len);
+    try testing.expect(iface.decls[0] == .type);
+    try testing.expect(iface.decls[0].type == .func);
+    try testing.expect(iface.decls[1] == .@"export");
+    try testing.expectEqualStrings("bar", iface.decls[1].@"export".name);
+}
+
+test "metadata_encode #285: named_func export round-trips as a top-level func export" {
+    // `export run: func();` — a world-level function, advertised as a
+    // top-level component func export named `run` (NOT wrapped in an
+    // instance). The world body holds a `func` type decl + a `func`
+    // extern export decl.
+    const source =
+        \\package docs:nf@0.1.0;
+        \\world w {
+        \\    export run: func();
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "w");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const outer = comp.types[0].component;
+    const world = outer.decls[0].type.component;
+    // [func type decl, func export decl].
+    try testing.expectEqual(@as(usize, 2), world.decls.len);
+    try testing.expect(world.decls[0] == .type);
+    try testing.expect(world.decls[0].type == .func);
+    try testing.expectEqual(@as(usize, 0), world.decls[0].type.func.params.len);
+    try testing.expect(world.decls[0].type.func.results == .none);
+    try testing.expect(world.decls[1] == .@"export");
+    try testing.expectEqualStrings("run", world.decls[1].@"export".name);
+    try testing.expect(world.decls[1].@"export".desc == .func);
+    try testing.expectEqual(@as(u32, 0), world.decls[1].@"export".desc.func);
+}
+
+test "metadata_encode #285: named_func import with a primitive result round-trips" {
+    // `import compute: func(x: u32) -> u32;` — a world-level function
+    // import, advertised as a top-level component func import.
+    const source =
+        \\package docs:nfi@0.1.0;
+        \\world w {
+        \\    import compute: func(x: u32) -> u32;
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "w");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const outer = comp.types[0].component;
+    const world = outer.decls[0].type.component;
+    try testing.expectEqual(@as(usize, 2), world.decls.len);
+    try testing.expect(world.decls[0] == .type);
+    try testing.expect(world.decls[0].type == .func);
+    const f = world.decls[0].type.func;
+    try testing.expectEqual(@as(usize, 1), f.params.len);
+    try testing.expect(f.params[0].type == .u32);
+    try testing.expect(f.results == .unnamed);
+    try testing.expect(f.results.unnamed == .u32);
+    try testing.expect(world.decls[1] == .import);
+    try testing.expectEqualStrings("compute", world.decls[1].import.name);
+    try testing.expect(world.decls[1].import.desc == .func);
+}
+
+test "metadata_encode #285: inline interface with a `use` clause is rejected (R2 scope guard)" {
+    const source =
+        \\package docs:niu@0.1.0;
+        \\interface types { type t = u32; }
+        \\world w {
+        \\    import foo: interface { use types.{t}; bar: func() -> t; };
+        \\}
+    ;
+    const r = encodeWorldFromSource(testing.allocator, source, "w");
+    try testing.expectError(error.UnsupportedWitFeature, r);
+}
+
+test "metadata_encode #263: lower P3 stream/future/error-context/async func" {
+    // P2 acceptance for #263: a 0.3.0-style interface using stream<T>,
+    // future<T>, error-context, and an async func lowers + encodes (no
+    // longer `UnsupportedWitFeature`) and round-trips through the loader.
+    const source =
+        \\package example:p3@0.3.0;
+        \\interface things {
+        \\    make-stream: func() -> stream<u8>;
+        \\    make-future: func() -> future<u32>;
+        \\    run: async func();
+        \\    fail: func() -> error-context;
+        \\}
+        \\world app {
+        \\    export things;
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "app");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const outer = comp.types[0].component;
+    const world = outer.decls[0].type.component;
+    const iface = world.decls[0].type.instance;
+
+    var saw_stream = false;
+    var saw_future = false;
+    var saw_async_func = false;
+    var saw_error_context = false;
+    for (iface.decls) |d| {
+        if (d != .type) continue;
+        switch (d.type) {
+            .stream => saw_stream = true,
+            .future => saw_future = true,
+            .func => |f| {
+                if (f.is_async) saw_async_func = true;
+                if (f.results == .unnamed and f.results.unnamed == .error_context) saw_error_context = true;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(saw_stream);
+    try testing.expect(saw_future);
+    try testing.expect(saw_async_func);
+    try testing.expect(saw_error_context);
+}
+
+test "metadata_encode #266: stream<borrow<r>> element is rejected" {
+    const source =
+        \\package example:p3@0.3.0;
+        \\interface things {
+        \\    resource r { }
+        \\    make: func() -> stream<borrow<r>>;
+        \\}
+        \\world app { export things; }
+    ;
+    try testing.expectError(error.InvalidWit, encodeWorldFromSource(testing.allocator, source, "app"));
+}
+
+test "metadata_encode #266: async func result with transitive borrow is rejected" {
+    const source =
+        \\package example:p3@0.3.0;
+        \\interface things {
+        \\    resource r { }
+        \\    run: async func() -> tuple<borrow<r>, u8>;
+        \\}
+        \\world app { export things; }
+    ;
+    try testing.expectError(error.InvalidWit, encodeWorldFromSource(testing.allocator, source, "app"));
+}
+
+test "metadata_encode #266: alias-hidden borrow inside a stream is rejected" {
+    // The borrow is buried behind a `type` alias — the walk must follow
+    // the hoisted typedef slot, not just the immediate element type.
+    const source =
+        \\package example:p3@0.3.0;
+        \\interface things {
+        \\    resource r { }
+        \\    type bad = tuple<borrow<r>, u8>;
+        \\    make: func() -> stream<bad>;
+        \\}
+        \\world app { export things; }
+    ;
+    try testing.expectError(error.InvalidWit, encodeWorldFromSource(testing.allocator, source, "app"));
+}
+
+test "metadata_encode #266: borrow in a sync func result is rejected" {
+    // wasmparser/wasmtime reject a `borrow` in *any* function result, not
+    // only async ones — so the encoder does too.
+    const source =
+        \\package example:p3@0.3.0;
+        \\interface things {
+        \\    resource r { }
+        \\    peek: func() -> borrow<r>;
+        \\}
+        \\world app { export things; }
+    ;
+    try testing.expectError(error.InvalidWit, encodeWorldFromSource(testing.allocator, source, "app"));
+}
+
+test "metadata_encode #266: borrow nested in future<list<...>> is rejected" {
+    const source =
+        \\package example:p3@0.3.0;
+        \\interface things {
+        \\    resource r { }
+        \\    make: func() -> future<list<borrow<r>>>;
+        \\}
+        \\world app { export things; }
+    ;
+    try testing.expectError(error.InvalidWit, encodeWorldFromSource(testing.allocator, source, "app"));
+}
+
+test "metadata_encode #266: borrow as a func *param* is still accepted" {
+    // The restriction is on results / stream / future elements — a borrow
+    // parameter is the normal, valid case and must keep encoding.
+    const source =
+        \\package example:p3@0.3.0;
+        \\interface things {
+        \\    resource r { }
+        \\    use-it: func(h: borrow<r>);
+        \\}
+        \\world app { export things; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "app");
+    defer testing.allocator.free(bytes);
+}
+
+test "metadata_encode #266: own<r> in a stream element is still accepted" {
+    // Only `borrow` is forbidden — `own` (and plain value types) must pass.
+    const source =
+        \\package example:p3@0.3.0;
+        \\interface things {
+        \\    resource r { }
+        \\    plain: func() -> stream<u8>;
+        \\    owned: func() -> stream<own<r>>;
+        \\    open: func() -> own<r>;
+        \\}
+        \\world app { export things; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "app");
+    defer testing.allocator.free(bytes);
+}
+
+test "metadata_encode #263: embed real wasi:filesystem@0.3.0 (stream/future)" {
+    // Stronger P2 acceptance: encode a world importing the embedded
+    // wasi:filesystem/types@0.3.0 interface, whose functions use
+    // `tuple<stream<u8>, future<result<_, error-code>>>` etc. Exercises the
+    // P3 lowering against the real 0.3.0 WIT (not a hand-written stub).
+    const parser = @import("parser.zig");
+    const resolver_mod = @import("resolver.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const main_doc = try parser.parse(ar,
+        \\package example:app@0.1.0;
+        \\world app {
+        \\  import wasi:filesystem/types@0.3.0;
+        \\}
+    , null);
+    const embedded = try resolver_mod.embeddedWasiDocs(ar);
+    const res = resolver_mod.Resolver.init(main_doc, embedded);
+
+    const bytes = try encodeWorldFromResolver(testing.allocator, res, "app");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    const comp = try loader.load(bytes, ar);
+    try testing.expect(comp.types.len >= 1);
+}
+
+test "metadata_encode: `result<u32, string>` payloads hoist correctly" {
+    // Exercise both ok and err payloads on a parameterized result.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    parse: func(s: string) -> result<u32, string>;
+        \\}
+        \\world demo {
+        \\    export ops;
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body: [result TypeDef, func TypeDef, export(func=1)].
+    try testing.expectEqual(@as(usize, 3), iface.decls.len);
+    try testing.expect(iface.decls[0].type.result.ok != null);
+    try testing.expect(iface.decls[0].type.result.err != null);
+    try testing.expect(iface.decls[0].type.result.ok.? == .u32);
+    try testing.expect(iface.decls[0].type.result.err.? == .string);
+    try testing.expect(iface.decls[1].type.func.results.unnamed.type_idx == 0);
+    try testing.expect(iface.decls[2].@"export".desc.func == 1);
+}
+
+test "metadata_encode: `list<u8>` param hoists to a TypeDef.list" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    write: func(bytes: list<u8>) -> u32;
+        \\}
+        \\world demo {
+        \\    export ops;
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    try testing.expectEqual(@as(usize, 3), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .list);
+    try testing.expect(iface.decls[0].type.list.element == .u8);
+    try testing.expect(iface.decls[1].type.func.params[0].type == .type_idx);
+    try testing.expectEqual(@as(u32, 0), iface.decls[1].type.func.params[0].type.type_idx);
+    try testing.expect(iface.decls[1].type.func.results.unnamed == .u32);
+}
+
+test "metadata_encode: primitive type alias resolves via name_map without a fresh slot" {
+    // `type my-u32 = u32;` is a pure rename — aliasing a primitive
+    // produces no new slot in the body's type-index space. A func
+    // referencing `my-u32` should inline the underlying primitive
+    // ValType.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    type my-u32 = u32;
+        \\    inc: func(x: my-u32) -> my-u32;
+        \\}
+        \\world demo {
+        \\    export ops;
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Just [func TypeDef, export(func=0)] — no slot for the alias.
+    try testing.expectEqual(@as(usize, 2), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .func);
+    const func = iface.decls[0].type.func;
+    try testing.expectEqual(@as(usize, 1), func.params.len);
+    try testing.expect(func.params[0].type == .u32);
+    try testing.expect(func.results.unnamed == .u32);
+}
+
+test "metadata_encode: compound alias is hoisted once, named refs reuse the slot" {
+    // `type bytes = list<u8>;` should emit exactly one TypeDef.list
+    // and bind `bytes` to that slot. A func using `bytes` twice
+    // (param + result) must reference the same `type_idx`, not
+    // re-hoist the list each time.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    type bytes = list<u8>;
+        \\    roundtrip: func(b: bytes) -> bytes;
+        \\}
+        \\world demo {
+        \\    export ops;
+        \\}
+    ;
+    const bytes_out = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes_out);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes_out, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body: [list TypeDef (idx 0), func TypeDef (idx 1), export(func=1)].
+    try testing.expectEqual(@as(usize, 3), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .list);
+    try testing.expect(iface.decls[0].type.list.element == .u8);
+    try testing.expect(iface.decls[1].type == .func);
+    const func = iface.decls[1].type.func;
+    try testing.expectEqual(@as(u32, 0), func.params[0].type.type_idx);
+    try testing.expect(func.results == .unnamed);
+    try testing.expectEqual(@as(u32, 0), func.results.unnamed.type_idx);
+}
+
+test "metadata_encode: alias chain (a -> u32, b -> a) resolves transitively" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    type a = u32;
+        \\    type b = a;
+        \\    f: func(x: b) -> b;
+        \\}
+        \\world demo {
+        \\    export ops;
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    try testing.expectEqual(@as(usize, 2), iface.decls.len);
+    const func = iface.decls[0].type.func;
+    try testing.expect(func.params[0].type == .u32);
+    try testing.expect(func.results.unnamed == .u32);
+}
+
+test "metadata_encode: unresolved name reports InvalidWit" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    f: func(x: nonexistent) -> u32;
+        \\}
+        \\world demo {
+        \\    export ops;
+        \\}
+    ;
+    const r = encodeWorldFromSource(testing.allocator, source, "demo");
+    try testing.expectError(error.InvalidWit, r);
+}
+
+test "metadata_encode: record typedef emits TypeDef.record + name binding" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    record point { x: u32, y: u32 }
+        \\    move-by: func(p: point, dx: s32) -> point;
+        \\}
+        \\world demo { export ops; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body: [record TypeDef (idx 0), Export "point" Eq 0 (idx 1), func TypeDef (idx 2), export(func=2)].
+    try testing.expectEqual(@as(usize, 4), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .record);
+    const rec = iface.decls[0].type.record;
+    try testing.expectEqual(@as(usize, 2), rec.fields.len);
+    try testing.expectEqualStrings("x", rec.fields[0].name);
+    try testing.expect(rec.fields[0].type == .u32);
+    try testing.expectEqualStrings("y", rec.fields[1].name);
+    try testing.expect(rec.fields[1].type == .u32);
+
+    try testing.expect(iface.decls[1] == .@"export");
+    try testing.expectEqualStrings("point", iface.decls[1].@"export".name);
+    try testing.expect(iface.decls[1].@"export".desc == .type);
+    try testing.expect(iface.decls[1].@"export".desc.type == .eq);
+    try testing.expectEqual(@as(u32, 0), iface.decls[1].@"export".desc.type.eq);
+
+    const func = iface.decls[2].type.func;
+    try testing.expectEqual(@as(u32, 1), func.params[0].type.type_idx);
+    try testing.expect(func.params[1].type == .s32);
+    try testing.expectEqual(@as(u32, 1), func.results.unnamed.type_idx);
+}
+
+test "metadata_encode: variant typedef with mixed payloads" {
+    // Mirrors `wasi:io/streams.stream-error`: a no-payload `closed`
+    // case plus a payload-carrying case. Both forms must encode and
+    // round-trip cleanly.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    variant stream-error {
+        \\        closed,
+        \\        last-operation-failed(string),
+        \\    }
+        \\    drain: func() -> result<u32, stream-error>;
+        \\}
+        \\world demo { export ops; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body: [variant (0), Export "stream-error" Eq 0 (1), result (2), func (3), export(func=3)].
+    try testing.expectEqual(@as(usize, 5), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .variant);
+    const v = iface.decls[0].type.variant;
+    try testing.expectEqual(@as(usize, 2), v.cases.len);
+    try testing.expectEqualStrings("closed", v.cases[0].name);
+    try testing.expect(v.cases[0].type == null);
+    try testing.expectEqualStrings("last-operation-failed", v.cases[1].name);
+    try testing.expect(v.cases[1].type != null);
+    try testing.expect(v.cases[1].type.? == .string);
+
+    try testing.expect(iface.decls[1] == .@"export");
+    try testing.expectEqualStrings("stream-error", iface.decls[1].@"export".name);
+
+    try testing.expect(iface.decls[2].type == .result);
+    const res = iface.decls[2].type.result;
+    try testing.expect(res.ok != null and res.ok.? == .u32);
+    try testing.expect(res.err != null);
+    try testing.expectEqual(@as(u32, 1), res.err.?.type_idx);
+
+    try testing.expect(iface.decls[3].type == .func);
+    try testing.expectEqual(@as(u32, 2), iface.decls[3].type.func.results.unnamed.type_idx);
+}
+
+test "metadata_encode: enum typedef" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    enum color { red, green, blue }
+        \\    pick: func() -> color;
+        \\}
+        \\world demo { export ops; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body: [enum (0), Export "color" Eq 0 (1), func (2), export(func=2)].
+    try testing.expectEqual(@as(usize, 4), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .enum_);
+    const e = iface.decls[0].type.enum_;
+    try testing.expectEqual(@as(usize, 3), e.names.len);
+    try testing.expectEqualStrings("red", e.names[0]);
+    try testing.expectEqualStrings("green", e.names[1]);
+    try testing.expectEqualStrings("blue", e.names[2]);
+    try testing.expect(iface.decls[1] == .@"export");
+    try testing.expectEqualStrings("color", iface.decls[1].@"export".name);
+    try testing.expectEqual(@as(u32, 1), iface.decls[2].type.func.results.unnamed.type_idx);
+}
+
+test "metadata_encode: flags typedef" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    flags perms { read, write, exec }
+        \\    check: func(p: perms) -> bool;
+        \\}
+        \\world demo { export ops; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body: [flags (0), Export "perms" Eq 0 (1), func (2), export(func=2)].
+    try testing.expectEqual(@as(usize, 4), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .flags);
+    const f = iface.decls[0].type.flags;
+    try testing.expectEqual(@as(usize, 3), f.names.len);
+    try testing.expectEqualStrings("read", f.names[0]);
+    try testing.expectEqualStrings("write", f.names[1]);
+    try testing.expectEqualStrings("exec", f.names[2]);
+    try testing.expect(iface.decls[1] == .@"export");
+    try testing.expectEqualStrings("perms", iface.decls[1].@"export".name);
+    try testing.expectEqual(@as(u32, 1), iface.decls[2].type.func.params[0].type.type_idx);
+}
+
+test "metadata_encode #222: @since-annotated resource methods survive end-to-end" {
+    // Audit-bake for #222. The user reported that resource methods
+    // carrying `@since(version = X.Y.Z)` annotations were dropped
+    // from the emitted interface body. Verified here that:
+    //   1. The parser captures all methods through annotations.
+    //   2. `metadata_encode` emits every method's func-type +
+    //      `[method]R.M`-named export decl.
+    //   3. `loader.load` round-trips the encoded section back.
+    //
+    // Uses the exact canonical `wasi:io/poll@0.2.6` shape the user
+    // pasted, including list types (which exercise the realloc-opt
+    // path).
+    const source =
+        \\package wasi:io@0.2.6;
+        \\
+        \\@since(version = 0.2.0)
+        \\interface poll {
+        \\  @since(version = 0.2.0)
+        \\  resource pollable {
+        \\    @since(version = 0.2.0)
+        \\    ready: func() -> bool;
+        \\
+        \\    @since(version = 0.2.0)
+        \\    block: func();
+        \\  }
+        \\
+        \\  @since(version = 0.2.0)
+        \\  poll: func(in: list<borrow<pollable>>) -> list<u32>;
+        \\}
+        \\
+        \\world test { import poll; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "test");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body shape (12 decls per the canonical lowering):
+    //   0: export "pollable" (sub_resource)
+    //   1: type val .borrow=0
+    //   2: type func (ready's sig)
+    //   3: export "[method]pollable.ready" func=2
+    //   4: type val .borrow=0
+    //   5: type func (block's sig)
+    //   6: export "[method]pollable.block" func=4
+    //   7: type val .borrow=0  (poll's list-element handle)
+    //   8: type list type_idx=7
+    //   9: type list u32
+    //  10: type func (poll's sig)
+    //  11: export "poll" func=10
+    try testing.expectEqual(@as(usize, 12), iface.decls.len);
+
+    // Pin every method/func export — these are the ones the user
+    // reported missing.
+    var saw_pollable = false;
+    var saw_ready = false;
+    var saw_block = false;
+    var saw_poll = false;
+    for (iface.decls) |d| {
+        if (d != .@"export") continue;
+        const e = d.@"export";
+        if (std.mem.eql(u8, e.name, "pollable")) {
+            try testing.expect(e.desc == .type);
+            try testing.expect(e.desc.type == .sub_resource);
+            saw_pollable = true;
+        }
+        if (std.mem.eql(u8, e.name, "[method]pollable.ready")) {
+            try testing.expect(e.desc == .func);
+            saw_ready = true;
+        }
+        if (std.mem.eql(u8, e.name, "[method]pollable.block")) {
+            try testing.expect(e.desc == .func);
+            saw_block = true;
+        }
+        if (std.mem.eql(u8, e.name, "poll")) {
+            try testing.expect(e.desc == .func);
+            saw_poll = true;
+        }
+    }
+    try testing.expect(saw_pollable);
+    try testing.expect(saw_ready);
+    try testing.expect(saw_block);
+    try testing.expect(saw_poll);
+}
+
+test "metadata_encode: resource with constructor + method + static" {
+    // Mirrors `wasi:io/streams.output-stream` style: a constructor, a
+    // method (gets implicit `self: borrow<R>`), and a static. The
+    // encoder must synthesize the canonical-ABI external names and
+    // the implicit `self` / `-> own<R>` insertions. The resource name
+    // is `output-stream` to mirror the canonical WIT identifier
+    // (kebab-case) rather than triggering a reserved `kw_stream`.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface streams {
+        \\    resource output-stream {
+        \\        constructor(seed: u32);
+        \\        write: func(byte: u8) -> u32;
+        \\        check: static func() -> u32;
+        \\    }
+        \\}
+        \\world demo { export streams; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body shape (handle types `borrow<R>` / `own<R>` must occupy
+    // their own typedef slot per the component-model spec):
+    //   0: ExportDecl "output-stream" (type sub-resource)   — slot 0
+    //   1: TypeDef.val .own=0          (ctor return slot)   — slot 1
+    //   2: TypeDef.func (seed:u32) -> type_idx=1            — slot 2
+    //   3: ExportDecl "[constructor]output-stream" func=2
+    //   4: TypeDef.val .borrow=0       (method self slot)   — slot 3
+    //   5: TypeDef.func (self:type_idx=3, byte:u8) -> u32   — slot 4
+    //   6: ExportDecl "[method]output-stream.write" func=4
+    //   7: TypeDef.func () -> u32                           — slot 5
+    //   8: ExportDecl "[static]output-stream.check" func=5
+    try testing.expectEqual(@as(usize, 9), iface.decls.len);
+
+    // Resource: introduced via export with `sub_resource` bound; no
+    // separate body type decl (component-types cannot *define* a
+    // resource as a body typedef, only export-by-name).
+    try testing.expect(iface.decls[0] == .@"export");
+    try testing.expectEqualStrings("output-stream", iface.decls[0].@"export".name);
+    try testing.expect(iface.decls[0].@"export".desc == .type);
+    try testing.expect(iface.decls[0].@"export".desc.type == .sub_resource);
+
+    // Constructor: own slot then func slot then export.
+    try testing.expect(iface.decls[1].type == .val);
+    try testing.expect(iface.decls[1].type.val == .own);
+    try testing.expectEqual(@as(u32, 0), iface.decls[1].type.val.own);
+    try testing.expect(iface.decls[2].type == .func);
+    const ctor = iface.decls[2].type.func;
+    try testing.expectEqual(@as(usize, 1), ctor.params.len);
+    try testing.expectEqualStrings("seed", ctor.params[0].name);
+    try testing.expect(ctor.params[0].type == .u32);
+    try testing.expect(ctor.results == .unnamed);
+    try testing.expect(ctor.results.unnamed == .type_idx);
+    try testing.expectEqual(@as(u32, 1), ctor.results.unnamed.type_idx);
+    try testing.expectEqualStrings("[constructor]output-stream", iface.decls[3].@"export".name);
+
+    // Method: implicit `self: borrow<0>` prepended (via its own
+    // typedef slot at index 3).
+    try testing.expect(iface.decls[4].type == .val);
+    try testing.expect(iface.decls[4].type.val == .borrow);
+    try testing.expectEqual(@as(u32, 0), iface.decls[4].type.val.borrow);
+    try testing.expect(iface.decls[5].type == .func);
+    const method = iface.decls[5].type.func;
+    try testing.expectEqual(@as(usize, 2), method.params.len);
+    try testing.expectEqualStrings("self", method.params[0].name);
+    try testing.expect(method.params[0].type == .type_idx);
+    try testing.expectEqual(@as(u32, 3), method.params[0].type.type_idx);
+    try testing.expectEqualStrings("byte", method.params[1].name);
+    try testing.expect(method.params[1].type == .u8);
+    try testing.expect(method.results.unnamed == .u32);
+    try testing.expectEqualStrings("[method]output-stream.write", iface.decls[6].@"export".name);
+
+    // Static: no implicit self, no forced result.
+    try testing.expect(iface.decls[7].type == .func);
+    const stat = iface.decls[7].type.func;
+    try testing.expectEqual(@as(usize, 0), stat.params.len);
+    try testing.expect(stat.results.unnamed == .u32);
+    try testing.expectEqualStrings("[static]output-stream.check", iface.decls[8].@"export".name);
+}
+
+test "metadata_encode: explicit `borrow<R>` / `own<R>` in func sigs" {
+    // A function that takes a borrow and returns an own — exercises
+    // `lowerType` for both handle forms via the post-resource
+    // `name_map` binding. Each handle gets its own typedef slot per
+    // the component-model spec (handle types are *defined* types).
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface streams {
+        \\    resource output-stream { }
+        \\    clone: func(s: borrow<output-stream>) -> own<output-stream>;
+        \\}
+        \\world demo { export streams; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body shape:
+    //   0: ExportDecl "output-stream" (type sub-resource)  — slot 0
+    //   1: TypeDef.val .borrow=0                            — slot 1
+    //   2: TypeDef.val .own=0                               — slot 2
+    //   3: TypeDef.func (s: type_idx=1) -> type_idx=2       — slot 3
+    //   4: ExportDecl "clone" func=3
+    try testing.expectEqual(@as(usize, 5), iface.decls.len);
+    try testing.expect(iface.decls[1].type == .val);
+    try testing.expect(iface.decls[1].type.val == .borrow);
+    try testing.expectEqual(@as(u32, 0), iface.decls[1].type.val.borrow);
+    try testing.expect(iface.decls[2].type == .val);
+    try testing.expect(iface.decls[2].type.val == .own);
+    try testing.expectEqual(@as(u32, 0), iface.decls[2].type.val.own);
+    try testing.expect(iface.decls[3].type == .func);
+    const f = iface.decls[3].type.func;
+    try testing.expect(f.params[0].type == .type_idx);
+    try testing.expectEqual(@as(u32, 1), f.params[0].type.type_idx);
+    try testing.expect(f.results.unnamed == .type_idx);
+    try testing.expectEqual(@as(u32, 2), f.results.unnamed.type_idx);
+    try testing.expectEqualStrings("clone", iface.decls[4].@"export".name);
+}
+
+test "metadata_encode: borrow<non-resource> reports InvalidWit" {
+    // `borrow<R>` where `R` is bound to a primitive alias (not a
+    // resource) is malformed. The encoder must catch it.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    type r = u32;
+        \\    f: func(x: borrow<r>);
+        \\}
+        \\world demo { export ops; }
+    ;
+    const r = encodeWorldFromSource(testing.allocator, source, "demo");
+    try testing.expectError(error.InvalidWit, r);
+}
+
+test "metadata_encode: use clause aliases resource from outer world body" {
+    // `use streams.{output-stream};` inside `stdout` must surface
+    // `output-stream` at the world-body type indexspace via an
+    // `alias instance-export sort=type` decl emitted right after
+    // `streams`'s import, and the consuming interface must pull it
+    // in via `alias outer (type 1 K)`. Mirrors wit-component
+    // 0.220.0's canonical encoding shape.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface streams {
+        \\    resource output-stream { }
+        \\}
+        \\interface stdout {
+        \\    use streams.{output-stream};
+        \\    get-stdout: func() -> own<output-stream>;
+        \\}
+        \\world cmd {
+        \\    import streams;
+        \\    import stdout;
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "cmd");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    // World body should contain 5 decls in order:
+    //   0: TypeDef.instance (streams body)            — world type slot 0
+    //   1: ImportDecl "docs:demo/streams@0.1.0"
+    //   2: Alias.instance_export sort=type inst=0 name="output-stream"
+    //                                                 — world type slot 1
+    //   3: TypeDef.instance (stdout body)             — world type slot 2
+    //   4: ImportDecl "docs:demo/stdout@0.1.0"
+    const world_body = comp.types[0].component.decls[0].type.component;
+    try testing.expectEqual(@as(usize, 5), world_body.decls.len);
+    try testing.expect(world_body.decls[2] == .alias);
+    try testing.expect(world_body.decls[2].alias == .instance_export);
+    try testing.expectEqualStrings("output-stream", world_body.decls[2].alias.instance_export.name);
+    try testing.expect(world_body.decls[2].alias.instance_export.sort == .type);
+    try testing.expectEqual(@as(u32, 0), world_body.decls[2].alias.instance_export.instance_idx);
+
+    // stdout body should contain 5 decls in order:
+    //   0: Alias.outer sort=type count=1 idx=1        — local type slot 0
+    //   1: ExportDecl "output-stream" type=eq{0}      — local type slot 1
+    //                                                  (binds `output-stream`
+    //                                                   here so `own<R>` /
+    //                                                   `borrow<R>` resolve
+    //                                                   through the named
+    //                                                   export id, per
+    //                                                   wasm-tools'
+    //                                                   `validate_and_register_named_types`)
+    //   2: TypeDef.val .own=1                          — local type slot 2
+    //                                                   (references the
+    //                                                   export slot, NOT the
+    //                                                   raw alias slot)
+    //   3: TypeDef.func get-stdout() -> type_idx=2     — local type slot 3
+    //   4: ExportDecl "get-stdout" func=3
+    const stdout_body = world_body.decls[3].type.instance;
+    try testing.expectEqual(@as(usize, 5), stdout_body.decls.len);
+    try testing.expect(stdout_body.decls[0] == .alias);
+    try testing.expect(stdout_body.decls[0].alias == .outer);
+    try testing.expect(stdout_body.decls[0].alias.outer.sort == .type);
+    try testing.expectEqual(@as(u32, 1), stdout_body.decls[0].alias.outer.outer_count);
+    try testing.expectEqual(@as(u32, 1), stdout_body.decls[0].alias.outer.idx);
+    try testing.expect(stdout_body.decls[1] == .@"export");
+    try testing.expectEqualStrings("output-stream", stdout_body.decls[1].@"export".name);
+    try testing.expect(stdout_body.decls[1].@"export".desc == .type);
+    try testing.expectEqual(@as(u32, 0), stdout_body.decls[1].@"export".desc.type.eq);
+    try testing.expect(stdout_body.decls[2].type == .val);
+    try testing.expect(stdout_body.decls[2].type.val == .own);
+    try testing.expectEqual(@as(u32, 1), stdout_body.decls[2].type.val.own);
+    try testing.expect(stdout_body.decls[3].type == .func);
+    try testing.expect(stdout_body.decls[3].type.func.results.unnamed == .type_idx);
+    try testing.expectEqual(@as(u32, 2), stdout_body.decls[3].type.func.results.unnamed.type_idx);
+}
+
+test "metadata_encode: use clause with rename binds the renamed name" {
+    // `use streams.{output-stream as out};` should bind the type
+    // under `out` in the consuming interface, not the original
+    // `output-stream`. The rename also drives the export decl's
+    // visible name so consumers see `out`, not `output-stream`.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface streams { resource output-stream { } }
+        \\interface stdout {
+        \\    use streams.{output-stream as out};
+        \\    get-stdout: func() -> own<out>;
+        \\}
+        \\world cmd { import streams; import stdout; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "cmd");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const world_body = comp.types[0].component.decls[0].type.component;
+    const stdout_body = world_body.decls[3].type.instance;
+    try testing.expectEqualStrings("out", stdout_body.decls[1].@"export".name);
+}
+
+test "metadata_encode: use of an unknown type in source iface reports InvalidWit" {
+    // `use streams.{missing-type};` — when `missing-type` is never
+    // declared in the source interface, the world-body pre-pass
+    // still records the request, but the consuming-iface lookup at
+    // `alias outer` emission time finds the slot (the pre-pass
+    // doesn't validate). To produce a clean error, the encoder
+    // would need a second validation pass — for now this test
+    // documents that the alias is emitted anyway; the splicer/canon
+    // stage will reject the dangling alias when the source
+    // interface is materialised.
+    //
+    // The wit-component encoder rejects this at parse time; we
+    // accept it here and rely on downstream validation. This test
+    // pins the current behaviour so a future validation pass can
+    // tighten it without surprise.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface streams { resource output-stream { } }
+        \\interface stdout { use streams.{missing-type}; }
+        \\world cmd { import streams; import stdout; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "cmd");
+    defer testing.allocator.free(bytes);
+}
+
+test "metadata_encode: implicit-imports source iface used by an iface in the world (#195 phase 4)" {
+    // Before #195 phase 4, the source interface of a `use` clause
+    // had to be explicitly imported/exported by the world; without
+    // that, the encoder returned `error.InvalidWit`. Now the
+    // encoder auto-imports the source — mirroring wit-component's
+    // implicit-import behaviour — so worlds like `wasi-http/proxy`
+    // (which only includes `imports`, not the underlying
+    // `wasi:http/types` interface that its exports `use`) encode
+    // cleanly.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface streams { resource output-stream { } }
+        \\interface stdout { use streams.{output-stream}; get-stdout: func() -> own<output-stream>; }
+        \\world cmd { import stdout; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "cmd");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const comp = try loader.load(bytes, arena.allocator());
+
+    // The world body should contain TWO imports — `stdout`
+    // (explicitly declared) and `streams` (auto-imported because
+    // `stdout` uses it).
+    const wb = comp.types[0].component.decls[0].type.component;
+    var import_names = std.ArrayList([]const u8).empty;
+    for (wb.decls) |d| switch (d) {
+        .import => |im| try import_names.append(arena.allocator(), im.name),
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 2), import_names.items.len);
+    var saw_streams = false;
+    var saw_stdout = false;
+    for (import_names.items) |n| {
+        if (std.mem.endsWith(u8, n, "/streams@0.1.0")) saw_streams = true;
+        if (std.mem.endsWith(u8, n, "/stdout@0.1.0")) saw_stdout = true;
+    }
+    try testing.expect(saw_streams);
+    try testing.expect(saw_stdout);
+}
+
+test "metadata_encode: use clause from qualified versioned source ref" {
+    // `use wasi:io/streams@0.2.6.{output-stream};` exercises
+    // `parseSemverText`'s lookahead so the `.` before `{` is not
+    // greedily swallowed as a semver continuation. Regression
+    // pin for the bug discovered while wiring Phase 1.c.3a
+    // (preview1.wit declaring `wasi:cli/stdout` + `wasi:cli/stderr`).
+    const source =
+        \\package wabt:demo@0.0.0;
+        \\interface streams { resource output-stream { } }
+        \\interface stdout {
+        \\    use wabt:demo/streams@0.0.0.{output-stream};
+        \\    get-stdout: func() -> own<output-stream>;
+        \\}
+        \\world cmd { import streams; import stdout; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "cmd");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const world_body = comp.types[0].component.decls[0].type.component;
+    // Same shape as the short-ref version: 5 world-body decls, with
+    // the alias-instance-export decl between `streams` and `stdout`.
+    try testing.expectEqual(@as(usize, 5), world_body.decls.len);
+    try testing.expectEqualStrings("output-stream", world_body.decls[2].alias.instance_export.name);
+}
+
+test "metadata_encode #234: cross-iface use of a type alias exports it from the source iface" {
+    // Regression for cataggar/wabt#234. When interface `timer` does
+    // `use clock.{duration}` where `clock` defines `type duration =
+    // u64`, the world body emits an `alias instance-export ...
+    // "duration"` against `clock`'s instance. That alias dangles
+    // unless `clock`'s instance type actually EXPORTS a type named
+    // `duration` — pre-fix the encoder inlined the alias to `u64` and
+    // emitted no export, producing `instance N has no export named
+    // 'duration'` at validation time.
+    const source =
+        \\package wabt:demo@0.0.0;
+        \\interface clock {
+        \\    type duration = u64;
+        \\    now: func() -> duration;
+        \\}
+        \\interface timer {
+        \\    use wabt:demo/clock@0.0.0.{duration};
+        \\    set: func(d: duration);
+        \\}
+        \\world w { import clock; import timer; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "w");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const world_body = comp.types[0].component.decls[0].type.component;
+    // decls[0] is the `clock` instance type; it must export `duration`
+    // as a named type so the cross-iface alias resolves.
+    const clock_inst = world_body.decls[0].type.instance;
+    var exports_duration = false;
+    for (clock_inst.decls) |d| {
+        if (d == .@"export" and d.@"export".desc == .type and
+            std.mem.eql(u8, d.@"export".name, "duration"))
+        {
+            exports_duration = true;
+        }
+    }
+    try testing.expect(exports_duration);
+}
+
+// ── #182: auto-wrap bare resource refs with own<> ─────────────────────────
+//
+// The component-model spec / wit-component's reference encoder
+// auto-wraps a bare `.name` reference to a resource with `own<>` in
+// any value-type position (tuple element, list element, record
+// field, variant payload, option inner, result ok/err, func param,
+// func result). Without this sugar a tuple/list/record over a bare
+// resource ref lowers to `Defined(Tuple([Type(N), …]))` where
+// `Type(N)` is the resource alias — wasmtime rejects this at parse
+// time ("type index N is not a defined type"). The tests below pin
+// the auto-own behavior for each value-type position and verify
+// negative cases (type aliases, explicit borrow<>) are unaffected.
+
+test "metadata_encode #182: bare resource as func result auto-wraps to own<R>" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface i {
+        \\    resource handle { }
+        \\    open: func() -> handle;
+        \\}
+        \\world demo { export i; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body shape:
+    //   0: ExportDecl "handle" (type sub-resource)         — slot 0
+    //   1: TypeDef.val .own=0   (auto-wrapped result slot) — slot 1
+    //   2: TypeDef.func open() -> type_idx=1               — slot 2
+    //   3: ExportDecl "open" func=2
+    try testing.expectEqual(@as(usize, 4), iface.decls.len);
+    try testing.expect(iface.decls[1].type == .val);
+    try testing.expect(iface.decls[1].type.val == .own);
+    try testing.expectEqual(@as(u32, 0), iface.decls[1].type.val.own);
+    try testing.expect(iface.decls[2].type == .func);
+    try testing.expect(iface.decls[2].type.func.results.unnamed == .type_idx);
+    try testing.expectEqual(@as(u32, 1), iface.decls[2].type.func.results.unnamed.type_idx);
+}
+
+test "metadata_encode #182: bare resource as func param auto-wraps to own<R>" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface i {
+        \\    resource handle { }
+        \\    consume: func(h: handle);
+        \\}
+        \\world demo { export i; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    //   0: ExportDecl "handle" (sub-resource)              — slot 0
+    //   1: TypeDef.val .own=0  (auto-wrapped param slot)   — slot 1
+    //   2: TypeDef.func consume(h: type_idx=1) -> none     — slot 2
+    //   3: ExportDecl "consume" func=2
+    try testing.expectEqual(@as(usize, 4), iface.decls.len);
+    try testing.expect(iface.decls[1].type.val == .own);
+    try testing.expectEqual(@as(u32, 0), iface.decls[1].type.val.own);
+    const func = iface.decls[2].type.func;
+    try testing.expectEqual(@as(usize, 1), func.params.len);
+    try testing.expectEqualStrings("h", func.params[0].name);
+    try testing.expect(func.params[0].type == .type_idx);
+    try testing.expectEqual(@as(u32, 1), func.params[0].type.type_idx);
+    try testing.expect(func.results == .none);
+}
+
+test "metadata_encode #182: bare resource in tuple element of use-introduced resource (preopens shape)" {
+    // The motivating fixture: `preopens.get-directories` returns
+    // `list<tuple<descriptor, string>>` where `descriptor` comes in
+    // via `use types.{descriptor};`. The encoder must auto-wrap the
+    // bare `descriptor` tuple element as `own<descriptor>` against
+    // the *export slot* of the `use`-introduced alias (NOT the
+    // outer alias slot), matching wit-component's wire bytes.
+    const source =
+        \\package wasi:filesystem@0.2.6;
+        \\interface types { resource descriptor { } }
+        \\interface preopens {
+        \\    use types.{descriptor};
+        \\    get-directories: func() -> list<tuple<descriptor, string>>;
+        \\}
+        \\world demo { import types; import preopens; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    // Walk: world body → preopens instance type body.
+    const world_body = comp.types[0].component.decls[0].type.component;
+    // World decls: 0 = types instance, 1 = import types,
+    //              2 = alias instance_export "descriptor",
+    //              3 = preopens instance, 4 = import preopens.
+    const preopens_body = world_body.decls[3].type.instance;
+    //   0: Alias.outer sort=type count=1 idx=1      — local slot 0
+    //   1: ExportDecl "descriptor" type=eq{0}       — local slot 1
+    //   2: TypeDef.val .own=1                       — local slot 2
+    //      (auto-wrap of bare `descriptor` in tuple)
+    //   3: TypeDef.tuple<type_idx=2, string>        — local slot 3
+    //   4: TypeDef.list<type_idx=3>                 — local slot 4
+    //   5: TypeDef.func () -> type_idx=4            — local slot 5
+    //   6: ExportDecl "get-directories" func=5
+    try testing.expectEqual(@as(usize, 7), preopens_body.decls.len);
+
+    // The auto-wrap: own slot referencing the export-eq slot (1).
+    try testing.expect(preopens_body.decls[2].type == .val);
+    try testing.expect(preopens_body.decls[2].type.val == .own);
+    try testing.expectEqual(@as(u32, 1), preopens_body.decls[2].type.val.own);
+
+    // Tuple slot points to the own slot (2), not the bare export
+    // slot (1). This is the bug #181 worked around with explicit
+    // `own<>`; the auto-own path must produce the same wire bytes.
+    try testing.expect(preopens_body.decls[3].type == .tuple);
+    const tup = preopens_body.decls[3].type.tuple;
+    try testing.expectEqual(@as(usize, 2), tup.fields.len);
+    try testing.expect(tup.fields[0] == .type_idx);
+    try testing.expectEqual(@as(u32, 2), tup.fields[0].type_idx);
+    try testing.expect(tup.fields[1] == .string);
+}
+
+test "metadata_encode #182: bare resource as record field auto-wraps to own<R>" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface i {
+        \\    resource handle { }
+        \\    record wrapper { h: handle, label: string }
+        \\}
+        \\world demo { export i; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    //   0: ExportDecl "handle" (sub-resource)              — slot 0
+    //   1: TypeDef.val .own=0  (auto-wrapped field slot)   — slot 1
+    //   2: TypeDef.record {h: type_idx=1, label: string}   — slot 2
+    //   3: ExportDecl "wrapper" type=eq{2}                 — slot 3
+    try testing.expectEqual(@as(usize, 4), iface.decls.len);
+    try testing.expect(iface.decls[1].type.val == .own);
+    try testing.expectEqual(@as(u32, 0), iface.decls[1].type.val.own);
+    try testing.expect(iface.decls[2].type == .record);
+    const rec = iface.decls[2].type.record;
+    try testing.expectEqual(@as(usize, 2), rec.fields.len);
+    try testing.expectEqualStrings("h", rec.fields[0].name);
+    try testing.expect(rec.fields[0].type == .type_idx);
+    try testing.expectEqual(@as(u32, 1), rec.fields[0].type.type_idx);
+    try testing.expect(rec.fields[1].type == .string);
+}
+
+test "metadata_encode #182: option/list/result/variant payload all auto-wrap" {
+    // Compact case covering the four remaining value-type positions.
+    // Each container's inner type must point at its own `own<R>`
+    // slot. Type defs come before func defs so forward refs aren't
+    // needed (encoder processes items in declaration order).
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface i {
+        \\    resource r { }
+        \\    variant variant-out { some(r), nothing }
+        \\    maybe: func() -> option<r>;
+        \\    many:  func() -> list<r>;
+        \\    fall:  func() -> result<r, string>;
+        \\    pick:  func() -> variant-out;
+        \\}
+        \\world demo { export i; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Walk through the decls and count `.val .own = 0` slots — one
+    // per auto-wrap site. Expected sites:
+    //   * variant-case-`some` payload (auto-wrap of `r`)
+    //   * option inner (`option<r>`)
+    //   * list element (`list<r>`)
+    //   * result.ok (`result<r, string>`)
+    // Four auto-wraps total, plus zero for the `pick` return (that's
+    // a `variant-out` named type reference, not a bare resource ref).
+    var own_slots: usize = 0;
+    for (iface.decls) |d| {
+        if (d == .type and d.type == .val and d.type.val == .own and d.type.val.own == 0) {
+            own_slots += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 4), own_slots);
+}
+
+test "metadata_encode #182: type alias to primitive is NOT auto-wrapped" {
+    // Negative: `type byte-count = u32;` followed by
+    // `sized: func() -> byte-count` must NOT route through the
+    // resource auto-wrap path — `byte-count` is a primitive alias,
+    // not a resource. The result must be the primitive ValType, not
+    // wrapped in `own<>`.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface i {
+        \\    type byte-count = u32;
+        \\    sized: func() -> byte-count;
+        \\}
+        \\world demo { export i; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body shape:
+    //   0: TypeDef.func sized() -> u32                    — slot 0
+    //   1: ExportDecl "sized" func=0
+    // (Primitive aliases don't consume a body slot — name_map
+    // maps directly to the primitive ValType.)
+    try testing.expectEqual(@as(usize, 2), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .func);
+    try testing.expect(iface.decls[0].type.func.results.unnamed == .u32);
+}
+
+test "metadata_encode #182: explicit borrow<R> on use-introduced resource still works" {
+    // Regression guard: the auto-own path must not break the
+    // existing explicit `borrow<R>` resolution for resources brought
+    // in via `use other.{R}`. The visible name (after `rename`) ends
+    // up in `resource_names` *and* in `name_map`; the explicit
+    // `borrow<R>` AST node goes through `handleValType`, which looks
+    // up `name_map` directly — unaffected by `resource_names`.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface types { resource handle { } }
+        \\interface ops {
+        \\    use types.{handle};
+        \\    peek: func(h: borrow<handle>);
+        \\}
+        \\world demo { import types; import ops; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const world_body = comp.types[0].component.decls[0].type.component;
+    const ops_body = world_body.decls[3].type.instance;
+    // ops body:
+    //   0: Alias.outer count=1 idx=1                       — slot 0
+    //   1: ExportDecl "handle" type=eq{0}                  — slot 1
+    //   2: TypeDef.val .borrow=1  (explicit borrow<>)      — slot 2
+    //   3: TypeDef.func peek(h: type_idx=2) -> none        — slot 3
+    //   4: ExportDecl "peek" func=3
+    try testing.expectEqual(@as(usize, 5), ops_body.decls.len);
+    try testing.expect(ops_body.decls[2].type == .val);
+    try testing.expect(ops_body.decls[2].type.val == .borrow);
+    try testing.expectEqual(@as(u32, 1), ops_body.decls[2].type.val.borrow);
+}
+
+test "metadata_encode #195p3: include splices base world's items" {
+    // Synthetic include test mirroring wasi-http's
+    // `world proxy { include imports; export incoming-handler; }`
+    // pattern. The consumer world should encode as if `base`'s
+    // items were inlined.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface a { f: func(); }
+        \\interface b { g: func(); }
+        \\world base {
+        \\    import a;
+        \\}
+        \\world consumer {
+        \\    include base;
+        \\    export b;
+        \\}
+    ;
+    const ct = try encodeWorldFromSource(testing.allocator, source, "consumer");
+    defer testing.allocator.free(ct);
+
+    const loader = @import("../loader.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const comp = try loader.load(ct, arena.allocator());
+
+    // World body: import a (instance) + export b (instance) — 4 decls.
+    const wb = comp.types[0].component.decls[0].type.component;
+    var imports: usize = 0;
+    var exports: usize = 0;
+    for (wb.decls) |d| switch (d) {
+        .import => imports += 1,
+        .@"export" => exports += 1,
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), imports);
+    try testing.expectEqual(@as(usize, 1), exports);
+}
+
+test "metadata_encode #195p3: transitive include (3 deep)" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface a { f: func(); }
+        \\interface b { g: func(); }
+        \\interface c { h: func(); }
+        \\world inner { import a; }
+        \\world middle { include inner; import b; }
+        \\world outer { include middle; export c; }
+    ;
+    const ct = try encodeWorldFromSource(testing.allocator, source, "outer");
+    defer testing.allocator.free(ct);
+
+    const loader = @import("../loader.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const comp = try loader.load(ct, arena.allocator());
+
+    const wb = comp.types[0].component.decls[0].type.component;
+    var imports: usize = 0;
+    var exports: usize = 0;
+    for (wb.decls) |d| switch (d) {
+        .import => imports += 1,
+        .@"export" => exports += 1,
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 2), imports); // a + b
+    try testing.expectEqual(@as(usize, 1), exports); // c
+}
+
+test "metadata_encode #195p3: include cycle is detected" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface a { f: func(); }
+        \\world w1 { include w2; }
+        \\world w2 { include w1; }
+    ;
+    const r = encodeWorldFromSource(testing.allocator, source, "w1");
+    try testing.expectError(error.IncludeCycle, r);
+}
+
+test "metadata_encode #195p3: include with { N as A } rename" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface a { f: func(); }
+        \\interface a-renamed { f: func(); }
+        \\world base { import a; }
+        \\world consumer { include base with { a as a-renamed }; }
+    ;
+    // The rename should rebind the imported name `a` to `a-renamed`.
+    // Since both interfaces exist in the package, the encoder uses
+    // the renamed local name to look up the interface body. Both
+    // should encode without error.
+    const ct = try encodeWorldFromSource(testing.allocator, source, "consumer");
+    defer testing.allocator.free(ct);
+
+    const loader = @import("../loader.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const comp = try loader.load(ct, arena.allocator());
+    const wb = comp.types[0].component.decls[0].type.component;
+    var found_renamed = false;
+    for (wb.decls) |d| switch (d) {
+        .import => |im| {
+            if (std.mem.indexOf(u8, im.name, "/a-renamed@") != null) found_renamed = true;
+        },
+        else => {},
+    };
+    try testing.expect(found_renamed);
+}

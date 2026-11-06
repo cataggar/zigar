@@ -1,0 +1,18 @@
+WebAssembly Component Model library (vendored from cataggar/wabt)
+Copyright 2026 The WABT-Zig Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use these files except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Source provenance:
+- Upstream repository: https://github.com/cataggar/wabt
+- Commit: d5c506a7195a1c5b59679ed0f0b0640e3a69f2df
+- Original paths:
+  - src/component/**
+  - src/tools/component_new.zig (as build_component.zig)
+  - src/Module.zig, src/Feature.zig, src/Opcode.zig, src/leb128.zig, src/types.zig (as core_types.zig)
+  - src/binary/{instr,reader,writer}.zig
+  - adapters/wasi_snapshot_preview1.zig (compiled into adapter/wasi_snapshot_preview1.{command,reactor}.wasm)
+  - src/component/wit/wasi-canon/** (canonical WASI WIT files from WebAssembly/WASI, Apache-2.0 WITH LLVM-exception)

@@ -1,0 +1,1742 @@
+//! Component Model binary format loader.
+//!
+//! Parses a WebAssembly Component binary into the in-memory AST defined
+//! in `types.zig`. Components use the same magic bytes as core modules
+//! but a different layer field (0x01) and version (0x0d).
+//!
+//! Component sections can be interleaved (unlike core module sections which
+//! have a strict ordering). Each section's definitions are appended to the
+//! appropriate index space.
+//!
+//! Originally developed in `cataggar/wamr` (`src/component/loader.zig`,
+//! Apache-2.0). Adapted for wabt.
+
+const std = @import("std");
+const ctypes = @import("types.zig");
+// Component preamble constants (component_version differs from core: layer=0x01).
+const wasm_magic: u32 = 0x6d736100;
+const component_version: u32 = 0x0001_000d;
+const leb128 = @import("leb128.zig");
+
+pub const LoadError = error{
+    InvalidMagic,
+    InvalidVersion,
+    UnexpectedEnd,
+    InvalidSectionId,
+    InvalidSectionSize,
+    InvalidEncoding,
+    UnsupportedFeature,
+    OutOfMemory,
+    Overflow,
+    InvalidUtf8,
+    DuplicateSection,
+    DuplicateName,
+    DuplicateAttribute,
+    UnsupportedSection,
+};
+
+/// A streaming reader over the component binary.
+const BinaryReader = struct {
+    data: []const u8,
+    pos: usize = 0,
+    limit: usize = 0,
+
+    fn end(self: *const BinaryReader) usize {
+        return if (self.limit == 0) self.data.len else self.limit;
+    }
+
+    fn remaining(self: *const BinaryReader) usize {
+        return self.end() - self.pos;
+    }
+
+    fn readByte(self: *BinaryReader) LoadError!u8 {
+        if (self.pos >= self.end()) return error.UnexpectedEnd;
+        const b = self.data[self.pos];
+        self.pos += 1;
+        return b;
+    }
+
+    fn peekByte(self: *BinaryReader) LoadError!u8 {
+        if (self.pos >= self.end()) return error.UnexpectedEnd;
+        return self.data[self.pos];
+    }
+
+    fn readBytes(self: *BinaryReader, n: usize) LoadError![]const u8 {
+        if (n > self.remaining()) return error.UnexpectedEnd;
+        const slice = self.data[self.pos .. self.pos + n];
+        self.pos += n;
+        return slice;
+    }
+
+    fn readU32(self: *BinaryReader) LoadError!u32 {
+        const end_pos = self.end();
+        if (self.pos >= end_pos) return error.UnexpectedEnd;
+        const slice = self.data[self.pos..end_pos];
+        const result = leb128.readU32Leb128(slice) catch |err| switch (err) {
+            error.Overflow => return error.InvalidEncoding,
+            error.UnexpectedEnd => return error.UnexpectedEnd,
+        };
+        self.pos += result.bytes_read;
+        return result.value;
+    }
+
+    /// Read a signed LEB128 in `s33` form (component valtype discriminator).
+    /// Non-negative values are type indices; negative values encode primitive
+    /// valtypes and handle forms.
+    fn readS33(self: *BinaryReader) LoadError!i64 {
+        const end_pos = self.end();
+        if (self.pos >= end_pos) return error.UnexpectedEnd;
+        const slice = self.data[self.pos..end_pos];
+        const result = leb128.readS33Leb128(slice) catch |err| switch (err) {
+            error.Overflow => return error.InvalidEncoding,
+            error.UnexpectedEnd => return error.UnexpectedEnd,
+        };
+        self.pos += result.bytes_read;
+        return result.value;
+    }
+
+    fn readFixedU32(self: *BinaryReader) LoadError!u32 {
+        const bytes = try self.readBytes(4);
+        return std.mem.readInt(u32, bytes[0..4], .little);
+    }
+
+    fn readName(self: *BinaryReader) LoadError![]const u8 {
+        const len = try self.readU32();
+        const name = try self.readBytes(len);
+        // Validate UTF-8
+        if (!std.unicode.utf8ValidateSlice(name)) return error.InvalidUtf8;
+        return name;
+    }
+};
+
+/// Component section IDs per the binary format spec.
+const SectionId = enum(u8) {
+    custom = 0,
+    core_module = 1,
+    core_instance = 2,
+    core_type = 3,
+    component = 4,
+    instance = 5,
+    alias = 6,
+    type = 7,
+    canon = 8,
+    start = 9,
+    import = 10,
+    @"export" = 11,
+    value = 12,
+};
+
+/// Load a WebAssembly Component from binary data.
+pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Component {
+    return loadInner(data, allocator, .{});
+}
+
+/// Decode the complete supported component subset without silently skipping
+/// sections that are not represented by the AST.
+pub fn loadStrict(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Component {
+    return loadInner(data, allocator, .{ .strict = true });
+}
+
+/// Like `load`, but additionally captures the physical section layout
+/// (`section_order`) and preserves custom sections, so that a
+/// `load -> writer.encode` round-trip reproduces the component's section
+/// sequence (and metadata) rather than the writer's conventional
+/// re-ordering. Used by `wabt component objdump -o` for round-trip
+/// testing. Do NOT use this for components that will be *mutated* before
+/// re-encoding (e.g. compose / component-new transforms): the captured
+/// `section_order` indices would go stale against the edited arrays.
+pub fn loadVerbatim(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Component {
+    return loadInner(data, allocator, .{ .capture_layout = true });
+}
+
+const LoadOptions = struct {
+    capture_layout: bool = false,
+    strict: bool = false,
+};
+
+fn loadInner(data: []const u8, allocator: std.mem.Allocator, options: LoadOptions) LoadError!ctypes.Component {
+    const capture_layout = options.capture_layout;
+    var reader = BinaryReader{ .data = data, .limit = data.len };
+
+    // Validate preamble
+    const magic = try reader.readFixedU32();
+    if (magic != wasm_magic) return error.InvalidMagic;
+    const version = try reader.readFixedU32();
+    if (version != component_version) return error.InvalidVersion;
+
+    // Collect sections into dynamic arrays
+    var core_modules: std.ArrayList(ctypes.CoreModule) = .empty;
+    var core_instances: std.ArrayList(ctypes.CoreInstanceExpr) = .empty;
+    var core_type_defs: std.ArrayList(ctypes.CoreTypeDef) = .empty;
+    var components: std.ArrayList(*ctypes.Component) = .empty;
+    var instances: std.ArrayList(ctypes.InstanceExpr) = .empty;
+    var aliases: std.ArrayList(ctypes.Alias) = .empty;
+    var type_defs: std.ArrayList(ctypes.TypeDef) = .empty;
+    var canons: std.ArrayList(ctypes.Canon) = .empty;
+    var imports: std.ArrayList(ctypes.ImportDecl) = .empty;
+    var exports: std.ArrayList(ctypes.ExportDecl) = .empty;
+    var start: ?ctypes.Start = null;
+    // Tracks the type index space in section-encounter order. Each entry
+    // is the local idx into `type_defs` for that slot, or null when
+    // the slot is consumed by an import (`.type`-bound) or alias whose
+    // target type def we don't materialize. Required to resolve real
+    // wasm32-wasip2 components where types and aliases interleave.
+    var type_indexspace: std.ArrayList(ctypes.TypeContributor) = .empty;
+    // Core-func index space contributors in binary declaration order.
+    // Each canon that produces a core func and each `core(.func)` alias
+    // appends one entry as it is parsed.
+    var core_func_indexspace: std.ArrayList(ctypes.CoreFuncContributor) = .empty;
+    // Component-instance index space contributors in binary
+    // declaration order. Required for `wasm-tools compose` output
+    // where instance and alias-of-instance sections interleave —
+    // the legacy "imports then instances then aliases" walk in
+    // `indexspace.resolveCompInstance` only handles non-interleaved
+    // layouts (issue #355).
+    var comp_instance_indexspace: std.ArrayList(ctypes.CompInstanceContributor) = .empty;
+
+    // Physical section layout, captured only when `capture_layout` is set
+    // (see `loadVerbatim`). One `SectionEntry` per physical section, in
+    // encounter order, so the writer's ordered path can faithfully
+    // reproduce the original section sequence. Custom sections — normally
+    // dropped — are preserved into `custom_sections` and referenced by
+    // their `.custom` entries. `layout_faithful` is cleared if a section
+    // we cannot represent (e.g. `value`) is encountered, in which case we
+    // emit no `section_order` and fall back to conventional ordering.
+    var section_order: std.ArrayList(ctypes.SectionEntry) = .empty;
+    var custom_sections: std.ArrayList(ctypes.CustomSection) = .empty;
+    var layout_faithful = true;
+
+    while (reader.remaining() > 0) {
+        const section_id_byte = try reader.readByte();
+        const section_size = try reader.readU32();
+
+        const section_start = reader.pos;
+        const section_end = std.math.add(usize, section_start, section_size) catch
+            return error.InvalidSectionSize;
+        if (section_end > reader.limit) return error.InvalidSectionSize;
+
+        const section_id = std.enums.fromInt(SectionId, section_id_byte) orelse
+            return error.InvalidSectionId;
+        const outer_limit = reader.limit;
+        reader.limit = section_end;
+
+        // Snapshot per-section array lengths so we can record a
+        // `SectionEntry` (start + count) for this physical section after
+        // it is parsed (only when capturing layout).
+        const len_before = .{
+            .custom = custom_sections.items.len,
+            .core_module = core_modules.items.len,
+            .core_instance = core_instances.items.len,
+            .core_type = core_type_defs.items.len,
+            .component = components.items.len,
+            .instance = instances.items.len,
+            .alias = aliases.items.len,
+            .type = type_defs.items.len,
+            .canon = canons.items.len,
+            .import = imports.items.len,
+            .@"export" = exports.items.len,
+        };
+
+        switch (section_id) {
+            .custom => {
+                // A custom section always starts with a valid UTF-8 name.
+                // Validate it even when the caller does not retain layout;
+                // skipping the whole body used to accept malformed sections.
+                const name = try reader.readName();
+                if (reader.pos > section_end) return error.InvalidSectionSize;
+                if (capture_layout) {
+                    // Preserve the custom section: name (LEB-prefixed) then
+                    // the remaining bytes as opaque payload.
+                    const payload = reader.data[reader.pos..section_end];
+                    try custom_sections.append(allocator, .{ .name = name, .payload = payload });
+                }
+                // Skip to the end (whether or not we captured the name).
+                reader.pos = section_end;
+            },
+            .core_module => {
+                // The core module is stored as raw bytes (nested module binary)
+                const module_data = reader.data[section_start..section_end];
+                try core_modules.append(allocator, .{ .data = module_data });
+                reader.pos = section_end;
+            },
+            .core_instance => {
+                const count = try reader.readU32();
+                var i: u32 = 0;
+                while (i < count) : (i += 1) {
+                    try core_instances.append(allocator, try parseCoreInstance(&reader, allocator));
+                }
+            },
+            .core_type => {
+                const count = try reader.readU32();
+                var i: u32 = 0;
+                while (i < count) : (i += 1) {
+                    try core_type_defs.append(allocator, try parseCoreType(&reader, allocator));
+                }
+            },
+            .component => {
+                // Nested component — recursively parse. Propagate
+                // `capture_layout` so nested components also preserve
+                // their section order + custom sections; otherwise the
+                // writer re-orders them and breaks their internal index
+                // spaces on re-emit (#267).
+                const comp_data = reader.data[section_start..section_end];
+                const child = try allocator.create(ctypes.Component);
+                child.* = try loadInner(comp_data, allocator, options);
+                try components.append(allocator, child);
+                reader.pos = section_end;
+            },
+            .instance => {
+                const count = try reader.readU32();
+                var i: u32 = 0;
+                while (i < count) : (i += 1) {
+                    const local_idx: u32 = @intCast(instances.items.len);
+                    try instances.append(allocator, try parseInstance(&reader, allocator));
+                    try comp_instance_indexspace.append(allocator, .{ .instance = local_idx });
+                }
+            },
+            .alias => {
+                const count = try reader.readU32();
+                var i: u32 = 0;
+                while (i < count) : (i += 1) {
+                    const a = try parseAlias(&reader);
+                    const local_idx: u32 = @intCast(aliases.items.len);
+                    try aliases.append(allocator, a);
+                    // Aliases of sort .type contribute a slot to the
+                    // type indexspace (target unresolved here → null).
+                    const sort: ctypes.Sort = switch (a) {
+                        .instance_export => |ie| ie.sort,
+                        .outer => |o| o.sort,
+                    };
+                    if (sort == .type) try type_indexspace.append(allocator, .{ .alias = local_idx });
+                    // Aliases of sort .core(.func) contribute to the
+                    // core-func indexspace.
+                    const is_core_func = switch (sort) {
+                        .core => |cs| cs == .func,
+                        else => false,
+                    };
+                    if (is_core_func) try core_func_indexspace.append(allocator, .{ .alias = local_idx });
+                    // Aliases of sort .instance contribute to the
+                    // component-instance index space.
+                    if (sort == .instance) {
+                        try comp_instance_indexspace.append(allocator, .{ .alias = local_idx });
+                    }
+                }
+            },
+            .type => {
+                const count = try reader.readU32();
+                var i: u32 = 0;
+                while (i < count) : (i += 1) {
+                    const local_idx: u32 = @intCast(type_defs.items.len);
+                    try type_defs.append(allocator, try parseTypeDef(&reader, allocator));
+                    try type_indexspace.append(allocator, .{ .type_def = local_idx });
+                }
+            },
+            .canon => {
+                const count = try reader.readU32();
+                var i: u32 = 0;
+                while (i < count) : (i += 1) {
+                    const local_idx: u32 = @intCast(canons.items.len);
+                    const c = try parseCanon(&reader, allocator);
+                    try canons.append(allocator, c);
+                    // Every canon kind except `.lift` contributes a slot
+                    // to the core-func indexspace.
+                    const contributes = switch (c) {
+                        .lower, .resource_drop, .resource_new, .resource_rep, .future_new, .future_read, .future_write, .future_cancel_read, .future_cancel_write, .future_drop_readable, .future_drop_writable, .stream_new, .stream_read, .stream_write, .stream_cancel_read, .stream_cancel_write, .stream_drop_readable, .stream_drop_writable, .error_context_new, .error_context_debug_message, .error_context_drop, .task_return, .waitable_set_new, .waitable_set_wait, .waitable_set_poll, .waitable_set_drop, .waitable_join, .task_cancel, .subtask_cancel, .subtask_drop, .context_get, .context_set, .backpressure_inc, .backpressure_dec, .thread_yield => true,
+                        .lift => false,
+                    };
+                    if (contributes) try core_func_indexspace.append(allocator, .{ .canon = local_idx });
+                }
+            },
+            .start => {
+                if (start != null) return error.DuplicateSection;
+                start = try parseStart(&reader, allocator);
+            },
+            .import => {
+                const count = try reader.readU32();
+                var i: u32 = 0;
+                while (i < count) : (i += 1) {
+                    const local_idx: u32 = @intCast(imports.items.len);
+                    const imp = try parseImport(&reader, allocator);
+                    if (options.strict and containsImportName(imports.items, imp.name))
+                        return error.DuplicateName;
+                    try imports.append(allocator, imp);
+                    if (imp.desc == .type) try type_indexspace.append(allocator, .{ .import = local_idx });
+                    // Instance-typed imports contribute to the
+                    // component-instance index space (issue #355).
+                    if (imp.desc == .instance) {
+                        try comp_instance_indexspace.append(allocator, .{ .import = local_idx });
+                    }
+                }
+            },
+            .@"export" => {
+                const count = try reader.readU32();
+                var i: u32 = 0;
+                while (i < count) : (i += 1) {
+                    const exp = try parseTopLevelExport(&reader, allocator);
+                    if (options.strict and containsExportName(exports.items, exp.name))
+                        return error.DuplicateName;
+                    try exports.append(allocator, exp);
+                }
+            },
+            .value => {
+                if (options.strict) return error.UnsupportedSection;
+                // Value definitions are not represented by the current AST.
+                reader.pos = section_end;
+            },
+        }
+        // Defensive: every typed-section parser above should have consumed
+        // exactly `section_size` bytes. If a bug causes under- or over-read
+        // we'd otherwise misalign the next section header.
+        if (reader.pos != section_end) return error.InvalidSectionSize;
+        reader.limit = outer_limit;
+
+        // Record this physical section's layout entry (one per section).
+        if (capture_layout) {
+            const Kind = ctypes.SectionKind;
+            const entry: ?ctypes.SectionEntry = switch (section_id) {
+                .custom => mkEntry(.custom, len_before.custom, custom_sections.items.len),
+                .core_module => mkEntry(.core_module, len_before.core_module, core_modules.items.len),
+                .core_instance => mkEntry(.core_instance, len_before.core_instance, core_instances.items.len),
+                .core_type => mkEntry(.core_type, len_before.core_type, core_type_defs.items.len),
+                .component => mkEntry(.component, len_before.component, components.items.len),
+                .instance => mkEntry(.instance, len_before.instance, instances.items.len),
+                .alias => mkEntry(.alias, len_before.alias, aliases.items.len),
+                .type => mkEntry(.type, len_before.type, type_defs.items.len),
+                .canon => mkEntry(.canon, len_before.canon, canons.items.len),
+                .start => ctypes.SectionEntry{ .kind = Kind.start, .start = 0, .count = 0 },
+                .import => mkEntry(.import, len_before.import, imports.items.len),
+                .@"export" => mkEntry(.@"export", len_before.@"export", exports.items.len),
+                // `value` sections aren't materialized, so the layout
+                // cannot be faithfully reproduced — disable layout capture.
+                .value => blk: {
+                    layout_faithful = false;
+                    break :blk null;
+                },
+            };
+            if (entry) |e| try section_order.append(allocator, e);
+        }
+    }
+
+    return .{
+        .core_modules = try core_modules.toOwnedSlice(allocator),
+        .core_instances = try core_instances.toOwnedSlice(allocator),
+        .core_types = try core_type_defs.toOwnedSlice(allocator),
+        .components = try components.toOwnedSlice(allocator),
+        .instances = try instances.toOwnedSlice(allocator),
+        .aliases = try aliases.toOwnedSlice(allocator),
+        .types = try type_defs.toOwnedSlice(allocator),
+        .type_indexspace = try type_indexspace.toOwnedSlice(allocator),
+        .canons = try canons.toOwnedSlice(allocator),
+        .start = start,
+        .imports = try imports.toOwnedSlice(allocator),
+        .exports = try exports.toOwnedSlice(allocator),
+        .core_func_indexspace = try core_func_indexspace.toOwnedSlice(allocator),
+        .comp_instance_indexspace = try comp_instance_indexspace.toOwnedSlice(allocator),
+        .custom_sections = if (capture_layout) try custom_sections.toOwnedSlice(allocator) else &.{},
+        .section_order = if (capture_layout and layout_faithful)
+            try section_order.toOwnedSlice(allocator)
+        else
+            null,
+    };
+}
+
+fn containsImportName(imports: []const ctypes.ImportDecl, name: []const u8) bool {
+    for (imports) |imp| {
+        if (std.mem.eql(u8, imp.name, name)) return true;
+    }
+    return false;
+}
+
+fn containsExportName(exports: []const ctypes.ExportDecl, name: []const u8) bool {
+    for (exports) |exp| {
+        if (std.mem.eql(u8, exp.name, name)) return true;
+    }
+    return false;
+}
+
+/// Build a `SectionEntry` from a per-section array's before/after length.
+fn mkEntry(kind: ctypes.SectionKind, before: usize, after: usize) ctypes.SectionEntry {
+    return .{ .kind = kind, .start = @intCast(before), .count = @intCast(after - before) };
+}
+
+// ── Section parsers ─────────────────────────────────────────────────────────
+
+fn parseCoreInstance(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!ctypes.CoreInstanceExpr {
+    const tag = try reader.readByte();
+    switch (tag) {
+        0x00 => {
+            const module_idx = try reader.readU32();
+            const arg_count = try reader.readU32();
+            const args = try allocator.alloc(ctypes.CoreInstantiateArg, arg_count);
+            for (args) |*arg| {
+                arg.name = try reader.readName();
+                const sort_byte = try reader.readByte();
+                _ = sort_byte; // Must be 0x12 (instance sort)
+                arg.instance_idx = try reader.readU32();
+            }
+            return .{ .instantiate = .{ .module_idx = module_idx, .args = args } };
+        },
+        0x01 => {
+            const count = try reader.readU32();
+            const exps = try allocator.alloc(ctypes.CoreInlineExport, count);
+            for (exps) |*e| {
+                e.name = try reader.readName();
+                const sort = try reader.readByte();
+                const idx = try reader.readU32();
+                e.sort_idx = .{
+                    .sort = std.enums.fromInt(ctypes.CoreSort, sort) orelse return error.InvalidEncoding,
+                    .idx = idx,
+                };
+            }
+            return .{ .exports = exps };
+        },
+        else => return error.InvalidEncoding,
+    }
+}
+
+fn parseCoreType(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!ctypes.CoreTypeDef {
+    const tag = try reader.readByte();
+    switch (tag) {
+        0x60 => {
+            // Core function type
+            const param_count = try reader.readU32();
+            const params = try allocator.alloc(ctypes.CoreValType, param_count);
+            for (params) |*p| p.* = try readCoreValType(reader);
+            const result_count = try reader.readU32();
+            const results = try allocator.alloc(ctypes.CoreValType, result_count);
+            for (results) |*r| r.* = try readCoreValType(reader);
+            return .{ .func = .{ .params = params, .results = results } };
+        },
+        0x50 => {
+            // Core module type
+            const decl_count = try reader.readU32();
+            var imp_list: std.ArrayList(ctypes.CoreImportDecl) = .empty;
+            var exp_list: std.ArrayList(ctypes.CoreExportDecl) = .empty;
+            var i: u32 = 0;
+            while (i < decl_count) : (i += 1) {
+                const decl_tag = try reader.readByte();
+                switch (decl_tag) {
+                    0x00 => {
+                        // import
+                        const mod = try reader.readName();
+                        const name = try reader.readName();
+                        const type_idx = try reader.readU32();
+                        try imp_list.append(allocator, .{ .module = mod, .name = name, .type_idx = type_idx });
+                    },
+                    0x01 => {
+                        // export
+                        const name = try reader.readName();
+                        const type_idx = try reader.readU32();
+                        try exp_list.append(allocator, .{ .name = name, .type_idx = type_idx });
+                    },
+                    else => return error.InvalidEncoding,
+                }
+            }
+            return .{ .module = .{
+                .imports = try imp_list.toOwnedSlice(allocator),
+                .exports = try exp_list.toOwnedSlice(allocator),
+            } };
+        },
+        else => return error.InvalidEncoding,
+    }
+}
+
+fn readCoreValType(reader: *BinaryReader) LoadError!ctypes.CoreValType {
+    const b = try reader.readByte();
+    return std.enums.fromInt(ctypes.CoreValType, b) orelse return error.InvalidEncoding;
+}
+
+fn parseInstance(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!ctypes.InstanceExpr {
+    const tag = try reader.readByte();
+    switch (tag) {
+        0x00 => {
+            const comp_idx = try reader.readU32();
+            const arg_count = try reader.readU32();
+            const args = try allocator.alloc(ctypes.InstantiateArg, arg_count);
+            for (args) |*arg| {
+                arg.name = try reader.readName();
+                arg.sort_idx = try readSortIdx(reader);
+            }
+            return .{ .instantiate = .{ .component_idx = comp_idx, .args = args } };
+        },
+        0x01 => {
+            const count = try reader.readU32();
+            const exps = try allocator.alloc(ctypes.InlineExport, count);
+            for (exps) |*e| {
+                const parsed_name = try readExternName(reader, allocator);
+                e.name = parsed_name.name;
+                e.attributes = parsed_name.attributes;
+                e.sort_idx = try readSortIdx(reader);
+            }
+            return .{ .exports = exps };
+        },
+        else => return error.InvalidEncoding,
+    }
+}
+
+fn readSortIdx(reader: *BinaryReader) LoadError!ctypes.SortIdx {
+    const sort = try readSort(reader);
+    const idx = try reader.readU32();
+    return .{ .sort = sort, .idx = idx };
+}
+
+fn readSort(reader: *BinaryReader) LoadError!ctypes.Sort {
+    const b = try reader.readByte();
+    return switch (b) {
+        0x00 => blk: {
+            const cs = try reader.readByte();
+            break :blk .{ .core = std.enums.fromInt(ctypes.CoreSort, cs) orelse return error.InvalidEncoding };
+        },
+        0x01 => .func,
+        0x02 => .value,
+        0x03 => .type,
+        0x04 => .component,
+        0x05 => .instance,
+        else => error.InvalidEncoding,
+    };
+}
+
+fn parseAlias(reader: *BinaryReader) LoadError!ctypes.Alias {
+    const sort = try readSort(reader);
+    const target_tag = try reader.readByte();
+    switch (target_tag) {
+        0x00 => {
+            // alias export: instance export
+            const instance_idx = try reader.readU32();
+            const name = try reader.readName();
+            return .{ .instance_export = .{ .sort = sort, .instance_idx = instance_idx, .name = name } };
+        },
+        0x01 => {
+            // alias core export: core instance export
+            const instance_idx = try reader.readU32();
+            const name = try reader.readName();
+            return .{ .instance_export = .{ .sort = sort, .instance_idx = instance_idx, .name = name } };
+        },
+        0x02 => {
+            // outer alias
+            const outer_count = try reader.readU32();
+            const idx = try reader.readU32();
+            return .{ .outer = .{ .sort = sort, .outer_count = outer_count, .idx = idx } };
+        },
+        else => return error.InvalidEncoding,
+    }
+}
+
+fn parseTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!ctypes.TypeDef {
+    // `deftype` starts with a tag byte that selects a compound type;
+    // the remaining space (primvaltypes 0x64..0x7F, own 0x69, borrow 0x68,
+    // and any non-negative typeidx encoded as signed-LEB) is a bare valtype.
+    // Peek the first byte and dispatch without consuming if not recognized.
+    const tag = try reader.peekByte();
+    return switch (tag) {
+        0x72, 0x71, 0x70, 0x6F, 0x6E, 0x6D, 0x6B, 0x6A, 0x66, 0x65, 0x3F, 0x40, 0x43, 0x41, 0x42 => parseCompoundTypeDef(reader, allocator),
+        else => .{ .val = try readValType(reader) },
+    };
+}
+
+fn parseCompoundTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!ctypes.TypeDef {
+    const tag = try reader.readByte();
+    return switch (tag) {
+        // Defined types
+        0x72 => blk: {
+            // record
+            const count = try reader.readU32();
+            const fields = try allocator.alloc(ctypes.Field, count);
+            for (fields) |*f| {
+                f.name = try reader.readName();
+                f.type = try readValType(reader);
+            }
+            break :blk .{ .record = .{ .fields = fields } };
+        },
+        0x71 => blk: {
+            // variant
+            const count = try reader.readU32();
+            const cases = try allocator.alloc(ctypes.Case, count);
+            for (cases) |*c| {
+                c.name = try reader.readName();
+                const has_type = try reader.readByte();
+                c.type = if (has_type != 0) try readValType(reader) else null;
+                // Current spec: case ends with a trailing 0x00 byte. (Older
+                // drafts used a `refines` u32; no longer emitted.)
+                const trailer = try reader.readByte();
+                if (trailer != 0x00) return error.InvalidEncoding;
+                c.refines = null;
+            }
+            break :blk .{ .variant = .{ .cases = cases } };
+        },
+        0x70 => blk: {
+            // list
+            const elem = try readValType(reader);
+            break :blk .{ .list = .{ .element = elem } };
+        },
+        0x6F => blk: {
+            // tuple
+            const count = try reader.readU32();
+            const fields = try allocator.alloc(ctypes.ValType, count);
+            for (fields) |*f| f.* = try readValType(reader);
+            break :blk .{ .tuple = .{ .fields = fields } };
+        },
+        0x6E => blk: {
+            // flags
+            const count = try reader.readU32();
+            const names = try allocator.alloc([]const u8, count);
+            for (names) |*n| n.* = try reader.readName();
+            break :blk .{ .flags = .{ .names = names } };
+        },
+        0x6D => blk: {
+            // enum
+            const count = try reader.readU32();
+            const names = try allocator.alloc([]const u8, count);
+            for (names) |*n| n.* = try reader.readName();
+            break :blk .{ .enum_ = .{ .names = names } };
+        },
+        0x6B => blk: {
+            // option
+            const inner = try readValType(reader);
+            break :blk .{ .option = .{ .inner = inner } };
+        },
+        0x6A => blk: {
+            // result
+            const has_ok = try reader.readByte();
+            const ok = if (has_ok != 0) try readValType(reader) else null;
+            const has_err = try reader.readByte();
+            const err = if (has_err != 0) try readValType(reader) else null;
+            break :blk .{ .result = .{ .ok = ok, .err = err } };
+        },
+        0x65 => blk: {
+            // future: `0x65` + optional element valtype
+            break :blk .{ .future = .{ .element = try readOptValType(reader) } };
+        },
+        0x66 => blk: {
+            // stream: `0x66` + optional element valtype
+            const elem = try readOptValType(reader);
+            // Spec: `(stream char)` is rejected (temporary).
+            if (elem) |e| if (e == .char) return error.InvalidEncoding;
+            break :blk .{ .stream = .{ .element = elem } };
+        },
+        0x3F => blk: {
+            // resource: `<rep:CoreValType> <dtor-opt>`. See
+            // writer.zig for the symmetric write side; `rep` is
+            // always `i32` (0x7F) for current component-model
+            // resources but the byte must round-trip through the
+            // wire.
+            const rep = try readCoreValType(reader);
+            const has_dtor = try reader.readByte();
+            const dtor = if (has_dtor != 0) try reader.readU32() else null;
+            break :blk .{ .resource = .{ .destructor = dtor, .rep = rep } };
+        },
+        0x40 => try parseFuncTypeBody(reader, allocator, false),
+        0x43 => try parseFuncTypeBody(reader, allocator, true),
+        0x41 => blk: {
+            // component type
+            const count = try reader.readU32();
+            const decls = try allocator.alloc(ctypes.Decl, count);
+            errdefer allocator.free(decls);
+            for (decls) |*d| d.* = try parseDecl(reader, allocator, .component_type);
+            break :blk .{ .component = .{ .decls = decls } };
+        },
+        0x42 => blk: {
+            // instance type
+            const count = try reader.readU32();
+            const decls = try allocator.alloc(ctypes.Decl, count);
+            errdefer allocator.free(decls);
+            for (decls) |*d| d.* = try parseDecl(reader, allocator, .instance_type);
+            break :blk .{ .instance = .{ .decls = decls } };
+        },
+        else => error.InvalidEncoding,
+    };
+}
+
+/// Scope of a declarator list: which decl tags are legal.
+const DeclScope = enum { component_type, instance_type };
+
+/// Parse a single declarator inside a component-type or instance-type body.
+///
+/// See: <https://github.com/WebAssembly/component-model/blob/main/design/mvp/Binary.md#type-definitions>
+fn parseDecl(
+    reader: *BinaryReader,
+    allocator: std.mem.Allocator,
+    scope: DeclScope,
+) LoadError!ctypes.Decl {
+    const tag = try reader.readByte();
+    return switch (tag) {
+        0x00 => .{ .core_type = try parseCoreType(reader, allocator) },
+        0x01 => .{ .type = try parseTypeDef(reader, allocator) },
+        0x02 => .{ .alias = try parseAlias(reader) },
+        0x03 => blk: {
+            if (scope != .component_type) return error.InvalidEncoding;
+            break :blk .{ .import = try parseImport(reader, allocator) };
+        },
+        0x04 => .{ .@"export" = try parseExport(reader, allocator) },
+        else => error.InvalidEncoding,
+    };
+}
+
+/// Decode a component-model `valtype`.
+///
+/// Encoded as a signed LEB128 in `s33` form. Non-negative values are type
+/// indices into the component type-index space; negative values are
+/// primitive valtypes or handle forms. The `own` / `borrow` variants are
+/// followed by an unsigned LEB128 `typeidx`.
+///
+/// See: <https://github.com/WebAssembly/component-model/blob/main/design/mvp/Binary.md#type-definitions>
+fn readValType(reader: *BinaryReader) LoadError!ctypes.ValType {
+    const raw = try reader.readS33();
+    if (raw >= 0) {
+        return .{ .type_idx = @intCast(raw) };
+    }
+    // Negative: primitive / handle form. Single-byte signed-LEB negatives
+    // reach us as values -1..-64; the spec assigns each to a byte-tag
+    // which equals `0x80 + raw` (so -1 → 0x7F, -24 → 0x68). Larger negative
+    // values can't possibly be a primitive code.
+    if (raw < -64) return error.InvalidEncoding;
+    const tag: u8 = @intCast(raw + 0x80);
+    return switch (tag) {
+        0x7F => .bool,
+        0x7E => .s8,
+        0x7D => .u8,
+        0x7C => .s16,
+        0x7B => .u16,
+        0x7A => .s32,
+        0x79 => .u32,
+        0x78 => .s64,
+        0x77 => .u64,
+        0x76 => .f32,
+        0x75 => .f64,
+        0x74 => .char,
+        0x73 => .string,
+        0x64 => .error_context,
+        0x69 => .{ .own = try reader.readU32() },
+        0x68 => .{ .borrow = try reader.readU32() },
+        else => error.InvalidEncoding,
+    };
+}
+
+/// Read an optional valtype: `0x00` → none, `0x01 <valtype>` → some.
+/// Used by `future` / `stream` element types.
+fn readOptValType(reader: *BinaryReader) LoadError!?ctypes.ValType {
+    const tag = try reader.readByte();
+    return switch (tag) {
+        0x00 => null,
+        0x01 => try readValType(reader),
+        else => error.InvalidEncoding,
+    };
+}
+
+/// Parse a func type body (paramlist + resultlist) after the `0x40`
+/// (sync) / `0x43` (async) tag has been consumed.
+fn parseFuncTypeBody(reader: *BinaryReader, allocator: std.mem.Allocator, is_async: bool) LoadError!ctypes.TypeDef {
+    const param_count = try reader.readU32();
+    const params = try allocator.alloc(ctypes.NamedValType, param_count);
+    for (params) |*p| {
+        p.name = try reader.readName();
+        p.type = try readValType(reader);
+    }
+    const result_tag = try reader.readByte();
+    const results: ctypes.FuncType.ResultList = switch (result_tag) {
+        0x00 => .{ .unnamed = try readValType(reader) },
+        0x01 => blk: {
+            const zero = try reader.readByte();
+            if (zero != 0x00) return error.InvalidEncoding;
+            break :blk .none;
+        },
+        else => return error.InvalidEncoding,
+    };
+    return .{ .func = .{ .params = params, .results = results, .is_async = is_async } };
+}
+
+fn parseCanon(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!ctypes.Canon {
+    const tag = try reader.readByte();
+    return switch (tag) {
+        0x00 => blk: {
+            // canon lift
+            const sub = try reader.readByte();
+            if (sub != 0x00) return error.InvalidEncoding;
+            const core_func_idx = try reader.readU32();
+            const opts = try readCanonOpts(reader, allocator);
+            const type_idx = try reader.readU32();
+            break :blk .{ .lift = .{
+                .core_func_idx = core_func_idx,
+                .type_idx = type_idx,
+                .opts = opts,
+            } };
+        },
+        0x01 => blk: {
+            // canon lower
+            const sub = try reader.readByte();
+            if (sub != 0x00) return error.InvalidEncoding;
+            const func_idx = try reader.readU32();
+            const opts = try readCanonOpts(reader, allocator);
+            break :blk .{ .lower = .{ .func_idx = func_idx, .opts = opts } };
+        },
+        0x02 => .{ .resource_new = try reader.readU32() },
+        0x03 => .{ .resource_drop = try reader.readU32() },
+        0x04 => .{ .resource_rep = try reader.readU32() },
+        0x15 => .{ .future_new = try reader.readU32() },
+        0x16 => blk: {
+            const ty = try reader.readU32();
+            const opts = try readCanonOpts(reader, allocator);
+            break :blk .{ .future_read = .{ .type_idx = ty, .opts = opts } };
+        },
+        0x17 => blk: {
+            const ty = try reader.readU32();
+            const opts = try readCanonOpts(reader, allocator);
+            break :blk .{ .future_write = .{ .type_idx = ty, .opts = opts } };
+        },
+        0x18 => blk: {
+            const ty = try reader.readU32();
+            break :blk .{ .future_cancel_read = .{ .type_idx = ty, .is_async = try readAsyncFlag(reader) } };
+        },
+        0x19 => blk: {
+            const ty = try reader.readU32();
+            break :blk .{ .future_cancel_write = .{ .type_idx = ty, .is_async = try readAsyncFlag(reader) } };
+        },
+        0x1A => .{ .future_drop_readable = try reader.readU32() },
+        0x1B => .{ .future_drop_writable = try reader.readU32() },
+        0x0E => .{ .stream_new = try reader.readU32() },
+        0x0F => blk: {
+            const ty = try reader.readU32();
+            const opts = try readCanonOpts(reader, allocator);
+            break :blk .{ .stream_read = .{ .type_idx = ty, .opts = opts } };
+        },
+        0x10 => blk: {
+            const ty = try reader.readU32();
+            const opts = try readCanonOpts(reader, allocator);
+            break :blk .{ .stream_write = .{ .type_idx = ty, .opts = opts } };
+        },
+        0x11 => blk: {
+            const ty = try reader.readU32();
+            break :blk .{ .stream_cancel_read = .{ .type_idx = ty, .is_async = try readAsyncFlag(reader) } };
+        },
+        0x12 => blk: {
+            const ty = try reader.readU32();
+            break :blk .{ .stream_cancel_write = .{ .type_idx = ty, .is_async = try readAsyncFlag(reader) } };
+        },
+        0x13 => .{ .stream_drop_readable = try reader.readU32() },
+        0x14 => .{ .stream_drop_writable = try reader.readU32() },
+        0x1C => .{ .error_context_new = try readCanonOpts(reader, allocator) },
+        0x1D => .{ .error_context_debug_message = try readCanonOpts(reader, allocator) },
+        0x1E => .error_context_drop,
+        0x09 => blk: {
+            const results = try readResultList(reader, allocator);
+            const opts = try readCanonOpts(reader, allocator);
+            break :blk .{ .task_return = .{ .results = results, .opts = opts } };
+        },
+        0x1F => .waitable_set_new,
+        0x20 => blk: {
+            const cancellable = (try reader.readByte()) != 0;
+            const memory = try reader.readU32();
+            break :blk .{ .waitable_set_wait = .{ .cancellable = cancellable, .memory = memory } };
+        },
+        0x21 => blk: {
+            const cancellable = (try reader.readByte()) != 0;
+            const memory = try reader.readU32();
+            break :blk .{ .waitable_set_poll = .{ .cancellable = cancellable, .memory = memory } };
+        },
+        0x22 => .waitable_set_drop,
+        0x23 => .waitable_join,
+        0x05 => .task_cancel,
+        0x06 => .{ .subtask_cancel = (try reader.readByte()) != 0 },
+        0x0D => .subtask_drop,
+        0x0A => blk: {
+            const ty = try readCoreValType(reader);
+            const slot = try reader.readU32();
+            break :blk .{ .context_get = .{ .ty = ty, .slot = slot } };
+        },
+        0x0B => blk: {
+            const ty = try readCoreValType(reader);
+            const slot = try reader.readU32();
+            break :blk .{ .context_set = .{ .ty = ty, .slot = slot } };
+        },
+        0x24 => .backpressure_inc,
+        0x25 => .backpressure_dec,
+        0x0C => .{ .thread_yield = (try reader.readByte()) != 0 },
+        else => error.InvalidEncoding,
+    };
+}
+
+/// Read an `async?` immediate: `0x00` → false, `0x01` → true.
+fn readAsyncFlag(reader: *BinaryReader) LoadError!bool {
+    return switch (try reader.readByte()) {
+        0x00 => false,
+        0x01 => true,
+        else => error.InvalidEncoding,
+    };
+}
+
+/// Read a `resultlist`: `0x00 <valtype>` (one result) | `0x01 0x00`
+/// (none). Mirrors `parseFuncTypeBody`'s result handling; used by
+/// `task.return`.
+fn readResultList(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!ctypes.FuncType.ResultList {
+    _ = allocator;
+    const tag = try reader.readByte();
+    return switch (tag) {
+        0x00 => .{ .unnamed = try readValType(reader) },
+        0x01 => blk: {
+            const zero = try reader.readByte();
+            if (zero != 0x00) return error.InvalidEncoding;
+            break :blk .none;
+        },
+        else => error.InvalidEncoding,
+    };
+}
+
+fn readCanonOpts(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError![]const ctypes.CanonOpt {
+    const count = try reader.readU32();
+    if (count == 0) return &.{};
+    const opts = try allocator.alloc(ctypes.CanonOpt, count);
+    for (opts) |*o| {
+        const tag = try reader.readByte();
+        o.* = switch (tag) {
+            0x00 => .{ .string_encoding = .utf8 },
+            0x01 => .{ .string_encoding = .utf16 },
+            0x02 => .{ .string_encoding = .latin1_utf16 },
+            0x03 => .{ .memory = try reader.readU32() },
+            0x04 => .{ .realloc = try reader.readU32() },
+            0x05 => .{ .post_return = try reader.readU32() },
+            0x06 => .async_,
+            0x07 => .{ .callback = try reader.readU32() },
+            else => return error.InvalidEncoding,
+        };
+    }
+    return opts;
+}
+
+fn parseStart(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!ctypes.Start {
+    const func_idx = try reader.readU32();
+    const arg_count = try reader.readU32();
+    const args = try allocator.alloc(u32, arg_count);
+    for (args) |*a| a.* = try reader.readU32();
+    const results = try reader.readU32();
+    return .{ .func_idx = func_idx, .args = args, .results = results };
+}
+
+fn readExternDesc(reader: *BinaryReader) LoadError!ctypes.ExternDesc {
+    const tag = try reader.readByte();
+    return switch (tag) {
+        0x00 => blk: {
+            const sub = try reader.readByte();
+            if (sub != 0x11) return error.InvalidEncoding; // module sort
+            break :blk .{ .module = try reader.readU32() };
+        },
+        0x01 => .{ .func = try reader.readU32() },
+        0x02 => .{ .value = try readValType(reader) },
+        0x03 => blk: {
+            const bound_tag = try reader.readByte();
+            break :blk .{ .type = switch (bound_tag) {
+                0x00 => .{ .eq = try reader.readU32() },
+                0x01 => .sub_resource,
+                else => return error.InvalidEncoding,
+            } };
+        },
+        0x04 => .{ .component = try reader.readU32() },
+        0x05 => .{ .instance = try reader.readU32() },
+        else => error.InvalidEncoding,
+    };
+}
+
+/// Read an `importname'` / `exportname'` (identical grammar per spec):
+///
+///   nameattributes ::= 0x00 len:<u32> en:<externname>
+///                    | 0x01 len:<u32> en:<externname>
+///                    | 0x02 len:<u32> en:<externname> a*:vec(<attribute>)
+///
+/// Attribute kinds are unique within the vector. Retaining them is necessary
+/// to reconstruct a complete version from a canonical interface name and its
+/// `versionsuffix`.
+const ParsedExternName = struct {
+    name: []const u8,
+    attributes: []const ctypes.ExternNameAttribute,
+};
+
+fn readExternName(
+    reader: *BinaryReader,
+    allocator: std.mem.Allocator,
+) LoadError!ParsedExternName {
+    const prefix = try reader.readByte();
+    if (prefix > 0x02) return error.InvalidEncoding;
+    const name = try reader.readName();
+    if (prefix != 0x02) return .{ .name = name, .attributes = &.{} };
+
+    const count = try reader.readU32();
+    const attributes = try allocator.alloc(ctypes.ExternNameAttribute, count);
+    errdefer allocator.free(attributes);
+    var seen_implements = false;
+    var seen_version_suffix = false;
+    var seen_external_id = false;
+    for (attributes) |*attribute| {
+        const tag = try reader.readByte();
+        attribute.* = switch (tag) {
+            0x00 => blk: {
+                if (seen_implements) return error.DuplicateAttribute;
+                seen_implements = true;
+                break :blk .{ .implements = try reader.readName() };
+            },
+            0x01 => blk: {
+                if (seen_version_suffix) return error.DuplicateAttribute;
+                seen_version_suffix = true;
+                break :blk .{ .version_suffix = try reader.readName() };
+            },
+            0x02 => blk: {
+                if (seen_external_id) return error.DuplicateAttribute;
+                seen_external_id = true;
+                break :blk .{ .external_id = try reader.readName() };
+            },
+            else => return error.InvalidEncoding,
+        };
+    }
+    return .{ .name = name, .attributes = attributes };
+}
+
+fn parseImport(
+    reader: *BinaryReader,
+    allocator: std.mem.Allocator,
+) LoadError!ctypes.ImportDecl {
+    const parsed_name = try readExternName(reader, allocator);
+    const desc = try readExternDesc(reader);
+    return .{
+        .name = parsed_name.name,
+        .desc = desc,
+        .attributes = parsed_name.attributes,
+    };
+}
+
+fn parseExport(
+    reader: *BinaryReader,
+    allocator: std.mem.Allocator,
+) LoadError!ctypes.ExportDecl {
+    // exportdecl (used inside component/instance type bodies):
+    //   en:<exportname'> ed:<externdesc>
+    const parsed_name = try readExternName(reader, allocator);
+    const desc = try readExternDesc(reader);
+    return .{
+        .name = parsed_name.name,
+        .desc = desc,
+        .attributes = parsed_name.attributes,
+    };
+}
+
+/// Parse a top-level `export` entry from the export section:
+///   export ::= en:<exportname'> si:<sortidx> ed?:<externdesc>?
+///
+/// Distinct from `parseExport` (the declarator form used inside
+/// component/instance types), which has no sortidx and a mandatory descriptor.
+fn parseTopLevelExport(
+    reader: *BinaryReader,
+    allocator: std.mem.Allocator,
+) LoadError!ctypes.ExportDecl {
+    const parsed_name = try readExternName(reader, allocator);
+    const sort_idx = try readSortIdx(reader);
+    const has_desc = try reader.readByte();
+    const desc: ctypes.ExternDesc = switch (has_desc) {
+        0x00 => inferExternDescFromSort(sort_idx),
+        0x01 => try readExternDesc(reader),
+        else => return error.InvalidEncoding,
+    };
+    return .{
+        .name = parsed_name.name,
+        .desc = desc,
+        .attributes = parsed_name.attributes,
+        .sort_idx = sort_idx,
+    };
+}
+
+/// When a top-level export omits its externdesc, the sortidx itself describes
+/// the kind. For sorts that carry a type idx (func/component/instance) we
+/// have no explicit type; fall back to a best-effort placeholder. The runtime
+/// treats these as opaque until Phase 1B index-space resolution fills them in.
+fn inferExternDescFromSort(si: ctypes.SortIdx) ctypes.ExternDesc {
+    return switch (si.sort) {
+        .func => .{ .func = 0 },
+        .value => .{ .value = .{ .type_idx = 0 } },
+        .type => .{ .type = .{ .eq = si.idx } },
+        .component => .{ .component = 0 },
+        .instance => .{ .instance = 0 },
+        .core => .{ .module = 0 },
+    };
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+test "load: minimal empty component" {
+    const data = [_]u8{
+        // magic
+        0x00, 0x61, 0x73, 0x6D,
+        // version=0x0d, layer=0x01
+        0x0d, 0x00, 0x01, 0x00,
+    };
+    const comp = try load(&data, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), comp.core_modules.len);
+    try std.testing.expectEqual(@as(usize, 0), comp.imports.len);
+    try std.testing.expectEqual(@as(usize, 0), comp.exports.len);
+    try std.testing.expectEqual(@as(usize, 0), comp.types.len);
+    try std.testing.expect(comp.start == null);
+}
+
+test "load: invalid magic returns error" {
+    const data = [_]u8{ 0x00, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x01, 0x00 };
+    try std.testing.expectError(error.InvalidMagic, load(&data, std.testing.allocator));
+}
+
+test "load: core module version returns error" {
+    const data = [_]u8{ 0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00 };
+    try std.testing.expectError(error.InvalidVersion, load(&data, std.testing.allocator));
+}
+
+test "readValType: primitive types" {
+    var reader = BinaryReader{ .data = &[_]u8{ 0x7F, 0x7A, 0x73 } };
+    const v1 = try readValType(&reader);
+    try std.testing.expect(v1 == .bool);
+    const v2 = try readValType(&reader);
+    try std.testing.expect(v2 == .s32);
+    const v3 = try readValType(&reader);
+    try std.testing.expect(v3 == .string);
+}
+
+test "readValType: own/borrow with typeidx" {
+    // own 3, borrow 5
+    var reader = BinaryReader{ .data = &[_]u8{ 0x69, 0x03, 0x68, 0x05 } };
+    const v1 = try readValType(&reader);
+    try std.testing.expectEqual(@as(u32, 3), v1.own);
+    const v2 = try readValType(&reader);
+    try std.testing.expectEqual(@as(u32, 5), v2.borrow);
+}
+
+test "readValType: typeidx non-negative, single byte" {
+    // 0 and 63 encode as single bytes 0x00 and 0x3F in signed-LEB.
+    var reader = BinaryReader{ .data = &[_]u8{ 0x00, 0x3F } };
+    const v1 = try readValType(&reader);
+    try std.testing.expectEqual(@as(u32, 0), v1.type_idx);
+    const v2 = try readValType(&reader);
+    try std.testing.expectEqual(@as(u32, 63), v2.type_idx);
+}
+
+test "readValType: typeidx >= 64 requires multi-byte signed LEB" {
+    // typeidx 64: signed-LEB `0xC0 0x00` (cont + value 64, trailing 0).
+    // typeidx 128: signed-LEB `0x80 0x01`.
+    // typeidx 8192: signed-LEB `0x80 0xC0 0x00` (trailing 0 to keep sign positive).
+    var reader = BinaryReader{ .data = &[_]u8{ 0xC0, 0x00, 0x80, 0x01, 0x80, 0xC0, 0x00 } };
+    const v64 = try readValType(&reader);
+    try std.testing.expectEqual(@as(u32, 64), v64.type_idx);
+    const v128 = try readValType(&reader);
+    try std.testing.expectEqual(@as(u32, 128), v128.type_idx);
+    const v8192 = try readValType(&reader);
+    try std.testing.expectEqual(@as(u32, 8192), v8192.type_idx);
+}
+
+test "readValType: rejects unknown negative code" {
+    // 0x67 decodes as signed LEB -25, which has no primitive mapping.
+    var reader = BinaryReader{ .data = &[_]u8{0x67} };
+    try std.testing.expectError(error.InvalidEncoding, readValType(&reader));
+}
+
+test "readValType: error-context (#263)" {
+    var reader = BinaryReader{ .data = &[_]u8{0x64} };
+    const v = try readValType(&reader);
+    try std.testing.expect(v == .error_context);
+}
+
+test "parseTypeDef: future / stream (#263)" {
+    // future<u8>: 0x65 0x01 0x7D ; bare future: 0x65 0x00
+    {
+        var reader = BinaryReader{ .data = &[_]u8{ 0x65, 0x01, 0x7D } };
+        const td = try parseTypeDef(&reader, std.testing.allocator);
+        try std.testing.expect(td.future.element.? == .u8);
+    }
+    {
+        var reader = BinaryReader{ .data = &[_]u8{ 0x65, 0x00 } };
+        const td = try parseTypeDef(&reader, std.testing.allocator);
+        try std.testing.expect(td.future.element == null);
+    }
+    // stream<u8>: 0x66 0x01 0x7D ; bare stream: 0x66 0x00
+    {
+        var reader = BinaryReader{ .data = &[_]u8{ 0x66, 0x01, 0x7D } };
+        const td = try parseTypeDef(&reader, std.testing.allocator);
+        try std.testing.expect(td.stream.element.? == .u8);
+    }
+    {
+        var reader = BinaryReader{ .data = &[_]u8{ 0x66, 0x00 } };
+        const td = try parseTypeDef(&reader, std.testing.allocator);
+        try std.testing.expect(td.stream.element == null);
+    }
+}
+
+test "parseTypeDef: rejects (stream char) (#263)" {
+    // 0x66 0x01 0x74 — stream<char> is rejected by the spec.
+    var reader = BinaryReader{ .data = &[_]u8{ 0x66, 0x01, 0x74 } };
+    try std.testing.expectError(error.InvalidEncoding, parseTypeDef(&reader, std.testing.allocator));
+}
+
+test "parseTypeDef: async func type (#263)" {
+    // async `() -> ()`: 0x43 + paramcount 0x00 + result `0x01 0x00`.
+    var areader = BinaryReader{ .data = &[_]u8{ 0x43, 0x00, 0x01, 0x00 } };
+    const atd = try parseTypeDef(&areader, std.testing.allocator);
+    try std.testing.expect(atd.func.is_async);
+    // sync uses 0x40.
+    var sreader = BinaryReader{ .data = &[_]u8{ 0x40, 0x00, 0x01, 0x00 } };
+    const std_td = try parseTypeDef(&sreader, std.testing.allocator);
+    try std.testing.expect(!std_td.func.is_async);
+}
+
+test "round-trip P3 type defs through writer + loader (#263)" {
+    const writer = @import("writer.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const type_defs = [_]ctypes.TypeDef{
+        .{ .val = .error_context },
+        .{ .future = .{ .element = .u8 } },
+        .{ .future = .{ .element = null } },
+        .{ .stream = .{ .element = .u8 } },
+        .{ .stream = .{ .element = null } },
+        .{ .func = .{ .params = &.{}, .results = .none, .is_async = true } },
+        .{ .func = .{ .params = &.{}, .results = .none, .is_async = false } },
+    };
+    const component: ctypes.Component = .{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &type_defs,
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+        .custom_sections = &.{},
+    };
+    const bytes = try writer.encode(ar, &component);
+    const loaded = try load(bytes, ar);
+
+    try std.testing.expectEqual(@as(usize, 7), loaded.types.len);
+    try std.testing.expect(loaded.types[0] == .val and loaded.types[0].val == .error_context);
+    try std.testing.expect(loaded.types[1].future.element.? == .u8);
+    try std.testing.expect(loaded.types[2].future.element == null);
+    try std.testing.expect(loaded.types[3].stream.element.? == .u8);
+    try std.testing.expect(loaded.types[4].stream.element == null);
+    try std.testing.expect(loaded.types[5].func.is_async);
+    try std.testing.expect(!loaded.types[6].func.is_async);
+}
+
+test "parseTypeDef: instance type with `sub resource` type decl" {
+    // Mirrors the first type definition in every Rust wasm32-wasip2 component:
+    //   (type (instance
+    //     (type $p (sub resource))            ; decl 0x01, type, resource with rep=i32 no dtor
+    //     (export "pollable" (type (eq $p)))  ; decl 0x04, export, type bound eq 0
+    //   ))
+    // Binary form:
+    //   0x42              ; instance-type tag
+    //   0x02              ; 2 decls
+    //   0x01              ; decl 1: type
+    //     0x3F 0x7F 0x00  ; resource, rep=i32, no destructor
+    //   0x04              ; decl 2: export
+    //     0x00            ; exportname' prefix
+    //     0x08 "pollable" ; name (len=8)
+    //     0x03            ; externdesc: type
+    //     0x00 0x00       ; bound: eq, typeidx 0
+    const data = [_]u8{
+        0x42, 0x02,
+        0x01, 0x3F,
+        0x7F, 0x00,
+        0x04, 0x00,
+        0x08, 'p',
+        'o',  'l',
+        'l',  'a',
+        'b',  'l',
+        'e',  0x03,
+        0x00, 0x00,
+    };
+    var reader = BinaryReader{ .data = &data };
+    const td = try parseTypeDef(&reader, std.testing.allocator);
+    defer {
+        // Free the decls slice (individual decls don't own heap beyond exports' names which are slices into `data`).
+        std.testing.allocator.free(td.instance.decls);
+    }
+    try std.testing.expect(td == .instance);
+    try std.testing.expectEqual(@as(usize, 2), td.instance.decls.len);
+    try std.testing.expect(td.instance.decls[0] == .type);
+    try std.testing.expect(td.instance.decls[0].type == .resource);
+    try std.testing.expect(td.instance.decls[1] == .@"export");
+    try std.testing.expectEqualStrings("pollable", td.instance.decls[1].@"export".name);
+    try std.testing.expect(td.instance.decls[1].@"export".desc == .type);
+    try std.testing.expectEqual(@as(u32, 0), td.instance.decls[1].@"export".desc.type.eq);
+}
+
+test "parseTypeDef: component type with import and alias decls" {
+    // (type (component
+    //   (import "x" (instance (type 0)))   ; decl 0x03, import
+    //   (alias outer 0 0 (type))           ; decl 0x02, alias outer
+    // ))
+    const data = [_]u8{
+        0x41, 0x02,
+        0x03, 0x00, 0x01, 'x', 0x05, 0x00, // import name'=(0x00 "x") externdesc=instance type 0
+        0x02, 0x03, 0x02, 0x00, 0x00, // alias: sort=type(0x03), outer(0x02), count=0, idx=0
+    };
+    var reader = BinaryReader{ .data = &data };
+    const td = try parseTypeDef(&reader, std.testing.allocator);
+    defer std.testing.allocator.free(td.component.decls);
+    try std.testing.expect(td == .component);
+    try std.testing.expectEqual(@as(usize, 2), td.component.decls.len);
+    try std.testing.expect(td.component.decls[0] == .import);
+    try std.testing.expectEqualStrings("x", td.component.decls[0].import.name);
+    try std.testing.expect(td.component.decls[1] == .alias);
+}
+
+test "parseTypeDef: instance type rejects import decl" {
+    // Instance types cannot contain import decls (0x03).
+    const data = [_]u8{ 0x42, 0x01, 0x03 };
+    var reader = BinaryReader{ .data = &data };
+    try std.testing.expectError(error.InvalidEncoding, parseTypeDef(&reader, std.testing.allocator));
+}
+
+test "load: real wasm32-wasip2 Rust component (stdio-echo)" {
+    // Prebuilt binary of examples/components/stdio-echo/ — a minimal
+    // Rust `fn main { println!("echo: ..."); }` compiled with
+    // `cargo build --release --target wasm32-wasip2`. This is the canonical
+    // Phase 1A regression fixture for #142: before the loader rework every
+    // wasm32-wasip2 component failed at the first `type` section.
+    const data = @embedFile("fixtures/stdio-echo.wasm");
+
+    // The loader allocates many small slices but has no Component.deinit yet
+    // (see #142 Phase 1B). Use an arena so the test doesn't leak.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const comp = try load(data, arena.allocator());
+
+    // Verified via `wasm-tools component wit`: world `root` imports 13
+    // wasi interfaces (io/poll, io/error, io/streams, cli/environment,
+    // cli/exit, cli/stdin, cli/stdout, cli/stderr, and 5 cli/terminal-*),
+    // and exports one: wasi:cli/run@0.2.0.
+    try std.testing.expectEqual(@as(usize, 13), comp.imports.len);
+    try std.testing.expectEqual(@as(usize, 1), comp.exports.len);
+
+    // Every import is an instance import (WASI p2 pattern — never flat funcs).
+    for (comp.imports) |imp| {
+        try std.testing.expect(imp.desc == .instance);
+    }
+    // The sole export is the wasi:cli/run instance.
+    try std.testing.expect(comp.exports[0].desc == .instance);
+    try std.testing.expect(std.mem.startsWith(u8, comp.exports[0].name, "wasi:cli/run@"));
+
+    // Spot-check a handful of imports against the golden list from wasm-tools.
+    const expected = [_][]const u8{
+        "wasi:io/poll@0.2.6",
+        "wasi:io/streams@0.2.6",
+        "wasi:cli/stdin@0.2.6",
+        "wasi:cli/stdout@0.2.6",
+        "wasi:cli/exit@0.2.6",
+    };
+    for (expected) |name| {
+        var found = false;
+        for (comp.imports) |imp| {
+            if (std.mem.eql(u8, imp.name, name)) {
+                found = true;
+                break;
+            }
+        }
+        std.testing.expect(found) catch |err| {
+            return err;
+        };
+    }
+}
+
+test "load: real P3 (component-model-async) component (#263)" {
+    // `fixtures/p3-future.wasm` — a minimal component assembled with
+    // `wasm-tools` from a hand-written .wat that uses `(future)`,
+    // `canon future.new`, `canon future.read` (memory opt), and an
+    // `async` `canon lift`. Ground-truth for wabt's P3 canon decoding;
+    // `wasm-tools validate --features=cm-async,cm-async-builtins,
+    // cm-async-stackful` accepts it.
+    const data = @embedFile("fixtures/p3-future.wasm");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const comp = try load(data, arena.allocator());
+
+    var saw_future_new = false;
+    var saw_future_read = false;
+    var saw_async_lift = false;
+    for (comp.canons) |c| switch (c) {
+        .future_new => saw_future_new = true,
+        .future_read => |rw| {
+            saw_future_read = true;
+            // `future.read` carries a `(memory 0)` option.
+            try std.testing.expect(rw.opts.len == 1 and rw.opts[0] == .memory);
+        },
+        .lift => |l| for (l.opts) |o| {
+            if (o == .async_) saw_async_lift = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_future_new);
+    try std.testing.expect(saw_future_read);
+    try std.testing.expect(saw_async_lift);
+
+    // Round-trip: re-encode and re-load; the canon kinds must survive.
+    const writer = @import("writer.zig");
+    const bytes2 = try writer.encode(arena.allocator(), &comp);
+    const comp2 = try load(bytes2, arena.allocator());
+    try std.testing.expectEqual(comp.canons.len, comp2.canons.len);
+    var fnew2 = false;
+    var fread2 = false;
+    for (comp2.canons) |c| switch (c) {
+        .future_new => fnew2 = true,
+        .future_read => fread2 = true,
+        else => {},
+    };
+    try std.testing.expect(fnew2 and fread2);
+}
+
+test "loadVerbatim: captures section_order and byte-faithfully round-trips (#267)" {
+    // The verbatim loader records the physical section layout so a
+    // `loadVerbatim -> writer.encode` round-trip reproduces the original
+    // section order, unlike the plain `load -> encode` path which falls
+    // back to the writer's conventional re-ordering.
+    const data = @embedFile("fixtures/p3-future.wasm");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const comp = try loadVerbatim(data, ar);
+    // Layout was captured: one entry per physical section.
+    try std.testing.expect(comp.section_order != null);
+    try std.testing.expect(comp.section_order.?.len > 0);
+
+    // Re-encode from the verbatim AST and re-load: the section order
+    // (and every per-section count) must be identical to the original.
+    const writer = @import("writer.zig");
+    const reencoded = try writer.encode(ar, &comp);
+    const comp2 = try loadVerbatim(reencoded, ar);
+
+    try std.testing.expect(comp2.section_order != null);
+    try std.testing.expectEqual(comp.section_order.?.len, comp2.section_order.?.len);
+    for (comp.section_order.?, comp2.section_order.?) |a, b| {
+        try std.testing.expectEqual(a.kind, b.kind);
+        try std.testing.expectEqual(a.count, b.count);
+    }
+}
+
+test "load: real P3 stream component (#263)" {
+    // `fixtures/p3-stream.wasm`: (stream u8) + stream.new + stream.read.
+    const data = @embedFile("fixtures/p3-stream.wasm");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const comp = try load(data, arena.allocator());
+    var saw_new = false;
+    var saw_read = false;
+    for (comp.canons) |c| switch (c) {
+        .stream_new => saw_new = true,
+        .stream_read => |rw| {
+            saw_read = true;
+            try std.testing.expect(rw.opts.len == 1 and rw.opts[0] == .memory);
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_new and saw_read);
+}
+
+test "load: real P3 error-context component (#263)" {
+    // `fixtures/p3-error-context.wasm`: error-context.new / .debug-message / .drop.
+    const data = @embedFile("fixtures/p3-error-context.wasm");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const comp = try load(data, arena.allocator());
+    var saw_new = false;
+    var saw_dbg = false;
+    var saw_drop = false;
+    for (comp.canons) |c| switch (c) {
+        .error_context_new => saw_new = true,
+        .error_context_debug_message => saw_dbg = true,
+        .error_context_drop => saw_drop = true,
+        else => {},
+    };
+    try std.testing.expect(saw_new and saw_dbg and saw_drop);
+}
+
+test "round-trip future-family canons + task.return through writer + loader (#263)" {
+    const writer = @import("writer.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const canons = [_]ctypes.Canon{
+        .{ .future_new = 0 },
+        .{ .future_read = .{ .type_idx = 0, .opts = &.{.{ .memory = 0 }} } },
+        .{ .future_write = .{ .type_idx = 0, .opts = &.{} } },
+        .{ .future_cancel_read = .{ .type_idx = 0, .is_async = true } },
+        .{ .future_cancel_write = .{ .type_idx = 0, .is_async = false } },
+        .{ .future_drop_readable = 0 },
+        .{ .future_drop_writable = 0 },
+        .{ .task_return = .{ .results = .none, .opts = &.{.async_} } },
+    };
+    // A single `(future)` type so the canons' type indices resolve.
+    const type_defs = [_]ctypes.TypeDef{.{ .future = .{ .element = null } }};
+    const component: ctypes.Component = .{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &type_defs,
+        .canons = &canons,
+        .imports = &.{},
+        .exports = &.{},
+        .custom_sections = &.{},
+    };
+    const bytes = try writer.encode(ar, &component);
+    const loaded = try load(bytes, ar);
+
+    try std.testing.expectEqual(@as(usize, 8), loaded.canons.len);
+    try std.testing.expect(loaded.canons[0] == .future_new);
+    try std.testing.expect(loaded.canons[1].future_read.opts[0] == .memory);
+    try std.testing.expect(loaded.canons[2] == .future_write);
+    try std.testing.expect(loaded.canons[3].future_cancel_read.is_async);
+    try std.testing.expect(!loaded.canons[4].future_cancel_write.is_async);
+    try std.testing.expect(loaded.canons[5] == .future_drop_readable);
+    try std.testing.expect(loaded.canons[6] == .future_drop_writable);
+    try std.testing.expect(loaded.canons[7].task_return.opts[0] == .async_);
+}
+
+test "round-trip waitable-set/waitable canons through writer + loader (#265)" {
+    const writer = @import("writer.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // Distinguishing field values catch a writer/loader field-order bug:
+    // `wait` is cancellable with memory 0, `poll` is non-cancellable with
+    // memory 0 — a swapped (memory, cancellable) order would not round-trip.
+    const canons = [_]ctypes.Canon{
+        .waitable_set_new,
+        .{ .waitable_set_wait = .{ .cancellable = true, .memory = 0 } },
+        .{ .waitable_set_poll = .{ .cancellable = false, .memory = 0 } },
+        .waitable_set_drop,
+        .waitable_join,
+    };
+    const component: ctypes.Component = .{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &canons,
+        .imports = &.{},
+        .exports = &.{},
+        .custom_sections = &.{},
+    };
+    const bytes = try writer.encode(ar, &component);
+    const loaded = try load(bytes, ar);
+
+    try std.testing.expectEqual(@as(usize, 5), loaded.canons.len);
+    try std.testing.expect(loaded.canons[0] == .waitable_set_new);
+    try std.testing.expect(loaded.canons[1].waitable_set_wait.cancellable);
+    try std.testing.expectEqual(@as(u32, 0), loaded.canons[1].waitable_set_wait.memory);
+    try std.testing.expect(!loaded.canons[2].waitable_set_poll.cancellable);
+    try std.testing.expect(loaded.canons[3] == .waitable_set_drop);
+    try std.testing.expect(loaded.canons[4] == .waitable_join);
+}
+
+test "round-trip subtask/task-cancel/backpressure/context canons through writer + loader (#267)" {
+    const writer = @import("writer.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // Distinguishing payloads catch field-order / operand bugs: the two
+    // `context.*` canons carry different (ty, slot) pairs, and
+    // `subtask.cancel` / `thread.yield` carry a cancellable flag.
+    const canons = [_]ctypes.Canon{
+        .task_cancel,
+        .{ .subtask_cancel = true },
+        .subtask_drop,
+        .{ .context_get = .{ .ty = .i32, .slot = 0 } },
+        .{ .context_set = .{ .ty = .i64, .slot = 3 } },
+        .backpressure_inc,
+        .backpressure_dec,
+        .{ .thread_yield = false },
+        .{ .thread_yield = true },
+    };
+    const component: ctypes.Component = .{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &canons,
+        .imports = &.{},
+        .exports = &.{},
+        .custom_sections = &.{},
+    };
+    const bytes = try writer.encode(ar, &component);
+    const loaded = try load(bytes, ar);
+
+    try std.testing.expectEqual(@as(usize, 9), loaded.canons.len);
+    try std.testing.expect(loaded.canons[0] == .task_cancel);
+    try std.testing.expect(loaded.canons[1].subtask_cancel);
+    try std.testing.expect(loaded.canons[2] == .subtask_drop);
+    try std.testing.expect(loaded.canons[3] == .context_get);
+    try std.testing.expectEqual(ctypes.CoreValType.i32, loaded.canons[3].context_get.ty);
+    try std.testing.expectEqual(@as(u32, 0), loaded.canons[3].context_get.slot);
+    try std.testing.expect(loaded.canons[4] == .context_set);
+    try std.testing.expectEqual(ctypes.CoreValType.i64, loaded.canons[4].context_set.ty);
+    try std.testing.expectEqual(@as(u32, 3), loaded.canons[4].context_set.slot);
+    try std.testing.expect(loaded.canons[5] == .backpressure_inc);
+    try std.testing.expect(loaded.canons[6] == .backpressure_dec);
+    try std.testing.expect(loaded.canons[7] == .thread_yield);
+    try std.testing.expect(!loaded.canons[7].thread_yield);
+    try std.testing.expect(loaded.canons[8] == .thread_yield);
+    try std.testing.expect(loaded.canons[8].thread_yield);
+}
+
+test "round-trip stream-family + error-context canons through writer + loader (#263)" {
+    const writer = @import("writer.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const canons = [_]ctypes.Canon{
+        .{ .stream_new = 0 },
+        .{ .stream_read = .{ .type_idx = 0, .opts = &.{.{ .memory = 0 }} } },
+        .{ .stream_write = .{ .type_idx = 0, .opts = &.{} } },
+        .{ .stream_cancel_read = .{ .type_idx = 0, .is_async = true } },
+        .{ .stream_cancel_write = .{ .type_idx = 0, .is_async = false } },
+        .{ .stream_drop_readable = 0 },
+        .{ .stream_drop_writable = 0 },
+        .{ .error_context_new = &.{.{ .memory = 0 }} },
+        .{ .error_context_debug_message = &.{.{ .realloc = 0 }} },
+        .error_context_drop,
+    };
+    const type_defs = [_]ctypes.TypeDef{.{ .stream = .{ .element = .u8 } }};
+    const component: ctypes.Component = .{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &type_defs,
+        .canons = &canons,
+        .imports = &.{},
+        .exports = &.{},
+        .custom_sections = &.{},
+    };
+    const bytes = try writer.encode(ar, &component);
+    const loaded = try load(bytes, ar);
+
+    try std.testing.expectEqual(@as(usize, 10), loaded.canons.len);
+    try std.testing.expect(loaded.canons[0] == .stream_new);
+    try std.testing.expect(loaded.canons[1].stream_read.opts[0] == .memory);
+    try std.testing.expect(loaded.canons[2] == .stream_write);
+    try std.testing.expect(loaded.canons[3].stream_cancel_read.is_async);
+    try std.testing.expect(!loaded.canons[4].stream_cancel_write.is_async);
+    try std.testing.expect(loaded.canons[5] == .stream_drop_readable);
+    try std.testing.expect(loaded.canons[6] == .stream_drop_writable);
+    try std.testing.expect(loaded.canons[7].error_context_new[0] == .memory);
+    try std.testing.expect(loaded.canons[8].error_context_debug_message[0] == .realloc);
+    try std.testing.expect(loaded.canons[9] == .error_context_drop);
+}
