@@ -464,7 +464,7 @@ fn Factory(comptime host: type, comptime module: type) type {
             const is_bit_vector = @sizeOf(ve.child) * ve.len > @sizeOf(T);
             try appendList(list, .{
                 .type = getMemberType(ve.child, false),
-                .bitSize = bit_size.get(ve.child),
+                .bitSize = if (!is_bit_vector and ve.child == bool) @sizeOf(bool) * 8 else bit_size.get(ve.child),
                 .byteSize = if (is_bit_vector) null else byte_size.get(ve.child),
                 .structure = try self.getStructure(ve.child),
             });

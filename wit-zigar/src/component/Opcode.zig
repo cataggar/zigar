@@ -249,6 +249,15 @@ pub const Code = enum(u32) {
     br_on_null = 0xd5,
     br_on_non_null = 0xd6,
 
+    // Stack switching / continuations (0xe0–0xe6)
+    cont_new = 0xe0,
+    cont_bind = 0xe1,
+    @"suspend" = 0xe2,
+    @"resume" = 0xe3,
+    resume_throw = 0xe4,
+    resume_throw_ref = 0xe5,
+    @"switch" = 0xe6,
+
     // -- GC prefix (0xfb << 8 | code) --
 
     struct_new = 0xfb00,
@@ -794,6 +803,16 @@ pub const Code = enum(u32) {
             .br_on_null,
             .br_on_non_null,
             => features.function_references,
+
+            // Stack switching (WasmFX)
+            .cont_new,
+            .cont_bind,
+            .@"suspend",
+            .@"resume",
+            .resume_throw,
+            .resume_throw_ref,
+            .@"switch",
+            => features.stack_switching,
 
             // Sign extension
             .i32_extend8_s,
@@ -1595,6 +1614,13 @@ pub const Code = enum(u32) {
             .ref_eq => "ref.eq",
             .br_on_null => "br_on_null",
             .br_on_non_null => "br_on_non_null",
+            .cont_new => "cont.new",
+            .cont_bind => "cont.bind",
+            .@"suspend" => "suspend",
+            .@"resume" => "resume",
+            .resume_throw => "resume_throw",
+            .resume_throw_ref => "resume_throw_ref",
+            .@"switch" => "switch",
             .struct_new => "struct.new",
             .struct_new_default => "struct.new_default",
             .struct_get => "struct.get",

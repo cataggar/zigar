@@ -92,9 +92,10 @@ pub const ref_null_prefix: u8 = 0x63;
 /// exhaustive: a heaptype missing from this table is rejected, never silently
 /// widened to `funcref`.
 const abstract_heap_types = [_]types.AbstractHeapType{
-    .noexn, .nofunc,  .noextern, .none,
-    .func,  .extern_, .any,      .eq,
-    .i31,   .struct_, .array,    .exn,
+    .nocont, .noexn,  .nofunc,  .noextern,
+    .none,   .func,   .extern_, .any,
+    .eq,     .i31,    .struct_, .array,
+    .exn,    .cont,
 };
 
 /// Resolve a decoded heaptype to a `types.RefType`. Abstract heap types come
@@ -258,12 +259,10 @@ const Reader = struct {
                 },
             };
         }
-        const vt = enumFromIntChecked(types.ValType, @as(i32, @intCast(@as(i8, @bitCast(byte))))) orelse
+        const vt = enumFromIntChecked(types.ValType, @as(i32, byte)) orelse
             return error.InvalidType;
-        // The abbreviated forms never carry a concrete index; a bare
-        // `.concrete_ref` byte would be an internal marker leaking into the
-        // binary format, which is not a valid encoding.
-        if (vt == .concrete_ref or vt == .concrete_ref_null) return error.InvalidType;
+        if (vt == .func or vt == .struct_ or vt == .array or vt == .cont or vt == .void_)
+            return error.InvalidType;
         return .{ .vt = vt };
     }
 
@@ -444,6 +443,7 @@ const Reader = struct {
     const func_form: u8 = 0x60;
     const struct_form: u8 = 0x5F;
     const array_form: u8 = 0x5E;
+    const cont_form: u8 = 0x5D;
 
     /// Position of a type within its recursion group, if any.
     const RecPlacement = struct {
@@ -488,6 +488,12 @@ const Reader = struct {
             array_form => blk: {
                 meta.kind = .array;
                 break :blk .{ .array_type = .{ .field = try self.readFieldType() } };
+            },
+            cont_form => blk: {
+                meta.kind = .cont;
+                const s33 = try self.readS33();
+                if (s33 < 0 or s33 > std.math.maxInt(u32)) return error.InvalidType;
+                break :blk .{ .cont_type = .{ .func_type_idx = @intCast(s33) } };
             },
             else => return error.InvalidType,
         };
@@ -580,6 +586,14 @@ const Reader = struct {
                 },
                 .array_type => |at| {
                     if (!inRange(at.field.type_idx, count)) return error.InvalidType;
+                },
+                .cont_type => |ct| {
+                    if (ct.func_type_idx == types.invalid_index or
+                        !inRange(ct.func_type_idx, count) or
+                        self.module.module_types.items[ct.func_type_idx] != .func_type)
+                    {
+                        return error.InvalidType;
+                    }
                 },
             }
         }
@@ -1179,9 +1193,10 @@ test "abstract heap types map to distinct value types" {
     // Every non-nullable internal marker in `ValType` is reachable from the
     // table, so none can be orphaned by a missing heap type entry.
     for ([_]types.ValType{
-        .ref_func,   .ref_extern,   .ref_any, .ref_none,
-        .ref_nofunc, .ref_noextern, .ref_eq,  .ref_i31,
-        .ref_struct, .ref_array,    .ref_exn, .ref_noexn,
+        .ref_func,   .ref_extern,   .ref_any,  .ref_none,
+        .ref_nofunc, .ref_noextern, .ref_eq,   .ref_i31,
+        .ref_struct, .ref_array,    .ref_exn,  .ref_noexn,
+        .ref_cont,   .ref_nocont,
     }) |vt| {
         try std.testing.expect(seen.contains(vt));
     }
@@ -1771,7 +1786,7 @@ test "empty recursion groups retain their type-section positions" {
 test "an empty recursion group does not hide an invalid following type" {
     const bytes = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-        0x01, 0x04, 0x02, 0x4e, 0x00, 0x5d,
+        0x01, 0x04, 0x02, 0x4e, 0x00, 0x5c,
     };
     try std.testing.expectError(error.InvalidType, readModule(std.testing.allocator, &bytes));
 }
@@ -1808,8 +1823,8 @@ test "malformed type definitions are rejected" {
     const allocator = std.testing.allocator;
     const header = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
 
-    // An unassigned form byte. 0x5d sits just below the array form.
-    const bad_form = header ++ [_]u8{ 0x01, 0x03, 0x01, 0x5d, 0x00 };
+    // An unassigned form byte. 0x5c sits just below the cont form.
+    const bad_form = header ++ [_]u8{ 0x01, 0x03, 0x01, 0x5c, 0x00 };
     try std.testing.expectError(error.InvalidType, readModule(allocator, &bad_form));
 
     // The supertype list is a vector, but at most one entry is allowed.
@@ -1921,3 +1936,128 @@ test "initialized table reserved byte is exactly zero" {
         try std.testing.expect(std.mem.indexOf(u8, encoded, expected) != null);
     }
 }
+
+test "WasmFX continuation types and instructions binary round-trip" {
+    const allocator = std.testing.allocator;
+    const writer = @import("writer.zig");
+    const header = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
+
+    // Module with:
+    // - type 0: (func (param contref nullcontref) (result (ref cont) (ref nocont)))
+    // - type 1: (cont 0)
+    // - tag 0: (type 0)
+    // - func 0 (type 0): body containing cont.new, cont.bind, suspend, resume (with on_label + on_switch),
+    //   resume_throw, resume_throw_ref, switch
+    const module_bytes = header ++ [_]u8{
+        // Type section (ID 1): 2 types
+        0x01, 0x0c, 0x02,
+        // type 0: func (param 0x68 0x75) (result (ref 0x68) (ref 0x75))
+        0x60, 0x02, 0x68, 0x75, 0x02, 0x64, 0x68, 0x64, 0x75,
+        // type 1: cont 0 (0x5d 0x00)
+        0x5d, 0x00,
+        // Function section (ID 3): 1 func of type 0
+        0x03, 0x02, 0x01, 0x00,
+        // Code section (ID 10): 1 body
+        0x0a, 0x22, 0x01,
+        0x20, // body size (32 bytes)
+        0x00, // 0 locals
+        0xe0, 0x01, // cont.new 1
+        0xe1, 0x01, 0x01, // cont.bind 1 1
+        0xe2, 0x00, // suspend 0
+        0xe3, 0x01, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, // resume 1 (on 0 0) (on 0 switch)
+        0xe4, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, // resume_throw 1 0 (on 0 0)
+        0xe5, 0x01, 0x01, 0x01, 0x00, // resume_throw_ref 1 (on 0 switch)
+        0xe6, 0x01, 0x00, // switch 1 0
+        0x0b, // end
+    };
+
+    var decoded = try readModule(allocator, &module_bytes);
+    defer decoded.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), decoded.module_types.items.len);
+    try std.testing.expectEqual(Mod.TypeMeta.Kind.func, decoded.type_meta.items[0].kind);
+    try std.testing.expectEqual(Mod.TypeMeta.Kind.cont, decoded.type_meta.items[1].kind);
+    try std.testing.expectEqual(@as(u32, 0), decoded.module_types.items[1].cont_type.func_type_idx);
+
+    const ft = decoded.module_types.items[0].func_type;
+    try std.testing.expectEqual(types.ValType.contref, ft.params[0]);
+    try std.testing.expectEqual(types.ValType.nullcontref, ft.params[1]);
+    try std.testing.expectEqual(types.ValType.ref_cont, ft.results[0]);
+    try std.testing.expectEqual(types.ValType.ref_nocont, ft.results[1]);
+
+    // Round-trip through binary writer and re-decode.
+    const encoded = try writer.writeModule(allocator, &decoded);
+    defer allocator.free(encoded);
+
+    var redecoded = try readModule(allocator, encoded);
+    defer redecoded.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), redecoded.module_types.items.len);
+    try std.testing.expectEqual(Mod.TypeMeta.Kind.cont, redecoded.type_meta.items[1].kind);
+    try std.testing.expectEqual(@as(u32, 0), redecoded.module_types.items[1].cont_type.func_type_idx);
+    try std.testing.expectEqualSlices(
+        u8,
+        decoded.funcs.items[0].code_bytes,
+        redecoded.funcs.items[0].code_bytes,
+    );
+
+    // Out-of-range func_type_idx in cont_type is rejected.
+    const bad_cont = header ++ [_]u8{ 0x01, 0x03, 0x01, 0x5d, 0x05 };
+    try std.testing.expectError(error.InvalidType, readModule(allocator, &bad_cont));
+
+    // Negative s33 func_type_idx in cont_type (e.g. 0x7f = -1) is rejected.
+    const neg_cont = header ++ [_]u8{ 0x01, 0x03, 0x01, 0x5d, 0x7f };
+    try std.testing.expectError(error.InvalidType, readModule(allocator, &neg_cont));
+
+    // cont_type referencing a non-func composite type (e.g. struct at index 0) is rejected.
+    const struct_cont = header ++ [_]u8{ 0x01, 0x05, 0x02, 0x5f, 0x00, 0x5d, 0x00 };
+    try std.testing.expectError(error.InvalidType, readModule(allocator, &struct_cont));
+
+    // Raw 0x5d (cont form) and internal negative markers 0xf1/0xf0 (ref_cont/ref_nocont)
+    // are rejected as standalone wire value types.
+    for ([_]u8{ 0x5d, 0xf1, 0xf0 }) |bad_vt| {
+        const bad_vt_mod = header ++ [_]u8{ 0x01, 0x05, 0x01, 0x60, 0x01, bad_vt, 0x00 };
+        try std.testing.expectError(error.InvalidType, readModule(allocator, &bad_vt_mod));
+    }
+}
+
+test "WasmFX cont_type s33 encoding for type index >= 64" {
+    const allocator = std.testing.allocator;
+    const writer = @import("writer.zig");
+
+    // Build a module with 65 types:
+    // - types 0..64: 65 empty func types `(func)` (3 bytes each: 0x60 0x00 0x00)
+    // - type 65: `(cont 64)` where 64 in s33 LEB128 is `0xC0 0x00` (4 bytes total: 0x5d 0xc0 0x00)
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, &[_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
+    // Type section (ID 1):
+    // count = 66 (0xc2 0x00 in u32 LEB128? No: u32 LEB128 for 66 is single byte 0x42!)
+    // 65 func types * 3 bytes = 195 bytes + 1 cont type (3 bytes: 0x5d, 0xc0, 0x00) + 1 byte count (0x42) = 199 bytes (0xc7 0x01)
+    try buf.appendSlice(allocator, &[_]u8{ 0x01, 0xc7, 0x01, 0x42 });
+    for (0..65) |_| {
+        try buf.appendSlice(allocator, &[_]u8{ 0x60, 0x00, 0x00 });
+    }
+    // cont 64 encoded as s33: 0x5d, 0xc0, 0x00
+    try buf.appendSlice(allocator, &[_]u8{ 0x5d, 0xc0, 0x00 });
+
+    var decoded = try readModule(allocator, buf.items);
+    defer decoded.deinit();
+
+    try std.testing.expectEqual(@as(usize, 66), decoded.module_types.items.len);
+    try std.testing.expectEqual(Mod.TypeMeta.Kind.cont, decoded.type_meta.items[65].kind);
+    try std.testing.expectEqual(@as(u32, 64), decoded.module_types.items[65].cont_type.func_type_idx);
+
+    const encoded = try writer.writeModule(allocator, &decoded);
+    defer allocator.free(encoded);
+
+    // Verify the writer emitted 0x5d 0xc0 0x00 (s33 for 64), NOT 0x5d 0x40 (which would be -64 in s33).
+    try std.testing.expect(std.mem.indexOf(u8, encoded, &[_]u8{ 0x5d, 0xc0, 0x00 }) != null);
+
+    var redecoded = try readModule(allocator, encoded);
+    defer redecoded.deinit();
+    try std.testing.expectEqual(@as(u32, 64), redecoded.module_types.items[65].cont_type.func_type_idx);
+}
+
+

@@ -3,21 +3,26 @@
 //! Usage:
 //!   wit-zigar <file.wit | dir> [--world <name>] [--wasm64] [-o <output.zig>]
 //!   wit-zigar --wasi <ns:pkg/world@ver> [--wasm64] [-o <output.zig>]
+//!   wit-zigar --detect-zigar-abi <path.wasm>
 //!   wit-zigar --help
 
 const std = @import("std");
 const bindgen = @import("bindgen.zig");
+const fast_abi = @import("fast_abi.zig");
 
 const usage_text =
     \\Usage:
     \\  wit-zigar <file.wit | dir> [--world <name>] [--wasm64] [-o <output.zig>]
     \\  wit-zigar --wasi <ns:pkg/world[@ver]> [--wasm64] [-o <output.zig>]
+    \\  wit-zigar --detect-zigar-abi <path.wasm>
     \\  wit-zigar --help
     \\
     \\Options:
     \\  --world <name>             Select target WIT world name
     \\  --wasi <ns:pkg/world@ver>  Generate bindings for an embedded WASI world
     \\                             (e.g. wasi:cli/command@0.3.0)
+    \\  --detect-zigar-abi <path>  Inspect a core Wasm module or Component for
+    \\                             a "zigar:abi" custom section and print its entries
     \\  --wasm64                   Emit Memory64 (cm64) pointer/slice signatures
     \\  -o <output.zig>            Write generated Zig code to file instead of stdout
     \\  -h, --help                 Display this help and exit
@@ -28,6 +33,7 @@ pub const CliArgs = struct {
     help: bool = false,
     input_path: ?[]const u8 = null,
     wasi_spec: ?[]const u8 = null,
+    detect_zigar_abi_path: ?[]const u8 = null,
     world_name: ?[]const u8 = null,
     output_path: ?[]const u8 = null,
     arch: bindgen.Arch = .wasm32,
@@ -52,6 +58,11 @@ pub fn parseCliArgs(args: []const []const u8) !CliArgs {
             if (i >= args.len) return error.MissingWasiArgument;
             if (parsed.wasi_spec != null) return error.ConflictingInputOptions;
             parsed.wasi_spec = args[i];
+        } else if (std.mem.eql(u8, arg, "--detect-zigar-abi")) {
+            i += 1;
+            if (i >= args.len) return error.MissingDetectZigarAbiArgument;
+            if (parsed.detect_zigar_abi_path != null) return error.ConflictingInputOptions;
+            parsed.detect_zigar_abi_path = args[i];
         } else if (std.mem.eql(u8, arg, "-o")) {
             i += 1;
             if (i >= args.len) return error.MissingOutputArgument;
@@ -63,10 +74,64 @@ pub fn parseCliArgs(args: []const []const u8) !CliArgs {
             return error.UnknownOption;
         }
     }
-    if (parsed.wasi_spec != null and parsed.input_path != null) {
+    var mode_count: usize = 0;
+    if (parsed.wasi_spec != null) mode_count += 1;
+    if (parsed.input_path != null) mode_count += 1;
+    if (parsed.detect_zigar_abi_path != null) mode_count += 1;
+    if (mode_count > 1) {
         return error.ConflictingInputOptions;
     }
     return parsed;
+}
+
+pub fn formatDetectedZigarAbi(
+    allocator: std.mem.Allocator,
+    wasm_bytes: []const u8,
+) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    if (try fast_abi.detectZigarAbi(allocator, wasm_bytes)) |meta| {
+        defer meta.deinit(allocator);
+        const header_line = try std.fmt.allocPrint(
+            allocator,
+            "zigar:abi v{d} (memory64={}, big_endian={}, zero_copy_slices={}, world_hash=0x{x:0>16}, entries={d})\n",
+            .{
+                meta.version,
+                meta.flags.is_memory64,
+                meta.flags.is_big_endian,
+                meta.flags.zero_copy_slices,
+                meta.world_hash,
+                meta.entries.len,
+            },
+        );
+        defer allocator.free(header_line);
+        try out.appendSlice(allocator, header_line);
+
+        for (meta.entries, 0..) |entry, idx| {
+            const iface_display = if (entry.interface_name.len == 0) "$root" else entry.interface_name;
+            const entry_line = try std.fmt.allocPrint(
+                allocator,
+                "  [{d}] {s}#{s} -> {s} (abi_hash=0x{x:0>16}, size={d}, align={d}, flags=0x{x})\n",
+                .{
+                    idx,
+                    iface_display,
+                    entry.func_name,
+                    entry.fast_export_name,
+                    entry.abi_hash,
+                    entry.arg_struct_size,
+                    entry.arg_struct_align,
+                    entry.flags,
+                },
+            );
+            defer allocator.free(entry_line);
+            try out.appendSlice(allocator, entry_line);
+        }
+    } else {
+        try out.appendSlice(allocator, "No \"zigar:abi\" section present.\n");
+    }
+
+    return out.toOwnedSlice(allocator);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -82,6 +147,16 @@ pub fn main(init: std.process.Init) !void {
     const parsed = try parseCliArgs(args);
     if (parsed.help) {
         try writeStdout(io, usage_text);
+        return;
+    }
+
+    if (parsed.detect_zigar_abi_path) |wasm_path| {
+        const cwd = std.Io.Dir.cwd();
+        const wasm_bytes = try cwd.readFileAlloc(io, wasm_path, allocator, .limited(64 * 1024 * 1024));
+        defer allocator.free(wasm_bytes);
+        const report = try formatDetectedZigarAbi(allocator, wasm_bytes);
+        defer allocator.free(report);
+        try writeStdout(io, report);
         return;
     }
 
@@ -277,6 +352,34 @@ test "cli main entry point and world spec parsing" {
     defer std.testing.allocator.free(generated);
     try std.testing.expect(std.mem.indexOf(u8, generated, "pub const Token = extern struct {") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "pub const verify_Fn =") != null);
+
+    // Test --detect-zigar-abi CLI parsing and formatting
+    const detect_args = try parseCliArgs(&.{ "wit-zigar", "--detect-zigar-abi", "guest.wasm" });
+    try std.testing.expectEqualStrings("guest.wasm", detect_args.detect_zigar_abi_path.?);
+
+    const minimal_core = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
+    const report_none = try formatDetectedZigarAbi(std.testing.allocator, &minimal_core);
+    defer std.testing.allocator.free(report_none);
+    try std.testing.expect(std.mem.indexOf(u8, report_none, "No \"zigar:abi\" section present.") != null);
+
+    const entries = [_]fast_abi.ZigarFuncEntry{.{
+        .interface_name = "zigar:sample/guest-service@0.1.0",
+        .func_name = "transform-rect",
+        .fast_export_name = "__zigar_fast_zigar:sample/guest-service@0.1.0#transform_rect",
+        .abi_hash = 0xCAFE_1234,
+        .arg_struct_size = 52,
+        .arg_struct_align = 4,
+        .flags = fast_abi.FLAG_IS_BLITTABLE_ONLY,
+    }};
+    const embedded = try fast_abi.embedZigarAbiSection(std.testing.allocator, &minimal_core, fast_abi.ZigarAbiMetadata{
+        .world_hash = 0x99,
+        .entries = &entries,
+    });
+    defer std.testing.allocator.free(embedded);
+    const report_some = try formatDetectedZigarAbi(std.testing.allocator, embedded);
+    defer std.testing.allocator.free(report_some);
+    try std.testing.expect(std.mem.indexOf(u8, report_some, "zigar:abi v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report_some, "transform-rect -> __zigar_fast_zigar:sample/guest-service@0.1.0#transform_rect") != null);
 }
 
 

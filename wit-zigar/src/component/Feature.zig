@@ -30,6 +30,7 @@ pub const Set = packed struct {
     custom_page_sizes: bool = false,
     compact_imports: bool = false,
     wide_arithmetic: bool = false,
+    stack_switching: bool = false,
 
     const field_names = std.meta.fieldNames(Set);
 
@@ -44,18 +45,25 @@ pub const Set = packed struct {
         .custom_page_sizes = true,
         .compact_imports = true,
         .wide_arithmetic = true,
+        .stack_switching = true,
     };
 
     /// Enforce feature dependency chain from wabt's feature.cc:
     ///   exceptions        → reference_types
     ///   function_references → reference_types
     ///   gc                → function_references
+    ///   stack_switching   → function_references
     ///   reference_types   → bulk_memory
     pub fn updateDependencies(self: *Set) void {
         if (self.exceptions) self.reference_types = true;
         if (self.function_references) self.reference_types = true;
         if (self.gc) self.function_references = true;
-        // Re-check after gc may have enabled function_references.
+        if (self.stack_switching) {
+            self.function_references = true;
+            self.exceptions = true;
+        }
+        // Re-check after gc/stack_switching may have enabled function_references/exceptions.
+        if (self.exceptions) self.reference_types = true;
         if (self.function_references) self.reference_types = true;
         if (self.reference_types) self.bulk_memory = true;
     }
@@ -112,6 +120,7 @@ test "default features" {
     try std.testing.expect(!defaults.custom_page_sizes);
     try std.testing.expect(!defaults.compact_imports);
     try std.testing.expect(!defaults.wide_arithmetic);
+    try std.testing.expect(!defaults.stack_switching);
 }
 
 test "updateDependencies cascades correctly" {
@@ -134,6 +143,19 @@ test "updateDependencies cascades correctly" {
     try std.testing.expect(g.function_references);
     try std.testing.expect(g.reference_types);
     try std.testing.expect(g.bulk_memory);
+
+    // Enabling stack_switching should pull in exceptions and function_references → reference_types → bulk_memory.
+    var sw = Set{};
+    sw.exceptions = false;
+    sw.reference_types = false;
+    sw.bulk_memory = false;
+    sw.function_references = false;
+    sw.stack_switching = true;
+    sw.updateDependencies();
+    try std.testing.expect(sw.exceptions);
+    try std.testing.expect(sw.function_references);
+    try std.testing.expect(sw.reference_types);
+    try std.testing.expect(sw.bulk_memory);
 }
 
 test "enableAll enables every feature" {
@@ -159,6 +181,7 @@ test "enableAll enables every feature" {
     try std.testing.expect(a.custom_page_sizes);
     try std.testing.expect(a.compact_imports);
     try std.testing.expect(a.wide_arithmetic);
+    try std.testing.expect(a.stack_switching);
     // enableAll and the named constant should agree.
     try std.testing.expectEqual(Set.all, a);
 }
@@ -172,6 +195,6 @@ test "count returns number of non-default features" {
     s.mutable_globals = false; // default true → changed
     try std.testing.expectEqual(@as(usize, 2), s.count());
 
-    // all has 5 non-default features (the 5 still false/off by default).
-    try std.testing.expectEqual(@as(usize, 5), Set.all.count());
+    // all has 6 non-default features (the 6 still false/off by default).
+    try std.testing.expectEqual(@as(usize, 6), Set.all.count());
 }

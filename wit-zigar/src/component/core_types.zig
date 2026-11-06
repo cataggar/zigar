@@ -21,6 +21,7 @@ pub const one_byte_page_size: u32 = 1;
 // ── Reference types ───────────────────────────────────────────────────────
 
 pub const AbstractHeapType = enum(i32) {
+    nocont = -0x0b,
     noexn = -0x0c,
     nofunc = -0x0d,
     noextern = -0x0e,
@@ -33,6 +34,7 @@ pub const AbstractHeapType = enum(i32) {
     struct_ = -0x15,
     array = -0x16,
     exn = -0x17,
+    cont = -0x18,
 
     pub fn fromCode(code: i64) ?AbstractHeapType {
         inline for (std.enums.values(AbstractHeapType)) |heap| {
@@ -51,10 +53,12 @@ pub const AbstractHeapType = enum(i32) {
             .struct_ => .structref,
             .array => .arrayref,
             .exn => .exnref,
+            .cont => .contref,
             .none => .nullref,
             .nofunc => .nullfuncref,
             .noextern => .nullexternref,
             .noexn => .nullexnref,
+            .nocont => .nullcontref,
         };
     }
 
@@ -68,10 +72,12 @@ pub const AbstractHeapType = enum(i32) {
             .struct_ => .ref_struct,
             .array => .ref_array,
             .exn => .ref_exn,
+            .cont => .ref_cont,
             .none => .ref_none,
             .nofunc => .ref_nofunc,
             .noextern => .ref_noextern,
             .noexn => .ref_noexn,
+            .nocont => .ref_nocont,
         };
     }
 
@@ -85,10 +91,12 @@ pub const AbstractHeapType = enum(i32) {
             .structref => .{ .nullable = true, .heap = .struct_ },
             .arrayref => .{ .nullable = true, .heap = .array },
             .exnref => .{ .nullable = true, .heap = .exn },
+            .contref => .{ .nullable = true, .heap = .cont },
             .nullref => .{ .nullable = true, .heap = .none },
             .nullfuncref => .{ .nullable = true, .heap = .nofunc },
             .nullexternref => .{ .nullable = true, .heap = .noextern },
             .nullexnref => .{ .nullable = true, .heap = .noexn },
+            .nullcontref => .{ .nullable = true, .heap = .nocont },
             .ref_func => .{ .nullable = false, .heap = .func },
             .ref_extern => .{ .nullable = false, .heap = .extern_ },
             .ref_any => .{ .nullable = false, .heap = .any },
@@ -97,10 +105,12 @@ pub const AbstractHeapType = enum(i32) {
             .ref_struct => .{ .nullable = false, .heap = .struct_ },
             .ref_array => .{ .nullable = false, .heap = .array },
             .ref_exn => .{ .nullable = false, .heap = .exn },
+            .ref_cont => .{ .nullable = false, .heap = .cont },
             .ref_none => .{ .nullable = false, .heap = .none },
             .ref_nofunc => .{ .nullable = false, .heap = .nofunc },
             .ref_noextern => .{ .nullable = false, .heap = .noextern },
             .ref_noexn => .{ .nullable = false, .heap = .noexn },
+            .ref_nocont => .{ .nullable = false, .heap = .nocont },
             else => null,
         };
     }
@@ -177,19 +187,22 @@ pub const ValType = enum(i32) {
     structref = 0x6b,
     arrayref = 0x6a,
     exnref = 0x69,
+    contref = 0x68,
 
     // Function signature marker
     func = 0x60,
 
-    // GC composite types
+    // GC & continuation composite types
     struct_ = 0x5f,
     array = 0x5e,
+    cont = 0x5d,
 
-    // GC nullable bottom types (ref null <bottom>)
+    // GC / exception / continuation nullable bottom types (ref null <bottom>)
     nullfuncref = 0x73, // (ref null nofunc) — bottom of func hierarchy
     nullexternref = 0x72, // (ref null noextern) — bottom of extern hierarchy
     nullref = 0x71, // (ref null none) — bottom of internal hierarchy
     nullexnref = 0x74, // (ref null noexn) — bottom of exn hierarchy
+    nullcontref = 0x75, // (ref null nocont) — bottom of cont hierarchy
 
     // Non-nullable abstract heap types (internal-only, not binary encoded)
     ref_func = -1, // (ref func) — non-nullable func
@@ -206,6 +219,8 @@ pub const ValType = enum(i32) {
     ref_noexn = -12, // (ref noexn) — non-nullable noexn (bottom)
     concrete_ref = -13, // (ref <typeidx>) — type index stored out-of-line
     concrete_ref_null = -14, // (ref null <typeidx>) — type index stored out-of-line
+    ref_cont = -15, // (ref cont) — non-nullable cont
+    ref_nocont = -16, // (ref nocont) — non-nullable nocont (bottom)
 
     // Block void type
     void_ = 0x40,
@@ -221,10 +236,12 @@ pub const ValType = enum(i32) {
             .structref,
             .arrayref,
             .exnref,
+            .contref,
             .nullfuncref,
             .nullexternref,
             .nullref,
             .nullexnref,
+            .nullcontref,
             .ref_func,
             .ref_extern,
             .ref_any,
@@ -237,6 +254,8 @@ pub const ValType = enum(i32) {
             .ref_noextern,
             .ref_exn,
             .ref_noexn,
+            .ref_cont,
+            .ref_nocont,
             .concrete_ref,
             .concrete_ref_null,
             => true,
@@ -276,6 +295,7 @@ pub const ValType = enum(i32) {
             .externref => "externref",
             .anyref => "anyref",
             .exnref => "exnref",
+            .contref => "contref",
             .eqref => "eqref",
             .i31ref => "i31ref",
             .structref => "structref",
@@ -283,11 +303,13 @@ pub const ValType = enum(i32) {
             .func => "func",
             .struct_ => "struct",
             .array => "array",
+            .cont => "cont",
             .void_ => "void",
             .nullfuncref => "nullfuncref",
             .nullexternref => "nullexternref",
             .nullref => "nullref",
             .nullexnref => "nullexnref",
+            .nullcontref => "nullcontref",
             .ref_func => "(ref func)",
             .ref_extern => "(ref extern)",
             .ref_any => "(ref any)",
@@ -300,6 +322,8 @@ pub const ValType = enum(i32) {
             .ref_array => "(ref array)",
             .ref_exn => "(ref exn)",
             .ref_noexn => "(ref noexn)",
+            .ref_cont => "(ref cont)",
+            .ref_nocont => "(ref nocont)",
             .concrete_ref => "(ref <typeidx>)",
             .concrete_ref_null => "(ref null <typeidx>)",
         };
@@ -411,6 +435,13 @@ pub const LabelType = enum {
     try_,
     try_table,
     catch_,
+    cont_new,
+    cont_bind,
+    @"suspend",
+    @"resume",
+    resume_throw,
+    resume_throw_ref,
+    @"switch",
 };
 
 // ── Data / Element segment helpers ───────────────────────────────────────
@@ -430,7 +461,7 @@ pub const SegmentFlags = packed struct(u8) {
     _padding: u5 = 0,
 };
 
-// ── Exception-handling helpers ───────────────────────────────────────────
+// ── Exception-handling & stack-switching helpers ─────────────────────────
 
 /// Catch clause kind used by `try_table`.
 pub const CatchKind = enum {
@@ -438,6 +469,14 @@ pub const CatchKind = enum {
     catch_ref,
     catch_all,
     catch_all_ref,
+};
+
+/// Handler clause kind used by `resume`, `resume_throw`, and `resume_throw_ref`.
+pub const ResumeHandlerKind = enum(u8) {
+    /// `0x00`: `on $tag $label` (`tag_idx: u32`, `label_idx: u32`)
+    on_label = 0x00,
+    /// `0x01`: `on $tag switch` (`tag_idx: u32`)
+    on_switch = 0x01,
 };
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -448,11 +487,14 @@ test "ValType encoding" {
     try std.testing.expectEqual(@as(i32, 0x7d), @backingInt(ValType.f32));
     try std.testing.expectEqual(@as(i32, 0x7c), @backingInt(ValType.f64));
     try std.testing.expectEqual(@as(i32, 0x7b), @backingInt(ValType.v128));
+    try std.testing.expectEqual(@as(i32, 0x75), @backingInt(ValType.nullcontref));
     try std.testing.expectEqual(@as(i32, 0x70), @backingInt(ValType.funcref));
     try std.testing.expectEqual(@as(i32, 0x6f), @backingInt(ValType.externref));
     try std.testing.expectEqual(@as(i32, 0x6e), @backingInt(ValType.anyref));
     try std.testing.expectEqual(@as(i32, 0x69), @backingInt(ValType.exnref));
+    try std.testing.expectEqual(@as(i32, 0x68), @backingInt(ValType.contref));
     try std.testing.expectEqual(@as(i32, 0x60), @backingInt(ValType.func));
+    try std.testing.expectEqual(@as(i32, 0x5d), @backingInt(ValType.cont));
     try std.testing.expectEqual(@as(i32, 0x40), @backingInt(ValType.void_));
 }
 
@@ -470,6 +512,7 @@ const spec_valtype_bytes = [_]struct { ValType, u8 }{
     .{ .i8, 0x78 },
     .{ .i16, 0x77 },
     // Nullable abstract reference types (shorthands for `(ref null <heap>)`)
+    .{ .nullcontref, 0x75 }, // nocont   = -0x0b
     .{ .nullexnref, 0x74 }, // noexn    = -0x0c
     .{ .nullfuncref, 0x73 }, // nofunc   = -0x0d
     .{ .nullexternref, 0x72 }, // noextern = -0x0e
@@ -482,10 +525,12 @@ const spec_valtype_bytes = [_]struct { ValType, u8 }{
     .{ .structref, 0x6b }, // struct   = -0x15
     .{ .arrayref, 0x6a }, // array    = -0x16
     .{ .exnref, 0x69 }, // exn      = -0x17
+    .{ .contref, 0x68 }, // cont     = -0x18
     // Composite type forms
     .{ .func, 0x60 },
     .{ .struct_, 0x5f },
     .{ .array, 0x5e },
+    .{ .cont, 0x5d },
     // Empty block type
     .{ .void_, 0x40 },
 };
@@ -550,6 +595,10 @@ test "ValType.isRefType" {
     try std.testing.expect(ValType.externref.isRefType());
     try std.testing.expect(ValType.anyref.isRefType());
     try std.testing.expect(ValType.exnref.isRefType());
+    try std.testing.expect(ValType.contref.isRefType());
+    try std.testing.expect(ValType.nullcontref.isRefType());
+    try std.testing.expect(ValType.ref_cont.isRefType());
+    try std.testing.expect(ValType.ref_nocont.isRefType());
     try std.testing.expect(ValType.concrete_ref.isRefType());
     try std.testing.expect(ValType.concrete_ref_null.isRefType());
 

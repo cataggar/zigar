@@ -127,6 +127,12 @@ const Writer = struct {
         } else if (vt == .ref_noexn) {
             try self.appendByte(reader.ref_prefix); // ref
             try self.appendByte(0x74); // noexn
+        } else if (vt == .ref_cont) {
+            try self.appendByte(reader.ref_prefix); // ref
+            try self.appendByte(0x68); // cont
+        } else if (vt == .ref_nocont) {
+            try self.appendByte(reader.ref_prefix); // ref
+            try self.appendByte(0x75); // nocont
         } else {
             try self.appendByte(@bitCast(@as(i8, @intCast(@backingInt(vt)))));
         }
@@ -297,6 +303,10 @@ const Writer = struct {
                     try self.appendByte(0x5E);
                     try self.writeValTypeWithTidx(at.field.type, at.field.type_idx);
                     try self.appendByte(if (at.field.mutable) 1 else 0);
+                },
+                .cont_type => |ct| {
+                    try self.appendByte(0x5D);
+                    try self.writeS64Leb(@intCast(ct.func_type_idx));
                 },
             }
         }

@@ -31,16 +31,19 @@ const path = require('node:path');
 const { performance } = require('node:perf_hooks');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
-const CACHE_ROOT = process.env.CACHE_ROOT || '/d/zigar-worktrees/.cache';
+const DEFAULT_CACHE_ROOT = path.join(ROOT_DIR, '.tmp-bench');
+const CACHE_ROOT = process.env.CACHE_ROOT || (existsSync(DEFAULT_CACHE_ROOT) ? DEFAULT_CACHE_ROOT : '/d/zigar-worktrees/.cache');
 const TMP_ROOT = path.join(CACHE_ROOT, 'tmp');
 const ZIG_GLOBAL_CACHE = path.join(CACHE_ROOT, 'zig-global');
 const ZIG_LOCAL_CACHE = path.join(CACHE_ROOT, 'zig-local');
-const WAZIG_MASTER_CACHE = path.join(CACHE_ROOT, 'wazig-master-caches', 'wazig');
+const WAZIG_MASTER_CACHE = existsSync(path.join(CACHE_ROOT, 'wazig-master-caches', 'wazig'))
+  ? path.join(CACHE_ROOT, 'wazig-master-caches', 'wazig')
+  : path.join('/d/zigar-worktrees/.cache', 'wazig-master-caches', 'wazig');
 
 const NODE24_BIN = process.env.NODE24_BIN || (existsSync('/opt/actions-runner/2.338.0/externals/node24/bin/node')
   ? '/opt/actions-runner/2.338.0/externals/node24/bin/node'
   : process.execPath);
-const WAZIG_BIN = process.env.WAZIG_BIN || '/home/g/.local/bin/wazig';
+const WAZIG_BIN = process.env.WAZIG_BIN || (existsSync('/d/zig/wazig/bin/wazig') ? '/d/zig/wazig/bin/wazig' : '/home/g/.local/bin/wazig');
 const ZIG_BIN = process.env.ZIG_BIN || '/home/g/.local/bin/zig';
 const WASM_TOOLS_BIN = process.env.WASM_TOOLS_BIN || '/d/jco/submodules/wasm-tools/target/release/wasm-tools';
 const JSCO_DIR = process.env.JSCO_DIR || '/d/jsco';
@@ -370,6 +373,7 @@ function compileWazigBenchmarkModule(workDir) {
 
   const env = {
     ...process.env,
+    GHR_TOOL_DIR: process.env.GHR_TOOL_DIR || path.resolve(path.dirname(WAZIG_BIN), '..'),
     TMPDIR: TMP_ROOT,
     ZIG_LOCAL_CACHE_DIR: '.zig-cache',
     ZIG_GLOBAL_CACHE_DIR: '.zig-cache',
@@ -389,7 +393,6 @@ function compileWazigBenchmarkModule(workDir) {
       '--stack',
       '262144',
       '-rdynamic',
-      '--export=__stack_pointer',
       '-femit-bin=stack_bench.wasm',
       '--cache-dir',
       '.zig-cache',

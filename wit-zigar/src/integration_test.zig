@@ -531,3 +531,110 @@ test "post_return invocation on CanonLower -> CanonLift round-trip" {
     try testing.expectEqualStrings("item-1", result[1]);
     try testing.expectEqualStrings("summary-ok", result[2]);
 }
+
+test "fast_abi component integration: buildComponent with embedded zigar:abi section, detectZigarAbiInComponent, and callAuto dispatch" {
+    const alloc = testing.allocator;
+    const fast_abi = root.fast_abi;
+    const component = root.component;
+
+    // 1. Verify bindgen output on `sample.wit` and `wasi:cli@0.2.6` contains fast_abi constructs
+    const sample_zig = try bindgen.generateFromWitSource(alloc, sample_wit_source, .{});
+    defer alloc.free(sample_zig);
+    try testing.expect(std.mem.indexOf(u8, sample_zig, "pub const transform_rect_zigar_abi_hash: u64 = canon.fast_abi.comptimeAbiHash(transform_rect_fn_t, false);") != null);
+    try testing.expect(std.mem.indexOf(u8, sample_zig, "canon.FastLift(transform_rect_fn_t, @field(Impl, \"transform_rect\"), false)") != null);
+    try testing.expect(std.mem.indexOf(u8, sample_zig, "pub const zigar_abi_entries = blk: {") != null);
+    try testing.expect(std.mem.indexOf(u8, sample_zig, "pub const zigar_abi = struct {") != null);
+
+    const cli_026_zig = try bindgen.generateWasiWorldBySpec(alloc, "wasi:cli@0.2.6", .{});
+    defer alloc.free(cli_026_zig);
+    try testing.expect(std.mem.indexOf(u8, cli_026_zig, "pub const run_zigar_abi_hash: u64 = canon.fast_abi.comptimeAbiHash(run_fn_t, false);") != null);
+    try testing.expect(std.mem.indexOf(u8, cli_026_zig, "canon.FastLift(run_fn_t, @field(Impl, \"run\"), false)") != null);
+    try testing.expect(std.mem.indexOf(u8, cli_026_zig, "pub const zigar_abi = struct {") != null);
+
+    // 2. Build a real WebAssembly Component binary from a core Wasm module that contains
+    //    both embedded WIT metadata ("wasm-v1") and a "zigar:abi" custom section.
+    const adder_wit =
+        \\package docs:adder@0.1.0;
+        \\
+        \\interface add {
+        \\  add: func(x: u32, y: u32) -> u32;
+        \\}
+        \\
+        \\world adder {
+        \\  export add;
+        \\}
+    ;
+
+    const AddFn = fn (u32, u32) u32;
+    const AddImpl = struct {
+        fn add(x: u32, y: u32) u32 {
+            return x + y;
+        }
+    };
+    const FastAddLift = fast_abi.FastLift(AddFn, AddImpl.add, false);
+    const CanonAddLift = canon.CanonLift(AddFn, false);
+    const CanonAddLower = canon.CanonLower(AddFn, false);
+
+    // Core Wasm module exporting `docs:adder/add@0.1.0#add` ((i32, i32) -> i32).
+    const core_bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01,
+        0x7f, 0x03, 0x02, 0x01, 0x00, 0x07, 28,   0x01,
+        24,   'd',  'o',  'c',  's',  ':',  'a',  'd',
+        'd',  'e',  'r',  '/',  'a',  'd',  'd',  '@',
+        '0',  '.',  '1',  '.',  '0',  '#',  'a',  'd',
+        'd',  0x00, 0x00, 0x0a, 0x09, 0x01, 0x07, 0x00,
+        0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b,
+    };
+
+    const core_with_wit = try component.embedWorldFromSource(alloc, &core_bytes, adder_wit, "adder");
+    defer alloc.free(core_with_wit);
+
+    const zigar_entries = [_]fast_abi.ZigarFuncEntry{.{
+        .interface_name = "docs:adder/add@0.1.0",
+        .func_name = "add",
+        .fast_export_name = "__zigar_fast_docs:adder/add@0.1.0#add",
+        .abi_hash = FastAddLift.abi_hash,
+        .arg_struct_size = @intCast(FastAddLift.frame_layout.frame_size),
+        .arg_struct_align = @intCast(FastAddLift.frame_layout.frame_align),
+        .flags = FastAddLift.frame_layout.flags,
+    }};
+    const zigar_meta = fast_abi.ZigarAbiMetadata{
+        .world_hash = fast_abi.fnv1a64("docs:adder/adder@0.1.0"),
+        .entries = &zigar_entries,
+    };
+
+    const core_with_both = try fast_abi.embedZigarAbiSection(alloc, core_with_wit, zigar_meta);
+    defer alloc.free(core_with_both);
+
+    const comp_bytes = try component.buildComponent(alloc, core_with_both);
+    defer alloc.free(comp_bytes);
+
+    // 3. Detect "zigar:abi" inside the built Component binary (`core_module` section id == 1)
+    const detected = (try fast_abi.detectZigarAbiInComponent(alloc, comp_bytes)).?;
+    defer detected.deinit(alloc);
+
+    try testing.expectEqual(zigar_meta.world_hash, detected.world_hash);
+    try testing.expectEqual(@as(usize, 1), detected.entries.len);
+    try testing.expectEqualStrings("docs:adder/add@0.1.0", detected.entries[0].interface_name);
+    try testing.expectEqualStrings("add", detected.entries[0].func_name);
+    try testing.expectEqual(FastAddLift.abi_hash, detected.entries[0].abi_hash);
+
+    // 4. Dispatch via `CanonLower.callAuto` using the detected component metadata
+    var mem: [1024]u8 align(16) = @splat(0);
+    var ctx = canon.MemoryContext{
+        .memory = &mem,
+        .fast_frame_offset = 64,
+    };
+    const sum = try CanonAddLower.callAuto(
+        &ctx,
+        detected,
+        "docs:adder/add@0.1.0",
+        "add",
+        FastAddLift.thunk(),
+        CanonAddLift.thunk(&AddImpl.add),
+        .{ 19, 23 },
+    );
+    try testing.expectEqual(@as(u32, 42), sum);
+}
+

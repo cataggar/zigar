@@ -68,8 +68,24 @@ pub const Imm = enum {
     select_types,
     /// A block signature followed by a vector of catch clauses.
     try_table,
+    /// A continuation type index followed by a vector of resume handler clauses (`resume`, `resume_throw_ref`).
+    resume_table,
+    /// A continuation type index and exception tag index followed by a vector of resume handler clauses (`resume_throw`).
+    resume_throw_table,
     /// The single reserved byte carried by `atomic.fence`.
     reserved_byte,
+};
+
+/// A single handler entry in the handler table vector of `resume`, `resume_throw`,
+/// or `resume_throw_ref`.
+pub const ResumeHandler = union(types.ResumeHandlerKind) {
+    on_label: struct {
+        tag_idx: u32,
+        label_idx: u32,
+    },
+    on_switch: struct {
+        tag_idx: u32,
+    },
 };
 
 /// Immediate shape for an opcode, or null when this writer has no way to
@@ -101,6 +117,10 @@ pub fn immediateShape(prefix: u8, code: u32) ?Imm {
             0xd0 => .heap_type,
             0xd1, 0xd3, 0xd4 => .none,
             0xd2, 0xd5, 0xd6 => .index,
+            0xe0, 0xe2 => .index,
+            0xe1, 0xe6 => .index_pair,
+            0xe3, 0xe5 => .resume_table,
+            0xe4 => .resume_throw_table,
             else => null,
         },
         0xfc => switch (code) {
@@ -336,6 +356,60 @@ pub fn skipImmediates(shape: Imm, bytes: []const u8, pos: *usize) Error!void {
                 _ = try readU32At(bytes, pos);
             }
         },
+        .resume_table => {
+            _ = try readU32At(bytes, pos);
+            const count = try readU32At(bytes, pos);
+            for (0..count) |_| {
+                _ = try decodeResumeHandler(bytes, pos);
+            }
+        },
+        .resume_throw_table => {
+            _ = try readU32At(bytes, pos);
+            _ = try readU32At(bytes, pos);
+            const count = try readU32At(bytes, pos);
+            for (0..count) |_| {
+                _ = try decodeResumeHandler(bytes, pos);
+            }
+        },
+    }
+}
+
+/// Decode one handler entry from a `resume`, `resume_throw`, or `resume_throw_ref`
+/// handler table vector.
+pub fn decodeResumeHandler(bytes: []const u8, pos: *usize) Error!ResumeHandler {
+    if (pos.* >= bytes.len) return error.TruncatedBody;
+    const kind_byte = bytes[pos.*];
+    pos.* += 1;
+    const kind = std.enums.fromInt(types.ResumeHandlerKind, kind_byte) orelse
+        return error.UnsupportedOpcode;
+    return switch (kind) {
+        .on_label => .{ .on_label = .{
+            .tag_idx = try readU32At(bytes, pos),
+            .label_idx = try readU32At(bytes, pos),
+        } },
+        .on_switch => .{ .on_switch = .{
+            .tag_idx = try readU32At(bytes, pos),
+        } },
+    };
+}
+
+/// Encode one handler entry for a `resume`, `resume_throw`, or `resume_throw_ref`
+/// handler table vector.
+pub fn encodeResumeHandler(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), handler: ResumeHandler) std.mem.Allocator.Error!void {
+    var tmp: [leb128.max_u32_bytes]u8 = undefined;
+    switch (handler) {
+        .on_label => |h| {
+            try buf.append(allocator, @backingInt(types.ResumeHandlerKind.on_label));
+            const n1 = leb128.writeU32Leb128(&tmp, h.tag_idx);
+            try buf.appendSlice(allocator, tmp[0..n1]);
+            const n2 = leb128.writeU32Leb128(&tmp, h.label_idx);
+            try buf.appendSlice(allocator, tmp[0..n2]);
+        },
+        .on_switch => |h| {
+            try buf.append(allocator, @backingInt(types.ResumeHandlerKind.on_switch));
+            const n = leb128.writeU32Leb128(&tmp, h.tag_idx);
+            try buf.appendSlice(allocator, tmp[0..n]);
+        },
     }
 }
 
@@ -392,8 +466,8 @@ test "typed select scanner requires one complete value type" {
         .{ .body = &.{ 0x1c, 0x81, 0x80, 0x80, 0x80, 0x80, 0x00 }, .expected = error.TruncatedBody },
         .{ .body = &.{ 0x1c, 0x01 }, .expected = error.TruncatedBody },
         .{ .body = &.{ 0x1c, 0x01, 0x80 }, .expected = error.TruncatedBody },
-        .{ .body = &.{ 0x1c, 0x01, 0x68 }, .expected = error.UnsupportedOpcode },
-        .{ .body = &.{ 0x1c, 0x01, 0xe8, 0x7f }, .expected = error.UnsupportedOpcode },
+        .{ .body = &.{ 0x1c, 0x01, 0x67 }, .expected = error.UnsupportedOpcode },
+        .{ .body = &.{ 0x1c, 0x01, 0xe7, 0x7f }, .expected = error.UnsupportedOpcode },
         .{ .body = &.{ 0x1c, 0x01, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00 }, .expected = error.UnsupportedOpcode },
         .{ .body = &.{ 0x1c, 0x01, 0x80, 0x80, 0x80, 0x80, 0x10 }, .expected = error.UnsupportedOpcode },
         .{ .body = &.{ 0x1c, 0x01, 0x63 }, .expected = error.TruncatedBody },
@@ -409,3 +483,62 @@ test "typed select scanner requires one complete value type" {
         );
     }
 }
+
+test "WasmFX continuation instructions and resume handler clauses round-trip" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectEqual(@as(?Imm, .index), immediateShape(0, 0xe0));
+    try std.testing.expectEqual(@as(?Imm, .index_pair), immediateShape(0, 0xe1));
+    try std.testing.expectEqual(@as(?Imm, .index), immediateShape(0, 0xe2));
+    try std.testing.expectEqual(@as(?Imm, .resume_table), immediateShape(0, 0xe3));
+    try std.testing.expectEqual(@as(?Imm, .resume_throw_table), immediateShape(0, 0xe4));
+    try std.testing.expectEqual(@as(?Imm, .resume_table), immediateShape(0, 0xe5));
+    try std.testing.expectEqual(@as(?Imm, .index_pair), immediateShape(0, 0xe6));
+
+    // Round-trip encode/decode of resume handler clauses (on_label and on_switch).
+    const handlers = [_]ResumeHandler{
+        .{ .on_label = .{ .tag_idx = 3, .label_idx = 7 } },
+        .{ .on_switch = .{ .tag_idx = 5 } },
+    };
+    var encoded_handlers: std.ArrayList(u8) = .empty;
+    defer encoded_handlers.deinit(allocator);
+    for (handlers) |h| {
+        try encodeResumeHandler(allocator, &encoded_handlers, h);
+    }
+
+    var h_pos: usize = 0;
+    const h0 = try decodeResumeHandler(encoded_handlers.items, &h_pos);
+    try std.testing.expectEqual(handlers[0], h0);
+    const h1 = try decodeResumeHandler(encoded_handlers.items, &h_pos);
+    try std.testing.expectEqual(handlers[1], h1);
+    try std.testing.expectEqual(encoded_handlers.items.len, h_pos);
+
+    // Full sequence of WasmFX instructions (0xe0..0xe6) followed by `end` (0x0b).
+    const seq = [_]u8{
+        0xe0, 0x01, // cont.new 1
+        0xe1, 0x01, 0x02, // cont.bind 1 2
+        0xe2, 0x00, // suspend 0
+        0xe3, 0x01, 0x02, 0x00, 0x03, 0x07, 0x01, 0x05, // resume 1 (on 3 7) (on 5 switch)
+        0xe4, 0x01, 0x04, 0x01, 0x00, 0x02, 0x01, // resume_throw 1 4 (on 2 1)
+        0xe5, 0x01, 0x01, 0x01, 0x06, // resume_throw_ref 1 (on 6 switch)
+        0xe6, 0x01, 0x00, // switch 1 0
+        0x0b, // end
+    };
+
+    var pos: usize = 0;
+    const expected_codes = [_]u32{ 0xe0, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0x0b };
+    for (expected_codes) |expected_code| {
+        const decoded = try decode(&seq, &pos);
+        try std.testing.expectEqual(@as(u8, 0), decoded.prefix);
+        try std.testing.expectEqual(expected_code, decoded.code);
+        try skipImmediates(decoded.shape, &seq, &pos);
+    }
+    try std.testing.expectEqual(seq.len, pos);
+
+    // Invalid resume handler clause kind is rejected.
+    const bad_handler = [_]u8{ 0xe3, 0x01, 0x01, 0x02, 0x00 };
+    var bad_pos: usize = 0;
+    const bad_dec = try decode(&bad_handler, &bad_pos);
+    try std.testing.expectError(error.UnsupportedOpcode, skipImmediates(bad_dec.shape, &bad_handler, &bad_pos));
+}
+

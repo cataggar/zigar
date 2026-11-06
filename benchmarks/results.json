@@ -1,8 +1,8 @@
 {
   "meta": {
-    "timestamp": "2026-11-05T07:30:40.392Z",
+    "timestamp": "2026-11-06T17:00:28.884Z",
     "mode": "quick",
-    "totalElapsedSec": 879.85,
+    "totalElapsedSec": 800.58,
     "nodeVersion": "v22.15.0",
     "platform": "linux",
     "arch": "arm64",
@@ -11,31 +11,31 @@
   },
   "toolchain": {
     "wazig": {
-      "version": "0.17.0-wazig.3",
-      "binPath": "~/.local/bin/wazig",
-      "unitDir": "~/.local/share/ghr/tools/_v2/units/u-cataggar/u-zig/u-wazig/_unit",
+      "version": "0.17.0",
+      "binPath": "/d/zig/wazig/bin/wazig",
+      "unitDir": "/d/zig/wazig",
       "target": "wasm64-wasip3 (universal, OS/arch-independent, no LLVM)",
       "archiveName": "wazig.tar.zst",
-      "archiveBytes": 8856032,
-      "compilerBinaryBytes": 41345053,
-      "libBytes": 29895915,
+      "archiveBytes": 8881369,
+      "compilerBinaryBytes": 36486450,
+      "libBytes": 29920315,
       "libFiles": 1321,
-      "totalUncompressedBytes": 71240968,
+      "totalUncompressedBytes": 66406765,
       "totalFiles": 1322,
       "cliVersionLatencyMs": {
-        "median": 313.95,
-        "mean": 312.14,
-        "min": 304.53,
-        "max": 318.37,
-        "p95": 318.37,
+        "median": 246.63,
+        "mean": 247.17,
+        "min": 239.37,
+        "max": 254.3,
+        "p95": 254.3,
         "samples": [
-          318.37,
-          317.13,
-          316.17,
-          313.95,
-          304.53,
-          308.09,
-          306.73
+          251.16,
+          252.89,
+          246.63,
+          254.3,
+          246.44,
+          239.4,
+          239.37
         ]
       }
     },
@@ -53,29 +53,29 @@
       "totalUncompressedBytes": 360344860,
       "totalFiles": 19505,
       "cliVersionLatencyMs": {
-        "median": 5.09,
-        "mean": 5.02,
-        "min": 4.71,
-        "max": 5.25,
-        "p95": 5.25,
+        "median": 4.42,
+        "mean": 4.49,
+        "min": 4.34,
+        "max": 4.92,
+        "p95": 4.92,
         "samples": [
-          4.96,
-          5.1,
-          5.12,
-          5.25,
-          4.93,
-          4.71,
-          5.09
+          4.37,
+          4.5,
+          4.49,
+          4.34,
+          4.36,
+          4.42,
+          4.92
         ]
       }
     },
     "ratios": {
-      "archiveDownloadReductionVsLinuxArm64": 5.97,
-      "archiveDownloadReductionVsWindowsX64": 11.32,
-      "archiveDownloadReductionVs6DesktopTargets": 47.4,
-      "compilerBinarySizeReduction": 4.15,
-      "libDirSizeReduction": 6.28,
-      "totalUncompressedSizeReduction": 5.06,
+      "archiveDownloadReductionVsLinuxArm64": 5.95,
+      "archiveDownloadReductionVsWindowsX64": 11.29,
+      "archiveDownloadReductionVs6DesktopTargets": 47.26,
+      "compilerBinarySizeReduction": 4.71,
+      "libDirSizeReduction": 6.27,
+      "totalUncompressedSizeReduction": 5.43,
       "fileCountReduction": 14.75
     },
     "libBreakdown": [
@@ -95,7 +95,7 @@
       },
       {
         "subdir": "lib/std",
-        "wazigBytes": 17338102,
+        "wazigBytes": 17362202,
         "wazigFiles": 568,
         "zigBytes": 17163952,
         "zigFiles": 565
@@ -109,7 +109,7 @@
       },
       {
         "subdir": "lib/c",
-        "wazigBytes": 2400408,
+        "wazigBytes": 2400708,
         "wazigFiles": 65,
         "zigBytes": 78858,
         "zigFiles": 20
@@ -165,7 +165,7 @@
       }
     ],
     "releaseArchives": {
-      "wazigTarZstBytes": 8856032,
+      "wazigTarZstBytes": 8881369,
       "zigAarch64LinuxTarXzBytes": 52877280,
       "zigX86_64LinuxTarXzBytes": 57332648,
       "zigAarch64MacosTarXzBytes": 53985220,
@@ -173,23 +173,23 @@
       "zigAarch64WindowsZipBytes": 95992853,
       "zigX86_64WindowsZipBytes": 100268137
     },
-    "wazigLibDir": "~/.local/share/ghr/tools/_v2/units/u-cataggar/u-zig/u-wazig/_unit/lib"
+    "wazigLibDir": "/d/zig/wazig/lib"
   },
   "compilation": {
     "translateCMicro": {
       "wazig": {
         "label": "wazig translate-c (in-process Aro)",
-        "coldMs": 319,
-        "warmMs": 310
+        "coldMs": 255.6,
+        "warmMs": 237.4
       },
       "zig": {
         "label": "zig translate-c (external sub-binary)",
         "coldMs": 61743.9,
-        "warmMs": 11.8
+        "warmMs": 11.2
       }
     },
     "stockZigMultithreadedError": "/home/g/.local/share/ghr/tools/_v2/units/u-cataggar/u-zig/_unit/zig-aarch64-linux-0.17.0/lib/std/heap.zig:18:74: error: unimplemented",
-    "stockZigNoLlvmMultithreadedError": "/home/g/.local/share/ghr/tools/_v2/units/u-cataggar/u-zig/u-wazig/_unit/lib/std/Thread.zig:1019:67: error: calling convention 'naked' not supported by compiler backend 'stage2_wasm'",
+    "stockZigNoLlvmMultithreadedError": "/d/zig/wazig/lib/std/Thread.zig:1019:67: error: calling convention 'naked' not supported by compiler backend 'stage2_wasm'",
     "modules": [
       {
         "id": "integers",
@@ -199,23 +199,23 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 3086.4,
-            "warmSharedCacheMs": 1021.3,
-            "warmIncrementalMs": 1056.2,
+            "coldMs": 2777.2,
+            "warmSharedCacheMs": 910.2,
+            "warmIncrementalMs": 923.8,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 17486.1,
-            "warmSharedCacheMs": 3401.2,
-            "warmIncrementalMs": 3388.6,
+            "coldMs": 9365,
+            "warmSharedCacheMs": 4209.9,
+            "warmIncrementalMs": 1959.9,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 6345.6,
-            "warmSharedCacheMs": 6345.6,
-            "warmIncrementalMs": 842.9,
+            "coldMs": 5637.8,
+            "warmSharedCacheMs": 5637.8,
+            "warmIncrementalMs": 719.5,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           }
@@ -229,23 +229,23 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 3001.6,
-            "warmSharedCacheMs": 936.6,
-            "warmIncrementalMs": 955.7,
+            "coldMs": 2746.2,
+            "warmSharedCacheMs": 879.3,
+            "warmIncrementalMs": 850.4,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 17143.3,
-            "warmSharedCacheMs": 3058.5,
-            "warmIncrementalMs": 3043.6,
+            "coldMs": 9193.3,
+            "warmSharedCacheMs": 4038.2,
+            "warmIncrementalMs": 1789.4,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 6260.9,
-            "warmSharedCacheMs": 6260.9,
-            "warmIncrementalMs": 1005.7,
+            "coldMs": 5606.9,
+            "warmSharedCacheMs": 5606.9,
+            "warmIncrementalMs": 900.4,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           }
@@ -259,23 +259,23 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 2979.7,
-            "warmSharedCacheMs": 914.6,
-            "warmIncrementalMs": 936.8,
+            "coldMs": 2709.3,
+            "warmSharedCacheMs": 842.3,
+            "warmIncrementalMs": 831.9,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 16985.8,
-            "warmSharedCacheMs": 2900.9,
-            "warmIncrementalMs": 2860,
+            "coldMs": 9066.6,
+            "warmSharedCacheMs": 3911.6,
+            "warmIncrementalMs": 1696.7,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 6238.9,
-            "warmSharedCacheMs": 6238.9,
-            "warmIncrementalMs": 986.8,
+            "coldMs": 5569.9,
+            "warmSharedCacheMs": 5569.9,
+            "warmIncrementalMs": 881.9,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           }
@@ -289,23 +289,23 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 62687.5,
-            "warmSharedCacheMs": 966.6,
-            "warmIncrementalMs": 917.5,
+            "coldMs": 62618.6,
+            "warmSharedCacheMs": 883.8,
+            "warmIncrementalMs": 893.8,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 18746.2,
-            "warmSharedCacheMs": 4477.2,
-            "warmIncrementalMs": 4472.8,
+            "coldMs": 9868.3,
+            "warmSharedCacheMs": 4803.9,
+            "warmIncrementalMs": 2633.2,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 6206.6,
-            "warmSharedCacheMs": 6206.6,
-            "warmIncrementalMs": 723.3,
+            "coldMs": 5511.7,
+            "warmSharedCacheMs": 5511.7,
+            "warmIncrementalMs": 660.3,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           }
@@ -319,23 +319,23 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 65726.4,
-            "warmSharedCacheMs": 4005.5,
-            "warmIncrementalMs": 4172.1,
+            "coldMs": 65238.5,
+            "warmSharedCacheMs": 3503.7,
+            "warmIncrementalMs": 3535.1,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 28348.5,
-            "warmSharedCacheMs": 14079.5,
-            "warmIncrementalMs": 14278.7,
+            "coldMs": 15219.2,
+            "warmSharedCacheMs": 10154.8,
+            "warmIncrementalMs": 7797.3,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 9245.5,
-            "warmSharedCacheMs": 9245.5,
-            "warmIncrementalMs": 4222.1,
+            "coldMs": 8131.6,
+            "warmSharedCacheMs": 8131.6,
+            "warmIncrementalMs": 3585.1,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           }
@@ -352,22 +352,22 @@
         "modes": {
           "zig_build_exe": {
             "coldMs": 34120.5,
-            "warmSharedCacheMs": 1895.5,
-            "warmIncrementalMs": 1916.7,
+            "warmSharedCacheMs": 1796.1,
+            "warmIncrementalMs": 1769.9,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 15942.3,
-            "warmSharedCacheMs": 3898.2,
-            "warmIncrementalMs": 3859.3,
+            "coldMs": 16780.1,
+            "warmSharedCacheMs": 2270.2,
+            "warmIncrementalMs": 2278,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 7163.6,
-            "warmSharedCacheMs": 7163.6,
-            "warmIncrementalMs": 1775.1,
+            "coldMs": 6379.2,
+            "warmSharedCacheMs": 6379.2,
+            "warmIncrementalMs": 1604,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           }
@@ -383,23 +383,23 @@
         "StockZigSupportedOutOfBox": false,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 3165.6,
-            "warmSharedCacheMs": 1100.6,
-            "warmIncrementalMs": 1044.3,
+            "coldMs": 2839.4,
+            "warmSharedCacheMs": 972.4,
+            "warmIncrementalMs": 983,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": true
           },
           "wazig_build_exe": {
-            "coldMs": 17833.1,
-            "warmSharedCacheMs": 3748.2,
-            "warmIncrementalMs": 3726.8,
+            "coldMs": 7311.2,
+            "warmSharedCacheMs": 2156.1,
+            "warmIncrementalMs": 2170.6,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 6424.9,
-            "warmSharedCacheMs": 6424.9,
-            "warmIncrementalMs": 1094.3,
+            "coldMs": 5700,
+            "warmSharedCacheMs": 5700,
+            "warmIncrementalMs": 1033,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": true
           }
@@ -415,23 +415,23 @@
         "StockZigSupportedOutOfBox": false,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 3184.5,
-            "warmSharedCacheMs": 854,
-            "warmIncrementalMs": 838.7,
+            "coldMs": 2803.9,
+            "warmSharedCacheMs": 814.5,
+            "warmIncrementalMs": 802.7,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": true
           },
           "wazig_build_exe": {
-            "coldMs": 17865.2,
-            "warmSharedCacheMs": 3185.4,
-            "warmIncrementalMs": 3168,
+            "coldMs": 9256.2,
+            "warmSharedCacheMs": 1856,
+            "warmIncrementalMs": 1825.6,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 6178.3,
-            "warmSharedCacheMs": 6178.3,
-            "warmIncrementalMs": 888.7,
+            "coldMs": 5542.1,
+            "warmSharedCacheMs": 5542.1,
+            "warmIncrementalMs": 852.7,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": true
           }
@@ -445,23 +445,23 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 3084.7,
-            "warmSharedCacheMs": 1044.8,
-            "warmIncrementalMs": 1018,
+            "coldMs": 2832.3,
+            "warmSharedCacheMs": 930.4,
+            "warmIncrementalMs": 951.9,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 17353.1,
-            "warmSharedCacheMs": 3259.5,
-            "warmIncrementalMs": 3221.1,
+            "coldMs": 9320.4,
+            "warmSharedCacheMs": 4178.5,
+            "warmIncrementalMs": 1909.5,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 6322.2,
-            "warmSharedCacheMs": 6322.2,
-            "warmIncrementalMs": 811.4,
+            "coldMs": 5767.6,
+            "warmSharedCacheMs": 5767.6,
+            "warmIncrementalMs": 758.6,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           }
@@ -475,23 +475,23 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 3550.4,
-            "warmSharedCacheMs": 1510.5,
-            "warmIncrementalMs": 1520.5,
+            "coldMs": 3328.4,
+            "warmSharedCacheMs": 1426.5,
+            "warmIncrementalMs": 1389.5,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 18621.3,
-            "warmSharedCacheMs": 4527.6,
-            "warmIncrementalMs": 4563.6,
+            "coldMs": 9992.4,
+            "warmSharedCacheMs": 4850.5,
+            "warmIncrementalMs": 2628.8,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 6787.9,
-            "warmSharedCacheMs": 6787.9,
-            "warmIncrementalMs": 1570.5,
+            "coldMs": 6263.7,
+            "warmSharedCacheMs": 6263.7,
+            "warmIncrementalMs": 1439.5,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           }
@@ -505,23 +505,23 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 5833.5,
-            "warmSharedCacheMs": 3793.6,
-            "warmIncrementalMs": 3722,
+            "coldMs": 5116.7,
+            "warmSharedCacheMs": 3214.8,
+            "warmIncrementalMs": 3338.7,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 25880.8,
-            "warmSharedCacheMs": 11787.2,
-            "warmIncrementalMs": 11780.5,
+            "coldMs": 13977.3,
+            "warmSharedCacheMs": 8835.4,
+            "warmIncrementalMs": 6503.8,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 9071,
-            "warmSharedCacheMs": 9071,
-            "warmIncrementalMs": 3772,
+            "coldMs": 8052,
+            "warmSharedCacheMs": 8052,
+            "warmIncrementalMs": 3388.7,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           }
@@ -535,23 +535,23 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 3172,
-            "warmSharedCacheMs": 1132.1,
-            "warmIncrementalMs": 1094.4,
+            "coldMs": 2929.6,
+            "warmSharedCacheMs": 1027.7,
+            "warmIncrementalMs": 1047.6,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 17713.5,
-            "warmSharedCacheMs": 3619.8,
-            "warmIncrementalMs": 3612.2,
+            "coldMs": 9509.9,
+            "warmSharedCacheMs": 4368,
+            "warmIncrementalMs": 2077.4,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 6409.5,
-            "warmSharedCacheMs": 6409.5,
-            "warmIncrementalMs": 1144.4,
+            "coldMs": 5864.9,
+            "warmSharedCacheMs": 5864.9,
+            "warmIncrementalMs": 1097.6,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           }
@@ -565,23 +565,23 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 3721.8,
-            "warmSharedCacheMs": 1681.9,
-            "warmIncrementalMs": 1627.2,
+            "coldMs": 3351.6,
+            "warmSharedCacheMs": 1449.7,
+            "warmIncrementalMs": 1488.2,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 18948,
-            "warmSharedCacheMs": 4854.4,
-            "warmIncrementalMs": 4826,
+            "coldMs": 10184.2,
+            "warmSharedCacheMs": 5042.3,
+            "warmIncrementalMs": 2739.3,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 6959.3,
-            "warmSharedCacheMs": 6959.3,
-            "warmIncrementalMs": 1677.2,
+            "coldMs": 6286.9,
+            "warmSharedCacheMs": 6286.9,
+            "warmIncrementalMs": 1538.2,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           }
@@ -595,23 +595,23 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 4807.2,
-            "warmSharedCacheMs": 2767.3,
-            "warmIncrementalMs": 2714.3,
+            "coldMs": 4409.7,
+            "warmSharedCacheMs": 2507.8,
+            "warmIncrementalMs": 2478.5,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 22240.8,
-            "warmSharedCacheMs": 8147.2,
-            "warmIncrementalMs": 8220,
+            "coldMs": 12051.5,
+            "warmSharedCacheMs": 6909.6,
+            "warmIncrementalMs": 4553.7,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 8044.7,
-            "warmSharedCacheMs": 8044.7,
-            "warmIncrementalMs": 2764.3,
+            "coldMs": 7345,
+            "warmSharedCacheMs": 7345,
+            "warmIncrementalMs": 2528.5,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           }
@@ -641,7 +641,7 @@
       },
       {
         "key": "wazig",
-        "label": "wazig v0.17.0-wazig.3 (MIR + post-link opt)"
+        "label": "wazig (MIR + post-link opt)"
       }
     ],
     "modules": [
@@ -651,13 +651,13 @@
         "byOptimize": {
           "Debug": {
             "zig_libc": {
-              "rawBytes": 1865443,
+              "rawBytes": 1865487,
               "strippedBytes": 237569,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 1500020,
+              "rawBytes": 1500064,
               "strippedBytes": 174964,
               "compileError": null,
               "stripError": null
@@ -669,8 +669,8 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 236129,
-              "strippedBytes": 150728,
+              "rawBytes": 196037,
+              "strippedBytes": 126633,
               "compileError": null,
               "stripError": null
             }
@@ -690,26 +690,26 @@
             },
             "zig_nollvm": {
               "rawBytes": 166827,
-              "strippedBytes": 159258,
+              "strippedBytes": 159276,
               "compileError": null,
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 138937,
-              "strippedBytes": 95300,
+              "rawBytes": 109377,
+              "strippedBytes": 78413,
               "compileError": null,
               "stripError": null
             }
           },
           "ReleaseFast": {
             "zig_libc": {
-              "rawBytes": 1462930,
+              "rawBytes": 1462974,
               "strippedBytes": 49544,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 1144029,
+              "rawBytes": 1144073,
               "strippedBytes": 34447,
               "compileError": null,
               "stripError": null
@@ -721,21 +721,21 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 162150,
-              "strippedBytes": 96157,
+              "rawBytes": 172526,
+              "strippedBytes": 114036,
               "compileError": null,
               "stripError": null
             }
           },
           "ReleaseSafe": {
             "zig_libc": {
-              "rawBytes": 1539283,
+              "rawBytes": 1539327,
               "strippedBytes": 73702,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 1186347,
+              "rawBytes": 1186391,
               "strippedBytes": 51746,
               "compileError": null,
               "stripError": null
@@ -747,8 +747,8 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 216475,
-              "strippedBytes": 143511,
+              "rawBytes": 176383,
+              "strippedBytes": 119302,
               "compileError": null,
               "stripError": null
             }
@@ -761,13 +761,13 @@
         "byOptimize": {
           "Debug": {
             "zig_libc": {
-              "rawBytes": 1846762,
+              "rawBytes": 1846806,
               "strippedBytes": 237785,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 1481926,
+              "rawBytes": 1481970,
               "strippedBytes": 175170,
               "compileError": null,
               "stripError": null
@@ -779,8 +779,8 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 231678,
-              "strippedBytes": 150645,
+              "rawBytes": 192117,
+              "strippedBytes": 126614,
               "compileError": null,
               "stripError": null
             }
@@ -800,26 +800,26 @@
             },
             "zig_nollvm": {
               "rawBytes": 156369,
-              "strippedBytes": 156100,
+              "strippedBytes": 156118,
               "compileError": null,
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 136021,
-              "strippedBytes": 96637,
+              "rawBytes": 106891,
+              "strippedBytes": 79496,
               "compileError": null,
               "stripError": null
             }
           },
           "ReleaseFast": {
             "zig_libc": {
-              "rawBytes": 1453196,
+              "rawBytes": 1453240,
               "strippedBytes": 50147,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 1134280,
+              "rawBytes": 1134324,
               "strippedBytes": 35033,
               "compileError": null,
               "stripError": null
@@ -831,21 +831,21 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 158637,
-              "strippedBytes": 97484,
+              "rawBytes": 168656,
+              "strippedBytes": 115104,
               "compileError": null,
               "stripError": null
             }
           },
           "ReleaseSafe": {
             "zig_libc": {
-              "rawBytes": 1531194,
+              "rawBytes": 1531238,
               "strippedBytes": 74088,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 1177997,
+              "rawBytes": 1178041,
               "strippedBytes": 52094,
               "compileError": null,
               "stripError": null
@@ -857,8 +857,8 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 212050,
-              "strippedBytes": 144421,
+              "rawBytes": 172490,
+              "strippedBytes": 120128,
               "compileError": null,
               "stripError": null
             }
@@ -871,13 +871,13 @@
         "byOptimize": {
           "Debug": {
             "zig_libc": {
-              "rawBytes": 1856130,
+              "rawBytes": 1856174,
               "strippedBytes": 239653,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 1490496,
+              "rawBytes": 1490540,
               "strippedBytes": 176669,
               "compileError": null,
               "stripError": null
@@ -889,8 +889,8 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 233816,
-              "strippedBytes": 151447,
+              "rawBytes": 194062,
+              "strippedBytes": 127331,
               "compileError": null,
               "stripError": null
             }
@@ -910,26 +910,26 @@
             },
             "zig_nollvm": {
               "rawBytes": 158270,
-              "strippedBytes": 157989,
+              "strippedBytes": 158007,
               "compileError": null,
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 137624,
-              "strippedBytes": 99547,
+              "rawBytes": 108315,
+              "strippedBytes": 81507,
               "compileError": null,
               "stripError": null
             }
           },
           "ReleaseFast": {
             "zig_libc": {
-              "rawBytes": 1457862,
+              "rawBytes": 1457906,
               "strippedBytes": 50319,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 1138936,
+              "rawBytes": 1138980,
               "strippedBytes": 35189,
               "compileError": null,
               "stripError": null
@@ -941,21 +941,21 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 160597,
-              "strippedBytes": 100404,
+              "rawBytes": 170433,
+              "strippedBytes": 117128,
               "compileError": null,
               "stripError": null
             }
           },
           "ReleaseSafe": {
             "zig_libc": {
-              "rawBytes": 1535493,
+              "rawBytes": 1535537,
               "strippedBytes": 74135,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 1182301,
+              "rawBytes": 1182345,
               "strippedBytes": 52141,
               "compileError": null,
               "stripError": null
@@ -967,8 +967,8 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 214269,
-              "strippedBytes": 145423,
+              "rawBytes": 174467,
+              "strippedBytes": 121045,
               "compileError": null,
               "stripError": null
             }
@@ -981,13 +981,13 @@
         "byOptimize": {
           "Debug": {
             "zig_libc": {
-              "rawBytes": 2062400,
+              "rawBytes": 2062444,
               "strippedBytes": 241851,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 2062400,
+              "rawBytes": 2062444,
               "strippedBytes": 241851,
               "compileError": null,
               "stripError": null
@@ -999,8 +999,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 332125,
-              "strippedBytes": 186578,
+              "rawBytes": 281040,
+              "strippedBytes": 156964,
               "compileError": null,
               "stripError": null
             }
@@ -1025,21 +1025,21 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 209698,
-              "strippedBytes": 126976,
+              "rawBytes": 169921,
+              "strippedBytes": 104698,
               "compileError": null,
               "stripError": null
             }
           },
           "ReleaseFast": {
             "zig_libc": {
-              "rawBytes": 1619285,
+              "rawBytes": 1619329,
               "strippedBytes": 50997,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 1619285,
+              "rawBytes": 1619329,
               "strippedBytes": 50997,
               "compileError": null,
               "stripError": null
@@ -1051,21 +1051,21 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 252896,
-              "strippedBytes": 128627,
+              "rawBytes": 273364,
+              "strippedBytes": 164933,
               "compileError": null,
               "stripError": null
             }
           },
           "ReleaseSafe": {
             "zig_libc": {
-              "rawBytes": 1649902,
+              "rawBytes": 1649946,
               "strippedBytes": 75333,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 1649902,
+              "rawBytes": 1649946,
               "strippedBytes": 75333,
               "compileError": null,
               "stripError": null
@@ -1077,8 +1077,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 312664,
-              "strippedBytes": 183806,
+              "rawBytes": 261180,
+              "strippedBytes": 153959,
               "compileError": null,
               "stripError": null
             }
@@ -1091,13 +1091,13 @@
         "byOptimize": {
           "Debug": {
             "zig_libc": {
-              "rawBytes": 3619678,
+              "rawBytes": 3619722,
               "strippedBytes": 295106,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 3149370,
+              "rawBytes": 3149414,
               "strippedBytes": 227854,
               "compileError": null,
               "stripError": null
@@ -1109,8 +1109,8 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 755141,
-              "strippedBytes": 188330,
+              "rawBytes": 663976,
+              "strippedBytes": 156406,
               "compileError": null,
               "stripError": null
             }
@@ -1130,26 +1130,26 @@
             },
             "zig_nollvm": {
               "rawBytes": 568699,
-              "strippedBytes": 562626,
+              "strippedBytes": 562644,
               "compileError": null,
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 492933,
-              "strippedBytes": 131806,
+              "rawBytes": 415288,
+              "strippedBytes": 103216,
               "compileError": null,
               "stripError": null
             }
           },
           "ReleaseFast": {
             "zig_libc": {
-              "rawBytes": 3090769,
+              "rawBytes": 3090813,
               "strippedBytes": 64051,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 2756791,
+              "rawBytes": 2756835,
               "strippedBytes": 49085,
               "compileError": null,
               "stripError": null
@@ -1161,21 +1161,21 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 660623,
-              "strippedBytes": 134896,
+              "rawBytes": 668959,
+              "strippedBytes": 142207,
               "compileError": null,
               "stripError": null
             }
           },
           "ReleaseSafe": {
             "zig_libc": {
-              "rawBytes": 2703157,
+              "rawBytes": 2703201,
               "strippedBytes": 96120,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 2381218,
+              "rawBytes": 2381262,
               "strippedBytes": 73735,
               "compileError": null,
               "stripError": null
@@ -1187,8 +1187,8 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 732705,
-              "strippedBytes": 188377,
+              "rawBytes": 641531,
+              "strippedBytes": 156313,
               "compileError": null,
               "stripError": null
             }
@@ -1201,13 +1201,13 @@
         "byOptimize": {
           "Debug": {
             "zig_libc": {
-              "rawBytes": 2238954,
+              "rawBytes": 2238998,
               "strippedBytes": 241454,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 1851601,
+              "rawBytes": 1851645,
               "strippedBytes": 178693,
               "compileError": null,
               "stripError": null
@@ -1219,8 +1219,8 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 345032,
-              "strippedBytes": 154457,
+              "rawBytes": 294282,
+              "strippedBytes": 129779,
               "compileError": null,
               "stripError": null
             }
@@ -1240,26 +1240,26 @@
             },
             "zig_nollvm": {
               "rawBytes": 254274,
-              "strippedBytes": 246704,
+              "strippedBytes": 246722,
               "compileError": null,
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 215246,
-              "strippedBytes": 98666,
+              "rawBytes": 176291,
+              "strippedBytes": 81216,
               "compileError": null,
               "stripError": null
             }
           },
           "ReleaseFast": {
             "zig_libc": {
-              "rawBytes": 1797672,
+              "rawBytes": 1797716,
               "strippedBytes": 51463,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 1479816,
+              "rawBytes": 1479860,
               "strippedBytes": 36542,
               "compileError": null,
               "stripError": null
@@ -1271,21 +1271,21 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 266601,
-              "strippedBytes": 99540,
+              "rawBytes": 269131,
+              "strippedBytes": 116883,
               "compileError": null,
               "stripError": null
             }
           },
           "ReleaseSafe": {
             "zig_libc": {
-              "rawBytes": 1761647,
+              "rawBytes": 1761691,
               "strippedBytes": 75743,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 1413686,
+              "rawBytes": 1413730,
               "strippedBytes": 53942,
               "compileError": null,
               "stripError": null
@@ -1297,8 +1297,8 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 325762,
-              "strippedBytes": 147417,
+              "rawBytes": 275010,
+              "strippedBytes": 122625,
               "compileError": null,
               "stripError": null
             }
@@ -1311,13 +1311,13 @@
         "byOptimize": {
           "Debug": {
             "zig_libc": {
-              "rawBytes": 2268532,
+              "rawBytes": 2268576,
               "strippedBytes": 244463,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 1879565,
+              "rawBytes": 1879609,
               "strippedBytes": 181619,
               "compileError": null,
               "stripError": null
@@ -1329,8 +1329,8 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 355878,
-              "strippedBytes": 157936,
+              "rawBytes": 303945,
+              "strippedBytes": 133230,
               "compileError": null,
               "stripError": null
             }
@@ -1350,26 +1350,26 @@
             },
             "zig_nollvm": {
               "rawBytes": 263308,
-              "strippedBytes": 255723,
+              "strippedBytes": 255741,
               "compileError": null,
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 221559,
-              "strippedBytes": 100489,
+              "rawBytes": 181943,
+              "strippedBytes": 83139,
               "compileError": null,
               "stripError": null
             }
           },
           "ReleaseFast": {
             "zig_libc": {
-              "rawBytes": 1894824,
+              "rawBytes": 1894868,
               "strippedBytes": 50869,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 1576929,
+              "rawBytes": 1576973,
               "strippedBytes": 35956,
               "compileError": null,
               "stripError": null
@@ -1381,21 +1381,21 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 274784,
-              "strippedBytes": 101504,
+              "rawBytes": 278498,
+              "strippedBytes": 118958,
               "compileError": null,
               "stripError": null
             }
           },
           "ReleaseSafe": {
             "zig_libc": {
-              "rawBytes": 1762803,
+              "rawBytes": 1762847,
               "strippedBytes": 75434,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 1411560,
+              "rawBytes": 1411604,
               "strippedBytes": 53589,
               "compileError": null,
               "stripError": null
@@ -1407,8 +1407,8 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 335406,
-              "strippedBytes": 151384,
+              "rawBytes": 283479,
+              "strippedBytes": 126366,
               "compileError": null,
               "stripError": null
             }
@@ -1421,13 +1421,13 @@
         "byOptimize": {
           "Debug": {
             "zig_libc": {
-              "rawBytes": 3086433,
+              "rawBytes": 3086477,
               "strippedBytes": 271631,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 2660145,
+              "rawBytes": 2660189,
               "strippedBytes": 208273,
               "compileError": null,
               "stripError": null
@@ -1439,8 +1439,8 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 608436,
-              "strippedBytes": 190711,
+              "rawBytes": 525558,
+              "strippedBytes": 159825,
               "compileError": null,
               "stripError": null
             }
@@ -1460,26 +1460,26 @@
             },
             "zig_nollvm": {
               "rawBytes": 454933,
-              "strippedBytes": 447179,
+              "strippedBytes": 447197,
               "compileError": null,
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 395571,
-              "strippedBytes": 127869,
+              "rawBytes": 329319,
+              "strippedBytes": 105798,
               "compileError": null,
               "stripError": null
             }
           },
           "ReleaseFast": {
             "zig_libc": {
-              "rawBytes": 2359228,
+              "rawBytes": 2359272,
               "strippedBytes": 68509,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 2046192,
+              "rawBytes": 2046236,
               "strippedBytes": 53580,
               "compileError": null,
               "stripError": null
@@ -1491,21 +1491,21 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 511121,
-              "strippedBytes": 128946,
+              "rawBytes": 484024,
+              "strippedBytes": 144001,
               "compileError": null,
               "stripError": null
             }
           },
           "ReleaseSafe": {
             "zig_libc": {
-              "rawBytes": 2206148,
+              "rawBytes": 2206192,
               "strippedBytes": 94055,
               "compileError": null,
               "stripError": null
             },
             "zig_llvm": {
-              "rawBytes": 1858617,
+              "rawBytes": 1858661,
               "strippedBytes": 72138,
               "compileError": null,
               "stripError": null
@@ -1517,8 +1517,8 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazig": {
-              "rawBytes": 588187,
-              "strippedBytes": 186435,
+              "rawBytes": 505297,
+              "strippedBytes": 155007,
               "compileError": null,
               "stripError": null
             }
@@ -1531,7 +1531,7 @@
     "targets": [
       {
         "key": "wazig",
-        "label": "wazig v0.17.0-wazig.3 (stage2_wasm + MIR opt)"
+        "label": "wazig (stage2_wasm + MIR opt)"
       },
       {
         "key": "zig_nollvm",
@@ -1551,39 +1551,39 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 101.64,
-            "mean": 101.41,
-            "min": 100.72,
-            "max": 101.86,
-            "p95": 101.86,
+            "median": 52.12,
+            "mean": 52.09,
+            "min": 51.8,
+            "max": 52.34,
+            "p95": 52.34,
             "samples": [
-              101.64,
-              101.86,
-              100.72
+              52.12,
+              52.34,
+              51.8
             ]
           },
           "zig_nollvm": {
-            "median": 99.65,
-            "mean": 99.72,
-            "min": 99.62,
-            "max": 99.9,
-            "p95": 99.9,
+            "median": 99.53,
+            "mean": 99.5,
+            "min": 99.24,
+            "max": 99.73,
+            "p95": 99.73,
             "samples": [
-              99.9,
-              99.62,
-              99.65
+              99.73,
+              99.53,
+              99.24
             ]
           },
           "zig_llvm": {
-            "median": 49.41,
-            "mean": 49.42,
-            "min": 49.23,
-            "max": 49.61,
-            "p95": 49.61,
+            "median": 49.37,
+            "mean": 49.35,
+            "min": 49.18,
+            "max": 49.49,
+            "p95": 49.49,
             "samples": [
-              49.61,
-              49.23,
-              49.41
+              49.49,
+              49.18,
+              49.37
             ]
           }
         }
@@ -1596,36 +1596,36 @@
         "timedIterations": 2,
         "compilers": {
           "wazig": {
-            "median": 2180.26,
-            "mean": 2180.26,
-            "min": 2180.17,
-            "max": 2180.35,
-            "p95": 2180.35,
+            "median": 312,
+            "mean": 312,
+            "min": 311.16,
+            "max": 312.84,
+            "p95": 312.84,
             "samples": [
-              2180.17,
-              2180.35
+              312.84,
+              311.16
             ]
           },
           "zig_nollvm": {
-            "median": 2203.88,
-            "mean": 2203.88,
-            "min": 2203.42,
-            "max": 2204.34,
-            "p95": 2204.34,
+            "median": 2210.56,
+            "mean": 2210.56,
+            "min": 2210.36,
+            "max": 2210.76,
+            "p95": 2210.76,
             "samples": [
-              2204.34,
-              2203.42
+              2210.76,
+              2210.36
             ]
           },
           "zig_llvm": {
-            "median": 195.98,
-            "mean": 195.98,
-            "min": 195.23,
-            "max": 196.72,
-            "p95": 196.72,
+            "median": 196.02,
+            "mean": 196.02,
+            "min": 195.15,
+            "max": 196.89,
+            "p95": 196.89,
             "samples": [
-              196.72,
-              195.23
+              196.89,
+              195.15
             ]
           }
         }
@@ -1638,39 +1638,39 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 494.35,
-            "mean": 494.45,
-            "min": 494.24,
-            "max": 494.76,
-            "p95": 494.76,
+            "median": 82.62,
+            "mean": 82.6,
+            "min": 82.57,
+            "max": 82.62,
+            "p95": 82.62,
             "samples": [
-              494.76,
-              494.35,
-              494.24
+              82.62,
+              82.62,
+              82.57
             ]
           },
           "zig_nollvm": {
-            "median": 515.13,
-            "mean": 515.14,
-            "min": 515.1,
-            "max": 515.19,
-            "p95": 515.19,
+            "median": 516.19,
+            "mean": 516.36,
+            "min": 515.78,
+            "max": 517.1,
+            "p95": 517.1,
             "samples": [
-              515.19,
-              515.13,
-              515.1
+              516.19,
+              517.1,
+              515.78
             ]
           },
           "zig_llvm": {
-            "median": 59.1,
+            "median": 59.09,
             "mean": 59.09,
-            "min": 59.05,
-            "max": 59.13,
-            "p95": 59.13,
+            "min": 59.07,
+            "max": 59.1,
+            "p95": 59.1,
             "samples": [
               59.1,
-              59.13,
-              59.05
+              59.09,
+              59.07
             ]
           }
         }
@@ -1683,39 +1683,39 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 167.4,
-            "mean": 167.41,
-            "min": 167.38,
-            "max": 167.45,
-            "p95": 167.45,
+            "median": 75.73,
+            "mean": 75.74,
+            "min": 75.66,
+            "max": 75.84,
+            "p95": 75.84,
             "samples": [
-              167.4,
-              167.38,
-              167.45
+              75.73,
+              75.66,
+              75.84
             ]
           },
           "zig_nollvm": {
-            "median": 166.6,
-            "mean": 166.57,
-            "min": 166.36,
-            "max": 166.75,
-            "p95": 166.75,
+            "median": 166.09,
+            "mean": 166.06,
+            "min": 165.89,
+            "max": 166.19,
+            "p95": 166.19,
             "samples": [
-              166.75,
-              166.6,
-              166.36
+              166.09,
+              166.19,
+              165.89
             ]
           },
           "zig_llvm": {
-            "median": 64.85,
-            "mean": 64.86,
-            "min": 64.75,
-            "max": 64.99,
-            "p95": 64.99,
+            "median": 64.76,
+            "mean": 64.74,
+            "min": 64.67,
+            "max": 64.81,
+            "p95": 64.81,
             "samples": [
-              64.99,
-              64.75,
-              64.85
+              64.81,
+              64.76,
+              64.67
             ]
           }
         }
@@ -1728,39 +1728,39 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 136.25,
-            "mean": 136.21,
-            "min": 136.1,
-            "max": 136.27,
-            "p95": 136.27,
+            "median": 37.07,
+            "mean": 37.17,
+            "min": 37.04,
+            "max": 37.39,
+            "p95": 37.39,
             "samples": [
-              136.27,
-              136.25,
-              136.1
+              37.39,
+              37.07,
+              37.04
             ]
           },
           "zig_nollvm": {
-            "median": 143.59,
-            "mean": 143.61,
-            "min": 143.57,
-            "max": 143.68,
-            "p95": 143.68,
+            "median": 143.09,
+            "mean": 143.09,
+            "min": 143.06,
+            "max": 143.12,
+            "p95": 143.12,
             "samples": [
-              143.68,
-              143.57,
-              143.59
+              143.06,
+              143.12,
+              143.09
             ]
           },
           "zig_llvm": {
-            "median": 15.64,
-            "mean": 15.69,
-            "min": 15.62,
-            "max": 15.82,
-            "p95": 15.82,
+            "median": 15.6,
+            "mean": 15.63,
+            "min": 15.6,
+            "max": 15.69,
+            "p95": 15.69,
             "samples": [
-              15.82,
-              15.64,
-              15.62
+              15.69,
+              15.6,
+              15.6
             ]
           }
         }
@@ -1773,39 +1773,39 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 101.73,
-            "mean": 97.13,
-            "min": 87.2,
-            "max": 102.47,
-            "p95": 102.47,
+            "median": 104.65,
+            "mean": 108.2,
+            "min": 103.03,
+            "max": 116.9,
+            "p95": 116.9,
             "samples": [
-              87.2,
-              102.47,
-              101.73
+              103.03,
+              104.65,
+              116.9
             ]
           },
           "zig_nollvm": {
-            "median": 107.21,
-            "mean": 101.18,
-            "min": 88.71,
-            "max": 107.62,
-            "p95": 107.62,
+            "median": 105.88,
+            "mean": 106.94,
+            "min": 101.1,
+            "max": 113.82,
+            "p95": 113.82,
             "samples": [
-              88.71,
-              107.62,
-              107.21
+              113.82,
+              101.1,
+              105.88
             ]
           },
           "zig_llvm": {
-            "median": 104.22,
-            "mean": 101.87,
-            "min": 94.69,
-            "max": 106.71,
-            "p95": 106.71,
+            "median": 110.7,
+            "mean": 107.54,
+            "min": 100,
+            "max": 111.92,
+            "p95": 111.92,
             "samples": [
-              94.69,
-              106.71,
-              104.22
+              100,
+              111.92,
+              110.7
             ]
           }
         }
@@ -1818,39 +1818,39 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 6.36,
-            "mean": 6.36,
-            "min": 6.34,
-            "max": 6.39,
-            "p95": 6.39,
+            "median": 4.23,
+            "mean": 4.24,
+            "min": 4.22,
+            "max": 4.27,
+            "p95": 4.27,
             "samples": [
-              6.39,
-              6.36,
-              6.34
+              4.27,
+              4.22,
+              4.23
             ]
           },
           "zig_nollvm": {
-            "median": 6.45,
-            "mean": 6.44,
-            "min": 6.35,
-            "max": 6.52,
-            "p95": 6.52,
+            "median": 6.28,
+            "mean": 6.32,
+            "min": 6.27,
+            "max": 6.4,
+            "p95": 6.4,
             "samples": [
-              6.45,
-              6.52,
-              6.35
+              6.28,
+              6.4,
+              6.27
             ]
           },
           "zig_llvm": {
-            "median": 0.33,
+            "median": 0.35,
             "mean": 0.3,
-            "min": 0.19,
-            "max": 0.39,
-            "p95": 0.39,
+            "min": 0.17,
+            "max": 0.38,
+            "p95": 0.38,
             "samples": [
-              0.39,
-              0.33,
-              0.19
+              0.38,
+              0.35,
+              0.17
             ]
           }
         }
@@ -1863,39 +1863,39 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 70.62,
-            "mean": 70.7,
-            "min": 70.62,
-            "max": 70.86,
-            "p95": 70.86,
+            "median": 49.59,
+            "mean": 49.6,
+            "min": 49.58,
+            "max": 49.63,
+            "p95": 49.63,
             "samples": [
-              70.62,
-              70.62,
-              70.86
+              49.63,
+              49.59,
+              49.58
             ]
           },
           "zig_nollvm": {
-            "median": 73.14,
-            "mean": 73.13,
-            "min": 73.06,
-            "max": 73.18,
-            "p95": 73.18,
+            "median": 73.22,
+            "mean": 73.19,
+            "min": 73.14,
+            "max": 73.22,
+            "p95": 73.22,
             "samples": [
-              73.18,
+              73.22,
               73.14,
-              73.06
+              73.22
             ]
           },
           "zig_llvm": {
-            "median": 3.12,
-            "mean": 3.13,
-            "min": 3.05,
-            "max": 3.24,
-            "p95": 3.24,
+            "median": 2.97,
+            "mean": 3.02,
+            "min": 2.97,
+            "max": 3.1,
+            "p95": 3.1,
             "samples": [
-              3.24,
-              3.05,
-              3.12
+              3.1,
+              2.97,
+              2.97
             ]
           }
         }
@@ -1908,39 +1908,39 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 27.33,
-            "mean": 27.33,
-            "min": 27.31,
-            "max": 27.35,
-            "p95": 27.35,
+            "median": 18,
+            "mean": 18,
+            "min": 17.99,
+            "max": 18,
+            "p95": 18,
             "samples": [
-              27.33,
-              27.31,
-              27.35
+              18,
+              17.99,
+              18
             ]
           },
           "zig_nollvm": {
-            "median": 27.88,
-            "mean": 27.87,
-            "min": 27.81,
-            "max": 27.92,
-            "p95": 27.92,
+            "median": 27.96,
+            "mean": 28,
+            "min": 27.83,
+            "max": 28.19,
+            "p95": 28.19,
             "samples": [
-              27.92,
-              27.88,
-              27.81
+              28.19,
+              27.96,
+              27.83
             ]
           },
           "zig_llvm": {
-            "median": 1.16,
+            "median": 1.19,
             "mean": 1.2,
-            "min": 1.14,
-            "max": 1.3,
-            "p95": 1.3,
+            "min": 1.17,
+            "max": 1.23,
+            "p95": 1.23,
             "samples": [
-              1.3,
-              1.16,
-              1.14
+              1.19,
+              1.17,
+              1.23
             ]
           }
         }
@@ -1953,39 +1953,39 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 85.08,
-            "mean": 85.05,
-            "min": 84.91,
-            "max": 85.16,
-            "p95": 85.16,
+            "median": 59.46,
+            "mean": 59.47,
+            "min": 59.44,
+            "max": 59.5,
+            "p95": 59.5,
             "samples": [
-              84.91,
-              85.16,
-              85.08
+              59.5,
+              59.46,
+              59.44
             ]
           },
           "zig_nollvm": {
-            "median": 85.5,
-            "mean": 85.48,
-            "min": 85.22,
-            "max": 85.73,
-            "p95": 85.73,
+            "median": 85.68,
+            "mean": 85.75,
+            "min": 85.63,
+            "max": 85.93,
+            "p95": 85.93,
             "samples": [
-              85.73,
-              85.5,
-              85.22
+              85.93,
+              85.68,
+              85.63
             ]
           },
           "zig_llvm": {
-            "median": 4.24,
-            "mean": 4.22,
-            "min": 4.19,
-            "max": 4.25,
-            "p95": 4.25,
+            "median": 4.14,
+            "mean": 4.13,
+            "min": 4.12,
+            "max": 4.14,
+            "p95": 4.14,
             "samples": [
-              4.25,
-              4.24,
-              4.19
+              4.12,
+              4.14,
+              4.14
             ]
           }
         }
@@ -1998,39 +1998,39 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 83.65,
-            "mean": 83.67,
-            "min": 83.57,
-            "max": 83.79,
-            "p95": 83.79,
+            "median": 62.99,
+            "mean": 62.97,
+            "min": 62.87,
+            "max": 63.06,
+            "p95": 63.06,
             "samples": [
-              83.79,
-              83.65,
-              83.57
+              62.99,
+              62.87,
+              63.06
             ]
           },
           "zig_nollvm": {
-            "median": 82.3,
-            "mean": 82.3,
-            "min": 82.28,
-            "max": 82.32,
-            "p95": 82.32,
+            "median": 82.56,
+            "mean": 82.56,
+            "min": 82.45,
+            "max": 82.67,
+            "p95": 82.67,
             "samples": [
-              82.28,
-              82.3,
-              82.32
+              82.56,
+              82.45,
+              82.67
             ]
           },
           "zig_llvm": {
-            "median": 6.53,
-            "mean": 6.54,
-            "min": 6.46,
-            "max": 6.63,
-            "p95": 6.63,
+            "median": 6.47,
+            "mean": 6.48,
+            "min": 6.39,
+            "max": 6.59,
+            "p95": 6.59,
             "samples": [
-              6.63,
-              6.53,
-              6.46
+              6.59,
+              6.47,
+              6.39
             ]
           }
         }
@@ -2043,39 +2043,39 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 450.98,
-            "mean": 451.03,
-            "min": 450.97,
-            "max": 451.15,
-            "p95": 451.15,
+            "median": 359.97,
+            "mean": 356.7,
+            "min": 350.12,
+            "max": 359.99,
+            "p95": 359.99,
             "samples": [
-              450.98,
-              451.15,
-              450.97
+              350.12,
+              359.99,
+              359.97
             ]
           },
           "zig_nollvm": {
-            "median": 458.63,
-            "mean": 458.4,
-            "min": 457.89,
-            "max": 458.68,
-            "p95": 458.68,
+            "median": 459.58,
+            "mean": 459.13,
+            "min": 458.12,
+            "max": 459.68,
+            "p95": 459.68,
             "samples": [
-              457.89,
-              458.63,
-              458.68
+              458.12,
+              459.68,
+              459.58
             ]
           },
           "zig_llvm": {
-            "median": 25.87,
-            "mean": 25.88,
-            "min": 25.82,
-            "max": 25.93,
-            "p95": 25.93,
+            "median": 25.78,
+            "mean": 25.77,
+            "min": 25.74,
+            "max": 25.79,
+            "p95": 25.79,
             "samples": [
-              25.93,
-              25.87,
-              25.82
+              25.78,
+              25.79,
+              25.74
             ]
           }
         }
@@ -2088,39 +2088,39 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 660.56,
-            "mean": 662.21,
-            "min": 660.28,
-            "max": 665.78,
-            "p95": 665.78,
+            "median": 414.3,
+            "mean": 413.98,
+            "min": 413.21,
+            "max": 414.44,
+            "p95": 414.44,
             "samples": [
-              660.56,
-              660.28,
-              665.78
+              414.3,
+              414.44,
+              413.21
             ]
           },
           "zig_nollvm": {
-            "median": 622.96,
-            "mean": 622.49,
-            "min": 621.24,
-            "max": 623.26,
-            "p95": 623.26,
+            "median": 615.34,
+            "mean": 614.64,
+            "min": 613.19,
+            "max": 615.38,
+            "p95": 615.38,
             "samples": [
-              623.26,
-              622.96,
-              621.24
+              615.38,
+              615.34,
+              613.19
             ]
           },
           "zig_llvm": {
-            "median": 201.51,
-            "mean": 201.52,
-            "min": 201.42,
-            "max": 201.63,
-            "p95": 201.63,
+            "median": 202.11,
+            "mean": 202.11,
+            "min": 202,
+            "max": 202.23,
+            "p95": 202.23,
             "samples": [
-              201.63,
-              201.42,
-              201.51
+              202,
+              202.23,
+              202.11
             ]
           }
         }
