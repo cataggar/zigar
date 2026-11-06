@@ -1,0 +1,796 @@
+//! Component Model types — in-memory AST for parsed components.
+//!
+//! Defines the data structures that represent a parsed WebAssembly Component
+//! per the Component Model binary format specification. A Component is a
+//! higher-level container that can embed core modules, other components, and
+//! defines interface types, canonical functions, and resource lifecycles.
+//!
+//! Originally developed in `cataggar/wamr` (`src/component/types.zig`,
+//! Apache-2.0). Adapted for wabt as the shared component AST used by
+//! `wabt component embed`, `wabt component new`, and
+//! `wabt component compose`.
+
+const std = @import("std");
+
+// ── Primitive interface value types ─────────────────────────────────────────
+
+/// Interface value types used in the Component Model type system.
+/// These extend core Wasm value types with higher-level constructs.
+pub const ValType = union(enum) {
+    // Primitives
+    bool,
+    s8,
+    u8,
+    s16,
+    u16,
+    s32,
+    u32,
+    s64,
+    u64,
+    f32,
+    f64,
+    char,
+    string,
+    /// `error-context` — P3 opaque async error value (primvaltype `0x64`).
+    error_context,
+
+    // Compound (index into component type index space)
+    record: u32,
+    variant: u32,
+    list: u32,
+    tuple: u32,
+    flags: u32,
+    enum_: u32,
+    option: u32,
+    result: u32,
+
+    // Resource handles
+    own: u32, // resource type index
+    borrow: u32, // resource type index
+
+    /// Type index reference (for recursive/named types).
+    type_idx: u32,
+};
+
+// ── Compound type definitions ───────────────────────────────────────────────
+
+pub const Field = struct {
+    name: []const u8,
+    type: ValType,
+};
+
+pub const Case = struct {
+    name: []const u8,
+    type: ?ValType, // null for cases with no payload
+    /// Refined index for cases that refine other cases.
+    refines: ?u32 = null,
+};
+
+pub const RecordType = struct {
+    fields: []const Field,
+};
+
+pub const VariantType = struct {
+    cases: []const Case,
+};
+
+pub const ListType = struct {
+    element: ValType,
+};
+
+pub const TupleType = struct {
+    fields: []const ValType,
+};
+
+pub const FlagsType = struct {
+    names: []const []const u8,
+};
+
+pub const EnumType = struct {
+    names: []const []const u8,
+};
+
+pub const OptionType = struct {
+    inner: ValType,
+};
+
+pub const ResultType = struct {
+    ok: ?ValType,
+    err: ?ValType,
+};
+
+/// `future<T>` — P3 async single-value channel. `element` is null for a
+/// bare `future`.
+pub const FutureType = struct {
+    element: ?ValType,
+};
+
+/// `stream<T>` — P3 async multi-value channel. `element` is null for a
+/// bare `stream`.
+pub const StreamType = struct {
+    element: ?ValType,
+};
+
+pub const ResourceType = struct {
+    /// Destructor function index (in the canon function index space), or null.
+    destructor: ?u32 = null,
+    /// Representation type (always i32 per spec).
+    rep: CoreValType = .i32,
+};
+
+// ── Function types ──────────────────────────────────────────────────────────
+
+pub const NamedValType = struct {
+    name: []const u8,
+    type: ValType,
+};
+
+/// Component-level function type. Unlike core Wasm functions which use
+/// value type stacks, component functions have named parameters and
+/// can return either a single unnamed type or named results.
+pub const FuncType = struct {
+    params: []const NamedValType,
+    results: ResultList,
+    /// `(func async …)` — P3 asynchronous function type (binary `0x43`
+    /// vs the synchronous `0x40`). wasmtime 46 (wasmparser 0.251) reads
+    /// this byte to mark a func type async, which the `async` canon
+    /// lift/lower option requires.
+    is_async: bool = false,
+
+    pub const ResultList = union(enum) {
+        /// No result (spec: `0x01 0x00`).
+        none,
+        /// Single unnamed result type (spec: `0x00 <valtype>`).
+        unnamed: ValType,
+        /// Named result types. Retained for backward compatibility with older
+        /// component-model encodings; no longer produced by the current spec.
+        named: []const NamedValType,
+    };
+};
+
+// ── Core types within component scope ───────────────────────────────────────
+
+/// Core Wasm value types (subset used in component core type definitions).
+pub const CoreValType = enum(u8) {
+    i32 = 0x7F,
+    i64 = 0x7E,
+    f32 = 0x7D,
+    f64 = 0x7C,
+};
+
+pub const CoreFuncType = struct {
+    params: []const CoreValType,
+    results: []const CoreValType,
+};
+
+pub const CoreModuleType = struct {
+    imports: []const CoreImportDecl,
+    exports: []const CoreExportDecl,
+};
+
+pub const CoreImportDecl = struct {
+    module: []const u8,
+    name: []const u8,
+    /// Type reference (function type index in core type space).
+    type_idx: u32,
+};
+
+pub const CoreExportDecl = struct {
+    name: []const u8,
+    type_idx: u32,
+};
+
+// ── Component type definitions (section 7) ──────────────────────────────────
+
+/// A type definition in the component type index space.
+pub const TypeDef = union(enum) {
+    // Primitive / handle / indexed value type used directly as a type def
+    // (per the `defvaltype` grammar, a type def can be a single valtype byte
+    // e.g. `(type (borrow $r))` or `(type u32)` inside an instance-type body).
+    val: ValType,
+
+    // Compound types
+    record: RecordType,
+    variant: VariantType,
+    list: ListType,
+    tuple: TupleType,
+    flags: FlagsType,
+    enum_: EnumType,
+    option: OptionType,
+    result: ResultType,
+    /// P3 async value types (`future<T>` / `stream<T>`).
+    future: FutureType,
+    stream: StreamType,
+    resource: ResourceType,
+
+    // Function and component/instance types
+    func: FuncType,
+    component: ComponentTypeDecl,
+    instance: InstanceTypeDecl,
+};
+
+/// Core type definition in the core type index space within a component.
+pub const CoreTypeDef = union(enum) {
+    func: CoreFuncType,
+    module: CoreModuleType,
+};
+
+/// Declarator inside a component-type or instance-type declaration.
+///
+/// Per the component-model binary format, the declarator list mixes
+/// type definitions, aliases, and import/export descriptors; their
+/// relative order establishes the nested type-index space used by
+/// subsequent declarators in the same list.
+///
+/// See: <https://github.com/WebAssembly/component-model/blob/main/design/mvp/Binary.md#type-definitions>
+pub const Decl = union(enum) {
+    core_type: CoreTypeDef,
+    type: TypeDef,
+    alias: Alias,
+    import: ImportDecl,
+    @"export": ExportDecl,
+};
+
+/// Declares the shape of a component type.
+///
+/// `decls` preserves the on-wire order of nested core-type, type, alias,
+/// import, and export declarations. The `imports` and `exports` helpers
+/// provide filtered views for callers that only care about externally
+/// visible declarators.
+pub const ComponentTypeDecl = struct {
+    decls: []const Decl,
+
+    pub fn importCount(self: ComponentTypeDecl) usize {
+        var n: usize = 0;
+        for (self.decls) |d| if (d == .import) {
+            n += 1;
+        };
+        return n;
+    }
+
+    pub fn exportCount(self: ComponentTypeDecl) usize {
+        var n: usize = 0;
+        for (self.decls) |d| if (d == .@"export") {
+            n += 1;
+        };
+        return n;
+    }
+};
+
+/// Declares the shape of an instance type.
+///
+/// Like `ComponentTypeDecl` but without import decls.
+pub const InstanceTypeDecl = struct {
+    decls: []const Decl,
+
+    pub fn exportCount(self: InstanceTypeDecl) usize {
+        var n: usize = 0;
+        for (self.decls) |d| if (d == .@"export") {
+            n += 1;
+        };
+        return n;
+    }
+};
+
+// ── Sorts ───────────────────────────────────────────────────────────────────
+
+/// Core-level sort discriminator (for core index spaces).
+pub const CoreSort = enum(u8) {
+    func = 0x00,
+    table = 0x01,
+    memory = 0x02,
+    global = 0x03,
+    tag = 0x04,
+    type = 0x10,
+    module = 0x11,
+    instance = 0x12,
+};
+
+/// Component-level sort discriminator.
+pub const Sort = union(enum) {
+    core: CoreSort,
+    func,
+    value,
+    type,
+    component,
+    instance,
+};
+
+/// A typed index: sort + index into that sort's index space.
+pub const SortIdx = struct {
+    sort: Sort,
+    idx: u32,
+};
+
+// ── Aliases ─────────────────────────────────────────────────────────────────
+
+pub const Alias = union(enum) {
+    /// Alias an export of an instance: (alias export <instance> <name>)
+    instance_export: struct {
+        sort: Sort,
+        instance_idx: u32,
+        name: []const u8,
+    },
+    /// Alias from an outer component scope: (alias outer <count> <idx>)
+    outer: struct {
+        sort: Sort,
+        outer_count: u32,
+        idx: u32,
+    },
+};
+
+// ── Canonical functions ─────────────────────────────────────────────────────
+
+pub const StringEncoding = enum(u8) {
+    utf8 = 0x00,
+    utf16 = 0x01,
+    latin1_utf16 = 0x02,
+};
+
+pub const CanonOpt = union(enum) {
+    /// Linear memory to use for indirect loads/stores.
+    memory: u32, // core memory index
+    /// Realloc function for allocating memory in the callee.
+    realloc: u32, // core func index
+    /// Post-return cleanup function.
+    post_return: u32, // core func index
+    /// String encoding to use.
+    string_encoding: StringEncoding,
+    /// `async` lift/lower option (P3, binary `0x06`). Named with a
+    /// trailing underscore because `async` is reserved.
+    async_,
+    /// `(callback f)` option (P3, binary `0x07`) — core func index.
+    callback: u32,
+};
+
+/// `{ type-index, opts }` payload shared by `future.read`/`.write` (and
+/// later `stream.read`/`.write`).
+pub const CanonRW = struct {
+    type_idx: u32,
+    opts: []const CanonOpt,
+};
+
+/// `{ type-index, async? }` payload for `future.cancel-*` (and later
+/// `stream.cancel-*`).
+pub const CanonCancel = struct {
+    type_idx: u32,
+    is_async: bool,
+};
+
+/// `{ results, opts }` payload for `task.return`.
+pub const CanonTaskReturn = struct {
+    results: FuncType.ResultList,
+    opts: []const CanonOpt,
+};
+
+/// `{ cancellable, memory }` payload for `waitable-set.wait`/`.poll`.
+/// Note: the binary form carries `memory` as a bare u32 index (not the
+/// canon-opts list used by stream/future read/write).
+pub const CanonWaitableSet = struct {
+    cancellable: bool,
+    memory: u32,
+};
+
+/// `{ ty, slot }` payload for `context.get` / `context.set`. `ty` is the
+/// core valtype of the task-local storage slot (the component-model
+/// validator currently accepts `i32`/`i64`); `slot` is the slot index.
+pub const CanonContext = struct {
+    ty: CoreValType,
+    slot: u32,
+};
+
+/// Canonical function definitions.
+pub const Canon = union(enum) {
+    /// Lift a core function to a component function.
+    lift: struct {
+        core_func_idx: u32,
+        type_idx: u32, // component func type
+        opts: []const CanonOpt,
+    },
+    /// Lower a component function to a core function.
+    lower: struct {
+        func_idx: u32, // component func index
+        opts: []const CanonOpt,
+    },
+    /// Create a new resource handle from a representation.
+    resource_new: u32, // resource type index
+    /// Drop a resource handle, calling its destructor.
+    resource_drop: u32, // resource type index
+    /// Get the representation of a resource handle.
+    resource_rep: u32, // resource type index
+
+    // ── P3 component-model-async built-ins (added demand-driven) ──
+    /// `future.new <ty>` (binary `0x15`).
+    future_new: u32,
+    /// `future.read <ty> <opts>` (binary `0x16`).
+    future_read: CanonRW,
+    /// `future.write <ty> <opts>` (binary `0x17`).
+    future_write: CanonRW,
+    /// `future.cancel-read <ty> <async?>` (binary `0x18`).
+    future_cancel_read: CanonCancel,
+    /// `future.cancel-write <ty> <async?>` (binary `0x19`).
+    future_cancel_write: CanonCancel,
+    /// `future.drop-readable <ty>` (binary `0x1a`).
+    future_drop_readable: u32,
+    /// `future.drop-writable <ty>` (binary `0x1b`).
+    future_drop_writable: u32,
+    /// `stream.new <ty>` (binary `0x0e`).
+    stream_new: u32,
+    /// `stream.read <ty> <opts>` (binary `0x0f`).
+    stream_read: CanonRW,
+    /// `stream.write <ty> <opts>` (binary `0x10`).
+    stream_write: CanonRW,
+    /// `stream.cancel-read <ty> <async?>` (binary `0x11`).
+    stream_cancel_read: CanonCancel,
+    /// `stream.cancel-write <ty> <async?>` (binary `0x12`).
+    stream_cancel_write: CanonCancel,
+    /// `stream.drop-readable <ty>` (binary `0x13`).
+    stream_drop_readable: u32,
+    /// `stream.drop-writable <ty>` (binary `0x14`).
+    stream_drop_writable: u32,
+    /// `error-context.new <opts>` (binary `0x1c`).
+    error_context_new: []const CanonOpt,
+    /// `error-context.debug-message <opts>` (binary `0x1d`).
+    error_context_debug_message: []const CanonOpt,
+    /// `error-context.drop` (binary `0x1e`).
+    error_context_drop,
+    /// `task.return <results> <opts>` (binary `0x09`).
+    task_return: CanonTaskReturn,
+    /// `waitable-set.new` (binary `0x1f`).
+    waitable_set_new,
+    /// `waitable-set.wait <cancellable> <memory>` (binary `0x20`).
+    waitable_set_wait: CanonWaitableSet,
+    /// `waitable-set.poll <cancellable> <memory>` (binary `0x21`).
+    waitable_set_poll: CanonWaitableSet,
+    /// `waitable-set.drop` (binary `0x22`).
+    waitable_set_drop,
+    /// `waitable.join` (binary `0x23`).
+    waitable_join,
+    /// `task.cancel` (binary `0x05`).
+    task_cancel,
+    /// `subtask.cancel <async?>` (binary `0x06`).
+    subtask_cancel: bool,
+    /// `subtask.drop` (binary `0x0d`).
+    subtask_drop,
+    /// `context.get <ty> <slot>` (binary `0x0a`).
+    context_get: CanonContext,
+    /// `context.set <ty> <slot>` (binary `0x0b`).
+    context_set: CanonContext,
+    /// `backpressure.inc` (binary `0x24`).
+    backpressure_inc,
+    /// `backpressure.dec` (binary `0x25`).
+    backpressure_dec,
+    /// `thread.yield <cancellable>` (binary `0x0c`). Lowers to a core func
+    /// of type `(func (result i32))`.
+    thread_yield: bool,
+};
+
+// ── Imports and exports ─────────────────────────────────────────────────────
+
+/// Extern descriptor for component-level imports/exports.
+pub const ExternDesc = union(enum) {
+    /// Module type (for core module imports).
+    module: u32, // core type index
+    /// Function type.
+    func: u32, // component func type index
+    /// Value type.
+    value: ValType,
+    /// Named type.
+    type: TypeBound,
+    /// Component type.
+    component: u32, // type index
+    /// Instance type.
+    instance: u32, // type index
+};
+
+pub const TypeBound = union(enum) {
+    /// Type must be equal to the given type index.
+    eq: u32,
+    /// Type must be a subtype of the given type index.
+    sub_resource,
+};
+
+/// Optional semantic information attached to a component import/export name.
+///
+/// These attributes do not participate in import/export identity, but they
+/// must be retained: in particular, `version_suffix` carries the part of an
+/// interface version removed by canonical-name encoding.
+pub const ExternNameAttribute = union(enum) {
+    implements: []const u8,
+    version_suffix: []const u8,
+    external_id: []const u8,
+};
+
+pub const ImportDecl = struct {
+    name: []const u8,
+    desc: ExternDesc,
+    attributes: []const ExternNameAttribute = &.{},
+};
+
+pub const ExportDecl = struct {
+    name: []const u8,
+    desc: ExternDesc,
+    attributes: []const ExternNameAttribute = &.{},
+    /// Set for top-level component exports (see spec `export` rule):
+    ///   export ::= en:<exportname'> si:<sortidx> ed?:<externdesc>?
+    /// Null for export declarators inside a component-type / instance-type
+    /// body, which carry only a name and a descriptor.
+    sort_idx: ?SortIdx = null,
+};
+
+// ── Instance expressions ────────────────────────────────────────────────────
+
+pub const CoreInstanceExpr = union(enum) {
+    /// Instantiate a core module with arguments.
+    instantiate: struct {
+        module_idx: u32,
+        args: []const CoreInstantiateArg,
+    },
+    /// Inline exports (bundle of named core items).
+    exports: []const CoreInlineExport,
+};
+
+pub const CoreInstantiateArg = struct {
+    name: []const u8,
+    instance_idx: u32,
+};
+
+pub const CoreInlineExport = struct {
+    name: []const u8,
+    sort_idx: struct { sort: CoreSort, idx: u32 },
+};
+
+pub const InstanceExpr = union(enum) {
+    /// Instantiate a component with arguments.
+    instantiate: struct {
+        component_idx: u32,
+        args: []const InstantiateArg,
+    },
+    /// Inline exports.
+    exports: []const InlineExport,
+};
+
+pub const InstantiateArg = struct {
+    name: []const u8,
+    sort_idx: SortIdx,
+};
+
+pub const InlineExport = struct {
+    name: []const u8,
+    sort_idx: SortIdx,
+    attributes: []const ExternNameAttribute = &.{},
+};
+
+// ── Start function ──────────────────────────────────────────────────────────
+
+pub const Start = struct {
+    func_idx: u32,
+    args: []const u32, // value indices
+    results: u32, // number of result values
+};
+
+/// Component custom section (id=0). Carries a name and an opaque payload.
+pub const CustomSection = struct {
+    name: []const u8,
+    payload: []const u8,
+};
+
+/// Physical section kind. Used by `Component.section_order` to drive
+/// interleaved emission when conventional section order would re-order
+/// type-indexspace contributors and break references between them.
+pub const SectionKind = enum {
+    custom,
+    core_module,
+    core_instance,
+    core_type,
+    component,
+    instance,
+    alias,
+    type,
+    canon,
+    start,
+    import,
+    @"export",
+};
+
+/// One physical section emission. `start..start+count` indexes into
+/// the corresponding per-section field on `Component` (e.g. for
+/// `.type`, into `component.types[]`; for `.alias`, into
+/// `component.aliases[]`). For `.start`, both fields are ignored (the
+/// field is a singleton). For `.custom`, indexes into
+/// `component.custom_sections[]`.
+///
+/// Multiple entries with the same `kind` produce multiple physical
+/// sections — legal and routinely necessary when the encoded shape
+/// requires types and imports to interleave.
+pub const SectionEntry = struct {
+    kind: SectionKind,
+    start: u32 = 0,
+    count: u32 = 0,
+};
+
+// ── Top-level Component ─────────────────────────────────────────────────────
+
+/// A parsed WebAssembly Component.
+///
+/// Unlike core modules which have a fixed section order, components can
+/// interleave sections. The `sections` list preserves the original order,
+/// and each section's definitions are added to the appropriate index space.
+pub const Component = struct {
+    /// Core modules embedded in this component.
+    core_modules: []const CoreModule,
+    /// Core instances.
+    core_instances: []const CoreInstanceExpr,
+    /// Core type definitions.
+    core_types: []const CoreTypeDef,
+    /// Nested sub-components.
+    components: []const *Component,
+    /// Component-level instances.
+    instances: []const InstanceExpr,
+    /// Aliases.
+    aliases: []const Alias,
+    /// Component-level type definitions.
+    types: []const TypeDef,
+    /// Type index-space contributors in binary declaration order.
+    /// Each entry records whether the slot was contributed by a
+    /// `(type ...)` def, a `(import ... (type ...))` import, or an
+    /// `(alias ... (type ...))` alias, along with the index into the
+    /// corresponding per-section array. Empty when the component was
+    /// constructed without a loader (e.g. hand-authored test
+    /// fixtures); callers in that case fall back to direct indexing of
+    /// `types`. The contributor metadata is required by
+    /// `wabt component compose`'s wrapper-types builder so it can
+    /// faithfully replicate alias-of-instance-export decls that bring
+    /// resources into the consumer's outer type indexspace (#129).
+    type_indexspace: []const TypeContributor = &.{},
+    /// Canonical function definitions.
+    canons: []const Canon,
+    /// Start function.
+    start: ?Start = null,
+    /// Component imports.
+    imports: []const ImportDecl,
+    /// Component exports.
+    exports: []const ExportDecl,
+    /// Core-func index-space contributors in binary declaration order.
+    /// Each entry records whether the slot was contributed by a canon
+    /// or by an `Alias.instance_export` with `sort = .core(.func)`,
+    /// along with the index into the corresponding per-section array.
+    /// Empty when the component was constructed without a loader (e.g.
+    /// hand-authored test fixtures); callers in that case fall back to
+    /// the section-order heuristic in `indexspace.resolveCoreFunc`.
+    core_func_indexspace: []const CoreFuncContributor = &.{},
+    /// Component-instance index-space contributors in binary
+    /// declaration order. Each entry records whether the slot was
+    /// contributed by an `.instance`-typed `import`, an `instance`
+    /// section entry, or an `alias` section entry of sort
+    /// `.instance`. Empty when the component was constructed without
+    /// a loader (e.g. hand-authored test fixtures); callers in that
+    /// case fall back to the legacy "imports, then instances, then
+    /// aliases" walk in `indexspace.resolveCompInstance`. The legacy
+    /// walk is correct for non-composed components and Phase 2A
+    /// fixtures; the section-ordered slice is required for
+    /// `wasm-tools compose` output where instance and alias sections
+    /// interleave (issue #355).
+    comp_instance_indexspace: []const CompInstanceContributor = &.{},
+    /// Custom sections to emit at the start of the encoded binary
+    /// (right after the preamble, before any known sections). Loaders
+    /// drop custom sections, so this field is write-only — round-trip
+    /// (load → encode) does not preserve them.
+    custom_sections: []const CustomSection = &.{},
+    /// Optional raw-bytes override used by `writer.encode` when this
+    /// component is emitted as a nested-component section. When set
+    /// (e.g. by `compose` after `loader.load`), the writer skips
+    /// re-serialization and passes the bytes through verbatim — the
+    /// only way to faithfully preserve a component's original
+    /// section interleaving (which the AST flattens away).
+    raw_bytes: ?[]const u8 = null,
+    /// Optional explicit section emission order. When non-null, the
+    /// writer emits one physical section per entry, in order, drawing
+    /// items from the corresponding per-section field. When null, the
+    /// writer falls back to the conventional "types, imports, core
+    /// modules, …" ordering. Required for components whose type
+    /// indexspace interleaves type defs, imports, and aliases — the
+    /// shape `wasm-tools component new --adapt` produces.
+    section_order: ?[]const SectionEntry = null,
+};
+
+/// A single contributor to the core-func index space.
+pub const CoreFuncContributor = union(enum) {
+    /// Index into `component.canons`. Only canon kinds that contribute
+    /// to the core-func indexspace (`.lower`, `.resource_drop`,
+    /// `.resource_new`, `.resource_rep`) appear here; `.lift` does not.
+    canon: u32,
+    /// Index into `component.aliases`.
+    alias: u32,
+};
+
+/// A single contributor to the component-instance index space, in the
+/// order it appeared in the binary. Composed components (output by
+/// `wasm-tools compose`) interleave `.instance` and `.alias` (sort
+/// `.instance`) section entries — so the index space cannot be derived
+/// by walking imports, then instances, then aliases as separate phases.
+/// (Issue #355.)
+pub const CompInstanceContributor = union(enum) {
+    /// Index into `component.imports` (must be `.instance` desc).
+    import: u32,
+    /// Index into `component.instances`.
+    instance: u32,
+    /// Index into `component.aliases` (must be `instance_export` of
+    /// sort `.instance`).
+    alias: u32,
+};
+
+/// A single contributor to the type index space, in the order it
+/// appeared in the binary. Real wasm32-wasip2 components interleave
+/// `(type)`, `(import (type))`, and `(alias (type))` decls, so a slot
+/// is not always backed by a `types[]` entry — alias slots in
+/// particular carry resource-binding identity that
+/// `wabt component compose` must replicate at the wrapper level
+/// (#129).
+pub const TypeContributor = union(enum) {
+    /// Index into `component.types`.
+    type_def: u32,
+    /// Index into `component.imports` (must be `.type` desc).
+    import: u32,
+    /// Index into `component.aliases` (must be of sort `.type`).
+    alias: u32,
+};
+
+/// A core module embedded within a component (stored as raw bytes
+/// to be loaded on demand via the existing core loader).
+pub const CoreModule = struct {
+    /// Raw binary of the core module (including preamble).
+    data: []const u8,
+};
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+test "ValType: primitive sizes" {
+    const v1: ValType = .bool;
+    const v2: ValType = .{ .record = 5 };
+    const v3: ValType = .{ .own = 3 };
+    try std.testing.expect(v1 == .bool);
+    try std.testing.expect(v2 == .record);
+    try std.testing.expect(v3 == .own);
+}
+
+test "TypeDef: record construction" {
+    const fields = [_]Field{
+        .{ .name = "x", .type = .s32 },
+        .{ .name = "y", .type = .s32 },
+    };
+    const td = TypeDef{ .record = .{ .fields = &fields } };
+    try std.testing.expect(td == .record);
+    try std.testing.expectEqual(@as(usize, 2), td.record.fields.len);
+}
+
+test "Canon: lift construction" {
+    const opts = [_]CanonOpt{
+        .{ .memory = 0 },
+        .{ .string_encoding = .utf8 },
+    };
+    const canon = Canon{ .lift = .{
+        .core_func_idx = 0,
+        .type_idx = 1,
+        .opts = &opts,
+    } };
+    try std.testing.expect(canon == .lift);
+    try std.testing.expectEqual(@as(usize, 2), canon.lift.opts.len);
+}
+
+test "Sort: core and component sorts" {
+    const s1 = Sort{ .core = .func };
+    const s2: Sort = .func;
+    try std.testing.expect(s1 == .core);
+    try std.testing.expect(s2 == .func);
+}
+
+test "Alias: instance export" {
+    const a = Alias{ .instance_export = .{
+        .sort = .func,
+        .instance_idx = 0,
+        .name = "my-func",
+    } };
+    try std.testing.expect(a == .instance_export);
+    try std.testing.expectEqualStrings("my-func", a.instance_export.name);
+}
