@@ -32,6 +32,10 @@ async function importModule(url, options) {
     omitFunctions = false,
     omitVariables = false,
     maxMemory,
+    useWazig = (process.env.USE_WAZIG !== undefined)
+      ? (process.env.USE_WAZIG !== '0' && process.env.USE_WAZIG !== 'false')
+      : undefined,
+    zigPath = process.env.ZIG_PATH || undefined,
   } = options;
   if (currentModule) {
     await currentModule.__zigar?.abandon();
@@ -46,7 +50,7 @@ async function importModule(url, options) {
   }
   const loader = resolve('../dist/index.js');
   const path = fileURLToPath(url);
-  const hash = md5(path + JSON.stringify(options));
+  const hash = md5(path + JSON.stringify({ ...options, useWazig, zigPath }));
   const jsPath = join(tmpdir(), 'webpack-integration-test', optimize, `${hash}.mjs`);
   const jsFile = parse(jsPath);
   const config = {
@@ -82,6 +86,8 @@ async function importModule(url, options) {
             omitFunctions,
             omitVariables,
             maxMemory,
+            ...(useWazig !== undefined ? { useWazig } : {}),
+            ...(zigPath !== undefined ? { zigPath } : {}),
           },
         },
       ]

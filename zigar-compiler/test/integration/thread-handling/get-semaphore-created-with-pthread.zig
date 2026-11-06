@@ -39,6 +39,7 @@ fn run1(_: ?*anyopaque) callconv(.c) ?*anyopaque {
 }
 
 fn run2(_: ?*anyopaque) callconv(.c) ?*anyopaque {
+    std.Io.sleep(io, .fromMilliseconds(10), .real) catch unreachable;
     std.debug.print("Thread 2 acquiring semaphore\n", .{});
     if (c.sem_trywait(&semaphore) != 0) {
         std.debug.print("Thread 2 failed: {}\n", .{std.c._errno().* == @intFromEnum(std.c.E.AGAIN)});
@@ -56,6 +57,7 @@ fn run2(_: ?*anyopaque) callconv(.c) ?*anyopaque {
 }
 
 fn run3(_: ?*anyopaque) callconv(.c) ?*anyopaque {
+    std.Io.sleep(io, .fromMilliseconds(20), .real) catch unreachable;
     std.debug.print("Thread 3 acquiring semaphore\n", .{});
     if (c.sem_trywait(&semaphore) != 0) {
         std.debug.print("Thread 3 failed: {}\n", .{std.c._errno().* == @intFromEnum(std.c.E.AGAIN)});

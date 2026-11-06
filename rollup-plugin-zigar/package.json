@@ -13,6 +13,10 @@
   },
   "scripts": {
     "test": "mocha -- --no-warnings test/*.test.js",
+    "test:wazig": "USE_WAZIG=1 mocha -- --no-warnings test/index.test.js",
+    "test:zig": "USE_WAZIG=0 mocha -- --no-warnings test/index.test.js",
+    "test:integration:wazig": "USE_WAZIG=1 mocha -- --no-warnings test/integration.test.js",
+    "test:integration:zig": "USE_WAZIG=0 mocha -- --no-warnings test/integration.test.js",
     "test:extended": "mocha -- test/*.test.js",
     "debug": "mocha --reporter spec --inspect-brk -- test/*.test.js",
     "coverage": "c8 mocha -- test/*.test.js"

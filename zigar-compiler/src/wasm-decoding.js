@@ -30,7 +30,7 @@ export function stripUnused(binary, options = {}) {
   const blacklist = [
     /^getFactoryThunk$/,
     /^getModuleAttributes$/,
-    /^exporter\.getFactoryThunk/,
+    /^export(?:er)?\.getFactoryThunk/,
   ];
 
   function getSection(type) {
@@ -118,14 +118,17 @@ export function stripUnused(binary, options = {}) {
   for (const fn of functions) {
     if (fn.name && blacklist.some(re => re.test(fn.name))) {
       fn.using = false;
-      if (fn.name === 'getFactoryThunk' && functionNames.length === 0) {
+      if (fn.name === 'getFactoryThunk') {
         // when compiled for ReleaseSmall, we don't get the name section
         // therefore unable to remove the factory function by name
         // we know that getFactoryThunk loads its address, however
         // and that a function pointer is just an index into table 0
         const ops = fn.instructions;
-        if (ops.length === 2 && ops[0].opcode === 0x41 && ops[1].opcode === 0x0B) {
+        const isConstEnd = (ops.length === 2 && ops[0].opcode === 0x41 && ops[1].opcode === 0x0B)
+          || (ops.length === 3 && ops[0].opcode === 0x41 && ops[1].opcode === 0x0F && ops[2].opcode === 0x0B);
+        if (isConstEnd) {
           // 0x41 is i32.const
+          // 0x0F is return
           // 0x0B is end
           const elemIndex = ops[0].operand;
           const elemSection = getSection(SectionType.Element);
@@ -261,6 +264,18 @@ export function stripUnused(binary, options = {}) {
         newExportSection.exports.push(object);
       }
     }
+    const globalSection = getSection(SectionType.Global);
+    const hasImportedGlobal = importSection?.imports.some(o => o.type === ObjectType.Global);
+    if (
+      globalSection?.data?.byteLength >= 3 &&
+      !hasImportedGlobal &&
+      globalSection.data.getUint8(0) >= 1 &&
+      globalSection.data.getUint8(1) === 0x7f &&
+      globalSection.data.getUint8(2) === 0x01 &&
+      !newExportSection.exports.some(e => e.name === '__stack_pointer')
+    ) {
+      newExportSection.exports.push({ name: '__stack_pointer', type: ObjectType.Global, index: 0 });
+    }
   }
   // create new import section
   let newImportSection = null;
@@ -329,8 +344,12 @@ export function stripUnused(binary, options = {}) {
         newSections.push(newStartSection);
         break;
       case SectionType.Custom:
-        if (section.name === 'name' && newNameSection) {
-          newSections.push(newNameSection);
+        if (section.name === 'name') {
+          if (newNameSection) {
+            newSections.push(newNameSection);
+          }
+        } else if (section.name === 'zigar:abi' || section.name.startsWith('component-type')) {
+          newSections.push(section);
         }
         break;
       default:
@@ -338,7 +357,28 @@ export function stripUnused(binary, options = {}) {
         break;
     }
   }
-  return repackBinary({ sections: newSections, size });
+  return repackBinary({ sections: newSections, size: size + 24 });
+}
+
+export function ensureStackPointerExport(binary) {
+  const { sections, size } = parseBinary(binary);
+  const importSection = sections.find(s => s.type === SectionType.Import);
+  const globalSection = sections.find(s => s.type === SectionType.Global);
+  const exportSection = sections.find(s => s.type === SectionType.Export);
+  const hasImportedGlobal = importSection?.imports.some(o => o.type === ObjectType.Global);
+  if (
+    exportSection &&
+    globalSection?.data?.byteLength >= 3 &&
+    !hasImportedGlobal &&
+    globalSection.data.getUint8(0) >= 1 &&
+    globalSection.data.getUint8(1) === 0x7f &&
+    globalSection.data.getUint8(2) === 0x01 &&
+    !exportSection.exports.some(e => e.name === '__stack_pointer')
+  ) {
+    exportSection.exports.push({ name: '__stack_pointer', type: ObjectType.Global, index: 0 });
+    return repackBinary({ sections, size: size + 24 });
+  }
+  return binary;
 }
 
 export function parseBinary(binary) {

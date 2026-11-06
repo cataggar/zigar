@@ -67,6 +67,7 @@ fn run1(_: ?*anyopaque) callconv(.c) ?*anyopaque {
 }
 
 fn run2(_: ?*anyopaque) callconv(.c) ?*anyopaque {
+    std.Io.sleep(io, .fromMilliseconds(10), .real) catch unreachable;
     const semaphore = c.sem_open("hello", 0, @as(c_int, 0), @as(c_int, 0));
     if (semaphore == SEM_FAILED) return null;
     std.debug.print("Thread 2 acquiring semaphore\n", .{});
@@ -87,6 +88,7 @@ fn run2(_: ?*anyopaque) callconv(.c) ?*anyopaque {
 }
 
 fn run3(_: ?*anyopaque) callconv(.c) ?*anyopaque {
+    std.Io.sleep(io, .fromMilliseconds(20), .real) catch unreachable;
     const semaphore = c.sem_open("hello", 0, @as(c_int, 0), @as(c_int, 0));
     if (semaphore == SEM_FAILED) return null;
     std.debug.print("Thread 3 acquiring semaphore\n", .{});

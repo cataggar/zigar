@@ -4,7 +4,7 @@ import { defineEnvironment } from '../../zigar-runtime/src/environment.js';
 import * as mixins from '../../zigar-runtime/src/mixins.js';
 import { generateCode } from './code-generation.js';
 import { compile } from './compilation.js';
-import { extractLimits, stripUnused } from './wasm-decoding.js';
+import { ensureStackPointerExport, extractLimits, stripUnused } from './wasm-decoding.js';
 
 export async function transpile(srcPath, options) {
   const {
@@ -14,6 +14,8 @@ export async function transpile(srcPath, options) {
     omitExports = false,
     stripWASM = (options.optimize && options.optimize !== 'Debug'),
     keepNames = false,
+    useJSPI = false,
+    continuationStackSize,
     moduleResolver = (name) => name,
     wasmLoader,
     ...compileOptions
@@ -34,6 +36,12 @@ export async function transpile(srcPath, options) {
     tableInitial,
     multithreaded,
   };
+  if (useJSPI) {
+    moduleOptions.useJSPI = true;
+  }
+  if (continuationStackSize !== undefined) {
+    moduleOptions.continuationStackSize = continuationStackSize;
+  }
   const Env = defineEnvironment();
   const env = new Env();
   env.loadModule(content, moduleOptions);
@@ -67,6 +75,8 @@ export async function transpile(srcPath, options) {
     let dv = new DataView(content.buffer);
     if (stripWASM) {
       dv = stripUnused(dv, { keepNames });
+    } else {
+      dv = ensureStackPointerExport(dv);
     }
     if (embedWASM) {
       binarySource = embed(srcPath, dv);

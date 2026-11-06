@@ -1,0 +1,787 @@
+{
+  "timestamp": "2026-11-06T23:06:09.292Z",
+  "issue": 14,
+  "workstream": "wasmfx-prototype",
+  "environment": {
+    "nodeVersion": "v24.21.0",
+    "v8Version": "13.6.233.17-node.53",
+    "wasmtimeVersion": "wasmtime 50.0.1 (c307ec81d 2026-10-29)",
+    "wazigVersion": "0.17.0-wazig.4",
+    "platform": "linux",
+    "arch": "arm64"
+  },
+  "part1_v8WasmFXMatrix": {
+    "nodeVersion": "v24.21.0",
+    "v8Version": "13.6.233.17-node.53",
+    "flagsTested": [
+      "--experimental-wasm-wasmfx",
+      "--experimental-wasm-exnref"
+    ],
+    "typeSystemMatrix": [
+      {
+        "id": "concrete_cont_local",
+        "description": "Concrete (type $ct (cont $ft)) [0x5d 0x00] + local (ref null $ct) [0x63 0x01]",
+        "moduleSizeBytes": 45,
+        "withoutWasmFXFlag": {
+          "valid": false,
+          "compiled": false,
+          "compileError": "WebAssembly.Module(): core stack switching not enabled (enable with --experimental-wasm-wasmfx) @+14",
+          "exportsList": null
+        },
+        "withWasmFXFlag": {
+          "valid": true,
+          "compiled": true,
+          "compileError": null,
+          "exportsList": [
+            {
+              "name": "run",
+              "kind": "function"
+            }
+          ]
+        },
+        "instantiationWithWasmFXFlag": {
+          "instantiated": false,
+          "returnValue": null,
+          "exitCode": null,
+          "fatalError": "unimplemented code"
+        }
+      },
+      {
+        "id": "concrete_cont_table_global_sig",
+        "description": "Concrete (ref null $ct) in Table, Global, and Function (param)/(result)",
+        "moduleSizeBytes": 90,
+        "withoutWasmFXFlag": {
+          "valid": false,
+          "compiled": false,
+          "compileError": "WebAssembly.Module(): core stack switching not enabled (enable with --experimental-wasm-wasmfx) @+14",
+          "exportsList": null
+        },
+        "withWasmFXFlag": {
+          "valid": true,
+          "compiled": true,
+          "compileError": null,
+          "exportsList": [
+            {
+              "name": "run",
+              "kind": "function"
+            },
+            {
+              "name": "tbl",
+              "kind": "table"
+            },
+            {
+              "name": "glb",
+              "kind": "global"
+            }
+          ]
+        },
+        "instantiationWithWasmFXFlag": {
+          "instantiated": false,
+          "returnValue": null,
+          "exitCode": null,
+          "fatalError": "unimplemented code"
+        }
+      },
+      {
+        "id": "rec_group_cont_subtyping",
+        "description": "Recursive type group (0x4e) with subtyping (0x50 sub (cont $ft))",
+        "moduleSizeBytes": 52,
+        "withoutWasmFXFlag": {
+          "valid": false,
+          "compiled": false,
+          "compileError": "WebAssembly.Module(): core stack switching not enabled (enable with --experimental-wasm-wasmfx) @+21",
+          "exportsList": null
+        },
+        "withWasmFXFlag": {
+          "valid": true,
+          "compiled": true,
+          "compileError": null,
+          "exportsList": [
+            {
+              "name": "run",
+              "kind": "function"
+            }
+          ]
+        },
+        "instantiationWithWasmFXFlag": {
+          "instantiated": false,
+          "returnValue": null,
+          "exitCode": null,
+          "fatalError": "unimplemented code"
+        }
+      },
+      {
+        "id": "abstract_contref_0x68",
+        "description": "Abstract contref (0x68) in Table, Global, Param, Return, Local + Execution",
+        "moduleSizeBytes": 68,
+        "withoutWasmFXFlag": {
+          "valid": false,
+          "compiled": false,
+          "compileError": "WebAssembly.Module(): invalid value type 'cont', enable with --experimental-wasm-wasmfx @+13",
+          "exportsList": null
+        },
+        "withWasmFXFlag": {
+          "valid": true,
+          "compiled": true,
+          "compileError": null,
+          "exportsList": [
+            {
+              "name": "run",
+              "kind": "function"
+            }
+          ]
+        },
+        "instantiationWithWasmFXFlag": {
+          "instantiated": true,
+          "returnValue": 1,
+          "exitCode": 0,
+          "fatalError": null
+        }
+      },
+      {
+        "id": "abstract_nullcontref_0x75",
+        "description": "Abstract nullcontref (0x75 nocont) subtyping into contref (0x68) + Execution",
+        "moduleSizeBytes": 51,
+        "withoutWasmFXFlag": {
+          "valid": false,
+          "compiled": false,
+          "compileError": "WebAssembly.Module(): invalid value type 'cont', enable with --experimental-wasm-wasmfx @+22",
+          "exportsList": null
+        },
+        "withWasmFXFlag": {
+          "valid": true,
+          "compiled": true,
+          "compileError": null,
+          "exportsList": [
+            {
+              "name": "run",
+              "kind": "function"
+            }
+          ]
+        },
+        "instantiationWithWasmFXFlag": {
+          "instantiated": true,
+          "returnValue": 1,
+          "exitCode": 0,
+          "fatalError": null
+        }
+      }
+    ],
+    "opcodeMatrix": [
+      {
+        "opcode": "0xe0",
+        "mnemonic": "cont.new",
+        "immediates": "$ct_type_idx (0x01)",
+        "specDefinedInWasmFX": true,
+        "v8ValidateWithWasmFX": false,
+        "v8CompileError": "WebAssembly.Module(): Compiling function #0 failed: Invalid opcode 0xe0 @+62",
+        "wasmtime50X64Compiled": true,
+        "wasmtime50CwasmBytes": 14072,
+        "wasmtime50Diagnostic": null
+      },
+      {
+        "opcode": "0xe1",
+        "mnemonic": "cont.bind",
+        "immediates": "$src_ct (0x03), $dst_ct (0x01)",
+        "specDefinedInWasmFX": true,
+        "v8ValidateWithWasmFX": false,
+        "v8CompileError": "WebAssembly.Module(): Compiling function #0 failed: Invalid opcode 0xe1 @+64",
+        "wasmtime50X64Compiled": true,
+        "wasmtime50CwasmBytes": 13960,
+        "wasmtime50Diagnostic": null
+      },
+      {
+        "opcode": "0xe2",
+        "mnemonic": "suspend",
+        "immediates": "$tag_idx (0x00)",
+        "specDefinedInWasmFX": true,
+        "v8ValidateWithWasmFX": false,
+        "v8CompileError": "WebAssembly.Module(): Compiling function #0 failed: Invalid opcode 0xe2 @+62",
+        "wasmtime50X64Compiled": true,
+        "wasmtime50CwasmBytes": 14024,
+        "wasmtime50Diagnostic": null
+      },
+      {
+        "opcode": "0xe3",
+        "mnemonic": "resume",
+        "immediates": "$ct_idx (0x01), vec(on_clause) (0x00)",
+        "specDefinedInWasmFX": true,
+        "v8ValidateWithWasmFX": false,
+        "v8CompileError": "WebAssembly.Module(): Compiling function #0 failed: Invalid opcode 0xe3 @+62",
+        "wasmtime50X64Compiled": true,
+        "wasmtime50CwasmBytes": 14016,
+        "wasmtime50Diagnostic": null
+      },
+      {
+        "opcode": "0xe4",
+        "mnemonic": "resume_throw",
+        "immediates": "$ct_idx (0x01), $tag_idx (0x01), vec(on_clause) (0x00)",
+        "specDefinedInWasmFX": true,
+        "v8ValidateWithWasmFX": false,
+        "v8CompileError": "WebAssembly.Module(): Compiling function #0 failed: Invalid opcode 0xe4 @+62",
+        "wasmtime50X64Compiled": true,
+        "wasmtime50CwasmBytes": 14200,
+        "wasmtime50Diagnostic": null
+      },
+      {
+        "opcode": "0xe5",
+        "mnemonic": "resume_throw_ref",
+        "immediates": "$ct_idx (0x01), vec(on_clause) (0x00)",
+        "specDefinedInWasmFX": true,
+        "v8ValidateWithWasmFX": false,
+        "v8CompileError": "WebAssembly.Module(): Compiling function #0 failed: Invalid opcode 0xe5 @+64",
+        "wasmtime50X64Compiled": true,
+        "wasmtime50CwasmBytes": 14080,
+        "wasmtime50Diagnostic": null
+      },
+      {
+        "opcode": "0xe6",
+        "mnemonic": "switch",
+        "immediates": "$ct_idx (0x05), $tag_idx (0x02)",
+        "specDefinedInWasmFX": true,
+        "v8ValidateWithWasmFX": false,
+        "v8CompileError": "WebAssembly.Module(): Compiling function #0 failed: Invalid opcode 0xe6 @+62",
+        "wasmtime50X64Compiled": true,
+        "wasmtime50CwasmBytes": 14024,
+        "wasmtime50Diagnostic": null
+      },
+      {
+        "opcode": "0xe7",
+        "mnemonic": "reserved_0xe7",
+        "immediates": "none",
+        "specDefinedInWasmFX": false,
+        "v8ValidateWithWasmFX": false,
+        "v8CompileError": "WebAssembly.Module(): Compiling function #0 failed: Invalid opcode 0xe7 @+60",
+        "wasmtime50X64Compiled": false,
+        "wasmtime50CwasmBytes": 0,
+        "wasmtime50Diagnostic": "    1: Invalid input WebAssembly code at offset 60: illegal opcode: 0xe7"
+      },
+      {
+        "opcode": "0xe8",
+        "mnemonic": "reserved_0xe8",
+        "immediates": "none",
+        "specDefinedInWasmFX": false,
+        "v8ValidateWithWasmFX": false,
+        "v8CompileError": "WebAssembly.Module(): Compiling function #0 failed: Invalid opcode 0xe8 @+60",
+        "wasmtime50X64Compiled": false,
+        "wasmtime50CwasmBytes": 0,
+        "wasmtime50Diagnostic": "    1: Invalid input WebAssembly code at offset 60: illegal opcode: 0xe8"
+      },
+      {
+        "opcode": "0xe9",
+        "mnemonic": "reserved_0xe9",
+        "immediates": "none",
+        "specDefinedInWasmFX": false,
+        "v8ValidateWithWasmFX": false,
+        "v8CompileError": "WebAssembly.Module(): Compiling function #0 failed: Invalid opcode 0xe9 @+60",
+        "wasmtime50X64Compiled": false,
+        "wasmtime50CwasmBytes": 0,
+        "wasmtime50Diagnostic": "    1: Invalid input WebAssembly code at offset 60: illegal opcode: 0xe9"
+      },
+      {
+        "opcode": "0xea",
+        "mnemonic": "reserved_0xea",
+        "immediates": "none",
+        "specDefinedInWasmFX": false,
+        "v8ValidateWithWasmFX": false,
+        "v8CompileError": "WebAssembly.Module(): Compiling function #0 failed: Invalid opcode 0xea @+60",
+        "wasmtime50X64Compiled": false,
+        "wasmtime50CwasmBytes": 0,
+        "wasmtime50Diagnostic": "    1: Invalid input WebAssembly code at offset 60: illegal opcode: 0xea"
+      },
+      {
+        "opcode": "0xeb",
+        "mnemonic": "reserved_0xeb",
+        "immediates": "none",
+        "specDefinedInWasmFX": false,
+        "v8ValidateWithWasmFX": false,
+        "v8CompileError": "WebAssembly.Module(): Compiling function #0 failed: Invalid opcode 0xeb @+60",
+        "wasmtime50X64Compiled": false,
+        "wasmtime50CwasmBytes": 0,
+        "wasmtime50Diagnostic": "    1: Invalid input WebAssembly code at offset 60: illegal opcode: 0xeb"
+      },
+      {
+        "opcode": "0xec",
+        "mnemonic": "reserved_0xec",
+        "immediates": "none",
+        "specDefinedInWasmFX": false,
+        "v8ValidateWithWasmFX": false,
+        "v8CompileError": "WebAssembly.Module(): Compiling function #0 failed: Invalid opcode 0xec @+60",
+        "wasmtime50X64Compiled": false,
+        "wasmtime50CwasmBytes": 0,
+        "wasmtime50Diagnostic": "    1: Invalid input WebAssembly code at offset 60: illegal opcode: 0xec"
+      },
+      {
+        "opcode": "0xed",
+        "mnemonic": "reserved_0xed",
+        "immediates": "none",
+        "specDefinedInWasmFX": false,
+        "v8ValidateWithWasmFX": false,
+        "v8CompileError": "WebAssembly.Module(): Compiling function #0 failed: Invalid opcode 0xed @+60",
+        "wasmtime50X64Compiled": false,
+        "wasmtime50CwasmBytes": 0,
+        "wasmtime50Diagnostic": "    1: Invalid input WebAssembly code at offset 60: illegal opcode: 0xed"
+      },
+      {
+        "opcode": "0xee",
+        "mnemonic": "reserved_0xee",
+        "immediates": "none",
+        "specDefinedInWasmFX": false,
+        "v8ValidateWithWasmFX": false,
+        "v8CompileError": "WebAssembly.Module(): Compiling function #0 failed: Invalid opcode 0xee @+60",
+        "wasmtime50X64Compiled": false,
+        "wasmtime50CwasmBytes": 0,
+        "wasmtime50Diagnostic": "    1: Invalid input WebAssembly code at offset 60: illegal opcode: 0xee"
+      },
+      {
+        "opcode": "0xef",
+        "mnemonic": "reserved_0xef",
+        "immediates": "none",
+        "specDefinedInWasmFX": false,
+        "v8ValidateWithWasmFX": false,
+        "v8CompileError": "WebAssembly.Module(): Compiling function #0 failed: Invalid opcode 0xef @+60",
+        "wasmtime50X64Compiled": false,
+        "wasmtime50CwasmBytes": 0,
+        "wasmtime50Diagnostic": "    1: Invalid input WebAssembly code at offset 60: illegal opcode: 0xef"
+      }
+    ]
+  },
+  "part2_wasmtimeStackSwitching": {
+    "wasmtimeVersion": "wasmtime 50.0.1 (c307ec81d 2026-10-29)",
+    "hostArch": "arm64",
+    "x86_64AotCompilation": {
+      "target": "x86_64-unknown-linux-gnu",
+      "flags": [
+        "-W stack-switching=y",
+        "-W exceptions=y",
+        "-W function-references=y"
+      ],
+      "succeeded": true,
+      "compileTimeMs": 8.02,
+      "cwasmArtifactBytes": 19184,
+      "symbols": [
+        {
+          "name": "wasm[0]::function[0]::worker_arg",
+          "sizeBytes": 480
+        },
+        {
+          "name": "wasm[0]::function[1]::test_cont_new_bind_suspend_resume",
+          "sizeBytes": 2090
+        },
+        {
+          "name": "wasm[0]::function[2]::test_resume_throw",
+          "sizeBytes": 1051
+        },
+        {
+          "name": "wasm[0]::function[3]::test_switch",
+          "sizeBytes": 920
+        },
+        {
+          "name": "wasm[0]::array_to_wasm_trampoline[0]",
+          "sizeBytes": 189
+        },
+        {
+          "name": "wasm[0]::array_to_wasm_trampoline[1]",
+          "sizeBytes": 184
+        },
+        {
+          "name": "wasm[0]::array_to_wasm_trampoline[2]",
+          "sizeBytes": 194
+        },
+        {
+          "name": "wasm[0]::array_to_wasm_trampoline[3]",
+          "sizeBytes": 194
+        },
+        {
+          "name": "signatures[0]::wasm_to_array_trampoline",
+          "sizeBytes": 97
+        },
+        {
+          "name": "signatures[2]::wasm_to_array_trampoline",
+          "sizeBytes": 106
+        },
+        {
+          "name": "signatures[5]::wasm_to_array_trampoline",
+          "sizeBytes": 112
+        },
+        {
+          "name": "signatures[7]::wasm_to_array_trampoline",
+          "sizeBytes": 90
+        },
+        {
+          "name": "signatures[9]::wasm_to_array_trampoline",
+          "sizeBytes": 107
+        },
+        {
+          "name": "wasmtime_builtin_ref_func",
+          "sizeBytes": 43
+        },
+        {
+          "name": "wasmtime_builtin_gc_alloc_raw",
+          "sizeBytes": 105
+        },
+        {
+          "name": "wasmtime_builtin_raise",
+          "sizeBytes": 45
+        },
+        {
+          "name": "wasmtime_builtin_cont_new",
+          "sizeBytes": 104
+        },
+        {
+          "name": "wasmtime_builtin_get_instance_id",
+          "sizeBytes": 45
+        },
+        {
+          "name": "wasmtime_builtin_throw_ref",
+          "sizeBytes": 97
+        }
+      ],
+      "inlineStackSwitchAssembly": [
+        "orq     0xd2(%rip), %rdi",
+        "movq    (%rcx), %rax",
+        "movq    %rsp, (%rcx)",
+        "movq    %rax, %rsp",
+        "movq    8(%rcx), %rax",
+        "movq    %rbp, 8(%rcx)",
+        "movq    %rax, %rbp",
+        "movq    0x10(%rcx), %rax",
+        "leaq    6(%rip), %rdx",
+        "movq    %rdx, 0x10(%rcx)",
+        "jmpq    *%rax",
+        "shrq    $0x20, %rdi"
+      ]
+    },
+    "aarch64Compilation": {
+      "target": "aarch64-unknown-linux-gnu",
+      "succeeded": false,
+      "diagnostic": "Error: the wasm_stack_switching feature is not supported on this compiler configuration"
+    },
+    "aarch64HostExecution": {
+      "succeeded": false,
+      "diagnostic": "Error: the wasm_stack_switching feature is not supported on this compiler configuration"
+    }
+  },
+  "part3_dualStackContextSwitching": {
+    "wazigVersion": "0.17.0-wazig.4",
+    "zigCompilationFlags": [
+      "-target wasm32-wasi",
+      "-O ReleaseSmall",
+      "-fno-entry",
+      "-rdynamic"
+    ],
+    "v8RuntimeFlags": [
+      "--experimental-wasm-growable-stacks",
+      "--wasm-stack-switching-stack-size=4"
+    ],
+    "wazigModuleSizes": {
+      "rawBytes": 1665,
+      "withExportedStackPointerBytes": 1665,
+      "compileTimeMs": 8437.72
+    },
+    "realWazigZigModule": {
+      "label": "wazig_real_zig_module",
+      "sharedMode": {
+        "mode": "shared_stack_pointer_default_jspi",
+        "switchStackPointer": false,
+        "numFibers": 50,
+        "maxDepth": 20,
+        "totalSuspensions": 1000,
+        "validFibers": 9,
+        "corruptedFibers": 41,
+        "corruptionRatePct": 82,
+        "uniqueFrameAddresses": 808,
+        "expectedFrameAddresses": 1000,
+        "collidingAddresses": 56,
+        "sampleCollisions": [
+          {
+            "bufPtr": "0xffffc0",
+            "fibersSharingAddress": [
+              1,
+              32
+            ]
+          },
+          {
+            "bufPtr": "0xffff80",
+            "fibersSharingAddress": [
+              2,
+              13,
+              6
+            ]
+          },
+          {
+            "bufPtr": "0xffff40",
+            "fibersSharingAddress": [
+              3,
+              14,
+              42
+            ]
+          },
+          {
+            "bufPtr": "0xffff00",
+            "fibersSharingAddress": [
+              4,
+              18,
+              26,
+              35
+            ]
+          },
+          {
+            "bufPtr": "0xfffec0",
+            "fibersSharingAddress": [
+              5,
+              9,
+              15,
+              43
+            ]
+          }
+        ],
+        "sampleDepth20Addresses": [
+          {
+            "fiberId": 1,
+            "bufPtrHex": "0xffffc0",
+            "bufPtrDec": 16777152
+          },
+          {
+            "fiberId": 2,
+            "bufPtrHex": "0xffff80",
+            "bufPtrDec": 16777088
+          },
+          {
+            "fiberId": 3,
+            "bufPtrHex": "0xffff40",
+            "bufPtrDec": 16777024
+          },
+          {
+            "fiberId": 4,
+            "bufPtrHex": "0xffff00",
+            "bufPtrDec": 16776960
+          },
+          {
+            "fiberId": 5,
+            "bufPtrHex": "0xfffec0",
+            "bufPtrDec": 16776896
+          },
+          {
+            "fiberId": 6,
+            "bufPtrHex": "0xfffe80",
+            "bufPtrDec": 16776832
+          }
+        ],
+        "totalElapsedMs": 2.436,
+        "nsPerContinuationSwitch": 2436
+      },
+      "switchedMode": {
+        "mode": "per_continuation_stack_pointer_switched",
+        "switchStackPointer": true,
+        "numFibers": 50,
+        "maxDepth": 20,
+        "totalSuspensions": 1000,
+        "validFibers": 50,
+        "corruptedFibers": 0,
+        "corruptionRatePct": 0,
+        "uniqueFrameAddresses": 1000,
+        "expectedFrameAddresses": 1000,
+        "collidingAddresses": 0,
+        "sampleCollisions": [],
+        "sampleDepth20Addresses": [
+          {
+            "fiberId": 1,
+            "bufPtrHex": "0x1004360",
+            "bufPtrDec": 16794464
+          },
+          {
+            "fiberId": 2,
+            "bufPtrHex": "0x1008360",
+            "bufPtrDec": 16810848
+          },
+          {
+            "fiberId": 3,
+            "bufPtrHex": "0x100c360",
+            "bufPtrDec": 16827232
+          },
+          {
+            "fiberId": 4,
+            "bufPtrHex": "0x1010360",
+            "bufPtrDec": 16843616
+          },
+          {
+            "fiberId": 5,
+            "bufPtrHex": "0x1014360",
+            "bufPtrDec": 16860000
+          },
+          {
+            "fiberId": 6,
+            "bufPtrHex": "0x1018360",
+            "bufPtrDec": 16876384
+          }
+        ],
+        "totalElapsedMs": 2.012,
+        "nsPerContinuationSwitch": 2012
+      },
+      "warmedThroughput20kSwitches": {
+        "sharedNsPerSwitch": 1515,
+        "switchedNsPerSwitch": 1461,
+        "overheadNsPerSwitch": -54
+      },
+      "rawGlobal0SaveRestoreBenchmark": {
+        "iterations": 500000,
+        "totalMs": 19.444,
+        "nsPerSaveRestorePair": 38.89,
+        "checksum": 33538048
+      }
+    },
+    "syntheticWasmModule": {
+      "label": "synthetic_wasm_binary",
+      "sharedMode": {
+        "mode": "shared_stack_pointer_default_jspi",
+        "switchStackPointer": false,
+        "numFibers": 50,
+        "maxDepth": 20,
+        "totalSuspensions": 1000,
+        "validFibers": 9,
+        "corruptedFibers": 41,
+        "corruptionRatePct": 82,
+        "uniqueFrameAddresses": 808,
+        "expectedFrameAddresses": 1000,
+        "collidingAddresses": 56,
+        "sampleCollisions": [
+          {
+            "bufPtr": "0x10040",
+            "fibersSharingAddress": [
+              1,
+              32
+            ]
+          },
+          {
+            "bufPtr": "0x10080",
+            "fibersSharingAddress": [
+              2,
+              13,
+              6
+            ]
+          },
+          {
+            "bufPtr": "0x100c0",
+            "fibersSharingAddress": [
+              3,
+              14,
+              42
+            ]
+          },
+          {
+            "bufPtr": "0x10100",
+            "fibersSharingAddress": [
+              4,
+              18,
+              26,
+              35
+            ]
+          },
+          {
+            "bufPtr": "0x10140",
+            "fibersSharingAddress": [
+              5,
+              9,
+              15,
+              43
+            ]
+          }
+        ],
+        "sampleDepth20Addresses": [
+          {
+            "fiberId": 1,
+            "bufPtrHex": "0x10040",
+            "bufPtrDec": 65600
+          },
+          {
+            "fiberId": 2,
+            "bufPtrHex": "0x10080",
+            "bufPtrDec": 65664
+          },
+          {
+            "fiberId": 3,
+            "bufPtrHex": "0x100c0",
+            "bufPtrDec": 65728
+          },
+          {
+            "fiberId": 4,
+            "bufPtrHex": "0x10100",
+            "bufPtrDec": 65792
+          },
+          {
+            "fiberId": 5,
+            "bufPtrHex": "0x10140",
+            "bufPtrDec": 65856
+          },
+          {
+            "fiberId": 6,
+            "bufPtrHex": "0x10180",
+            "bufPtrDec": 65920
+          }
+        ],
+        "totalElapsedMs": 2.424,
+        "nsPerContinuationSwitch": 2424
+      },
+      "switchedMode": {
+        "mode": "per_continuation_stack_pointer_switched",
+        "switchStackPointer": true,
+        "numFibers": 50,
+        "maxDepth": 20,
+        "totalSuspensions": 1000,
+        "validFibers": 50,
+        "corruptedFibers": 0,
+        "corruptionRatePct": 0,
+        "uniqueFrameAddresses": 1000,
+        "expectedFrameAddresses": 1000,
+        "collidingAddresses": 0,
+        "sampleCollisions": [],
+        "sampleDepth20Addresses": [
+          {
+            "fiberId": 1,
+            "bufPtrHex": "0x18040",
+            "bufPtrDec": 98368
+          },
+          {
+            "fiberId": 2,
+            "bufPtrHex": "0x1c040",
+            "bufPtrDec": 114752
+          },
+          {
+            "fiberId": 3,
+            "bufPtrHex": "0x20040",
+            "bufPtrDec": 131136
+          },
+          {
+            "fiberId": 4,
+            "bufPtrHex": "0x24040",
+            "bufPtrDec": 147520
+          },
+          {
+            "fiberId": 5,
+            "bufPtrHex": "0x28040",
+            "bufPtrDec": 163904
+          },
+          {
+            "fiberId": 6,
+            "bufPtrHex": "0x2c040",
+            "bufPtrDec": 180288
+          }
+        ],
+        "totalElapsedMs": 1.63,
+        "nsPerContinuationSwitch": 1630
+      },
+      "warmedThroughput20kSwitches": {
+        "sharedNsPerSwitch": 1004,
+        "switchedNsPerSwitch": 1264,
+        "overheadNsPerSwitch": 260
+      },
+      "rawGlobal0SaveRestoreBenchmark": {
+        "iterations": 500000,
+        "totalMs": 21.044,
+        "nsPerSaveRestorePair": 42.09,
+        "checksum": 114688
+      }
+    }
+  }
+}

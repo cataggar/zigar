@@ -1,6 +1,6 @@
 import { expect, use } from 'chai';
 import chaiAsPromised from 'chai-as-promised';
-import { readdir, stat } from 'fs/promises';
+import { readdir, readFile, stat } from 'fs/promises';
 import os, { tmpdir } from 'os';
 import { join, sep } from 'path';
 import { fileURLToPath } from 'url';
@@ -102,6 +102,119 @@ describe('Compilation', function() {
       const config = await createConfig(srcPath, modPath, options);
       expect(config.outputPath).to.equal(join(modPath, 'freebsd.arm64.so'));
     })
+    it('should use direct build-exe for standard WASM builds', async function() {
+      const srcPath = absolute('./zig-samples/basic/integers.zig');
+      const options = {
+        optimize: 'ReleaseSmall',
+        platform: 'wasi',
+        arch: 'wasm32',
+        isWASM: true,
+      };
+      const modPath = getModuleCachePath(srcPath, options);
+      const config = await createConfig(srcPath, modPath, options);
+      expect(config.useBuildExe).to.be.true;
+      expect(config.zigArgs[0]).to.equal('build-exe');
+      expect(config.zigArgs).to.include('--cache-dir');
+      expect(config.zigArgs).to.include('.zig-cache');
+      expect(config.zigArgs).to.include('-mexec-model=reactor');
+      expect(config.relOutputPath).to.equal(join('ReleaseSmall', 'integers.wasm'));
+      expect(config.translateCArgs).to.be.null;
+    })
+    it('should prepare translateCArgs for WASM builds with build.extra.h', async function() {
+      const srcPath = absolute('./zig-samples/c-import/print.zig');
+      const options = {
+        optimize: 'Debug',
+        platform: 'wasi',
+        arch: 'wasm32',
+        isWASM: true,
+      };
+      const modPath = getModuleCachePath(srcPath, options);
+      const config = await createConfig(srcPath, modPath, options);
+      expect(config.useBuildExe).to.be.true;
+      expect(config.translateCArgs).to.be.an('array');
+      expect(config.translateCArgs[0]).to.equal('translate-c');
+      expect(config.translateCArgs).to.include(join('src', 'build.extra.h'));
+      expect(config.zigArgs).to.include('-Mc=c.zig');
+    })
+    it('should fall back to zig build when useBuildExe is false or custom build files exist', async function() {
+      const intPath = absolute('./zig-samples/basic/integers.zig');
+      const customPath = absolute('./zig-samples/custom/custom.zig');
+      const extraPath = absolute('./zig-samples/extra/extra.zig');
+      const wasmOpts = { optimize: 'Debug', platform: 'wasi', arch: 'wasm32', isWASM: true };
+      const cfgDisabled = await createConfig(intPath, null, { ...wasmOpts, useBuildExe: false });
+      expect(cfgDisabled.useBuildExe).to.be.false;
+      expect(cfgDisabled.zigArgs[0]).to.equal('build');
+      const cfgCustom = await createConfig(customPath, null, wasmOpts);
+      expect(cfgCustom.useBuildExe).to.be.false;
+      expect(cfgCustom.zigArgs[0]).to.equal('build');
+      const cfgExtra = await createConfig(extraPath, null, wasmOpts);
+      expect(cfgExtra.useBuildExe).to.be.false;
+      expect(cfgExtra.zigArgs[0]).to.equal('build');
+    })
+    it('should select wazig by default for WASM builds and allow overriding via options or env', async function() {
+      const srcPath = absolute('./zig-samples/basic/integers.zig');
+      const wasmOpts = { optimize: 'ReleaseSmall', platform: 'wasi', arch: 'wasm32', isWASM: true };
+      const prevZigPath = process.env.ZIG_PATH;
+      const prevUseWazig = process.env.USE_WAZIG;
+      delete process.env.ZIG_PATH;
+      delete process.env.USE_WAZIG;
+      try {
+        const cfgDefaultWasm = await createConfig(srcPath, null, wasmOpts);
+        expect(cfgDefaultWasm.useWazig).to.be.true;
+        expect(cfgDefaultWasm.zigPath).to.equal('wazig');
+
+        const cfgDisableWazig = await createConfig(srcPath, null, { ...wasmOpts, useWazig: false });
+        expect(cfgDisableWazig.useWazig).to.be.false;
+        expect(cfgDisableWazig.zigPath).to.equal('zig');
+
+        const nativeOpts = { optimize: 'Debug', isWASM: false };
+        const modPath = getModuleCachePath(srcPath, nativeOpts);
+        const cfgNative = await createConfig(srcPath, modPath, nativeOpts);
+        expect(cfgNative.useWazig).to.be.false;
+        expect(cfgNative.zigPath).to.equal('zig');
+
+        process.env.ZIG_PATH = '/custom/bin/zig';
+        const cfgEnvZigPath = await createConfig(srcPath, null, wasmOpts);
+        expect(cfgEnvZigPath.zigPath).to.equal('/custom/bin/zig');
+        expect(cfgEnvZigPath.useWazig).to.be.false;
+        delete process.env.ZIG_PATH;
+
+        process.env.USE_WAZIG = '0';
+        const cfgEnvUseWazigFalse = await createConfig(srcPath, null, wasmOpts);
+        expect(cfgEnvUseWazigFalse.useWazig).to.be.false;
+        expect(cfgEnvUseWazigFalse.zigPath).to.equal('zig');
+
+        process.env.USE_WAZIG = '1';
+        const cfgEnvUseWazigTrue = await createConfig(srcPath, null, wasmOpts);
+        expect(cfgEnvUseWazigTrue.useWazig).to.be.true;
+        expect(cfgEnvUseWazigTrue.zigPath).to.equal('wazig');
+
+        const cfgEnvUseWazigNative = await createConfig(srcPath, modPath, nativeOpts);
+        expect(cfgEnvUseWazigNative.useWazig).to.be.false;
+        expect(cfgEnvUseWazigNative.zigPath).to.equal('zig');
+      } finally {
+        if (prevZigPath !== undefined) process.env.ZIG_PATH = prevZigPath;
+        else delete process.env.ZIG_PATH;
+        if (prevUseWazig !== undefined) process.env.USE_WAZIG = prevUseWazig;
+        else delete process.env.USE_WAZIG;
+      }
+    })
+    it('should keep useBuildExe enabled for wazigl WASM builds with useLLVM: true', async function() {
+      const srcPath = absolute('./zig-samples/basic/integers.zig');
+      const wasmOpts = {
+        optimize: 'ReleaseSmall',
+        platform: 'wasi',
+        arch: 'wasm32',
+        isWASM: true,
+        zigPath: 'wazigl',
+        useLLVM: true,
+      };
+      const config = await createConfig(srcPath, null, wasmOpts);
+      expect(config.useBuildExe).to.be.true;
+      expect(config.useWazig).to.be.true;
+      expect(config.zigPath).to.equal('wazigl');
+      expect(config.zigArgs).to.include('-fllvm');
+    })
   })
   describe('compile', function() {
     it('should compile zig source code for C addon', async function() {
@@ -119,6 +232,26 @@ describe('Compilation', function() {
       const { outputPath } = await compile(srcPath, modPath, options);
       const { size } = await stat(outputPath);
       expect(size).to.be.at.least(1000);
+    })
+    it('should not link libc on pure-Zig WASM32 builds', async function() {
+      for (const relPath of [ './zig-samples/basic/console.zig', './integration/function-calling/return-c-pointer.zig' ]) {
+        const srcPath = absolute(relPath);
+        const options = { optimize: 'ReleaseSmall', arch: 'wasm32', platform: 'wasi', isWASM: true, useLibc: false };
+        const modPath = getModuleCachePath(srcPath, options);
+        const { outputPath } = await compile(srcPath, modPath, options);
+        const wasmMod = await WebAssembly.compile(await readFile(outputPath));
+        const exportNames = WebAssembly.Module.exports(wasmMod).map(e => e.name);
+        expect(exportNames).to.not.include('initializeLibc');
+      }
+    })
+    it('should link libc on WASM32 builds when useLibc is true', async function() {
+      const srcPath = absolute('./zig-samples/basic/console.zig');
+      const options = { optimize: 'ReleaseSmall', arch: 'wasm32', platform: 'wasi', isWASM: true, useLibc: true };
+      const modPath = getModuleCachePath(srcPath, options);
+      const { outputPath } = await compile(srcPath, modPath, options);
+      const wasmMod = await WebAssembly.compile(await readFile(outputPath));
+      const exportNames = WebAssembly.Module.exports(wasmMod).map(e => e.name);
+      expect(exportNames).to.include('initializeLibc');
     })
     it('should compile code for Linux', async function() {
       const srcPath = absolute('./zig-samples/basic/integers.zig');
@@ -357,6 +490,44 @@ describe('Compilation', function() {
       const options = { optimize: 'Debug', arch: 'x64', platform: 'linux', useLLVM: false };
       const modPath = getModuleCachePath(srcPath, options);
       await expect(compile(srcPath, modPath, options)).to.eventually.be.fulfilled;
+    })
+    it('should compile pure-Zig WASM module via direct build-exe with wazig', async function() {
+      for (const sample of [ './zig-samples/basic/integers.zig', './zig-samples/basic/console.zig' ]) {
+        const srcPath = absolute(sample);
+        const options = { optimize: 'ReleaseSmall', arch: 'wasm32', platform: 'wasi', isWASM: true, useWazig: true };
+        const modPath = getModuleCachePath(srcPath, options);
+        const { outputPath } = await compile(srcPath, modPath, options);
+        const { size } = await stat(outputPath);
+        expect(size).to.be.at.least(1000);
+      }
+    })
+    it('should track sibling imports and C header in sourcePaths for WASM build-exe', async function() {
+      const srcPath = absolute('./zig-samples/c-import/print.zig');
+      const options = { optimize: 'Debug', arch: 'wasm32', platform: 'wasi', isWASM: true, useWazig: true };
+      const modPath = getModuleCachePath(srcPath, options);
+      const { sourcePaths } = await compile(srcPath, modPath, options);
+      expect(sourcePaths.some(p => p.includes('print.zig'))).to.be.true;
+      expect(sourcePaths.some(p => p.includes('hello.zig'))).to.be.true;
+      expect(sourcePaths.some(p => p.includes('build.extra.h'))).to.be.true;
+      expect(sourcePaths.some(p => p.includes('export.zig'))).to.be.true;
+    })
+    it('should compile WASM module with useLibc enabled via build-exe', async function() {
+      const srcPath = absolute('./zig-samples/c-allocator/dupe.zig');
+      const options = { optimize: 'ReleaseSmall', arch: 'wasm32', platform: 'wasi', isWASM: true, useLibc: true, useWazig: true };
+      const modPath = getModuleCachePath(srcPath, options);
+      const { outputPath } = await compile(srcPath, modPath, options);
+      const { size } = await stat(outputPath);
+      expect(size).to.be.at.least(1000);
+    })
+    it('should compile WASM module with build.extra.h via translate-c and build-exe', async function() {
+      const srcPath = absolute('./integration/function-calling/return-c-pointer.zig');
+      const options = { optimize: 'ReleaseSmall', arch: 'wasm32', platform: 'wasi', isWASM: true, useWazig: true };
+      const modPath = getModuleCachePath(srcPath, options);
+      const { outputPath, sourcePaths } = await compile(srcPath, modPath, options);
+      const { size } = await stat(outputPath);
+      expect(size).to.be.at.least(1000);
+      expect(sourcePaths.some(p => p.includes('return-c-pointer.zig'))).to.be.true;
+      expect(sourcePaths.some(p => p.includes('build.extra.h'))).to.be.true;
     })
   })
   describe('test', function() {

@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url';
 import {
   MagicNumber,
   SectionType,
+  ensureStackPointerExport,
   parseBinary,
   parseFunction,
   parseNames,
@@ -180,6 +181,67 @@ describe('WASM decoding', function() {
       const nameSection = module.sections.find(s => s.type === SectionType.Custom);
       expect(nameSection).to.not.be.undefined;
       expect(nameSection).to.have.property('name', 'name');
+    })
+    it('should preserve zigar:abi and component-type custom sections while stripping others', async function() {
+      const path = absolute(`./wasm-samples/simple-with-names.wasm`);
+      const content = await readFile(path);
+      const binary = new DataView(content.buffer);
+      const origModule = parseBinary(binary);
+      const origCodeSection = origModule.sections.find(s => s.type === SectionType.Code);
+      const abiPayload = new Uint8Array([ 1, 2, 3, 4 ]);
+      const witPayload = new Uint8Array([ 5, 6, 7, 8 ]);
+      const otherPayload = new Uint8Array([ 9, 10 ]);
+      origModule.sections.push(
+        { type: SectionType.Custom, name: 'zigar:abi', data: new DataView(abiPayload.buffer) },
+        { type: SectionType.Custom, name: 'component-type:test-world', data: new DataView(witPayload.buffer) },
+        { type: SectionType.Custom, name: 'producers', data: new DataView(otherPayload.buffer) },
+      );
+      const inputBinary = repackBinary({ sections: origModule.sections, size: origModule.size + 256 });
+      const newBinary = stripUnused(inputBinary);
+      expect(newBinary.byteLength).to.be.below(inputBinary.byteLength);
+      const strippedModule = parseBinary(newBinary);
+      const strippedCodeSection = strippedModule.sections.find(s => s.type === SectionType.Code);
+      expect(strippedCodeSection.functions.length).to.be.below(origCodeSection.functions.length);
+      const customSections = strippedModule.sections.filter(s => s.type === SectionType.Custom);
+      expect(customSections.map(s => s.name)).to.eql([ 'zigar:abi', 'component-type:test-world' ]);
+      expect([ ...new Uint8Array(customSections[0].data.buffer, customSections[0].data.byteOffset, customSections[0].data.byteLength) ]).to.eql([ 1, 2, 3, 4 ]);
+      expect([ ...new Uint8Array(customSections[1].data.buffer, customSections[1].data.byteOffset, customSections[1].data.byteLength) ]).to.eql([ 5, 6, 7, 8 ]);
+    })
+    it('should ensure __stack_pointer global[0] is exported for stack switching', async function() {
+      const path = absolute(`../../zigar-runtime/test/features/wasm-samples/read-file.wasm`);
+      const content = await readFile(path);
+      const binary = new DataView(content.buffer);
+      const newBinary = stripUnused(binary);
+      const mod = new WebAssembly.Module(new Uint8Array(newBinary.buffer, newBinary.byteOffset, newBinary.byteLength));
+      const exports = WebAssembly.Module.exports(mod);
+      expect(exports).to.deep.include({ name: '__stack_pointer', kind: 'global' });
+      // Calling ensureStackPointerExport on an unstripped binary should also export __stack_pointer
+      const debugBinary = ensureStackPointerExport(binary);
+      const debugMod = new WebAssembly.Module(new Uint8Array(debugBinary.buffer, debugBinary.byteOffset, debugBinary.byteLength));
+      expect(WebAssembly.Module.exports(debugMod)).to.deep.include({ name: '__stack_pointer', kind: 'global' });
+      // Calling ensureStackPointerExport a second time should be a no-op
+      expect(ensureStackPointerExport(debugBinary)).to.equal(debugBinary);
+    })
+    it('should export __stack_pointer even if global[0] is exported under another name, and skip if global is imported', function() {
+      // Module where global[0] is mutable i32 and exported as "sp_alias"
+      const aliasWasm = new Uint8Array([
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x06, 0x07, 0x01, 0x7f, 0x01, 0x41, 0x80, 0x08, 0x0b,
+        0x07, 0x0c, 0x01, 0x08, 0x73, 0x70, 0x5f, 0x61, 0x6c, 0x69, 0x61, 0x73, 0x03, 0x00,
+      ]);
+      const patched = ensureStackPointerExport(new DataView(aliasWasm.buffer));
+      const mod = new WebAssembly.Module(new Uint8Array(patched.buffer, patched.byteOffset, patched.byteLength));
+      expect(WebAssembly.Module.exports(mod)).to.deep.include({ name: '__stack_pointer', kind: 'global' });
+
+      // Module where global[0] is imported
+      const importedGlobalWasm = new Uint8Array([
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x02, 0x0a, 0x01, 0x03, 0x65, 0x6e, 0x76, 0x02, 0x67, 0x30, 0x03, 0x7f, 0x01,
+        0x06, 0x07, 0x01, 0x7f, 0x01, 0x41, 0x80, 0x08, 0x0b,
+        0x07, 0x01, 0x00,
+      ]);
+      const dvImported = new DataView(importedGlobalWasm.buffer);
+      expect(ensureStackPointerExport(dvImported)).to.equal(dvImported);
     })
   })
   describe('parseNames', function() {

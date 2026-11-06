@@ -3,7 +3,7 @@ import { execSync } from 'child_process';
 import os from 'os';
 import { join } from 'path';
 import { fileURLToPath } from 'url';
-import { createConfig } from '../../zigar-compiler/src/compilation.js';
+import { compile, createConfig } from '../../zigar-compiler/src/compilation.js';
 
 import {
   buildAddon,
@@ -72,6 +72,11 @@ describe('Addon functionalities', function() {
     };
     const getModulePath = async (name) => {
       const modPath = join(sampleDir, `${name}.zigar`);
+      if (name === 'integers') {
+        const srcPath = fileURLToPath(new URL('../../zigar-compiler/test/zig-samples/basic/integers.zig', import.meta.url));
+        const { outputPath } = await compile(srcPath, modPath, { ...options, recompile: false });
+        return outputPath;
+      }
       const { outputPath } = await createConfig(null, modPath, options);
       return outputPath;
     };

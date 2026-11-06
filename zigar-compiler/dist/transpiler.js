@@ -1,12 +1,12 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import fs, { open, readdir, lstat, rmdir, unlink, readFile, stat, mkdir, writeFile, chmod, realpath } from 'node:fs/promises';
+import fs, { open, stat, mkdir, readFile, writeFile, chmod, readdir, lstat, rmdir, unlink, realpath } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import os from 'node:os';
-import { sep, dirname, join, resolve, relative, parse, basename, isAbsolute } from 'node:path';
+import { sep, dirname, join, resolve, relative, parse, basename, isAbsolute, delimiter } from 'node:path';
 import { fileURLToPath, URL as URL$1 } from 'node:url';
 import { promisify } from 'node:util';
-import { writeFileSync } from 'node:fs';
+import { accessSync, constants, writeFileSync } from 'node:fs';
 
 const StructureType = {
   Primitive: 0,
@@ -1403,6 +1403,28 @@ function* chunk(arr, n) {
 
 const execFileAsync = promisify(execFile);
 
+let cachedWazigPathEnv;
+let cachedHasWazig;
+
+function hasWazigCommand() {
+  const pathEnv = process.env.PATH ?? '';
+  if (pathEnv === cachedWazigPathEnv && cachedHasWazig !== undefined) {
+    return cachedHasWazig;
+  }
+  cachedWazigPathEnv = pathEnv;
+  const binName = process.platform === 'win32' ? 'wazig.exe' : 'wazig';
+  cachedHasWazig = pathEnv.split(delimiter).some(dir => {
+    if (!dir) return false;
+    try {
+      accessSync(join(dir, binName), constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  return cachedHasWazig;
+}
+
 async function compile(srcPath, modPath, options) {
   const srcInfo = (srcPath) ? await stat(srcPath) : null;
   if (srcInfo?.isDirectory()) {
@@ -1430,8 +1452,30 @@ async function compile(srcPath, modPath, options) {
         const { onStart, onEnd } = options;
         // create config file
         await createProject(config);
+        const canShareCache = config.useBuildExe && !config.clean && config.buildDirSize > 0;
+        const sharedCacheDir = canShareCache
+          ? join(config.buildDir, `.zig-cache-${sha1(config.zigPath).slice(0, 8)}`)
+          : null;
+        const localCacheDir = join(moduleBuildDir, '.zig-cache');
+        if (sharedCacheDir) {
+          await syncCacheDir(sharedCacheDir, localCacheDir);
+        }
+        if (config.useBuildExe && config.translateCArgs) {
+          const cCode = await runCompiler(zigPath, config.translateCArgs, { cwd: moduleBuildDir });
+          await writeFile(join(moduleBuildDir, 'c.zig'), cCode);
+        }
         // then run the compiler
         await runCompiler(zigPath, zigArgs, { cwd: moduleBuildDir, onStart, onEnd });
+        if (sharedCacheDir) {
+          await syncCacheDir(localCacheDir, sharedCacheDir);
+        }
+        if (config.useBuildExe) {
+          const builtWasmPath = join(moduleBuildDir, config.relOutputPath);
+          if (builtWasmPath !== outputPath) {
+            await createDirectory(dirname(outputPath));
+            await copyFile(outputPath, builtWasmPath);
+          }
+        }
       }
     } catch(err) {
       if (err.code === 'ENOENT') {
@@ -1443,7 +1487,7 @@ async function compile(srcPath, modPath, options) {
       }
     } finally {
       // get list of files involved in build
-      sourcePaths = await findSourcePaths(moduleBuildDir);
+      sourcePaths = await findSourcePaths(moduleBuildDir, config);
       if (config.clean) {
         await deleteDirectory(moduleBuildDir);
       }
@@ -1482,7 +1526,28 @@ async function runCompiler(path, args, options) {
   const unlock = await getLock();
   try {
     onStart?.();
-    await execFileAsync(path, args, { cwd, windowsHide: true });
+    const isWazig = basename(path).startsWith('wazig');
+    const useLocalCacheEnv = isWazig || args[0] === 'build-exe' || args[0] === 'translate-c';
+    const env = {
+      ...process.env,
+      ZIG_LOCAL_CACHE_DIR: '.zig-cache',
+      ...(useLocalCacheEnv ? {
+        ZIG_GLOBAL_CACHE_DIR: '.zig-cache',
+      } : {}),
+    };
+    if (isWazig) {
+      delete env.ZIG_LIB_DIR;
+      if (!env.GHR_TOOL_DIR && isAbsolute(path)) {
+        env.GHR_TOOL_DIR = resolve(dirname(path), '..');
+      }
+    }
+    const { stdout } = await execFileAsync(path, args, {
+      cwd,
+      env,
+      windowsHide: true,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return stdout;
   } catch (err) {
     throw new CompilationError(path, args, cwd, err);
   } finally {
@@ -1520,7 +1585,7 @@ function formatProjectConfig(config) {
   const lines = [];
   const fields = [
     'moduleName', 'modulePath', 'moduleDir', 'outputPath', 'pdbPath', 'zigarSrcPath',
-    'cHeaderPath', 'useLibc', 'useLLVM', 'usePthreadEmulation', 'useRedirection', 'isWASM',
+    'cHeaderPath', 'useLibc', 'useLLVM', 'useWazig', 'usePthreadEmulation', 'useRedirection', 'isWASM',
     'multithreaded', 'persistent', 'stackSize', 'maxMemory', 'evalBranchQuota', 'omitFunctions',
     'omitVariables',
   ];
@@ -1533,23 +1598,111 @@ function formatProjectConfig(config) {
   return lines.join('\n') + '\n';
 }
 
-async function createProject(config) {
-  const dir = config.moduleBuildDir;
+function formatOptionsZig(config) {
+  return [
+    `pub const eval_branch_quota: comptime_int = ${config.evalBranchQuota};`,
+    `pub const omit_functions: bool = ${Boolean(config.omitFunctions)};`,
+    `pub const omit_variables: bool = ${Boolean(config.omitVariables)};`,
+    `pub const use_redirection: bool = ${Boolean(config.useRedirection)};`,
+    `pub const use_pthread_emulation: bool = ${Boolean(config.usePthreadEmulation)};`,
+    `pub const persistent: bool = ${Boolean(config.persistent)};`,
+    `pub const module_path: [:0]const u8 = ${JSON.stringify(config.modulePath ?? '')};`,
+    '',
+  ].join('\n');
+}
+
+async function stageDirectory(srcDir, dstDir, filterFn) {
+  await createDirectory(dstDir);
+  const entries = await readdir(srcDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const srcPath = join(srcDir, entry.name);
+    const dstPath = join(dstDir, entry.name);
+    if (!filterFn(entry.name, entry.isDirectory())) {
+      continue;
+    }
+    if (entry.isDirectory()) {
+      await stageDirectory(srcPath, dstPath, filterFn);
+    } else if (entry.isFile()) {
+      await copyFile(dstPath, srcPath);
+    }
+  }
+}
+
+async function syncCacheDir(srcDir, dstDir, isManifestDir = false) {
+  let entries;
+  try {
+    entries = await readdir(srcDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  await createDirectory(dstDir);
+  for (const entry of entries) {
+    if (entry.name === 'tmp') continue;
+    const srcPath = join(srcDir, entry.name);
+    const dstPath = join(dstDir, entry.name);
+    if (entry.isDirectory()) {
+      await syncCacheDir(srcPath, dstPath, entry.name === 'h');
+    } else if (entry.isFile()) {
+      try {
+        await fs.link(srcPath, dstPath);
+      } catch (err) {
+        if (err.code === 'EEXIST') {
+          if (isManifestDir) {
+            try {
+              const [srcStat, dstStat] = await Promise.all([stat(srcPath), stat(dstPath)]);
+              if (srcStat.ino !== dstStat.ino && srcStat.mtimeMs > dstStat.mtimeMs) {
+                await deleteFile(dstPath);
+                await fs.link(srcPath, dstPath);
+              }
+            } catch {}
+          }
+        } else {
+          try {
+            await copyFile(dstPath, srcPath);
+          } catch {}
+        }
+      }
+    }
+  }
+}
+
+async function createProject(config, dir = config.moduleBuildDir) {
   await createDirectory(dir);
   const content = formatProjectConfig(config);
   const cfgFilePath = join(dir, 'build.cfg.zig');
   await writeFile(cfgFilePath, content);
-  const buildFilePath = join(dir, 'build.zig');
-  await copyFile(buildFilePath, config.buildFilePath);
-  const extraFilePath = join(dir, 'build.extra.zig');
-  if (config.extraFilePath) {
-    await copyFile(extraFilePath, config.extraFilePath);
+  if (config.useBuildExe) {
+    const optionsFilePath = join(dir, 'options.zig');
+    await writeFile(optionsFilePath, formatOptionsZig(config));
+    await stageDirectory(config.zigarSrcPath, join(dir, 'zig'), (name, isDir) => {
+      if (isDir) {
+        return !['.zig-cache', 'zig-cache', 'zig-out', 'node_modules'].includes(name);
+      }
+      if (name === 'build.zig' || name === 'build.extra.zig' || name === 'options.zig') {
+        return false;
+      }
+      return name.endsWith('.zig') || name.endsWith('.h');
+    });
+    await stageDirectory(config.moduleDir, join(dir, 'src'), (name, isDir) => {
+      if (isDir) {
+        return !['.zig-cache', 'zig-cache', 'zig-out', 'node_modules'].includes(name) && !name.endsWith('.zigar');
+      }
+      return name.endsWith('.zig') || name.endsWith('.h') || name.endsWith('.c');
+    });
+    await createDirectory(join(dir, config.optimize));
   } else {
-    await writeFile(extraFilePath, '');
-  }
-  if (config.packageConfigPath) {
-    const packageConfigPath = join(dir, 'build.zig.zon');
-    await copyZonFile(config.packageConfigPath, packageConfigPath);
+    const buildFilePath = join(dir, 'build.zig');
+    await copyFile(buildFilePath, config.buildFilePath);
+    const extraFilePath = join(dir, 'build.extra.zig');
+    if (config.extraFilePath) {
+      await copyFile(extraFilePath, config.extraFilePath);
+    } else {
+      await writeFile(extraFilePath, '');
+    }
+    if (config.packageConfigPath) {
+      const packageConfigPath = join(dir, 'build.zig.zon');
+      await copyZonFile(config.packageConfigPath, packageConfigPath);
+    }
   }
 }
 
@@ -1595,8 +1748,9 @@ async function createConfig(srcPath, modPath, options = {}) {
     clean = false,
     buildDir = join(os.tmpdir(), 'zigar-build'),
     buildDirSize = 4294967296,
-    zigPath = 'zig',
+    zigPath: zigPathOption,
     zigArgs: zigArgsStr = '',
+    useWazig: useWazigOption,
     multithreaded = (isWASM) ? false : true,
     persistent = false,
     stackSize = 256 * 1024,
@@ -1605,6 +1759,7 @@ async function createConfig(srcPath, modPath, options = {}) {
     omitFunctions = false,
     omitVariables = false,
     ignoreBuildFile = false,
+    useBuildExe: useBuildExeOption,
   } = options;
   const src = parse(srcPath ?? '');
   const mod = parse(modPath ?? '');
@@ -1627,52 +1782,9 @@ async function createConfig(srcPath, modPath, options = {}) {
   if (platform === 'win32') {
     pdbPath = join(dirname(outputPath), `${platform}.${arch}.pdb`);
   }
-  const zigArgs = zigArgsStr.split(/\s+/).filter(s => !!s);
-  if (!zigArgs.find(s => /^[^-]/.test(s))) {
-    zigArgs.unshift('build');
-  }
-  if (!zigArgs.find(s => /^\-Doptimize=/.test(s))) {
-    zigArgs.push(`-Doptimize=${optimize}`);
-  }
-  if (!zigArgs.find(s => /^\-Dtarget=/.test(s))) {
-    // translate from names used by Node to those used by Zig
-    const cpuArchs = {
-      arm: 'arm',
-      arm64: 'aarch64',
-      ia32: 'x86',
-      loong64: 'loong64',
-      mips: 'mips',
-      mipsel: 'mipsel',
-      ppc: 'powerpc',
-      ppc64: 'powerpc64le',
-      s390: undefined,
-      riscv64: 'riscv64',
-      s390x: 's390x',
-      x64: 'x86_64',
-    };
-    const osTags = {
-      aix: 'aix',
-      darwin: 'macos',
-      freebsd: 'freebsd',
-      linux: 'linux-gnu',
-      openbsd: 'openbsd',
-      sunos: 'solaris',
-      win32: 'windows',
-    };
-    const cpuArch = cpuArchs[arch] ?? arch;
-    const osTag = osTags[platform] ?? platform;
-    zigArgs.push(`-Dtarget=${cpuArch}-${osTag}`);
-  }
-  if (isWASM && !zigArgs.find(s => /^\-Dcpu=/.test(s))) {
-    if (multithreaded) {
-      // we need support for atomic operations, among other things
-      zigArgs.push(`-Dcpu=generic+atomics+bulk_memory`);
-    } else {
-      zigArgs.push(`-Dcpu=generic`);
-    }
-  }
   const zigarSrcPath = fileURLToPath(new URL$1('../zig/', import.meta.url));
   let buildFilePath = join(zigarSrcPath, `build.zig`);
+  let hasCustomBuildFile = false;
   if (!ignoreBuildFile) {
     // use custom build file if one is found
     const customBuildFilePath = await findModuleFile(moduleDir, 'build.zig');
@@ -1681,6 +1793,7 @@ async function createConfig(srcPath, modPath, options = {}) {
       const remaining = code.replace(/\/\/.*/g, '').trim();
       if (remaining) {
         buildFilePath = customBuildFilePath;
+        hasCustomBuildFile = true;
       }
     }
   }
@@ -1690,6 +1803,152 @@ async function createConfig(srcPath, modPath, options = {}) {
   const cHeaderPath = await findModuleFile(moduleDir, 'build.extra.h');
   // add package manager manifest
   const packageConfigPath = await findModuleFile(moduleDir, 'build.zig.zon');
+  const isWazigPath = Boolean(
+    (zigPathOption && basename(zigPathOption).startsWith('wazig')) ||
+    (!zigPathOption && process.env.ZIG_PATH && basename(process.env.ZIG_PATH).startsWith('wazig'))
+  );
+  const useBuildExe = Boolean(
+    modulePath && (useBuildExeOption ?? (isWASM && !hasCustomBuildFile && !extraFilePath && !packageConfigPath && !zigArgsStr.trim() && (useLLVM !== true || isWazigPath)))
+  );
+  let useWazig;
+  let zigPath;
+  if (zigPathOption !== undefined) {
+    zigPath = zigPathOption;
+    useWazig = Boolean(useWazigOption ?? basename(zigPath).startsWith('wazig'));
+  } else if (useWazigOption !== undefined) {
+    useWazig = Boolean(useWazigOption);
+    zigPath = useWazig ? (process.env.WA_ZIG_PATH || 'wazig') : (process.env.ZIG_PATH || 'zig');
+  } else if (process.env.ZIG_PATH) {
+    zigPath = process.env.ZIG_PATH;
+    useWazig = basename(zigPath).startsWith('wazig');
+  } else if (process.env.USE_WAZIG !== undefined && process.env.USE_WAZIG !== '') {
+    const envUseWazig = !['0', 'false', 'no'].includes(process.env.USE_WAZIG.toLowerCase());
+    useWazig = Boolean(envUseWazig && isWASM && useBuildExe && useLLVM !== true);
+    zigPath = useWazig ? 'wazig' : 'zig';
+  } else if (isWASM && useBuildExe && useLLVM !== true && hasWazigCommand()) {
+    useWazig = true;
+    zigPath = 'wazig';
+  } else {
+    useWazig = false;
+    zigPath = 'zig';
+  }
+  // translate from names used by Node to those used by Zig
+  const cpuArchs = {
+    arm: 'arm',
+    arm64: 'aarch64',
+    ia32: 'x86',
+    loong64: 'loong64',
+    mips: 'mips',
+    mipsel: 'mipsel',
+    ppc: 'powerpc',
+    ppc64: 'powerpc64le',
+    s390: undefined,
+    riscv64: 'riscv64',
+    s390x: 's390x',
+    x64: 'x86_64',
+  };
+  const osTags = {
+    aix: 'aix',
+    darwin: 'macos',
+    freebsd: 'freebsd',
+    linux: 'linux-gnu',
+    openbsd: 'openbsd',
+    sunos: 'solaris',
+    win32: 'windows',
+  };
+  const cpuArch = cpuArchs[arch] ?? arch;
+  const osTag = osTags[platform] ?? platform;
+  const target = `${cpuArch}-${osTag}`;
+  const cpu = multithreaded ? 'generic+atomics+bulk_memory' : 'generic';
+  const relOutputPath = join(optimize, `${src.name}.wasm`);
+  let zigArgs;
+  let translateCArgs = null;
+  if (useBuildExe) {
+    zigArgs = [
+      'build-exe',
+      '--cache-dir', '.zig-cache',
+      '--global-cache-dir', '.zig-cache',
+      '-fno-entry',
+      '--stack', `${stackSize}`,
+      multithreaded ? '-fno-single-threaded' : '-fsingle-threaded',
+      `-O${optimize}`,
+      '-target', target,
+      '-mcpu', cpu,
+    ];
+    if (useLLVM !== null) {
+      zigArgs.push(useLLVM ? '-fllvm' : '-fno-llvm');
+    }
+    if (useLibc) {
+      zigArgs.push('-lc');
+    }
+    zigArgs.push(
+      '--name', moduleName,
+      '-static',
+      '-rdynamic',
+      multithreaded ? '--import-memory' : '--import-table',
+    );
+    if (maxMemory !== undefined) {
+      zigArgs.push(`--max-memory=${maxMemory}`);
+    }
+    zigArgs.push(
+      '-mexec-model=reactor',
+      '--dep', 'module',
+      '--dep', 'options.zig',
+      `-Mroot=${join('zig', 'stub.zig')}`,
+      '-O' + optimize,
+      '-target', target,
+      '-mcpu', cpu,
+      '-I', 'src',
+      '--dep', 'zigar',
+    );
+    if (cHeaderPath) {
+      zigArgs.push('--dep', 'c');
+    }
+    zigArgs.push(
+      `-Mmodule=${join('src', basename(modulePath))}`,
+      '-Moptions.zig=options.zig',
+      '-O' + optimize,
+      '-target', target,
+      '-mcpu', cpu,
+      `-Mzigar=${join('zig', 'zigar.zig')}`,
+    );
+    if (cHeaderPath) {
+      zigArgs.push(
+        '-O' + optimize,
+        '-target', target,
+        '-mcpu', cpu,
+        ...(useLibc ? ['-lc'] : []),
+        '-Mc=c.zig',
+      );
+    }
+    zigArgs.push(`-femit-bin=${relOutputPath}`);
+    if (cHeaderPath) {
+      translateCArgs = [
+        'translate-c',
+        '--cache-dir', '.zig-cache',
+        '--global-cache-dir', '.zig-cache',
+        '-lc',
+        '-target', target,
+        `-O${optimize}`,
+        '-I', 'src',
+        join('src', basename(cHeaderPath)),
+      ];
+    }
+  } else {
+    zigArgs = zigArgsStr.split(/\s+/).filter(s => !!s);
+    if (!zigArgs.find(s => /^[^-]/.test(s))) {
+      zigArgs.unshift('build');
+    }
+    if (!zigArgs.find(s => /^\-Doptimize=/.test(s))) {
+      zigArgs.push(`-Doptimize=${optimize}`);
+    }
+    if (!zigArgs.find(s => /^\-Dtarget=/.test(s))) {
+      zigArgs.push(`-Dtarget=${target}`);
+    }
+    if (isWASM && !zigArgs.find(s => /^\-Dcpu=/.test(s))) {
+      zigArgs.push(`-Dcpu=${cpu}`);
+    }
+  }
   return {
     platform,
     arch,
@@ -1704,11 +1963,15 @@ async function createConfig(srcPath, modPath, options = {}) {
     buildFilePath,
     packageConfigPath,
     outputPath,
+    relOutputPath,
     cHeaderPath,
     pdbPath,
     clean,
     zigPath,
     zigArgs,
+    translateCArgs,
+    useBuildExe,
+    useWazig,
     useLibc,
     useLLVM,
     useRedirection,
@@ -1744,7 +2007,7 @@ async function getManifestLists(buildPath) {
   return names.filter(n => /^\w{32}$/.test(n)).map(n => join(dirPath, n));
 }
 
-async function findSourcePaths(buildPath) {
+async function findSourcePaths(buildPath, config) {
   const realBuildPath = await realpath(buildPath);
   const manifestPaths = await getManifestLists(realBuildPath);
   const involved = {};
@@ -1754,10 +2017,23 @@ async function findSourcePaths(buildPath) {
       let offset = 41;
       while (offset < data.length) {
         const si = offset;
-        while (data[offset] !== 0) offset++;
+        while (data[offset] !== 0 && offset < data.length) offset++;
         const ei = offset;
         const pathBytes = data.subarray(si, ei);
-        const srcPath = pathBytes.toString('utf-8');
+        let srcPath = pathBytes.toString('utf-8');
+        if (config?.useBuildExe) {
+          let rel = srcPath;
+          if (rel.startsWith(realBuildPath + sep)) {
+            rel = rel.slice(realBuildPath.length + 1);
+          } else if (rel.startsWith('./') || rel.startsWith('.\\')) {
+            rel = rel.slice(2);
+          }
+          if (rel.startsWith('src/') || rel.startsWith('src\\')) {
+            srcPath = config.moduleDir ? join(config.moduleDir, rel.slice(4)) : srcPath;
+          } else if (rel.startsWith('zig/') || rel.startsWith('zig\\')) {
+            srcPath = config.zigarSrcPath ? join(config.zigarSrcPath, rel.slice(4)) : srcPath;
+          }
+        }
         if(isAbsolute(srcPath) && !srcPath.startsWith(realBuildPath) && !srcPath.includes('/.cache/zig/')) {
           try {
             await stat(srcPath);
@@ -1768,6 +2044,45 @@ async function findSourcePaths(buildPath) {
       }
       /* c8 ignore next 2 */
     } catch (err) {
+    }
+  }
+  if (config?.useBuildExe) {
+    if (config.cHeaderPath) {
+      try {
+        await stat(config.cHeaderPath);
+        involved[config.cHeaderPath] = true;
+      } catch {}
+    }
+    const queue = [
+      config.modulePath,
+      config.zigarSrcPath ? join(config.zigarSrcPath, 'stub.zig') : null,
+      config.zigarSrcPath ? join(config.zigarSrcPath, 'zigar.zig') : null,
+    ].filter(Boolean);
+    const visited = new Set();
+    while (queue.length > 0) {
+      const filePath = queue.shift();
+      if (visited.has(filePath)) continue;
+      visited.add(filePath);
+      try {
+        await stat(filePath);
+        involved[filePath] = true;
+        if (filePath.endsWith('.zig')) {
+          const content = await readFile(filePath, 'utf-8');
+          const dir = dirname(filePath);
+          const regex = /@(?:import|embedFile)\(\s*"([^"]+)"\s*\)/g;
+          let match;
+          while ((match = regex.exec(content)) !== null) {
+            const spec = match[1];
+            if (spec === 'options.zig') continue;
+            if (spec.endsWith('.zig') || spec.startsWith('.') || spec.includes('/')) {
+              const resolved = resolve(dir, spec);
+              if (!visited.has(resolved)) {
+                queue.push(resolved);
+              }
+            }
+          }
+        }
+      } catch {}
     }
   }
   return Object.keys(involved);
@@ -1846,6 +2161,10 @@ const optionsForCompile = {
   useLLVM: {
     type: 'boolean',
     title: 'Use LLVM as compiler backend',
+  },
+  useWazig: {
+    type: 'boolean',
+    title: 'Use wazig WebAssembly Zig compiler',
   },
   useRedirection: {
     type: 'boolean',
@@ -3743,7 +4062,7 @@ var callMarshalingInbound = mixin({
   handleJscall(id, argAddress, argSize, canWait) {
     const dv = this.obtainZigView(argAddress, argSize, false);
     const caller = this.jsFunctionCallerMap.get(id);
-    return (caller) ? caller(dv, canWait) : PosixError.EFAULT;
+    return (caller) ? caller(dv, canWait || !!this.activeContinuation) : PosixError.EFAULT;
   },
   releaseFunction(id) {
     const thunk = this.jsFunctionThunkMap.get(id);
@@ -3896,52 +4215,71 @@ var callMarshalingOutbound = mixin({
     const success = (attrs)
     ? this.runVariadicThunk(thunkAddress, fnAddress, argAddress, attrAddress, attrs.length)
     : this.runThunk(thunkAddress, fnAddress, argAddress);
-    if (!success) {
-      if (!finalized) {
-        finalize();
+    const finishCall = (success) => {
+      if (!success) {
+        if (!finalized) {
+          finalize();
+        }
+        throw new ZigError();
       }
-      throw new ZigError();
-    }
-    {
-      // finalized can be true here, if a function chooses to immediately invoke a promise's resolve method
-      if (!finalized) {
-        // copy retval from shadow view
-        argStruct[UPDATE]?.(this.findShadowView(argStruct[MEMORY]));
-      }
-    }
-    const transform = fn[TRANSFORM];
-    if (isAsync) {
-      let retval = null;
-      // if a function has returned a value or failed synchronmously, the promise is resolved immediately
-      if (!finalized) {
-        try {
-          retval = argStruct.retval;
-        } catch (err) {
-          retval = new ZigError(err, 1);
+      {
+        // finalized can be true here, if a function chooses to immediately invoke a promise's resolve method
+        if (!finalized) {
+          // copy retval from shadow view
+          argStruct[UPDATE]?.(this.findShadowView(argStruct[MEMORY]));
         }
       }
-      if (retval != null) {
-        if (transform) {
-          retval = transform(retval);
+      const transform = fn[TRANSFORM];
+      if (isAsync) {
+        let retval = null;
+        // if a function has returned a value or failed synchronmously, the promise is resolved immediately
+        if (!finalized) {
+          try {
+            retval = argStruct.retval;
+          } catch (err) {
+            retval = new ZigError(err, 1);
+          }
         }
-        argStruct[RETURN](retval);
+        if (retval != null) {
+          if (transform) {
+            retval = transform(retval);
+          }
+          argStruct[RETURN](retval);
+        } else {
+          if (transform) {
+            // so the promise or generator can perform the transform 
+            argStruct[TRANSFORM] = transform;
+          }
+        }
+        // this would be undefined if a callback function is used instead
+        return argStruct[PROMISE] ?? argStruct[GENERATOR];
       } else {
-        if (transform) {
-          // so the promise or generator can perform the transform 
-          argStruct[TRANSFORM] = transform;
+        finalize();
+        try {
+          const { retval } = argStruct;
+          return (transform) ? transform(retval) : retval;
+        } catch (err) {
+          throw new ZigError(err, 1);
         }
       }
-      // this would be undefined if a callback function is used instead
-      return argStruct[PROMISE] ?? argStruct[GENERATOR];
-    } else {
-      finalize();
-      try {
-        const { retval } = argStruct;
-        return (transform) ? transform(retval) : retval;
-      } catch (err) {
-        throw new ZigError(err, 1);
+    };
+    if (isPromise(success)) {
+      const promise = success.then(finishCall, (err) => {
+        if (!finalized) {
+          finalize();
+        }
+        if (err instanceof Exit && err.code === 0) {
+          return;
+        }
+        throw err;
+      });
+      if (isAsync && argStruct[GENERATOR]) {
+        promise.catch((err) => argStruct[RETURN]?.(err));
+        return argStruct[GENERATOR];
       }
+      return promise;
     }
+    return finishCall(success);
   },
   ...({
     imports: {
@@ -4650,6 +4988,13 @@ var moduleLoading = mixin({
       this.initialTableLength = 0;
       this.exportedFunctions = null;
       this.customWASI = null;
+      this.useJSPI = false;
+      this.continuationStackSize = 65536;
+      this.continuationStackPool = [];
+      this.activeContinuation = null;
+      this.suspendedContinuationCount = 0;
+      this.stackPointerGlobal = null;
+      this.initialStackPointer = 0;
     }
   },
   abandonModule() {
@@ -4701,19 +5046,192 @@ var moduleLoading = mixin({
       if (!fn) {
         return () => {};
       }
-      return (...args) => {
+      const wrapper = (...args) => {
         args = args.map((arg, i) => this.fromWebAssembly(argType.charAt(i), arg));
         const retval = fn.apply(this, args);
-        const retval2 = this.toWebAssembly(returnType, retval);
-        return retval2;
+        return isPromise(retval)
+        ? retval.then(v => this.toWebAssembly(returnType, v))
+        : this.toWebAssembly(returnType, retval);
       };
+      return (this.useJSPI && name === 'handleJscall') ? this.wrapSuspending(wrapper) : wrapper;
     },
     importFunction(fn, argType = '', returnType = '') {
       return (...args) => {
         args = args.map((arg, i) => this.toWebAssembly(argType.charAt(i), arg));
         const retval = fn.apply(this, args);
-        return this.fromWebAssembly(returnType, retval);
+        return isPromise(retval)
+        ? retval.then(v => this.fromWebAssembly(returnType, v))
+        : this.fromWebAssembly(returnType, retval);
       };
+    },
+    wrapSuspending(fn) {
+      const hasSuspending = typeof WA.Suspending === 'function';
+      const wrapper = (...args) => {
+        const cont = this.activeContinuation;
+        const spGlobal = this.stackPointerGlobal;
+        const savedSp = spGlobal ? spGlobal.value : 0;
+        if (cont && spGlobal) {
+          cont.sp = savedSp;
+        }
+        let res;
+        try {
+          res = fn(...args);
+        } catch (err) {
+          this.activeContinuation = cont;
+          if (cont && spGlobal) {
+            spGlobal.value = savedSp;
+          }
+          throw err;
+        }
+        if (isPromise(res) || (cont && hasSuspending)) {
+          if (cont) {
+            cont.sp = savedSp;
+            if (!cont.suspended) {
+              cont.suspended = true;
+              this.suspendedContinuationCount++;
+            }
+          }
+          if (spGlobal) {
+            spGlobal.value = cont ? cont.parentSp : this.initialStackPointer;
+          }
+          this.activeContinuation = cont ? cont.parentContinuation : null;
+          if (cont) {
+            cont.parentContinuation = null;
+            cont.parentSp = this.initialStackPointer;
+          }
+          const resumeContinuation = () => {
+            if (this.activeContinuation && this.activeContinuation !== cont && !this.activeContinuation.suspended) {
+              this.activeContinuation.finish?.();
+            }
+            if (cont) {
+              if (cont.suspended) {
+                cont.suspended = false;
+                this.suspendedContinuationCount--;
+              }
+              cont.parentSp = spGlobal ? spGlobal.value : this.initialStackPointer;
+              cont.parentContinuation = null;
+              if (spGlobal) {
+                spGlobal.value = cont.sp;
+              }
+            }
+            this.activeContinuation = cont;
+          };
+          const promise = isPromise(res) ? res : Promise.resolve(res);
+          return promise.then((val) => {
+            resumeContinuation();
+            return val;
+          }, (err) => {
+            resumeContinuation();
+            throw err;
+          });
+        }
+        this.activeContinuation = cont;
+        if (cont && spGlobal) {
+          spGlobal.value = savedSp;
+        }
+        return res;
+      };
+      return hasSuspending ? new WA.Suspending(wrapper) : wrapper;
+    },
+    allocateContinuationStack() {
+      if (this.continuationStackPool.length > 0) {
+        return this.continuationStackPool.pop();
+      }
+      const size = (this.continuationStackSize + 15) & -16;
+      const address = this.allocateScratchMemory(size, 16);
+      if (!address) {
+        throw new Error('Out of memory');
+      }
+      if (this.memory && address + 4 <= this.memory.buffer.byteLength) {
+        const dv = new DataView(this.memory.buffer, address, 4);
+        dv.setUint32(0, 0xdeadbeef, true);
+      }
+      return { address, size };
+    },
+    freeContinuationStack(stack) {
+      if (this.memory && stack.address + 4 <= this.memory.buffer.byteLength) {
+        const dv = new DataView(this.memory.buffer, stack.address, 4);
+        if (dv.getUint32(0, true) !== 0xdeadbeef) {
+          this.freeScratchMemory?.(stack.address, stack.size, 16);
+          throw new Error('Stack overflow');
+        }
+      }
+      if (this.continuationStackPool.length < 16) {
+        this.continuationStackPool.push(stack);
+      } else {
+        this.freeScratchMemory?.(stack.address, stack.size, 16);
+      }
+    },
+    runWithContinuation(fn) {
+      const spGlobal = this.stackPointerGlobal;
+      if (!spGlobal && this.suspendedContinuationCount > 0) {
+        throw new Error('Concurrent JSPI calls require __stack_pointer export');
+      }
+      const prevCont = this.activeContinuation;
+      if (prevCont && spGlobal) {
+        prevCont.sp = spGlobal.value;
+      }
+      const stack = (spGlobal && this.allocateScratchMemory) ? this.allocateContinuationStack() : null;
+      const stackTop = stack ? stack.address + stack.size : 0;
+      let finished = false;
+      const cont = {
+        stack,
+        sp: stackTop,
+        parentSp: spGlobal ? spGlobal.value : 0,
+        parentContinuation: prevCont,
+        suspended: false,
+        finish: null,
+      };
+      const finish = cont.finish = () => {
+        if (finished) return;
+        finished = true;
+        if (cont.suspended) {
+          cont.suspended = false;
+          this.suspendedContinuationCount--;
+        }
+        let overflowError = null;
+        if (stack) {
+          try {
+            this.freeContinuationStack(stack);
+          } catch (err) {
+            overflowError = err;
+          }
+        }
+        if (this.activeContinuation === cont) {
+          this.activeContinuation = cont.parentContinuation;
+          if (spGlobal) {
+            spGlobal.value = cont.parentSp;
+          }
+        }
+        if (overflowError) {
+          throw overflowError;
+        }
+      };
+      this.activeContinuation = cont;
+      if (stack && spGlobal) {
+        spGlobal.value = stackTop;
+      }
+      let res;
+      try {
+        res = fn();
+      } catch (err) {
+        finish();
+        throw err;
+      }
+      if (!cont.suspended) {
+        finish();
+      }
+      if (isPromise(res)) {
+        return res.then((val) => {
+          finish();
+          return val;
+        }, (err) => {
+          finish();
+          throw err;
+        });
+      }
+      finish();
+      return res;
     },
     exportFunctions() {
       const imports = {};
@@ -4729,13 +5247,34 @@ var moduleLoading = mixin({
       if (!this.memory) {
         this.memory = exports.memory;
       }
+      if (exports.__stack_pointer) {
+        this.stackPointerGlobal = exports.__stack_pointer;
+        this.initialStackPointer = exports.__stack_pointer.value;
+        if (!this.options?.continuationStackSize && this.initialStackPointer > 0) {
+          this.continuationStackSize = (this.initialStackPointer + 15) & -16;
+        }
+      }
       for (const [ name, { argType, returnType } ] of Object.entries(this.imports)) {
-        const fn = exports[name];
+        let fn = exports[name];
         if (fn) {
+          if (this.useJSPI && (name === 'runThunk' || name === 'runVariadicThunk') && typeof WA.promising === 'function') {
+            defineProperty(this, `${name}Sync`, defineValue(this.importFunction(fn, argType, returnType)));
+            this.destructors.push(() => this[`${name}Sync`] = throwError$1);
+            const promisingFn = WA.promising(fn);
+            fn = (...args) => this.runWithContinuation(() => promisingFn(...args));
+          }
           defineProperty(this, name, defineValue(this.importFunction(fn, argType, returnType)));
           this.destructors.push(() => this[name] = throwError$1);
         }
       }
+      this.destructors.push(() => {
+        for (const { address, size } of this.continuationStackPool) {
+          exports.freeScratchMemory?.(address, size, 16);
+        }
+        this.continuationStackPool.length = 0;
+        this.activeContinuation = null;
+        this.suspendedContinuationCount = 0;
+      });
     },
     async instantiateWebAssembly(source, options) {
       const {
@@ -4743,7 +5282,13 @@ var moduleLoading = mixin({
         memoryMax,
         tableInitial,
         multithreaded,
+        useJSPI = false,
+        continuationStackSize,
       } = this.options = options;
+      this.useJSPI = Boolean(useJSPI && typeof WA.Suspending === 'function' && typeof WA.promising === 'function');
+      if (continuationStackSize) {
+        this.continuationStackSize = (continuationStackSize + 15) & -16;
+      }
       const res = await source;
       const suffix = (res[Symbol.toStringTag] === 'Response') ? 'Streaming' : '';
       const f = WA['compile' + suffix];
@@ -4793,10 +5338,14 @@ var moduleLoading = mixin({
     },
     getWASIHandler(name) {
       const nameCamelized = name.replace(/_./g, m => m.charAt(1).toUpperCase());
-      const handler = this[nameCamelized]?.bind?.(this);
+      const method = this[nameCamelized];
+      const handler = method?.bind?.(this);
       const eventName = this[nameCamelized + 'Event'];
-      return (...args) => {
-        const result = handler?.(...args) ?? PosixError.ENOTSUP;
+      const fn = (...args) => {
+        const callArgs = (this.activeContinuation && method && args.length < method.length)
+        ? [ ...args, true ]
+        : args;
+        const result = handler?.(...callArgs) ?? PosixError.ENOTSUP;
         const onResult = (result) => {
           if (result === PosixError.ENOTSUP || result === PosixError.ENOTCAPABLE) {
             // the handler has is either missing or has declined to deal with it, 
@@ -4817,6 +5366,7 @@ var moduleLoading = mixin({
         };
         return isPromise(result) ? result.then(onResult) : onResult(result);
       };
+      return (this.useJSPI && name !== 'proc_exit') ? this.wrapSuspending(fn) : fn;
     },
     setCustomWASI(wasi) {
       this.customWASI = wasi;
@@ -11323,6 +11873,7 @@ const SectionType = {
   Custom: 0,
   Import: 2,
   Function: 3,
+  Global: 6,
   Export: 7,
   Start: 8,
   Element: 9,
@@ -11342,7 +11893,7 @@ function stripUnused(binary, options = {}) {
   const blacklist = [
     /^getFactoryThunk$/,
     /^getModuleAttributes$/,
-    /^exporter\.getFactoryThunk/,
+    /^export(?:er)?\.getFactoryThunk/,
   ];
 
   function getSection(type) {
@@ -11430,14 +11981,17 @@ function stripUnused(binary, options = {}) {
   for (const fn of functions) {
     if (fn.name && blacklist.some(re => re.test(fn.name))) {
       fn.using = false;
-      if (fn.name === 'getFactoryThunk' && functionNames.length === 0) {
+      if (fn.name === 'getFactoryThunk') {
         // when compiled for ReleaseSmall, we don't get the name section
         // therefore unable to remove the factory function by name
         // we know that getFactoryThunk loads its address, however
         // and that a function pointer is just an index into table 0
         const ops = fn.instructions;
-        if (ops.length === 2 && ops[0].opcode === 0x41 && ops[1].opcode === 0x0B) {
+        const isConstEnd = (ops.length === 2 && ops[0].opcode === 0x41 && ops[1].opcode === 0x0B)
+          || (ops.length === 3 && ops[0].opcode === 0x41 && ops[1].opcode === 0x0F && ops[2].opcode === 0x0B);
+        if (isConstEnd) {
           // 0x41 is i32.const
+          // 0x0F is return
           // 0x0B is end
           const elemIndex = ops[0].operand;
           const elemSection = getSection(SectionType.Element);
@@ -11573,6 +12127,18 @@ function stripUnused(binary, options = {}) {
         newExportSection.exports.push(object);
       }
     }
+    const globalSection = getSection(SectionType.Global);
+    const hasImportedGlobal = importSection?.imports.some(o => o.type === ObjectType.Global);
+    if (
+      globalSection?.data?.byteLength >= 3 &&
+      !hasImportedGlobal &&
+      globalSection.data.getUint8(0) >= 1 &&
+      globalSection.data.getUint8(1) === 0x7f &&
+      globalSection.data.getUint8(2) === 0x01 &&
+      !newExportSection.exports.some(e => e.name === '__stack_pointer')
+    ) {
+      newExportSection.exports.push({ name: '__stack_pointer', type: ObjectType.Global, index: 0 });
+    }
   }
   // create new import section
   let newImportSection = null;
@@ -11641,8 +12207,12 @@ function stripUnused(binary, options = {}) {
         newSections.push(newStartSection);
         break;
       case SectionType.Custom:
-        if (section.name === 'name' && newNameSection) {
-          newSections.push(newNameSection);
+        if (section.name === 'name') {
+          if (newNameSection) {
+            newSections.push(newNameSection);
+          }
+        } else if (section.name === 'zigar:abi' || section.name.startsWith('component-type')) {
+          newSections.push(section);
         }
         break;
       default:
@@ -11650,7 +12220,28 @@ function stripUnused(binary, options = {}) {
         break;
     }
   }
-  return repackBinary({ sections: newSections, size });
+  return repackBinary({ sections: newSections, size: size + 24 });
+}
+
+function ensureStackPointerExport(binary) {
+  const { sections, size } = parseBinary(binary);
+  const importSection = sections.find(s => s.type === SectionType.Import);
+  const globalSection = sections.find(s => s.type === SectionType.Global);
+  const exportSection = sections.find(s => s.type === SectionType.Export);
+  const hasImportedGlobal = importSection?.imports.some(o => o.type === ObjectType.Global);
+  if (
+    exportSection &&
+    globalSection?.data?.byteLength >= 3 &&
+    !hasImportedGlobal &&
+    globalSection.data.getUint8(0) >= 1 &&
+    globalSection.data.getUint8(1) === 0x7f &&
+    globalSection.data.getUint8(2) === 0x01 &&
+    !exportSection.exports.some(e => e.name === '__stack_pointer')
+  ) {
+    exportSection.exports.push({ name: '__stack_pointer', type: ObjectType.Global, index: 0 });
+    return repackBinary({ sections, size: size + 24 });
+  }
+  return binary;
 }
 
 function parseBinary(binary) {
@@ -12706,6 +13297,8 @@ async function transpile(srcPath, options) {
     omitExports = false,
     stripWASM = (options.optimize && options.optimize !== 'Debug'),
     keepNames = false,
+    useJSPI = false,
+    continuationStackSize,
     moduleResolver = (name) => name,
     wasmLoader,
     ...compileOptions
@@ -12726,6 +13319,12 @@ async function transpile(srcPath, options) {
     tableInitial,
     multithreaded,
   };
+  if (useJSPI) {
+    moduleOptions.useJSPI = true;
+  }
+  if (continuationStackSize !== undefined) {
+    moduleOptions.continuationStackSize = continuationStackSize;
+  }
   const Env = defineEnvironment();
   const env = new Env();
   env.loadModule(content, moduleOptions);
@@ -12759,6 +13358,8 @@ async function transpile(srcPath, options) {
     let dv = new DataView(content.buffer);
     if (stripWASM) {
       dv = stripUnused(dv, { keepNames });
+    } else {
+      dv = ensureStackPointerExport(dv);
     }
     if (embedWASM) {
       binarySource = embed(srcPath, dv);

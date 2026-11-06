@@ -12,21 +12,27 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const use_llvm = @as(?bool, cfg.use_llvm) orelse default: {
-        if (cfg.is_wasm) break :default true;
         if (builtin.target.cpu.arch == .x86_64 and cfg.multithreaded) break :default true;
         break :default null;
     };
-    const root_translate_c = b.addTranslateC(.{
-        .root_source_file = .{ .cwd_relative = cfg.zigar_src_path ++ "include/c.h" },
-        .target = target,
-        .optimize = optimize,
-    });
+    const root_imports: []const Import = switch (cfg.is_wasm) {
+        true => &.{},
+        false => &.{.{
+            .name = "c",
+            .module = b.addTranslateC(.{
+                .root_source_file = .{ .cwd_relative = cfg.zigar_src_path ++ "include/c.h" },
+                .target = target,
+                .optimize = optimize,
+            }).createModule(),
+        }},
+    };
     const root = b.addModule("root", .{
         .root_source_file = .{ .cwd_relative = cfg.zigar_src_path ++ "stub.zig" },
         .target = target,
         .optimize = optimize,
         .single_threaded = !cfg.multithreaded,
-        .imports = &.{.{ .name = "c", .module = root_translate_c.createModule() }},
+        .link_libc = if (cfg.is_wasm) cfg.use_libc else null,
+        .imports = root_imports,
     });
     const lib = b.addLibrary(.{
         .linkage = .dynamic,
@@ -44,11 +50,16 @@ pub fn build(b: *std.Build) !void {
             .root_source_file = .{ .cwd_relative = cfg.c_header_path },
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
         false => {},
     };
     const c_import: []const Import = switch (use_c_header) {
-        true => &.{.{ .name = "c", .module = translate_c.createModule() }},
+        true => init: {
+            const c_mod = translate_c.createModule();
+            c_mod.link_libc = cfg.use_libc;
+            break :init &.{.{ .name = "c", .module = c_mod }};
+        },
         false => &.{},
     };
     const extra_imports: []const Import = switch (@hasDecl(extra, "getImports")) {

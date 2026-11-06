@@ -1,0 +1,189 @@
+package zigar:sample@0.1.0;
+
+interface shared-types {
+    enum color {
+        red,
+        green,
+        blue,
+        alpha,
+    }
+
+    enum error-kind {
+        invalid-input,
+        not-found,
+        timeout,
+        overflow,
+    }
+
+    record point {
+        x: f32,
+        y: f32,
+    }
+
+    record rect {
+        origin: point,
+        extent: point,
+        id: u32,
+        layer: u8,
+        tag: u16,
+    }
+
+    record pair-a {
+        a: f32,
+        b: s32,
+    }
+
+    record pair-b {
+        x: s32,
+        y: s64,
+    }
+
+    flags flags8 {
+        b0, b1, b2, b3, b4,
+    }
+
+    flags flags16 {
+        f0, f1, f2, f3, f4, f5, f6, f7,
+        f8, f9, f10, f11,
+    }
+
+    flags flags32 {
+        k0, k1, k2, k3, k4, k5, k6, k7,
+        k8, k9, k10, k11, k12, k13, k14, k15,
+        k16, k17, k18, k19,
+    }
+
+    flags flags64 {
+        m0, m1, m2, m3, m4, m5, m6, m7,
+        m8, m9, m10, m11, m12, m13, m14, m15,
+        m16, m17, m18, m19, m20, m21, m22, m23,
+        m24, m25, m26, m27, m28, m29, m30, m31,
+        m32, m33, m34, m35, m36, m37, m38, m39,
+    }
+
+    flags flags70 {
+        w0, w1, w2, w3, w4, w5, w6, w7,
+        w8, w9, w10, w11, w12, w13, w14, w15,
+        w16, w17, w18, w19, w20, w21, w22, w23,
+        w24, w25, w26, w27, w28, w29, w30, w31,
+        w32, w33, w34, w35, w36, w37, w38, w39,
+        w40, w41, w42, w43, w44, w45, w46, w47,
+        w48, w49, w50, w51, w52, w53, w54, w55,
+        w56, w57, w58, w59, w60, w61, w62, w63,
+        w64, w65, w66, w67, w68, w69,
+    }
+
+    variant join-i32-f32 {
+        as-int(s32),
+        as-float(f32),
+        empty,
+    }
+
+    variant join-i32-i64 {
+        as-int32(s32),
+        as-int64(s64),
+        empty,
+    }
+
+    variant join-f32-f64 {
+        as-f32(f32),
+        as-f64(f64),
+        empty,
+    }
+
+    variant multi-slot {
+        first(pair-a),
+        second(pair-b),
+        third(f64),
+        empty,
+    }
+
+    record complex-record {
+        id: u64,
+        label: string,
+        points: list<point>,
+        tags: list<string>,
+        maybe-score: option<u64>,
+        maybe-note: option<string>,
+        outcome: result<point, error-kind>,
+        tint: color,
+        glyph: char,
+        f8: flags8,
+        f16: flags16,
+        f32-val: flags32,
+        f64-val: flags64,
+        f70: flags70,
+        v-if: join-i32-f32,
+        v-ii: join-i32-i64,
+        v-ff: join-f32-f64,
+        v-multi: multi-slot,
+    }
+}
+
+interface host-api {
+    use shared-types.{
+        color, error-kind, point, rect, pair-a, pair-b,
+        flags8, flags16, flags32, flags64, flags70,
+        join-i32-f32, join-i32-i64, join-f32-f64, multi-slot,
+        complex-record,
+    };
+
+    resource session {
+        constructor(name: string);
+        get-id: func() -> u64;
+        connect: static async func(endpoint: string) -> result<session, error-context>;
+    }
+
+    compute-distance: func(a: point, b: point) -> f32;
+
+    merge-handles: func(
+        own-s: own<session>,
+        bor-s: borrow<session>,
+        st: stream<u8>,
+        fut: future<u32>,
+        err: error-context,
+    ) -> own<session>;
+
+    flip-flags: func(
+        f8: flags8,
+        f16: flags16,
+        f32-val: flags32,
+        f64-val: flags64,
+        f70: flags70,
+    ) -> tuple<flags8, flags16, flags32, flags64, flags70>;
+
+    process-complex: func(
+        rec: complex-record,
+        v1: join-i32-f32,
+        v2: join-i32-i64,
+        v3: join-f32-f64,
+    ) -> result<complex-record, error-kind>;
+
+    spill-seventeen: func(
+        a1: u32, a2: u32, a3: u32, a4: u32,
+        a5: u32, a6: u32, a7: u32, a8: u32,
+        a9: u32, a10: u32, a11: u32, a12: u32,
+        a13: u32, a14: u32, a15: u32, a16: u32,
+        a17: u32,
+    ) -> u32;
+
+    async-five: async func(
+        a1: u32, a2: u32, a3: u32, a4: u32, a5: u32,
+    ) -> u64;
+
+    format-summary: func(prefix: string, items: list<point>) -> list<string>;
+}
+
+interface guest-service {
+    use shared-types.{point, rect, error-kind, complex-record};
+
+    transform-rect: func(r: rect, scale: f32) -> rect;
+    inspect-record: func(rec: complex-record) -> result<string, error-kind>;
+    async-compute: async func(a: u32, b: u32, c: u32, d: u32, e: u32) -> result<point, error-kind>;
+}
+
+world sample-world {
+    import shared-types;
+    import host-api;
+    export guest-service;
+}

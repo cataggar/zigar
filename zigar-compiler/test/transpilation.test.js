@@ -133,6 +133,50 @@ describe('Transpilation', function() {
       const { code } = await transpile(path, options);
       expect(code).to.contain('"spawn"');
     })
+    it('should transpile pure-Zig WASM module using wazig build-exe', async function() {
+      const path = getSamplePath('console');
+      const { code, sourcePaths } = await transpile(path, { optimize: 'ReleaseSmall', useWazig: true });
+      expect(code).to.contain('"hello"');
+      expect(sourcePaths.some(p => p.includes('console.zig'))).to.be.true;
+    })
+    it('should transpile WASM module with relative sibling import and C header using wazig', async function() {
+      const printPath = fileURLToPath(new URL('./zig-samples/c-import/print.zig', import.meta.url));
+      const { code: printCode, sourcePaths } = await transpile(printPath, { optimize: 'ReleaseSmall', useWazig: true });
+      expect(printCode).to.contain('"printZig"');
+      expect(printCode).to.contain('"printC"');
+      expect(sourcePaths.some(p => p.includes('print.zig'))).to.be.true;
+      expect(sourcePaths.some(p => p.includes('hello.zig'))).to.be.true;
+      expect(sourcePaths.some(p => p.includes('build.extra.h'))).to.be.true;
+      const cPtrPath = fileURLToPath(new URL('./integration/function-calling/return-c-pointer.zig', import.meta.url));
+      const prevDev = process.env.DEV;
+      delete process.env.DEV;
+      try {
+        const { code: cPtrCode } = await transpile(cPtrPath, { optimize: 'ReleaseSmall', useWazig: true });
+        expect(cPtrCode).to.contain('"getString"');
+        expect(cPtrCode).to.contain('"getPointer"');
+      } finally {
+        if (prevDev !== undefined) process.env.DEV = prevDev;
+      }
+    })
+    it('should transpile WASM module with useLibc enabled using wazig', async function() {
+      const dupePath = fileURLToPath(new URL('./zig-samples/c-allocator/dupe.zig', import.meta.url));
+      const { code } = await transpile(dupePath, { optimize: 'ReleaseSmall', useLibc: true, useWazig: true });
+      expect(code).to.contain('"dupe"');
+    })
+    it('should include useJSPI and continuationStackSize in moduleOptions when specified', async function() {
+      const path = getSamplePath('simple');
+      const options = {
+        optimize: 'ReleaseSmall',
+        embedWASM: false,
+        wasmLoader: () => 'loadWASM()',
+        useWazig: true,
+        useJSPI: true,
+        continuationStackSize: 131072,
+      };
+      const { code } = await transpile(path, options);
+      expect(code).to.contain('"useJSPI":true');
+      expect(code).to.contain('"continuationStackSize":131072');
+    })
 
   })
 })
