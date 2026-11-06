@@ -19,6 +19,8 @@ pub const types = @import("component/types.zig");
 pub const core_types = @import("component/core_types.zig");
 pub const canon = @import("canon.zig");
 pub const fast_abi = @import("fast_abi.zig");
+pub const async_runtime = @import("async_runtime.zig");
+pub const zigar_bridge = @import("zigar_bridge.zig");
 pub const bindgen = @import("bindgen.zig");
 pub const cli = @import("main.zig");
 pub const integration_test = @import("integration_test.zig");
@@ -33,6 +35,8 @@ test {
     _ = abi;
     _ = canon;
     _ = fast_abi;
+    _ = async_runtime;
+    _ = zigar_bridge;
     _ = bindgen;
     _ = cli;
     _ = integration_test;

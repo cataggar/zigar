@@ -1279,7 +1279,7 @@ pub fn FastLower(comptime FnType: type, comptime is_memory64: bool) type {
             return base_off;
         }
 
-        pub fn call(
+        pub inline fn call(
             mem_ctx: *canon.MemoryContext,
             fast_fn: FastCoreFnPtr(is_memory64),
             args: ArgsTuple,
@@ -1288,7 +1288,22 @@ pub fn FastLower(comptime FnType: type, comptime is_memory64: bool) type {
             return callAtOffset(mem_ctx, base_off, fast_fn, args);
         }
 
-        pub fn callAtOffset(
+        /// Invoke `FastLower.call` on an isolated `TaskContext` shadow stack.
+        pub inline fn callOnShadowStack(
+            mem_ctx: *canon.MemoryContext,
+            task_ctx: anytype,
+            fast_fn: FastCoreFnPtr(is_memory64),
+            args: ArgsTuple,
+        ) canon.CanonResult(ReturnType) {
+            const Runner = struct {
+                fn invoke(m: *canon.MemoryContext, f: FastCoreFnPtr(is_memory64), a: *const ArgsTuple) canon.CanonResult(ReturnType) {
+                    return call(m, f, a.*);
+                }
+            };
+            return task_ctx.run(Runner.invoke, .{ mem_ctx, fast_fn, &args });
+        }
+
+        pub inline fn callAtOffset(
             mem_ctx: *canon.MemoryContext,
             frame_offset: usize,
             fast_fn: FastCoreFnPtr(is_memory64),
@@ -1335,7 +1350,7 @@ pub fn FastLower(comptime FnType: type, comptime is_memory64: bool) type {
         /// `OutOfMemory`, etc.) occurs BEFORE `fast_fn` is invoked, restores
         /// `mem_ctx.fast_bump_cursor` and returns `.fallback_needed` so
         /// `CanonLower.callAuto` can cleanly fall back to the Canonical ABI.
-        pub fn tryCallOrFallback(
+        pub inline fn tryCallOrFallback(
             mem_ctx: *canon.MemoryContext,
             fast_fn: FastCoreFnPtr(is_memory64),
             args: ArgsTuple,
@@ -1450,6 +1465,10 @@ pub fn FastLift(comptime FnType: type, comptime impl_fn: FnType, comptime is_mem
             var lift_ctx = mem_ctx.*;
             lift_ctx.allocator = lift_arena.allocator();
 
+            const prev_canon_ctx = canon.getActiveMemoryContext();
+            canon.setActiveMemoryContext(mem_ctx.*);
+            defer canon.setActiveMemoryContext(prev_canon_ctx);
+
             const args = try loadFastFrame(FnType, is_memory64, &lift_ctx, frame_offset);
             const ret_val: ReturnType = @call(.auto, impl_fn, args);
 
@@ -1483,6 +1502,17 @@ pub fn FastLift(comptime FnType: type, comptime impl_fn: FnType, comptime is_mem
             }
         }
 
+        /// Invoke `FastLift.callFromMemory` on an isolated `TaskContext` shadow stack.
+        pub fn callFromMemoryOnShadowStack(
+            mem_ctx: *canon.MemoryContext,
+            task_ctx: anytype,
+            frame_addr: PtrT,
+        ) canon.Error!void {
+            return task_ctx.run(callFromMemory, .{ mem_ctx, frame_addr });
+        }
+
+        pub const callOnShadowStack = callFromMemoryOnShadowStack;
+
         pub fn createThunk(comptime mem_ctx_ptr: *canon.MemoryContext) FastCoreFnPtr(is_memory64) {
             const Thunk = struct {
                 pub fn call(frame_addr: PtrT) callconv(.c) void {
@@ -1495,13 +1525,11 @@ pub fn FastLift(comptime FnType: type, comptime impl_fn: FnType, comptime is_mem
         pub fn thunk() FastCoreFnPtr(is_memory64) {
             const ActiveThunk = struct {
                 pub fn call(frame_addr: PtrT) callconv(.c) void {
-                    if (comptime builtin.cpu.arch != .wasm32 and builtin.cpu.arch != .wasm64) {
-                        if (active_fast_memory_ctx) |ctx_ptr| {
-                            callFromMemory(ctx_ptr, frame_addr) catch @trap();
-                            return;
-                        }
-                        @trap();
-                    } else {
+                    if (active_fast_memory_ctx) |ctx_ptr| {
+                        callFromMemory(ctx_ptr, frame_addr) catch @trap();
+                        return;
+                    }
+                    if (comptime builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64) {
                         const wasm_bytes = @as(usize, @wasmMemorySize(0)) * 65536;
                         if (wasm_bytes <= 1) @trap();
                         const mem_slice = @as([*]u8, @ptrFromInt(1))[0 .. wasm_bytes - 1];
@@ -1512,6 +1540,7 @@ pub fn FastLift(comptime FnType: type, comptime impl_fn: FnType, comptime is_mem
                         callFromMemory(&wasm_ctx, frame_addr) catch @trap();
                         return;
                     }
+                    @trap();
                 }
             };
             return &ActiveThunk.call;
@@ -2130,5 +2159,89 @@ test "Adversarial review edge cases: B2 (>4KB nested slice lift), B3 (frame head
     );
 }
 
+test "FastLower and FastLift callOnShadowStack with ShadowStackPool and async WIT subtask" {
+    const async_runtime = @import("async_runtime.zig");
+    const alloc = testing.allocator;
 
+    var sched = async_runtime.AsyncScheduler.init(alloc);
+    defer sched.deinit();
 
+    var mem: [4096]u8 align(16) = @splat(0);
+    var bump = canon.BumpAllocator.init(512, mem.len);
+    var mem_ctx = canon.MemoryContext{
+        .memory = &mem,
+        .base_addr = if (builtin.cpu.arch.isWasm()) @intFromPtr(&mem) else 0,
+        .realloc_ctx = &bump,
+        .realloc_fn = canon.BumpAllocator.realloc,
+        .fast_frame_offset = 64,
+    };
+    sched.configureMemoryContext(&mem_ctx);
+
+    const HostImportFn = fn (n: u32) u32;
+    const GuestFastFn = fn (label: []const u8, factor: u32) u32;
+
+    const AsyncBridgeEnv = struct {
+        sched_ptr: *async_runtime.AsyncScheduler,
+        mem_ctx_ptr: *canon.MemoryContext,
+        pending_arg: u32 = 0,
+        ret_ptr: usize = 0,
+        steps: u32 = 0,
+        sp_during_suspend: usize = 0,
+
+        var current: ?*@This() = null;
+
+        fn step(raw_ctx: ?*anyopaque, s: *async_runtime.AsyncScheduler, _: i32) !async_runtime.SubtaskState {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            self.steps += 1;
+            self.sp_during_suspend = s.sp_binding.get();
+            if (self.steps < 2) return .started;
+            try canon.storeToMemory(u32, .wasm32, self.mem_ctx_ptr.*, self.ret_ptr, self.pending_arg + 10);
+            return .returned;
+        }
+
+        fn hostAsyncCore(n: i32, ret_ptr: i32) i32 {
+            const self = current.?;
+            self.pending_arg = @bitCast(n);
+            self.ret_ptr = @intCast(@as(u32, @bitCast(ret_ptr)));
+            const h = self.sched_ptr.spawnAsyncSubtask(self, step) catch unreachable;
+            return async_runtime.SubtaskState.started.pack(@intCast(h));
+        }
+
+        fn guestFastImpl(label: []const u8, factor: u32) u32 {
+            const mctx = canon.getActiveMemoryContext().?;
+            const imported = canon.lowerCall(
+                HostImportFn,
+                .{ .arch = .wasm32, .is_async = true, .direction = .lower },
+                mctx,
+                &hostAsyncCore,
+                .{@as(u32, @intCast(label.len)) * factor},
+            ) catch unreachable;
+            return imported * 2;
+        }
+    };
+
+    var env = AsyncBridgeEnv{
+        .sched_ptr = &sched,
+        .mem_ctx_ptr = &mem_ctx,
+    };
+    AsyncBridgeEnv.current = &env;
+    defer AsyncBridgeEnv.current = null;
+
+    var host_sp: usize = 0x7000_0000;
+    sched.sp_binding = async_runtime.StackPointerBinding.fromHostSlot(&host_sp);
+
+    const stack = try sched.stack_pool.acquire(alloc);
+    defer sched.stack_pool.release(alloc, stack) catch {};
+    var task_ctx = async_runtime.TaskContext.init(stack, sched.sp_binding);
+
+    const LowerFast = FastLower(GuestFastFn, false);
+    const LiftFast = FastLift(GuestFastFn, AsyncBridgeEnv.guestFastImpl, false);
+
+    // ("zigar".len * 6 + 10) * 2 = 80
+    const res = try LowerFast.callOnShadowStack(&mem_ctx, &task_ctx, LiftFast.thunk(), .{ "zigar", 6 });
+    try testing.expectEqual(@as(u32, 80), res);
+    try testing.expectEqual(@as(u32, 2), env.steps);
+    try testing.expectEqual(@as(usize, 0x7000_0000), env.sp_during_suspend);
+    try testing.expectEqual(@as(usize, 0x7000_0000), host_sp);
+    try testing.expectEqual(async_runtime.TaskContext.State.completed, task_ctx.state);
+}

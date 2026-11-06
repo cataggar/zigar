@@ -508,6 +508,16 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\}
         \\
         \\pub const canon = struct {
+        \\    pub const PrimChar = Char;
+        \\    pub const PrimResult = Result;
+        \\    pub const PrimOwn = Own;
+        \\    pub const PrimBorrow = Borrow;
+        \\    pub const PrimStream = Stream;
+        \\    pub const PrimFuture = Future;
+        \\    pub const PrimErrorContext = ErrorContext;
+        \\    pub const PrimWitString = WitString;
+        \\    pub const PrimCanonSlice = CanonSlice;
+        \\
         \\    pub const Error = error{
         \\        OutOfMemory,
         \\        OutOfBounds,
@@ -547,6 +557,17 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\
         \\    pub const PostReturnFn = *const fn (ctx: ?*anyopaque, ret_val: usize) void;
         \\
+        \\    pub const AwaitSubtaskFn = *const fn (
+        \\        ctx: ?*anyopaque,
+        \\        mem_ctx: *MemoryContext,
+        \\        packed_status: i32,
+        \\    ) Error!void;
+        \\
+        \\    pub const PollTaskFn = *const fn (
+        \\        ctx: ?*anyopaque,
+        \\        mem_ctx: *MemoryContext,
+        \\    ) Error!void;
+        \\
         \\    pub const MemoryContext = struct {
         \\        memory: []u8,
         \\        base_addr: usize = 0,
@@ -556,6 +577,10 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\        post_return_fn: ?PostReturnFn = null,
         \\        task_return_ctx: ?*anyopaque = null,
         \\        task_return_fn: ?PostReturnFn = null,
+        \\        await_subtask_ctx: ?*anyopaque = null,
+        \\        await_subtask_fn: ?AwaitSubtaskFn = null,
+        \\        poll_task_ctx: ?*anyopaque = null,
+        \\        poll_task_fn: ?PollTaskFn = null,
         \\        allocator: ?std.mem.Allocator = null,
         \\        zero_copy_slices: bool = true,
         \\        validate_utf8: bool = true,
@@ -582,6 +607,49 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\            return off;
         \\        }
         \\    };
+        \\
+        \\    threadlocal var active_memory_ctx: ?MemoryContext = null;
+        \\
+        \\    pub fn setActiveMemoryContext(ctx: anytype) void {
+        \\        const CtxT = @TypeOf(ctx);
+        \\        if (CtxT == @TypeOf(null)) {
+        \\            active_memory_ctx = null;
+        \\        } else if (CtxT == ?MemoryContext or CtxT == MemoryContext) {
+        \\            active_memory_ctx = ctx;
+        \\        } else if (@typeInfo(CtxT) == .optional) {
+        \\            if (ctx) |v| {
+        \\                setActiveMemoryContext(v);
+        \\            } else {
+        \\                active_memory_ctx = null;
+        \\            }
+        \\        } else {
+        \\            active_memory_ctx = .{
+        \\                .memory = ctx.memory,
+        \\                .base_addr = ctx.base_addr,
+        \\                .realloc_ctx = ctx.realloc_ctx,
+        \\                .realloc_fn = if (ctx.realloc_fn) |f| @ptrCast(f) else null,
+        \\                .post_return_ctx = ctx.post_return_ctx,
+        \\                .post_return_fn = if (ctx.post_return_fn) |f| @ptrCast(f) else null,
+        \\                .task_return_ctx = ctx.task_return_ctx,
+        \\                .task_return_fn = if (ctx.task_return_fn) |f| @ptrCast(f) else null,
+        \\                .await_subtask_ctx = ctx.await_subtask_ctx,
+        \\                .await_subtask_fn = if (ctx.await_subtask_fn) |f| @ptrCast(f) else null,
+        \\                .poll_task_ctx = ctx.poll_task_ctx,
+        \\                .poll_task_fn = if (ctx.poll_task_fn) |f| @ptrCast(f) else null,
+        \\                .allocator = ctx.allocator,
+        \\                .zero_copy_slices = ctx.zero_copy_slices,
+        \\                .validate_utf8 = ctx.validate_utf8,
+        \\                .strict_utf8_on_u8_slices = ctx.strict_utf8_on_u8_slices,
+        \\                .fast_frame_offset = ctx.fast_frame_offset,
+        \\                .fast_bump_cursor = ctx.fast_bump_cursor,
+        \\                .fast_scratch_limit = ctx.fast_scratch_limit,
+        \\            };
+        \\        }
+        \\    }
+        \\
+        \\    pub fn getActiveMemoryContext() ?MemoryContext {
+        \\        return active_memory_ctx;
+        \\    }
         \\
         \\    pub const fast_abi = struct {
         \\        pub const SECTION_NAME = "zigar:abi";
@@ -1769,12 +1837,22 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\                    return base_off;
         \\                }
         \\
-        \\                pub fn call(mem_ctx: *MemoryContext, fast_fn: FastCoreFnPtr(is_memory64), args: ArgsTuple) CanonResult(RetT) {
+        \\                pub inline fn call(mem_ctx: anytype, fast_fn: FastCoreFnPtr(is_memory64), args: ArgsTuple) CanonResult(RetT) {
         \\                    const base_off = try resolveFrameOffset(mem_ctx, args);
         \\                    return callAtOffset(mem_ctx, base_off, fast_fn, args);
         \\                }
         \\
-        \\                pub fn callAtOffset(mem_ctx: *MemoryContext, frame_offset: usize, fast_fn: FastCoreFnPtr(is_memory64), args: ArgsTuple) CanonResult(RetT) {
+        \\                pub inline fn callOnShadowStack(mem_ctx: anytype, task_ctx: anytype, fast_fn: FastCoreFnPtr(is_memory64), args: ArgsTuple) CanonResult(RetT) {
+        \\                    const MemCtxPtrT = @TypeOf(mem_ctx);
+        \\                    const Runner = struct {
+        \\                        fn invoke(m: MemCtxPtrT, f: FastCoreFnPtr(is_memory64), a: *const ArgsTuple) CanonResult(RetT) {
+        \\                            return call(m, f, a.*);
+        \\                        }
+        \\                    };
+        \\                    return task_ctx.run(Runner.invoke, .{ mem_ctx, fast_fn, &args });
+        \\                }
+        \\
+        \\                pub inline fn callAtOffset(mem_ctx: anytype, frame_offset: usize, fast_fn: FastCoreFnPtr(is_memory64), args: ArgsTuple) CanonResult(RetT) {
         \\                    const effective_limit = mem_ctx.effectiveFastLimit();
         \\                    const aligned_frame_off = alignSizeForward(frame_offset, frame_layout.frame_align);
         \\                    var bump_off: usize = aligned_frame_off + frame_layout.frame_size;
@@ -1783,7 +1861,22 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\                    const frame_addr = mem_ctx.base_addr + aligned_frame_off;
         \\                    if (frame_addr > std.math.maxInt(PtrT)) return error.OutOfBounds;
         \\                    const prev_fast = active_fast_memory_ctx;
-        \\                    setActiveFastMemoryContext(mem_ctx);
+        \\                    var bridged_ctx: MemoryContext = if (comptime @TypeOf(mem_ctx) == *MemoryContext) undefined else .{
+        \\                        .memory = mem_ctx.memory,
+        \\                        .base_addr = mem_ctx.base_addr,
+        \\                        .allocator = mem_ctx.allocator,
+        \\                        .zero_copy_slices = mem_ctx.zero_copy_slices,
+        \\                        .validate_utf8 = mem_ctx.validate_utf8,
+        \\                        .strict_utf8_on_u8_slices = mem_ctx.strict_utf8_on_u8_slices,
+        \\                        .fast_frame_offset = mem_ctx.fast_frame_offset,
+        \\                        .fast_bump_cursor = mem_ctx.fast_bump_cursor,
+        \\                        .fast_scratch_limit = mem_ctx.fast_scratch_limit,
+        \\                    };
+        \\                    if (comptime @TypeOf(mem_ctx) == *MemoryContext) {
+        \\                        setActiveFastMemoryContext(mem_ctx);
+        \\                    } else {
+        \\                        setActiveFastMemoryContext(&bridged_ctx);
+        \\                    }
         \\                    defer setActiveFastMemoryContext(prev_fast);
         \\                    fast_fn(@intCast(frame_addr));
         \\                    const updated_bump_addr: usize = @intCast(std.mem.readInt(PtrT, mem_ctx.memory[aligned_frame_off + frame_layout.header_bump_offset ..][0..@sizeOf(PtrT)], .little));
@@ -1832,6 +1925,9 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\                    defer lift_arena.deinit();
         \\                    var lift_ctx = mem_ctx.*;
         \\                    lift_ctx.allocator = lift_arena.allocator();
+        \\                    const prev_canon_ctx = getActiveMemoryContext();
+        \\                    setActiveMemoryContext(mem_ctx.*);
+        \\                    defer setActiveMemoryContext(prev_canon_ctx);
         \\                    const f = @typeInfo(FnType).@"fn";
         \\                    var args: ArgsTuple = undefined;
         \\                    inline for (0..f.param_types.len) |i| {
@@ -1863,6 +1959,12 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\                    }
         \\                }
         \\
+        \\                pub fn callFromMemoryOnShadowStack(mem_ctx: anytype, task_ctx: anytype, frame_addr: PtrT) Error!void {
+        \\                    return task_ctx.run(callFromMemory, .{ mem_ctx, frame_addr });
+        \\                }
+        \\
+        \\                pub const callOnShadowStack = callFromMemoryOnShadowStack;
+        \\
         \\                pub fn createThunk(comptime mem_ctx_ptr: anytype) FastCoreFnPtr(is_memory64) {
         \\                    const Thunk = struct {
         \\                        pub fn call(frame_addr: PtrT) callconv(.c) void {
@@ -1875,13 +1977,11 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\                pub fn thunk() FastCoreFnPtr(is_memory64) {
         \\                    const ActiveThunk = struct {
         \\                        pub fn call(frame_addr: PtrT) callconv(.c) void {
-        \\                            if (comptime @import("builtin").cpu.arch != .wasm32 and @import("builtin").cpu.arch != .wasm64) {
-        \\                                if (active_fast_memory_ctx) |ctx_ptr| {
-        \\                                    callFromMemory(ctx_ptr, frame_addr) catch @trap();
-        \\                                    return;
-        \\                                }
-        \\                                @trap();
-        \\                            } else {
+        \\                            if (active_fast_memory_ctx) |ctx_ptr| {
+        \\                                callFromMemory(ctx_ptr, frame_addr) catch @trap();
+        \\                                return;
+        \\                            }
+        \\                            if (comptime @import("builtin").cpu.arch == .wasm32 or @import("builtin").cpu.arch == .wasm64) {
         \\                                const wasm_bytes = @as(usize, @wasmMemorySize(0)) * 65536;
         \\                                if (wasm_bytes <= 1) @trap();
         \\                                const mem_slice = @as([*]u8, @ptrFromInt(1))[0 .. wasm_bytes - 1];
@@ -1889,6 +1989,7 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\                                callFromMemory(&wasm_ctx, frame_addr) catch @trap();
         \\                                return;
         \\                            }
+        \\                            @trap();
         \\                        }
         \\                    };
         \\                    return &ActiveThunk.call;
@@ -1899,6 +2000,182 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\
         \\    pub const FastLower = fast_abi.FastLower;
         \\    pub const FastLift = fast_abi.FastLift;
+        \\
+        \\    pub const WitErrorSet = error{
+        \\        WitResultError,
+        \\    };
+        \\
+        \\    pub const BridgeError = Error || WitErrorSet;
+        \\
+        \\    pub fn isWitResult(comptime T: type) bool {
+        \\        return switch (@typeInfo(T)) {
+        \\            .@"union" => @hasDecl(T, "wit_is_result") and T.wit_is_result,
+        \\            else => false,
+        \\        };
+        \\    }
+        \\
+        \\    pub fn LastWitErrorStore(comptime Err: type) type {
+        \\        if (comptime (@typeInfo(Err) == .@"enum" or @typeInfo(Err) == .@"struct" or @typeInfo(Err) == .@"union") and @hasDecl(Err, "WitLastErrorSlot")) {
+        \\            return Err.WitLastErrorSlot;
+        \\        }
+        \\        return struct {
+        \\            pub threadlocal var last_err: ?Err = null;
+        \\        };
+        \\    }
+        \\
+        \\    pub fn getLastWitError(comptime Err: type) ?Err {
+        \\        if (comptime Err == void) return {};
+        \\        return LastWitErrorStore(Err).last_err;
+        \\    }
+        \\
+        \\    pub fn setLastWitError(comptime Err: type, err_val: Err) void {
+        \\        if (comptime Err == void) return;
+        \\        LastWitErrorStore(Err).last_err = err_val;
+        \\    }
+        \\
+        \\    pub fn clearLastWitError(comptime Err: type) void {
+        \\        if (comptime Err == void) return;
+        \\        LastWitErrorStore(Err).last_err = null;
+        \\    }
+        \\
+        \\    pub fn unwrapWitResult(res: anytype) WitErrorSet!@TypeOf(res).OkType {
+        \\        const ResT = @TypeOf(res);
+        \\        switch (res) {
+        \\            .ok => |v| {
+        \\                clearLastWitError(ResT.ErrType);
+        \\                return v;
+        \\            },
+        \\            .err => |e| {
+        \\                setLastWitError(ResT.ErrType, e);
+        \\                return error.WitResultError;
+        \\            },
+        \\        }
+        \\    }
+        \\
+        \\    pub fn wrapWitResult(comptime ResT: type, eu_val: anytype, default_err: ResT.ErrType) ResT {
+        \\        if (eu_val) |ok_val| {
+        \\            return .{ .ok = ok_val };
+        \\        } else |err| {
+        \\            if (comptime ResT.ErrType == void) {
+        \\                return .{ .err = {} };
+        \\            }
+        \\            if (err == error.WitResultError) {
+        \\                if (getLastWitError(ResT.ErrType)) |stored_err| {
+        \\                    clearLastWitError(ResT.ErrType);
+        \\                    return .{ .err = stored_err };
+        \\                }
+        \\            }
+        \\            return .{ .err = default_err };
+        \\        }
+        \\    }
+        \\
+        \\    pub fn ZigarBridgeReturnType(comptime FnT: type, comptime MemCtxPtrT: type, comptime unwrap_result: bool) type {
+        \\        const RetT = ReturnType(FnT);
+        \\        const has_mem_ctx = (MemCtxPtrT != @TypeOf(null) and MemCtxPtrT != void);
+        \\        if (has_mem_ctx) {
+        \\            if (unwrap_result and isWitResult(RetT)) {
+        \\                return BridgeError!RetT.OkType;
+        \\            }
+        \\            return CanonResult(RetT);
+        \\        } else {
+        \\            if (unwrap_result and isWitResult(RetT)) {
+        \\                return WitErrorSet!RetT.OkType;
+        \\            }
+        \\            return RetT;
+        \\        }
+        \\    }
+        \\
+        \\    pub fn ZigarBridgeFnType(comptime FnT: type, comptime MemCtxPtrT: type, comptime unwrap_result: bool) type {
+        \\        const f = @typeInfo(FnT).@"fn";
+        \\        var param_types: [f.param_types.len]type = undefined;
+        \\        var param_attrs: [f.param_types.len]std.lang.Type.Fn.ParamAttributes = undefined;
+        \\        for (f.param_types, 0..) |maybe_pt, i| {
+        \\            param_types[i] = maybe_pt.?;
+        \\            param_attrs[i] = f.param_attrs[i];
+        \\        }
+        \\        const OutRet = ZigarBridgeReturnType(FnT, MemCtxPtrT, unwrap_result);
+        \\        return @Fn(&param_types, &param_attrs, OutRet, .{});
+        \\    }
+        \\
+        \\    fn BridgeTupleElemType(comptime TupleT: type, comptime idx: usize) type {
+        \\        const fields = @typeInfo(TupleT).@"struct".field_types;
+        \\        return if (idx < fields.len) fields[idx] else void;
+        \\    }
+        \\
+        \\    fn getBridgeSpreadPyramid(comptime ArgsT: type, comptime OutRet: type, comptime invokeTuple: anytype) type {
+        \\        return struct {
+        \\            pub fn call0() OutRet { return invokeTuple(.{}); }
+        \\            pub fn call1(a0: BridgeTupleElemType(ArgsT, 0)) OutRet { return invokeTuple(.{a0}); }
+        \\            pub fn call2(a0: BridgeTupleElemType(ArgsT, 0), a1: BridgeTupleElemType(ArgsT, 1)) OutRet { return invokeTuple(.{ a0, a1 }); }
+        \\            pub fn call3(a0: BridgeTupleElemType(ArgsT, 0), a1: BridgeTupleElemType(ArgsT, 1), a2: BridgeTupleElemType(ArgsT, 2)) OutRet { return invokeTuple(.{ a0, a1, a2 }); }
+        \\            pub fn call4(a0: BridgeTupleElemType(ArgsT, 0), a1: BridgeTupleElemType(ArgsT, 1), a2: BridgeTupleElemType(ArgsT, 2), a3: BridgeTupleElemType(ArgsT, 3)) OutRet { return invokeTuple(.{ a0, a1, a2, a3 }); }
+        \\            pub fn call5(a0: BridgeTupleElemType(ArgsT, 0), a1: BridgeTupleElemType(ArgsT, 1), a2: BridgeTupleElemType(ArgsT, 2), a3: BridgeTupleElemType(ArgsT, 3), a4: BridgeTupleElemType(ArgsT, 4)) OutRet { return invokeTuple(.{ a0, a1, a2, a3, a4 }); }
+        \\            pub fn call6(a0: BridgeTupleElemType(ArgsT, 0), a1: BridgeTupleElemType(ArgsT, 1), a2: BridgeTupleElemType(ArgsT, 2), a3: BridgeTupleElemType(ArgsT, 3), a4: BridgeTupleElemType(ArgsT, 4), a5: BridgeTupleElemType(ArgsT, 5)) OutRet { return invokeTuple(.{ a0, a1, a2, a3, a4, a5 }); }
+        \\            pub fn call7(a0: BridgeTupleElemType(ArgsT, 0), a1: BridgeTupleElemType(ArgsT, 1), a2: BridgeTupleElemType(ArgsT, 2), a3: BridgeTupleElemType(ArgsT, 3), a4: BridgeTupleElemType(ArgsT, 4), a5: BridgeTupleElemType(ArgsT, 5), a6: BridgeTupleElemType(ArgsT, 6)) OutRet { return invokeTuple(.{ a0, a1, a2, a3, a4, a5, a6 }); }
+        \\            pub fn call8(a0: BridgeTupleElemType(ArgsT, 0), a1: BridgeTupleElemType(ArgsT, 1), a2: BridgeTupleElemType(ArgsT, 2), a3: BridgeTupleElemType(ArgsT, 3), a4: BridgeTupleElemType(ArgsT, 4), a5: BridgeTupleElemType(ArgsT, 5), a6: BridgeTupleElemType(ArgsT, 6), a7: BridgeTupleElemType(ArgsT, 7)) OutRet { return invokeTuple(.{ a0, a1, a2, a3, a4, a5, a6, a7 }); }
+        \\            pub fn call9(a0: BridgeTupleElemType(ArgsT, 0), a1: BridgeTupleElemType(ArgsT, 1), a2: BridgeTupleElemType(ArgsT, 2), a3: BridgeTupleElemType(ArgsT, 3), a4: BridgeTupleElemType(ArgsT, 4), a5: BridgeTupleElemType(ArgsT, 5), a6: BridgeTupleElemType(ArgsT, 6), a7: BridgeTupleElemType(ArgsT, 7), a8: BridgeTupleElemType(ArgsT, 8)) OutRet { return invokeTuple(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8 }); }
+        \\            pub fn call10(a0: BridgeTupleElemType(ArgsT, 0), a1: BridgeTupleElemType(ArgsT, 1), a2: BridgeTupleElemType(ArgsT, 2), a3: BridgeTupleElemType(ArgsT, 3), a4: BridgeTupleElemType(ArgsT, 4), a5: BridgeTupleElemType(ArgsT, 5), a6: BridgeTupleElemType(ArgsT, 6), a7: BridgeTupleElemType(ArgsT, 7), a8: BridgeTupleElemType(ArgsT, 8), a9: BridgeTupleElemType(ArgsT, 9)) OutRet { return invokeTuple(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9 }); }
+        \\            pub fn call11(a0: BridgeTupleElemType(ArgsT, 0), a1: BridgeTupleElemType(ArgsT, 1), a2: BridgeTupleElemType(ArgsT, 2), a3: BridgeTupleElemType(ArgsT, 3), a4: BridgeTupleElemType(ArgsT, 4), a5: BridgeTupleElemType(ArgsT, 5), a6: BridgeTupleElemType(ArgsT, 6), a7: BridgeTupleElemType(ArgsT, 7), a8: BridgeTupleElemType(ArgsT, 8), a9: BridgeTupleElemType(ArgsT, 9), a10: BridgeTupleElemType(ArgsT, 10)) OutRet { return invokeTuple(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10 }); }
+        \\            pub fn call12(a0: BridgeTupleElemType(ArgsT, 0), a1: BridgeTupleElemType(ArgsT, 1), a2: BridgeTupleElemType(ArgsT, 2), a3: BridgeTupleElemType(ArgsT, 3), a4: BridgeTupleElemType(ArgsT, 4), a5: BridgeTupleElemType(ArgsT, 5), a6: BridgeTupleElemType(ArgsT, 6), a7: BridgeTupleElemType(ArgsT, 7), a8: BridgeTupleElemType(ArgsT, 8), a9: BridgeTupleElemType(ArgsT, 9), a10: BridgeTupleElemType(ArgsT, 10), a11: BridgeTupleElemType(ArgsT, 11)) OutRet { return invokeTuple(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 }); }
+        \\            pub fn call13(a0: BridgeTupleElemType(ArgsT, 0), a1: BridgeTupleElemType(ArgsT, 1), a2: BridgeTupleElemType(ArgsT, 2), a3: BridgeTupleElemType(ArgsT, 3), a4: BridgeTupleElemType(ArgsT, 4), a5: BridgeTupleElemType(ArgsT, 5), a6: BridgeTupleElemType(ArgsT, 6), a7: BridgeTupleElemType(ArgsT, 7), a8: BridgeTupleElemType(ArgsT, 8), a9: BridgeTupleElemType(ArgsT, 9), a10: BridgeTupleElemType(ArgsT, 10), a11: BridgeTupleElemType(ArgsT, 11), a12: BridgeTupleElemType(ArgsT, 12)) OutRet { return invokeTuple(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12 }); }
+        \\            pub fn call14(a0: BridgeTupleElemType(ArgsT, 0), a1: BridgeTupleElemType(ArgsT, 1), a2: BridgeTupleElemType(ArgsT, 2), a3: BridgeTupleElemType(ArgsT, 3), a4: BridgeTupleElemType(ArgsT, 4), a5: BridgeTupleElemType(ArgsT, 5), a6: BridgeTupleElemType(ArgsT, 6), a7: BridgeTupleElemType(ArgsT, 7), a8: BridgeTupleElemType(ArgsT, 8), a9: BridgeTupleElemType(ArgsT, 9), a10: BridgeTupleElemType(ArgsT, 10), a11: BridgeTupleElemType(ArgsT, 11), a12: BridgeTupleElemType(ArgsT, 12), a13: BridgeTupleElemType(ArgsT, 13)) OutRet { return invokeTuple(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13 }); }
+        \\            pub fn call15(a0: BridgeTupleElemType(ArgsT, 0), a1: BridgeTupleElemType(ArgsT, 1), a2: BridgeTupleElemType(ArgsT, 2), a3: BridgeTupleElemType(ArgsT, 3), a4: BridgeTupleElemType(ArgsT, 4), a5: BridgeTupleElemType(ArgsT, 5), a6: BridgeTupleElemType(ArgsT, 6), a7: BridgeTupleElemType(ArgsT, 7), a8: BridgeTupleElemType(ArgsT, 8), a9: BridgeTupleElemType(ArgsT, 9), a10: BridgeTupleElemType(ArgsT, 10), a11: BridgeTupleElemType(ArgsT, 11), a12: BridgeTupleElemType(ArgsT, 12), a13: BridgeTupleElemType(ArgsT, 13), a14: BridgeTupleElemType(ArgsT, 14)) OutRet { return invokeTuple(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14 }); }
+        \\            pub fn call16(a0: BridgeTupleElemType(ArgsT, 0), a1: BridgeTupleElemType(ArgsT, 1), a2: BridgeTupleElemType(ArgsT, 2), a3: BridgeTupleElemType(ArgsT, 3), a4: BridgeTupleElemType(ArgsT, 4), a5: BridgeTupleElemType(ArgsT, 5), a6: BridgeTupleElemType(ArgsT, 6), a7: BridgeTupleElemType(ArgsT, 7), a8: BridgeTupleElemType(ArgsT, 8), a9: BridgeTupleElemType(ArgsT, 9), a10: BridgeTupleElemType(ArgsT, 10), a11: BridgeTupleElemType(ArgsT, 11), a12: BridgeTupleElemType(ArgsT, 12), a13: BridgeTupleElemType(ArgsT, 13), a14: BridgeTupleElemType(ArgsT, 14), a15: BridgeTupleElemType(ArgsT, 15)) OutRet { return invokeTuple(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15 }); }
+        \\            pub fn call17(a0: BridgeTupleElemType(ArgsT, 0), a1: BridgeTupleElemType(ArgsT, 1), a2: BridgeTupleElemType(ArgsT, 2), a3: BridgeTupleElemType(ArgsT, 3), a4: BridgeTupleElemType(ArgsT, 4), a5: BridgeTupleElemType(ArgsT, 5), a6: BridgeTupleElemType(ArgsT, 6), a7: BridgeTupleElemType(ArgsT, 7), a8: BridgeTupleElemType(ArgsT, 8), a9: BridgeTupleElemType(ArgsT, 9), a10: BridgeTupleElemType(ArgsT, 10), a11: BridgeTupleElemType(ArgsT, 11), a12: BridgeTupleElemType(ArgsT, 12), a13: BridgeTupleElemType(ArgsT, 13), a14: BridgeTupleElemType(ArgsT, 14), a15: BridgeTupleElemType(ArgsT, 15), a16: BridgeTupleElemType(ArgsT, 16)) OutRet { return invokeTuple(.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16 }); }
+        \\        };
+        \\    }
+        \\
+        \\    pub fn wrapZigarExportedFn(
+        \\        comptime FnT: type,
+        \\        comptime is_memory64: bool,
+        \\        comptime impl_fn: FnT,
+        \\        comptime mem_ctx_ptr: anytype,
+        \\        comptime unwrap_result: bool,
+        \\    ) ZigarBridgeFnType(FnT, @TypeOf(mem_ctx_ptr), unwrap_result) {
+        \\        const f = @typeInfo(FnT).@"fn";
+        \\        const ArgsT = std.meta.ArgsTuple(FnT);
+        \\        const RetT = ReturnType(FnT);
+        \\        const MemCtxPtrT = @TypeOf(mem_ctx_ptr);
+        \\        const OutRet = ZigarBridgeReturnType(FnT, MemCtxPtrT, unwrap_result);
+        \\        const has_mem_ctx = (MemCtxPtrT != @TypeOf(null) and MemCtxPtrT != void);
+        \\        const Invoker = struct {
+        \\            fn callTuple(args: ArgsT) OutRet {
+        \\                if (comptime has_mem_ctx) {
+        \\                    const FastL = fast_abi.FastLower(FnT, is_memory64);
+        \\                    const FastU = fast_abi.FastLift(FnT, impl_fn, is_memory64);
+        \\                    const raw_ret = try FastL.call(mem_ctx_ptr, FastU.createThunk(mem_ctx_ptr), args);
+        \\                    if (comptime unwrap_result and isWitResult(RetT)) {
+        \\                        return try unwrapWitResult(raw_ret);
+        \\                    }
+        \\                    return raw_ret;
+        \\                } else {
+        \\                    const raw_ret: RetT = @call(.auto, impl_fn, args);
+        \\                    if (comptime unwrap_result and isWitResult(RetT)) {
+        \\                        return try unwrapWitResult(raw_ret);
+        \\                    }
+        \\                    return raw_ret;
+        \\                }
+        \\            }
+        \\        };
+        \\        const pyramid = getBridgeSpreadPyramid(ArgsT, OutRet, Invoker.callTuple);
+        \\        const caller_name = std.fmt.comptimePrint("call{d}", .{f.param_types.len});
+        \\        return @field(pyramid, caller_name);
+        \\    }
+        \\
+        \\    pub fn runWrappedOnShadowStack(
+        \\        comptime func: anytype,
+        \\        task_ctx: anytype,
+        \\        args: std.meta.ArgsTuple(@TypeOf(func)),
+        \\    ) ReturnType(@TypeOf(func)) {
+        \\        const ArgsT = std.meta.ArgsTuple(@TypeOf(func));
+        \\        const OutT = ReturnType(@TypeOf(func));
+        \\        const Runner = struct {
+        \\            fn invoke(a: *const ArgsT) OutT {
+        \\                return @call(.auto, func, a.*);
+        \\            }
+        \\        };
+        \\        return task_ctx.run(Runner.invoke, .{&args});
+        \\    }
         \\};
         \\
         \\
@@ -2563,7 +2840,8 @@ fn emitWorldLevelBindings(
             opts,
             "",
         );
-        try w.writeAll("pub const exportWorldBindings = exportBindings;\n\n");
+        try w.writeAll("pub const exportWorldBindings = exportBindings;\n");
+        try w.writeAll("pub const exportWorldZigarBridge = exportZigarBridge;\n\n");
     }
 
     // Also emit any plain `decoded.func_externs` (when no world-level types existed).
@@ -2617,7 +2895,10 @@ fn emitWorldLevelBindings(
             opts,
             "",
         );
-        try w.writeAll("pub const exportWorldBindings = exportBindings;\n\n");
+        try w.writeAll("pub const exportWorldBindings = exportBindings;\n");
+        try w.writeAll("pub const exportWorldZigarBridge = exportZigarBridge;\n\n");
+    } else if (synth_export_ib == null) {
+        try emitWorldInterfaceZigarBridgeHelper(ar, w, iface_bindings);
     }
 }
 
@@ -2853,6 +3134,9 @@ fn emitTypeDef(
                     const f_ty = try formatWitType(ar, f.type);
                     try w.print("{s}    {s}: {s},\n", .{ indent, f_snake, f_ty });
                 }
+                try w.print("{s}    pub const WitLastErrorSlot = struct {{\n", .{indent});
+                try w.print("{s}        pub threadlocal var last_err: ?{s} = null;\n", .{ indent, pascal_name });
+                try w.print("{s}    }};\n", .{indent});
                 try w.print("{s}}};\n\n", .{indent});
             } else {
                 try w.print("{s}pub const {s} = struct {{\n", .{ indent, pascal_name });
@@ -2868,6 +3152,9 @@ fn emitTypeDef(
                     try w.print("{s}        {s}: {s},\n", .{ indent, f_snake, wire_ty });
                 }
                 try w.print("{s}    }};\n", .{indent});
+                try w.print("{s}    pub const WitLastErrorSlot = struct {{\n", .{indent});
+                try w.print("{s}        pub threadlocal var last_err: ?{s} = null;\n", .{ indent, pascal_name });
+                try w.print("{s}    }};\n", .{indent});
                 try w.print("{s}}};\n\n", .{indent});
             }
         },
@@ -2878,6 +3165,9 @@ fn emitTypeDef(
                 const c_snake = try toSnakeCase(ar, c);
                 try w.print("{s}    {s} = {d},\n", .{ indent, c_snake, idx });
             }
+            try w.print("{s}    pub const WitLastErrorSlot = struct {{\n", .{indent});
+            try w.print("{s}        pub threadlocal var last_err: ?{s} = null;\n", .{ indent, pascal_name });
+            try w.print("{s}    }};\n", .{indent});
             try w.print("{s}}};\n\n", .{indent});
         },
         .flags => |flags| {
@@ -2886,6 +3176,9 @@ fn emitTypeDef(
                 try w.print("{s}pub const {s} = packed struct(u8) {{\n", .{ indent, pascal_name });
                 try w.print("{s}    _padding: u8 = 0,\n", .{indent});
                 try w.print("{s}    pub const wit_flags_count: u32 = 0;\n", .{indent});
+                try w.print("{s}    pub const WitLastErrorSlot = struct {{\n", .{indent});
+                try w.print("{s}        pub threadlocal var last_err: ?{s} = null;\n", .{ indent, pascal_name });
+                try w.print("{s}    }};\n", .{indent});
                 try w.print("{s}}};\n\n", .{indent});
             } else if (f_count <= 32) {
                 const backing_bits: usize = if (f_count <= 8)
@@ -2904,6 +3197,9 @@ fn emitTypeDef(
                     try w.print("{s}    _padding: u{d} = 0,\n", .{ indent, pad_bits });
                 }
                 try w.print("{s}    pub const wit_flags_count: u32 = {d};\n", .{ indent, f_count });
+                try w.print("{s}    pub const WitLastErrorSlot = struct {{\n", .{indent});
+                try w.print("{s}        pub threadlocal var last_err: ?{s} = null;\n", .{ indent, pascal_name });
+                try w.print("{s}    }};\n", .{indent});
                 try w.print("{s}}};\n\n", .{indent});
             } else {
                 const num_words = (f_count + 31) / 32;
@@ -2944,6 +3240,9 @@ fn emitTypeDef(
                 try w.print("{s}        }}\n", .{indent});
                 try w.print("{s}        return out;\n", .{indent});
                 try w.print("{s}    }}\n", .{indent});
+                try w.print("{s}    pub const WitLastErrorSlot = struct {{\n", .{indent});
+                try w.print("{s}        pub threadlocal var last_err: ?{s} = null;\n", .{ indent, pascal_name });
+                try w.print("{s}    }};\n", .{indent});
                 try w.print("{s}}};\n\n", .{indent});
             }
         },
@@ -2959,6 +3258,9 @@ fn emitTypeDef(
                     try w.print("{s}    {s}: void,\n", .{ indent, c_snake });
                 }
             }
+            try w.print("{s}    pub const WitLastErrorSlot = struct {{\n", .{indent});
+            try w.print("{s}        pub threadlocal var last_err: ?{s} = null;\n", .{ indent, pascal_name });
+            try w.print("{s}    }};\n", .{indent});
             try w.print("{s}}};\n\n", .{indent});
         },
         .resource => |methods| {
@@ -3424,7 +3726,355 @@ fn emitExportBindingsHelper(
     }
     try w.print("{s}        }}\n", .{indent});
     try w.print("{s}    }};\n", .{indent});
+    try w.print("{s}}}\n\n", .{indent});
+
+    try w.print("{s}pub fn exportZigarBridge(comptime Impl: type, comptime mem_ctx_ptr: anytype) type {{\n", .{indent});
+    try w.print("{s}    const _Outer = @This();\n", .{indent});
+    try w.print("{s}    return struct {{\n", .{indent});
+    try w.print("{s}        pub const Interface = _Outer;\n", .{indent});
+    try w.print("{s}        pub const Implementation = Impl;\n", .{indent});
+    try w.print("{s}        pub const Exported = _Outer.exportBindings(Impl);\n", .{indent});
+    try w.print("{s}        pub const scratch_ptr = canon.fast_abi.fastScratchPtr;\n", .{indent});
+    try w.print("{s}        pub const scratch_len = canon.fast_abi.fastScratchLen;\n", .{indent});
+    try w.print("{s}        pub const zigar_abi_entries = Exported.zigar_abi_entries;\n", .{indent});
+    try w.print("{s}        pub const registerCoreExports = Exported.registerCoreExports;\n", .{indent});
+    try w.print("{s}        pub const Char = canon.PrimChar;\n", .{indent});
+    try w.print("{s}        pub const Result = canon.PrimResult;\n", .{indent});
+    try w.print("{s}        pub const Own = canon.PrimOwn;\n", .{indent});
+    try w.print("{s}        pub const Borrow = canon.PrimBorrow;\n", .{indent});
+    try w.print("{s}        pub const Stream = canon.PrimStream;\n", .{indent});
+    try w.print("{s}        pub const Future = canon.PrimFuture;\n", .{indent});
+    try w.print("{s}        pub const ErrorContext = canon.PrimErrorContext;\n", .{indent});
+    try w.print("{s}        pub const WitString = canon.PrimWitString;\n", .{indent});
+    try w.print("{s}        pub const CanonSlice = canon.PrimCanonSlice;\n", .{indent});
+    try w.print("{s}        pub const WitErrorSet = canon.WitErrorSet;\n", .{indent});
+    try w.print("{s}        pub const BridgeError = canon.BridgeError;\n", .{indent});
+    try w.print("{s}        pub const LastWitErrorStore = canon.LastWitErrorStore;\n", .{indent});
+    try w.print("{s}        pub const getLastWitError = canon.getLastWitError;\n", .{indent});
+    try w.print("{s}        pub const setLastWitError = canon.setLastWitError;\n", .{indent});
+    try w.print("{s}        pub const clearLastWitError = canon.clearLastWitError;\n", .{indent});
+    try w.print("{s}        pub const unwrapWitResult = canon.unwrapWitResult;\n", .{indent});
+    try w.print("{s}        pub const wrapWitResult = canon.wrapWitResult;\n", .{indent});
+
+    var seen_types = std.StringHashMapUnmanaged(void).empty;
+    for ([_][]const u8{
+        "Interface",        "Implementation",     "Exported",        "scratch_ptr",
+        "scratch_len",      "zigar_abi_entries",  "registerCoreExports", "Char",
+        "Result",           "Own",                "Borrow",          "Stream",
+        "Future",           "ErrorContext",       "WitString",       "CanonSlice",
+        "WitErrorSet",      "BridgeError",        "LastWitErrorStore", "getLastWitError",
+        "setLastWitError",  "clearLastWitError",  "unwrapWitResult", "wrapWitResult",
+    }) |reserved| {
+        try seen_types.put(ar, reserved, {});
+    }
+
+    for (items) |it| {
+        switch (it) {
+            .use => |u| {
+                for (u.names) |un| {
+                    const orig_pascal = try toPascalCase(ar, un.name);
+                    const alias_pascal = if (un.rename) |ren|
+                        try toPascalCase(ar, ren)
+                    else
+                        orig_pascal;
+                    if (!seen_types.contains(alias_pascal)) {
+                        try seen_types.put(ar, alias_pascal, {});
+                        try w.print("{s}        pub const {s} = _Outer.{s};\n", .{ indent, alias_pascal, alias_pascal });
+                    }
+                }
+            },
+            .type => |td| {
+                const pascal_name = try toPascalCase(ar, td.name);
+                if (!seen_types.contains(pascal_name)) {
+                    try seen_types.put(ar, pascal_name, {});
+                    try w.print("{s}        pub const {s} = _Outer.{s};\n", .{ indent, pascal_name, pascal_name });
+                }
+            },
+            .func => {},
+        }
+    }
+
+    for (items) |it| {
+        if (it != .func) continue;
+        if (findFuncRef(ext_funcs, it.func.name) == null) continue;
+        const raw_snake = try toRawSnakeCase(ar, it.func.name);
+        const collides = import_collisions.contains(it.func.name);
+        const decl_base = if (collides)
+            try std.fmt.allocPrint(ar, "export_{s}", .{raw_snake})
+        else
+            raw_snake;
+        const escaped_decl = try escapeZigId(ar, decl_base);
+
+        try w.print("{s}        pub const {s}_Fn = _Outer.{s}_Fn;\n", .{ indent, decl_base, decl_base });
+        try w.print("{s}        pub const {s}_fn_t = _Outer.{s}_fn_t;\n", .{ indent, decl_base, decl_base });
+        try w.print("{s}        pub const {s}_CoreFn = _Outer.{s}_CoreFn;\n", .{ indent, decl_base, decl_base });
+        try w.print("{s}        pub const {s}_sig = _Outer.{s}_sig;\n", .{ indent, decl_base, decl_base });
+        try w.print("{s}        pub const {s}_meta = _Outer.{s}_meta;\n", .{ indent, decl_base, decl_base });
+        try w.print("{s}        pub const {s}_canon_meta = _Outer.{s}_canon_meta;\n", .{ indent, decl_base, decl_base });
+        try w.print("{s}        pub const {s}_zigar_abi_hash = _Outer.{s}_zigar_abi_hash;\n", .{ indent, decl_base, decl_base });
+        try w.print("{s}        pub const fast_{s} = Exported.fast_{s};\n", .{ indent, decl_base, decl_base });
+        try w.print(
+            "{s}        pub const {s} = if (@hasDecl(Impl, \"{s}\") and @TypeOf(@field(Impl, \"{s}\")) == _Outer.{s}_fn_t)\n" ++
+                "{s}            canon.wrapZigarExportedFn(_Outer.{s}_fn_t, {s}, @field(Impl, \"{s}\"), mem_ctx_ptr, true)\n" ++
+                "{s}        else if (@hasDecl(Impl, \"{s}\"))\n" ++
+                "{s}            @field(Impl, \"{s}\")\n" ++
+                "{s}        else\n" ++
+                "{s}            void;\n",
+            .{
+                indent,
+                escaped_decl,
+                raw_snake,
+                raw_snake,
+                decl_base,
+                indent,
+                decl_base,
+                is_mem64_lit,
+                raw_snake,
+                indent,
+                raw_snake,
+                indent,
+                raw_snake,
+                indent,
+                indent,
+            },
+        );
+        try w.print(
+            "{s}        pub const {s}_raw = if (@hasDecl(Impl, \"{s}\") and @TypeOf(@field(Impl, \"{s}\")) == _Outer.{s}_fn_t)\n" ++
+                "{s}            canon.wrapZigarExportedFn(_Outer.{s}_fn_t, {s}, @field(Impl, \"{s}\"), mem_ctx_ptr, false)\n" ++
+                "{s}        else if (@hasDecl(Impl, \"{s}\"))\n" ++
+                "{s}            @field(Impl, \"{s}\")\n" ++
+                "{s}        else\n" ++
+                "{s}            void;\n",
+            .{
+                indent,
+                decl_base,
+                raw_snake,
+                raw_snake,
+                decl_base,
+                indent,
+                decl_base,
+                is_mem64_lit,
+                raw_snake,
+                indent,
+                raw_snake,
+                indent,
+                raw_snake,
+                indent,
+                indent,
+            },
+        );
+    }
+
+    try w.print(
+        \\{s}        pub fn callRaw(
+        \\{s}            comptime func_name: []const u8,
+        \\{s}            args: std.meta.ArgsTuple(@field(@This(), func_name ++ "_Fn")),
+        \\{s}        ) canon.ZigarBridgeReturnType(@field(@This(), func_name ++ "_Fn"), @TypeOf(mem_ctx_ptr), false) {{
+        \\{s}            return @call(.auto, @field(@This(), func_name ++ "_raw"), args);
+        \\{s}        }}
+        \\
+        \\{s}        pub fn call(
+        \\{s}            comptime func_name: []const u8,
+        \\{s}            args: std.meta.ArgsTuple(@field(@This(), func_name ++ "_Fn")),
+        \\{s}        ) canon.ZigarBridgeReturnType(@field(@This(), func_name ++ "_Fn"), @TypeOf(mem_ctx_ptr), true) {{
+        \\{s}            return @call(.auto, @field(@This(), func_name), args);
+        \\{s}        }}
+        \\
+        \\{s}        pub fn callRawOnShadowStack(
+        \\{s}            comptime func_name: []const u8,
+        \\{s}            task_ctx: anytype,
+        \\{s}            args: std.meta.ArgsTuple(@field(@This(), func_name ++ "_Fn")),
+        \\{s}        ) canon.ZigarBridgeReturnType(@field(@This(), func_name ++ "_Fn"), @TypeOf(mem_ctx_ptr), false) {{
+        \\{s}            return canon.runWrappedOnShadowStack(@field(@This(), func_name ++ "_raw"), task_ctx, args);
+        \\{s}        }}
+        \\
+        \\{s}        pub fn callOnShadowStack(
+        \\{s}            comptime func_name: []const u8,
+        \\{s}            task_ctx: anytype,
+        \\{s}            args: std.meta.ArgsTuple(@field(@This(), func_name ++ "_Fn")),
+        \\{s}        ) canon.ZigarBridgeReturnType(@field(@This(), func_name ++ "_Fn"), @TypeOf(mem_ctx_ptr), true) {{
+        \\{s}            return canon.runWrappedOnShadowStack(@field(@This(), func_name), task_ctx, args);
+        \\{s}        }}
+        \\
+    , .{
+        indent, indent, indent, indent, indent, indent,
+        indent, indent, indent, indent, indent, indent,
+        indent, indent, indent, indent, indent, indent, indent,
+        indent, indent, indent, indent, indent, indent, indent,
+    });
+    try w.print("{s}    }};\n", .{indent});
     try w.print("{s}}}\n", .{indent});
+}
+
+fn emitWorldInterfaceZigarBridgeHelper(
+    ar: Allocator,
+    w: anytype,
+    iface_bindings: []const InterfaceBinding,
+) BindgenError!void {
+    try w.writeAll("pub fn exportZigarBridge(comptime Impl: type, comptime mem_ctx_ptr: anytype) type {\n");
+    try w.writeAll("    const _World = @This();\n");
+    try w.writeAll("    return struct {\n");
+    try w.writeAll("        pub const World = _World;\n");
+    try w.writeAll("        pub const Implementation = Impl;\n");
+    try w.writeAll("        pub const scratch_ptr = canon.fast_abi.fastScratchPtr;\n");
+    try w.writeAll("        pub const scratch_len = canon.fast_abi.fastScratchLen;\n");
+    try w.writeAll("        pub const Char = canon.PrimChar;\n");
+    try w.writeAll("        pub const Result = canon.PrimResult;\n");
+    try w.writeAll("        pub const Own = canon.PrimOwn;\n");
+    try w.writeAll("        pub const Borrow = canon.PrimBorrow;\n");
+    try w.writeAll("        pub const Stream = canon.PrimStream;\n");
+    try w.writeAll("        pub const Future = canon.PrimFuture;\n");
+    try w.writeAll("        pub const ErrorContext = canon.PrimErrorContext;\n");
+    try w.writeAll("        pub const WitString = canon.PrimWitString;\n");
+    try w.writeAll("        pub const CanonSlice = canon.PrimCanonSlice;\n");
+    try w.writeAll("        pub const WitErrorSet = canon.WitErrorSet;\n");
+    try w.writeAll("        pub const BridgeError = canon.BridgeError;\n");
+    try w.writeAll("        pub const LastWitErrorStore = canon.LastWitErrorStore;\n");
+    try w.writeAll("        pub const getLastWitError = canon.getLastWitError;\n");
+    try w.writeAll("        pub const setLastWitError = canon.setLastWitError;\n");
+    try w.writeAll("        pub const clearLastWitError = canon.clearLastWitError;\n");
+    try w.writeAll("        pub const unwrapWitResult = canon.unwrapWitResult;\n");
+    try w.writeAll("        pub const wrapWitResult = canon.wrapWitResult;\n");
+
+    var seen_decls = std.StringHashMapUnmanaged(void).empty;
+    for ([_][]const u8{
+        "World",            "Implementation",     "scratch_ptr",       "scratch_len",
+        "Char",             "Result",             "Own",               "Borrow",
+        "Stream",           "Future",             "ErrorContext",      "WitString",
+        "CanonSlice",       "WitErrorSet",        "BridgeError",       "LastWitErrorStore",
+        "getLastWitError",  "setLastWitError",    "clearLastWitError", "unwrapWitResult",
+        "wrapWitResult",    "call",               "callRaw",           "callOnShadowStack",
+        "callRawOnShadowStack",
+    }) |reserved| {
+        try seen_decls.put(ar, reserved, {});
+    }
+
+    for (iface_bindings) |ib| {
+        if (ib.is_synth_world) continue;
+        try seen_decls.put(ar, ib.zig_ident, {});
+        if (ib.ext.is_export) {
+            if (ib.alias_ident) |al| {
+                try w.print(
+                    "        pub const {s} = if (@hasDecl(Impl, \"{s}\"))\n" ++
+                        "            _World.{s}.exportZigarBridge(@field(Impl, \"{s}\"), mem_ctx_ptr)\n" ++
+                        "        else if (@hasDecl(Impl, \"{s}\"))\n" ++
+                        "            _World.{s}.exportZigarBridge(@field(Impl, \"{s}\"), mem_ctx_ptr)\n" ++
+                        "        else\n" ++
+                        "            _World.{s}.exportZigarBridge(Impl, mem_ctx_ptr);\n",
+                    .{ ib.zig_ident, ib.zig_ident, ib.zig_ident, ib.zig_ident, al, ib.zig_ident, al, ib.zig_ident },
+                );
+            } else {
+                try w.print(
+                    "        pub const {s} = if (@hasDecl(Impl, \"{s}\"))\n" ++
+                        "            _World.{s}.exportZigarBridge(@field(Impl, \"{s}\"), mem_ctx_ptr)\n" ++
+                        "        else\n" ++
+                        "            _World.{s}.exportZigarBridge(Impl, mem_ctx_ptr);\n",
+                    .{ ib.zig_ident, ib.zig_ident, ib.zig_ident, ib.zig_ident, ib.zig_ident },
+                );
+            }
+        } else {
+            try w.print("        pub const {s} = _World.{s};\n", .{ ib.zig_ident, ib.zig_ident });
+        }
+        if (ib.alias_ident) |al| {
+            if (!seen_decls.contains(al)) {
+                try seen_decls.put(ar, al, {});
+                try w.print("        pub const {s} = @This().{s};\n", .{ al, ib.zig_ident });
+            }
+        }
+    }
+
+    for (iface_bindings) |ib| {
+        for (ib.items) |it| {
+            switch (it) {
+                .use => |u| {
+                    for (u.names) |un| {
+                        const orig_pascal = try toPascalCase(ar, un.name);
+                        const alias_pascal = if (un.rename) |ren|
+                            try toPascalCase(ar, ren)
+                        else
+                            orig_pascal;
+                        if (!seen_decls.contains(alias_pascal)) {
+                            try seen_decls.put(ar, alias_pascal, {});
+                            if (ib.is_synth_world) {
+                                try w.print("        pub const {s} = _World.{s};\n", .{ alias_pascal, alias_pascal });
+                            } else {
+                                try w.print("        pub const {s} = _World.{s}.{s};\n", .{ alias_pascal, ib.zig_ident, alias_pascal });
+                            }
+                        }
+                    }
+                },
+                .type => |td| {
+                    const pascal_name = try toPascalCase(ar, td.name);
+                    if (!seen_decls.contains(pascal_name)) {
+                        try seen_decls.put(ar, pascal_name, {});
+                        if (ib.is_synth_world) {
+                            try w.print("        pub const {s} = _World.{s};\n", .{ pascal_name, pascal_name });
+                        } else {
+                            try w.print("        pub const {s} = _World.{s}.{s};\n", .{ pascal_name, ib.zig_ident, pascal_name });
+                        }
+                    }
+                },
+                .func => {},
+            }
+        }
+    }
+
+    for (iface_bindings) |ib| {
+        if (ib.is_synth_world or !ib.ext.is_export) continue;
+        for (ib.items) |it| {
+            if (it != .func) continue;
+            if (findFuncRef(ib.ext.funcs, it.func.name) == null) continue;
+            const raw_snake = try toRawSnakeCase(ar, it.func.name);
+            const escaped_snake = try escapeZigId(ar, raw_snake);
+            if (!seen_decls.contains(raw_snake)) {
+                try seen_decls.put(ar, raw_snake, {});
+                try w.print("        pub const {s}_Fn = @This().{s}.{s}_Fn;\n", .{ raw_snake, ib.zig_ident, raw_snake });
+                try w.print("        pub const {s}_fn_t = @This().{s}.{s}_fn_t;\n", .{ raw_snake, ib.zig_ident, raw_snake });
+                try w.print("        pub const {s}_CoreFn = @This().{s}.{s}_CoreFn;\n", .{ raw_snake, ib.zig_ident, raw_snake });
+                try w.print("        pub const {s}_meta = @This().{s}.{s}_meta;\n", .{ raw_snake, ib.zig_ident, raw_snake });
+                try w.print("        pub const {s}_zigar_abi_hash = @This().{s}.{s}_zigar_abi_hash;\n", .{ raw_snake, ib.zig_ident, raw_snake });
+                try w.print("        pub const fast_{s} = @This().{s}.fast_{s};\n", .{ raw_snake, ib.zig_ident, raw_snake });
+                try w.print("        pub const {s} = @This().{s}.{s};\n", .{ escaped_snake, ib.zig_ident, escaped_snake });
+                try w.print("        pub const {s}_raw = @This().{s}.{s}_raw;\n", .{ raw_snake, ib.zig_ident, raw_snake });
+            }
+        }
+    }
+
+    try w.writeAll(
+        \\        pub fn callRaw(
+        \\            comptime func_name: []const u8,
+        \\            args: std.meta.ArgsTuple(@field(@This(), func_name ++ "_Fn")),
+        \\        ) canon.ZigarBridgeReturnType(@field(@This(), func_name ++ "_Fn"), @TypeOf(mem_ctx_ptr), false) {
+        \\            return @call(.auto, @field(@This(), func_name ++ "_raw"), args);
+        \\        }
+        \\
+        \\        pub fn call(
+        \\            comptime func_name: []const u8,
+        \\            args: std.meta.ArgsTuple(@field(@This(), func_name ++ "_Fn")),
+        \\        ) canon.ZigarBridgeReturnType(@field(@This(), func_name ++ "_Fn"), @TypeOf(mem_ctx_ptr), true) {
+        \\            return @call(.auto, @field(@This(), func_name), args);
+        \\        }
+        \\
+        \\        pub fn callRawOnShadowStack(
+        \\            comptime func_name: []const u8,
+        \\            task_ctx: anytype,
+        \\            args: std.meta.ArgsTuple(@field(@This(), func_name ++ "_Fn")),
+        \\        ) canon.ZigarBridgeReturnType(@field(@This(), func_name ++ "_Fn"), @TypeOf(mem_ctx_ptr), false) {
+        \\            return canon.runWrappedOnShadowStack(@field(@This(), func_name ++ "_raw"), task_ctx, args);
+        \\        }
+        \\
+        \\        pub fn callOnShadowStack(
+        \\            comptime func_name: []const u8,
+        \\            task_ctx: anytype,
+        \\            args: std.meta.ArgsTuple(@field(@This(), func_name ++ "_Fn")),
+        \\        ) canon.ZigarBridgeReturnType(@field(@This(), func_name ++ "_Fn"), @TypeOf(mem_ctx_ptr), true) {
+        \\            return canon.runWrappedOnShadowStack(@field(@This(), func_name), task_ctx, args);
+        \\        }
+        \\
+    );
+    try w.writeAll("    };\n");
+    try w.writeAll("}\n");
+    try w.writeAll("pub const exportWorldZigarBridge = exportZigarBridge;\n\n");
 }
 
 fn emitWorldZigarAbiNamespace(

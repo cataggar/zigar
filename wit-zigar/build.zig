@@ -3,11 +3,15 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const is_aarch64_host = target.result.cpu.arch == .aarch64 and (@import("builtin").zig_backend == .stage2_aarch64);
+    const strip: ?bool = if (is_aarch64_host) true else null;
+    const use_llvm: ?bool = if (is_aarch64_host) false else null;
 
     const mod = b.addModule("wit-zigar", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
     mod.addAnonymousImport("sample_wit", .{
         .root_source_file = b.path("test/fixtures/sample.wit"),
@@ -19,6 +23,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
         }),
     });
     b.installArtifact(exe);
@@ -32,6 +37,7 @@ pub fn build(b: *std.Build) void {
     // 1. Unit + integration tests on `src/root.zig`
     const unit_tests = b.addTest(.{
         .root_module = mod,
+        .use_llvm = use_llvm,
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
@@ -53,6 +59,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("test/generated_bindings_test.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
     gen_test_mod.addImport("wit_zigar", mod);
     gen_test_mod.addAnonymousImport("generated_wasi_cli", .{
@@ -67,6 +74,7 @@ pub fn build(b: *std.Build) void {
 
     const gen_tests = b.addTest(.{
         .root_module = gen_test_mod,
+        .use_llvm = use_llvm,
     });
     const run_gen_tests = b.addRunArtifact(gen_tests);
 

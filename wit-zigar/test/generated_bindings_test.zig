@@ -766,4 +766,372 @@ test "generated fast_abi bindings: <fn>_zigar_abi_hash, exportBindings(Impl).fas
     try testing.expectEqual(@as(u32, 0xDEADBEEF), odd_u32[1]);
 }
 
+test "Phase 5 generated sample.wit async functions over AsyncScheduler and exportZigarBridge / ZigarBridge round-trips" {
+    const alloc = testing.allocator;
+    const async_rt = wit_zigar.async_runtime;
+    const bridge = wit_zigar.zigar_bridge;
+
+    // ── Part 1: Generated `HostApi.async_five_Fn` and `GuestService.async_compute_Fn`
+    //            over `AsyncScheduler` + `configureMemoryContext` + `TaskContext` shadow stacks ──
+    var sched = async_rt.AsyncScheduler.init(alloc);
+    defer sched.deinit();
+
+    var host_sp: usize = 0x7800_0000;
+    sched.sp_binding = async_rt.StackPointerBinding.fromHostSlot(&host_sp);
+
+    var mem_buf: [32768]u8 align(16) = @splat(0);
+    var bump = canon.BumpAllocator.init(128, mem_buf.len);
+    var mem_ctx = bump.memoryContext(&mem_buf);
+    mem_ctx.allocator = alloc;
+    sched.configureMemoryContext(&mem_ctx);
+
+    const ws = try sched.waitableSetNew();
+    defer sched.waitableSetDrop(ws) catch unreachable;
+    const stream_pair = try sched.streamNewWithCapacity(32);
+    defer {
+        sched.streamDropReadable(stream_pair.readable) catch {};
+        sched.streamDropWritable(stream_pair.writable) catch {};
+    }
+    const future_pair = try sched.futureNew(4);
+    defer {
+        sched.futureDropReadable(future_pair.readable) catch {};
+        sched.futureDropWritable(future_pair.writable) catch {};
+    }
+    try sched.waitableJoin(stream_pair.readable, ws);
+    try sched.waitableJoin(future_pair.readable, ws);
+
+    // Initiate blocked reads on stream & future into guest memory
+    try testing.expectEqual(async_rt.BLOCKED, try sched.streamRead(stream_pair.readable, &mem_ctx, 640, 6));
+    try testing.expectEqual(async_rt.BLOCKED, try sched.futureRead(future_pair.readable, &mem_ctx, 656, 4));
+
+    // Pending async host import for `HostApi.async_five_Fn`
+    const AsyncFivePendingEnv = struct {
+        sched_ptr: *async_rt.AsyncScheduler,
+        mem_ctx_ptr: *canon.MemoryContext,
+        host_sp_ptr: *usize,
+        stream_w: i32,
+        future_w: i32,
+        params_ptr: usize = 0,
+        ret_ptr: usize = 0,
+        steps: u32 = 0,
+        sp_during_wait: usize = 0,
+
+        var current: ?*@This() = null;
+
+        fn step(raw_ctx: ?*anyopaque, s: *async_rt.AsyncScheduler, _: i32) !async_rt.SubtaskState {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            self.steps += 1;
+            if (self.steps == 1) {
+                self.sp_during_wait = self.host_sp_ptr.*;
+                _ = try s.streamWriteSlice(self.stream_w, "wakeup");
+                var fut_val: [4]u8 = undefined;
+                std.mem.writeInt(u32, &fut_val, 77, .little);
+                _ = try s.futureWriteSlice(self.future_w, &fut_val);
+                return .started;
+            }
+            const mctx = self.mem_ctx_ptr.*;
+            const a = try canon.loadFromMemory(u32, .wasm32, mctx, self.params_ptr + 0);
+            const b = try canon.loadFromMemory(u32, .wasm32, mctx, self.params_ptr + 4);
+            const c = try canon.loadFromMemory(u32, .wasm32, mctx, self.params_ptr + 8);
+            const d = try canon.loadFromMemory(u32, .wasm32, mctx, self.params_ptr + 12);
+            const e = try canon.loadFromMemory(u32, .wasm32, mctx, self.params_ptr + 16);
+            try canon.storeToMemory(u64, .wasm32, mctx, self.ret_ptr, @as(u64, a) + b + c + d + e);
+            return .returned;
+        }
+
+        fn coreFn(params_ptr: i32, ret_ptr: i32) i32 {
+            const self = current.?;
+            self.params_ptr = @intCast(@as(u32, @bitCast(params_ptr)));
+            self.ret_ptr = @intCast(@as(u32, @bitCast(ret_ptr)));
+            const handle = self.sched_ptr.spawnAsyncSubtask(self, step) catch unreachable;
+            return async_rt.SubtaskState.started.pack(@intCast(handle));
+        }
+    };
+
+    var five_env = AsyncFivePendingEnv{
+        .sched_ptr = &sched,
+        .mem_ctx_ptr = &mem_ctx,
+        .host_sp_ptr = &host_sp,
+        .stream_w = stream_pair.writable,
+        .future_w = future_pair.writable,
+    };
+    AsyncFivePendingEnv.current = &five_env;
+    defer AsyncFivePendingEnv.current = null;
+
+    const stack = try sched.stack_pool.acquire(alloc);
+    var stack_released = false;
+    defer if (!stack_released) {
+        sched.stack_pool.release(alloc, stack) catch {};
+    };
+    var task_ctx = async_rt.TaskContext.init(stack, sched.sp_binding);
+    sched.active_task = &task_ctx;
+    defer sched.active_task = null;
+
+    task_ctx.enter();
+    try testing.expectEqual(stack.initialTop(), host_sp);
+
+    const five_total = try canon.CanonLower(HostApi.async_five_Fn, .{
+        .arch = .wasm32,
+        .is_async = HostApi.async_five_meta.is_async,
+    }).call(mem_ctx, &AsyncFivePendingEnv.coreFn, .{ 11, 22, 33, 44, 55 });
+    try testing.expectEqual(@as(u64, 165), five_total);
+    try testing.expectEqual(@as(u32, 2), five_env.steps);
+    try testing.expectEqual(@as(usize, 0x7800_0000), five_env.sp_during_wait);
+    try testing.expectEqual(stack.initialTop(), host_sp);
+
+    // Collect the stream and future wakeup events on `ws`
+    const w_ev1 = try sched.waitableSetWait(ws, &mem_ctx, 672);
+    const w_ev2 = try sched.waitableSetWait(ws, &mem_ctx, 680);
+    try testing.expect((w_ev1.code == .stream_read and w_ev2.code == .future_read) or
+        (w_ev1.code == .future_read and w_ev2.code == .stream_read));
+    try testing.expectEqualStrings("wakeup", mem_buf[640..646]);
+    try testing.expectEqual(@as(u32, 77), std.mem.readInt(u32, mem_buf[656..660], .little));
+
+    try task_ctx.complete();
+    stack_released = true;
+    try sched.stack_pool.release(alloc, stack);
+
+    // Deferred `[task-return]` completion on generated `GuestService.async_compute_Fn`
+    const AsyncComputeDeferredGuest = struct {
+        sched_ptr: *async_rt.AsyncScheduler,
+        args: [5]u32 = .{ 0, 0, 0, 0, 0 },
+        steps: u32 = 0,
+
+        var current: ?*@This() = null;
+
+        fn step(raw_ctx: ?*anyopaque, s: *async_rt.AsyncScheduler, _: i32) !async_rt.SubtaskState {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            self.steps += 1;
+            if (self.steps < 2) return .started;
+            const active = canon.getActiveMemoryContext().?;
+            const RetT = sample.Result(ST.Point, ST.ErrorKind);
+            const res_val: RetT = if (self.args[4] == 0)
+                .{ .err = .timeout }
+            else
+                .{ .ok = .{
+                    .x = @floatFromInt(self.args[0] + self.args[1]),
+                    .y = @floatFromInt(self.args[2] + self.args[3] + self.args[4]),
+                } };
+            const ret_lay = comptime canon.layoutOf(RetT, .wasm32);
+            const ret_ptr = try active.realloc(ret_lay.alignment, ret_lay.size);
+            try canon.storeToMemory(RetT, .wasm32, active, ret_ptr, res_val);
+            if (active.task_return_fn) |tr_fn| {
+                tr_fn(active.task_return_ctx, ret_ptr);
+            }
+            s.notifyTaskReturn();
+            return .returned;
+        }
+
+        fn coreExport(a: i32, b: i32, c: i32, d: i32, e: i32) void {
+            const self = current.?;
+            self.args = .{
+                @bitCast(a),
+                @bitCast(b),
+                @bitCast(c),
+                @bitCast(d),
+                @bitCast(e),
+            };
+            _ = self.sched_ptr.spawnAsyncSubtask(self, step) catch unreachable;
+        }
+    };
+
+    var async_compute_guest = AsyncComputeDeferredGuest{ .sched_ptr = &sched };
+    AsyncComputeDeferredGuest.current = &async_compute_guest;
+    defer AsyncComputeDeferredGuest.current = null;
+
+    const async_compute_ok = try canon.callLifted(
+        GuestService.async_compute_Fn,
+        .{ .arch = .wasm32, .is_async = GuestService.async_compute_meta.is_async },
+        mem_ctx,
+        &AsyncComputeDeferredGuest.coreExport,
+        .{ 3, 4, 5, 6, 7 },
+    );
+    try testing.expect(async_compute_ok == .ok);
+    try testing.expectEqual(ST.Point{ .x = 7.0, .y = 18.0 }, async_compute_ok.ok);
+    try testing.expectEqual(@as(u32, 2), async_compute_guest.steps);
+
+    // ── Part 2: `zigar_bridge.HostInstanceBridge` (`ZigarBridge`) and `bindgen`'s
+    //            `exportZigarBridge` on `generated_sample` (`GuestService` & world level) ──
+    const SampleImpl = struct {
+        pub fn transform_rect(r: ST.Rect, factor: f32) ST.Rect {
+            return .{
+                .origin = .{ .x = r.origin.x * factor, .y = r.origin.y * factor },
+                .extent = .{ .x = r.extent.x * factor, .y = r.extent.y * factor },
+                .id = r.id + 100,
+                .layer = r.layer + 1,
+                .tag = r.tag + 2,
+            };
+        }
+
+        pub fn inspect_record(rec: ST.ComplexRecord) sample.Result([]const u8, ST.ErrorKind) {
+            if (rec.label.len == 0) {
+                return .{ .err = .invalid_input };
+            }
+            if (rec.id == 0) {
+                return .{ .err = .not_found };
+            }
+            return .{ .ok = rec.label };
+        }
+
+        pub fn async_compute(a: u32, b: u32, c: u32, d: u32, e: u32) sample.Result(ST.Point, ST.ErrorKind) {
+            if (e == 0) {
+                return .{ .err = .overflow };
+            }
+            return .{
+                .ok = .{
+                    .x = @floatFromInt(a + b + c),
+                    .y = @floatFromInt(d + e),
+                },
+            };
+        }
+    };
+
+    // 2a. Test generated `GuestService.exportZigarBridge` and world-level `sample.exportZigarBridge`
+    const StaticBridgeCtx = struct {
+        var bm = bridge.BridgeMemory(32768).init();
+        var ctx: sample.canon.MemoryContext = undefined;
+    };
+    StaticBridgeCtx.ctx = .{
+        .memory = StaticBridgeCtx.bm.memorySlice(),
+        .allocator = alloc,
+        .fast_frame_offset = StaticBridgeCtx.bm.fast_frame_offset,
+        .fast_scratch_limit = StaticBridgeCtx.bm.fast_scratch_limit,
+    };
+
+    const ExportedIfaceBridge = GuestService.exportZigarBridge(SampleImpl, &StaticBridgeCtx.ctx);
+    const ExportedWorldBridge = sample.exportZigarBridge(struct {
+        pub const guest_service = SampleImpl;
+    }, &StaticBridgeCtx.ctx);
+
+    // Verify re-exported WIT types on both interface-level and world-level `exportZigarBridge`
+    try testing.expectEqual(ST.Point, ExportedIfaceBridge.Point);
+    try testing.expectEqual(ST.Rect, ExportedIfaceBridge.Rect);
+    try testing.expectEqual(ST.ErrorKind, ExportedIfaceBridge.ErrorKind);
+    try testing.expectEqual(ST.Point, ExportedWorldBridge.shared_types.Point);
+    try testing.expectEqual(ST.Rect, ExportedWorldBridge.guest_service.Rect);
+
+    const rect_in = ST.Rect{
+        .origin = .{ .x = 2.0, .y = 4.0 },
+        .extent = .{ .x = 6.0, .y = 8.0 },
+        .id = 7,
+        .layer = 1,
+        .tag = 9,
+    };
+    const bridged_rect = try ExportedIfaceBridge.transform_rect(rect_in, 1.5);
+    try testing.expectEqual(ST.Point{ .x = 3.0, .y = 6.0 }, bridged_rect.origin);
+    try testing.expectEqual(ST.Point{ .x = 9.0, .y = 12.0 }, bridged_rect.extent);
+    try testing.expectEqual(@as(u32, 107), bridged_rect.id);
+
+    const world_bridged_rect = try ExportedWorldBridge.guest_service.transform_rect(rect_in, 1.5);
+    try testing.expectEqual(bridged_rect, world_bridged_rect);
+
+    // Verify `async_compute` ok + error unwrapping via `exportZigarBridge` and `LastWitErrorStore`
+    const bridged_pt = try ExportedIfaceBridge.async_compute(10, 20, 30, 40, 50);
+    try testing.expectEqual(ST.Point{ .x = 60.0, .y = 90.0 }, bridged_pt);
+
+    ExportedIfaceBridge.clearLastWitError(ST.ErrorKind);
+    try testing.expectError(
+        error.WitResultError,
+        ExportedIfaceBridge.async_compute(10, 20, 30, 40, 0),
+    );
+    try testing.expectEqual(@as(?ST.ErrorKind, .overflow), ExportedIfaceBridge.getLastWitError(ST.ErrorKind));
+    // Also verify `zigar_bridge.getLastWitError(ST.ErrorKind)` shares the same `WitLastErrorSlot`!
+    try testing.expectEqual(@as(?ST.ErrorKind, .overflow), bridge.getLastWitError(ST.ErrorKind));
+
+    // 2b. Test `zigar_bridge.HostInstanceBridge` (`ZigarBridge`) with `GuestService` on `ShadowStackPool`
+    const GuestBridge = bridge.ZigarBridge(GuestService, SampleImpl, .{
+        .unwrap_results = true,
+        .scratch_capacity = 32768,
+        .prefer_fast_abi = true,
+    });
+    var inst = GuestBridge.init(alloc);
+
+    // Zero-copy `[]const ST.Rect` and `[]const ST.Point` in `BridgeMemory`
+    const rects_slice_in = [_]ST.Rect{
+        rect_in,
+        .{
+            .origin = .{ .x = -1.0, .y = -2.0 },
+            .extent = .{ .x = 10.0, .y = 20.0 },
+            .id = 88,
+            .layer = 3,
+            .tag = 12,
+        },
+    };
+    const zero_copy_rects = try inst.bridge_memory.copySliceInPlace(ST.Rect, &rects_slice_in);
+    try testing.expectEqual(@as(usize, 2), zero_copy_rects.len);
+    try testing.expectEqual(rects_slice_in[1], zero_copy_rects[1]);
+
+    const pts_slice_in = [_]ST.Point{ .{ .x = 1.0, .y = 2.0 }, .{ .x = 3.0, .y = 4.0 } };
+    const zero_copy_pts = try inst.bridge_memory.copySliceInPlace(ST.Point, &pts_slice_in);
+
+    const complex_record_in = ST.ComplexRecord{
+        .id = 999,
+        .label = "zero-copy-bridged-record",
+        .points = zero_copy_pts,
+        .tags = &[_][]const u8{ "alpha", "beta" },
+        .maybe_score = 123,
+        .maybe_note = "ok",
+        .outcome = .{ .ok = .{ .x = 5.0, .y = 6.0 } },
+        .tint = .green,
+        .glyph = 'Z',
+        .f8 = .{ .b0 = true },
+        .f16 = .{ .f1 = true },
+        .f32_val = .{ .k0 = true },
+        .f64_val = ST.Flags64.fromPacked(.{ .m0 = true }),
+        .f70 = .{},
+        .v_if = .{ .as_int = 7 },
+        .v_ii = .{ .as_int64 = 8 },
+        .v_ff = .{ .as_f32 = 9.0 },
+        .v_multi = .{ .first = .{ .a = 1.0, .b = 2 } },
+    };
+
+    // Execute both Fast ABI (`zigar:abi`) and Canonical ABI fallback on a `ShadowStackPool` shadow stack
+    const pool_stack = try sched.stack_pool.acquire(alloc);
+    defer sched.stack_pool.release(alloc, pool_stack) catch unreachable;
+    var shadow_task = async_rt.TaskContext.init(pool_stack, sched.sp_binding);
+    shadow_task.enter();
+
+    // Fast ABI path
+    const fast_rect = try inst.call("transform_rect", .{ zero_copy_rects[0], 2.0 });
+    try testing.expectEqual(bridge.DispatchPath.fast_abi, inst.last_dispatch);
+    const fast_label = try inst.call("inspect_record", .{complex_record_in});
+    try testing.expectEqual(bridge.DispatchPath.fast_abi, inst.last_dispatch);
+    try testing.expectEqualStrings("zero-copy-bridged-record", fast_label);
+    const fast_compute = try inst.call("async_compute", .{ 1, 2, 3, 4, 5 });
+    try testing.expectEqual(bridge.DispatchPath.fast_abi, inst.last_dispatch);
+
+    // Canonical ABI fallback path
+    inst.prefer_fast_abi = false;
+    const canon_rect = try inst.call("transform_rect", .{ zero_copy_rects[0], 2.0 });
+    try testing.expectEqual(bridge.DispatchPath.canonical_abi, inst.last_dispatch);
+    const canon_label = try inst.call("inspect_record", .{complex_record_in});
+    try testing.expectEqual(bridge.DispatchPath.canonical_abi, inst.last_dispatch);
+    try testing.expectEqualStrings(fast_label, canon_label);
+    const canon_compute = try inst.call("async_compute", .{ 1, 2, 3, 4, 5 });
+    try testing.expectEqual(bridge.DispatchPath.canonical_abi, inst.last_dispatch);
+
+    try testing.expectEqual(fast_rect, canon_rect);
+    try testing.expectEqual(fast_compute, canon_compute);
+    try testing.expectEqual(ST.Point{ .x = 6.0, .y = 9.0 }, canon_compute);
+
+    // Verify `inspect_record` error unwrapping across both Fast ABI and Canonical ABI
+    var bad_record = complex_record_in;
+    bad_record.label = "";
+
+    inst.prefer_fast_abi = true;
+    bridge.clearLastWitError(ST.ErrorKind);
+    try testing.expectError(error.WitResultError, inst.call("inspect_record", .{bad_record}));
+    try testing.expectEqual(@as(?ST.ErrorKind, .invalid_input), bridge.getLastWitError(ST.ErrorKind));
+
+    bad_record.label = "non-empty";
+    bad_record.id = 0;
+    inst.prefer_fast_abi = false;
+    bridge.clearLastWitError(ST.ErrorKind);
+    try testing.expectError(error.WitResultError, inst.call("inspect_record", .{bad_record}));
+    try testing.expectEqual(@as(?ST.ErrorKind, .not_found), bridge.getLastWitError(ST.ErrorKind));
+
+    try shadow_task.complete();
+}
+
+
 

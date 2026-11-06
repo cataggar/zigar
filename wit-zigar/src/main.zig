@@ -134,15 +134,15 @@ pub fn formatDetectedZigarAbi(
     return out.toOwnedSlice(allocator);
 }
 
-pub fn main(init: std.process.Init) !void {
-    const io = init.io;
+pub fn main(init: std.process.Init.Minimal) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var args_arena = std.heap.ArenaAllocator.init(allocator);
     defer args_arena.deinit();
-    const args = try init.minimal.args.toSlice(args_arena.allocator());
+    const args = try init.args.toSlice(args_arena.allocator());
 
     const parsed = try parseCliArgs(args);
     if (parsed.help) {

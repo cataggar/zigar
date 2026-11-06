@@ -344,8 +344,12 @@ export function stripUnused(binary, options = {}) {
         newSections.push(newStartSection);
         break;
       case SectionType.Custom:
-        if (section.name === 'name' && newNameSection) {
-          newSections.push(newNameSection);
+        if (section.name === 'name') {
+          if (newNameSection) {
+            newSections.push(newNameSection);
+          }
+        } else if (section.name === 'zigar:abi' || section.name.startsWith('component-type')) {
+          newSections.push(section);
         }
         break;
       default:
