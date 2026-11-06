@@ -7,6 +7,7 @@ import {
   UPDATE,
   VISIT
 } from '../symbols.js';
+import { isPromise } from '../utils.js';
 
 export default mixin({
   createOutboundCaller(thunk, ArgStruct) {
@@ -137,52 +138,71 @@ export default mixin({
     const success = (attrs)
     ? this.runVariadicThunk(thunkAddress, fnAddress, argAddress, attrAddress, attrs.length)
     : this.runThunk(thunkAddress, fnAddress, argAddress);
-    if (!success) {
-      if (!finalized) {
-        finalize();
+    const finishCall = (success) => {
+      if (!success) {
+        if (!finalized) {
+          finalize();
+        }
+        throw new ZigError();
       }
-      throw new ZigError();
-    }
-    if (process.env.TARGET === 'wasm') {
-      // finalized can be true here, if a function chooses to immediately invoke a promise's resolve method
-      if (!finalized) {
-        // copy retval from shadow view
-        argStruct[UPDATE]?.(this.findShadowView(argStruct[MEMORY]));
-      }
-    }
-    const transform = fn[TRANSFORM];
-    if (isAsync) {
-      let retval = null;
-      // if a function has returned a value or failed synchronmously, the promise is resolved immediately
-      if (!finalized) {
-        try {
-          retval = argStruct.retval;
-        } catch (err) {
-          retval = new ZigError(err, 1);
+      if (process.env.TARGET === 'wasm') {
+        // finalized can be true here, if a function chooses to immediately invoke a promise's resolve method
+        if (!finalized) {
+          // copy retval from shadow view
+          argStruct[UPDATE]?.(this.findShadowView(argStruct[MEMORY]));
         }
       }
-      if (retval != null) {
-        if (transform) {
-          retval = transform(retval);
+      const transform = fn[TRANSFORM];
+      if (isAsync) {
+        let retval = null;
+        // if a function has returned a value or failed synchronmously, the promise is resolved immediately
+        if (!finalized) {
+          try {
+            retval = argStruct.retval;
+          } catch (err) {
+            retval = new ZigError(err, 1);
+          }
         }
-        argStruct[RETURN](retval);
+        if (retval != null) {
+          if (transform) {
+            retval = transform(retval);
+          }
+          argStruct[RETURN](retval);
+        } else {
+          if (transform) {
+            // so the promise or generator can perform the transform 
+            argStruct[TRANSFORM] = transform;
+          }
+        }
+        // this would be undefined if a callback function is used instead
+        return argStruct[PROMISE] ?? argStruct[GENERATOR];
       } else {
-        if (transform) {
-          // so the promise or generator can perform the transform 
-          argStruct[TRANSFORM] = transform;
+        finalize();
+        try {
+          const { retval } = argStruct;
+          return (transform) ? transform(retval) : retval;
+        } catch (err) {
+          throw new ZigError(err, 1);
         }
       }
-      // this would be undefined if a callback function is used instead
-      return argStruct[PROMISE] ?? argStruct[GENERATOR];
-    } else {
-      finalize();
-      try {
-        const { retval } = argStruct;
-        return (transform) ? transform(retval) : retval;
-      } catch (err) {
-        throw new ZigError(err, 1);
+    };
+    if (process.env.TARGET === 'wasm' && isPromise(success)) {
+      const promise = success.then(finishCall, (err) => {
+        if (!finalized) {
+          finalize();
+        }
+        if (err instanceof Exit && err.code === 0) {
+          return;
+        }
+        throw err;
+      });
+      if (isAsync && argStruct[GENERATOR]) {
+        promise.catch((err) => argStruct[RETURN]?.(err));
+        return argStruct[GENERATOR];
       }
+      return promise;
     }
+    return finishCall(success);
   },
   ...(process.env.TARGET === 'wasm' ? {
     imports: {

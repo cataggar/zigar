@@ -1551,6 +1551,50 @@ describe('Feature: call-marshaling-outbound', function() {
       const result = env.invokeThunk(thunk, fn, args);
       expect(result).to.equal(1234);
     })
+    if (process.env.TARGET === 'wasm') {
+      it('should handle Promise returned from runThunk in JSPI mode', async function() {
+        const env = new Env();
+        env.runThunk = async () => true;
+        env.allocateScratchMemory = () => 0x1000;
+        env.freeScratchMemory = () => {};
+        env.memory = new WebAssembly.Memory({ initial: 1 });
+        env.flushStdout = () => {};
+        const Arg = function() {
+          this[MEMORY] = new DataView(new ArrayBuffer(16));
+          this[MEMORY][ALIGN] = 4;
+          this.retval = 5678;
+        };
+        const thunk = { [MEMORY]: env.obtainZigView(usize(100), 0) };
+        const fn = { [MEMORY]: env.obtainZigView(usize(200), 0) };
+        const args = new Arg();
+        const result = env.invokeThunk(thunk, fn, args);
+        expect(result).to.be.a('promise');
+        expect(await result).to.equal(5678);
+      })
+      it('should handle Exit(0) and errors from async runThunk in JSPI mode', async function() {
+        const env = new Env();
+        env.allocateScratchMemory = () => 0x1000;
+        env.freeScratchMemory = () => {};
+        env.memory = new WebAssembly.Memory({ initial: 1 });
+        env.flushStdout = () => {};
+        const Arg = function() {
+          this[MEMORY] = new DataView(new ArrayBuffer(16));
+          this[MEMORY][ALIGN] = 4;
+          this.retval = 5678;
+        };
+        const thunk = { [MEMORY]: env.obtainZigView(usize(100), 0) };
+        const fn = { [MEMORY]: env.obtainZigView(usize(200), 0) };
+
+        env.runThunk = async () => { throw new Exit(0); };
+        expect(await env.invokeThunk(thunk, fn, new Arg())).to.be.undefined;
+
+        env.runThunk = async () => false;
+        await expect(env.invokeThunk(thunk, fn, new Arg())).to.eventually.be.rejected;
+
+        env.runThunk = async () => { throw new Exit(1); };
+        await expect(env.invokeThunk(thunk, fn, new Arg())).to.eventually.be.rejectedWith(Exit);
+      })
+    }
   })
 })
 

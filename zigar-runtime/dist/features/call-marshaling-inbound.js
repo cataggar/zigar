@@ -166,7 +166,7 @@ var callMarshalingInbound = mixin({
   handleJscall(id, argAddress, argSize, canWait) {
     const dv = this.obtainZigView(argAddress, argSize, false);
     const caller = this.jsFunctionCallerMap.get(id);
-    return (caller) ? caller(dv, canWait) : PosixError.EFAULT;
+    return (caller) ? caller(dv, canWait || !!this.activeContinuation) : PosixError.EFAULT;
   },
   releaseFunction(id) {
     const thunk = this.jsFunctionThunkMap.get(id);

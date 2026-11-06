@@ -534,6 +534,231 @@ describe('Feature: module-loading', function() {
         expect(unlinkArgs).to.eql([ 3, 4096, 10 ]);
       })
     })
+    describe('JSPI and __stack_pointer switching', function() {
+      it('should wrap suspending imports and promising exports when useJSPI is true', async function() {
+        const env = new Env();
+        const url = new URL('./wasm-samples/read-file.wasm', import.meta.url);
+        const buffer = await readFile(fileURLToPath(url));
+        await env.loadModule(buffer, {
+          memoryInitial: 257,
+          memoryMax: undefined,
+          tableInitial: 210,
+          multithreaded: false,
+          useJSPI: true,
+          continuationStackSize: 32768,
+        });
+        expect(env.useJSPI).to.equal(typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function');
+        expect(env.continuationStackSize).to.equal(32768);
+        if (env.useJSPI) {
+          expect(env.runThunkSync).to.be.a('function');
+        }
+        env.abandonModule();
+      })
+      it('should switch __stack_pointer per continuation across concurrent out-of-order JSPI suspensions', async function() {
+        if (typeof WebAssembly.Suspending !== 'function' || typeof WebAssembly.promising !== 'function') {
+          this.skip();
+        }
+        const runThunkBody = [
+          0x01, 0x02, 0x7f, // locals: local 3 = sp, local 4 = canary
+          // sp = global.get 0 - 16; global.set 0, sp
+          0x23, 0x00, 0x41, 0x10, 0x6b, 0x22, 0x03, 0x24, 0x00,
+          // canary = thunkAddr * 1000 + fnAddr
+          0x20, 0x00, 0x41, 0xe8, 0x07, 0x6c, 0x20, 0x01, 0x6a, 0x21, 0x04,
+          // i32.store [sp] = canary
+          0x20, 0x03, 0x20, 0x04, 0x36, 0x02, 0x00,
+          // call _handleJscall(thunkAddr, sp, 16)
+          0x20, 0x00, 0x20, 0x03, 0x41, 0x10, 0x10, 0x00, 0x1a,
+          // i32.store [argAddr] = i32.load [sp]
+          0x20, 0x02, 0x20, 0x03, 0x28, 0x02, 0x00, 0x36, 0x02, 0x00,
+          // global.set 0, sp + 16
+          0x20, 0x03, 0x41, 0x10, 0x6a, 0x24, 0x00,
+          // return (i32.load [argAddr] == canary)
+          0x20, 0x02, 0x28, 0x02, 0x00, 0x20, 0x04, 0x46,
+          0x0b
+        ];
+        const allocBody = [
+          0x01, 0x01, 0x7f, // local 2 = addr
+          0x23, 0x01, 0x22, 0x02,
+          0x20, 0x00, 0x6a, 0x24, 0x01,
+          0x20, 0x02,
+          0x0b
+        ];
+        const freeBody = [ 0x00, 0x0b ];
+        const initBody = [ 0x00, 0x0b ];
+        const typeSection = [
+          0x04,
+          0x60, 0x03, 0x7f, 0x7f, 0x7f, 0x01, 0x7f,
+          0x60, 0x00, 0x00,
+          0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f,
+          0x60, 0x03, 0x7f, 0x7f, 0x7f, 0x00,
+        ];
+        const importSection = [
+          0x01,
+          0x03, 0x65,0x6e,0x76,
+          0x0d, 0x5f,0x68,0x61,0x6e,0x64,0x6c,0x65,0x4a,0x73,0x63,0x61,0x6c,0x6c,
+          0x00, 0x00,
+        ];
+        const funcSection = [ 0x04, 0x01, 0x02, 0x03, 0x00 ];
+        const memSection = [ 0x01, 0x00, 0x04 ];
+        const globalSection = [
+          0x02,
+          0x7f, 0x01, 0x41, 0x80, 0x80, 0x04, 0x0b,
+          0x7f, 0x01, 0x41, 0x80, 0x80, 0x04, 0x0b,
+        ];
+        const exportSection = [
+          0x06,
+          0x06, 0x6d,0x65,0x6d,0x6f,0x72,0x79, 0x02, 0x00,
+          0x0f, 0x5f,0x5f,0x73,0x74,0x61,0x63,0x6b,0x5f,0x70,0x6f,0x69,0x6e,0x74,0x65,0x72, 0x03, 0x00,
+          0x0a, 0x69,0x6e,0x69,0x74,0x69,0x61,0x6c,0x69,0x7a,0x65, 0x00, 0x01,
+          0x15, 0x61,0x6c,0x6c,0x6f,0x63,0x61,0x74,0x65,0x53,0x63,0x72,0x61,0x74,0x63,0x68,0x4d,0x65,0x6d,0x6f,0x72,0x79, 0x00, 0x02,
+          0x11, 0x66,0x72,0x65,0x65,0x53,0x63,0x72,0x61,0x74,0x63,0x68,0x4d,0x65,0x6d,0x6f,0x72,0x79, 0x00, 0x03,
+          0x08, 0x72,0x75,0x6e,0x54,0x68,0x75,0x6e,0x6b, 0x00, 0x04,
+        ];
+        const codeSection = [
+          0x04,
+          initBody.length, ...initBody,
+          allocBody.length, ...allocBody,
+          freeBody.length, ...freeBody,
+          runThunkBody.length, ...runThunkBody,
+        ];
+        const wasmBytes = new Uint8Array([
+          0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
+          0x01, typeSection.length, ...typeSection,
+          0x02, importSection.length, ...importSection,
+          0x03, funcSection.length, ...funcSection,
+          0x05, memSection.length, ...memSection,
+          0x06, globalSection.length, ...globalSection,
+          0x07, exportSection.length, ...exportSection,
+          0x0a, codeSection.length, ...codeSection,
+        ]);
+
+        const env = new Env();
+        await env.loadModule(wasmBytes, {
+          memoryInitial: 0,
+          tableInitial: 0,
+          multithreaded: false,
+          useJSPI: true,
+          continuationStackSize: 4096,
+        });
+
+        const spAddresses = [];
+        for (let i = 1; i <= 8; i++) {
+          env.jsFunctionCallerMap.set(i, (dv, canWait) => {
+            expect(canWait).to.be.true;
+            spAddresses.push(dv.byteOffset);
+            const waitMs = (i % 2 === 0) ? 10 : 2;
+            return delay(waitMs).then(() => PosixError.NONE);
+          });
+        }
+
+        const results = await Promise.all(
+          Array.from({ length: 8 }, (_, idx) => {
+            const id = idx + 1;
+            const outAddr = env.allocateScratchMemory(4, 4);
+            return env.runThunk(id, id * 7, outAddr).then((ok) => {
+              const dv = new DataView(env.memory.buffer, outAddr, 4);
+              return { ok, val: dv.getInt32(0, true), expected: id * 1000 + id * 7 };
+            });
+          })
+        );
+
+        for (const { ok, val, expected } of results) {
+          expect(ok).to.be.true;
+          expect(val).to.equal(expected);
+        }
+        // All 8 concurrent continuations should have received distinct linear shadow stack addresses
+        expect(new Set(spAddresses).size).to.equal(8);
+        // And after completion, all 8 stacks should be returned to continuationStackPool
+        expect(env.continuationStackPool.length).to.equal(8);
+        // And __stack_pointer should be restored to its initial value (65536)
+        expect(env.stackPointerGlobal.value).to.equal(65536);
+
+        // Verify nested Wasm -> JS -> Wasm calls (both sync and async) inside a JSPI callback
+        // do not clobber the outer continuation's __stack_pointer or activeContinuation
+        env.jsFunctionCallerMap.set(99, (dv, canWait) => {
+          expect(canWait).to.be.true;
+          return PosixError.NONE;
+        });
+        env.jsFunctionCallerMap.set(98, (dv, canWait) => {
+          expect(canWait).to.be.true;
+          return delay(2).then(() => PosixError.NONE);
+        });
+        env.jsFunctionCallerMap.set(90, async (dv, canWait) => {
+          expect(canWait).to.be.true;
+          const outerSp = dv.byteOffset;
+          // 1. Nested synchronous Wasm call inside async JS callback
+          const syncOut = env.allocateScratchMemory(4, 4);
+          const syncOk = await env.runThunk(99, 11, syncOut);
+          expect(syncOk).to.be.true;
+          expect(new DataView(env.memory.buffer, syncOut, 4).getInt32(0, true)).to.equal(99 * 1000 + 11);
+          // 2. Nested asynchronous Wasm call inside async JS callback
+          const asyncOut = env.allocateScratchMemory(4, 4);
+          const asyncOk = await env.runThunk(98, 22, asyncOut);
+          expect(asyncOk).to.be.true;
+          expect(new DataView(env.memory.buffer, asyncOut, 4).getInt32(0, true)).to.equal(98 * 1000 + 22);
+          // Outer stack frame canary at outerSp must remain untouched
+          expect(new DataView(env.memory.buffer, outerSp, 4).getInt32(0, true)).to.equal(90 * 1000 + 33);
+          await delay(5);
+          return PosixError.NONE;
+        });
+        const nestedOut = env.allocateScratchMemory(4, 4);
+        const nestedOk = await env.runThunk(90, 33, nestedOut);
+        expect(nestedOk).to.be.true;
+        expect(new DataView(env.memory.buffer, nestedOut, 4).getInt32(0, true)).to.equal(90 * 1000 + 33);
+        expect(env.stackPointerGlobal.value).to.equal(65536);
+
+        env.abandonModule();
+        expect(env.continuationStackPool.length).to.equal(0);
+      })
+      it('should cap continuationStackPool at 16, detect OOM and stack overflow, and restore __stack_pointer on error', async function() {
+        const env = new Env();
+        let freedCount = 0;
+        let nextAddr = 0x10000;
+        env.memory = new WebAssembly.Memory({ initial: 4 });
+        env.allocateScratchMemory = (size) => {
+          const addr = nextAddr;
+          nextAddr += size;
+          return addr;
+        };
+        env.freeScratchMemory = () => {
+          freedCount++;
+        };
+        env.stackPointerGlobal = new WebAssembly.Global({ value: 'i32', mutable: true }, 0x8000);
+        for (let i = 0; i < 20; i++) {
+          const addr = 0x1000 + i * 0x400;
+          new DataView(env.memory.buffer, addr, 4).setUint32(0, 0xdeadbeef, true);
+          env.freeContinuationStack({ address: addr, size: 0x400 });
+        }
+        expect(env.continuationStackPool.length).to.equal(16);
+        expect(freedCount).to.equal(4);
+
+        expect(() => env.runWithContinuation(() => {
+          expect(env.stackPointerGlobal.value).to.not.equal(0x8000);
+          throw new Error('sync boom');
+        })).to.throw('sync boom');
+        expect(env.stackPointerGlobal.value).to.equal(0x8000);
+
+        await expect(env.runWithContinuation(() => Promise.reject(new Error('async boom'))))
+          .to.eventually.be.rejectedWith('async boom');
+        expect(env.stackPointerGlobal.value).to.equal(0x8000);
+
+        // Detect stack overflow when canary at bottom of continuation stack is overwritten
+        expect(() => env.runWithContinuation(() => {
+          const stackBottom = env.stackPointerGlobal.value - 0x400;
+          new DataView(env.memory.buffer, stackBottom, 4).setUint32(0, 0xbadc0de, true);
+        })).to.throw('Stack overflow');
+
+        // Detect OOM when allocateScratchMemory returns 0
+        env.continuationStackPool.length = 0;
+        env.allocateScratchMemory = () => 0;
+        expect(() => env.allocateContinuationStack()).to.throw('Out of memory');
+
+        // Reject concurrent JSPI calls when __stack_pointer is missing
+        env.stackPointerGlobal = null;
+        env.suspendedContinuationCount = 1;
+        expect(() => env.runWithContinuation(() => {})).to.throw('Concurrent JSPI calls require __stack_pointer export');
+      })
+    })
   } else if (process.env.TARGET === 'node') {
     describe('exportFunctions', function() {
       it('should export functions of the class needed by Zig code', function() {

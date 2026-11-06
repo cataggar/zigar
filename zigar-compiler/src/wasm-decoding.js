@@ -264,6 +264,18 @@ export function stripUnused(binary, options = {}) {
         newExportSection.exports.push(object);
       }
     }
+    const globalSection = getSection(SectionType.Global);
+    const hasImportedGlobal = importSection?.imports.some(o => o.type === ObjectType.Global);
+    if (
+      globalSection?.data?.byteLength >= 3 &&
+      !hasImportedGlobal &&
+      globalSection.data.getUint8(0) >= 1 &&
+      globalSection.data.getUint8(1) === 0x7f &&
+      globalSection.data.getUint8(2) === 0x01 &&
+      !newExportSection.exports.some(e => e.name === '__stack_pointer')
+    ) {
+      newExportSection.exports.push({ name: '__stack_pointer', type: ObjectType.Global, index: 0 });
+    }
   }
   // create new import section
   let newImportSection = null;
@@ -341,7 +353,28 @@ export function stripUnused(binary, options = {}) {
         break;
     }
   }
-  return repackBinary({ sections: newSections, size });
+  return repackBinary({ sections: newSections, size: size + 24 });
+}
+
+export function ensureStackPointerExport(binary) {
+  const { sections, size } = parseBinary(binary);
+  const importSection = sections.find(s => s.type === SectionType.Import);
+  const globalSection = sections.find(s => s.type === SectionType.Global);
+  const exportSection = sections.find(s => s.type === SectionType.Export);
+  const hasImportedGlobal = importSection?.imports.some(o => o.type === ObjectType.Global);
+  if (
+    exportSection &&
+    globalSection?.data?.byteLength >= 3 &&
+    !hasImportedGlobal &&
+    globalSection.data.getUint8(0) >= 1 &&
+    globalSection.data.getUint8(1) === 0x7f &&
+    globalSection.data.getUint8(2) === 0x01 &&
+    !exportSection.exports.some(e => e.name === '__stack_pointer')
+  ) {
+    exportSection.exports.push({ name: '__stack_pointer', type: ObjectType.Global, index: 0 });
+    return repackBinary({ sections, size: size + 24 });
+  }
+  return binary;
 }
 
 export function parseBinary(binary) {

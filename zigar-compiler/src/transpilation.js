@@ -4,7 +4,7 @@ import { defineEnvironment } from '../../zigar-runtime/src/environment.js';
 import * as mixins from '../../zigar-runtime/src/mixins.js';
 import { generateCode } from './code-generation.js';
 import { compile } from './compilation.js';
-import { extractLimits, stripUnused } from './wasm-decoding.js';
+import { ensureStackPointerExport, extractLimits, stripUnused } from './wasm-decoding.js';
 
 export async function transpile(srcPath, options) {
   const {
@@ -67,6 +67,8 @@ export async function transpile(srcPath, options) {
     let dv = new DataView(content.buffer);
     if (stripWASM) {
       dv = stripUnused(dv, { keepNames });
+    } else {
+      dv = ensureStackPointerExport(dv);
     }
     if (embedWASM) {
       binarySource = embed(srcPath, dv);
