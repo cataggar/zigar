@@ -152,7 +152,7 @@ export async function runCompiler(path, args, options) {
   try {
     onStart?.();
     const isWazig = basename(path).startsWith('wazig');
-    const useLocalCacheEnv = args[0] === 'build-exe' || args[0] === 'translate-c';
+    const useLocalCacheEnv = isWazig || args[0] === 'build-exe' || args[0] === 'translate-c';
     const env = {
       ...process.env,
       ZIG_LOCAL_CACHE_DIR: '.zig-cache',
@@ -162,6 +162,9 @@ export async function runCompiler(path, args, options) {
     };
     if (isWazig) {
       delete env.ZIG_LIB_DIR;
+      if (!env.GHR_TOOL_DIR && isAbsolute(path)) {
+        env.GHR_TOOL_DIR = resolve(dirname(path), '..');
+      }
     }
     const { stdout } = await execFileAsync(path, args, {
       cwd,

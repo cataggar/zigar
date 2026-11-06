@@ -9,6 +9,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+pub const fast_abi = @import("fast_abi.zig");
+pub const FastLower = fast_abi.FastLower;
+pub const FastLift = fast_abi.FastLift;
+pub const ZigarAbiMetadata = fast_abi.ZigarAbiMetadata;
+pub const detectZigarAbi = fast_abi.detectZigarAbi;
+
 pub const Error = error{
     OutOfMemory,
     OutOfBounds,
@@ -22,7 +28,14 @@ pub const Error = error{
     UnalignedPointer,
     AsyncCallPending,
     AsyncTaskDidNotReturn,
+    ReallocFailed,
 };
+
+pub const CanonError = Error;
+
+pub fn PtrInt(comptime is_memory64: bool) type {
+    return if (is_memory64) u64 else u32;
+}
 
 /// Result type for lifting operations that may return either a Canonical ABI
 /// error (`Error`) or, when `T` itself is a Zig error union `E!Payload`, the
@@ -773,6 +786,20 @@ pub const MemoryContext = struct {
     zero_copy_slices: bool = true,
     validate_utf8: bool = true,
     strict_utf8_on_u8_slices: bool = false,
+    fast_frame_offset: usize = 0,
+    fast_bump_cursor: usize = 0,
+    fast_scratch_limit: ?usize = null,
+
+    pub inline fn effectiveFastLimit(self: MemoryContext) usize {
+        return if (self.fast_scratch_limit) |lim| @min(lim, self.memory.len) else self.memory.len;
+    }
+
+    pub fn configureFastScratch(self: *MemoryContext, scratch_addr: usize, scratch_len: usize) Error!void {
+        const start_off = try self.addrToOffset(scratch_addr, scratch_len);
+        self.fast_frame_offset = start_off;
+        self.fast_scratch_limit = start_off + scratch_len;
+        self.fast_bump_cursor = start_off;
+    }
 
     pub inline fn addrToOffset(self: MemoryContext, addr: usize, byte_len: usize) Error!usize {
         if (addr < self.base_addr) return error.OutOfBounds;
@@ -1430,24 +1457,24 @@ pub fn loadFromMemory(comptime T: type, comptime arch: Arch, ctx: MemoryContext,
         },
         .error_set => {
             const raw: u32 = switch (layout.size) {
-                1 => ctx.memory[addr],
-                2 => std.mem.readInt(u16, ctx.memory[addr..][0..2], .little),
-                4 => std.mem.readInt(u32, ctx.memory[addr..][0..4], .little),
+                1 => ctx.memory[off],
+                2 => std.mem.readInt(u16, ctx.memory[off..][0..2], .little),
+                4 => std.mem.readInt(u32, ctx.memory[off..][0..4], .little),
                 else => unreachable,
             };
             return try raiseErrorByIndex(T, raw);
         },
         .error_union => |eu| {
-            const disc = ctx.memory[addr];
+            const disc = ctx.memory[off];
             const pay_off = comptime variantPayloadOffset(T, arch);
             const err_layout = comptime layoutOf(eu.error_set, arch);
             switch (disc) {
                 0 => return try loadFromMemory(eu.payload, arch, ctx, addr + pay_off),
                 1 => {
                     const raw: u32 = switch (err_layout.size) {
-                        1 => ctx.memory[addr + pay_off],
-                        2 => std.mem.readInt(u16, ctx.memory[addr + pay_off ..][0..2], .little),
-                        4 => std.mem.readInt(u32, ctx.memory[addr + pay_off ..][0..4], .little),
+                        1 => ctx.memory[off + pay_off],
+                        2 => std.mem.readInt(u16, ctx.memory[off + pay_off ..][0..2], .little),
+                        4 => std.mem.readInt(u32, ctx.memory[off + pay_off ..][0..4], .little),
                         else => unreachable,
                     };
                     return try raiseErrorByIndex(eu.error_set, raw);
@@ -2401,31 +2428,105 @@ pub fn CanonSig(comptime FnType: type, comptime opts: CallOptions) type {
     };
 }
 
+fn normalizeCallOptions(comptime opts_or_mem64: anytype) CallOptions {
+    const T = @TypeOf(opts_or_mem64);
+    if (T == CallOptions) return opts_or_mem64;
+    if (T == bool) return .{ .arch = if (opts_or_mem64) .wasm64 else .wasm32 };
+    if (T == Arch) return .{ .arch = opts_or_mem64 };
+    if (@typeInfo(T) == .enum_literal) {
+        return .{ .arch = @as(Arch, opts_or_mem64) };
+    }
+    if (@typeInfo(T) == .@"struct") {
+        var resolved: CallOptions = .{};
+        if (@hasField(T, "arch")) resolved.arch = opts_or_mem64.arch;
+        if (@hasField(T, "is_async")) resolved.is_async = opts_or_mem64.is_async;
+        if (@hasField(T, "is_memory64")) resolved.arch = if (opts_or_mem64.is_memory64) .wasm64 else .wasm32;
+        return resolved;
+    }
+    @compileError("Expected CallOptions, Arch, or bool (is_memory64), got " ++ @typeName(T));
+}
+
 /// Comptime host-to-guest lowering thunk namespace (`canon lower`).
-pub fn CanonLower(comptime FnType: type, comptime opts: CallOptions) type {
+pub fn CanonLower(comptime FnType: type, comptime opts_or_mem64: anytype) type {
+    const opts = comptime normalizeCallOptions(opts_or_mem64);
+    const is_memory64 = (opts.arch == .wasm64);
     return struct {
+        const Self = @This();
         pub const Sig = CanonSig(FnType, opts);
+        pub const CoreFnPtr = *const Sig.CoreFn;
+        pub const ArgsTuple = Sig.ZigArgs;
+        pub const ZigReturn = Sig.ZigReturn;
+        pub const abi_hash: u64 = fast_abi.comptimeAbiHash(FnType, is_memory64);
 
         pub fn call(
-            ctx: MemoryContext,
-            core_fn: *const Sig.CoreFn,
-            args: Sig.ZigArgs,
+            ctx_or_ptr: anytype,
+            core_fn: CoreFnPtr,
+            args: ArgsTuple,
         ) CanonResult(Sig.ZigReturn) {
+            const CtxT = @TypeOf(ctx_or_ptr);
+            const ctx: MemoryContext = if (comptime @typeInfo(CtxT) == .pointer) ctx_or_ptr.* else ctx_or_ptr;
             return lowerCall(FnType, opts, ctx, core_fn, args);
+        }
+
+        /// Automatically dispatch via the zero-overhead `FastLower` bypass when
+        /// `guest_abi` contains a compatible `"zigar:abi"` entry matching
+        /// `(interface_name, func_name, abi_hash, frame_size, frame_align, is_memory64)`
+        /// and `fast_core_fn` is available; otherwise transparently fall back to
+        /// the standard Component Model Canonical ABI (`Self.call`). Also falls
+        /// back to `Self.call` if a fast-path store-phase capacity error occurs
+        /// before `fast_core_fn` is invoked.
+        pub fn callAuto(
+            mem_ctx: *MemoryContext,
+            guest_abi: anytype,
+            interface_name: []const u8,
+            func_name: []const u8,
+            fast_core_fn: ?fast_abi.FastCoreFnPtr(is_memory64),
+            canon_core_fn: CoreFnPtr,
+            args: ArgsTuple,
+        ) CanonResult(Sig.ZigReturn) {
+            const GuestAbiT = @TypeOf(guest_abi);
+            if (comptime GuestAbiT != @TypeOf(null)) {
+                if (fast_core_fn) |fast_fn| {
+                    const Fast = fast_abi.FastLower(FnType, is_memory64);
+                    const expected_size: u32 = @intCast(Fast.frame_layout.frame_size);
+                    const expected_align: u32 = @intCast(Fast.frame_layout.frame_align);
+                    const matched = if (comptime @typeInfo(GuestAbiT) == .optional)
+                        if (guest_abi) |meta|
+                            meta.findCompatibleFuncWithLayout(interface_name, func_name, abi_hash, expected_size, expected_align, is_memory64) != null
+                        else
+                            false
+                    else
+                        guest_abi.findCompatibleFuncWithLayout(interface_name, func_name, abi_hash, expected_size, expected_align, is_memory64) != null;
+
+                    if (matched) {
+                        switch (Fast.tryCallOrFallback(mem_ctx, fast_fn, args)) {
+                            .completed => |res| return res,
+                            .fallback_needed => {},
+                        }
+                    }
+                }
+            }
+            return Self.call(mem_ctx.*, canon_core_fn, args);
         }
     };
 }
 
 /// Comptime guest-to-host lifting thunk namespace (`canon lift`).
-pub fn CanonLift(comptime FnType: type, comptime opts: CallOptions) type {
+pub fn CanonLift(comptime FnType: type, comptime opts_or_mem64: anytype) type {
+    const opts = comptime normalizeCallOptions(opts_or_mem64);
     return struct {
         pub const Sig = CanonSig(FnType, opts);
+        pub const CoreFnPtr = *const Sig.CoreFn;
+        pub const ArgsTuple = Sig.ZigArgs;
+        pub const ReturnType = Sig.ZigReturn;
 
         pub fn call(
-            ctx: MemoryContext,
+            ctx_or_ptr: anytype,
             handler: *const FnType,
             core_args: Sig.CoreParams,
         ) Error!Sig.CoreReturn {
+            const CtxT = @TypeOf(ctx_or_ptr);
+            const ctx: MemoryContext = if (comptime @typeInfo(CtxT) == .pointer) ctx_or_ptr.* else ctx_or_ptr;
             return liftCall(FnType, opts, ctx, handler, core_args);
         }
 
@@ -3195,5 +3296,199 @@ test "non-sequential/signed enum case-index encoding, flags high-bit masking, al
     const lifted_res = try liftFromFlat(ResWithErrSet, .wasm32, ctx, res_flat);
     try testing.expectEqual(error.Third, lifted_res.err);
 }
+
+test "CanonLower.callAuto: fast-path dispatch (0 reallocs) and transparent Canonical ABI fallback" {
+    var mem: [8192]u8 align(16) = undefined;
+    @memset(&mem, 0);
+
+    const CountingAllocator = struct {
+        bump: BumpAllocator,
+        realloc_count: usize = 0,
+
+        fn realloc(
+            raw_ctx: ?*anyopaque,
+            orig_ptr: usize,
+            orig_size: usize,
+            alignment: usize,
+            new_size: usize,
+        ) Error!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            self.realloc_count += 1;
+            return BumpAllocator.realloc(&self.bump, orig_ptr, orig_size, alignment, new_size);
+        }
+    };
+
+    var counting = CountingAllocator{ .bump = BumpAllocator.init(512, mem.len) };
+    var ctx = MemoryContext{
+        .memory = &mem,
+        .base_addr = if (builtin.cpu.arch.isWasm()) @intFromPtr(&mem) else 0,
+        .realloc_ctx = &counting,
+        .realloc_fn = CountingAllocator.realloc,
+        .allocator = testing.allocator,
+        .fast_frame_offset = 64,
+    };
+
+    const GreetFn = fn (name: []const u8, repeat: u32) u32;
+    const GuestImpl = struct {
+        fn greet(name: []const u8, repeat: u32) u32 {
+            return @as(u32, @intCast(name.len)) * repeat;
+        }
+    };
+
+    const Lower = CanonLower(GreetFn, false);
+    const LiftCanon = CanonLift(GreetFn, false);
+    const LiftFast = FastLift(GreetFn, GuestImpl.greet, false);
+
+    // Prepare active context for Canonical ABI thunk
+    setActiveMemoryContext(ctx);
+    defer setActiveMemoryContext(null);
+
+    const canon_thunk = LiftCanon.thunk(&GuestImpl.greet);
+    const fast_thunk = LiftFast.thunk();
+
+    const entries = [_]fast_abi.ZigarFuncEntry{.{
+        .interface_name = "zigar:test/greeter",
+        .func_name = "greet",
+        .fast_export_name = "__zigar_fast_zigar:test/greeter#greet",
+        .abi_hash = Lower.abi_hash,
+        .arg_struct_size = @intCast(LiftFast.frame_layout.frame_size),
+        .arg_struct_align = @intCast(LiftFast.frame_layout.frame_align),
+        .flags = LiftFast.frame_layout.flags,
+    }};
+    const matching_meta = fast_abi.ZigarAbiMetadata{
+        .world_hash = 0x42,
+        .entries = &entries,
+    };
+
+    // 1. Matching `guest_abi` + `fast_core_fn` -> takes fast path (`realloc_count == 0`!)
+    counting.realloc_count = 0;
+    const fast_res = try Lower.callAuto(
+        &ctx,
+        matching_meta,
+        "zigar:test/greeter",
+        "greet",
+        fast_thunk,
+        canon_thunk,
+        .{ "hello-zigar", 3 },
+    );
+    try testing.expectEqual(@as(u32, 33), fast_res);
+    try testing.expectEqual(@as(usize, 0), counting.realloc_count);
+
+    // 2. `guest_abi == null` -> falls back to Canonical ABI (`realloc_count > 0` for string lowering)
+    counting.realloc_count = 0;
+    const fallback_null = try Lower.callAuto(
+        &ctx,
+        null,
+        "zigar:test/greeter",
+        "greet",
+        fast_thunk,
+        canon_thunk,
+        .{ "hello-zigar", 3 },
+    );
+    try testing.expectEqual(@as(u32, 33), fallback_null);
+    try testing.expect(counting.realloc_count > 0);
+
+    // 3. Function / interface name missing in `guest_abi` -> falls back to Canonical ABI
+    counting.realloc_count = 0;
+    const fallback_missing = try Lower.callAuto(
+        &ctx,
+        matching_meta,
+        "zigar:test/other-iface",
+        "greet",
+        fast_thunk,
+        canon_thunk,
+        .{ "hello-zigar", 4 },
+    );
+    try testing.expectEqual(@as(u32, 44), fallback_missing);
+    try testing.expect(counting.realloc_count > 0);
+
+    // 4. Mismatched `abi_hash` -> falls back to Canonical ABI
+    const mismatched_entries = [_]fast_abi.ZigarFuncEntry{.{
+        .interface_name = "zigar:test/greeter",
+        .func_name = "greet",
+        .fast_export_name = "__zigar_fast_zigar:test/greeter#greet",
+        .abi_hash = Lower.abi_hash ^ 1,
+        .arg_struct_size = @intCast(LiftFast.frame_layout.frame_size),
+        .arg_struct_align = @intCast(LiftFast.frame_layout.frame_align),
+        .flags = LiftFast.frame_layout.flags,
+    }};
+    const mismatched_meta = fast_abi.ZigarAbiMetadata{ .entries = &mismatched_entries };
+    counting.realloc_count = 0;
+    const fallback_hash = try Lower.callAuto(
+        &ctx,
+        mismatched_meta,
+        "zigar:test/greeter",
+        "greet",
+        fast_thunk,
+        canon_thunk,
+        .{ "hello-zigar", 5 },
+    );
+    try testing.expectEqual(@as(u32, 55), fallback_hash);
+    try testing.expect(counting.realloc_count > 0);
+
+    // 5. N3a: Mismatched `arg_struct_size` / `arg_struct_align` -> falls back to Canonical ABI
+    const bad_size_entries = [_]fast_abi.ZigarFuncEntry{.{
+        .interface_name = "zigar:test/greeter",
+        .func_name = "greet",
+        .fast_export_name = "__zigar_fast_zigar:test/greeter#greet",
+        .abi_hash = Lower.abi_hash,
+        .arg_struct_size = @intCast(LiftFast.frame_layout.frame_size + 8),
+        .arg_struct_align = @intCast(LiftFast.frame_layout.frame_align),
+        .flags = LiftFast.frame_layout.flags,
+    }};
+    const bad_size_meta = fast_abi.ZigarAbiMetadata{ .entries = &bad_size_entries };
+    counting.realloc_count = 0;
+    const fallback_size = try Lower.callAuto(
+        &ctx,
+        bad_size_meta,
+        "zigar:test/greeter",
+        "greet",
+        fast_thunk,
+        canon_thunk,
+        .{ "hello-zigar", 6 },
+    );
+    try testing.expectEqual(@as(u32, 66), fallback_size);
+    try testing.expect(counting.realloc_count > 0);
+
+    // 6. N3b: Store-phase `OutOfBounds` in `FastLower` (e.g. `fast_frame_offset` past end of memory)
+    // transparently falls back to Canonical ABI `Self.call` before `fast_fn` is invoked!
+    ctx.fast_frame_offset = mem.len - 4;
+    defer ctx.fast_frame_offset = 64;
+    counting.realloc_count = 0;
+    const fallback_oob = try Lower.callAuto(
+        &ctx,
+        matching_meta,
+        "zigar:test/greeter",
+        "greet",
+        fast_thunk,
+        canon_thunk,
+        .{ "hello-zigar", 7 },
+    );
+    try testing.expectEqual(@as(u32, 77), fallback_oob);
+    try testing.expect(counting.realloc_count > 0);
+
+    // 7. `configureFastScratch` with a tight `fast_scratch_limit`: when argument payload exceeds
+    // `fast_scratch_limit`, `FastLower` returns `error.OutOfBounds` and `CanonLower.callAuto`
+    // transparently falls back to Canonical ABI (`realloc_count > 0`)!
+    try ctx.configureFastScratch(ctx.base_addr + 64, LiftFast.frame_layout.frame_size + 4);
+    defer ctx.fast_scratch_limit = null;
+    try testing.expectError(
+        error.OutOfBounds,
+        FastLower(GreetFn, false).call(&ctx, fast_thunk, .{ "payload-exceeding-4-byte-scratch-tail", 8 }),
+    );
+    counting.realloc_count = 0;
+    const fallback_scratch_limit = try Lower.callAuto(
+        &ctx,
+        matching_meta,
+        "zigar:test/greeter",
+        "greet",
+        fast_thunk,
+        canon_thunk,
+        .{ "payload-exceeding-4-byte-scratch-tail", 8 },
+    );
+    try testing.expectEqual(@as(u32, 37 * 8), fallback_scratch_limit);
+    try testing.expect(counting.realloc_count > 0);
+}
+
 
 

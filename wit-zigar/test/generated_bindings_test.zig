@@ -11,7 +11,9 @@ const testing = std.testing;
 
 const wit_zigar = @import("wit_zigar");
 const canon = wit_zigar.canon;
+const fast_abi = wit_zigar.fast_abi;
 const wasi_cli = @import("generated_wasi_cli");
+const wasi_cli_026 = @import("generated_wasi_cli_026");
 const sample = @import("generated_sample");
 
 const ST = sample.shared_types;
@@ -510,9 +512,11 @@ test "exportBindings instantiation and binary list<u8> vs WitString validation" 
         }
     };
 
-    comptime {
-        GuestService.exportBindings(GuestImpl);
-    }
+    const GuestExported = GuestService.exportBindings(GuestImpl);
+    try testing.expectEqual(@as(usize, 3), GuestExported.zigar_abi_entries.len);
+    try testing.expectEqual(GuestService.transform_rect_zigar_abi_hash, GuestExported.fast_transform_rect.abi_hash);
+    try testing.expectEqual(GuestService.inspect_record_zigar_abi_hash, GuestExported.fast_inspect_record.abi_hash);
+    try testing.expectEqual(GuestService.async_compute_zigar_abi_hash, GuestExported.fast_async_compute.abi_hash);
 
     // Verify `GuestService` exported `_CoreFn` types match `.direction = .lift` signatures:
     // - `transform_rect_CoreFn`: 8 params (7 for Rect + 1 for scale), returns `i32` (guest return-area pointer)
@@ -537,4 +541,229 @@ test "exportBindings instantiation and binary list<u8> vs WitString validation" 
         canon.lowerToFlat(sample.WitString, .wasm32, ctx, .{ .bytes = &binary_bytes }),
     );
 }
+
+test "generated fast_abi bindings: <fn>_zigar_abi_hash, exportBindings(Impl).fast_<fn>, zigar_abi_entries, zigar_abi.encodeSection, and callAuto on sample.wit and wasi:cli@0.2.6" {
+    const alloc = testing.allocator;
+
+    // 1. Verify comptime ABI hashes on `sample.wit` match `wit_zigar.fast_abi.comptimeAbiHash`
+    try testing.expectEqual(
+        fast_abi.comptimeAbiHash(HostApi.compute_distance_Fn, false),
+        HostApi.compute_distance_zigar_abi_hash,
+    );
+    try testing.expectEqual(
+        fast_abi.comptimeAbiHash(GuestService.transform_rect_Fn, false),
+        GuestService.transform_rect_zigar_abi_hash,
+    );
+    try testing.expectEqual(
+        fast_abi.comptimeAbiHash(GuestService.inspect_record_Fn, false),
+        GuestService.inspect_record_zigar_abi_hash,
+    );
+    try testing.expectEqual(
+        fast_abi.comptimeAbiHash(GuestService.async_compute_Fn, false),
+        GuestService.async_compute_zigar_abi_hash,
+    );
+
+    // 2. Verify `sample.zigar_abi.encodeSection` round-trips through `fast_abi.decodeZigarAbiSection`
+    const sample_sec = try sample.zigar_abi.encodeSection(alloc);
+    defer alloc.free(sample_sec);
+    const decoded_sample_meta = try fast_abi.decodeZigarAbiSection(alloc, sample_sec);
+    defer decoded_sample_meta.deinit(alloc);
+    try testing.expectEqual(@as(usize, 3), decoded_sample_meta.entries.len);
+    try testing.expectEqualStrings("zigar:sample/guest-service@0.1.0", decoded_sample_meta.entries[0].interface_name);
+    try testing.expectEqualStrings("transform-rect", decoded_sample_meta.entries[0].func_name);
+    try testing.expectEqual(GuestService.transform_rect_zigar_abi_hash, decoded_sample_meta.entries[0].abi_hash);
+
+    // 3. Verify `GuestService.exportBindings(Impl).fast_<fn>` and `CanonLower.callAuto` with 0 cabi_realloc calls
+    const SampleGuestImpl = struct {
+        pub fn transform_rect(r: ST.Rect, scale: f32) ST.Rect {
+            return .{
+                .origin = .{ .x = r.origin.x * scale, .y = r.origin.y * scale },
+                .extent = .{ .x = r.extent.x * scale, .y = r.extent.y * scale },
+                .id = r.id + 100,
+                .layer = r.layer,
+                .tag = r.tag,
+            };
+        }
+
+        pub fn inspect_record(rec: ST.ComplexRecord) sample.Result([]const u8, ST.ErrorKind) {
+            return .{ .ok = rec.label };
+        }
+
+        pub fn async_compute(a: u32, b: u32, c: u32, d: u32, e: u32) sample.Result(ST.Point, ST.ErrorKind) {
+            _ = c;
+            _ = d;
+            _ = e;
+            return .{ .ok = .{ .x = @floatFromInt(a), .y = @floatFromInt(b) } };
+        }
+    };
+    const SampleExported = GuestService.exportBindings(SampleGuestImpl);
+
+    var mem: [16384]u8 align(16) = @splat(0);
+    const ReallocCounter = struct {
+        var count: usize = 0;
+        fn realloc(_: ?*anyopaque, _: usize, _: usize, _: usize, _: usize) canon.Error!usize {
+            count += 1;
+            return error.ReallocFailed;
+        }
+    };
+    ReallocCounter.count = 0;
+    const CtxHolder = struct {
+        var ctx: canon.MemoryContext = undefined;
+    };
+    CtxHolder.ctx = canon.MemoryContext{
+        .memory = &mem,
+        .realloc_fn = ReallocCounter.realloc,
+        .allocator = alloc,
+        .fast_frame_offset = 128,
+    };
+
+    const dummy_canon_thunk = canon.CanonLift(GuestService.transform_rect_Fn, false).thunk(&SampleGuestImpl.transform_rect);
+    const rect_in = ST.Rect{
+        .origin = .{ .x = 2.0, .y = 4.0 },
+        .extent = .{ .x = 6.0, .y = 8.0 },
+        .id = 7,
+        .layer = 1,
+        .tag = 99,
+    };
+    const rect_out = try canon.CanonLower(GuestService.transform_rect_Fn, false).callAuto(
+        &CtxHolder.ctx,
+        decoded_sample_meta,
+        "zigar:sample/guest-service@0.1.0",
+        "transform-rect",
+        SampleExported.fast_transform_rect.createThunk(&CtxHolder.ctx),
+        dummy_canon_thunk,
+        .{ rect_in, 3.0 },
+    );
+    try testing.expectEqual(@as(f32, 6.0), rect_out.origin.x);
+    try testing.expectEqual(@as(f32, 12.0), rect_out.origin.y);
+    try testing.expectEqual(@as(u32, 107), rect_out.id);
+    try testing.expectEqual(@as(usize, 0), ReallocCounter.count);
+
+    // 4. Verify `wasi:cli@0.2.6` (`wasi:cli/command@0.2.6`) generated fast_abi bindings
+    try testing.expectEqualStrings("wasi:cli/command@0.2.6", wasi_cli_026.world_name);
+    try testing.expectEqual(
+        fast_abi.comptimeAbiHash(wasi_cli_026.run.run_Fn, false),
+        wasi_cli_026.run.run_zigar_abi_hash,
+    );
+
+    const CliRunImpl = struct {
+        var invoked: bool = false;
+        pub fn run() wasi_cli_026.Result(void, void) {
+            invoked = true;
+            return .{ .ok = {} };
+        }
+    };
+    const CliExported = wasi_cli_026.run.exportBindings(CliRunImpl);
+    try testing.expectEqual(@as(usize, 1), CliExported.zigar_abi_entries.len);
+    try testing.expectEqualStrings("wasi:cli/run@0.2.6", CliExported.zigar_abi_entries[0].interface_name);
+    try testing.expectEqualStrings("run", CliExported.zigar_abi_entries[0].func_name);
+    try testing.expectEqualStrings("__zigar_fast_wasi:cli/run@0.2.6#run", CliExported.zigar_abi_entries[0].fast_export_name);
+
+    const cli_sec = try wasi_cli_026.zigar_abi.encodeSection(alloc);
+    defer alloc.free(cli_sec);
+    const decoded_cli_meta = try fast_abi.decodeZigarAbiSection(alloc, cli_sec);
+    defer decoded_cli_meta.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), decoded_cli_meta.entries.len);
+    try testing.expectEqual(wasi_cli_026.run.run_zigar_abi_hash, decoded_cli_meta.entries[0].abi_hash);
+
+    CliRunImpl.invoked = false;
+    try CliExported.fast_run.callFromMemory(&CtxHolder.ctx, 128);
+    try testing.expect(CliRunImpl.invoked);
+
+    // 5. Verify adversarial review edge cases on generated `sample.canon.fast_abi` and `exportBindings`:
+    // (a) B3: Static guest scratch buffer helper exports
+    try testing.expect(SampleExported.scratch_ptr() != 0);
+    try testing.expectEqual(@as(usize, 65536), SampleExported.scratch_len());
+    try testing.expectEqual(@as(usize, 0), SampleExported.scratch_ptr() % 16);
+
+    // (b) N2: `exportBindings` with raw `_CoreFn` vs idiomatic `_Fn` only emits `FastLift`
+    // and `zigar_abi_entries` for functions whose signature equals `<fn>_fn_t`!
+    const MixedGuestImpl = struct {
+        // Raw CoreFn (8 flat args -> i32) instead of `transform_rect_fn_t`
+        pub fn transform_rect(_: f32, _: f32, _: f32, _: f32, _: i32, _: i32, _: i64, _: f32) callconv(.c) i32 {
+            return 0;
+        }
+        // Idiomatic `_fn_t`
+        pub fn inspect_record(rec: ST.ComplexRecord) sample.Result([]const u8, ST.ErrorKind) {
+            return .{ .ok = rec.label };
+        }
+    };
+    const MixedExported = GuestService.exportBindings(MixedGuestImpl);
+    try testing.expect(MixedExported.fast_transform_rect == void);
+    try testing.expect(MixedExported.fast_inspect_record != void);
+    try testing.expectEqual(@as(usize, 1), MixedExported.zigar_abi_entries.len);
+    try testing.expectEqualStrings("inspect-record", MixedExported.zigar_abi_entries[0].func_name);
+
+    // (c) B3, B4 & N4: Generated `sample.canon.MemoryContext` + `sample.canon.FastLower` / `FastLift`:
+    // Non-in-place argument slice + returned slice do not collide (frame header `bump_cursor`),
+    // and unaligned slice pointers / unaligned host buffers are handled safely.
+    var gen_mem: [16384]u8 align(16) = @splat(0);
+    var gen_ctx = sample.canon.MemoryContext{
+        .memory = &gen_mem,
+        .allocator = alloc,
+        .fast_frame_offset = 64,
+    };
+
+    const InspectGuest = struct {
+        pub fn inspect_record(rec: ST.ComplexRecord) sample.Result([]const u8, ST.ErrorKind) {
+            _ = rec;
+            return .{ .ok = "generated-callee-external-response-slice" };
+        }
+    };
+    const GenLower = sample.canon.FastLower(GuestService.inspect_record_Fn, false);
+    const GenLift = sample.canon.FastLift(GuestService.inspect_record_Fn, InspectGuest.inspect_record, false);
+    const complex_in = ST.ComplexRecord{
+        .id = 0x1234_5678,
+        .label = "generated-caller-external-input-label",
+        .points = &[_]ST.Point{ .{ .x = 1.0, .y = 2.0 }, .{ .x = 3.0, .y = 4.0 } },
+        .tags = &[_][]const u8{ "tag-a", "tag-b" },
+        .maybe_score = 42,
+        .maybe_note = "note",
+        .outcome = .{ .ok = .{ .x = 4.0, .y = 8.0 } },
+        .tint = .blue,
+        .glyph = 'λ',
+        .f8 = .{ .b0 = true },
+        .f16 = .{ .f1 = true },
+        .f32_val = .{ .k0 = true },
+        .f64_val = ST.Flags64.fromPacked(.{ .m0 = true }),
+        .f70 = .{},
+        .v_if = .{ .as_float = 3.14 },
+        .v_ii = .{ .as_int64 = -99 },
+        .v_ff = .{ .as_f32 = 1.5 },
+        .v_multi = .{ .second = .{ .x = -1, .y = 2 } },
+    };
+    const gen_res = try GenLower.call(&gen_ctx, GenLift.thunk(), .{complex_in});
+    try testing.expect(gen_res == .ok);
+    try testing.expectEqualStrings("generated-callee-external-response-slice", gen_res.ok);
+    // Verify input label at `64 + frame_size` was not overwritten by the return string
+    const gen_arg_off = 64 + GenLower.frame_layout.frame_size;
+    try testing.expectEqualStrings(
+        "generated-caller-external-input-label",
+        gen_mem[gen_arg_off..][0.."generated-caller-external-input-label".len],
+    );
+
+    // Unaligned `[]const u32` pointer in generated `loadFastValue` -> `error.UnalignedPointer`
+    std.mem.writeInt(u32, gen_mem[16..20], 103, .little);
+    std.mem.writeInt(u32, gen_mem[20..24], 2, .little);
+    try testing.expectError(
+        error.UnalignedPointer,
+        sample.canon.fast_abi.loadFastValue([]const u32, false, &gen_ctx, 16),
+    );
+
+    // Unaligned host buffer (`gen_mem[1..]`, `base_addr = 0`) falls back to `odd_gen_ctx.allocator`
+    var odd_gen_ctx = sample.canon.MemoryContext{
+        .memory = gen_mem[1..],
+        .base_addr = 0,
+        .allocator = alloc,
+    };
+    std.mem.writeInt(u32, odd_gen_ctx.memory[16..20], 64, .little);
+    std.mem.writeInt(u32, odd_gen_ctx.memory[20..24], 2, .little);
+    std.mem.writeInt(u32, odd_gen_ctx.memory[64..68], 0xCAFEBABE, .little);
+    std.mem.writeInt(u32, odd_gen_ctx.memory[68..72], 0xDEADBEEF, .little);
+    const odd_u32 = try sample.canon.fast_abi.loadFastValue([]const u32, false, &odd_gen_ctx, 16);
+    defer alloc.free(odd_u32);
+    try testing.expectEqual(@as(u32, 0xCAFEBABE), odd_u32[0]);
+    try testing.expectEqual(@as(u32, 0xDEADBEEF), odd_u32[1]);
+}
+
 

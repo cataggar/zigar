@@ -233,28 +233,52 @@ pub const WorldSpec = struct {
 };
 
 pub fn parseWorldSpec(spec: []const u8) ?WorldSpec {
-    const slash = std.mem.indexOfScalar(u8, spec, '/') orelse return null;
-    const pkg_part = spec[0..slash];
-    const colon = std.mem.indexOfScalar(u8, pkg_part, ':') orelse return null;
-    const ns = pkg_part[0..colon];
-    const pkg_name = pkg_part[colon + 1 ..];
-    const rest = spec[slash + 1 ..];
-    if (ns.len == 0 or pkg_name.len == 0 or rest.len == 0) return null;
-    if (std.mem.indexOfScalar(u8, rest, '@')) |at| {
-        const wname = rest[0..at];
-        const ver = rest[at + 1 ..];
-        if (wname.len == 0 or ver.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, spec, '/')) |slash| {
+        const pkg_part = spec[0..slash];
+        const colon = std.mem.indexOfScalar(u8, pkg_part, ':') orelse return null;
+        const ns = pkg_part[0..colon];
+        const pkg_name = pkg_part[colon + 1 ..];
+        const rest = spec[slash + 1 ..];
+        if (ns.len == 0 or pkg_name.len == 0 or rest.len == 0) return null;
+        if (std.mem.indexOfScalar(u8, rest, '@')) |at| {
+            const wname = rest[0..at];
+            const ver = rest[at + 1 ..];
+            if (wname.len == 0 or ver.len == 0) return null;
+            return .{
+                .namespace = ns,
+                .pkg_name = pkg_name,
+                .world_name = wname,
+                .version = ver,
+            };
+        }
         return .{
             .namespace = ns,
             .pkg_name = pkg_name,
-            .world_name = wname,
+            .world_name = rest,
+            .version = null,
+        };
+    }
+    // Support `<ns>:<pkg>[@<ver>]` shorthand (e.g. `"wasi:cli@0.2.6"`),
+    // defaulting to the `"command"` world (or first world in the package).
+    const colon = std.mem.indexOfScalar(u8, spec, ':') orelse return null;
+    const ns = spec[0..colon];
+    const rest = spec[colon + 1 ..];
+    if (ns.len == 0 or rest.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, rest, '@')) |at| {
+        const pkg_name = rest[0..at];
+        const ver = rest[at + 1 ..];
+        if (pkg_name.len == 0 or ver.len == 0) return null;
+        return .{
+            .namespace = ns,
+            .pkg_name = pkg_name,
+            .world_name = "command",
             .version = ver,
         };
     }
     return .{
         .namespace = ns,
-        .pkg_name = pkg_name,
-        .world_name = rest,
+        .pkg_name = rest,
+        .world_name = "command",
         .version = null,
     };
 }
@@ -387,6 +411,17 @@ pub fn generateFromResolver(
         );
     }
 
+    // Emit world-level `zigar_abi` metadata and section encoder namespace.
+    try emitWorldZigarAbiNamespace(
+        ar,
+        w,
+        effective_res,
+        prepared,
+        decoded,
+        iface_bindings,
+        opts,
+    );
+
     return out.toOwnedSlice(allocator);
 }
 
@@ -471,6 +506,1400 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\        len: PtrInt = 0,
         \\    };
         \\}
+        \\
+        \\pub const canon = struct {
+        \\    pub const Error = error{
+        \\        OutOfMemory,
+        \\        OutOfBounds,
+        \\        InvalidDiscriminant,
+        \\        InvalidChar,
+        \\        InvalidUtf8,
+        \\        InvalidBool,
+        \\        MissingRealloc,
+        \\        MissingAllocator,
+        \\        AlignmentError,
+        \\        UnalignedPointer,
+        \\        AsyncCallPending,
+        \\        AsyncTaskDidNotReturn,
+        \\        ReallocFailed,
+        \\    };
+        \\    pub const CanonError = Error;
+        \\
+        \\    pub fn CanonResult(comptime T: type) type {
+        \\        return switch (@typeInfo(T)) {
+        \\            .error_union => |eu| (Error || eu.error_set)!eu.payload,
+        \\            .error_set => (Error || T)!void,
+        \\            else => Error!T,
+        \\        };
+        \\    }
+        \\
+        \\    pub fn ReturnType(comptime FnType: type) type {
+        \\        return @typeInfo(FnType).@"fn".return_type orelse void;
+        \\    }
+        \\
+        \\    pub const ReallocFn = *const fn (
+        \\        ctx: ?*anyopaque,
+        \\        orig_ptr: usize,
+        \\        orig_size: usize,
+        \\        alignment: usize,
+        \\        new_size: usize,
+        \\    ) Error!usize;
+        \\
+        \\    pub const PostReturnFn = *const fn (ctx: ?*anyopaque, ret_val: usize) void;
+        \\
+        \\    pub const MemoryContext = struct {
+        \\        memory: []u8,
+        \\        base_addr: usize = 0,
+        \\        realloc_ctx: ?*anyopaque = null,
+        \\        realloc_fn: ?ReallocFn = null,
+        \\        post_return_ctx: ?*anyopaque = null,
+        \\        post_return_fn: ?PostReturnFn = null,
+        \\        task_return_ctx: ?*anyopaque = null,
+        \\        task_return_fn: ?PostReturnFn = null,
+        \\        allocator: ?std.mem.Allocator = null,
+        \\        zero_copy_slices: bool = true,
+        \\        validate_utf8: bool = true,
+        \\        strict_utf8_on_u8_slices: bool = false,
+        \\        fast_frame_offset: usize = 0,
+        \\        fast_bump_cursor: usize = 0,
+        \\        fast_scratch_limit: ?usize = null,
+        \\
+        \\        pub inline fn effectiveFastLimit(self: MemoryContext) usize {
+        \\            return if (self.fast_scratch_limit) |lim| @min(lim, self.memory.len) else self.memory.len;
+        \\        }
+        \\
+        \\        pub fn configureFastScratch(self: *MemoryContext, scratch_addr: usize, scratch_len: usize) Error!void {
+        \\            const start_off = try self.addrToOffset(scratch_addr, scratch_len);
+        \\            self.fast_frame_offset = start_off;
+        \\            self.fast_scratch_limit = start_off + scratch_len;
+        \\            self.fast_bump_cursor = start_off;
+        \\        }
+        \\
+        \\        pub inline fn addrToOffset(self: MemoryContext, addr: usize, byte_len: usize) Error!usize {
+        \\            if (addr < self.base_addr) return error.OutOfBounds;
+        \\            const off = addr - self.base_addr;
+        \\            if (off > self.memory.len or self.memory.len - off < byte_len) return error.OutOfBounds;
+        \\            return off;
+        \\        }
+        \\    };
+        \\
+        \\    pub const fast_abi = struct {
+        \\        pub const SECTION_NAME = "zigar:abi";
+        \\        pub const MAGIC: [4]u8 = "ZGAR".*;
+        \\        pub const FORMAT_VERSION: u16 = 1;
+        \\        pub const FLAG_HAS_INDIRECT_SLICES: u32 = 1 << 0;
+        \\        pub const FLAG_IS_BLITTABLE_ONLY: u32 = 1 << 1;
+        \\        pub const DEFAULT_FAST_SCRATCH_LEN: usize = 65536;
+        \\        pub var __zigar_fast_scratch: [DEFAULT_FAST_SCRATCH_LEN]u8 align(16) = undefined;
+        \\
+        \\        pub fn fastScratchPtr() callconv(.c) usize {
+        \\            return @intFromPtr(&__zigar_fast_scratch);
+        \\        }
+        \\
+        \\        pub fn fastScratchLen() callconv(.c) usize {
+        \\            return __zigar_fast_scratch.len;
+        \\        }
+        \\
+        \\        const ScratchExports = struct {
+        \\            pub const exported = blk: {
+        \\                @export(&fastScratchPtr, .{ .name = "__zigar_fast_scratch_ptr" });
+        \\                @export(&fastScratchLen, .{ .name = "__zigar_fast_scratch_len" });
+        \\                break :blk true;
+        \\            };
+        \\        };
+        \\
+        \\        pub fn ensureScratchExported() void {
+        \\            _ = ScratchExports.exported;
+        \\        }
+        \\
+        \\        pub fn StackFallbackAllocator(comptime size: usize) type {
+        \\            return struct {
+        \\                buffer: [size]u8 align(16) = undefined,
+        \\                bfa: std.heap.BufferFirstAllocator = undefined,
+        \\
+        \\                pub fn get(self: *@This(), fallback_allocator: std.mem.Allocator) std.mem.Allocator {
+        \\                    self.bfa = std.heap.BufferFirstAllocator.init(&self.buffer, fallback_allocator);
+        \\                    return self.bfa.allocator();
+        \\                }
+        \\            };
+        \\        }
+        \\
+        \\        threadlocal var active_fast_memory_ctx: ?*MemoryContext = null;
+        \\
+        \\        pub fn setActiveFastMemoryContext(ctx: ?*MemoryContext) void {
+        \\            active_fast_memory_ctx = ctx;
+        \\        }
+        \\
+        \\        pub fn getActiveFastMemoryContext() ?*MemoryContext {
+        \\            return active_fast_memory_ctx;
+        \\        }
+        \\
+        \\        pub const Flags = packed struct(u16) {
+        \\            is_memory64: bool = false,
+        \\            is_big_endian: bool = false,
+        \\            zero_copy_slices: bool = true,
+        \\            _reserved: u13 = 0,
+        \\        };
+        \\
+        \\        pub const ZigarFuncEntry = struct {
+        \\            interface_name: []const u8 = "",
+        \\            func_name: []const u8,
+        \\            fast_export_name: []const u8,
+        \\            abi_hash: u64,
+        \\            arg_struct_size: u32,
+        \\            arg_struct_align: u32,
+        \\            flags: u32 = 0,
+        \\
+        \\            pub fn hasIndirectSlices(self: ZigarFuncEntry) bool {
+        \\                return (self.flags & FLAG_HAS_INDIRECT_SLICES) != 0;
+        \\            }
+        \\
+        \\            pub fn isBlittableOnly(self: ZigarFuncEntry) bool {
+        \\                return (self.flags & FLAG_IS_BLITTABLE_ONLY) != 0;
+        \\            }
+        \\        };
+        \\
+        \\        pub const ZigarAbiMetadata = struct {
+        \\            version: u16 = FORMAT_VERSION,
+        \\            flags: Flags = .{},
+        \\            world_hash: u64 = 0,
+        \\            entries: []const ZigarFuncEntry = &.{},
+        \\
+        \\            pub fn isTargetCompatible(self: ZigarAbiMetadata, comptime is_memory64: bool) bool {
+        \\                const host_is_big_endian = (@import("builtin").cpu.arch.endian() == .big);
+        \\                return self.version == FORMAT_VERSION and
+        \\                    self.flags.is_memory64 == is_memory64 and
+        \\                    self.flags.is_big_endian == host_is_big_endian and
+        \\                    self.flags._reserved == 0;
+        \\            }
+        \\
+        \\            pub fn findCompatibleFunc(
+        \\                self: ZigarAbiMetadata,
+        \\                interface_name: []const u8,
+        \\                func_name: []const u8,
+        \\                expected_abi_hash: u64,
+        \\                comptime is_memory64: bool,
+        \\            ) ?ZigarFuncEntry {
+        \\                if (!self.isTargetCompatible(is_memory64)) return null;
+        \\                const norm_want = if (std.mem.eql(u8, interface_name, "$root")) "" else interface_name;
+        \\                for (self.entries) |entry| {
+        \\                    const norm_have = if (std.mem.eql(u8, entry.interface_name, "$root")) "" else entry.interface_name;
+        \\                    if (std.mem.eql(u8, norm_have, norm_want) and
+        \\                        std.mem.eql(u8, entry.func_name, func_name) and
+        \\                        entry.abi_hash == expected_abi_hash)
+        \\                    {
+        \\                        return entry;
+        \\                    }
+        \\                }
+        \\                return null;
+        \\            }
+        \\
+        \\            pub fn findCompatibleFuncWithLayout(
+        \\                self: ZigarAbiMetadata,
+        \\                interface_name: []const u8,
+        \\                func_name: []const u8,
+        \\                expected_abi_hash: u64,
+        \\                expected_size: u32,
+        \\                expected_align: u32,
+        \\                comptime is_memory64: bool,
+        \\            ) ?ZigarFuncEntry {
+        \\                const entry = self.findCompatibleFunc(interface_name, func_name, expected_abi_hash, is_memory64) orelse return null;
+        \\                if (entry.arg_struct_size != expected_size or entry.arg_struct_align != expected_align) {
+        \\                    return null;
+        \\                }
+        \\                return entry;
+        \\            }
+        \\        };
+        \\
+        \\        pub const Fnv1a64 = struct {
+        \\            state: u64 = 0xcbf29ce484222325,
+        \\            pub fn update(self: *Fnv1a64, bytes: []const u8) void {
+        \\                for (bytes) |b| {
+        \\                    self.state ^= b;
+        \\                    self.state *%= 0x100000001b3;
+        \\                }
+        \\            }
+        \\            pub fn updateByte(self: *Fnv1a64, b: u8) void {
+        \\                self.state ^= b;
+        \\                self.state *%= 0x100000001b3;
+        \\            }
+        \\            pub fn updateU32(self: *Fnv1a64, v: u32) void {
+        \\                var buf: [4]u8 = undefined;
+        \\                std.mem.writeInt(u32, &buf, v, .little);
+        \\                self.update(&buf);
+        \\            }
+        \\            pub fn updateU64(self: *Fnv1a64, v: u64) void {
+        \\                var buf: [8]u8 = undefined;
+        \\                std.mem.writeInt(u64, &buf, v, .little);
+        \\                self.update(&buf);
+        \\            }
+        \\        };
+        \\
+        \\        pub fn fnv1a64(bytes: []const u8) u64 {
+        \\            var h = Fnv1a64{};
+        \\            h.update(bytes);
+        \\            return h.state;
+        \\        }
+        \\
+        \\        pub fn encodeZigarAbiSection(alloc: std.mem.Allocator, meta: ZigarAbiMetadata) std.mem.Allocator.Error![]u8 {
+        \\            var out = std.ArrayList(u8).empty;
+        \\            errdefer out.deinit(alloc);
+        \\            try out.appendSlice(alloc, &MAGIC);
+        \\            try appendInt(alloc, &out, u16, meta.version);
+        \\            try appendInt(alloc, &out, u16, @bitCast(meta.flags));
+        \\            try appendInt(alloc, &out, u64, meta.world_hash);
+        \\            try appendInt(alloc, &out, u32, @intCast(meta.entries.len));
+        \\            for (meta.entries) |entry| {
+        \\                try appendString(alloc, &out, entry.interface_name);
+        \\                try appendString(alloc, &out, entry.func_name);
+        \\                try appendString(alloc, &out, entry.fast_export_name);
+        \\                try appendInt(alloc, &out, u64, entry.abi_hash);
+        \\                try appendInt(alloc, &out, u32, entry.arg_struct_size);
+        \\                try appendInt(alloc, &out, u32, entry.arg_struct_align);
+        \\                try appendInt(alloc, &out, u32, entry.flags);
+        \\            }
+        \\            return out.toOwnedSlice(alloc);
+        \\        }
+        \\
+        \\        fn appendInt(alloc: std.mem.Allocator, out: *std.ArrayList(u8), comptime IntT: type, v: IntT) std.mem.Allocator.Error!void {
+        \\            var buf: [@sizeOf(IntT)]u8 = undefined;
+        \\            std.mem.writeInt(IntT, &buf, v, .little);
+        \\            try out.appendSlice(alloc, &buf);
+        \\        }
+        \\
+        \\        fn appendString(alloc: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) std.mem.Allocator.Error!void {
+        \\            try appendInt(alloc, out, u32, @intCast(s.len));
+        \\            try out.appendSlice(alloc, s);
+        \\        }
+        \\
+        \\        pub fn PtrInt(comptime is_memory64: bool) type {
+        \\            return if (is_memory64) u64 else u32;
+        \\        }
+        \\
+        \\        pub const Layout = struct {
+        \\            size: u32,
+        \\            alignment: u32,
+        \\            has_indirect_slices: bool = false,
+        \\            is_blittable: bool = false,
+        \\        };
+        \\
+        \\        pub fn alignForward(offset: u32, alignment: u32) u32 {
+        \\            return (offset + (alignment - 1)) & ~(alignment - 1);
+        \\        }
+        \\
+        \\        pub fn discSize(case_count: usize) u32 {
+        \\            if (case_count <= 256) return 1;
+        \\            if (case_count <= 65536) return 2;
+        \\            return 4;
+        \\        }
+        \\
+        \\        pub fn isCharType(comptime T: type) bool {
+        \\            if (T == u21) return true;
+        \\            return switch (@typeInfo(T)) {
+        \\                .@"enum" => |en| en.tag_type == u21 and @hasDecl(T, "wit_is_char"),
+        \\                else => false,
+        \\            };
+        \\        }
+        \\
+        \\        pub fn isHandleType(comptime T: type) bool {
+        \\            return @typeInfo(T) == .@"struct" and @hasDecl(T, "wit_handle_kind") and @hasField(T, "handle");
+        \\        }
+        \\
+        \\        pub fn isStringWrapper(comptime T: type) bool {
+        \\            return @typeInfo(T) == .@"struct" and @hasDecl(T, "wit_is_string") and @hasField(T, "bytes");
+        \\        }
+        \\
+        \\        pub fn fieldOffset(comptime S: type, comptime is_memory64: bool, comptime field_idx: usize) u32 {
+        \\            return comptime blk: {
+        \\                const st = @typeInfo(S).@"struct";
+        \\                var offset: u32 = 0;
+        \\                for (st.field_types, 0..) |FT, i| {
+        \\                    if (st.field_attrs[i].@"comptime") continue;
+        \\                    const fl = wireLayoutOf(FT, is_memory64);
+        \\                    offset = alignForward(offset, fl.alignment);
+        \\                    if (i == field_idx) break :blk offset;
+        \\                    offset += fl.size;
+        \\                }
+        \\                unreachable;
+        \\            };
+        \\        }
+        \\
+        \\        pub fn wireLayoutOf(comptime T: type, comptime is_memory64: bool) Layout {
+        \\            return comptime blk: {
+        \\                @setEvalBranchQuota(200_000);
+        \\                const ptr_size: u32 = if (is_memory64) 8 else 4;
+        \\                const is_le = @import("builtin").cpu.arch.endian() == .little;
+        \\                if (T == void) break :blk .{ .size = 0, .alignment = 1, .is_blittable = true };
+        \\                if (isCharType(T)) break :blk .{ .size = 4, .alignment = 4, .is_blittable = false };
+        \\                switch (@typeInfo(T)) {
+        \\                    .bool => break :blk .{ .size = 1, .alignment = 1, .is_blittable = false },
+        \\                    .int => |int| {
+        \\                        const b: u32 = int.bits / 8;
+        \\                        break :blk .{ .size = b, .alignment = b, .is_blittable = (b == 1 or is_le) };
+        \\                    },
+        \\                    .float => |fl| {
+        \\                        const b: u32 = fl.bits / 8;
+        \\                        break :blk .{ .size = b, .alignment = b, .is_blittable = is_le };
+        \\                    },
+        \\                    .@"enum" => |en| {
+        \\                        const ds = discSize(en.field_names.len);
+        \\                        break :blk .{ .size = ds, .alignment = ds, .is_blittable = false };
+        \\                    },
+        \\                    .pointer => |pt| switch (pt.size) {
+        \\                        .slice => break :blk .{
+        \\                            .size = 2 * ptr_size,
+        \\                            .alignment = ptr_size,
+        \\                            .has_indirect_slices = true,
+        \\                            .is_blittable = false,
+        \\                        },
+        \\                        else => @compileError("Unsupported pointer in fast_abi"),
+        \\                    },
+        \\                    .array => |ar| {
+        \\                        const el = wireLayoutOf(ar.child, is_memory64);
+        \\                        const total_size = @as(u32, @intCast(ar.len)) * el.size;
+        \\                        break :blk .{
+        \\                            .size = total_size,
+        \\                            .alignment = el.alignment,
+        \\                            .has_indirect_slices = el.has_indirect_slices,
+        \\                            .is_blittable = is_le and el.is_blittable and (@sizeOf(T) == total_size),
+        \\                        };
+        \\                    },
+        \\                    .@"struct" => |st| {
+        \\                        if (isHandleType(T)) break :blk .{ .size = 4, .alignment = 4, .is_blittable = is_le };
+        \\                        if (isStringWrapper(T)) break :blk .{
+        \\                            .size = 2 * ptr_size,
+        \\                            .alignment = ptr_size,
+        \\                            .has_indirect_slices = true,
+        \\                            .is_blittable = false,
+        \\                        };
+        \\                        if (st.layout == .@"packed" or @hasDecl(T, "wit_flags_count")) {
+        \\                            const bit_count: usize = if (@hasDecl(T, "wit_flags_count"))
+        \\                                T.wit_flags_count
+        \\                            else
+        \\                                @bitSizeOf(st.backing_integer.?);
+        \\                            if (bit_count == 0) break :blk .{ .size = 0, .alignment = 1, .is_blittable = true };
+        \\                            if (bit_count <= 8) break :blk .{ .size = 1, .alignment = 1, .is_blittable = (bit_count == 8) };
+        \\                            if (bit_count <= 16) break :blk .{ .size = 2, .alignment = 2, .is_blittable = is_le and (bit_count == 16) };
+        \\                            if (bit_count <= 32) break :blk .{ .size = 4, .alignment = 4, .is_blittable = is_le and (bit_count == 32) };
+        \\                            const words: u32 = @intCast((bit_count + 31) / 32);
+        \\                            break :blk .{
+        \\                                .size = words * 4,
+        \\                                .alignment = 4,
+        \\                                .is_blittable = is_le and ((@hasField(T, "words") and (bit_count % 32 == 0)) or (bit_count == words * 32 and @alignOf(T) == 4)),
+        \\                            };
+        \\                        }
+        \\                        var offset: u32 = 0;
+        \\                        var max_align: u32 = 1;
+        \\                        var has_indirect = false;
+        \\                        var all_blittable = is_le and (st.layout == .@"extern");
+        \\                        for (st.field_types, 0..) |FT, i| {
+        \\                            if (st.field_attrs[i].@"comptime") continue;
+        \\                            const fl = wireLayoutOf(FT, is_memory64);
+        \\                            offset = alignForward(offset, fl.alignment);
+        \\                            if (st.layout == .@"extern" and @offsetOf(T, st.field_names[i]) != offset) {
+        \\                                all_blittable = false;
+        \\                            }
+        \\                            offset += fl.size;
+        \\                            max_align = @max(max_align, fl.alignment);
+        \\                            has_indirect = has_indirect or fl.has_indirect_slices;
+        \\                            all_blittable = all_blittable and fl.is_blittable;
+        \\                        }
+        \\                        const total_size = alignForward(offset, max_align);
+        \\                        if (st.layout == .@"extern" and (@sizeOf(T) != total_size or @alignOf(T) != max_align)) {
+        \\                            all_blittable = false;
+        \\                        }
+        \\                        break :blk .{
+        \\                            .size = total_size,
+        \\                            .alignment = max_align,
+        \\                            .has_indirect_slices = has_indirect,
+        \\                            .is_blittable = all_blittable and !has_indirect,
+        \\                        };
+        \\                    },
+        \\                    .optional => |op| {
+        \\                        const cl = wireLayoutOf(op.child, is_memory64);
+        \\                        const pay_off = alignForward(1, cl.alignment);
+        \\                        const total_size = alignForward(pay_off + cl.size, cl.alignment);
+        \\                        break :blk .{
+        \\                            .size = total_size,
+        \\                            .alignment = cl.alignment,
+        \\                            .has_indirect_slices = cl.has_indirect_slices,
+        \\                            .is_blittable = false,
+        \\                        };
+        \\                    },
+        \\                    .@"union" => |un| {
+        \\                        const ds = discSize(un.field_names.len);
+        \\                        var max_align: u32 = ds;
+        \\                        var max_pay: u32 = 0;
+        \\                        var has_indirect = false;
+        \\                        for (un.field_types) |CaseT| {
+        \\                            const cl = wireLayoutOf(CaseT, is_memory64);
+        \\                            max_align = @max(max_align, cl.alignment);
+        \\                            max_pay = @max(max_pay, cl.size);
+        \\                            has_indirect = has_indirect or cl.has_indirect_slices;
+        \\                        }
+        \\                        const pay_off = alignForward(ds, max_align);
+        \\                        const total_size = alignForward(pay_off + max_pay, max_align);
+        \\                        break :blk .{
+        \\                            .size = total_size,
+        \\                            .alignment = max_align,
+        \\                            .has_indirect_slices = has_indirect,
+        \\                            .is_blittable = false,
+        \\                        };
+        \\                    },
+        \\                    .error_set => |es| {
+        \\                        const ds = discSize(es.error_names.?.len);
+        \\                        break :blk .{ .size = ds, .alignment = ds, .is_blittable = false };
+        \\                    },
+        \\                    .error_union => |eu| {
+        \\                        const ok_l = wireLayoutOf(eu.payload, is_memory64);
+        \\                        const err_l = wireLayoutOf(eu.error_set, is_memory64);
+        \\                        const max_align = @max(@as(u32, 1), @max(ok_l.alignment, err_l.alignment));
+        \\                        const pay_off = alignForward(1, max_align);
+        \\                        const total_size = alignForward(pay_off + @max(ok_l.size, err_l.size), max_align);
+        \\                        break :blk .{
+        \\                            .size = total_size,
+        \\                            .alignment = max_align,
+        \\                            .has_indirect_slices = ok_l.has_indirect_slices,
+        \\                            .is_blittable = false,
+        \\                        };
+        \\                    },
+        \\                    else => @compileError("Unsupported type in wireLayoutOf"),
+        \\                }
+        \\            };
+        \\        }
+        \\
+        \\        pub fn comptimeTypeAbiHash(comptime T: type, comptime is_memory64: bool) u64 {
+        \\            return comptime blk: {
+        \\                @setEvalBranchQuota(200_000);
+        \\                var h = Fnv1a64{};
+        \\                hashTypeStructure(T, is_memory64, &h);
+        \\                break :blk h.state;
+        \\            };
+        \\        }
+        \\
+        \\        pub fn comptimeAbiHash(comptime FnType: type, comptime is_memory64: bool) u64 {
+        \\            return comptime blk: {
+        \\                @setEvalBranchQuota(200_000);
+        \\                const f = @typeInfo(FnType).@"fn";
+        \\                var h = Fnv1a64{};
+        \\                h.update("zigar:fn:v1");
+        \\                h.updateByte(if (is_memory64) 1 else 0);
+        \\                h.updateU32(@intCast(f.param_types.len));
+        \\                for (f.param_types) |maybe_pt| {
+        \\                    h.updateU64(comptimeTypeAbiHash(maybe_pt.?, is_memory64));
+        \\                }
+        \\                const RetT = f.return_type orelse void;
+        \\                h.updateU64(comptimeTypeAbiHash(RetT, is_memory64));
+        \\                break :blk h.state;
+        \\            };
+        \\        }
+        \\
+        \\        fn hashTypeStructure(comptime T: type, comptime is_memory64: bool, h: *Fnv1a64) void {
+        \\            const wl = wireLayoutOf(T, is_memory64);
+        \\            if (T == void) {
+        \\                h.update("void");
+        \\                return;
+        \\            }
+        \\            if (isCharType(T)) {
+        \\                h.update("char:u21");
+        \\                return;
+        \\            }
+        \\            switch (@typeInfo(T)) {
+        \\                .bool => h.update("bool"),
+        \\                .int => |int| {
+        \\                    h.update(if (int.signedness == .signed) "sint:" else "uint:");
+        \\                    h.updateU32(int.bits);
+        \\                },
+        \\                .float => |fl| {
+        \\                    h.update("float:");
+        \\                    h.updateU32(fl.bits);
+        \\                },
+        \\                .@"enum" => |en| {
+        \\                    h.update("enum:");
+        \\                    h.updateU32(@intCast(en.field_names.len));
+        \\                    h.updateU32(wl.size);
+        \\                },
+        \\                .pointer => |pt| switch (pt.size) {
+        \\                    .slice => {
+        \\                        h.update("slice:");
+        \\                        h.updateU32(@sizeOf(PtrInt(is_memory64)));
+        \\                        hashTypeStructure(pt.child, is_memory64, h);
+        \\                    },
+        \\                    else => @compileError("Unsupported pointer"),
+        \\                },
+        \\                .array => |ar| {
+        \\                    h.update("array:");
+        \\                    h.updateU32(@intCast(ar.len));
+        \\                    hashTypeStructure(ar.child, is_memory64, h);
+        \\                },
+        \\                .@"struct" => |st| {
+        \\                    if (isHandleType(T)) {
+        \\                        h.update("handle:");
+        \\                        h.update(@tagName(T.wit_handle_kind));
+        \\                        return;
+        \\                    }
+        \\                    if (isStringWrapper(T)) {
+        \\                        h.update("slice:");
+        \\                        h.updateU32(@sizeOf(PtrInt(is_memory64)));
+        \\                        const ElemT = if (@hasDecl(T, "CodeUnit")) T.CodeUnit else u8;
+        \\                        hashTypeStructure(ElemT, is_memory64, h);
+        \\                        return;
+        \\                    }
+        \\                    if (st.layout == .@"packed" or @hasDecl(T, "wit_flags_count")) {
+        \\                        const bit_count: u32 = if (@hasDecl(T, "wit_flags_count"))
+        \\                            T.wit_flags_count
+        \\                        else
+        \\                            @bitSizeOf(st.backing_integer.?);
+        \\                        h.update("flags:");
+        \\                        h.updateU32(bit_count);
+        \\                        h.updateU32(wl.size);
+        \\                        h.updateU32(wl.alignment);
+        \\                        return;
+        \\                    }
+        \\                    h.update("struct:");
+        \\                    h.updateU32(wl.size);
+        \\                    h.updateU32(wl.alignment);
+        \\                    var runtime_fields: u32 = 0;
+        \\                    for (st.field_attrs) |attr| {
+        \\                        if (!attr.@"comptime") runtime_fields += 1;
+        \\                    }
+        \\                    h.updateU32(runtime_fields);
+        \\                    for (st.field_types, 0..) |FT, i| {
+        \\                        if (st.field_attrs[i].@"comptime") continue;
+        \\                        h.updateU32(fieldOffset(T, is_memory64, i));
+        \\                        hashTypeStructure(FT, is_memory64, h);
+        \\                    }
+        \\                },
+        \\                .optional => |op| {
+        \\                    h.update("option:");
+        \\                    h.updateU32(wl.size);
+        \\                    h.updateU32(wl.alignment);
+        \\                    hashTypeStructure(op.child, is_memory64, h);
+        \\                },
+        \\                .@"union" => |un| {
+        \\                    if (@hasDecl(T, "wit_is_result") and @hasDecl(T, "OkType") and @hasDecl(T, "ErrType")) {
+        \\                        h.update("result:");
+        \\                        h.updateU32(wl.size);
+        \\                        h.updateU32(wl.alignment);
+        \\                        hashTypeStructure(T.OkType, is_memory64, h);
+        \\                        hashTypeStructure(T.ErrType, is_memory64, h);
+        \\                        return;
+        \\                    }
+        \\                    h.update("variant:");
+        \\                    h.updateU32(wl.size);
+        \\                    h.updateU32(wl.alignment);
+        \\                    h.updateU32(@intCast(un.field_names.len));
+        \\                    for (un.field_types) |CaseT| {
+        \\                        hashTypeStructure(CaseT, is_memory64, h);
+        \\                    }
+        \\                },
+        \\                .error_set => |es| {
+        \\                    h.update("errset:");
+        \\                    h.updateU32(@intCast(es.error_names.?.len));
+        \\                    h.updateU32(wl.size);
+        \\                },
+        \\                .error_union => |eu| {
+        \\                    h.update("result:");
+        \\                    h.updateU32(wl.size);
+        \\                    h.updateU32(wl.alignment);
+        \\                    hashTypeStructure(eu.payload, is_memory64, h);
+        \\                    hashTypeStructure(eu.error_set, is_memory64, h);
+        \\                },
+        \\                else => @compileError("Unsupported type in hashTypeStructure"),
+        \\            }
+        \\        }
+        \\
+        \\        pub fn FrameLayout(comptime FnType: type) type {
+        \\            const f = @typeInfo(FnType).@"fn";
+        \\            return struct {
+        \\                header_bump_offset: usize,
+        \\                header_limit_offset: usize,
+        \\                header_size: usize,
+        \\                has_return: bool,
+        \\                ret_offset: usize,
+        \\                param_offsets: [f.param_types.len]usize,
+        \\                frame_size: usize,
+        \\                frame_align: usize,
+        \\                has_indirect_slices: bool,
+        \\                is_blittable_only: bool,
+        \\                flags: u32,
+        \\            };
+        \\        }
+        \\
+        \\        pub fn ArgStructLayout(comptime FnType: type, comptime is_memory64: bool) FrameLayout(FnType) {
+        \\            return comptime blk: {
+        \\                @setEvalBranchQuota(200_000);
+        \\                const f = @typeInfo(FnType).@"fn";
+        \\                const RetT = f.return_type orelse void;
+        \\                const ptr_size: u32 = @sizeOf(PtrInt(is_memory64));
+        \\                var offset: u32 = 2 * ptr_size;
+        \\                var max_align: u32 = ptr_size;
+        \\                var has_indirect_slices = false;
+        \\                var is_blittable_only = true;
+        \\                var ret_offset: usize = 2 * ptr_size;
+        \\                const has_return = (RetT != void);
+        \\                if (has_return) {
+        \\                    const rl = wireLayoutOf(RetT, is_memory64);
+        \\                    offset = alignForward(offset, rl.alignment);
+        \\                    ret_offset = offset;
+        \\                    offset += rl.size;
+        \\                    max_align = @max(max_align, rl.alignment);
+        \\                    has_indirect_slices = has_indirect_slices or rl.has_indirect_slices;
+        \\                    is_blittable_only = is_blittable_only and rl.is_blittable;
+        \\                }
+        \\                var param_offsets: [f.param_types.len]usize = undefined;
+        \\                for (f.param_types, 0..) |maybe_pt, i| {
+        \\                    const PT = maybe_pt.?;
+        \\                    const pl = wireLayoutOf(PT, is_memory64);
+        \\                    offset = alignForward(offset, pl.alignment);
+        \\                    param_offsets[i] = offset;
+        \\                    offset += pl.size;
+        \\                    max_align = @max(max_align, pl.alignment);
+        \\                    has_indirect_slices = has_indirect_slices or pl.has_indirect_slices;
+        \\                    is_blittable_only = is_blittable_only and pl.is_blittable;
+        \\                }
+        \\                const frame_size = alignForward(offset, max_align);
+        \\                var flags: u32 = 0;
+        \\                if (has_indirect_slices) flags |= FLAG_HAS_INDIRECT_SLICES;
+        \\                if (is_blittable_only) flags |= FLAG_IS_BLITTABLE_ONLY;
+        \\                break :blk .{
+        \\                    .header_bump_offset = 0,
+        \\                    .header_limit_offset = ptr_size,
+        \\                    .header_size = 2 * ptr_size,
+        \\                    .has_return = has_return,
+        \\                    .ret_offset = ret_offset,
+        \\                    .param_offsets = param_offsets,
+        \\                    .frame_size = frame_size,
+        \\                    .frame_align = max_align,
+        \\                    .has_indirect_slices = has_indirect_slices,
+        \\                    .is_blittable_only = is_blittable_only,
+        \\                    .flags = flags,
+        \\                };
+        \\            };
+        \\        }
+        \\
+        \\        pub fn FastCoreFnPtr(comptime is_memory64: bool) type {
+        \\            return *const fn (PtrInt(is_memory64)) callconv(.c) void;
+        \\        }
+        \\
+        \\        pub fn isDirectSliceCompatible(comptime Elem: type, comptime is_memory64: bool) bool {
+        \\            const wl = comptime wireLayoutOf(Elem, is_memory64);
+        \\            if (Elem == u8 or Elem == i8) return true;
+        \\            const is_le = @import("builtin").cpu.arch.endian() == .little;
+        \\            return is_le and wl.is_blittable and !wl.has_indirect_slices and
+        \\                (@sizeOf(Elem) == wl.size) and (@alignOf(Elem) == wl.alignment);
+        \\        }
+        \\
+        \\        fn alignSizeForward(offset: usize, alignment: usize) usize {
+        \\            return (offset + (alignment - 1)) & ~(alignment - 1);
+        \\        }
+        \\
+        \\        fn sliceInMemory(memory: []const u8, ptr: anytype, byte_len: usize) ?usize {
+        \\            if (memory.len == 0) return null;
+        \\            const mem_start = @intFromPtr(memory.ptr);
+        \\            const mem_end = mem_start + memory.len;
+        \\            const p = @intFromPtr(ptr);
+        \\            if (p >= mem_start and p <= mem_end and byte_len <= mem_end - p) {
+        \\                return p - mem_start;
+        \\            }
+        \\            return null;
+        \\        }
+        \\
+        \\        fn packedFlagsMask(comptime T: type) @Int(.unsigned, @bitSizeOf(@typeInfo(T).@"struct".backing_integer.?)) {
+        \\            const st = @typeInfo(T).@"struct";
+        \\            const BackingInt = st.backing_integer.?;
+        \\            const UnsignedInt = @Int(.unsigned, @bitSizeOf(BackingInt));
+        \\            const bit_count: usize = if (@hasDecl(T, "wit_flags_count")) T.wit_flags_count else @bitSizeOf(UnsignedInt);
+        \\            if (bit_count == 0) return 0;
+        \\            if (bit_count >= @bitSizeOf(UnsignedInt)) return std.math.maxInt(UnsignedInt);
+        \\            return (@as(UnsignedInt, 1) << @intCast(bit_count)) - 1;
+        \\        }
+        \\
+        \\        fn flagsWordMask(comptime bit_count: usize, comptime w: usize) u32 {
+        \\            const start = w * 32;
+        \\            if (bit_count <= start) return 0;
+        \\            const rem = bit_count - start;
+        \\            if (rem >= 32) return std.math.maxInt(u32);
+        \\            return (@as(u32, 1) << @intCast(rem)) - 1;
+        \\        }
+        \\
+        \\        fn needsFlagsWordMasking(comptime T: type) bool {
+        \\            if (@typeInfo(T) != .@"struct") return false;
+        \\            return @hasDecl(T, "wit_flags_count") and @hasField(T, "words") and (T.wit_flags_count % 32 != 0);
+        \\        }
+        \\
+        \\        fn errorToIndex(comptime ES: type, err: ES) u32 {
+        \\            const es = @typeInfo(ES).error_set;
+        \\            const names = es.error_names orelse @compileError("anyerror is not supported in fast_abi");
+        \\            inline for (names, 0..) |name, idx| {
+        \\                if (err == @field(ES, name)) return @intCast(idx);
+        \\            }
+        \\            unreachable;
+        \\        }
+        \\
+        \\        fn indexToError(comptime ES: type, raw: u32) Error!ES {
+        \\            const es = @typeInfo(ES).error_set;
+        \\            const names = es.error_names orelse @compileError("anyerror is not supported in fast_abi");
+        \\            inline for (names, 0..) |name, idx| {
+        \\                if (raw == idx) return @field(ES, name);
+        \\            }
+        \\            return error.InvalidDiscriminant;
+        \\        }
+        \\
+        \\        pub fn storeFastValue(comptime T: type, comptime is_memory64: bool, mem_ctx: anytype, addr: usize, val: T, bump_off: *usize) Error!void {
+        \\            const layout = comptime wireLayoutOf(T, is_memory64);
+        \\            const off = try mem_ctx.addrToOffset(addr, layout.size);
+        \\            if (comptime layout.alignment > 1) {
+        \\                if ((layout.size > 0 or addr != 0) and (addr % layout.alignment != 0)) {
+        \\                    return error.UnalignedPointer;
+        \\                }
+        \\            }
+        \\            if (comptime layout.is_blittable and !layout.has_indirect_slices and @sizeOf(T) == layout.size and !needsFlagsWordMasking(T)) {
+        \\                if (comptime layout.size > 0) @memcpy(mem_ctx.memory[off..][0..layout.size], std.mem.asBytes(&val));
+        \\                return;
+        \\            }
+        \\            if (T == void) return;
+        \\            if (comptime isCharType(T)) {
+        \\                const cp: u21 = if (@typeInfo(T) == .@"enum") @intFromEnum(val) else val;
+        \\                if (cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF)) return error.InvalidChar;
+        \\                std.mem.writeInt(u32, mem_ctx.memory[off..][0..4], @as(u32, cp), .little);
+        \\                return;
+        \\            }
+        \\            switch (@typeInfo(T)) {
+        \\                .bool => mem_ctx.memory[off] = if (val) 1 else 0,
+        \\                .int => |int| switch (int.bits) {
+        \\                    8 => mem_ctx.memory[off] = @bitCast(val),
+        \\                    16 => std.mem.writeInt(T, mem_ctx.memory[off..][0..2], val, .little),
+        \\                    32 => std.mem.writeInt(T, mem_ctx.memory[off..][0..4], val, .little),
+        \\                    64 => std.mem.writeInt(T, mem_ctx.memory[off..][0..8], val, .little),
+        \\                    else => unreachable,
+        \\                },
+        \\                .float => |fl| switch (fl.bits) {
+        \\                    32 => std.mem.writeInt(u32, mem_ctx.memory[off..][0..4], @bitCast(val), .little),
+        \\                    64 => std.mem.writeInt(u64, mem_ctx.memory[off..][0..8], @bitCast(val), .little),
+        \\                    else => unreachable,
+        \\                },
+        \\                .@"enum" => |en| {
+        \\                    var idx: u32 = 0;
+        \\                    inline for (en.field_names, 0..) |fname, i| {
+        \\                        if (val == @field(T, fname)) idx = @intCast(i);
+        \\                    }
+        \\                    switch (layout.size) {
+        \\                        1 => mem_ctx.memory[off] = @intCast(idx),
+        \\                        2 => std.mem.writeInt(u16, mem_ctx.memory[off..][0..2], @intCast(idx), .little),
+        \\                        4 => std.mem.writeInt(u32, mem_ctx.memory[off..][0..4], idx, .little),
+        \\                        else => unreachable,
+        \\                    }
+        \\                },
+        \\                .pointer => |pt| switch (pt.size) {
+        \\                    .slice => {
+        \\                        const E = pt.child;
+        \\                        if (comptime E == u8) {
+        \\                            if (mem_ctx.validate_utf8 and mem_ctx.strict_utf8_on_u8_slices and !std.unicode.utf8ValidateSlice(val)) {
+        \\                                return error.InvalidUtf8;
+        \\                            }
+        \\                        }
+        \\                        const el = comptime wireLayoutOf(E, is_memory64);
+        \\                        const byte_len = std.math.mul(usize, val.len, el.size) catch return error.OutOfBounds;
+        \\                        if (byte_len > 0x7fff_ffff) return error.OutOfBounds;
+        \\                        const PtrT = PtrInt(is_memory64);
+        \\                        const ptr_size = @sizeOf(PtrT);
+        \\                        if (comptime isDirectSliceCompatible(E, is_memory64)) {
+        \\                            if (sliceInMemory(mem_ctx.memory, val.ptr, byte_len)) |existing_off| {
+        \\                                const existing_addr = mem_ctx.base_addr + existing_off;
+        \\                                if (el.alignment == 1 or (existing_addr % el.alignment == 0)) {
+        \\                                    if (existing_addr > std.math.maxInt(PtrT) or val.len > std.math.maxInt(PtrT)) return error.OutOfBounds;
+        \\                                    std.mem.writeInt(PtrT, mem_ctx.memory[off..][0..ptr_size], @intCast(existing_addr), .little);
+        \\                                    std.mem.writeInt(PtrT, mem_ctx.memory[off + ptr_size ..][0..ptr_size], @intCast(val.len), .little);
+        \\                                    return;
+        \\                                }
+        \\                            }
+        \\                            const effective_limit = if (@hasField(@TypeOf(mem_ctx.*), "fast_scratch_limit"))
+        \\                                (if (mem_ctx.fast_scratch_limit) |lim| @min(lim, mem_ctx.memory.len) else mem_ctx.memory.len)
+        \\                            else
+        \\                                mem_ctx.memory.len;
+        \\                            const extra_sentinel: usize = if (comptime pt.sentinel_ptr != null and E == u8) 1 else 0;
+        \\                            const data_off = alignSizeForward(bump_off.*, el.alignment);
+        \\                            if (data_off > effective_limit or effective_limit - data_off < byte_len + extra_sentinel) return error.OutOfBounds;
+        \\                            bump_off.* = data_off + byte_len + extra_sentinel;
+        \\                            if (byte_len > 0) @memcpy(mem_ctx.memory[data_off..][0..byte_len], std.mem.sliceAsBytes(val));
+        \\                            if (comptime extra_sentinel == 1) {
+        \\                                const sentinel_val = @as(*const u8, @ptrCast(@alignCast(pt.sentinel_ptr.?))).*;
+        \\                                mem_ctx.memory[data_off + byte_len] = sentinel_val;
+        \\                            }
+        \\                            const data_addr = mem_ctx.base_addr + data_off;
+        \\                            if (data_addr > std.math.maxInt(PtrT) or val.len > std.math.maxInt(PtrT)) return error.OutOfBounds;
+        \\                            std.mem.writeInt(PtrT, mem_ctx.memory[off..][0..ptr_size], @intCast(data_addr), .little);
+        \\                            std.mem.writeInt(PtrT, mem_ctx.memory[off + ptr_size ..][0..ptr_size], @intCast(val.len), .little);
+        \\                            return;
+        \\                        }
+        \\                        const effective_limit = if (@hasField(@TypeOf(mem_ctx.*), "fast_scratch_limit"))
+        \\                            (if (mem_ctx.fast_scratch_limit) |lim| @min(lim, mem_ctx.memory.len) else mem_ctx.memory.len)
+        \\                        else
+        \\                            mem_ctx.memory.len;
+        \\                        const data_off = alignSizeForward(bump_off.*, el.alignment);
+        \\                        if (data_off > effective_limit or effective_limit - data_off < byte_len) return error.OutOfBounds;
+        \\                        bump_off.* = data_off + byte_len;
+        \\                        const data_addr = mem_ctx.base_addr + data_off;
+        \\                        if (data_addr > std.math.maxInt(PtrT) or val.len > std.math.maxInt(PtrT)) return error.OutOfBounds;
+        \\                        for (val, 0..) |elem, i| {
+        \\                            try storeFastValue(E, is_memory64, mem_ctx, data_addr + i * el.size, elem, bump_off);
+        \\                        }
+        \\                        std.mem.writeInt(PtrT, mem_ctx.memory[off..][0..ptr_size], @intCast(data_addr), .little);
+        \\                        std.mem.writeInt(PtrT, mem_ctx.memory[off + ptr_size ..][0..ptr_size], @intCast(val.len), .little);
+        \\                    },
+        \\                    else => unreachable,
+        \\                },
+        \\                .array => |ar| {
+        \\                    const el = comptime wireLayoutOf(ar.child, is_memory64);
+        \\                    for (val, 0..) |elem, i| {
+        \\                        try storeFastValue(ar.child, is_memory64, mem_ctx, addr + i * el.size, elem, bump_off);
+        \\                    }
+        \\                },
+        \\                .@"struct" => |st| {
+        \\                    if (comptime isHandleType(T)) {
+        \\                        std.mem.writeInt(i32, mem_ctx.memory[off..][0..4], val.handle, .little);
+        \\                        return;
+        \\                    }
+        \\                    if (comptime isStringWrapper(T)) {
+        \\                        if (val.bytes.len > 0x7fff_ffff) return error.OutOfBounds;
+        \\                        if (mem_ctx.validate_utf8 and !std.unicode.utf8ValidateSlice(val.bytes)) return error.InvalidUtf8;
+        \\                        return storeFastValue([]const u8, is_memory64, mem_ctx, addr, val.bytes, bump_off);
+        \\                    }
+        \\                    if (comptime st.layout == .@"packed") {
+        \\                        const BackingInt = st.backing_integer.?;
+        \\                        const UnsignedInt = @Int(.unsigned, @bitSizeOf(BackingInt));
+        \\                        const raw: UnsignedInt = (@as(UnsignedInt, @bitCast(val))) & (comptime packedFlagsMask(T));
+        \\                        switch (layout.size) {
+        \\                            0 => {},
+        \\                            1 => mem_ctx.memory[off] = @intCast(raw),
+        \\                            2 => std.mem.writeInt(u16, mem_ctx.memory[off..][0..2], @intCast(raw), .little),
+        \\                            4 => std.mem.writeInt(u32, mem_ctx.memory[off..][0..4], @intCast(raw), .little),
+        \\                            8 => std.mem.writeInt(u64, mem_ctx.memory[off..][0..8], @intCast(raw), .little),
+        \\                            else => {
+        \\                                const word_count = layout.size / 4;
+        \\                                inline for (0..word_count) |w| {
+        \\                                    const shift = w * 32;
+        \\                                    const word: u32 = if (comptime shift < @bitSizeOf(UnsignedInt))
+        \\                                        (if (comptime @bitSizeOf(UnsignedInt) <= 32) @as(u32, raw >> shift) else @truncate(raw >> shift))
+        \\                                    else
+        \\                                        0;
+        \\                                    std.mem.writeInt(u32, mem_ctx.memory[off + w * 4 ..][0..4], word, .little);
+        \\                                }
+        \\                            },
+        \\                        }
+        \\                        return;
+        \\                    }
+        \\                    if (comptime @hasDecl(T, "wit_flags_count") and @hasField(T, "words")) {
+        \\                        var masked = val;
+        \\                        inline for (0..masked.words.len) |w| {
+        \\                            masked.words[w] &= comptime flagsWordMask(T.wit_flags_count, w);
+        \\                        }
+        \\                        try storeFastValue(@TypeOf(masked.words), is_memory64, mem_ctx, addr, masked.words, bump_off);
+        \\                        return;
+        \\                    }
+        \\                    inline for (st.field_names, 0..) |fname, i| {
+        \\                        if (comptime st.field_attrs[i].@"comptime") continue;
+        \\                        const f_off = comptime fieldOffset(T, is_memory64, i);
+        \\                        try storeFastValue(st.field_types[i], is_memory64, mem_ctx, addr + f_off, @field(val, fname), bump_off);
+        \\                    }
+        \\                },
+        \\                .optional => |op| {
+        \\                    const cl = comptime wireLayoutOf(op.child, is_memory64);
+        \\                    const pay_off = comptime alignForward(1, cl.alignment);
+        \\                    if (val) |payload| {
+        \\                        mem_ctx.memory[off] = 1;
+        \\                        try storeFastValue(op.child, is_memory64, mem_ctx, addr + pay_off, payload, bump_off);
+        \\                    } else {
+        \\                        @memset(mem_ctx.memory[off..][0..layout.size], 0);
+        \\                    }
+        \\                },
+        \\                .@"union" => |un| {
+        \\                    const ds = comptime discSize(un.field_names.len);
+        \\                    const pay_off = comptime alignForward(ds, layout.alignment);
+        \\                    @memset(mem_ctx.memory[off..][0..layout.size], 0);
+        \\                    const active_tag = std.meta.activeTag(val);
+        \\                    inline for (un.field_names, 0..) |fname, case_idx| {
+        \\                        if (active_tag == @field(un.tag_type.?, fname)) {
+        \\                            switch (ds) {
+        \\                                1 => mem_ctx.memory[off] = @intCast(case_idx),
+        \\                                2 => std.mem.writeInt(u16, mem_ctx.memory[off..][0..2], @intCast(case_idx), .little),
+        \\                                4 => std.mem.writeInt(u32, mem_ctx.memory[off..][0..4], @intCast(case_idx), .little),
+        \\                                else => unreachable,
+        \\                            }
+        \\                            try storeFastValue(un.field_types[case_idx], is_memory64, mem_ctx, addr + pay_off, @field(val, fname), bump_off);
+        \\                            return;
+        \\                        }
+        \\                    }
+        \\                },
+        \\                .error_set => {
+        \\                    const raw = errorToIndex(T, val);
+        \\                    switch (layout.size) {
+        \\                        1 => mem_ctx.memory[off] = @intCast(raw),
+        \\                        2 => std.mem.writeInt(u16, mem_ctx.memory[off..][0..2], @intCast(raw), .little),
+        \\                        4 => std.mem.writeInt(u32, mem_ctx.memory[off..][0..4], raw, .little),
+        \\                        else => unreachable,
+        \\                    }
+        \\                },
+        \\                .error_union => |eu| {
+        \\                    const pay_off = comptime alignForward(1, layout.alignment);
+        \\                    @memset(mem_ctx.memory[off..][0..layout.size], 0);
+        \\                    if (val) |ok_val| {
+        \\                        mem_ctx.memory[off] = 0;
+        \\                        try storeFastValue(eu.payload, is_memory64, mem_ctx, addr + pay_off, ok_val, bump_off);
+        \\                    } else |err_val| {
+        \\                        mem_ctx.memory[off] = 1;
+        \\                        try storeFastValue(eu.error_set, is_memory64, mem_ctx, addr + pay_off, err_val, bump_off);
+        \\                    }
+        \\                },
+        \\                else => unreachable,
+        \\            }
+        \\        }
+        \\
+        \\        pub fn loadFastValue(comptime T: type, comptime is_memory64: bool, mem_ctx: anytype, addr: usize) CanonResult(T) {
+        \\            const layout = comptime wireLayoutOf(T, is_memory64);
+        \\            const off = try mem_ctx.addrToOffset(addr, layout.size);
+        \\            if (comptime layout.alignment > 1) {
+        \\                if ((layout.size > 0 or addr != 0) and (addr % layout.alignment != 0)) {
+        \\                    return error.UnalignedPointer;
+        \\                }
+        \\            }
+        \\            if (comptime layout.is_blittable and !layout.has_indirect_slices and @sizeOf(T) == layout.size and !needsFlagsWordMasking(T)) {
+        \\                if (comptime layout.size == 0) return @as(T, undefined);
+        \\                return std.mem.bytesToValue(T, mem_ctx.memory[off..][0..layout.size]);
+        \\            }
+        \\            if (T == void) return {};
+        \\            if (comptime isCharType(T)) {
+        \\                const raw = std.mem.readInt(u32, mem_ctx.memory[off..][0..4], .little);
+        \\                if (raw > 0x10FFFF or (raw >= 0xD800 and raw <= 0xDFFF)) return error.InvalidChar;
+        \\                const cp: u21 = @intCast(raw);
+        \\                return if (@typeInfo(T) == .@"enum") @enumFromInt(cp) else cp;
+        \\            }
+        \\            switch (@typeInfo(T)) {
+        \\                .bool => return switch (mem_ctx.memory[off]) {
+        \\                    0 => false,
+        \\                    1 => true,
+        \\                    else => error.InvalidBool,
+        \\                },
+        \\                .int => |int| return switch (int.bits) {
+        \\                    8 => @bitCast(mem_ctx.memory[off]),
+        \\                    16 => std.mem.readInt(T, mem_ctx.memory[off..][0..2], .little),
+        \\                    32 => std.mem.readInt(T, mem_ctx.memory[off..][0..4], .little),
+        \\                    64 => std.mem.readInt(T, mem_ctx.memory[off..][0..8], .little),
+        \\                    else => unreachable,
+        \\                },
+        \\                .float => |fl| return switch (fl.bits) {
+        \\                    32 => @bitCast(std.mem.readInt(u32, mem_ctx.memory[off..][0..4], .little)),
+        \\                    64 => @bitCast(std.mem.readInt(u64, mem_ctx.memory[off..][0..8], .little)),
+        \\                    else => unreachable,
+        \\                },
+        \\                .@"enum" => |en| {
+        \\                    const raw: u32 = switch (layout.size) {
+        \\                        1 => mem_ctx.memory[off],
+        \\                        2 => std.mem.readInt(u16, mem_ctx.memory[off..][0..2], .little),
+        \\                        4 => std.mem.readInt(u32, mem_ctx.memory[off..][0..4], .little),
+        \\                        else => unreachable,
+        \\                    };
+        \\                    inline for (en.field_names, 0..) |fname, i| {
+        \\                        if (raw == i) return @field(T, fname);
+        \\                    }
+        \\                    return error.InvalidDiscriminant;
+        \\                },
+        \\                .pointer => |pt| switch (pt.size) {
+        \\                    .slice => {
+        \\                        const E = pt.child;
+        \\                        const el = comptime wireLayoutOf(E, is_memory64);
+        \\                        const PtrT = PtrInt(is_memory64);
+        \\                        const ptr_size = @sizeOf(PtrT);
+        \\                        const data_addr: usize = @intCast(std.mem.readInt(PtrT, mem_ctx.memory[off..][0..ptr_size], .little));
+        \\                        const len: usize = @intCast(std.mem.readInt(PtrT, mem_ctx.memory[off + ptr_size ..][0..ptr_size], .little));
+        \\                        const byte_len = std.math.mul(usize, len, el.size) catch return error.OutOfBounds;
+        \\                        if (byte_len > 0x7fff_ffff) return error.OutOfBounds;
+        \\                        if (el.alignment > 1 and (len > 0 or data_addr != 0) and (data_addr % el.alignment != 0)) {
+        \\                            return error.UnalignedPointer;
+        \\                        }
+        \\                        const data_off = try mem_ctx.addrToOffset(data_addr, byte_len);
+        \\                        if (comptime isDirectSliceCompatible(E, is_memory64)) {
+        \\                            const raw_bytes = mem_ctx.memory[data_off..][0..byte_len];
+        \\                            if (comptime E == u8) {
+        \\                                if (mem_ctx.validate_utf8 and mem_ctx.strict_utf8_on_u8_slices and !std.unicode.utf8ValidateSlice(raw_bytes)) {
+        \\                                    return error.InvalidUtf8;
+        \\                                }
+        \\                            }
+        \\                            if (mem_ctx.zero_copy_slices and comptime pt.attrs.@"const" and pt.sentinel_ptr == null) {
+        \\                                if (len == 0) return &.{};
+        \\                                if (@alignOf(E) == 1 or (@intFromPtr(raw_bytes.ptr) % @alignOf(E) == 0)) {
+        \\                                    const aligned_ptr: [*]const E = @ptrCast(@alignCast(raw_bytes.ptr));
+        \\                                    return aligned_ptr[0..len];
+        \\                                }
+        \\                            }
+        \\                            const alloc = mem_ctx.allocator orelse return error.MissingAllocator;
+        \\                            if (comptime pt.sentinel_ptr != null and E == u8) {
+        \\                                const sentinel_val = @as(*const u8, @ptrCast(@alignCast(pt.sentinel_ptr.?))).*;
+        \\                                const buf = try alloc.allocSentinel(u8, len, sentinel_val);
+        \\                                if (byte_len > 0) @memcpy(buf, raw_bytes);
+        \\                                return buf;
+        \\                            }
+        \\                            const buf = try alloc.alloc(E, len);
+        \\                            if (byte_len > 0) @memcpy(std.mem.sliceAsBytes(buf), raw_bytes);
+        \\                            return buf;
+        \\                        }
+        \\                        const alloc = mem_ctx.allocator orelse return error.MissingAllocator;
+        \\                        const buf = try alloc.alloc(E, len);
+        \\                        for (0..len) |i| {
+        \\                            buf[i] = try loadFastValue(E, is_memory64, mem_ctx, data_addr + i * el.size);
+        \\                        }
+        \\                        return buf;
+        \\                    },
+        \\                    else => unreachable,
+        \\                },
+        \\                .array => |ar| {
+        \\                    const el = comptime wireLayoutOf(ar.child, is_memory64);
+        \\                    var out: T = undefined;
+        \\                    for (0..ar.len) |i| {
+        \\                        out[i] = try loadFastValue(ar.child, is_memory64, mem_ctx, addr + i * el.size);
+        \\                    }
+        \\                    return out;
+        \\                },
+        \\                .@"struct" => |st| {
+        \\                    if (comptime isHandleType(T)) {
+        \\                        return .{ .handle = std.mem.readInt(i32, mem_ctx.memory[off..][0..4], .little) };
+        \\                    }
+        \\                    if (comptime isStringWrapper(T)) {
+        \\                        const s = try loadFastValue([]const u8, is_memory64, mem_ctx, addr);
+        \\                        if (mem_ctx.validate_utf8 and !std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
+        \\                        return .{ .bytes = s };
+        \\                    }
+        \\                    if (comptime st.layout == .@"packed") {
+        \\                        const BackingInt = st.backing_integer.?;
+        \\                        const UnsignedInt = @Int(.unsigned, @bitSizeOf(BackingInt));
+        \\                        const raw: UnsignedInt = switch (layout.size) {
+        \\                            0 => 0,
+        \\                            1 => @intCast(mem_ctx.memory[off]),
+        \\                            2 => @intCast(std.mem.readInt(u16, mem_ctx.memory[off..][0..2], .little)),
+        \\                            4 => @intCast(std.mem.readInt(u32, mem_ctx.memory[off..][0..4], .little)),
+        \\                            8 => @intCast(std.mem.readInt(u64, mem_ctx.memory[off..][0..8], .little)),
+        \\                            else => blk: {
+        \\                                var acc: UnsignedInt = 0;
+        \\                                const word_count = layout.size / 4;
+        \\                                inline for (0..word_count) |w| {
+        \\                                    const shift = w * 32;
+        \\                                    if (comptime shift < @bitSizeOf(UnsignedInt)) {
+        \\                                        const word = std.mem.readInt(u32, mem_ctx.memory[off + w * 4 ..][0..4], .little);
+        \\                                        acc |= (@as(UnsignedInt, @intCast(word)) << shift);
+        \\                                    }
+        \\                                }
+        \\                                break :blk acc;
+        \\                            },
+        \\                        };
+        \\                        return @bitCast(raw & (comptime packedFlagsMask(T)));
+        \\                    }
+        \\                    var out: T = undefined;
+        \\                    inline for (st.field_names, 0..) |fname, i| {
+        \\                        if (comptime st.field_attrs[i].@"comptime") continue;
+        \\                        const f_off = comptime fieldOffset(T, is_memory64, i);
+        \\                        @field(out, fname) = try loadFastValue(st.field_types[i], is_memory64, mem_ctx, addr + f_off);
+        \\                    }
+        \\                    if (comptime @hasDecl(T, "wit_flags_count") and @hasField(T, "words")) {
+        \\                        inline for (0..out.words.len) |w| {
+        \\                            out.words[w] &= comptime flagsWordMask(T.wit_flags_count, w);
+        \\                        }
+        \\                    }
+        \\                    return out;
+        \\                },
+        \\                .optional => |op| {
+        \\                    const cl = comptime wireLayoutOf(op.child, is_memory64);
+        \\                    const pay_off = comptime alignForward(1, cl.alignment);
+        \\                    return switch (mem_ctx.memory[off]) {
+        \\                        0 => null,
+        \\                        1 => try loadFastValue(op.child, is_memory64, mem_ctx, addr + pay_off),
+        \\                        else => error.InvalidDiscriminant,
+        \\                    };
+        \\                },
+        \\                .@"union" => |un| {
+        \\                    const ds = comptime discSize(un.field_names.len);
+        \\                    const pay_off = comptime alignForward(ds, layout.alignment);
+        \\                    const raw_disc: u32 = switch (ds) {
+        \\                        1 => mem_ctx.memory[off],
+        \\                        2 => std.mem.readInt(u16, mem_ctx.memory[off..][0..2], .little),
+        \\                        4 => std.mem.readInt(u32, mem_ctx.memory[off..][0..4], .little),
+        \\                        else => unreachable,
+        \\                    };
+        \\                    inline for (un.field_names, 0..) |fname, case_idx| {
+        \\                        if (raw_disc == case_idx) {
+        \\                            const payload = try loadFastValue(un.field_types[case_idx], is_memory64, mem_ctx, addr + pay_off);
+        \\                            return @unionInit(T, fname, payload);
+        \\                        }
+        \\                    }
+        \\                    return error.InvalidDiscriminant;
+        \\                },
+        \\                .error_set => {
+        \\                    const raw: u32 = switch (layout.size) {
+        \\                        1 => mem_ctx.memory[off],
+        \\                        2 => std.mem.readInt(u16, mem_ctx.memory[off..][0..2], .little),
+        \\                        4 => std.mem.readInt(u32, mem_ctx.memory[off..][0..4], .little),
+        \\                        else => unreachable,
+        \\                    };
+        \\                    return indexToError(T, raw);
+        \\                },
+        \\                .error_union => |eu| {
+        \\                    const pay_off = comptime alignForward(1, layout.alignment);
+        \\                    return switch (mem_ctx.memory[off]) {
+        \\                        0 => try loadFastValue(eu.payload, is_memory64, mem_ctx, addr + pay_off),
+        \\                        1 => blk: {
+        \\                            const err_val = try loadFastValue(eu.error_set, is_memory64, mem_ctx, addr + pay_off);
+        \\                            break :blk err_val;
+        \\                        },
+        \\                        else => error.InvalidDiscriminant,
+        \\                    };
+        \\                },
+        \\                else => unreachable,
+        \\            }
+        \\        }
+        \\
+        \\        fn maxInPlaceSliceEnd(comptime T: type, comptime is_memory64: bool, memory: []const u8, val: T) usize {
+        \\            if (comptime isStringWrapper(T)) {
+        \\                return maxInPlaceSliceEnd([]const u8, is_memory64, memory, val.bytes);
+        \\            }
+        \\            return switch (@typeInfo(T)) {
+        \\                .pointer => |pt| if (comptime pt.size == .slice) blk: {
+        \\                    const elem_size = comptime wireLayoutOf(pt.child, is_memory64).size;
+        \\                    const byte_len = val.len * elem_size;
+        \\                    var max_end: usize = 0;
+        \\                    if (sliceInMemory(memory, val.ptr, byte_len)) |off| {
+        \\                        max_end = off + byte_len;
+        \\                    }
+        \\                    if (comptime !isDirectSliceCompatible(pt.child, is_memory64)) {
+        \\                        for (val) |elem| {
+        \\                            max_end = @max(max_end, maxInPlaceSliceEnd(pt.child, is_memory64, memory, elem));
+        \\                        }
+        \\                    }
+        \\                    break :blk max_end;
+        \\                } else 0,
+        \\                .array => |ar| blk: {
+        \\                    var max_end: usize = 0;
+        \\                    for (val) |elem| {
+        \\                        max_end = @max(max_end, maxInPlaceSliceEnd(ar.child, is_memory64, memory, elem));
+        \\                    }
+        \\                    break :blk max_end;
+        \\                },
+        \\                .@"struct" => |st| blk: {
+        \\                    if (comptime st.layout == .@"packed" or isHandleType(T)) break :blk 0;
+        \\                    var max_end: usize = 0;
+        \\                    inline for (st.field_names, 0..) |fname, i| {
+        \\                        if (comptime st.field_attrs[i].@"comptime") continue;
+        \\                        max_end = @max(max_end, maxInPlaceSliceEnd(st.field_types[i], is_memory64, memory, @field(val, fname)));
+        \\                    }
+        \\                    break :blk max_end;
+        \\                },
+        \\                .optional => |op| if (val) |payload| maxInPlaceSliceEnd(op.child, is_memory64, memory, payload) else 0,
+        \\                .@"union" => |un| blk: {
+        \\                    if (comptime un.tag_type == null) break :blk 0;
+        \\                    const active = std.meta.activeTag(val);
+        \\                    inline for (un.field_names, 0..) |fname, i| {
+        \\                        if (active == @field(un.tag_type.?, fname)) {
+        \\                            break :blk maxInPlaceSliceEnd(un.field_types[i], is_memory64, memory, @field(val, fname));
+        \\                        }
+        \\                    }
+        \\                    break :blk 0;
+        \\                },
+        \\                .error_union => |eu| if (val) |ok_val| maxInPlaceSliceEnd(eu.payload, is_memory64, memory, ok_val) else |_| 0,
+        \\                else => 0,
+        \\            };
+        \\        }
+        \\
+        \\        pub fn storeFastFrame(comptime FnType: type, comptime is_memory64: bool, mem_ctx: anytype, frame_offset: usize, args: std.meta.ArgsTuple(FnType), bump_off: *usize) Error!void {
+        \\            const fl = comptime ArgStructLayout(FnType, is_memory64);
+        \\            const f = @typeInfo(FnType).@"fn";
+        \\            const PtrT = PtrInt(is_memory64);
+        \\            const ptr_size = @sizeOf(PtrT);
+        \\            const effective_limit = if (@hasField(@TypeOf(mem_ctx.*), "fast_scratch_limit"))
+        \\                (if (mem_ctx.fast_scratch_limit) |lim| @min(lim, mem_ctx.memory.len) else mem_ctx.memory.len)
+        \\            else
+        \\                mem_ctx.memory.len;
+        \\            if (frame_offset > effective_limit or effective_limit - frame_offset < fl.frame_size) return error.OutOfBounds;
+        \\            const frame_addr = mem_ctx.base_addr + frame_offset;
+        \\            if (fl.frame_align > 1 and (frame_addr % fl.frame_align != 0)) return error.UnalignedPointer;
+        \\            @memset(mem_ctx.memory[frame_offset..][0..fl.header_size], 0);
+        \\            if (fl.has_return and fl.frame_size > 0) {
+        \\                const RetT = f.return_type orelse void;
+        \\                const rl = comptime wireLayoutOf(RetT, is_memory64);
+        \\                @memset(mem_ctx.memory[frame_offset + fl.ret_offset ..][0..rl.size], 0);
+        \\            }
+        \\            inline for (0..f.param_types.len) |i| {
+        \\                const PT = f.param_types[i].?;
+        \\                try storeFastValue(PT, is_memory64, mem_ctx, frame_addr + fl.param_offsets[i], args[i], bump_off);
+        \\            }
+        \\            if (bump_off.* > effective_limit) return error.OutOfBounds;
+        \\            const bump_addr = mem_ctx.base_addr + bump_off.*;
+        \\            const limit_addr = mem_ctx.base_addr + effective_limit;
+        \\            if (bump_addr > std.math.maxInt(PtrT)) return error.OutOfBounds;
+        \\            std.mem.writeInt(PtrT, mem_ctx.memory[frame_offset + fl.header_bump_offset ..][0..ptr_size], @intCast(bump_addr), .little);
+        \\            const encoded_limit: PtrT = if (limit_addr <= std.math.maxInt(PtrT)) @intCast(limit_addr) else 0;
+        \\            std.mem.writeInt(PtrT, mem_ctx.memory[frame_offset + fl.header_limit_offset ..][0..ptr_size], encoded_limit, .little);
+        \\        }
+        \\
+        \\        pub fn FastLower(comptime FnType: type, comptime is_memory64: bool) type {
+        \\            return struct {
+        \\                pub const abi_hash: u64 = comptimeAbiHash(FnType, is_memory64);
+        \\                pub const frame_layout = ArgStructLayout(FnType, is_memory64);
+        \\                pub const ArgsTuple = std.meta.ArgsTuple(FnType);
+        \\                pub const RetT = ReturnType(FnType);
+        \\                pub const PtrT = PtrInt(is_memory64);
+        \\
+        \\                pub fn resolveFrameOffset(mem_ctx: anytype, args: ArgsTuple) Error!usize {
+        \\                    const effective_limit = if (@hasField(@TypeOf(mem_ctx.*), "fast_scratch_limit"))
+        \\                        (if (mem_ctx.fast_scratch_limit) |lim| @min(lim, mem_ctx.memory.len) else mem_ctx.memory.len)
+        \\                    else
+        \\                        mem_ctx.memory.len;
+        \\                    var base_off = alignSizeForward(mem_ctx.fast_frame_offset, frame_layout.frame_align);
+        \\                    if (comptime frame_layout.has_indirect_slices) {
+        \\                        const in_place_end = maxInPlaceSliceEnd(ArgsTuple, is_memory64, mem_ctx.memory, args);
+        \\                        if (in_place_end > base_off) {
+        \\                            const after_in_place = alignSizeForward(in_place_end, frame_layout.frame_align);
+        \\                            if (after_in_place > effective_limit or effective_limit - after_in_place < frame_layout.frame_size) {
+        \\                                return error.OutOfBounds;
+        \\                            }
+        \\                            base_off = after_in_place;
+        \\                        }
+        \\                    }
+        \\                    if (base_off > effective_limit or effective_limit - base_off < frame_layout.frame_size) {
+        \\                        return error.OutOfBounds;
+        \\                    }
+        \\                    return base_off;
+        \\                }
+        \\
+        \\                pub fn call(mem_ctx: *MemoryContext, fast_fn: FastCoreFnPtr(is_memory64), args: ArgsTuple) CanonResult(RetT) {
+        \\                    const base_off = try resolveFrameOffset(mem_ctx, args);
+        \\                    return callAtOffset(mem_ctx, base_off, fast_fn, args);
+        \\                }
+        \\
+        \\                pub fn callAtOffset(mem_ctx: *MemoryContext, frame_offset: usize, fast_fn: FastCoreFnPtr(is_memory64), args: ArgsTuple) CanonResult(RetT) {
+        \\                    const effective_limit = mem_ctx.effectiveFastLimit();
+        \\                    const aligned_frame_off = alignSizeForward(frame_offset, frame_layout.frame_align);
+        \\                    var bump_off: usize = aligned_frame_off + frame_layout.frame_size;
+        \\                    try storeFastFrame(FnType, is_memory64, mem_ctx, aligned_frame_off, args, &bump_off);
+        \\                    mem_ctx.fast_bump_cursor = bump_off;
+        \\                    const frame_addr = mem_ctx.base_addr + aligned_frame_off;
+        \\                    if (frame_addr > std.math.maxInt(PtrT)) return error.OutOfBounds;
+        \\                    const prev_fast = active_fast_memory_ctx;
+        \\                    setActiveFastMemoryContext(mem_ctx);
+        \\                    defer setActiveFastMemoryContext(prev_fast);
+        \\                    fast_fn(@intCast(frame_addr));
+        \\                    const updated_bump_addr: usize = @intCast(std.mem.readInt(PtrT, mem_ctx.memory[aligned_frame_off + frame_layout.header_bump_offset ..][0..@sizeOf(PtrT)], .little));
+        \\                    if (updated_bump_addr >= mem_ctx.base_addr) {
+        \\                        const updated_off = updated_bump_addr - mem_ctx.base_addr;
+        \\                        if (updated_off <= effective_limit) {
+        \\                            mem_ctx.fast_bump_cursor = @max(bump_off, updated_off);
+        \\                        }
+        \\                    }
+        \\                    if (comptime RetT == void) return;
+        \\                    return loadFastValue(RetT, is_memory64, mem_ctx, frame_addr + frame_layout.ret_offset);
+        \\                }
+        \\            };
+        \\        }
+        \\
+        \\        pub fn FastLift(comptime FnType: type, comptime impl_fn: FnType, comptime is_memory64: bool) type {
+        \\            return struct {
+        \\                pub const abi_hash: u64 = comptimeAbiHash(FnType, is_memory64);
+        \\                pub const frame_layout = ArgStructLayout(FnType, is_memory64);
+        \\                pub const ArgsTuple = std.meta.ArgsTuple(FnType);
+        \\                pub const RetT = ReturnType(FnType);
+        \\                pub const PtrT = PtrInt(is_memory64);
+        \\
+        \\                pub fn callFromMemory(mem_ctx: anytype, frame_addr: PtrT) Error!void {
+        \\                    const addr_usize: usize = std.math.cast(usize, frame_addr) orelse return error.OutOfBounds;
+        \\                    if (frame_layout.frame_align > 1 and (addr_usize % frame_layout.frame_align != 0)) {
+        \\                        return error.UnalignedPointer;
+        \\                    }
+        \\                    const frame_offset = try mem_ctx.addrToOffset(addr_usize, frame_layout.frame_size);
+        \\                    const ptr_size = @sizeOf(PtrT);
+        \\                    const raw_bump_addr: usize = @intCast(std.mem.readInt(PtrT, mem_ctx.memory[frame_offset + frame_layout.header_bump_offset ..][0..ptr_size], .little));
+        \\                    const raw_limit_addr: usize = @intCast(std.mem.readInt(PtrT, mem_ctx.memory[frame_offset + frame_layout.header_limit_offset ..][0..ptr_size], .little));
+        \\                    var header_bump_off: usize = 0;
+        \\                    if (raw_bump_addr != 0) {
+        \\                        if (raw_bump_addr < mem_ctx.base_addr) return error.OutOfBounds;
+        \\                        header_bump_off = raw_bump_addr - mem_ctx.base_addr;
+        \\                        if (header_bump_off > mem_ctx.memory.len) return error.OutOfBounds;
+        \\                    }
+        \\                    const default_fallback = if (comptime @import("builtin").cpu.arch.isWasm())
+        \\                        std.heap.wasm_allocator
+        \\                    else
+        \\                        std.heap.page_allocator;
+        \\                    var sfa = StackFallbackAllocator(4096){};
+        \\                    const backing_alloc = mem_ctx.allocator orelse sfa.get(default_fallback);
+        \\                    var lift_arena = std.heap.ArenaAllocator.init(backing_alloc);
+        \\                    defer lift_arena.deinit();
+        \\                    var lift_ctx = mem_ctx.*;
+        \\                    lift_ctx.allocator = lift_arena.allocator();
+        \\                    const f = @typeInfo(FnType).@"fn";
+        \\                    var args: ArgsTuple = undefined;
+        \\                    inline for (0..f.param_types.len) |i| {
+        \\                        const PT = f.param_types[i].?;
+        \\                        args[i] = try loadFastValue(PT, is_memory64, &lift_ctx, addr_usize + frame_layout.param_offsets[i]);
+        \\                    }
+        \\                    const ret_val: RetT = @call(.auto, impl_fn, args);
+        \\                    if (comptime RetT != void) {
+        \\                        const min_bump = frame_offset + frame_layout.frame_size;
+        \\                        var bump_off: usize = if (raw_bump_addr != 0)
+        \\                            @max(header_bump_off, min_bump)
+        \\                        else
+        \\                            @max(mem_ctx.fast_bump_cursor, min_bump);
+        \\                        var store_ctx = mem_ctx.*;
+        \\                        if (raw_limit_addr != 0) {
+        \\                            if (raw_limit_addr < mem_ctx.base_addr) return error.OutOfBounds;
+        \\                            const limit_off = raw_limit_addr - mem_ctx.base_addr;
+        \\                            if (limit_off > mem_ctx.memory.len or limit_off < min_bump) return error.OutOfBounds;
+        \\                            if (@hasField(@TypeOf(store_ctx), "fast_scratch_limit")) {
+        \\                                store_ctx.fast_scratch_limit = limit_off;
+        \\                            }
+        \\                            store_ctx.memory = mem_ctx.memory[0..limit_off];
+        \\                        }
+        \\                        try storeFastValue(RetT, is_memory64, &store_ctx, addr_usize + frame_layout.ret_offset, ret_val, &bump_off);
+        \\                        mem_ctx.fast_bump_cursor = bump_off;
+        \\                        const new_bump_addr = mem_ctx.base_addr + bump_off;
+        \\                        if (new_bump_addr > std.math.maxInt(PtrT)) return error.OutOfBounds;
+        \\                        std.mem.writeInt(PtrT, mem_ctx.memory[frame_offset + frame_layout.header_bump_offset ..][0..ptr_size], @intCast(new_bump_addr), .little);
+        \\                    }
+        \\                }
+        \\
+        \\                pub fn createThunk(comptime mem_ctx_ptr: anytype) FastCoreFnPtr(is_memory64) {
+        \\                    const Thunk = struct {
+        \\                        pub fn call(frame_addr: PtrT) callconv(.c) void {
+        \\                            callFromMemory(mem_ctx_ptr, frame_addr) catch @trap();
+        \\                        }
+        \\                    };
+        \\                    return &Thunk.call;
+        \\                }
+        \\
+        \\                pub fn thunk() FastCoreFnPtr(is_memory64) {
+        \\                    const ActiveThunk = struct {
+        \\                        pub fn call(frame_addr: PtrT) callconv(.c) void {
+        \\                            if (comptime @import("builtin").cpu.arch != .wasm32 and @import("builtin").cpu.arch != .wasm64) {
+        \\                                if (active_fast_memory_ctx) |ctx_ptr| {
+        \\                                    callFromMemory(ctx_ptr, frame_addr) catch @trap();
+        \\                                    return;
+        \\                                }
+        \\                                @trap();
+        \\                            } else {
+        \\                                const wasm_bytes = @as(usize, @wasmMemorySize(0)) * 65536;
+        \\                                if (wasm_bytes <= 1) @trap();
+        \\                                const mem_slice = @as([*]u8, @ptrFromInt(1))[0 .. wasm_bytes - 1];
+        \\                                var wasm_ctx = MemoryContext{ .memory = mem_slice, .base_addr = 1 };
+        \\                                callFromMemory(&wasm_ctx, frame_addr) catch @trap();
+        \\                                return;
+        \\                            }
+        \\                        }
+        \\                    };
+        \\                    return &ActiveThunk.call;
+        \\                }
+        \\            };
+        \\        }
+        \\    };
+        \\
+        \\    pub const FastLower = fast_abi.FastLower;
+        \\    pub const FastLift = fast_abi.FastLift;
+        \\};
         \\
         \\
     );
@@ -1763,6 +3192,10 @@ fn emitFuncSigAndMeta(
         \\{s}    .lift_needs_realloc = {},
         \\{s}    .lift_needs_post_return = {},
         \\{s}}};
+        \\{s}pub const {s}_fn_t = {s}_Fn;
+        \\{s}pub const {s}_sig = {s}_CoreFn;
+        \\{s}pub const {s}_canon_meta = {s}_meta;
+        \\{s}pub const {s}_zigar_abi_hash: u64 = canon.fast_abi.comptimeAbiHash({s}_fn_t, {s});
         \\
         \\
     , .{
@@ -1779,6 +3212,19 @@ fn emitFuncSigAndMeta(
         indent,
         lift_opts.needs_post_return,
         indent,
+        indent,
+        fn_raw,
+        fn_raw,
+        indent,
+        fn_raw,
+        fn_raw,
+        indent,
+        fn_raw,
+        fn_raw,
+        indent,
+        fn_raw,
+        fn_raw,
+        if (opts.arch == .wasm64) "true" else "false",
     });
 }
 
@@ -1794,7 +3240,111 @@ fn emitExportBindingsHelper(
     opts: BindgenOptions,
     indent: []const u8,
 ) BindgenError!void {
-    try w.print("{s}pub fn exportBindings(comptime Impl: type) void {{\n", .{indent});
+    const is_mem64_lit: []const u8 = if (opts.arch == .wasm64) "true" else "false";
+    const iface_lit: []const u8 = if (std.mem.eql(u8, canonical_module, "$root")) "" else canonical_module;
+
+    try w.print("{s}pub fn exportBindings(comptime Impl: type) type {{\n", .{indent});
+    try w.print("{s}    return struct {{\n", .{indent});
+    try w.print("{s}        pub const scratch_ptr = canon.fast_abi.fastScratchPtr;\n", .{indent});
+    try w.print("{s}        pub const scratch_len = canon.fast_abi.fastScratchLen;\n", .{indent});
+
+    var func_count: usize = 0;
+    for (items) |it| {
+        if (it != .func) continue;
+        if (findFuncRef(ext_funcs, it.func.name) == null) continue;
+        func_count += 1;
+        const raw_snake = try toRawSnakeCase(ar, it.func.name);
+        const collides = import_collisions.contains(it.func.name);
+        const decl_base = if (collides)
+            try std.fmt.allocPrint(ar, "export_{s}", .{raw_snake})
+        else
+            raw_snake;
+        try w.print(
+            "{s}        pub const fast_{s} = if (@hasDecl(Impl, \"{s}\") and @TypeOf(@field(Impl, \"{s}\")) == {s}_fn_t)\n" ++
+                "{s}            canon.FastLift({s}_fn_t, @field(Impl, \"{s}\"), {s})\n" ++
+                "{s}        else\n" ++
+                "{s}            void;\n",
+            .{
+                indent,
+                decl_base,
+                raw_snake,
+                raw_snake,
+                decl_base,
+                indent,
+                decl_base,
+                raw_snake,
+                is_mem64_lit,
+                indent,
+                indent,
+            },
+        );
+    }
+
+    try w.print("{s}        pub const zigar_abi_entries = blk: {{\n", .{indent});
+    try w.print("{s}            var _entries: [{d}]canon.fast_abi.ZigarFuncEntry = undefined;\n", .{ indent, func_count });
+    try w.print("{s}            var _count: usize = 0;\n", .{indent});
+    for (items) |it| {
+        if (it != .func) continue;
+        if (findFuncRef(ext_funcs, it.func.name) == null) continue;
+        const raw_snake = try toRawSnakeCase(ar, it.func.name);
+        const collides = import_collisions.contains(it.func.name);
+        const decl_base = if (collides)
+            try std.fmt.allocPrint(ar, "export_{s}", .{raw_snake})
+        else
+            raw_snake;
+        const fast_export_sym = if (iface_lit.len == 0)
+            try std.fmt.allocPrint(ar, "__zigar_fast_{s}", .{decl_base})
+        else
+            try std.fmt.allocPrint(ar, "__zigar_fast_{s}#{s}", .{ iface_lit, decl_base });
+
+        try w.print(
+            \\{s}            if (@hasDecl(Impl, "{s}") and @TypeOf(@field(Impl, "{s}")) == {s}_fn_t) {{
+            \\{s}                _entries[_count] = .{{
+            \\{s}                    .interface_name = "{s}",
+            \\{s}                    .func_name = "{s}",
+            \\{s}                    .fast_export_name = "{s}",
+            \\{s}                    .abi_hash = {s}_zigar_abi_hash,
+            \\{s}                    .arg_struct_size = @intCast(canon.fast_abi.ArgStructLayout({s}_fn_t, {s}).frame_size),
+            \\{s}                    .arg_struct_align = @intCast(canon.fast_abi.ArgStructLayout({s}_fn_t, {s}).frame_align),
+            \\{s}                    .flags = canon.fast_abi.ArgStructLayout({s}_fn_t, {s}).flags,
+            \\{s}                }};
+            \\{s}                _count += 1;
+            \\{s}            }}
+            \\
+        , .{
+            indent,
+            raw_snake,
+            raw_snake,
+            decl_base,
+            indent,
+            indent,
+            iface_lit,
+            indent,
+            it.func.name,
+            indent,
+            fast_export_sym,
+            indent,
+            decl_base,
+            indent,
+            decl_base,
+            is_mem64_lit,
+            indent,
+            decl_base,
+            is_mem64_lit,
+            indent,
+            decl_base,
+            is_mem64_lit,
+            indent,
+            indent,
+            indent,
+        });
+    }
+    try w.print("{s}            const _final = _entries[0.._count].*;\n", .{indent});
+    try w.print("{s}            break :blk _final;\n", .{indent});
+    try w.print("{s}        }};\n\n", .{indent});
+
+    try w.print("{s}        pub fn registerCoreExports() void {{\n", .{indent});
+    try w.print("{s}            canon.fast_abi.ensureScratchExported();\n", .{indent});
     var any_fn = false;
     for (items) |it| {
         if (it != .func) continue;
@@ -1806,10 +3356,14 @@ fn emitExportBindingsHelper(
             try std.fmt.allocPrint(ar, "export_{s}", .{raw_snake})
         else
             raw_snake;
-        const export_sym = if (canonical_module.len == 0 or std.mem.eql(u8, canonical_module, "$root"))
+        const export_sym = if (iface_lit.len == 0)
             it.func.name
         else
-            try std.fmt.allocPrint(ar, "{s}#{s}", .{ canonical_module, it.func.name });
+            try std.fmt.allocPrint(ar, "{s}#{s}", .{ iface_lit, it.func.name });
+        const fast_export_sym = if (iface_lit.len == 0)
+            try std.fmt.allocPrint(ar, "__zigar_fast_{s}", .{decl_base})
+        else
+            try std.fmt.allocPrint(ar, "__zigar_fast_{s}#{s}", .{ iface_lit, decl_base });
 
         const ftr = abi.FuncTypeRef{
             .func = fref.sig,
@@ -1824,48 +3378,215 @@ fn emitExportBindingsHelper(
         else
             coreValTypeToZig(core_sig.results[0]);
 
-        try w.print("{s}    if (@hasDecl(Impl, \"{s}\")) {{\n", .{ indent, raw_snake });
-        try w.print("{s}        const _impl_fn = @field(Impl, \"{s}\");\n", .{ indent, raw_snake });
-        try w.print("{s}        const _ImplT = @TypeOf(_impl_fn);\n", .{indent});
-        try w.print("{s}        if (_ImplT == {s}_CoreFn) {{\n", .{ indent, decl_base });
-        try w.print("{s}            @export(&_impl_fn, .{{ .name = \"{s}\" }});\n", .{ indent, export_sym });
-        try w.print("{s}        }} else {{\n", .{indent});
-        try w.print("{s}            const _Wrapper = struct {{\n", .{indent});
-        try w.print("{s}                pub fn call(", .{indent});
+        try w.print("{s}            if (@hasDecl(Impl, \"{s}\")) {{\n", .{ indent, raw_snake });
+        try w.print("{s}                const _impl_fn = @field(Impl, \"{s}\");\n", .{ indent, raw_snake });
+        try w.print("{s}                const _ImplT = @TypeOf(_impl_fn);\n", .{indent});
+        try w.print("{s}                if (_ImplT == {s}_CoreFn) {{\n", .{ indent, decl_base });
+        try w.print("{s}                    @export(&_impl_fn, .{{ .name = \"{s}\" }});\n", .{ indent, export_sym });
+        try w.print("{s}                }} else {{\n", .{indent});
+        try w.print("{s}                    const _Wrapper = struct {{\n", .{indent});
+        try w.print("{s}                        pub fn call(", .{indent});
         for (core_sig.params, 0..) |pt, idx| {
             if (idx > 0) try w.writeAll(", ");
             try w.print("p{d}: {s}", .{ idx, coreValTypeToZig(pt) });
         }
         try w.print(") callconv(.c) {s} {{\n", .{core_ret});
-        try w.print("{s}                    if (comptime @hasDecl(Impl, \"canon\") and _ImplT == {s}_Fn) {{\n", .{ indent, decl_base });
+        try w.print("{s}                            if (comptime @hasDecl(Impl, \"canon\") and _ImplT == {s}_Fn) {{\n", .{ indent, decl_base });
         try w.print(
-            "{s}                        const _thunk = Impl.canon.createLiftThunk({s}_Fn, .{{ .arch = if (is_wasm64) .wasm64 else .wasm32, .is_async = {s}_meta.is_async, .direction = .lift, .string_encoding_utf8 = {s}_meta.string_encoding_utf8 }}, &_impl_fn);\n",
+            "{s}                                const _thunk = Impl.canon.createLiftThunk({s}_Fn, .{{ .arch = if (is_wasm64) .wasm64 else .wasm32, .is_async = {s}_meta.is_async, .direction = .lift, .string_encoding_utf8 = {s}_meta.string_encoding_utf8 }}, &_impl_fn);\n",
             .{ indent, decl_base, decl_base, decl_base },
         );
-        try w.print("{s}                        return _thunk(", .{indent});
+        try w.print("{s}                                return _thunk(", .{indent});
         for (0..core_sig.params.len) |idx| {
             if (idx > 0) try w.writeAll(", ");
             try w.print("p{d}", .{idx});
         }
         try w.writeAll(");\n");
-        try w.print("{s}                    }} else {{\n", .{indent});
-        try w.print("{s}                        return @call(.auto, _impl_fn, .{{", .{indent});
+        try w.print("{s}                            }} else {{\n", .{indent});
+        try w.print("{s}                                return @call(.auto, _impl_fn, .{{", .{indent});
         for (0..core_sig.params.len) |idx| {
             if (idx > 0) try w.writeAll(", ");
             try w.print("p{d}", .{idx});
         }
         try w.writeAll("});\n");
-        try w.print("{s}                    }}\n", .{indent});
+        try w.print("{s}                            }}\n", .{indent});
+        try w.print("{s}                        }}\n", .{indent});
+        try w.print("{s}                    }};\n", .{indent});
+        try w.print("{s}                    @export(&_Wrapper.call, .{{ .name = \"{s}\" }});\n", .{ indent, export_sym });
         try w.print("{s}                }}\n", .{indent});
-        try w.print("{s}            }};\n", .{indent});
-        try w.print("{s}            @export(&_Wrapper.call, .{{ .name = \"{s}\" }});\n", .{ indent, export_sym });
-        try w.print("{s}        }}\n", .{indent});
-        try w.print("{s}    }}\n", .{indent});
+        try w.print("{s}                if (_ImplT == {s}_fn_t) {{\n", .{ indent, decl_base });
+        try w.print("{s}                    @export(@field(@This(), \"fast_{s}\").thunk(), .{{ .name = \"{s}\" }});\n", .{ indent, decl_base, fast_export_sym });
+        try w.print("{s}                }}\n", .{indent});
+        try w.print("{s}            }}\n", .{indent});
     }
     if (!any_fn) {
-        try w.print("{s}    _ = Impl;\n", .{indent});
+        try w.print("{s}            _ = Impl;\n", .{indent});
     }
+    try w.print("{s}        }}\n", .{indent});
+    try w.print("{s}    }};\n", .{indent});
     try w.print("{s}}}\n", .{indent});
+}
+
+fn emitWorldZigarAbiNamespace(
+    ar: Allocator,
+    w: anytype,
+    res: resolver_mod.Resolver,
+    prepared: PreparedWorld,
+    decoded: metadata_decode.DecodedWorld,
+    iface_bindings: []const InterfaceBinding,
+    opts: BindgenOptions,
+) BindgenError!void {
+    const is_mem64_lit: []const u8 = if (opts.arch == .wasm64) "true" else "false";
+
+    var synth_import_ib: ?InterfaceBinding = null;
+    var synth_export_ib: ?InterfaceBinding = null;
+    for (iface_bindings) |ib| {
+        if (!ib.is_synth_world) continue;
+        if (std.mem.eql(u8, ib.bare_name, synth_world_imports_name)) {
+            synth_import_ib = ib;
+        } else if (std.mem.eql(u8, ib.bare_name, synth_world_exports_name)) {
+            synth_export_ib = ib;
+        }
+    }
+
+    var world_import_names = std.StringHashMapUnmanaged(void).empty;
+    if (synth_import_ib) |ib| {
+        for (ib.items) |it| {
+            if (it == .func) try world_import_names.put(ar, it.func.name, {});
+        }
+    }
+    for (decoded.func_externs) |fe| {
+        if (!fe.is_export) try world_import_names.put(ar, fe.name, {});
+    }
+
+    try w.writeAll(
+        \\pub const zigar_abi = struct {
+        \\    pub const world_hash: u64 = canon.fast_abi.fnv1a64(world_name);
+        \\    pub const entries = [_]canon.fast_abi.ZigarFuncEntry{
+        \\
+    );
+
+    if (synth_export_ib) |ib| {
+        for (ib.items) |it| {
+            if (it != .func) continue;
+            if (findFuncRef(ib.ext.funcs, it.func.name) == null) continue;
+            const raw_snake = try toRawSnakeCase(ar, it.func.name);
+            const collides = world_import_names.contains(it.func.name);
+            const decl_base = if (collides)
+                try std.fmt.allocPrint(ar, "export_{s}", .{raw_snake})
+            else
+                raw_snake;
+            try w.print(
+                \\        .{{
+                \\            .interface_name = "",
+                \\            .func_name = "{s}",
+                \\            .fast_export_name = "__zigar_fast_{s}",
+                \\            .abi_hash = {s}_zigar_abi_hash,
+                \\            .arg_struct_size = @intCast(canon.fast_abi.ArgStructLayout({s}_fn_t, {s}).frame_size),
+                \\            .arg_struct_align = @intCast(canon.fast_abi.ArgStructLayout({s}_fn_t, {s}).frame_align),
+                \\            .flags = canon.fast_abi.ArgStructLayout({s}_fn_t, {s}).flags,
+                \\        }},
+                \\
+            , .{
+                it.func.name,
+                decl_base,
+                decl_base,
+                decl_base,
+                is_mem64_lit,
+                decl_base,
+                is_mem64_lit,
+                decl_base,
+                is_mem64_lit,
+            });
+        }
+    }
+
+    for (decoded.func_externs) |fe| {
+        if (!fe.is_export) continue;
+        if (findWorldNamedFunc(res, prepared.world, prepared.pkg, fe.name, true, 0) == null) continue;
+        const raw_snake = try toRawSnakeCase(ar, fe.name);
+        const collides = world_import_names.contains(fe.name);
+        const decl_base = if (collides)
+            try std.fmt.allocPrint(ar, "export_{s}", .{raw_snake})
+        else
+            raw_snake;
+        try w.print(
+            \\        .{{
+            \\            .interface_name = "",
+            \\            .func_name = "{s}",
+            \\            .fast_export_name = "__zigar_fast_{s}",
+            \\            .abi_hash = {s}_zigar_abi_hash,
+            \\            .arg_struct_size = @intCast(canon.fast_abi.ArgStructLayout({s}_fn_t, {s}).frame_size),
+            \\            .arg_struct_align = @intCast(canon.fast_abi.ArgStructLayout({s}_fn_t, {s}).frame_align),
+            \\            .flags = canon.fast_abi.ArgStructLayout({s}_fn_t, {s}).flags,
+            \\        }},
+            \\
+        , .{
+            fe.name,
+            decl_base,
+            decl_base,
+            decl_base,
+            is_mem64_lit,
+            decl_base,
+            is_mem64_lit,
+            decl_base,
+            is_mem64_lit,
+        });
+    }
+
+    for (iface_bindings) |ib| {
+        if (ib.is_synth_world or !ib.ext.is_export) continue;
+        const sorted_items = try sortInterfaceItems(ar, ib.items);
+        for (sorted_items) |item| {
+            if (item != .func) continue;
+            if (findFuncRef(ib.ext.funcs, item.func.name) == null) continue;
+            const raw_snake = try toRawSnakeCase(ar, item.func.name);
+            const qual_decl = try std.fmt.allocPrint(ar, "{s}.{s}", .{ ib.zig_ident, raw_snake });
+            try w.print(
+                \\        .{{
+                \\            .interface_name = "{s}",
+                \\            .func_name = "{s}",
+                \\            .fast_export_name = "__zigar_fast_{s}#{s}",
+                \\            .abi_hash = {s}_zigar_abi_hash,
+                \\            .arg_struct_size = @intCast(canon.fast_abi.ArgStructLayout({s}_fn_t, {s}).frame_size),
+                \\            .arg_struct_align = @intCast(canon.fast_abi.ArgStructLayout({s}_fn_t, {s}).frame_align),
+                \\            .flags = canon.fast_abi.ArgStructLayout({s}_fn_t, {s}).flags,
+                \\        }},
+                \\
+            , .{
+                ib.ext.qualified_name,
+                item.func.name,
+                ib.ext.qualified_name,
+                raw_snake,
+                qual_decl,
+                qual_decl,
+                is_mem64_lit,
+                qual_decl,
+                is_mem64_lit,
+                qual_decl,
+                is_mem64_lit,
+            });
+        }
+    }
+
+    try w.writeAll(
+        \\    };
+        \\
+        \\    pub fn metadata() canon.fast_abi.ZigarAbiMetadata {
+        \\        return .{
+        \\            .version = canon.fast_abi.FORMAT_VERSION,
+        \\            .flags = .{ .is_memory64 = is_wasm64, .is_big_endian = false, .zero_copy_slices = true },
+        \\            .world_hash = world_hash,
+        \\            .entries = &entries,
+        \\        };
+        \\    }
+        \\
+        \\    pub fn encodeSection(alloc: std.mem.Allocator) ![]u8 {
+        \\        return canon.fast_abi.encodeZigarAbiSection(alloc, metadata());
+        \\    }
+        \\};
+        \\
+    );
 }
 
 // ── Type Formatting & C-ABI Layout Helpers ─────────────────────────────────
@@ -2440,7 +4161,8 @@ test "wasi-canon/0.3.0 worlds generate valid Zig ASTs" {
     try testing.expect(std.mem.indexOf(u8, cli_src, "pub const get_arguments_Fn = fn () []const []const u8;") != null);
     try testing.expect(std.mem.indexOf(u8, cli_src, "pub const run = struct {") != null);
     try testing.expect(std.mem.indexOf(u8, cli_src, "pub extern \"[export]wasi:cli/run@0.3.0\" fn @\"[task-return]run\"(p0: i32) void;") != null);
-    try testing.expect(std.mem.indexOf(u8, cli_src, "pub fn exportBindings(comptime Impl: type) void") != null);
+    try testing.expect(std.mem.indexOf(u8, cli_src, "pub fn exportBindings(comptime Impl: type) type") != null);
+    try testing.expect(std.mem.indexOf(u8, cli_src, "pub const zigar_abi = struct {") != null);
 
     const http_src = try generateWasiWorldBySpec(alloc, "wasi:http/service@0.3.0", .{});
     defer alloc.free(http_src);

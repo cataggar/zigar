@@ -18,8 +18,14 @@ pub const CustomSectionPolicy = enum {
     preserve,
 };
 
+pub const OptimizeMode = enum {
+    small,
+    fast,
+};
+
 pub const Options = struct {
     custom_sections: CustomSectionPolicy = .reject,
+    optimize_mode: OptimizeMode = .small,
 };
 
 pub const Error = error{
@@ -33,7 +39,7 @@ pub const Error = error{
 };
 
 const component_version: u32 = 0x0001_000d;
-const max_pass_rounds: usize = 4;
+const max_pass_rounds: usize = 8;
 
 /// Optimize a binary WebAssembly module and return the optimized binary bytes.
 pub fn optimize(allocator: std.mem.Allocator, wasm_bytes: []const u8, options: Options) Error![]u8 {
@@ -94,13 +100,41 @@ pub fn optimizeModule(allocator: std.mem.Allocator, module: *Mod.Module, options
         }
     }
 
-    for (module.funcs.items[module.num_func_imports..]) |*func| {
+    const locals_compacted = allocator.alloc(bool, module.funcs.items.len) catch return error.OutOfMemory;
+    defer allocator.free(locals_compacted);
+    @memset(locals_compacted, false);
+
+    for (module.num_func_imports..module.funcs.items.len) |i| {
+        const func = &module.funcs.items[i];
         if (func.is_import or func.code_bytes.len == 0) continue;
-        try optimizeFuncBody(allocator, func);
+        if (try optimizeFuncBody(allocator, module, func, options.optimize_mode)) {
+            locals_compacted[i] = true;
+        }
     }
 
-    try inlineTrivialFunctions(allocator, module);
-    try removeDeadFunctions(allocator, module);
+    const max_inline_rounds: usize = switch (options.optimize_mode) {
+        .small => 2,
+        .fast => 4,
+    };
+    if (module.funcs.items.len > module.num_func_imports) {
+        const modified_funcs = allocator.alloc(bool, module.funcs.items.len) catch return error.OutOfMemory;
+        defer allocator.free(modified_funcs);
+
+        for (0..max_inline_rounds) |_| {
+            @memset(modified_funcs, false);
+            const any_inlined = try inlineTrivialFunctions(allocator, module, options.optimize_mode, modified_funcs);
+            if (!any_inlined) break;
+            for (module.num_func_imports..module.funcs.items.len) |i| {
+                if (modified_funcs[i]) {
+                    if (try optimizeFuncBody(allocator, module, &module.funcs.items[i], options.optimize_mode)) {
+                        locals_compacted[i] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    try removeDeadFunctions(allocator, module, locals_compacted);
 }
 
 // ── Preflight validation ─────────────────────────────────────────────────
@@ -148,7 +182,7 @@ fn preflightDeclarations(module: *const Mod.Module) Error!void {
     }
     for (module.module_types.items) |entry| {
         switch (entry) {
-            .struct_type, .array_type => return error.UnsupportedFeature,
+            .struct_type, .array_type, .cont_type => return error.UnsupportedFeature,
             .func_type => |ft| {
                 for (ft.params, 0..) |p, i| {
                     if (!isAllowedValType(p, Mod.FuncSignature.concreteIdxAt(ft.param_type_idxs, i))) {
@@ -356,7 +390,7 @@ fn preflightInstrBytes(module: *const Mod.Module, bytes: []const u8) Error!void 
                     return error.UnsupportedFeature;
                 }
             },
-            0x06...0x0a, 0x14, 0x15, 0x18, 0x19, 0x1f, 0xd3...0xd6 => {
+            0x06...0x0a, 0x14, 0x15, 0x18, 0x19, 0x1f, 0xd3...0xd6, 0xe0...0xe6 => {
                 return error.UnsupportedOpcode;
             },
             else => return error.InvalidInput,
@@ -479,6 +513,9 @@ const Instr = union(enum) {
     call: u32,
     return_call: u32,
     return_call_indirect: []const u8,
+    local_get: u32,
+    local_set: u32,
+    local_tee: u32,
     i32_const: i32,
     i64_const: i64,
     ref_func: u32,
@@ -605,6 +642,18 @@ fn parseInstrBlock(
                 _ = readU32(bytes, pos) catch return error.InvalidInput;
                 out_list.append(arena, .{ .return_call_indirect = bytes[instr_start..pos.*] }) catch return error.OutOfMemory;
             },
+            0x20 => {
+                const idx = readU32(bytes, pos) catch return error.InvalidInput;
+                out_list.append(arena, .{ .local_get = idx }) catch return error.OutOfMemory;
+            },
+            0x21 => {
+                const idx = readU32(bytes, pos) catch return error.InvalidInput;
+                out_list.append(arena, .{ .local_set = idx }) catch return error.OutOfMemory;
+            },
+            0x22 => {
+                const idx = readU32(bytes, pos) catch return error.InvalidInput;
+                out_list.append(arena, .{ .local_tee = idx }) catch return error.OutOfMemory;
+            },
             0x41 => {
                 const val = readS32(bytes, pos) catch return error.InvalidInput;
                 out_list.append(arena, .{ .i32_const = val }) catch return error.OutOfMemory;
@@ -687,6 +736,18 @@ fn encodeInstrList(allocator: std.mem.Allocator, list: []const Instr, buf: *std.
             .return_call_indirect => |raw| {
                 buf.appendSlice(allocator, raw) catch return error.OutOfMemory;
             },
+            .local_get => |idx| {
+                buf.append(allocator, 0x20) catch return error.OutOfMemory;
+                try appendU32Leb(allocator, buf, idx);
+            },
+            .local_set => |idx| {
+                buf.append(allocator, 0x21) catch return error.OutOfMemory;
+                try appendU32Leb(allocator, buf, idx);
+            },
+            .local_tee => |idx| {
+                buf.append(allocator, 0x22) catch return error.OutOfMemory;
+                try appendU32Leb(allocator, buf, idx);
+            },
             .i32_const => |val| {
                 buf.append(allocator, 0x41) catch return error.OutOfMemory;
                 try appendS32Leb(allocator, buf, val);
@@ -709,7 +770,12 @@ fn encodeInstrList(allocator: std.mem.Allocator, list: []const Instr, buf: *std.
     }
 }
 
-fn optimizeFuncBody(allocator: std.mem.Allocator, func: *Mod.Func) Error!void {
+fn optimizeFuncBody(
+    allocator: std.mem.Allocator,
+    module: *const Mod.Module,
+    func: *Mod.Func,
+    optimize_mode: OptimizeMode,
+) Error!bool {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -721,11 +787,15 @@ fn optimizeFuncBody(allocator: std.mem.Allocator, func: *Mod.Func) Error!void {
 
     for (0..max_pass_rounds) |_| {
         var changed = false;
+        if (eliminateLeafStackCopy(&root_list)) changed = true;
+        if (try simplifyLocals(arena, &root_list, optimize_mode)) changed = true;
         if (foldConstants(&root_list)) changed = true;
         if (try simplifyControlFlow(arena, &root_list)) changed = true;
         if (eliminateDeadCode(&root_list)) changed = true;
         if (!changed) break;
     }
+
+    const compacted = compactLocals(arena, module, func, &root_list) catch return error.OutOfMemory;
 
     var out_buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out_buf.deinit(allocator);
@@ -738,6 +808,483 @@ fn optimizeFuncBody(allocator: std.mem.Allocator, func: *Mod.Func) Error!void {
     }
     func.code_bytes = new_bytes;
     func.owns_code_bytes = true;
+    return compacted;
+}
+
+// ── Pass L: Local Simplification and Compaction ──────────────────────────
+
+fn eliminateLeafStackCopy(root_list: *InstrList) bool {
+    const items = root_list.items;
+    if (items.len < 8) return false;
+
+    // Match stage2_wasm leaf by-value aggregate copy prologue:
+    //   0: global.get _       (.raw { 0x23, ... })
+    //   1: i32.const n        (n > 0)
+    //   2: i32.sub            (.numeric_op 0x6b)
+    //   3: local.tee tmp      (.local_tee tmp_local)
+    //   4: local.get src      (.local_get src_param, src_param != tmp_local)
+    //   5: i32.const n2       (n2 == n)
+    //   6: memory.copy 0 0    (.raw { 0xfc, 0x0a, 0x00, 0x00 })
+    if (items[0] != .raw or !std.mem.eql(u8, items[0].raw, &.{ 0x23, 0x00 })) return false;
+    if (items[1] != .i32_const or items[1].i32_const <= 0) return false;
+    const copy_size = items[1].i32_const;
+    if (items[2] != .numeric_op or items[2].numeric_op != 0x6b) return false;
+    if (items[3] != .local_tee) return false;
+    const tmp_local = items[3].local_tee;
+    if (items[4] != .local_get) return false;
+    const src_param = items[4].local_get;
+    if (src_param == tmp_local) return false;
+    if (items[5] != .i32_const or items[5].i32_const != copy_size) return false;
+    if (items[6] != .raw or !std.mem.eql(u8, items[6].raw, &.{ 0xfc, 0x0a, 0x00, 0x00 })) return false;
+
+    for (items[7..]) |inst| {
+        switch (inst) {
+            .block, .loop, .if_, .br, .br_if, .br_table, .unreachable_ => return false,
+            .call, .return_call, .return_call_indirect => return false,
+            .local_set => |idx| if (idx == tmp_local or idx == src_param) return false,
+            .local_tee => |idx| if (idx == tmp_local or idx == src_param) return false,
+            .raw => |r| {
+                if (r.len == 0) return false;
+                switch (r[0]) {
+                    0x10...0x15, 0x24, 0x36...0x3e, 0x40, 0xfc, 0xfd, 0xfe => return false,
+                    else => {},
+                }
+            },
+            else => {},
+        }
+    }
+
+    for (items[7..]) |*inst| {
+        if (inst.* == .local_get and inst.local_get == tmp_local) {
+            inst.* = .{ .local_get = src_param };
+        }
+    }
+
+    const tail_len = items.len - 7;
+    std.mem.copyForwards(Instr, root_list.items[0..tail_len], root_list.items[7..]);
+    root_list.shrinkRetainingCapacity(tail_len);
+    return true;
+}
+
+fn isPropagatableInstr(inst: Instr) bool {
+    return switch (inst) {
+        .i32_const, .i64_const, .ref_func, .local_get => true,
+        .raw => |r| r.len > 0 and switch (r[0]) {
+            0x43, 0x44, 0xd0 => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+fn isLargeConstantInstr(inst: Instr) bool {
+    return switch (inst) {
+        .i32_const => |v| v < -64 or v > 63,
+        .i64_const => |v| v < -64 or v > 63,
+        .raw => |r| r.len > 0 and (r[0] == 0x43 or r[0] == 0x44),
+        else => false,
+    };
+}
+
+fn invalidateLocal(bindings: *std.AutoHashMapUnmanaged(u32, Instr), local_idx: u32) void {
+    _ = bindings.remove(local_idx);
+    while (true) {
+        var victim: ?u32 = null;
+        var it = bindings.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* == .local_get and entry.value_ptr.local_get == local_idx) {
+                victim = entry.key_ptr.*;
+                break;
+            }
+        }
+        if (victim) |k| {
+            _ = bindings.remove(k);
+        } else {
+            break;
+        }
+    }
+}
+
+fn collectModifiedLocals(
+    list: *const InstrList,
+    arena: std.mem.Allocator,
+    modified: *std.AutoHashMapUnmanaged(u32, void),
+) Error!void {
+    for (list.items) |inst| {
+        switch (inst) {
+            .local_set => |x| modified.put(arena, x, {}) catch return error.OutOfMemory,
+            .local_tee => |x| modified.put(arena, x, {}) catch return error.OutOfMemory,
+            .block => |*b| try collectModifiedLocals(&b.body, arena, modified),
+            .loop => |*l| try collectModifiedLocals(&l.body, arena, modified),
+            .if_ => |*i| {
+                try collectModifiedLocals(&i.then_body, arena, modified);
+                if (i.has_else) try collectModifiedLocals(&i.else_body, arena, modified);
+            },
+            else => {},
+        }
+    }
+}
+
+fn simplifyLocalsBlock(
+    arena: std.mem.Allocator,
+    list: *InstrList,
+    bindings: *std.AutoHashMapUnmanaged(u32, Instr),
+    optimize_mode: OptimizeMode,
+    initial_reads: *const std.AutoHashMapUnmanaged(u32, u32),
+) Error!bool {
+    var changed = false;
+    var out: InstrList = .empty;
+    out.ensureTotalCapacity(arena, list.items.len) catch return error.OutOfMemory;
+
+    for (list.items) |inst| {
+        switch (inst) {
+            .local_get => |idx| {
+                if (out.items.len > 0 and out.items[out.items.len - 1] == .local_set and out.items[out.items.len - 1].local_set == idx) {
+                    if (bindings.get(idx)) |repl| {
+                        out.append(arena, repl) catch return error.OutOfMemory;
+                        changed = true;
+                        continue;
+                    } else {
+                        out.items[out.items.len - 1] = .{ .local_tee = idx };
+                        changed = true;
+                        continue;
+                    }
+                }
+                if (bindings.get(idx)) |repl| {
+                    out.append(arena, repl) catch return error.OutOfMemory;
+                    changed = true;
+                    continue;
+                }
+                out.append(arena, inst) catch return error.OutOfMemory;
+                continue;
+            },
+            .local_set => |x| {
+                if (out.items.len > 0 and out.items[out.items.len - 1] == .local_get and out.items[out.items.len - 1].local_get == x) {
+                    _ = out.pop();
+                    changed = true;
+                    continue;
+                }
+                var k: usize = 0;
+                while (k < out.items.len and out.items[out.items.len - 1 - k] == .local_set) : (k += 1) {}
+                var producer: ?Instr = null;
+                if (out.items.len >= 2 * k + 1) {
+                    var all_prop = true;
+                    for (out.items[out.items.len - 2 * k - 1 .. out.items.len - k]) |item| {
+                        if (!isPropagatableInstr(item)) {
+                            all_prop = false;
+                            break;
+                        }
+                    }
+                    if (all_prop) {
+                        const cand = out.items[out.items.len - 2 * k - 1];
+                        var valid = true;
+                        if (cand == .local_get) {
+                            const src = cand.local_get;
+                            if (src == x) {
+                                valid = false;
+                            } else {
+                                for (out.items[out.items.len - k ..]) |set_item| {
+                                    if (set_item.local_set == src) {
+                                        valid = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (valid) producer = cand;
+                    }
+                }
+                invalidateLocal(bindings, x);
+                if (producer) |prod| {
+                    const allow_bind = !(optimize_mode == .small and
+                        isLargeConstantInstr(prod) and
+                        (initial_reads.get(x) orelse 0) > 1);
+                    if (allow_bind) {
+                        bindings.put(arena, x, prod) catch return error.OutOfMemory;
+                    }
+                }
+                out.append(arena, inst) catch return error.OutOfMemory;
+                continue;
+            },
+            .local_tee => |x| {
+                if (out.items.len > 0 and out.items[out.items.len - 1] == .local_get and out.items[out.items.len - 1].local_get == x) {
+                    changed = true;
+                    continue;
+                }
+                invalidateLocal(bindings, x);
+                if (out.items.len > 0 and isPropagatableInstr(out.items[out.items.len - 1])) {
+                    const prev = out.items[out.items.len - 1];
+                    const ok = switch (prev) {
+                        .local_get => |src| src != x,
+                        else => !(optimize_mode == .small and
+                            isLargeConstantInstr(prev) and
+                            (initial_reads.get(x) orelse 0) > 1),
+                    };
+                    if (ok) {
+                        bindings.put(arena, x, prev) catch return error.OutOfMemory;
+                    }
+                }
+                out.append(arena, inst) catch return error.OutOfMemory;
+                continue;
+            },
+            .block => |b_in| {
+                var b = b_in;
+                var blk_bindings = bindings.clone(arena) catch return error.OutOfMemory;
+                if (try simplifyLocalsBlock(arena, &b.body, &blk_bindings, optimize_mode, initial_reads)) changed = true;
+                var modified: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                try collectModifiedLocals(&b.body, arena, &modified);
+                var mod_it = modified.keyIterator();
+                while (mod_it.next()) |k| {
+                    invalidateLocal(bindings, k.*);
+                }
+                out.append(arena, .{ .block = b }) catch return error.OutOfMemory;
+                continue;
+            },
+            .if_ => |if_in| {
+                var if_inst = if_in;
+                var then_bindings = bindings.clone(arena) catch return error.OutOfMemory;
+                if (try simplifyLocalsBlock(arena, &if_inst.then_body, &then_bindings, optimize_mode, initial_reads)) changed = true;
+                if (if_inst.has_else) {
+                    var else_bindings = bindings.clone(arena) catch return error.OutOfMemory;
+                    if (try simplifyLocalsBlock(arena, &if_inst.else_body, &else_bindings, optimize_mode, initial_reads)) changed = true;
+                }
+                var modified: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                try collectModifiedLocals(&if_inst.then_body, arena, &modified);
+                if (if_inst.has_else) {
+                    try collectModifiedLocals(&if_inst.else_body, arena, &modified);
+                }
+                var mod_it = modified.keyIterator();
+                while (mod_it.next()) |k| {
+                    invalidateLocal(bindings, k.*);
+                }
+                out.append(arena, .{ .if_ = if_inst }) catch return error.OutOfMemory;
+                continue;
+            },
+            .loop => |lp_in| {
+                var lp = lp_in;
+                var modified: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                try collectModifiedLocals(&lp.body, arena, &modified);
+                var mod_it = modified.keyIterator();
+                while (mod_it.next()) |k| {
+                    invalidateLocal(bindings, k.*);
+                }
+                var lp_bindings = bindings.clone(arena) catch return error.OutOfMemory;
+                if (try simplifyLocalsBlock(arena, &lp.body, &lp_bindings, optimize_mode, initial_reads)) changed = true;
+                var mod_it2 = modified.keyIterator();
+                while (mod_it2.next()) |k| {
+                    invalidateLocal(bindings, k.*);
+                }
+                out.append(arena, .{ .loop = lp }) catch return error.OutOfMemory;
+                continue;
+            },
+            else => {
+                out.append(arena, inst) catch return error.OutOfMemory;
+                if (inst.isUnconditionalTransfer()) {
+                    bindings.clearRetainingCapacity();
+                }
+                continue;
+            },
+        }
+    }
+
+    list.* = out;
+    return changed;
+}
+
+fn countLocalReads(
+    list: *const InstrList,
+    arena: std.mem.Allocator,
+    read_counts: *std.AutoHashMapUnmanaged(u32, u32),
+) Error!void {
+    for (list.items) |inst| {
+        switch (inst) {
+            .local_get => |x| {
+                const gop = read_counts.getOrPutValue(arena, x, 0) catch return error.OutOfMemory;
+                gop.value_ptr.* += 1;
+            },
+            .block => |*b| try countLocalReads(&b.body, arena, read_counts),
+            .loop => |*l| try countLocalReads(&l.body, arena, read_counts),
+            .if_ => |*i| {
+                try countLocalReads(&i.then_body, arena, read_counts);
+                if (i.has_else) try countLocalReads(&i.else_body, arena, read_counts);
+            },
+            else => {},
+        }
+    }
+}
+
+fn eliminateDeadLocalStores(
+    arena: std.mem.Allocator,
+    list: *InstrList,
+    read_counts: *const std.AutoHashMapUnmanaged(u32, u32),
+) Error!bool {
+    var changed = false;
+    var out: InstrList = .empty;
+    out.ensureTotalCapacity(arena, list.items.len) catch return error.OutOfMemory;
+
+    for (list.items) |inst| {
+        switch (inst) {
+            .local_tee => |x| {
+                if ((read_counts.get(x) orelse 0) == 0) {
+                    changed = true;
+                    continue;
+                }
+                out.append(arena, inst) catch return error.OutOfMemory;
+            },
+            .local_set => |x| {
+                if ((read_counts.get(x) orelse 0) == 0) {
+                    if (out.items.len > 0 and isPureZeroPopInstr(out.items[out.items.len - 1])) {
+                        _ = out.pop();
+                    } else {
+                        out.append(arena, .{ .raw = &[_]u8{0x1a} }) catch return error.OutOfMemory;
+                    }
+                    changed = true;
+                    continue;
+                }
+                out.append(arena, inst) catch return error.OutOfMemory;
+            },
+            .block => |b_in| {
+                var b = b_in;
+                if (try eliminateDeadLocalStores(arena, &b.body, read_counts)) changed = true;
+                out.append(arena, .{ .block = b }) catch return error.OutOfMemory;
+            },
+            .loop => |l_in| {
+                var l = l_in;
+                if (try eliminateDeadLocalStores(arena, &l.body, read_counts)) changed = true;
+                out.append(arena, .{ .loop = l }) catch return error.OutOfMemory;
+            },
+            .if_ => |if_in| {
+                var if_inst = if_in;
+                if (try eliminateDeadLocalStores(arena, &if_inst.then_body, read_counts)) changed = true;
+                if (if_inst.has_else and try eliminateDeadLocalStores(arena, &if_inst.else_body, read_counts)) changed = true;
+                out.append(arena, .{ .if_ = if_inst }) catch return error.OutOfMemory;
+            },
+            else => {
+                out.append(arena, inst) catch return error.OutOfMemory;
+            },
+        }
+    }
+
+    list.* = out;
+    return changed;
+}
+
+fn simplifyLocals(
+    arena: std.mem.Allocator,
+    root_list: *InstrList,
+    optimize_mode: OptimizeMode,
+) Error!bool {
+    var initial_reads: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    if (optimize_mode == .small) {
+        try countLocalReads(root_list, arena, &initial_reads);
+    }
+    var bindings: std.AutoHashMapUnmanaged(u32, Instr) = .empty;
+    var changed = try simplifyLocalsBlock(arena, root_list, &bindings, optimize_mode, &initial_reads);
+
+    while (true) {
+        var read_counts: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        try countLocalReads(root_list, arena, &read_counts);
+        if (try eliminateDeadLocalStores(arena, root_list, &read_counts)) {
+            changed = true;
+        } else {
+            break;
+        }
+    }
+
+    return changed;
+}
+
+fn markUsedLocals(list: *const InstrList, param_count: u32, used: []bool) void {
+    for (list.items) |inst| {
+        switch (inst) {
+            .local_get, .local_set, .local_tee => |idx| {
+                if (idx >= param_count and idx - param_count < used.len) {
+                    used[idx - param_count] = true;
+                }
+            },
+            .block => |*b| markUsedLocals(&b.body, param_count, used),
+            .loop => |*l| markUsedLocals(&l.body, param_count, used),
+            .if_ => |*i| {
+                markUsedLocals(&i.then_body, param_count, used);
+                if (i.has_else) markUsedLocals(&i.else_body, param_count, used);
+            },
+            else => {},
+        }
+    }
+}
+
+fn rewriteLocalIndices(list: *InstrList, param_count: u32, remap: []const u32) void {
+    for (list.items) |*inst| {
+        switch (inst.*) {
+            .local_get => |*idx| if (idx.* >= param_count and idx.* - param_count < remap.len) {
+                idx.* = remap[idx.* - param_count];
+            },
+            .local_set => |*idx| if (idx.* >= param_count and idx.* - param_count < remap.len) {
+                idx.* = remap[idx.* - param_count];
+            },
+            .local_tee => |*idx| if (idx.* >= param_count and idx.* - param_count < remap.len) {
+                idx.* = remap[idx.* - param_count];
+            },
+            .block => |*b| rewriteLocalIndices(&b.body, param_count, remap),
+            .loop => |*l| rewriteLocalIndices(&l.body, param_count, remap),
+            .if_ => |*i| {
+                rewriteLocalIndices(&i.then_body, param_count, remap);
+                if (i.has_else) rewriteLocalIndices(&i.else_body, param_count, remap);
+            },
+            else => {},
+        }
+    }
+}
+
+fn compactLocals(
+    arena: std.mem.Allocator,
+    module: *const Mod.Module,
+    func: *Mod.Func,
+    root_list: *InstrList,
+) std.mem.Allocator.Error!bool {
+    const num_locals = func.local_types.items.len;
+    if (num_locals == 0) return false;
+
+    const sig = getFuncSignature(module, func) orelse return false;
+    const param_count: u32 = @intCast(sig.params.len);
+
+    const used = try arena.alloc(bool, num_locals);
+    @memset(used, false);
+    markUsedLocals(root_list, param_count, used);
+
+    var all_used = true;
+    for (used) |u| {
+        if (!u) {
+            all_used = false;
+            break;
+        }
+    }
+    if (all_used) return false;
+
+    const remap = try arena.alloc(u32, num_locals);
+    const has_type_idxs = func.local_type_idxs.items.len == num_locals;
+    var write_idx: usize = 0;
+    for (0..num_locals) |i| {
+        if (used[i]) {
+            remap[i] = param_count + @as(u32, @intCast(write_idx));
+            func.local_types.items[write_idx] = func.local_types.items[i];
+            if (has_type_idxs) {
+                func.local_type_idxs.items[write_idx] = func.local_type_idxs.items[i];
+            }
+            write_idx += 1;
+        } else {
+            remap[i] = types.invalid_index;
+        }
+    }
+    func.local_types.shrinkRetainingCapacity(write_idx);
+    if (has_type_idxs) {
+        func.local_type_idxs.shrinkRetainingCapacity(write_idx);
+    } else {
+        func.local_type_idxs.clearRetainingCapacity();
+    }
+
+    rewriteLocalIndices(root_list, param_count, remap);
+    return true;
 }
 
 // ── Pass A: Constant Folding (i32 and i64) ───────────────────────────────
@@ -891,7 +1438,11 @@ fn invertComparisonOp(op: u8) ?u8 {
 
 fn isPureZeroPopInstr(inst: Instr) bool {
     return switch (inst) {
-        .raw => |r| r.len > 0 and (r[0] == 0x20 or r[0] == 0x23),
+        .i32_const, .i64_const, .ref_func, .local_get => true,
+        .raw => |r| r.len > 0 and switch (r[0]) {
+            0x23, 0x43, 0x44, 0xd0 => true,
+            else => false,
+        },
         else => false,
     };
 }
@@ -1430,6 +1981,48 @@ fn decrementOuterLabels(instrs: []Instr, min_depth: u32) void {
     }
 }
 
+fn isBranchFreeStraightLine(instrs: []const Instr) bool {
+    for (instrs) |inst| {
+        switch (inst) {
+            .block, .loop, .if_, .br, .br_if, .br_table, .return_, .unreachable_ => return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
+fn sliceStackDelta(instrs: []const Instr) ?isize {
+    var height: isize = 0;
+    for (instrs) |inst| {
+        const pops_and_pushes: struct { pops: isize, pushes: isize } = switch (inst) {
+            .nop => .{ .pops = 0, .pushes = 0 },
+            .local_get, .i32_const, .i64_const, .ref_func => .{ .pops = 0, .pushes = 1 },
+            .local_set => .{ .pops = 1, .pushes = 0 },
+            .local_tee => .{ .pops = 1, .pushes = 1 },
+            .numeric_op => |op| switch (op) {
+                0x45, 0x50, 0x67...0x69, 0x79...0x7b, 0x8b...0x91, 0x99...0x9f, 0xa7...0xc4 => .{ .pops = 1, .pushes = 1 },
+                0x46...0x4f, 0x51...0x66, 0x6a...0x78, 0x7c...0x8a, 0x92...0x98, 0xa0...0xa6 => .{ .pops = 2, .pushes = 1 },
+                else => return null,
+            },
+            .raw => |r| blk: {
+                if (r.len == 0) return null;
+                break :blk switch (r[0]) {
+                    0x1a, 0x24 => .{ .pops = 1, .pushes = 0 },
+                    0x1b, 0x1c => .{ .pops = 3, .pushes = 1 },
+                    0x36...0x3e => .{ .pops = 2, .pushes = 0 },
+                    0x23, 0x3f, 0x43, 0x44, 0xd0 => .{ .pops = 0, .pushes = 1 },
+                    0x28...0x35, 0x40, 0xd1 => .{ .pops = 1, .pushes = 1 },
+                    else => return null,
+                };
+            },
+            else => return null,
+        };
+        if (height < pops_and_pushes.pops) return null;
+        height = height - pops_and_pushes.pops + pops_and_pushes.pushes;
+    }
+    return height;
+}
+
 fn stripRedundantCondTests(out: *InstrList) bool {
     var stripped = false;
     while (out.items.len >= 2) {
@@ -1519,6 +2112,78 @@ fn simplifyControlFlow(arena: std.mem.Allocator, list: *InstrList) Error!bool {
                     decrementOuterLabels(b_inst.body.items, 0);
                     out.appendSlice(arena, b_inst.body.items) catch return error.OutOfMemory;
                     continue;
+                }
+                if (b_inst.block_type.isEmpty()) {
+                    const items = b_inst.body.items;
+                    if (items.len == 3 and
+                        isPureZeroPopInstr(items[0]) and
+                        items[1] == .br_if and items[1].br_if == 0 and
+                        items[2] == .unreachable_)
+                    {
+                        var then_body: InstrList = .empty;
+                        then_body.append(arena, .unreachable_) catch return error.OutOfMemory;
+                        out.append(arena, items[0]) catch return error.OutOfMemory;
+                        out.append(arena, .{ .numeric_op = 0x45 }) catch return error.OutOfMemory;
+                        out.append(arena, .{
+                            .if_ = .{
+                                .block_type = b_inst.block_type,
+                                .then_body = then_body,
+                            },
+                        }) catch return error.OutOfMemory;
+                        changed = true;
+                        continue;
+                    }
+                    if (items.len == 4 and
+                        isPureZeroPopInstr(items[0]) and
+                        items[1] == .numeric_op and items[1].numeric_op == 0x45 and
+                        items[2] == .br_if and items[2].br_if == 0 and
+                        items[3] == .unreachable_)
+                    {
+                        var then_body: InstrList = .empty;
+                        then_body.append(arena, .unreachable_) catch return error.OutOfMemory;
+                        out.append(arena, items[0]) catch return error.OutOfMemory;
+                        out.append(arena, .{
+                            .if_ = .{
+                                .block_type = b_inst.block_type,
+                                .then_body = then_body,
+                            },
+                        }) catch return error.OutOfMemory;
+                        changed = true;
+                        continue;
+                    }
+                    if (items.len >= 2 and
+                        items[items.len - 1] == .unreachable_ and
+                        items[items.len - 2] == .block)
+                    {
+                        const inner_blk = items[items.len - 2].block;
+                        const inner_items = inner_blk.body.items;
+                        if (inner_blk.block_type.isEmpty() and
+                            inner_items.len >= 3 and
+                            inner_items[inner_items.len - 2] == .br_if and inner_items[inner_items.len - 2].br_if == 0 and
+                            inner_items[inner_items.len - 1] == .br and inner_items[inner_items.len - 1].br == 1)
+                        {
+                            const setup_slice = items[0 .. items.len - 2];
+                            const cond_slice = inner_items[0 .. inner_items.len - 2];
+                            if (isBranchFreeStraightLine(setup_slice) and
+                                isBranchFreeStraightLine(cond_slice) and
+                                sliceStackDelta(setup_slice) == @as(?isize, 0) and
+                                sliceStackDelta(cond_slice) == @as(?isize, 1))
+                            {
+                                var then_body: InstrList = .empty;
+                                then_body.append(arena, .unreachable_) catch return error.OutOfMemory;
+                                out.appendSlice(arena, setup_slice) catch return error.OutOfMemory;
+                                out.appendSlice(arena, cond_slice) catch return error.OutOfMemory;
+                                out.append(arena, .{
+                                    .if_ = .{
+                                        .block_type = b_inst.block_type,
+                                        .then_body = then_body,
+                                    },
+                                }) catch return error.OutOfMemory;
+                                changed = true;
+                                continue;
+                            }
+                        }
+                    }
                 }
             },
             else => {},
@@ -1631,13 +2296,25 @@ fn rewriteExprFuncIndices(
     return out.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
-const TrivialLeaf = struct {
-    bytes: [16]u8 = undefined,
-    len: u8 = 0,
+const max_inline_params = 6;
+const max_inline_locals = 12;
+const max_inline_total_locals = max_inline_params + max_inline_locals;
 
-    fn slice(self: *const TrivialLeaf) []const u8 {
-        return self.bytes[0..self.len];
-    }
+const TrivialLeaf = struct {
+    body_bytes: []const u8 = &.{},
+    effective_end: usize = 0,
+    op_count: u32 = 0,
+    param_types: [max_inline_params]types.ValType = undefined,
+    param_count: u8 = 0,
+    result_types: [1]types.ValType = undefined,
+    result_count: u8 = 0,
+    local_types: [max_inline_locals]types.ValType = undefined,
+    local_count: u8 = 0,
+    prefix_params: u8 = 0,
+    leading_end_offsets: [max_inline_params]usize = @splat(0),
+    needs_local_zero_init: [max_inline_locals]bool = @splat(false),
+    needs_result_block: bool = false,
+    has_early_return: bool = false,
 };
 
 const TrivialKind = union(enum) {
@@ -1666,56 +2343,386 @@ fn isTrivialTail(tail: []const u8) bool {
     return std.mem.eql(u8, tail, &.{ 0x0f, 0x0b });
 }
 
-fn classifyTrivialFunc(module: *const Mod.Module, fidx: u32, func: *const Mod.Func) TrivialKind {
+fn isZeroInitSupportedType(vt: types.ValType) bool {
+    return switch (vt) {
+        .i32, .i64, .f32, .f64, .v128, .funcref, .externref => true,
+        else => false,
+    };
+}
+
+fn depth0StackDelta(code: u8) ?i32 {
+    return switch (code) {
+        0x1a, 0x21, 0x24 => -1,
+        0x1b, 0x1c, 0x36...0x3e => -2,
+        0x20, 0x23, 0x3f, 0x41...0x44, 0xd0, 0xd2 => 1,
+        0x22, 0x28...0x35, 0x40, 0x45, 0x50, 0x67...0x69, 0x79...0x7b, 0x8b...0x91, 0x99...0x9f, 0xa7...0xc4, 0xd1 => 0,
+        0x46...0x4f, 0x51...0x66, 0x6a...0x78, 0x7c...0x8a, 0x92...0x98, 0xa0...0xa6 => -1,
+        else => null,
+    };
+}
+
+fn classifyTrivialFunc(
+    module: *const Mod.Module,
+    fidx: u32,
+    func: *const Mod.Func,
+    optimize_mode: OptimizeMode,
+    call_count: u32,
+    is_externally_used: bool,
+) TrivialKind {
     if (func.is_import or func.code_bytes.len == 0) return .none;
-    if (func.local_types.items.len != 0) return .none;
+    if (func.local_types.items.len > max_inline_locals) return .none;
     const sig = getFuncSignature(module, func) orelse return .none;
-    if (sig.params.len != 0 or sig.results.len > 1) return .none;
+    if (sig.params.len > max_inline_params or sig.results.len > 1) return .none;
+
+    for (sig.params, 0..) |p, i| {
+        if (!isAllowedValType(p, Mod.FuncSignature.concreteIdxAt(sig.param_type_idxs, i))) return .none;
+    }
+    for (sig.results, 0..) |r, i| {
+        if (!isAllowedValType(r, Mod.FuncSignature.concreteIdxAt(sig.result_type_idxs, i))) return .none;
+    }
+    for (func.local_types.items, 0..) |lt, i| {
+        const tidx = if (i < func.local_type_idxs.items.len) func.local_type_idxs.items[i] else types.invalid_index;
+        if (!isAllowedValType(lt, tidx) or !isZeroInitSupportedType(lt)) return .none;
+    }
 
     const bytes = func.code_bytes;
-    if (sig.results.len == 0) {
-        if (isTrivialTail(bytes) or std.mem.eql(u8, bytes, &.{ 0x01, 0x0b })) {
-            return .{ .leaf = .{} };
-        }
-        var pos: usize = 0;
+    if (bytes[bytes.len - 1] != 0x0b) return .none;
+
+    if (sig.params.len == 0 and func.local_types.items.len == 0) {
+        var fpos: usize = 0;
+        if (instr.decode(bytes, &fpos)) |decoded| {
+            if (decoded.prefix == 0 and (decoded.code == 0x10 or decoded.code == 0x12)) {
+                if (readU32(bytes, &fpos)) |callee| {
+                    if (isTrivialTail(bytes[fpos..]) and callee < module.funcs.items.len and callee != fidx) {
+                        if (getFuncSignature(module, &module.funcs.items[callee])) |callee_sig| {
+                            if (Mod.FuncSignature.eql(sig, callee_sig)) {
+                                return .{ .forward = .{ .callee = callee, .is_tail = decoded.code == 0x12 } };
+                            }
+                        }
+                    }
+                } else |_| {}
+            }
+        } else |_| {}
+    }
+
+    const body_end = bytes.len - 1;
+    var effective_end: usize = body_end;
+    var pos: usize = 0;
+    var depth: u32 = 0;
+    var block_types: [32]i64 = undefined;
+    var op_count: u32 = 0;
+    var depth0_stack: i32 = 0;
+    var depth0_stack_exact: bool = true;
+    var had_trailing_return: bool = false;
+
+    const param_count: u32 = @intCast(sig.params.len);
+    const local_count: u32 = @intCast(func.local_types.items.len);
+    const total_locals: u32 = param_count + local_count;
+
+    var local_use_counts: [max_inline_total_locals]u32 = @splat(0);
+    var local_written_at_depth0: [max_inline_total_locals]bool = @splat(false);
+    var needs_local_zero_init: [max_inline_locals]bool = @splat(false);
+
+    var leading_matched: u8 = 0;
+    var leading_still_matching: bool = true;
+    var leading_end_offsets: [max_inline_params]usize = @splat(0);
+
+    var needs_result_block: bool = false;
+    var has_early_return: bool = false;
+
+    while (pos < body_end) {
+        const instr_start = pos;
         const decoded = instr.decode(bytes, &pos) catch return .none;
-        if (decoded.prefix == 0 and (decoded.code == 0x10 or decoded.code == 0x12)) {
-            const callee = readU32(bytes, &pos) catch return .none;
-            if (!isTrivialTail(bytes[pos..])) return .none;
-            if (callee >= module.funcs.items.len or callee == fidx) return .none;
-            const callee_sig = getFuncSignature(module, &module.funcs.items[callee]) orelse return .none;
-            if (!Mod.FuncSignature.eql(sig, callee_sig)) return .none;
-            return .{ .forward = .{ .callee = callee, .is_tail = decoded.code == 0x12 } };
+        if (decoded.prefix == 0) {
+            switch (decoded.code) {
+                0x01 => {
+                    leading_still_matching = false;
+                    continue;
+                },
+                0x0b => {
+                    if (depth == 0) return .none;
+                    depth -= 1;
+                    if (depth == 0) {
+                        if (block_types[0] < -64) {
+                            depth0_stack += 1;
+                        } else if (block_types[0] != -64) {
+                            depth0_stack_exact = false;
+                        }
+                    }
+                    leading_still_matching = false;
+                    continue;
+                },
+                0x05 => {
+                    if (depth == 0) return .none;
+                    leading_still_matching = false;
+                    continue;
+                },
+                else => {},
+            }
         }
+
+        op_count += 1;
+        if (op_count > 91) return .none;
+
+        if (decoded.prefix == 0) {
+            switch (decoded.code) {
+                0x10, 0x11, 0x12, 0x13 => return .none,
+                0x00 => {
+                    if (depth == 0) return .none;
+                    leading_still_matching = false;
+                    continue;
+                },
+                0x02, 0x03, 0x04 => {
+                    leading_still_matching = false;
+                    if (depth >= block_types.len or pos >= body_end) return .none;
+                    const bt_byte = bytes[pos];
+                    var bt_val: i64 = 0;
+                    if (bt_byte == 0x40) {
+                        pos += 1;
+                        bt_val = -64;
+                    } else if (bt_byte < 0x80) {
+                        pos += 1;
+                        bt_val = -@as(i64, bt_byte);
+                        if (depth == 0 and bt_byte < 0x40) {
+                            depth0_stack_exact = false;
+                        }
+                    } else {
+                        return .none;
+                    }
+                    if (depth == 0 and decoded.code == 0x04) {
+                        depth0_stack -= 1;
+                    }
+                    block_types[depth] = bt_val;
+                    depth += 1;
+                    continue;
+                },
+                0x0f => {
+                    leading_still_matching = false;
+                    if (depth == 0 and pos == body_end) {
+                        had_trailing_return = true;
+                        if (!has_early_return and depth0_stack_exact and depth0_stack == @as(i32, @intCast(sig.results.len))) {
+                            effective_end = instr_start;
+                            op_count -= 1;
+                        } else {
+                            has_early_return = true;
+                            needs_result_block = true;
+                        }
+                    } else if (depth > 0 and pos < body_end and (bytes[pos] == 0x0b or bytes[pos] == 0x05)) {
+                        has_early_return = true;
+                        needs_result_block = true;
+                    } else {
+                        return .none;
+                    }
+                    continue;
+                },
+                0x0c, 0x0d => {
+                    leading_still_matching = false;
+                    const target = readU32(bytes, &pos) catch return .none;
+                    if (target > depth) return .none;
+                    if (target == depth) needs_result_block = true;
+                    if (depth == 0) {
+                        if (decoded.code == 0x0d) {
+                            depth0_stack -= 1;
+                        } else {
+                            depth0_stack_exact = false;
+                        }
+                    }
+                    continue;
+                },
+                0x0e => {
+                    leading_still_matching = false;
+                    const count = readU32(bytes, &pos) catch return .none;
+                    for (0..@as(usize, count) + 1) |_| {
+                        const target = readU32(bytes, &pos) catch return .none;
+                        if (target > depth) return .none;
+                        if (target == depth) needs_result_block = true;
+                    }
+                    if (depth == 0) depth0_stack_exact = false;
+                    continue;
+                },
+                0x20 => {
+                    const idx = readU32(bytes, &pos) catch return .none;
+                    if (idx >= total_locals) return .none;
+                    local_use_counts[idx] += 1;
+                    if (depth == 0) depth0_stack += 1;
+                    if (idx >= param_count and !local_written_at_depth0[idx]) {
+                        needs_local_zero_init[idx - param_count] = true;
+                    }
+                    if (leading_still_matching and
+                        depth == 0 and
+                        op_count == @as(u32, leading_matched) + 1 and
+                        idx == @as(u32, leading_matched) and
+                        leading_matched < sig.params.len)
+                    {
+                        leading_end_offsets[leading_matched] = pos;
+                        leading_matched += 1;
+                    } else {
+                        leading_still_matching = false;
+                    }
+                    continue;
+                },
+                0x21, 0x22 => {
+                    leading_still_matching = false;
+                    const idx = readU32(bytes, &pos) catch return .none;
+                    if (idx >= total_locals) return .none;
+                    local_use_counts[idx] += 1;
+                    if (depth == 0) {
+                        local_written_at_depth0[idx] = true;
+                        if (decoded.code == 0x21) depth0_stack -= 1;
+                    }
+                    continue;
+                },
+                else => {
+                    if (depth == 0) {
+                        if (depth0StackDelta(@intCast(decoded.code))) |delta| {
+                            depth0_stack += delta;
+                        } else {
+                            depth0_stack_exact = false;
+                        }
+                    }
+                },
+            }
+        } else if (depth == 0) {
+            depth0_stack_exact = false;
+        }
+
+        leading_still_matching = false;
+        instr.skipImmediates(decoded.shape, bytes, &pos) catch return .none;
+    }
+
+    if (pos != body_end or depth != 0) return .none;
+    if (sig.params.len == 0 and op_count <= 1 and !had_trailing_return and !std.mem.eql(u8, bytes, &.{ 0x01, 0x0b })) {
         return .none;
     }
 
+    var prefix_params: u8 = 0;
+    if (!needs_result_block) {
+        while (prefix_params < leading_matched) : (prefix_params += 1) {
+            if (local_use_counts[prefix_params] != 1) break;
+        }
+    }
+
+    switch (optimize_mode) {
+        .small => {
+            _ = call_count;
+            _ = is_externally_used;
+            if (op_count > 6 or func.local_types.items.len != 0 or sig.params.len > 2) return .none;
+            const allowed_params = sig.params.len == 0 or
+                prefix_params == sig.params.len or
+                (sig.params.len == 1 and op_count <= 4);
+            if (!allowed_params) return .none;
+        },
+        .fast => {
+            if (op_count > 90 or sig.params.len > max_inline_params or func.local_types.items.len > max_inline_locals) return .none;
+        },
+    }
+
+    var leaf = TrivialLeaf{
+        .body_bytes = bytes,
+        .effective_end = effective_end,
+        .op_count = op_count,
+        .param_count = @intCast(sig.params.len),
+        .result_count = @intCast(sig.results.len),
+        .local_count = @intCast(func.local_types.items.len),
+        .prefix_params = prefix_params,
+        .leading_end_offsets = leading_end_offsets,
+        .needs_local_zero_init = needs_local_zero_init,
+        .needs_result_block = needs_result_block,
+        .has_early_return = has_early_return,
+    };
+    @memcpy(leaf.param_types[0..sig.params.len], sig.params);
+    @memcpy(leaf.result_types[0..sig.results.len], sig.results);
+    @memcpy(leaf.local_types[0..func.local_types.items.len], func.local_types.items);
+    return .{ .leaf = leaf };
+}
+
+fn markExprExternalRefs(
+    bytes: []const u8,
+    num_funcs: usize,
+    is_externally_used: []bool,
+) Error!void {
     var pos: usize = 0;
-    const decoded = instr.decode(bytes, &pos) catch return .none;
-    if (decoded.prefix != 0) return .none;
-    switch (decoded.code) {
-        0x23, 0x41, 0x42, 0x43, 0x44, 0xd0, 0xd2 => {
-            instr.skipImmediates(decoded.shape, bytes, &pos) catch return .none;
-            if (pos > 16 or !isTrivialTail(bytes[pos..])) return .none;
-            var leaf: TrivialLeaf = .{ .len = @intCast(pos) };
-            @memcpy(leaf.bytes[0..pos], bytes[0..pos]);
-            return .{ .leaf = leaf };
-        },
-        0x10, 0x12 => {
-            const callee = readU32(bytes, &pos) catch return .none;
-            if (!isTrivialTail(bytes[pos..])) return .none;
-            if (callee >= module.funcs.items.len or callee == fidx) return .none;
-            const callee_sig = getFuncSignature(module, &module.funcs.items[callee]) orelse return .none;
-            if (!Mod.FuncSignature.eql(sig, callee_sig)) return .none;
-            return .{ .forward = .{ .callee = callee, .is_tail = decoded.code == 0x12 } };
-        },
-        else => return .none,
+    while (pos < bytes.len) {
+        const decoded = instr.decode(bytes, &pos) catch return error.InvalidInput;
+        if (decoded.prefix == 0 and (decoded.code == 0x10 or decoded.code == 0x12 or decoded.code == 0xd2)) {
+            const idx = readU32(bytes, &pos) catch return error.InvalidInput;
+            if (idx < num_funcs) is_externally_used[idx] = true;
+        } else {
+            instr.skipImmediates(decoded.shape, bytes, &pos) catch return error.InvalidInput;
+        }
     }
 }
 
-fn inlineTrivialFunctions(allocator: std.mem.Allocator, module: *Mod.Module) Error!void {
+fn inlineTrivialFunctions(
+    allocator: std.mem.Allocator,
+    module: *Mod.Module,
+    optimize_mode: OptimizeMode,
+    modified_funcs: []bool,
+) Error!bool {
     const num_funcs = module.funcs.items.len;
-    if (num_funcs <= module.num_func_imports) return;
+    if (num_funcs <= module.num_func_imports) return false;
+
+    const call_counts = allocator.alloc(u32, num_funcs) catch return error.OutOfMemory;
+    defer allocator.free(call_counts);
+    @memset(call_counts, 0);
+
+    const is_externally_used = allocator.alloc(bool, num_funcs) catch return error.OutOfMemory;
+    defer allocator.free(is_externally_used);
+    @memset(is_externally_used, false);
+
+    for (0..module.num_func_imports) |i| {
+        is_externally_used[i] = true;
+    }
+    for (module.exports.items) |exp| {
+        if (exp.kind == .func and exp.var_ == .index and exp.var_.index < num_funcs) {
+            is_externally_used[exp.var_.index] = true;
+        }
+    }
+    if (module.start_var) |sv| {
+        if (sv == .index and sv.index < num_funcs) {
+            is_externally_used[sv.index] = true;
+        }
+    }
+    for (module.elem_segments.items) |seg| {
+        for (seg.elem_var_indices.items) |v| {
+            if (v == .index and v.index < num_funcs) {
+                is_externally_used[v.index] = true;
+            }
+        }
+        if (seg.elem_expr_bytes.len > 0) {
+            try markExprExternalRefs(seg.elem_expr_bytes, num_funcs, is_externally_used);
+        }
+        if (seg.kind == .active and seg.offset_expr_bytes.len > 0) {
+            try markExprExternalRefs(seg.offset_expr_bytes, num_funcs, is_externally_used);
+        }
+    }
+    for (module.globals.items) |g| {
+        if (!g.is_import and g.init_expr_bytes.len > 0) {
+            try markExprExternalRefs(g.init_expr_bytes, num_funcs, is_externally_used);
+        }
+    }
+    for (module.tables.items) |t| {
+        if (!t.is_import and t.hasInitExpr() and t.init_expr_bytes.len > 0) {
+            try markExprExternalRefs(t.init_expr_bytes, num_funcs, is_externally_used);
+        }
+    }
+    for (module.funcs.items[module.num_func_imports..]) |func| {
+        if (func.is_import or func.code_bytes.len == 0) continue;
+        var pos: usize = 0;
+        const bytes = func.code_bytes;
+        while (pos < bytes.len) {
+            const decoded = instr.decode(bytes, &pos) catch return error.InvalidInput;
+            if (decoded.prefix == 0 and (decoded.code == 0x10 or decoded.code == 0x12)) {
+                const callee = readU32(bytes, &pos) catch return error.InvalidInput;
+                if (callee < num_funcs) call_counts[callee] +|= 1;
+            } else if (decoded.prefix == 0 and decoded.code == 0xd2) {
+                const idx = readU32(bytes, &pos) catch return error.InvalidInput;
+                if (idx < num_funcs) is_externally_used[idx] = true;
+            } else {
+                instr.skipImmediates(decoded.shape, bytes, &pos) catch return error.InvalidInput;
+            }
+        }
+    }
 
     const trivials = allocator.alloc(TrivialKind, num_funcs) catch return error.OutOfMemory;
     defer allocator.free(trivials);
@@ -1727,27 +2734,50 @@ fn inlineTrivialFunctions(allocator: std.mem.Allocator, module: *Mod.Module) Err
 
     var any_trivial = false;
     for (module.num_func_imports..num_funcs) |i| {
-        const kind = classifyTrivialFunc(module, @intCast(i), &module.funcs.items[i]);
+        const kind = classifyTrivialFunc(
+            module,
+            @intCast(i),
+            &module.funcs.items[i],
+            optimize_mode,
+            call_counts[i],
+            is_externally_used[i],
+        );
         trivials[i] = kind;
         orig_forwards[i] = kind;
         if (kind != .none) any_trivial = true;
     }
-    if (!any_trivial) return;
+    if (!any_trivial) return false;
 
     // Resolve forwarding chains (e.g. getFactoryThunk -> host.getFactoryThunk -> export.getFactoryThunk).
     for (module.num_func_imports..num_funcs) |i| {
         if (trivials[i] != .forward) continue;
         var curr = trivials[i].forward.callee;
         const orig_tail = trivials[i].forward.is_tail;
+        var chain_single_use: bool = (@as(u32, @intFromBool(is_externally_used[i])) + call_counts[i]) <= 1;
         var resolved: TrivialKind = .none;
         for (0..16) |_| {
             if (curr < module.num_func_imports) {
                 resolved = .{ .forward = .{ .callee = curr, .is_tail = orig_tail } };
                 break;
             }
+            if (is_externally_used[curr] or call_counts[curr] > 1) {
+                chain_single_use = false;
+            }
             switch (trivials[curr]) {
                 .leaf => |leaf| {
-                    resolved = .{ .leaf = leaf };
+                    const small_leaf_ok = (optimize_mode == .fast) or
+                        chain_single_use or
+                        (leaf.op_count <= 6 and leaf.local_count == 0);
+                    if (small_leaf_ok and
+                        leaf.param_count == 0 and
+                        leaf.local_count == 0 and
+                        !leaf.needs_result_block and
+                        !leaf.has_early_return)
+                    {
+                        resolved = .{ .leaf = leaf };
+                    } else {
+                        resolved = .{ .forward = .{ .callee = curr, .is_tail = orig_tail } };
+                    }
                     break;
                 },
                 .forward => |fwd| {
@@ -1766,6 +2796,8 @@ fn inlineTrivialFunctions(allocator: std.mem.Allocator, module: *Mod.Module) Err
         trivials[i] = resolved;
     }
 
+    var any_inlined = false;
+
     for (module.num_func_imports..num_funcs) |i| {
         const func = &module.funcs.items[i];
         if (func.is_import or func.code_bytes.len == 0) continue;
@@ -1775,8 +2807,8 @@ fn inlineTrivialFunctions(allocator: std.mem.Allocator, module: *Mod.Module) Err
                 .leaf => |leaf| {
                     var out: std.ArrayListUnmanaged(u8) = .empty;
                     errdefer out.deinit(module.allocator);
-                    out.ensureTotalCapacity(module.allocator, leaf.len + 1) catch return error.OutOfMemory;
-                    out.appendSliceAssumeCapacity(leaf.slice());
+                    out.ensureTotalCapacity(module.allocator, leaf.effective_end + 1) catch return error.OutOfMemory;
+                    out.appendSliceAssumeCapacity(leaf.body_bytes[0..leaf.effective_end]);
                     out.appendAssumeCapacity(0x0b);
                     const new_bytes = out.toOwnedSlice(module.allocator) catch return error.OutOfMemory;
                     if (func.owns_code_bytes and func.code_bytes.len > 0) {
@@ -1784,6 +2816,7 @@ fn inlineTrivialFunctions(allocator: std.mem.Allocator, module: *Mod.Module) Err
                     }
                     func.code_bytes = new_bytes;
                     func.owns_code_bytes = true;
+                    any_inlined = true;
                 },
                 .forward => |fwd| {
                     if (fwd.callee != orig_forwards[i].forward.callee) {
@@ -1798,12 +2831,18 @@ fn inlineTrivialFunctions(allocator: std.mem.Allocator, module: *Mod.Module) Err
                         }
                         func.code_bytes = new_bytes;
                         func.owns_code_bytes = true;
+                        any_inlined = true;
                     }
                 },
                 .none => {},
             }
             continue;
         }
+
+        const caller_sig = getFuncSignature(module, func) orelse continue;
+        const caller_param_count: u32 = @intCast(caller_sig.params.len);
+        const can_inline_leaves = (optimize_mode == .small) or
+            (func.code_bytes.len <= 16384 and func.local_types.items.len <= 512);
 
         // Check whether this non-trivial function calls any trivial function.
         var has_trivial_call = false;
@@ -1814,9 +2853,18 @@ fn inlineTrivialFunctions(allocator: std.mem.Allocator, module: *Mod.Module) Err
                 const decoded = instr.decode(bytes, &pos) catch return error.InvalidInput;
                 if (decoded.prefix == 0 and (decoded.code == 0x10 or decoded.code == 0x12)) {
                     const callee = readU32(bytes, &pos) catch return error.InvalidInput;
-                    if (callee >= module.num_func_imports and callee < num_funcs and trivials[callee] != .none) {
-                        has_trivial_call = true;
-                        break;
+                    if (callee != i and callee >= module.num_func_imports and callee < num_funcs) {
+                        switch (trivials[callee]) {
+                            .leaf => if (can_inline_leaves) {
+                                has_trivial_call = true;
+                                break;
+                            },
+                            .forward => {
+                                has_trivial_call = true;
+                                break;
+                            },
+                            .none => {},
+                        }
                     }
                 } else {
                     instr.skipImmediates(decoded.shape, bytes, &pos) catch return error.InvalidInput;
@@ -1837,19 +2885,125 @@ fn inlineTrivialFunctions(allocator: std.mem.Allocator, module: *Mod.Module) Err
             const decoded = instr.decode(bytes, &pos) catch return error.InvalidInput;
             if (decoded.prefix == 0 and (decoded.code == 0x10 or decoded.code == 0x12)) {
                 const callee = readU32(bytes, &pos) catch return error.InvalidInput;
-                if (callee >= module.num_func_imports and callee < num_funcs) {
+                if (callee != i and callee >= module.num_func_imports and callee < num_funcs) {
                     switch (trivials[callee]) {
-                        .leaf => |leaf| {
-                            out.appendSlice(module.allocator, leaf.slice()) catch return error.OutOfMemory;
-                            if (decoded.code == 0x12) {
-                                out.append(module.allocator, 0x0f) catch return error.OutOfMemory;
+                        .leaf => |*leaf| {
+                            const needed_locals: usize = (leaf.param_count - leaf.prefix_params) + leaf.local_count;
+                            const can_inline_site = switch (optimize_mode) {
+                                .small => func.local_types.items.len + needed_locals <= 4096,
+                                .fast => out.items.len + (bytes.len - pos) <= 16384 and func.local_types.items.len + needed_locals <= 512,
+                            };
+                            if (can_inline_site) {
+                                var local_map: [max_inline_total_locals]u32 = undefined;
+                                for (leaf.prefix_params..leaf.param_count) |p| {
+                                    const new_idx: u32 = caller_param_count + @as(u32, @intCast(func.local_types.items.len));
+                                    if (func.local_type_idxs.items.len == func.local_types.items.len and func.local_type_idxs.items.len > 0) {
+                                        func.local_type_idxs.append(module.allocator, types.invalid_index) catch return error.OutOfMemory;
+                                    } else {
+                                        func.local_type_idxs.clearRetainingCapacity();
+                                    }
+                                    func.local_types.append(module.allocator, leaf.param_types[p]) catch return error.OutOfMemory;
+                                    local_map[p] = new_idx;
+                                }
+                                for (0..leaf.local_count) |l| {
+                                    const new_idx: u32 = caller_param_count + @as(u32, @intCast(func.local_types.items.len));
+                                    if (func.local_type_idxs.items.len == func.local_types.items.len and func.local_type_idxs.items.len > 0) {
+                                        func.local_type_idxs.append(module.allocator, types.invalid_index) catch return error.OutOfMemory;
+                                    } else {
+                                        func.local_type_idxs.clearRetainingCapacity();
+                                    }
+                                    func.local_types.append(module.allocator, leaf.local_types[l]) catch return error.OutOfMemory;
+                                    local_map[leaf.param_count + l] = new_idx;
+                                }
+
+                                var p: usize = leaf.param_count;
+                                while (p > leaf.prefix_params) {
+                                    p -= 1;
+                                    out.append(module.allocator, 0x21) catch return error.OutOfMemory;
+                                    try appendU32Leb(module.allocator, &out, local_map[p]);
+                                }
+
+                                for (0..leaf.local_count) |l| {
+                                    if (!leaf.needs_local_zero_init[l]) continue;
+                                    switch (leaf.local_types[l]) {
+                                        .i32 => out.appendSlice(module.allocator, &.{ 0x41, 0x00 }) catch return error.OutOfMemory,
+                                        .i64 => out.appendSlice(module.allocator, &.{ 0x42, 0x00 }) catch return error.OutOfMemory,
+                                        .f32 => out.appendSlice(module.allocator, &.{ 0x43, 0, 0, 0, 0 }) catch return error.OutOfMemory,
+                                        .f64 => out.appendSlice(module.allocator, &.{ 0x44, 0, 0, 0, 0, 0, 0, 0, 0 }) catch return error.OutOfMemory,
+                                        .v128 => out.appendSlice(module.allocator, &([_]u8{ 0xfd, 0x0c } ++ (@as([16]u8, @splat(0))))) catch return error.OutOfMemory,
+                                        .funcref => out.appendSlice(module.allocator, &.{ 0xd0, 0x70 }) catch return error.OutOfMemory,
+                                        .externref => out.appendSlice(module.allocator, &.{ 0xd0, 0x6f }) catch return error.OutOfMemory,
+                                        else => unreachable,
+                                    }
+                                    out.append(module.allocator, 0x21) catch return error.OutOfMemory;
+                                    try appendU32Leb(module.allocator, &out, local_map[leaf.param_count + l]);
+                                }
+
+                                if (leaf.needs_result_block) {
+                                    out.append(module.allocator, 0x02) catch return error.OutOfMemory;
+                                    if (leaf.result_count == 0) {
+                                        out.append(module.allocator, 0x40) catch return error.OutOfMemory;
+                                    } else {
+                                        const vt_byte: u8 = @bitCast(@as(i8, @intCast(@backingInt(leaf.result_types[0]))));
+                                        out.append(module.allocator, vt_byte) catch return error.OutOfMemory;
+                                    }
+                                }
+
+                                const body_start: usize = if (leaf.prefix_params > 0)
+                                    leaf.leading_end_offsets[leaf.prefix_params - 1]
+                                else
+                                    0;
+                                var bpos: usize = body_start;
+                                var inner_depth: u32 = 0;
+                                while (bpos < leaf.effective_end) {
+                                    const bstart = bpos;
+                                    const bdecoded = instr.decode(leaf.body_bytes, &bpos) catch return error.InvalidInput;
+                                    if (bdecoded.prefix == 0) {
+                                        switch (bdecoded.code) {
+                                            0x02, 0x03, 0x04 => {
+                                                inner_depth += 1;
+                                                instr.skipImmediates(bdecoded.shape, leaf.body_bytes, &bpos) catch return error.InvalidInput;
+                                                out.appendSlice(module.allocator, leaf.body_bytes[bstart..bpos]) catch return error.OutOfMemory;
+                                                continue;
+                                            },
+                                            0x0b => {
+                                                if (inner_depth > 0) inner_depth -= 1;
+                                                out.append(module.allocator, 0x0b) catch return error.OutOfMemory;
+                                                continue;
+                                            },
+                                            0x20, 0x21, 0x22 => {
+                                                const old_local = readU32(leaf.body_bytes, &bpos) catch return error.InvalidInput;
+                                                out.append(module.allocator, @intCast(bdecoded.code)) catch return error.OutOfMemory;
+                                                try appendU32Leb(module.allocator, &out, local_map[old_local]);
+                                                continue;
+                                            },
+                                            0x0f => {
+                                                out.append(module.allocator, 0x0c) catch return error.OutOfMemory;
+                                                try appendU32Leb(module.allocator, &out, inner_depth);
+                                                continue;
+                                            },
+                                            else => {},
+                                        }
+                                    }
+                                    instr.skipImmediates(bdecoded.shape, leaf.body_bytes, &bpos) catch return error.InvalidInput;
+                                    out.appendSlice(module.allocator, leaf.body_bytes[bstart..bpos]) catch return error.OutOfMemory;
+                                }
+
+                                if (leaf.needs_result_block) {
+                                    out.append(module.allocator, 0x0b) catch return error.OutOfMemory;
+                                }
+                                if (decoded.code == 0x12) {
+                                    out.append(module.allocator, 0x0f) catch return error.OutOfMemory;
+                                }
+                                inlined_leaf = true;
+                                any_inlined = true;
+                                continue;
                             }
-                            inlined_leaf = true;
-                            continue;
                         },
                         .forward => |fwd| {
                             out.append(module.allocator, @intCast(decoded.code)) catch return error.OutOfMemory;
                             try appendU32Leb(module.allocator, &out, fwd.callee);
+                            if (fwd.callee != callee) any_inlined = true;
                             continue;
                         },
                         .none => {},
@@ -1870,14 +3024,28 @@ fn inlineTrivialFunctions(allocator: std.mem.Allocator, module: *Mod.Module) Err
         func.owns_code_bytes = true;
 
         if (inlined_leaf) {
-            try optimizeFuncBody(allocator, func);
+            modified_funcs[i] = true;
         }
     }
+
+    return any_inlined;
 }
 
-fn removeDeadFunctions(allocator: std.mem.Allocator, module: *Mod.Module) Error!void {
+fn removeDeadFunctions(
+    allocator: std.mem.Allocator,
+    module: *Mod.Module,
+    locals_compacted: []const bool,
+) Error!void {
     const num_funcs = module.funcs.items.len;
     if (num_funcs <= module.num_func_imports) return;
+
+    var any_locals_compacted = false;
+    for (locals_compacted) |c| {
+        if (c) {
+            any_locals_compacted = true;
+            break;
+        }
+    }
 
     const live = allocator.alloc(bool, num_funcs) catch return error.OutOfMemory;
     defer allocator.free(live);
@@ -1979,7 +3147,7 @@ fn removeDeadFunctions(allocator: std.mem.Allocator, module: *Mod.Module) Error!
             break;
         }
     }
-    if (all_live) return;
+    if (all_live and !any_locals_compacted) return;
 
     const old_to_new = allocator.alloc(u32, num_funcs) catch return error.OutOfMemory;
     defer allocator.free(old_to_new);
@@ -1991,6 +3159,38 @@ fn removeDeadFunctions(allocator: std.mem.Allocator, module: *Mod.Module) Error!
         } else {
             old_to_new[i] = types.invalid_index;
         }
+    }
+
+    if (all_live) {
+        if (module.customs.items.len > 0) {
+            var custom_write_idx: usize = 0;
+            for (module.customs.items) |custom| {
+                if (!std.mem.eql(u8, custom.name, "name")) {
+                    module.customs.items[custom_write_idx] = custom;
+                    custom_write_idx += 1;
+                    continue;
+                }
+                if (rewriteNameSectionPayload(module.allocator, custom.data, old_to_new, locals_compacted, any_locals_compacted)) |rewritten| {
+                    if (custom.owns_data and custom.data.len > 0) {
+                        module.allocator.free(custom.data);
+                    }
+                    var updated = custom;
+                    updated.data = rewritten;
+                    updated.owns_data = true;
+                    module.customs.items[custom_write_idx] = updated;
+                    custom_write_idx += 1;
+                } else |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvalidNameSection => {
+                        if (custom.owns_data and custom.data.len > 0) {
+                            module.allocator.free(custom.data);
+                        }
+                    },
+                }
+            }
+            module.customs.shrinkRetainingCapacity(custom_write_idx);
+        }
+        return;
     }
 
     // Rewrite function indices in live defined functions before compacting module.funcs.
@@ -2081,7 +3281,7 @@ fn removeDeadFunctions(allocator: std.mem.Allocator, module: *Mod.Module) Error!
                 custom_write_idx += 1;
                 continue;
             }
-            if (rewriteNameSectionPayload(module.allocator, custom.data, old_to_new)) |rewritten| {
+            if (rewriteNameSectionPayload(module.allocator, custom.data, old_to_new, locals_compacted, any_locals_compacted)) |rewritten| {
                 if (custom.owns_data and custom.data.len > 0) {
                     module.allocator.free(custom.data);
                 }
@@ -2124,6 +3324,8 @@ fn rewriteNameSectionPayload(
     allocator: std.mem.Allocator,
     data: []const u8,
     old_to_new: []const u32,
+    locals_compacted: []const bool,
+    any_locals_compacted: bool,
 ) RewriteNameSectionError![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -2187,7 +3389,10 @@ fn rewriteNameSectionPayload(
                     }
                     const inner_bytes = subsec_body[inner_start..sub_pos];
 
-                    if (func_idx < old_to_new.len and old_to_new[func_idx] != types.invalid_index) {
+                    const keep_entry = func_idx < old_to_new.len and
+                        old_to_new[func_idx] != types.invalid_index and
+                        !(subsec_id == 2 and func_idx < locals_compacted.len and locals_compacted[func_idx]);
+                    if (keep_entry) {
                         try appendU32Leb(allocator, &entries_buf, old_to_new[func_idx]);
                         try entries_buf.appendSlice(allocator, inner_bytes);
                         surviving_count += 1;
@@ -2195,13 +3400,15 @@ fn rewriteNameSectionPayload(
                 }
                 if (sub_pos != subsec_body.len) return error.InvalidNameSection;
 
-                var count_tmp: [leb128.max_u32_bytes]u8 = undefined;
-                const count_len = leb128.writeU32Leb128(&count_tmp, surviving_count);
-                const new_subsec_size: u32 = @intCast(count_len + entries_buf.items.len);
-                try out.append(allocator, subsec_id);
-                try appendU32Leb(allocator, &out, new_subsec_size);
-                try out.appendSlice(allocator, count_tmp[0..count_len]);
-                try out.appendSlice(allocator, entries_buf.items);
+                if (surviving_count > 0 or !(subsec_id == 2 and any_locals_compacted)) {
+                    var count_tmp: [leb128.max_u32_bytes]u8 = undefined;
+                    const count_len = leb128.writeU32Leb128(&count_tmp, surviving_count);
+                    const new_subsec_size: u32 = @intCast(count_len + entries_buf.items.len);
+                    try out.append(allocator, subsec_id);
+                    try appendU32Leb(allocator, &out, new_subsec_size);
+                    try out.appendSlice(allocator, count_tmp[0..count_len]);
+                    try out.appendSlice(allocator, entries_buf.items);
+                }
             },
             else => {
                 try out.append(allocator, subsec_id);
@@ -2895,3 +4102,728 @@ test "Optimizer: trivial 0-param constant and forwarding callee chain inlining" 
     // compute inlined `call 0` -> `i32.const 1` and folded `1 + 41` -> `i32.const 42; end`.
     try testing.expectEqualSlices(u8, &[_]u8{ 0x41, 42, 0x0b }, opt_mod.funcs.items[1].code_bytes);
 }
+
+test "Optimizer: 1-parameter leaf inlining (field load, std.debug.assert, and std.math.isNan)" {
+    const allocator = testing.allocator;
+
+    var mod = Mod.Module.init(allocator);
+    defer mod.deinit();
+
+    try mod.memories.append(allocator, .{
+        .type = .{ .limits = .{ .initial = 1 } },
+    });
+
+    // Type 0: (param i32) -> (result f32)
+    try mod.module_types.append(allocator, .{ .func_type = .{
+        .params = try allocator.dupe(types.ValType, &.{.i32}),
+        .results = try allocator.dupe(types.ValType, &.{.f32}),
+    } });
+    try mod.type_meta.append(allocator, .{});
+
+    // Type 1: (param i32) -> ()
+    try mod.module_types.append(allocator, .{ .func_type = .{
+        .params = try allocator.dupe(types.ValType, &.{.i32}),
+        .results = &.{},
+    } });
+    try mod.type_meta.append(allocator, .{});
+
+    // Type 2: (param f32) -> (result i32)
+    try mod.module_types.append(allocator, .{ .func_type = .{
+        .params = try allocator.dupe(types.ValType, &.{.f32}),
+        .results = try allocator.dupe(types.ValType, &.{.i32}),
+    } });
+    try mod.type_meta.append(allocator, .{});
+
+    // Type 3: (param i32, i32) -> (result i32)
+    try mod.module_types.append(allocator, .{ .func_type = .{
+        .params = try allocator.dupe(types.ValType, &.{ .i32, .i32 }),
+        .results = try allocator.dupe(types.ValType, &.{.i32}),
+    } });
+    try mod.type_meta.append(allocator, .{});
+
+    // func 0 (Rect.x): local.get 0; f32.load align=2 offset=4; return; end
+    const rect_x_code = [_]u8{ 0x20, 0x00, 0x2a, 0x02, 0x04, 0x0f, 0x0b };
+    // func 1 (std.debug.assert): block (empty) { local.get 0; br_if 0; unreachable } end; return; end
+    const assert_code = [_]u8{ 0x02, 0x40, 0x20, 0x00, 0x0d, 0x00, 0x00, 0x0b, 0x0f, 0x0b };
+    // func 2 (std.math.isNan): local.get 0; local.get 0; f32.ne; return; end
+    const is_nan_code = [_]u8{ 0x20, 0x00, 0x20, 0x00, 0x5c, 0x0f, 0x0b };
+    // func 3 (caller_pure):
+    //   local.get 0; local.get 1; i32.lt_u; call $assert;
+    //   local.get 0; call $rect_x; call $is_nan; end
+    const caller_code = [_]u8{
+        0x20, 0x00, // local.get 0
+        0x20, 0x01, // local.get 1
+        0x49, // i32.lt_u
+        0x10, 0x01, // call $assert
+        0x20, 0x00, // local.get 0
+        0x10, 0x00, // call $rect_x
+        0x10, 0x02, // call $is_nan
+        0x0b, // end
+    };
+    // func 4 (caller_pure_isnan): local.get 0; call $is_nan; end
+    const caller_pure_isnan_code = [_]u8{
+        0x20, 0x00, // local.get 0
+        0x10, 0x02, // call $is_nan
+        0x0b, // end
+    };
+
+    try mod.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &rect_x_code });
+    try mod.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 1 } }, .code_bytes = &assert_code });
+    try mod.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 2 } }, .code_bytes = &is_nan_code });
+    try mod.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 3 } }, .code_bytes = &caller_code });
+    try mod.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 2 } }, .code_bytes = &caller_pure_isnan_code });
+
+    try mod.exports.append(allocator, .{ .name = "caller", .kind = .func, .var_ = .{ .index = 3 } });
+    try mod.exports.append(allocator, .{ .name = "caller_pure_isnan", .kind = .func, .var_ = .{ .index = 4 } });
+
+    const wasm = try writer.writeModule(allocator, &mod);
+    defer allocator.free(wasm);
+
+    const opt_bytes = try optimize(allocator, wasm, .{});
+    defer allocator.free(opt_bytes);
+
+    var opt_mod = try reader.readModule(allocator, opt_bytes);
+    defer opt_mod.deinit();
+
+    // Helpers 0, 1, 2 were inlined and pruned; only the 2 exported callers remain.
+    try testing.expectEqual(@as(usize, 2), opt_mod.funcs.items.len);
+
+    // caller (func 0):
+    // - `local.get 0; local.get 1; i32.lt_u; call $assert` inlined with zero scratch locals and
+    //   folded `i32.lt_u; i32.eqz` -> `i32.ge_u; if (empty) { unreachable } end`
+    // - `local.get 0; call $rect_x` inlined with zero scratch locals -> `local.get 0; f32.load align=2 offset=4`
+    // - `call $is_nan` on non-pure `f32.load` folded `local.set 2; local.get 2` -> `local.tee 2; local.get 2; f32.ne`
+    try testing.expectEqualSlices(types.ValType, &.{.f32}, opt_mod.funcs.items[0].local_types.items);
+    try testing.expectEqualSlices(
+        u8,
+        &[_]u8{
+            0x20, 0x00, // local.get 0
+            0x20, 0x01, // local.get 1
+            0x4f, // i32.ge_u
+            0x04, 0x40, // if (empty)
+            0x00, // unreachable
+            0x0b, // end
+            0x20, 0x00, // local.get 0
+            0x2a, 0x02, 0x04, // f32.load align=2 offset=4
+            0x22, 0x02, // local.tee 2
+            0x20, 0x02, // local.get 2
+            0x5c, // f32.ne
+            0x0b, // end
+        },
+        opt_mod.funcs.items[0].code_bytes,
+    );
+
+    // caller_pure_isnan (func 1):
+    // `local.get 0; call $is_nan` propagated `local.get 0` to both uses and compacted away the scratch local!
+    try testing.expectEqual(@as(usize, 0), opt_mod.funcs.items[1].local_types.items.len);
+    try testing.expectEqualSlices(
+        u8,
+        &[_]u8{
+            0x20, 0x00, // local.get 0
+            0x20, 0x00, // local.get 0
+            0x5c, // f32.ne
+            0x0b, // end
+        },
+        opt_mod.funcs.items[1].code_bytes,
+    );
+}
+
+test "Optimizer: multi-parameter leaf inlining with simplifyLocals and compactLocals" {
+    const allocator = testing.allocator;
+
+    var mod = Mod.Module.init(allocator);
+    defer mod.deinit();
+
+    try mod.memories.append(allocator, .{
+        .type = .{ .limits = .{ .initial = 1 } },
+    });
+
+    // Type 0: (param i32, i32) -> (result i32)
+    try mod.module_types.append(allocator, .{ .func_type = .{
+        .params = try allocator.dupe(types.ValType, &.{ .i32, .i32 }),
+        .results = try allocator.dupe(types.ValType, &.{.i32}),
+    } });
+    try mod.type_meta.append(allocator, .{});
+
+    // Type 1: (param i32, i32, i32) -> (result i32)
+    try mod.module_types.append(allocator, .{ .func_type = .{
+        .params = try allocator.dupe(types.ValType, &.{ .i32, .i32, .i32 }),
+        .results = try allocator.dupe(types.ValType, &.{.i32}),
+    } });
+    try mod.type_meta.append(allocator, .{});
+
+    // Type 2: (param i32) -> (result i32)
+    try mod.module_types.append(allocator, .{ .func_type = .{
+        .params = try allocator.dupe(types.ValType, &.{.i32}),
+        .results = try allocator.dupe(types.ValType, &.{.i32}),
+    } });
+    try mod.type_meta.append(allocator, .{});
+
+    // func 0 (sub2): local.get 0; local.get 1; i32.sub; return; end (prefix_params = 2)
+    const sub2_code = [_]u8{ 0x20, 0x00, 0x20, 0x01, 0x6b, 0x0f, 0x0b };
+    // func 1 (fma_reuse): (a * b) + (c - a)
+    // Uses param 0 (`a`) twice and accesses `c` then `a`, so params 0..2 use scratch locals on inline.
+    const fma_code = [_]u8{
+        0x20, 0x00, // local.get 0 (a)
+        0x20, 0x01, // local.get 1 (b)
+        0x6c, // i32.mul
+        0x20, 0x02, // local.get 2 (c)
+        0x20, 0x00, // local.get 0 (a)
+        0x6b, // i32.sub
+        0x6a, // i32.add
+        0x0f, // return
+        0x0b, // end
+    };
+    // func 2 (exported caller):
+    //   local.get 0; i32.const 4; i32.const 20; call $fma_reuse;
+    //   i32.const 5; call $sub2; end
+    // Expected after inlining + simplifyLocals + foldConstants + compactLocals:
+    //   ((x << 2) + (20 - x)) - 5, with 0 scratch locals remaining!
+    const caller_code = [_]u8{
+        0x20, 0x00, // local.get 0 (x)
+        0x41, 0x04, // i32.const 4
+        0x41, 20, // i32.const 20
+        0x10, 0x01, // call $fma_reuse
+        0x41, 0x05, // i32.const 5
+        0x10, 0x00, // call $sub2
+        0x0b, // end
+    };
+
+    try mod.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &sub2_code });
+    try mod.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 1 } }, .code_bytes = &fma_code });
+    try mod.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 2 } }, .code_bytes = &caller_code });
+
+    try mod.exports.append(allocator, .{ .name = "compute", .kind = .func, .var_ = .{ .index = 2 } });
+
+    const wasm = try writer.writeModule(allocator, &mod);
+    defer allocator.free(wasm);
+
+    const opt_bytes = try optimize(allocator, wasm, .{ .optimize_mode = .fast });
+    defer allocator.free(opt_bytes);
+
+    var opt_mod = try reader.readModule(allocator, opt_bytes);
+    defer opt_mod.deinit();
+
+    try testing.expectEqual(@as(usize, 1), opt_mod.funcs.items.len);
+    // All 3 temporary parameter locals from $fma_reuse were propagated and compacted away!
+    try testing.expectEqual(@as(usize, 0), opt_mod.funcs.items[0].local_types.items.len);
+    try testing.expectEqualSlices(
+        u8,
+        &[_]u8{
+            0x20, 0x00, // local.get 0
+            0x41, 0x02, // i32.const 2 (strength-reduced from * 4)
+            0x74, // i32.shl
+            0x41, 20, // i32.const 20
+            0x20, 0x00, // local.get 0
+            0x6b, // i32.sub
+            0x6a, // i32.add
+            0x41, 0x05, // i32.const 5
+            0x6b, // i32.sub
+            0x0b, // end
+        },
+        opt_mod.funcs.items[0].code_bytes,
+    );
+}
+
+test "Optimizer: OptimizeMode.small vs OptimizeMode.fast leaf inlining thresholds" {
+    const allocator = testing.allocator;
+
+    var mod = Mod.Module.init(allocator);
+    defer mod.deinit();
+
+    // Type 0: (param i32) -> (result i32)
+    try mod.module_types.append(allocator, .{ .func_type = .{
+        .params = try allocator.dupe(types.ValType, &.{.i32}),
+        .results = try allocator.dupe(types.ValType, &.{.i32}),
+    } });
+    try mod.type_meta.append(allocator, .{});
+
+    // func 0: 13-op leaf hash step (exceeds .small multi-call limit of 6 ops, within .fast limit of 64 ops)
+    const medium_leaf_code = [_]u8{
+        0x20, 0x00, // 1: local.get 0
+        0x41, 16, // 2: i32.const 16
+        0x76, // 3: i32.shr_u
+        0x20, 0x00, // 4: local.get 0
+        0x73, // 5: i32.xor
+        0x41, 0x45, // 6: i32.const 0x45
+        0x6c, // 7: i32.mul
+        0x20, 0x00, // 8: local.get 0
+        0x41, 0x07, // 9: i32.const 7
+        0x77, // 10: i32.rotl
+        0x73, // 11: i32.xor
+        0x41, 0x01, // 12: i32.const 1
+        0x6a, // 13: i32.add
+        0x0f, // return
+        0x0b, // end
+    };
+
+    // func 1 (exported caller calling func 0 twice):
+    const dual_caller_code = [_]u8{
+        0x20, 0x00, // local.get 0
+        0x10, 0x00, // call 0
+        0x10, 0x00, // call 0
+        0x0b, // end
+    };
+
+    try mod.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &medium_leaf_code });
+    try mod.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &dual_caller_code });
+    try mod.exports.append(allocator, .{ .name = "hash2", .kind = .func, .var_ = .{ .index = 1 } });
+
+    const wasm = try writer.writeModule(allocator, &mod);
+    defer allocator.free(wasm);
+
+    // In .small mode, func 0 has 2 call sites and 13 ops (> 6), so it is NOT inlined.
+    const opt_small = try optimize(allocator, wasm, .{ .optimize_mode = .small });
+    defer allocator.free(opt_small);
+    var mod_small = try reader.readModule(allocator, opt_small);
+    defer mod_small.deinit();
+    try testing.expectEqual(@as(usize, 2), mod_small.funcs.items.len);
+    try testing.expectEqualSlices(u8, &dual_caller_code, mod_small.funcs.items[1].code_bytes);
+
+    // In .fast mode, func 0 (13 ops <= 64) IS inlined at both call sites and pruned!
+    const opt_fast = try optimize(allocator, wasm, .{ .optimize_mode = .fast });
+    defer allocator.free(opt_fast);
+    var mod_fast = try reader.readModule(allocator, opt_fast);
+    defer mod_fast.deinit();
+    try testing.expectEqual(@as(usize, 1), mod_fast.funcs.items.len);
+}
+
+test "Optimizer: early return, depth-0 br_if, return_call, and zero-init local in loop" {
+    const allocator = testing.allocator;
+
+    var mod = Mod.Module.init(allocator);
+    defer mod.deinit();
+
+    // Type 0: (param i32) -> (result i32)
+    try mod.module_types.append(allocator, .{ .func_type = .{
+        .params = try allocator.dupe(types.ValType, &.{.i32}),
+        .results = try allocator.dupe(types.ValType, &.{.i32}),
+    } });
+    try mod.type_meta.append(allocator, .{});
+
+    // Type 1: (param i32) -> ()
+    try mod.module_types.append(allocator, .{ .func_type = .{
+        .params = try allocator.dupe(types.ValType, &.{.i32}),
+        .results = &.{},
+    } });
+    try mod.type_meta.append(allocator, .{});
+
+    // func 0 (early_ret_1):
+    //   local.get 0; if (empty) { i32.const 99; return } end; local.get 0; i32.const 1; i32.add; return; end
+    const early_ret_1_code = [_]u8{
+        0x20, 0x00, // local.get 0
+        0x04, 0x40, // if (empty)
+        0x41, 99, // i32.const 99
+        0x0f, // return -> rewritten to `br 1` inside `block (result i32)`
+        0x0b, // end
+        0x20, 0x00, // local.get 0
+        0x41, 0x01, // i32.const 1
+        0x6a, // i32.add
+        0x0f, // return
+        0x0b, // end
+    };
+
+    // func 1 (depth0_br_if_0):
+    //   local.get 0; br_if 0; nop; return; end (0-result, depth-0 br_if triggers needs_result_block)
+    const depth0_br_if_code = [_]u8{
+        0x20, 0x00, // local.get 0
+        0x0d, 0x00, // br_if 0 (targets function root -> needs_result_block = true)
+        0x0f, // return
+        0x0b, // end
+    };
+
+    // func 2 (zero_init_local):
+    //   has 1 non-param local (local 1: i32) read before write at depth 0:
+    //   local.get 1; local.get 0; i32.add; local.tee 1; return; end
+    const zero_init_code = [_]u8{
+        0x20, 0x01, // local.get 1 (unwritten non-param local -> needs_local_zero_init[0] = true)
+        0x20, 0x00, // local.get 0
+        0x6a, // i32.add
+        0x0f, // return
+        0x0b, // end
+    };
+
+    // func 3 (tail_callee): local.get 0; i32.const 7; i32.add; return; end
+    const tail_callee_code = [_]u8{ 0x20, 0x00, 0x41, 0x07, 0x6a, 0x0f, 0x0b };
+
+    // func 4 (exported caller exercising early return, depth-0 br_if, zero-init inside loop, and return_call):
+    const caller_code = [_]u8{
+        0x20, 0x00, // local.get 0
+        0x10, 0x01, // call $depth0_br_if_0
+        0x03, 0x40, // loop (empty)
+        0x20, 0x00, // local.get 0
+        0x10, 0x02, // call $zero_init_local
+        0x1a, // drop
+        0x0b, // end loop
+        0x20, 0x00, // local.get 0
+        0x10, 0x00, // call $early_ret_1
+        0x12, 0x03, // return_call $tail_callee -> emits `<spliced>; return`
+        0x0b, // end
+    };
+
+    try mod.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &early_ret_1_code });
+    try mod.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 1 } }, .code_bytes = &depth0_br_if_code });
+    var func2 = Mod.Func{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &zero_init_code };
+    try func2.local_types.append(allocator, .i32);
+    try mod.funcs.append(allocator, func2);
+    try mod.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &tail_callee_code });
+    try mod.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &caller_code });
+
+    try mod.exports.append(allocator, .{ .name = "run", .kind = .func, .var_ = .{ .index = 4 } });
+
+    const wasm = try writer.writeModule(allocator, &mod);
+    defer allocator.free(wasm);
+
+    const opt_bytes = try optimize(allocator, wasm, .{ .optimize_mode = .fast });
+    defer allocator.free(opt_bytes);
+
+    var opt_mod = try reader.readModule(allocator, opt_bytes);
+    defer opt_mod.deinit();
+
+    // All 4 helpers were inlined into `run` and pruned!
+    try testing.expectEqual(@as(usize, 1), opt_mod.funcs.items.len);
+    // Verify `return_call $tail_callee` emitted trailing `0x0f` (`return`) before `0x0b` (`end`).
+    const run_bytes = opt_mod.funcs.items[0].code_bytes;
+    try testing.expect(run_bytes.len >= 2);
+    try testing.expectEqual(@as(u8, 0x0f), run_bytes[run_bytes.len - 2]);
+    try testing.expectEqual(@as(u8, 0x0b), run_bytes[run_bytes.len - 1]);
+
+    // Trailing `return` (0x0f) with extra stack values (`i32.const 1; local.get 0; return; end`)
+    // is wrapped in `block (result i32)` and rewritten to `br 0` so extra stack values are unwound!
+    var mod_stack = Mod.Module.init(allocator);
+    defer mod_stack.deinit();
+    try mod_stack.module_types.append(allocator, .{ .func_type = .{
+        .params = try allocator.dupe(types.ValType, &.{.i32}),
+        .results = try allocator.dupe(types.ValType, &.{.i32}),
+    } });
+    try mod_stack.type_meta.append(allocator, .{});
+
+    const extra_stack_callee = [_]u8{
+        0x41, 0x01, // i32.const 1 (extra stack value)
+        0x20, 0x00, // local.get 0 (actual return value)
+        0x0f, // return (unwinds extra i32.const 1)
+        0x0b, // end
+    };
+    const extra_stack_caller = [_]u8{
+        0x20, 0x00, // local.get 0
+        0x10, 0x00, // call 0
+        0x0b, // end
+    };
+    try mod_stack.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &extra_stack_callee });
+    try mod_stack.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &extra_stack_caller });
+    try mod_stack.exports.append(allocator, .{ .name = "f", .kind = .func, .var_ = .{ .index = 1 } });
+
+    const wasm_stack = try writer.writeModule(allocator, &mod_stack);
+    defer allocator.free(wasm_stack);
+    const opt_stack = try optimize(allocator, wasm_stack, .{ .optimize_mode = .fast });
+    defer allocator.free(opt_stack);
+    var mod_stack_opt = try reader.readModule(allocator, opt_stack);
+    defer mod_stack_opt.deinit();
+
+    try testing.expectEqual(@as(usize, 1), mod_stack_opt.funcs.items.len);
+    try testing.expectEqualSlices(
+        u8,
+        &[_]u8{
+            0x02, 0x7f, // block (result i32)
+            0x41, 0x01, // i32.const 1
+            0x20, 0x00, // local.get 0
+            0x0c, 0x00, // br 0
+            0x0b, // end block
+            0x0b, // end func
+        },
+        mod_stack_opt.funcs.items[0].code_bytes,
+    );
+}
+
+test "Optimizer: multi-caller forwarder to single-use medium leaf and large constant preservation in .small mode" {
+    const allocator = testing.allocator;
+
+    // 1. Multi-caller forwarder F -> 10-op single-use leaf L in .small mode:
+    //    F is called twice, L is called once (by F). Resolving F -> L must NOT inline L twice in .small mode.
+    var mod = Mod.Module.init(allocator);
+    defer mod.deinit();
+
+    try mod.module_types.append(allocator, .{ .func_type = .{
+        .params = &.{},
+        .results = try allocator.dupe(types.ValType, &.{.i32}),
+    } });
+    try mod.type_meta.append(allocator, .{});
+
+    try mod.globals.append(allocator, .{
+        .type = .{ .val_type = .i32, .mutability = .mutable },
+        .init_expr_bytes = &[_]u8{ 0x41, 0x00 },
+    });
+
+    // func 0 (L): 9-op leaf reading global 0 (cannot be constant-folded, > 6 ops)
+    const leaf_code = [_]u8{
+        0x23, 0x00, // 1: global.get 0
+        0x41, 0x03, // 2: i32.const 3
+        0x73, // 3: i32.xor
+        0x23, 0x00, // 4: global.get 0
+        0x6a, // 5: i32.add
+        0x23, 0x00, // 6: global.get 0
+        0x73, // 7: i32.xor
+        0x23, 0x00, // 8: global.get 0
+        0x6a, // 9: i32.add
+        0x0f, // return
+        0x0b, // end
+    };
+    // func 1 (F): forwarder `call 0; return; end`
+    const fwd_code = [_]u8{ 0x10, 0x00, 0x0f, 0x0b };
+    // func 2 (exported caller): calls F twice (`call 1; call 1; i32.add; end`)
+    const caller_code = [_]u8{ 0x10, 0x01, 0x10, 0x01, 0x6a, 0x0b };
+
+    try mod.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &leaf_code });
+    try mod.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &fwd_code });
+    try mod.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &caller_code });
+    try mod.exports.append(allocator, .{ .name = "main", .kind = .func, .var_ = .{ .index = 2 } });
+
+    const wasm = try writer.writeModule(allocator, &mod);
+    defer allocator.free(wasm);
+
+    const opt_small = try optimize(allocator, wasm, .{ .optimize_mode = .small });
+    defer allocator.free(opt_small);
+    var mod_small = try reader.readModule(allocator, opt_small);
+    defer mod_small.deinit();
+
+    // Forwarder F (func 1) was bypassed and pruned, but L (func 0) was NOT inlined twice in .small mode!
+    try testing.expectEqual(@as(usize, 2), mod_small.funcs.items.len);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x10, 0x00, 0x10, 0x00, 0x6a, 0x0b }, mod_small.funcs.items[1].code_bytes);
+
+    // 2. Large constant local read 3 times is kept in a local in .small mode, but propagated in .fast mode:
+    const large_const_code = [_]u8{
+        0x41, 0x80, 0x80, 0x04, // i32.const 65536 (4 bytes)
+        0x21, 0x00, // local.set 0
+        0x20, 0x00, // local.get 0
+        0x20, 0x00, // local.get 0
+        0x20, 0x00, // local.get 0
+        0x6c, // i32.mul
+        0x6a, // i32.add
+        0x0b, // end
+    };
+    const wasm_lc = try buildSingleFuncModule(allocator, &.{}, &.{.i32}, &.{.i32}, &large_const_code);
+    defer allocator.free(wasm_lc);
+
+    const opt_lc_small = try optimize(allocator, wasm_lc, .{ .optimize_mode = .small });
+    defer allocator.free(opt_lc_small);
+    var mod_lc_small = try reader.readModule(allocator, opt_lc_small);
+    defer mod_lc_small.deinit();
+    // In .small mode, local 0 is kept (`local.tee 0; local.get 0; local.get 0; i32.mul; i32.add`).
+    try testing.expectEqual(@as(usize, 1), mod_lc_small.funcs.items[0].local_types.items.len);
+
+    const opt_lc_fast = try optimize(allocator, wasm_lc, .{ .optimize_mode = .fast });
+    defer allocator.free(opt_lc_fast);
+    var mod_lc_fast = try reader.readModule(allocator, opt_lc_fast);
+    defer mod_lc_fast.deinit();
+    // In .fast mode, local 0 is propagated, constant-folded, and compacted away!
+    try testing.expectEqual(@as(usize, 0), mod_lc_fast.funcs.items[0].local_types.items.len);
+}
+
+test "Optimizer: stage2_wasm assert inner-block and Rect.x shadow-stack copy inlining in .small mode" {
+    const allocator = testing.allocator;
+
+    var mod = Mod.Module.init(allocator);
+    defer mod.deinit();
+
+    try mod.memories.append(allocator, .{
+        .type = .{ .limits = .{ .initial = 1 } },
+    });
+    try mod.globals.append(allocator, .{
+        .type = .{ .val_type = .i32, .mutability = .mutable },
+        .init_expr_bytes = &[_]u8{ 0x41, 0x00 },
+    });
+
+    // Type 0: (param i32) -> ()  (std.debug.assert)
+    try mod.module_types.append(allocator, .{ .func_type = .{
+        .params = try allocator.dupe(types.ValType, &.{.i32}),
+        .results = &.{},
+    } });
+    try mod.type_meta.append(allocator, .{});
+
+    // Type 1: (param i32) -> (result f32)  (Rect.y)
+    try mod.module_types.append(allocator, .{ .func_type = .{
+        .params = try allocator.dupe(types.ValType, &.{.i32}),
+        .results = try allocator.dupe(types.ValType, &.{.f32}),
+    } });
+    try mod.type_meta.append(allocator, .{});
+
+    // func 0: stage2_wasm lowering of `std.debug.assert(ok: bool)`:
+    //   (local i32)
+    //   block (0x40)
+    //     local.get 0; i32.eqz; local.set 1;
+    //     block (0x40)
+    //       local.get 1; br_if 0; br 1
+    //     end
+    //     unreachable
+    //   end
+    //   return; end
+    const stage2_assert_code = [_]u8{
+        0x02, 0x40, // block (empty)
+        0x20, 0x00, // local.get 0
+        0x45, // i32.eqz
+        0x21, 0x01, // local.set 1
+        0x02, 0x40, // block (empty)
+        0x20, 0x01, // local.get 1
+        0x0d, 0x00, // br_if 0
+        0x0c, 0x01, // br 1
+        0x0b, // end inner block
+        0x00, // unreachable
+        0x0b, // end outer block
+        0x0f, // return
+        0x0b, // end
+    };
+
+    // func 1: stage2_wasm lowering of `Rect.y(self: Rect) f32` with 16-byte shadow-stack copy:
+    //   (local i32)
+    //   global.get 0; i32.const 16; i32.sub; local.tee 1;
+    //   local.get 0; i32.const 16; memory.copy 0 0;
+    //   local.get 1; f32.load align=2 offset=4; return; end
+    const stage2_rect_y_code = [_]u8{
+        0x23, 0x00, // global.get 0
+        0x41, 16, // i32.const 16
+        0x6b, // i32.sub
+        0x22, 0x01, // local.tee 1
+        0x20, 0x00, // local.get 0
+        0x41, 16, // i32.const 16
+        0xfc, 0x0a, 0x00, 0x00, // memory.copy 0 0
+        0x20, 0x01, // local.get 1
+        0x2a, 0x02, 0x04, // f32.load align=2 offset=4
+        0x0f, // return
+        0x0b, // end
+    };
+
+    // func 2 (exported caller):
+    //   local.get 0; i32.const 0; i32.ne; call $assert;
+    //   local.get 0; call $rect_y; end
+    const caller_code = [_]u8{
+        0x20, 0x00, // local.get 0
+        0x41, 0x00, // i32.const 0
+        0x47, // i32.ne
+        0x10, 0x00, // call $assert
+        0x20, 0x00, // local.get 0
+        0x10, 0x01, // call $rect_y
+        0x0b, // end
+    };
+
+    var f0 = Mod.Func{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &stage2_assert_code };
+    try f0.local_types.append(allocator, .i32);
+    try mod.funcs.append(allocator, f0);
+
+    var f1 = Mod.Func{ .decl = .{ .type_var = .{ .index = 1 } }, .code_bytes = &stage2_rect_y_code };
+    try f1.local_types.append(allocator, .i32);
+    try mod.funcs.append(allocator, f1);
+
+    try mod.funcs.append(allocator, .{ .decl = .{ .type_var = .{ .index = 1 } }, .code_bytes = &caller_code });
+    try mod.exports.append(allocator, .{ .name = "get_y", .kind = .func, .var_ = .{ .index = 2 } });
+
+    const wasm = try writer.writeModule(allocator, &mod);
+    defer allocator.free(wasm);
+
+    const opt_small = try optimize(allocator, wasm, .{ .optimize_mode = .small });
+    defer allocator.free(opt_small);
+
+    var opt_mod = try reader.readModule(allocator, opt_small);
+    defer opt_mod.deinit();
+
+    // Both `std.debug.assert` and `Rect.y` were simplified to 0-local prefix_params=1 leaves,
+    // inlined into `get_y` in .small mode, and pruned!
+    try testing.expectEqual(@as(usize, 1), opt_mod.funcs.items.len);
+    try testing.expectEqual(@as(usize, 0), opt_mod.funcs.items[0].local_types.items.len);
+    try testing.expectEqualSlices(
+        u8,
+        &[_]u8{
+            0x20, 0x00, // local.get 0
+            0x45, // i32.eqz (folded from `i32.const 0; i32.ne; i32.eqz`)
+            0x04, 0x40, // if (empty)
+            0x00, // unreachable
+            0x0b, // end
+            0x20, 0x00, // local.get 0
+            0x2a, 0x02, 0x04, // f32.load align=2 offset=4
+            0x0b, // end
+        },
+        opt_mod.funcs.items[0].code_bytes,
+    );
+
+    // 2. `eliminateLeafStackCopy` must NOT strip the prologue if the tail contains a 0xfd SIMD store (`v128.store`):
+    var mod_simd = Mod.Module.init(allocator);
+    defer mod_simd.deinit();
+    try mod_simd.memories.append(allocator, .{ .type = .{ .limits = .{ .initial = 1 } } });
+    try mod_simd.globals.append(allocator, .{
+        .type = .{ .val_type = .i32, .mutability = .mutable },
+        .init_expr_bytes = &[_]u8{ 0x41, 0x00 },
+    });
+    try mod_simd.module_types.append(allocator, .{ .func_type = .{
+        .params = try allocator.dupe(types.ValType, &.{ .i32, .v128 }),
+        .results = try allocator.dupe(types.ValType, &.{.f32}),
+    } });
+    try mod_simd.type_meta.append(allocator, .{});
+
+    const simd_store_code = [_]u8{
+        0x23, 0x00, // global.get 0
+        0x41, 16, // i32.const 16
+        0x6b, // i32.sub
+        0x22, 0x02, // local.tee 2
+        0x20, 0x00, // local.get 0
+        0x41, 16, // i32.const 16
+        0xfc, 0x0a, 0x00, 0x00, // memory.copy 0 0
+        0x20, 0x00, // local.get 0
+        0x20, 0x01, // local.get 1 (v128)
+        0xfd, 0x0b, 0x04, 0x00, // v128.store align=4 offset=0
+        0x20, 0x02, // local.get 2
+        0x2a, 0x02, 0x00, // f32.load align=2 offset=0
+        0x0b, // end
+    };
+    var f_simd = Mod.Func{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &simd_store_code };
+    try f_simd.local_types.append(allocator, .i32);
+    try mod_simd.funcs.append(allocator, f_simd);
+    try mod_simd.exports.append(allocator, .{ .name = "simd_fn", .kind = .func, .var_ = .{ .index = 0 } });
+
+    const wasm_simd = try writer.writeModule(allocator, &mod_simd);
+    defer allocator.free(wasm_simd);
+    const opt_simd = try optimize(allocator, wasm_simd, .{ .optimize_mode = .small });
+    defer allocator.free(opt_simd);
+    var mod_simd_opt = try reader.readModule(allocator, opt_simd);
+    defer mod_simd_opt.deinit();
+    // Prologue and scratch local 2 are preserved because of `v128.store`!
+    try testing.expectEqual(@as(usize, 1), mod_simd_opt.funcs.items[0].local_types.items.len);
+    try testing.expectEqualSlices(u8, &simd_store_code, mod_simd_opt.funcs.items[0].code_bytes);
+
+    // 3. `rewriteNameSectionPayload` on the `all_live` path (no dead functions removed) prunes
+    //    stale subsection 2 (local names) when `compactLocals` removes an unused local:
+    var mod_names = Mod.Module.init(allocator);
+    defer mod_names.deinit();
+    try mod_names.module_types.append(allocator, .{ .func_type = .{
+        .params = try allocator.dupe(types.ValType, &.{.i32}),
+        .results = try allocator.dupe(types.ValType, &.{.i32}),
+    } });
+    try mod_names.type_meta.append(allocator, .{});
+
+    // Exported function 0 has 1 unused non-parameter local (local 1: i32) that `compactLocals` removes.
+    const unused_local_code = [_]u8{ 0x20, 0x00, 0x0b };
+    var f_names = Mod.Func{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &unused_local_code };
+    try f_names.local_types.append(allocator, .i32);
+    try mod_names.funcs.append(allocator, f_names);
+    try mod_names.exports.append(allocator, .{ .name = "id", .kind = .func, .var_ = .{ .index = 0 } });
+
+    // Name section with subsec 1 (func 0 -> "id") and subsec 2 (func 0 -> { local 0 -> "x", local 1 -> "unused" })
+    const name_sec = [_]u8{
+        1, 5, 1, 0, 2, 'i', 'd', // subsec 1: 1 entry (func 0 -> "id")
+        2, 14, 1, 0, 2, 0, 1, 'x', 1, 6, 'u', 'n', 'u', 's', 'e', 'd', // subsec 2: 1 func (0) with 2 local names
+    };
+    try mod_names.customs.append(allocator, .{ .name = "name", .data = &name_sec });
+
+    const wasm_names = try writer.writeModule(allocator, &mod_names);
+    defer allocator.free(wasm_names);
+    const opt_names = try optimize(allocator, wasm_names, .{ .custom_sections = .preserve, .optimize_mode = .small });
+    defer allocator.free(opt_names);
+    var mod_names_opt = try reader.readModule(allocator, opt_names);
+    defer mod_names_opt.deinit();
+
+    try testing.expectEqual(@as(usize, 0), mod_names_opt.funcs.items[0].local_types.items.len);
+    try testing.expectEqual(@as(usize, 1), mod_names_opt.customs.items.len);
+    // Subsec 1 (func names) is preserved, while stale subsec 2 (local names for compacted func 0) is dropped!
+    try testing.expectEqualSlices(u8, &[_]u8{ 1, 5, 1, 0, 2, 'i', 'd' }, mod_names_opt.customs.items[0].data);
+}
+
+
+

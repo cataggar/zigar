@@ -40,6 +40,10 @@ pub fn build(b: *std.Build) void {
     gen_wasi_cmd.addArgs(&.{ "--wasi", "wasi:cli/imports@0.3.0", "-o" });
     const generated_wasi_cli = gen_wasi_cmd.addOutputFileArg("generated_wasi_cli.zig");
 
+    const gen_wasi_026_cmd = b.addRunArtifact(exe);
+    gen_wasi_026_cmd.addArgs(&.{ "--wasi", "wasi:cli@0.2.6", "-o" });
+    const generated_wasi_cli_026 = gen_wasi_026_cmd.addOutputFileArg("generated_wasi_cli_026.zig");
+
     const gen_sample_cmd = b.addRunArtifact(exe);
     gen_sample_cmd.addFileArg(b.path("test/fixtures/sample.wit"));
     gen_sample_cmd.addArg("-o");
@@ -53,6 +57,9 @@ pub fn build(b: *std.Build) void {
     gen_test_mod.addImport("wit_zigar", mod);
     gen_test_mod.addAnonymousImport("generated_wasi_cli", .{
         .root_source_file = generated_wasi_cli,
+    });
+    gen_test_mod.addAnonymousImport("generated_wasi_cli_026", .{
+        .root_source_file = generated_wasi_cli_026,
     });
     gen_test_mod.addAnonymousImport("generated_sample", .{
         .root_source_file = generated_sample,

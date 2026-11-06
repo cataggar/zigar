@@ -123,6 +123,13 @@ pub const ExprType = enum {
     unary,
     @"unreachable",
     v128_const,
+    cont_new,
+    cont_bind,
+    @"suspend",
+    @"resume",
+    resume_throw,
+    resume_throw_ref,
+    @"switch",
 };
 
 // ── FuncSignature ────────────────────────────────────────────────────────
@@ -159,11 +166,12 @@ pub const FuncSignature = struct {
 
 // ── TypeEntry ────────────────────────────────────────────────────────────
 
-/// Type section entry: function, struct, or array type (GC proposal).
+/// Type section entry: function, struct, array, or continuation type.
 pub const TypeEntry = union(enum) {
     func_type: FuncSignature,
     struct_type: StructType,
     array_type: ArrayType,
+    cont_type: ContType,
 
     pub const StructType = struct {
         fields: std.ArrayList(Field),
@@ -178,6 +186,10 @@ pub const TypeEntry = union(enum) {
 
     pub const ArrayType = struct {
         field: StructType.Field,
+    };
+
+    pub const ContType = struct {
+        func_type_idx: u32,
     };
 };
 
@@ -354,7 +366,7 @@ pub const TypeMeta = struct {
     type_refs: []const u32 = &.{},
     /// Canonical rec group ID — types in iso-recursively equivalent rec groups share this.
     canonical_group: u32 = std.math.maxInt(u32),
-    pub const Kind = enum { func, struct_, array };
+    pub const Kind = enum { func, struct_, array, cont };
 };
 
 // ── Module ───────────────────────────────────────────────────────────────
@@ -570,7 +582,7 @@ test "Const" {
 }
 
 test "ExprType count" {
-    try std.testing.expectEqual(@as(usize, 71), std.enums.values(ExprType).len);
+    try std.testing.expectEqual(@as(usize, 78), std.enums.values(ExprType).len);
 }
 
 test "Module getExport" {
