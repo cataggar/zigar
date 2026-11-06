@@ -182,6 +182,31 @@ describe('WASM decoding', function() {
       expect(nameSection).to.not.be.undefined;
       expect(nameSection).to.have.property('name', 'name');
     })
+    it('should preserve zigar:abi and component-type custom sections while stripping others', async function() {
+      const path = absolute(`./wasm-samples/simple-with-names.wasm`);
+      const content = await readFile(path);
+      const binary = new DataView(content.buffer);
+      const origModule = parseBinary(binary);
+      const origCodeSection = origModule.sections.find(s => s.type === SectionType.Code);
+      const abiPayload = new Uint8Array([ 1, 2, 3, 4 ]);
+      const witPayload = new Uint8Array([ 5, 6, 7, 8 ]);
+      const otherPayload = new Uint8Array([ 9, 10 ]);
+      origModule.sections.push(
+        { type: SectionType.Custom, name: 'zigar:abi', data: new DataView(abiPayload.buffer) },
+        { type: SectionType.Custom, name: 'component-type:test-world', data: new DataView(witPayload.buffer) },
+        { type: SectionType.Custom, name: 'producers', data: new DataView(otherPayload.buffer) },
+      );
+      const inputBinary = repackBinary({ sections: origModule.sections, size: origModule.size + 256 });
+      const newBinary = stripUnused(inputBinary);
+      expect(newBinary.byteLength).to.be.below(inputBinary.byteLength);
+      const strippedModule = parseBinary(newBinary);
+      const strippedCodeSection = strippedModule.sections.find(s => s.type === SectionType.Code);
+      expect(strippedCodeSection.functions.length).to.be.below(origCodeSection.functions.length);
+      const customSections = strippedModule.sections.filter(s => s.type === SectionType.Custom);
+      expect(customSections.map(s => s.name)).to.eql([ 'zigar:abi', 'component-type:test-world' ]);
+      expect([ ...new Uint8Array(customSections[0].data.buffer, customSections[0].data.byteOffset, customSections[0].data.byteLength) ]).to.eql([ 1, 2, 3, 4 ]);
+      expect([ ...new Uint8Array(customSections[1].data.buffer, customSections[1].data.byteOffset, customSections[1].data.byteLength) ]).to.eql([ 5, 6, 7, 8 ]);
+    })
     it('should ensure __stack_pointer global[0] is exported for stack switching', async function() {
       const path = absolute(`../../zigar-runtime/test/features/wasm-samples/read-file.wasm`);
       const content = await readFile(path);

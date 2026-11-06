@@ -773,6 +773,17 @@ pub const ReallocFn = *const fn (
 
 pub const PostReturnFn = *const fn (ctx: ?*anyopaque, ret_val: usize) void;
 
+pub const AwaitSubtaskFn = *const fn (
+    ctx: ?*anyopaque,
+    mem_ctx: *MemoryContext,
+    packed_status: i32,
+) Error!void;
+
+pub const PollTaskFn = *const fn (
+    ctx: ?*anyopaque,
+    mem_ctx: *MemoryContext,
+) Error!void;
+
 pub const MemoryContext = struct {
     memory: []u8,
     base_addr: usize = 0,
@@ -782,6 +793,10 @@ pub const MemoryContext = struct {
     post_return_fn: ?PostReturnFn = null,
     task_return_ctx: ?*anyopaque = null,
     task_return_fn: ?PostReturnFn = null,
+    await_subtask_ctx: ?*anyopaque = null,
+    await_subtask_fn: ?AwaitSubtaskFn = null,
+    poll_task_ctx: ?*anyopaque = null,
+    poll_task_fn: ?PollTaskFn = null,
     allocator: ?std.mem.Allocator = null,
     zero_copy_slices: bool = true,
     validate_utf8: bool = true,
@@ -1267,6 +1282,59 @@ pub fn storeToMemory(comptime T: type, comptime arch: Arch, ctx: MemoryContext, 
     }
 }
 
+/// Load fields of a non-packed, non-wrapper struct `T` directly into `out.*`
+/// without unwrapping nested large struct error unions by value (which can
+/// exhaust GP registers on `.stage2_aarch64`).
+pub fn loadStructFieldsFromMemory(comptime T: type, comptime arch: Arch, ctx: MemoryContext, addr: usize, out: *T) Error!void {
+    const layout = comptime layoutOf(T, arch);
+    _ = try ctx.addrToOffset(addr, layout.size);
+    if (comptime layout.alignment > 1) {
+        if ((layout.size > 0 or addr != 0) and (addr % layout.alignment != 0)) {
+            return error.UnalignedPointer;
+        }
+    }
+    const st = @typeInfo(T).@"struct";
+    inline for (st.field_names, 0..) |fname, i| {
+        if (comptime st.field_attrs[i].@"comptime") continue;
+        const FT = st.field_types[i];
+        const f_off = comptime fieldOffset(T, arch, i);
+        if (comptime @typeInfo(FT) == .error_set) {
+            loadErrorSetFromMemory(FT, arch, ctx, addr + f_off, &@field(out.*, fname)) catch |err| {
+                inline for (0..i) |prev_i| {
+                    if (comptime !st.field_attrs[prev_i].@"comptime") {
+                        freeLoadedSlices(st.field_types[prev_i], ctx, @field(out.*, st.field_names[prev_i]));
+                    }
+                }
+                return err;
+            };
+        } else if (comptime @typeInfo(FT) == .@"struct" and
+            !isHandleType(FT) and
+            !isStringWrapper(FT) and
+            @typeInfo(FT).@"struct".layout != .@"packed" and
+            !(@hasDecl(FT, "wit_flags_count") and @hasField(FT, "words")) and
+            !(layoutOf(FT, arch).is_blittable and @sizeOf(FT) == layoutOf(FT, arch).size and !needsFlagsWordMasking(FT)))
+        {
+            loadStructFieldsFromMemory(FT, arch, ctx, addr + f_off, &@field(out.*, fname)) catch |err| {
+                inline for (0..i) |prev_i| {
+                    if (comptime !st.field_attrs[prev_i].@"comptime") {
+                        freeLoadedSlices(st.field_types[prev_i], ctx, @field(out.*, st.field_names[prev_i]));
+                    }
+                }
+                return err;
+            };
+        } else {
+            @field(out.*, fname) = loadFromMemory(FT, arch, ctx, addr + f_off) catch |err| {
+                inline for (0..i) |prev_i| {
+                    if (comptime !st.field_attrs[prev_i].@"comptime") {
+                        freeLoadedSlices(st.field_types[prev_i], ctx, @field(out.*, st.field_names[prev_i]));
+                    }
+                }
+                return err;
+            };
+        }
+    }
+}
+
 /// Load a Zig value of type `T` from `ctx.memory[addr..]` according to the
 /// Canonical ABI layout for `arch`.
 pub fn loadFromMemory(comptime T: type, comptime arch: Arch, ctx: MemoryContext, addr: usize) CanonResult(T) {
@@ -1390,30 +1458,7 @@ pub fn loadFromMemory(comptime T: type, comptime arch: Arch, ctx: MemoryContext,
                 return out;
             }
             var out: T = undefined;
-            inline for (st.field_names, 0..) |fname, i| {
-                if (comptime st.field_attrs[i].@"comptime") continue;
-                const FT = st.field_types[i];
-                const f_off = comptime fieldOffset(T, arch, i);
-                if (comptime @typeInfo(FT) == .error_set) {
-                    loadErrorSetFromMemory(FT, arch, ctx, addr + f_off, &@field(out, fname)) catch |err| {
-                        inline for (0..i) |prev_i| {
-                            if (comptime !st.field_attrs[prev_i].@"comptime") {
-                                freeLoadedSlices(st.field_types[prev_i], ctx, @field(out, st.field_names[prev_i]));
-                            }
-                        }
-                        return err;
-                    };
-                } else {
-                    @field(out, fname) = loadFromMemory(FT, arch, ctx, addr + f_off) catch |err| {
-                        inline for (0..i) |prev_i| {
-                            if (comptime !st.field_attrs[prev_i].@"comptime") {
-                                freeLoadedSlices(st.field_types[prev_i], ctx, @field(out, st.field_names[prev_i]));
-                            }
-                        }
-                        return err;
-                    };
-                }
-            }
+            try loadStructFieldsFromMemory(T, arch, ctx, addr, &out);
             return out;
         },
         .optional => |op| {
@@ -1537,7 +1582,7 @@ pub fn uncoerceFromJoinedSlot(
 }
 
 /// Lower a Zig value `val` of type `T` into its flat register tuple for `arch`.
-pub fn lowerToFlat(comptime T: type, comptime arch: Arch, ctx: MemoryContext, val: T) Error!FlatTuple(T, arch) {
+pub inline fn lowerToFlat(comptime T: type, comptime arch: Arch, ctx: MemoryContext, val: T) Error!FlatTuple(T, arch) {
     const layout = comptime layoutOf(T, arch);
 
     if (T == void) return .{};
@@ -1653,15 +1698,17 @@ pub fn lowerToFlat(comptime T: type, comptime arch: Arch, ctx: MemoryContext, va
             break :blk out;
         },
         .@"union" => |un| blk: {
+            var runtime_val: T = val;
+            _ = &runtime_val;
             var out: FlatTuple(T, arch) = undefined;
-            const active_tag = std.meta.activeTag(val);
+            const active_tag = std.meta.activeTag(runtime_val);
             inline for (un.field_names, 0..) |fname, case_idx| {
                 const tag_val = @field(un.tag_type.?, fname);
                 if (active_tag == tag_val) {
                     out[0] = @intCast(case_idx);
                     const CaseT = un.field_types[case_idx];
                     const cl = comptime layoutOf(CaseT, arch);
-                    const sub = try lowerToFlat(CaseT, arch, ctx, @field(val, fname));
+                    const sub = try lowerToFlat(CaseT, arch, ctx, @field(runtime_val, fname));
                     inline for (0..cl.flat_count) |j| {
                         out[1 + j] = coerceToJoinedSlot(cl.flat_types[j], layout.flat_types[1 + j], sub[j]);
                     }
@@ -1704,7 +1751,7 @@ pub fn lowerToFlat(comptime T: type, comptime arch: Arch, ctx: MemoryContext, va
 }
 
 /// Lift a Zig value of type `T` from its flat register tuple `flat` for `arch`.
-pub fn liftFromFlat(comptime T: type, comptime arch: Arch, ctx: MemoryContext, flat: FlatTuple(T, arch)) CanonResult(T) {
+pub inline fn liftFromFlat(comptime T: type, comptime arch: Arch, ctx: MemoryContext, flat: FlatTuple(T, arch)) CanonResult(T) {
     const layout = comptime layoutOf(T, arch);
 
     if (T == void) return {};
@@ -2094,7 +2141,7 @@ pub fn getLastAsyncTaskReturnPtr() ?usize {
 ///     pointing to the guest's return area; loads the result from
 ///     `ctx.memory[ret_ptr]` and invokes `ctx.post_return_fn` with `ret_ptr`
 ///     if non-null.
-pub fn lowerCall(
+pub inline fn lowerCall(
     comptime FnType: type,
     comptime opts: CallOptions,
     in_ctx: MemoryContext,
@@ -2134,6 +2181,31 @@ pub fn lowerCall(
         core_args[ret_param_idx] = @bitCast(@as(AddrT, @intCast(ret_ptr)));
     }
 
+    const TaskReturnCapture = struct {
+        orig_ctx: ?*anyopaque = null,
+        orig_fn: ?PostReturnFn = null,
+        called: bool = false,
+        ret_ptr: usize = 0,
+
+        fn callback(raw_self: ?*anyopaque, ret_val: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw_self.?));
+            self.called = true;
+            self.ret_ptr = ret_val;
+            last_async_task_return_ptr = ret_val;
+            if (self.orig_fn) |f| {
+                f(self.orig_ctx, ret_val);
+            }
+        }
+    };
+    var task_ret_capture = TaskReturnCapture{
+        .orig_ctx = ctx.task_return_ctx,
+        .orig_fn = ctx.task_return_fn,
+    };
+    if (comptime opts.direction == .lift and opts.is_async) {
+        ctx.task_return_ctx = &task_ret_capture;
+        ctx.task_return_fn = &TaskReturnCapture.callback;
+    }
+
     const prev_ctx = active_memory_ctx;
     active_memory_ctx = ctx;
     defer active_memory_ctx = prev_ctx;
@@ -2149,12 +2221,40 @@ pub fn lowerCall(
         const ustatus: u32 = @bitCast(raw_ret);
         const state: u4 = @truncate(ustatus & 0xf);
         // WASI P3 SubtaskState.returned == 2
-        if (state != 2) return error.AsyncCallPending;
+        if (state != 2) {
+            if (ctx.await_subtask_fn) |a_fn| {
+                try a_fn(ctx.await_subtask_ctx, &ctx, raw_ret);
+                active_memory_ctx = ctx;
+            } else {
+                return error.AsyncCallPending;
+            }
+        } else if ((ustatus >> 4) != 0) {
+            if (ctx.await_subtask_fn) |a_fn| {
+                try a_fn(ctx.await_subtask_ctx, &ctx, raw_ret);
+                active_memory_ctx = ctx;
+            }
+        }
     }
 
     if (comptime opts.direction == .lift and opts.is_async) {
+        if (!task_ret_capture.called and last_async_task_return_ptr == null) {
+            if (ctx.poll_task_fn) |p_fn| {
+                var poll_iters: usize = 0;
+                while (!task_ret_capture.called and last_async_task_return_ptr == null) : (poll_iters += 1) {
+                    if (poll_iters >= 100_000) return error.AsyncTaskDidNotReturn;
+                    try p_fn(ctx.poll_task_ctx, &ctx);
+                    active_memory_ctx = ctx;
+                }
+            }
+        }
+        if (!task_ret_capture.called and last_async_task_return_ptr == null) {
+            return error.AsyncTaskDidNotReturn;
+        }
         if (comptime RetT == void) return {};
-        const delivered_ptr = last_async_task_return_ptr orelse return error.AsyncTaskDidNotReturn;
+        const delivered_ptr = if (task_ret_capture.called)
+            task_ret_capture.ret_ptr
+        else
+            (last_async_task_return_ptr orelse return error.AsyncTaskDidNotReturn);
         if (last_async_task_return_in_static_buf) {
             var tmp_ctx = ctx;
             tmp_ctx.memory = &async_task_return_buf;
@@ -2195,7 +2295,7 @@ pub fn lowerCall(
 }
 
 /// Convenience helper to invoke a lifted guest export (`direction = .lift`).
-pub fn callLifted(
+pub inline fn callLifted(
     comptime FnType: type,
     comptime opts: CallOptions,
     ctx: MemoryContext,
@@ -2220,7 +2320,7 @@ pub fn callLifted(
 /// from `core_args` (or from the spilled parameter pointer in `ctx.memory`),
 /// calls `handler`, and lowers the result to the flat return register,
 /// indirect `retptr` parameter (`.lower`), or returned return-area pointer (`.lift`).
-pub fn liftCall(
+pub inline fn liftCall(
     comptime FnType: type,
     comptime opts: CallOptions,
     in_ctx: MemoryContext,
@@ -2236,17 +2336,18 @@ pub fn liftCall(
     const RetT = ReturnType(FnType);
     const AddrT = AddrInt(opts.arch);
 
-    const zig_args: ArgsT = if (comptime !cls.params_spill) blk: {
+    var zig_args: ArgsT = undefined;
+    if (comptime !cls.params_spill) {
         var flat_args: FlatTuple(ArgsT, opts.arch) = undefined;
         inline for (0..cls.params_flat) |i| {
             flat_args[i] = core_args[i];
         }
-        break :blk try liftFromFlat(ArgsT, opts.arch, ctx, flat_args);
-    } else blk: {
+        zig_args = try liftFromFlat(ArgsT, opts.arch, ctx, flat_args);
+    } else {
         const raw_ptr: AddrT = @bitCast(core_args[0]);
         const params_ptr: usize = std.math.cast(usize, raw_ptr) orelse return error.OutOfBounds;
-        break :blk try loadFromMemory(ArgsT, opts.arch, ctx, params_ptr);
-    };
+        try loadStructFieldsFromMemory(ArgsT, opts.arch, ctx, params_ptr, &zig_args);
+    }
 
     const zig_ret: RetT = @call(.auto, handler, zig_args);
 
@@ -2273,6 +2374,12 @@ pub fn liftCall(
                 }
             } else {
                 return error.MissingRealloc;
+            }
+        } else {
+            last_async_task_return_ptr = 0;
+            last_async_task_return_in_static_buf = false;
+            if (ctx.task_return_fn) |tr_fn| {
+                tr_fn(ctx.task_return_ctx orelse ctx.realloc_ctx, 0);
             }
         }
         return;
@@ -2323,8 +2430,8 @@ pub fn createLiftThunk(
         var fallback_buf: [4096]u8 align(16) = @splat(0);
 
         inline fn callTuple(core_args: CoreParams) CoreRet {
-            if (active_memory_ctx) |ctx| {
-                return liftCall(FnType, opts, ctx, handler, core_args) catch @panic("Canonical ABI liftCall trap");
+            if (active_memory_ctx) |*ctx| {
+                return liftCall(FnType, opts, ctx.*, handler, core_args) catch @panic("Canonical ABI liftCall trap");
             }
             if (comptime builtin.cpu.arch.isWasm()) {
                 const wasm_bytes = @as(usize, @wasmMemorySize(0)) * 65536;
@@ -2440,6 +2547,8 @@ fn normalizeCallOptions(comptime opts_or_mem64: anytype) CallOptions {
         var resolved: CallOptions = .{};
         if (@hasField(T, "arch")) resolved.arch = opts_or_mem64.arch;
         if (@hasField(T, "is_async")) resolved.is_async = opts_or_mem64.is_async;
+        if (@hasField(T, "direction")) resolved.direction = opts_or_mem64.direction;
+        if (@hasField(T, "string_encoding_utf8")) resolved.string_encoding_utf8 = opts_or_mem64.string_encoding_utf8;
         if (@hasField(T, "is_memory64")) resolved.arch = if (opts_or_mem64.is_memory64) .wasm64 else .wasm32;
         return resolved;
     }
@@ -2458,7 +2567,7 @@ pub fn CanonLower(comptime FnType: type, comptime opts_or_mem64: anytype) type {
         pub const ZigReturn = Sig.ZigReturn;
         pub const abi_hash: u64 = fast_abi.comptimeAbiHash(FnType, is_memory64);
 
-        pub fn call(
+        pub inline fn call(
             ctx_or_ptr: anytype,
             core_fn: CoreFnPtr,
             args: ArgsTuple,
@@ -2475,7 +2584,7 @@ pub fn CanonLower(comptime FnType: type, comptime opts_or_mem64: anytype) type {
         /// the standard Component Model Canonical ABI (`Self.call`). Also falls
         /// back to `Self.call` if a fast-path store-phase capacity error occurs
         /// before `fast_core_fn` is invoked.
-        pub fn callAuto(
+        pub inline fn callAuto(
             mem_ctx: *MemoryContext,
             guest_abi: anytype,
             interface_name: []const u8,
@@ -2520,7 +2629,7 @@ pub fn CanonLift(comptime FnType: type, comptime opts_or_mem64: anytype) type {
         pub const ArgsTuple = Sig.ZigArgs;
         pub const ReturnType = Sig.ZigReturn;
 
-        pub fn call(
+        pub inline fn call(
             ctx_or_ptr: anytype,
             handler: *const FnType,
             core_args: Sig.CoreParams,
@@ -3490,5 +3599,132 @@ test "CanonLower.callAuto: fast-path dispatch (0 reallocs) and transparent Canon
     try testing.expect(counting.realloc_count > 0);
 }
 
+test "canon async lowerCall await_subtask_fn and callLifted poll_task_fn" {
+    var mem: [4096]u8 align(16) = @splat(0);
+    var bump = BumpAllocator.init(64, mem.len);
 
+    // 1. Async lowerCall with pending subtask resolved via ctx.await_subtask_fn
+    const PendingSubtaskEnv = struct {
+        saved_arg: u32 = 0,
+        saved_ret_ptr: usize = 0,
+        awaited_status: i32 = 0,
+        await_calls: usize = 0,
 
+        var current: ?*@This() = null;
+
+        fn coreImport(x: i32, ret_ptr: i32) i32 {
+            const env = current.?;
+            env.saved_arg = @bitCast(x);
+            env.saved_ret_ptr = @intCast(@as(u32, @bitCast(ret_ptr)));
+            // Return SubtaskState.started (1) with subtask handle 7: 1 | (7 << 4)
+            return @as(i32, 1 | (7 << 4));
+        }
+
+        fn coreImmediateWithHandle(x: i32, ret_ptr: i32) i32 {
+            const env = current.?;
+            const mctx = getActiveMemoryContext().?;
+            const ptr: usize = @intCast(@as(u32, @bitCast(ret_ptr)));
+            const val: u32 = @as(u32, @bitCast(x)) + 100;
+            storeToMemory(u32, .wasm32, mctx, ptr, val) catch unreachable;
+            env.saved_ret_ptr = ptr;
+            // Return SubtaskState.returned (2) with non-zero handle 9: 2 | (9 << 4)
+            return @as(i32, 2 | (9 << 4));
+        }
+
+        fn awaitSubtask(raw_ctx: ?*anyopaque, mem_ctx: *MemoryContext, packed_status: i32) Error!void {
+            const env: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            env.awaited_status = packed_status;
+            env.await_calls += 1;
+            const ustatus: u32 = @bitCast(packed_status);
+            const state: u4 = @truncate(ustatus & 0xf);
+            if (state != 2) {
+                try storeToMemory(u32, .wasm32, mem_ctx.*, env.saved_ret_ptr, env.saved_arg * 3 + 1);
+            }
+        }
+    };
+
+    var sub_env = PendingSubtaskEnv{};
+    PendingSubtaskEnv.current = &sub_env;
+    defer PendingSubtaskEnv.current = null;
+
+    const AsyncImportFn = fn (x: u32) u32;
+    const lower_async_opts = CallOptions{
+        .arch = .wasm32,
+        .is_async = true,
+        .direction = .lower,
+    };
+
+    const no_await_ctx = MemoryContext{
+        .memory = &mem,
+        .realloc_ctx = &bump,
+        .realloc_fn = BumpAllocator.realloc,
+    };
+    try testing.expectError(
+        error.AsyncCallPending,
+        lowerCall(AsyncImportFn, lower_async_opts, no_await_ctx, &PendingSubtaskEnv.coreImport, .{14}),
+    );
+
+    var await_ctx = no_await_ctx;
+    await_ctx.await_subtask_ctx = &sub_env;
+    await_ctx.await_subtask_fn = &PendingSubtaskEnv.awaitSubtask;
+
+    const async_res = try lowerCall(AsyncImportFn, lower_async_opts, await_ctx, &PendingSubtaskEnv.coreImport, .{14});
+    try testing.expectEqual(@as(u32, 43), async_res);
+    try testing.expectEqual(@as(usize, 1), sub_env.await_calls);
+    try testing.expectEqual(@as(i32, 1 | (7 << 4)), sub_env.awaited_status);
+
+    // State == 2 with handle != 0 also invokes await_subtask_fn to drop the handle
+    const imm_res = try lowerCall(AsyncImportFn, lower_async_opts, await_ctx, &PendingSubtaskEnv.coreImmediateWithHandle, .{25});
+    try testing.expectEqual(@as(u32, 125), imm_res);
+    try testing.expectEqual(@as(usize, 2), sub_env.await_calls);
+    try testing.expectEqual(@as(i32, 2 | (9 << 4)), sub_env.awaited_status);
+
+    // 2. Async callLifted with deferred [task-return] driven by ctx.poll_task_fn
+    const DeferredLiftEnv = struct {
+        pending_arg: u32 = 0,
+        polls: usize = 0,
+
+        var current: ?*@This() = null;
+
+        fn coreDeferredExport(x: i32) void {
+            const env = current.?;
+            env.pending_arg = @bitCast(x);
+            // Does NOT call task_return_fn during initial invocation!
+        }
+
+        fn pollTask(raw_ctx: ?*anyopaque, mem_ctx: *MemoryContext) Error!void {
+            const env: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            env.polls += 1;
+            if (env.polls >= 2) {
+                const ret_ptr = try mem_ctx.realloc(4, 4);
+                try storeToMemory(u32, .wasm32, mem_ctx.*, ret_ptr, env.pending_arg + 500);
+                if (mem_ctx.task_return_fn) |tr_fn| {
+                    tr_fn(mem_ctx.task_return_ctx, ret_ptr);
+                }
+            }
+        }
+    };
+
+    var lift_env = DeferredLiftEnv{};
+    DeferredLiftEnv.current = &lift_env;
+    defer DeferredLiftEnv.current = null;
+
+    try testing.expectError(
+        error.AsyncTaskDidNotReturn,
+        callLifted(AsyncImportFn, .{ .arch = .wasm32, .is_async = true }, no_await_ctx, &DeferredLiftEnv.coreDeferredExport, .{42}),
+    );
+
+    var poll_ctx = no_await_ctx;
+    poll_ctx.poll_task_ctx = &lift_env;
+    poll_ctx.poll_task_fn = &DeferredLiftEnv.pollTask;
+
+    const lifted_res = try callLifted(
+        AsyncImportFn,
+        .{ .arch = .wasm32, .is_async = true },
+        poll_ctx,
+        &DeferredLiftEnv.coreDeferredExport,
+        .{42},
+    );
+    try testing.expectEqual(@as(u32, 542), lifted_res);
+    try testing.expectEqual(@as(usize, 2), lift_env.polls);
+}

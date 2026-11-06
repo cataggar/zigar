@@ -14,6 +14,8 @@ export async function transpile(srcPath, options) {
     omitExports = false,
     stripWASM = (options.optimize && options.optimize !== 'Debug'),
     keepNames = false,
+    useJSPI = false,
+    continuationStackSize,
     moduleResolver = (name) => name,
     wasmLoader,
     ...compileOptions
@@ -34,6 +36,12 @@ export async function transpile(srcPath, options) {
     tableInitial,
     multithreaded,
   };
+  if (useJSPI) {
+    moduleOptions.useJSPI = true;
+  }
+  if (continuationStackSize !== undefined) {
+    moduleOptions.continuationStackSize = continuationStackSize;
+  }
   const Env = defineEnvironment();
   const env = new Env();
   env.loadModule(content, moduleOptions);

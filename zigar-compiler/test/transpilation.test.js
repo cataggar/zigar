@@ -163,6 +163,20 @@ describe('Transpilation', function() {
       const { code } = await transpile(dupePath, { optimize: 'ReleaseSmall', useLibc: true, useWazig: true });
       expect(code).to.contain('"dupe"');
     })
+    it('should include useJSPI and continuationStackSize in moduleOptions when specified', async function() {
+      const path = getSamplePath('simple');
+      const options = {
+        optimize: 'ReleaseSmall',
+        embedWASM: false,
+        wasmLoader: () => 'loadWASM()',
+        useWazig: true,
+        useJSPI: true,
+        continuationStackSize: 131072,
+      };
+      const { code } = await transpile(path, options);
+      expect(code).to.contain('"useJSPI":true');
+      expect(code).to.contain('"continuationStackSize":131072');
+    })
 
   })
 })

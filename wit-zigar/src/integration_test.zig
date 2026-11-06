@@ -638,3 +638,318 @@ test "fast_abi component integration: buildComponent with embedded zigar:abi sec
     try testing.expectEqual(@as(u32, 42), sum);
 }
 
+test "Phase 5 e2e: sample.wit async functions over AsyncScheduler (TaskContext shadow stack, pending subtask, stream/future wakeups, [task-return]) and ZigarBridge dual-ABI" {
+    const alloc = testing.allocator;
+    const async_rt = root.async_runtime;
+    const bridge = root.zigar_bridge;
+
+    // 1. Verify `bindgen.generateFromWitSource` emits `exportZigarBridge` and `WitLastErrorSlot`
+    const sample_zig = try bindgen.generateFromWitSource(alloc, sample_wit_source, .{});
+    defer alloc.free(sample_zig);
+    try testing.expect(std.mem.indexOf(u8, sample_zig, "pub fn exportZigarBridge(comptime Impl: type, comptime mem_ctx_ptr: anytype) type") != null);
+    try testing.expect(std.mem.indexOf(u8, sample_zig, "pub const WitLastErrorSlot = struct") != null);
+
+    // 2. Execute `HostApi.async_five_Fn` (5 u32 params -> async spill -> u64) and
+    //    `GuestService.async_compute_Fn` (5 u32 params -> Result(Point, ErrorKind))
+    //    over `AsyncScheduler` with `configureMemoryContext`, pending subtask
+    //    (`SubtaskState.started`), `waitableSetWait` suspension on a `TaskContext`
+    //    shadow stack, stream/future wakeups, and `[task-return]` completion.
+    var sched = async_rt.AsyncScheduler.init(alloc);
+    defer sched.deinit();
+
+    var host_sp: usize = 0x8000_0000;
+    sched.sp_binding = async_rt.StackPointerBinding.fromHostSlot(&host_sp);
+
+    var mem_buf: [32768]u8 align(16) = @splat(0);
+    var bump = canon.BumpAllocator.init(128, mem_buf.len);
+    var mem_ctx = bump.memoryContext(&mem_buf);
+    sched.configureMemoryContext(&mem_ctx);
+
+    const AsyncFiveFn = fn (u32, u32, u32, u32, u32) u64;
+    const AsyncComputeFn = fn (u32, u32, u32, u32, u32) canon.Result(SharedTypes.Point, SharedTypes.ErrorKind);
+
+    // (a) `async-five` host import returning `SubtaskState.started` while a stream + future
+    //     deliver data across `waitableSetWait` on an active `TaskContext` shadow stack.
+    const AsyncFiveImportEnv = struct {
+        sched_ptr: *async_rt.AsyncScheduler,
+        mem_ctx_ptr: *canon.MemoryContext,
+        host_sp_ptr: *usize,
+        stream_pair: async_rt.StreamPair,
+        future_pair: async_rt.FuturePair,
+        ws_handle: i32,
+        params_ptr: usize = 0,
+        ret_ptr: usize = 0,
+        step_count: u32 = 0,
+        suspended_sp_observed: usize = 0,
+
+        var current: ?*@This() = null;
+
+        fn step(raw_ctx: ?*anyopaque, s: *async_rt.AsyncScheduler, _: i32) !async_rt.SubtaskState {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            self.step_count += 1;
+            if (self.step_count == 1) {
+                // While the caller TaskContext is suspended in waitableSetWait, host_sp is restored
+                self.suspended_sp_observed = self.host_sp_ptr.*;
+                // Wake stream and future
+                _ = try s.streamWriteSlice(self.stream_pair.writable, "five");
+                var bonus_bytes: [4]u8 = undefined;
+                std.mem.writeInt(u32, &bonus_bytes, 100, .little);
+                _ = try s.futureWriteSlice(self.future_pair.writable, &bonus_bytes);
+                return .started;
+            }
+            const mctx = self.mem_ctx_ptr.*;
+            const p0 = try canon.loadFromMemory(u32, .wasm32, mctx, self.params_ptr + 0);
+            const p1 = try canon.loadFromMemory(u32, .wasm32, mctx, self.params_ptr + 4);
+            const p2 = try canon.loadFromMemory(u32, .wasm32, mctx, self.params_ptr + 8);
+            const p3 = try canon.loadFromMemory(u32, .wasm32, mctx, self.params_ptr + 12);
+            const p4 = try canon.loadFromMemory(u32, .wasm32, mctx, self.params_ptr + 16);
+            const sum: u64 = @as(u64, p0) + p1 + p2 + p3 + p4 + 100;
+            try canon.storeToMemory(u64, .wasm32, mctx, self.ret_ptr, sum);
+            return .returned;
+        }
+
+        fn coreImport(params_ptr: i32, ret_ptr: i32) i32 {
+            const self = current.?;
+            self.params_ptr = @intCast(@as(u32, @bitCast(params_ptr)));
+            self.ret_ptr = @intCast(@as(u32, @bitCast(ret_ptr)));
+            const handle = self.sched_ptr.spawnAsyncSubtask(self, step) catch unreachable;
+            return async_rt.SubtaskState.started.pack(@intCast(handle));
+        }
+    };
+
+    const ws = try sched.waitableSetNew();
+    defer sched.waitableSetDrop(ws) catch unreachable;
+    const stream_pair = try sched.streamNewWithCapacity(16);
+    defer {
+        sched.streamDropReadable(stream_pair.readable) catch {};
+        sched.streamDropWritable(stream_pair.writable) catch {};
+    }
+    const future_pair = try sched.futureNew(4);
+    defer {
+        sched.futureDropReadable(future_pair.readable) catch {};
+        sched.futureDropWritable(future_pair.writable) catch {};
+    }
+    try sched.waitableJoin(stream_pair.readable, ws);
+    try sched.waitableJoin(future_pair.readable, ws);
+
+    // Post non-blocking reads on the stream and future at guest memory offsets 512 and 528
+    try testing.expectEqual(async_rt.BLOCKED, try sched.streamRead(stream_pair.readable, &mem_ctx, 512, 4));
+    try testing.expectEqual(async_rt.BLOCKED, try sched.futureRead(future_pair.readable, &mem_ctx, 528, 4));
+
+    var five_env = AsyncFiveImportEnv{
+        .sched_ptr = &sched,
+        .mem_ctx_ptr = &mem_ctx,
+        .host_sp_ptr = &host_sp,
+        .stream_pair = stream_pair,
+        .future_pair = future_pair,
+        .ws_handle = ws,
+    };
+    AsyncFiveImportEnv.current = &five_env;
+    defer AsyncFiveImportEnv.current = null;
+
+    // Acquire a ShadowStack from sched.stack_pool and run `async-five` inside a TaskContext
+    const stack = try sched.stack_pool.acquire(alloc);
+    var stack_released = false;
+    defer if (!stack_released) {
+        sched.stack_pool.release(alloc, stack) catch {};
+    };
+    var task_ctx = async_rt.TaskContext.init(stack, sched.sp_binding);
+    sched.active_task = &task_ctx;
+    defer sched.active_task = null;
+
+    task_ctx.enter();
+    try testing.expectEqual(stack.initialTop(), host_sp);
+
+    const five_res = try canon.CanonLower(AsyncFiveFn, .{
+        .arch = .wasm32,
+        .is_async = true,
+    }).call(mem_ctx, &AsyncFiveImportEnv.coreImport, .{ 10, 20, 30, 40, 50 });
+
+    try testing.expectEqual(@as(u64, 250), five_res);
+    try testing.expectEqual(@as(u32, 2), five_env.step_count);
+    // While suspended inside waitableSetWait, host_sp was restored to 0x8000_0000, and then resumed to stack.initialTop()
+    try testing.expectEqual(@as(usize, 0x8000_0000), five_env.suspended_sp_observed);
+    try testing.expectEqual(stack.initialTop(), host_sp);
+
+    // Pop the stream_read and future_read events from `ws` via waitableSetWait
+    const ev1 = try sched.waitableSetWait(ws, &mem_ctx, 544);
+    const ev2 = try sched.waitableSetWait(ws, &mem_ctx, 552);
+    try testing.expect((ev1.code == .stream_read and ev2.code == .future_read) or
+        (ev1.code == .future_read and ev2.code == .stream_read));
+    try testing.expectEqualStrings("five", mem_buf[512..516]);
+    try testing.expectEqual(@as(u32, 100), std.mem.readInt(u32, mem_buf[528..532], .little));
+
+    try task_ctx.complete();
+    try testing.expectEqual(@as(usize, 0x8000_0000), host_sp);
+    stack_released = true;
+    try sched.stack_pool.release(alloc, stack);
+
+    // (b) `async-compute` guest export completing asynchronously via deferred `[task-return]`
+    const DeferredComputeGuest = struct {
+        sched_ptr: *async_rt.AsyncScheduler,
+        args: [5]u32 = .{ 0, 0, 0, 0, 0 },
+        steps: u32 = 0,
+
+        var current: ?*@This() = null;
+
+        fn step(raw_ctx: ?*anyopaque, s: *async_rt.AsyncScheduler, _: i32) !async_rt.SubtaskState {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            self.steps += 1;
+            if (self.steps < 2) return .started;
+            const active = canon.getActiveMemoryContext().?;
+            const RetT = canon.Result(SharedTypes.Point, SharedTypes.ErrorKind);
+            const res_val: RetT = if (self.args[4] == 0)
+                .{ .err = .invalid_input }
+            else
+                .{ .ok = .{
+                    .x = @floatFromInt(self.args[0] + self.args[1] + self.args[2]),
+                    .y = @floatFromInt(self.args[3] + self.args[4]),
+                } };
+            const ret_lay = comptime canon.layoutOf(RetT, .wasm32);
+            const ret_ptr = try active.realloc(ret_lay.alignment, ret_lay.size);
+            try canon.storeToMemory(RetT, .wasm32, active, ret_ptr, res_val);
+            if (active.task_return_fn) |tr_fn| {
+                tr_fn(active.task_return_ctx, ret_ptr);
+            }
+            s.notifyTaskReturn();
+            return .returned;
+        }
+
+        fn coreExport(a: i32, b: i32, c: i32, d: i32, e: i32) void {
+            const self = current.?;
+            self.args = .{
+                @bitCast(a),
+                @bitCast(b),
+                @bitCast(c),
+                @bitCast(d),
+                @bitCast(e),
+            };
+            _ = self.sched_ptr.spawnAsyncSubtask(self, step) catch unreachable;
+        }
+    };
+
+    var compute_guest = DeferredComputeGuest{ .sched_ptr = &sched };
+    DeferredComputeGuest.current = &compute_guest;
+    defer DeferredComputeGuest.current = null;
+
+    const compute_ok = try canon.callLifted(
+        AsyncComputeFn,
+        .{ .arch = .wasm32, .is_async = true },
+        mem_ctx,
+        &DeferredComputeGuest.coreExport,
+        .{ 1, 2, 3, 4, 5 },
+    );
+    try testing.expect(compute_ok == .ok);
+    try testing.expectEqual(SharedTypes.Point{ .x = 6.0, .y = 9.0 }, compute_ok.ok);
+    try testing.expectEqual(@as(u32, 2), compute_guest.steps);
+
+    // 3. Test `zigar_bridge.HostInstanceBridge` (`ZigarBridge`) with `SharedTypes.Rect` / `[]const SharedTypes.Rect`,
+    //    WIT `Result` unwrapping (`error.WitResultError` + `LastWitErrorStore`), and Dual-ABI parity on `ShadowStackPool`.
+    const SampleGuestInterface = struct {
+        pub const transform_rect_Fn = fn (SharedTypes.Rect, f32) SharedTypes.Rect;
+        pub const transform_rect_meta = .{
+            .wit_name = "transform-rect",
+            .interface_name = "zigar:sample/guest-service@0.1.0",
+            .is_async = false,
+            .string_encoding_utf8 = false,
+        };
+
+        pub const batch_rects_Fn = fn ([]const SharedTypes.Rect, f32) canon.Result(SharedTypes.Point, SharedTypes.ErrorKind);
+        pub const batch_rects_meta = .{
+            .wit_name = "batch-rects",
+            .interface_name = "zigar:sample/guest-service@0.1.0",
+            .is_async = false,
+            .string_encoding_utf8 = false,
+        };
+    };
+
+    const SampleGuestImpl = struct {
+        pub fn transform_rect(r: SharedTypes.Rect, factor: f32) SharedTypes.Rect {
+            return .{
+                .origin = .{ .x = r.origin.x * factor, .y = r.origin.y * factor },
+                .extent = .{ .x = r.extent.x * factor, .y = r.extent.y * factor },
+                .id = r.id + 10,
+                .layer = r.layer + 1,
+                .tag = r.tag + 2,
+            };
+        }
+
+        pub fn batch_rects(rects: []const SharedTypes.Rect, factor: f32) canon.Result(SharedTypes.Point, SharedTypes.ErrorKind) {
+            if (rects.len == 0) return .{ .err = .invalid_input };
+            if (factor < 0.0) return .{ .err = .overflow };
+            var sx: f32 = 0;
+            var sy: f32 = 0;
+            for (rects) |r| {
+                sx += (r.origin.x + r.extent.x) * factor;
+                sy += (r.origin.y + r.extent.y) * factor;
+            }
+            return .{ .ok = .{ .x = sx, .y = sy } };
+        }
+    };
+
+    const SampleBridge = bridge.ZigarBridge(SampleGuestInterface, SampleGuestImpl, .{
+        .unwrap_results = true,
+        .scratch_capacity = 16384,
+        .prefer_fast_abi = true,
+    });
+    var inst = SampleBridge.init(alloc);
+
+    const rects_input = [_]SharedTypes.Rect{
+        .{
+            .origin = .{ .x = 1.0, .y = 2.0 },
+            .extent = .{ .x = 3.0, .y = 4.0 },
+            .id = 1,
+            .layer = 2,
+            .tag = 3,
+        },
+        .{
+            .origin = .{ .x = 5.0, .y = 6.0 },
+            .extent = .{ .x = 7.0, .y = 8.0 },
+            .id = 4,
+            .layer = 5,
+            .tag = 6,
+        },
+    };
+    const zero_copy_rects = try inst.bridge_memory.copySliceInPlace(SharedTypes.Rect, &rects_input);
+    const reallocs_before = inst.bridge_memory.realloc_count;
+
+    // Run on a ShadowStack from ShadowStackPool
+    var pool = async_rt.ShadowStackPool.init(16384);
+    defer pool.deinit(alloc);
+    const sstack = try pool.acquire(alloc);
+    defer pool.release(alloc, sstack) catch unreachable;
+    var bridge_task = async_rt.TaskContext.init(sstack, sched.sp_binding);
+    bridge_task.enter();
+
+    // Fast ABI path: 0 cabi_realloc calls for zero-copy `extern struct` and `[]const SharedTypes.Rect`
+    const rect_fast = try inst.call("transform_rect", .{ rects_input[0], 2.0 });
+    try testing.expectEqual(bridge.DispatchPath.fast_abi, inst.last_dispatch);
+    const pt_fast = try inst.call("batch_rects", .{ zero_copy_rects, 2.0 });
+    try testing.expectEqual(bridge.DispatchPath.fast_abi, inst.last_dispatch);
+    try testing.expectEqual(reallocs_before, inst.bridge_memory.realloc_count);
+
+    // Canonical ABI fallback path: identical results
+    inst.prefer_fast_abi = false;
+    const rect_canon = try inst.call("transform_rect", .{ rects_input[0], 2.0 });
+    try testing.expectEqual(bridge.DispatchPath.canonical_abi, inst.last_dispatch);
+    const pt_canon = try inst.call("batch_rects", .{ zero_copy_rects, 2.0 });
+    try testing.expectEqual(bridge.DispatchPath.canonical_abi, inst.last_dispatch);
+    try testing.expectEqual(rect_fast, rect_canon);
+    try testing.expectEqual(pt_fast, pt_canon);
+    try testing.expectEqual(SharedTypes.Point{ .x = 32.0, .y = 40.0 }, pt_canon);
+
+    // Error unwrapping into `error.WitResultError` + `LastWitErrorStore` across both paths
+    inst.prefer_fast_abi = true;
+    bridge.clearLastWitError(SharedTypes.ErrorKind);
+    try testing.expectError(error.WitResultError, inst.call("batch_rects", .{ &[_]SharedTypes.Rect{}, 1.0 }));
+    try testing.expectEqual(@as(?SharedTypes.ErrorKind, .invalid_input), bridge.getLastWitError(SharedTypes.ErrorKind));
+
+    inst.prefer_fast_abi = false;
+    bridge.clearLastWitError(SharedTypes.ErrorKind);
+    try testing.expectError(error.WitResultError, inst.call("batch_rects", .{ zero_copy_rects, -1.0 }));
+    try testing.expectEqual(@as(?SharedTypes.ErrorKind, .overflow), bridge.getLastWitError(SharedTypes.ErrorKind));
+
+    try bridge_task.complete();
+}
+
+
