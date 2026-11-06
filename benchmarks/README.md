@@ -1,19 +1,21 @@
-# `wazig` (`v0.17.0-wazig.3`) vs Standard `zig` (`0.17.0`) — Benchmark Suite
+# `wazig` (`v0.17.0-wazig.4`) & `wazigl` (`v0.17.0-wazigl.4`) vs Standard `zig` (`0.17.0`) — Benchmark Suite
 
-Reproducible Node.js ESM benchmark and comparison suite (`wazig-benchmark.js`) measuring **`wazig` (`v0.17.0-wazig.3`)** against **standard `zig` (`0.17.0`)** across all four dimensions relevant to `zigar-compiler` and `zigar-runtime`:
+Reproducible Node.js ESM benchmark and comparison suite (`wazig-benchmark.js`) measuring **`wazig` (`v0.17.0-wazig.4`)** and **`wazigl` (`v0.17.0-wazigl.4`)** against **standard `zig` (`0.17.0`)** across all four dimensions relevant to `zigar-compiler` and `zigar-runtime`:
 
-1. **Toolchain & Distribution Footprint** — Compressed download archive sizes, installed disk footprint (`wazig.wasm` + Wasm-focused `lib/` vs native `zig` binary + multi-target `lib/`), file counts, `lib/` subdirectory breakdown, and CLI startup latency (`wazig version` vs `zig version`).
-2. **Compilation & Transpilation Performance (Cold & Warm Cache)** — Compares three compilation pipelines across 14 representative Zig modules (Pure-Zig basic, C header `translate-c`, Libc `-lc`, Multithreaded WASM, and Compute Kernels):
+1. **Toolchain & Distribution Footprint** — Compressed download archive sizes (`wazig.tar.zst` `8.88 MB` / `8.47 MiB` and `wazigl.tar.zst` `38.25 MB` / `36.48 MiB` vs `zig` `52.88–100.27 MB` per platform), installed disk footprint (`wazig.wasm` `36.63 MB`, `wazigl.wasm` `207.08 MB`, and Wasm-focused `lib/` `29.92 MB` vs native `zig` binary `171.69 MB` + multi-target `lib/` `187.64 MB`), file counts, `lib/` subdirectory breakdown, and CLI startup latency (`wazig version`, `wazigl version`, `zig version`).
+2. **Compilation & Transpilation Performance (Cold & Warm Cache)** — Compares four compilation pipelines across 14 representative Zig modules (Pure-Zig basic, C header `translate-c`, Libc `-lc`, Multithreaded WASM, and Compute Kernels):
    - **`zig build` (Upstream baseline)**: `zigPath: 'zig', useBuildExe: false`
    - **`zig build-exe` (Native Zig fast-path)**: `zigPath: 'zig', useBuildExe: true`
-   - **`wazig build-exe` (`v0.17.0-wazig.3`)**: `zigPath: 'wazig', useBuildExe: true`
+   - **`wazig build-exe` (`v0.17.0-wazig.4`)**: `zigPath: 'wazig', useBuildExe: true`
+   - **`wazigl build-exe` (`v0.17.0-wazigl.4`)**: `zigPath: 'wazigl', useBuildExe: true`
    Measures cold `.zig-cache` compilation, warm shared `.zig-cache` compilation (where `std`, `compiler_rt`, `libzigc.a`, and `translate-c` are cached), and warm incremental rebuilds after a source edit, plus a direct `translate-c` cold vs warm microbenchmark and out-of-the-box multithreaded WASM verification.
 3. **Output `.wasm` Binary Size (Raw & Stripped)** — Measures raw (`compile()`) and dead-code/reflection-stripped (`stripUnused()`) `.wasm` binary sizes across all four Zig optimization modes (`Debug`, `ReleaseSmall`, `ReleaseFast`, `ReleaseSafe`) for:
    - `zig 0.17.0` with upstream `-lc` + LLVM (`useLibc: true, useLLVM: true`)
    - `zig 0.17.0` pure-Zig + LLVM (`useLibc: false, useLLVM: true`)
+   - `wazigl v0.17.0-wazigl.4` Wasm-hosted LLVM 21 + pure-Zig `libzigc.a` (`zigPath: 'wazigl', useLLVM: true`)
    - `zig 0.17.0` self-hosted `stage2_wasm` (`useLibc: false, useLLVM: false`)
-   - `wazig v0.17.0-wazig.3` (`stage2_wasm` + MIR dead-store/copy-propagation, MemArg offset folding, local RLE compaction, trivial callee inlining, and post-link dead-function/constant pruning)
-4. **Runtime Execution Performance in V8 (Node.js)** — Transpiles and instantiates 13 compute and image-processing workloads via `transpile({ optimize: 'ReleaseFast' })` + `zigar-runtime`, running warmup iterations followed by timed iterations (`performance.now()`) and reporting `median`, `mean`, `min`, and `p95` (in `ms`):
+   - `wazig v0.17.0-wazig.4` (`stage2_wasm` + SROA, `Optimizer.zig` leaf inlining & peephole passes, MIR dead-store/copy-propagation, MemArg offset folding, local RLE compaction, and post-link dead-function/constant pruning)
+4. **Runtime Execution Performance in V8 (Node.js)** — Transpiles and instantiates 13 compute and image-processing workloads via `transpile({ optimize: 'ReleaseFast' })` + `zigar-runtime` across `wazig`, `wazigl`, `zig (-fno-llvm)`, and `zig (LLVM)`, running warmup iterations followed by timed iterations (`performance.now()`) and reporting `median`, `mean`, `min`, and `p95` (in `ms`):
    - **Benchmarks Game**: `nbody`, `fannkuch-redux`, `spectral-norm`, `mandelbrot`, `binary-trees`, `fasta`
    - **Image Processing**: `polish-flag`, `resize`, `greyscale`, `sepia`, `circle-pattern`, `raytracer`, `mandelbulb-quick`
 
@@ -22,7 +24,8 @@ Reproducible Node.js ESM benchmark and comparison suite (`wazig-benchmark.js`) m
 ## Prerequisites
 
 - **Node.js** `>= 20` (with `zigar-compiler` dependencies installed in `../zigar-compiler/node_modules` and `zigar-runtime` built in `../zigar-runtime/dist`)
-- **`wazig`** (`v0.17.0-wazig.3`) on `PATH` (wrapped with `wasmtime`)
+- **`wazig`** (`v0.17.0-wazig.4`) on `PATH` (wrapped with `wasmtime`)
+- **`wazigl`** (`v0.17.0-wazigl.4`) on `PATH` (wrapped with `wasmtime`)
 - **`zig`** (`0.17.0`) on `PATH`
 
 ---
@@ -109,16 +112,17 @@ jobs:
 
 ## Summary of Key Findings (from [`RESULTS.md`](./RESULTS.md))
 
-| Dimension | Standard `zig` (`0.17.0`) | `wazig` (`v0.17.0-wazig.3`) | Impact |
-| :--- | :--- | :--- | :--- |
-| **Release Download Size** | `52.9–100.3 MB` per OS/arch (`419.8 MB` across 6 desktop targets) | **`8.86 MB` (`8.45 MiB`)** single universal `wasm64-wasip3` archive | **5.97x–11.3x smaller** per target; **47.4x smaller** across 6 targets |
-| **Installed Disk Footprint** | `360.34 MB` (`343.65 MiB`, `19,505` files) | **`71.24 MB` (`67.94 MiB`, `1,322` files)** | **5.06x smaller** on disk, **14.75x fewer files** |
-| **Cold `translate-c` Latency** | `~61,744 ms` (compiles external `lib/compiler/translate-c` via LLVM) | **`~319 ms`** (in-process Aro C frontend inside `wazig.wasm`) | **~194x faster** cold C-header translation |
-| **Cold C-Import Compile (`print.zig`)** | `~62,636 ms` (`zig build-exe`) | **`~18,549 ms`** (`wazig build-exe`) | **3.38x faster** end-to-end cold compile |
-| **Multithreaded WASM (`thread.zig`, `atomic.zig`)** | **Fails out-of-the-box** (`WasmAllocator` unimplemented; `-fno-llvm` lacks `naked`/TLS) | **Works out-of-the-box** (built-in `WasmAllocator`, `wasi-thread`, `stage2_wasm` TLS/atomics) | **Zero manual stdlib patching or LLVM required** |
-| **Libc `-lc` Reactor Linking (`dupe.zig`)** | `-fno-llvm` **fails** (`libc.a: undefined function: __main_argc_argv`); LLVM compiles ~400 C files | **Works out-of-the-box** across all 4 optimize modes via pure-Zig `libzigc.a` | **Pure-Zig `libzigc.a` without Clang/LLVM** |
-| **`Debug` `.wasm` Binary Size** | `1,804–3,535 KiB` raw / `232–288 KiB` stripped (`-lc`) | **`226–737 KiB` raw / `147–186 KiB` stripped** | **4.8x–8.0x smaller raw**, **23%–37% smaller stripped** |
-| **`ReleaseSmall` Stripped vs `zig -fno-llvm`** | `152–549 KiB` stripped (fails to inline `getFactoryThunk`; crashes `stripUnused()` in other modes) | **`93–129 KiB` stripped** (MIR + post-link dead-code & RLE compaction) | **1.6x–4.27x smaller stripped** than upstream `stage2_wasm` |
+| Dimension | Standard `zig` (`0.17.0`) | `wazigl` (`v0.17.0-wazigl.4`) | `wazig` (`v0.17.0-wazig.4`) | Impact |
+| :--- | :--- | :--- | :--- | :--- |
+| **Release Download Size** | `52.88–100.27 MB` per OS/arch (`419.77 MB` across 6 desktop targets) | **`38.25 MB` (`36.48 MiB`)** single universal `wasm64-wasip3` archive (with LLVM 21 + Clang) | **`8.88 MB` (`8.47 MiB`)** single universal `wasm64-wasip3` archive (self-hosted `stage2_wasm`) | `wazig`: **5.96x–11.3x smaller** per target (**47.27x** vs 6 targets); `wazigl`: **1.38x–2.62x smaller** (**10.97x** vs 6 targets) |
+| **Installed Disk Footprint** | `360.34 MB` (`343.65 MiB`, `19,505` files) | **`237.00 MB` (`226.02 MiB`, `1,322` files)** | **`66.55 MB` (`63.47 MiB`, `1,322` files)** | `wazig`: **5.41x smaller**, **14.75x fewer files**; `wazigl`: **1.52x smaller**, **14.75x fewer files** |
+| **Cold `translate-c` Latency** | `~54,625 ms` (compiles external `lib/compiler/translate-c` via LLVM) | **`~1,437 ms`** (in-process Clang C frontend inside `wazigl.wasm`) | **`~243 ms`** (in-process Aro C frontend inside `wazig.wasm`) | `wazig`: **~225x faster**; `wazigl`: **~38.0x faster** cold C-header translation |
+| **Cold C-Import Compile (`print.zig`)** | `~57,163 ms` (`zig build-exe`) | **`~15,884 ms`** (`wazigl build-exe`) | **`~9,681 ms`** (`wazig build-exe`) | `wazig`: **5.90x faster**; `wazigl`: **3.60x faster** end-to-end cold compile |
+| **Multithreaded WASM (`thread.zig`, `atomic.zig`)** | **Fails out-of-the-box** (`WasmAllocator` unimplemented; `-fno-llvm` lacks `naked`/TLS) | **Works out-of-the-box** (built-in `WasmAllocator`, `wasi-thread`, LLVM TLS/atomics) | **Works out-of-the-box** (built-in `WasmAllocator`, `wasi-thread`, `stage2_wasm` TLS/atomics) | **Zero manual stdlib patching required in `wazig` or `wazigl`** |
+| **Libc `-lc` Reactor Linking (`dupe.zig`)** | `-fno-llvm` **fails** (`libc.a: undefined function: __main_argc_argv`); LLVM links musl `libc.a` | **Works out-of-the-box** across all 4 optimize modes via pure-Zig `libzigc.a` | **Works out-of-the-box** across all 4 optimize modes via pure-Zig `libzigc.a` | **Pure-Zig `libzigc.a` in both `wazig` and `wazigl`** |
+| **`Debug` `.wasm` Binary Size** | `1,804–3,535 KiB` raw / `232–288 KiB` stripped (`-lc`) | `1,451–3,345 KiB` raw / `171–235 KiB` stripped | **`185–632 KiB` raw / `123–156 KiB` stripped** | `wazig`: **5.59x–9.73x smaller raw**, **35%–47% smaller stripped** |
+| **`ReleaseSmall` Stripped vs `zig -fno-llvm`** | `153–550 KiB` stripped (fails to inline `getFactoryThunk`; crashes `stripUnused()` in other modes) | **`31–46 KiB` stripped** (byte-for-byte parity with native `zig (Pure-Zig LLVM)`) | **`76–103 KiB` stripped** (MIR + SROA + `Optimizer.zig` + post-link pruning) | `wazig`: **1.95x–5.47x smaller stripped** than `zig -fno-llvm`; `wazigl`: **exact LLVM size parity** |
+| **V8 Runtime Execution (`ReleaseFast`)** | `zig -fno-llvm`: `6.25–2,213.57 ms`; `zig (LLVM)`: `0.33–201.15 ms` | **`0.42–201.30 ms`** (**1.00x parity** with native `zig (LLVM)`) | **`4.27–413.38 ms`** (**1.08x–7.11x faster** than `zig -fno-llvm`) | `wazig` up to **7.11x faster** than `-fno-llvm`; `wazigl` **1.00x parity** with native LLVM |
 
 ---
 

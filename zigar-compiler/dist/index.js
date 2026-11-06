@@ -928,7 +928,7 @@ async function runCompiler(path, args, options) {
   try {
     onStart?.();
     const isWazig = basename(path).startsWith('wazig');
-    const useLocalCacheEnv = args[0] === 'build-exe' || args[0] === 'translate-c';
+    const useLocalCacheEnv = isWazig || args[0] === 'build-exe' || args[0] === 'translate-c';
     const env = {
       ...process.env,
       ZIG_LOCAL_CACHE_DIR: '.zig-cache',
@@ -938,6 +938,9 @@ async function runCompiler(path, args, options) {
     };
     if (isWazig) {
       delete env.ZIG_LIB_DIR;
+      if (!env.GHR_TOOL_DIR && isAbsolute(path)) {
+        env.GHR_TOOL_DIR = resolve(dirname(path), '..');
+      }
     }
     const { stdout } = await execFileAsync(path, args, {
       cwd,
@@ -1202,8 +1205,12 @@ async function createConfig(srcPath, modPath, options = {}) {
   const cHeaderPath = await findModuleFile(moduleDir, 'build.extra.h');
   // add package manager manifest
   const packageConfigPath = await findModuleFile(moduleDir, 'build.zig.zon');
+  const isWazigPath = Boolean(
+    (zigPathOption && basename(zigPathOption).startsWith('wazig')) ||
+    (!zigPathOption && process.env.ZIG_PATH && basename(process.env.ZIG_PATH).startsWith('wazig'))
+  );
   const useBuildExe = Boolean(
-    modulePath && (useBuildExeOption ?? (isWASM && !hasCustomBuildFile && !extraFilePath && !packageConfigPath && !zigArgsStr.trim() && useLLVM !== true))
+    modulePath && (useBuildExeOption ?? (isWASM && !hasCustomBuildFile && !extraFilePath && !packageConfigPath && !zigArgsStr.trim() && (useLLVM !== true || isWazigPath)))
   );
   let useWazig;
   let zigPath;

@@ -199,6 +199,22 @@ describe('Compilation', function() {
         else delete process.env.USE_WAZIG;
       }
     })
+    it('should keep useBuildExe enabled for wazigl WASM builds with useLLVM: true', async function() {
+      const srcPath = absolute('./zig-samples/basic/integers.zig');
+      const wasmOpts = {
+        optimize: 'ReleaseSmall',
+        platform: 'wasi',
+        arch: 'wasm32',
+        isWASM: true,
+        zigPath: 'wazigl',
+        useLLVM: true,
+      };
+      const config = await createConfig(srcPath, null, wasmOpts);
+      expect(config.useBuildExe).to.be.true;
+      expect(config.useWazig).to.be.true;
+      expect(config.zigPath).to.equal('wazigl');
+      expect(config.zigArgs).to.include('-fllvm');
+    })
   })
   describe('compile', function() {
     it('should compile zig source code for C addon', async function() {

@@ -14,7 +14,7 @@
  *     ELF64 `.cwasm` symbol table + `wasmtime objdump` inline `%rsp`/`%rbp`/`%rip` switch
  *     disassembly, and `aarch64` target diagnostic verification.
  *  3. Executable Dual-Stack (`__stack_pointer` / `global[0]`) Context-Switching Prototype
- *     and Benchmark on both a synthetic Wasm binary and a real `wazig`-compiled Zig `.wasm`
+ *     and Benchmark on both a synthetic Wasm binary and a real `wazig` (`0.17.0-wazig.4`) compiled Zig `.wasm`
  *     module (`-target wasm32-wasi -O ReleaseSmall -fno-entry -rdynamic`) across 50 concurrent
  *     out-of-order fibers (depth = 20, 1,000 suspensions), proving silent linear shadow stack
  *     corruption when sharing `global[0]` vs 100% isolation when switching `global[0]`.
@@ -24,9 +24,17 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
 
-const NODE24_BIN = process.env.NODE24_BIN || process.execPath;
-const WASMTIME_BIN = process.env.WASMTIME_BIN || '/home/g/.local/bin/wasmtime';
-const WAZIG_BIN = process.env.WAZIG_BIN || '/home/g/.local/bin/wazig';
+const os = require('os');
+const LOCAL_BIN_DIR = path.join(os.homedir(), '.local', 'bin');
+if (fs.existsSync(LOCAL_BIN_DIR) && !(process.env.PATH || '').split(':').includes(LOCAL_BIN_DIR)) {
+  process.env.PATH = `${LOCAL_BIN_DIR}:${process.env.PATH || ''}`;
+}
+
+const NODE24_BIN = process.env.NODE24_BIN || (fs.existsSync('/opt/actions-runner/2.338.0/externals/node24/bin/node')
+  ? '/opt/actions-runner/2.338.0/externals/node24/bin/node'
+  : process.execPath);
+const WASMTIME_BIN = process.env.WASMTIME_BIN || (fs.existsSync(path.join(LOCAL_BIN_DIR, 'wasmtime')) ? path.join(LOCAL_BIN_DIR, 'wasmtime') : 'wasmtime');
+const WAZIG_BIN = process.env.WAZIG_BIN || (fs.existsSync(path.join(LOCAL_BIN_DIR, 'wazig')) ? path.join(LOCAL_BIN_DIR, 'wazig') : 'wazig');
 const TMP_ROOT = process.env.TMP_ROOT || '/d/zigar-worktrees/.cache/tmp';
 const WORK_DIR = path.join(TMP_ROOT, `wasmfx-proto-${process.pid}`);
 const RESULTS_PATH = path.join(__dirname, 'wasmfx-results.json');
@@ -650,6 +658,12 @@ function runPart2WasmtimeVerification() {
  * enabling direct `WebAssembly.Global` `.value` inspection and context-switching from JS.
  */
 function exportGlobal0AsStackPointer(wasmBytes) {
+  try {
+    const mod = new WebAssembly.Module(wasmBytes);
+    if (WebAssembly.Module.exports(mod).some((e) => e.name === '__stack_pointer')) {
+      return new Uint8Array(wasmBytes);
+    }
+  } catch {}
   let offset = 8;
   const out = [Buffer.from(wasmBytes.slice(0, 8))];
   while (offset < wasmBytes.length) {

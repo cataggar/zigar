@@ -1,9 +1,9 @@
 # V8 `--experimental-wasm-growable-stacks` & `--experimental-wasm-wasmfx` — Benchmark & Prototype Results (`#14`)
 
-Empirical evaluation, prototype, and runtime integration of V8's WebAssembly stack-switching mechanisms across **`zigar-runtime`**, **`wazig` (`v0.17.0-wazig.3`)**, **`zig` (`0.17.0`)**, **`jsco` / `jco` (WASI P1/P2/P3)**, and **Wasmtime (`50.0.1`)**.
+Empirical evaluation, prototype, and runtime integration of V8's WebAssembly stack-switching mechanisms across **`zigar-runtime`**, **`wazig` (`v0.17.0-wazig.4`)**, **`wazigl` (`v0.17.0-wazigl.4`)**, **`zig` (`0.17.0`)**, **`jsco` / `jco` (WASI P1/P2/P3)**, and **Wasmtime (`50.0.1`)**.
 
 - **Runtime**: Node.js `v24.21.0` (V8 `13.6.233.17-node.53`, `linux-arm64`)
-- **Toolchains**: `wazig` `0.17.0-wazig.3`, `zig` `0.17.0`, `wasmtime` `50.0.1 (c307ec81d 2026-10-29)`
+- **Toolchains**: `wazig` `0.17.0-wazig.4`, `wazigl` `0.17.0-wazigl.4`, `zig` `0.17.0`, `wasmtime` `50.0.1 (c307ec81d 2026-10-29)`
 - **Benchmark Scripts**:
   - [`benchmarks/wasm-stack-switching-benchmark.js`](./wasm-stack-switching-benchmark.js) → [`benchmarks/stack-switching-results.json`](./stack-switching-results.json)
   - [`benchmarks/wasmfx-prototype.js`](./wasmfx-prototype.js) → [`benchmarks/wasmfx-results.json`](./wasmfx-results.json)
@@ -142,14 +142,14 @@ Zig, C, and Rust compile to WebAssembly using a **dual-stack ABI**:
 
 When `50` concurrent `wazig`-compiled Zig fibers (`depth = 20`, `1,000` total suspensions, each holding a `64 B` `[16]u32` stack frame on `__stack_pointer`) suspend and resolve out of order:
 
-| Mode (`wazig 0.17.0-wazig.3` `ReleaseSmall`, 50 Fibers × Depth 20) | Valid Fibers | Corrupted Fibers | Corruption Rate | Unique Frame Addresses (`expected = 1000`) | Colliding Frame Addresses | Warmed Throughput (`20k` Switches) |
+| Mode (`wazig 0.17.0-wazig.4` `ReleaseSmall`, 50 Fibers × Depth 20) | Valid Fibers | Corrupted Fibers | Corruption Rate | Unique Frame Addresses (`expected = 1000`) | Colliding Frame Addresses | Warmed Throughput (`20k` Switches) |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
 | **Shared `__stack_pointer` (Standard JSPI)** | `9 / 50` | **`41 / 50`** | **82.0%** | `808 / 1000` | **`56` collisions** (up to 4 fibers overwriting the same address) | `1,461 ns/switch` |
 | **Per-Continuation `__stack_pointer` Switched** | **`50 / 50`** | **`0 / 50`** | **0.0%** | **`1000 / 1000`** | **`0` collisions** | `1,611 ns/switch` (`+150 ns/switch` e2e; `38.96 ns` raw `global[0]` save+restore) |
 
-### Architectural Split: `zigar-runtime` vs `wazig` Compiler
-1. **JSPI + `--experimental-wasm-growable-stacks` → `zigar-runtime` + `zigar-compiler`**:
-   - `zigar-compiler` (`stripUnused()` and `ensureStackPointerExport()` in `zigar-compiler/src/wasm-decoding.js`, called from `transpile()` in both stripped and `Debug` modes) ensures `__stack_pointer` (`global[0]`) is exported in the Wasm module's Export section (`--export=__stack_pointer` can also be passed directly at link time).
+### Architectural Split: `zigar-runtime` vs `wazig` / `wazigl` Compilers
+1. **JSPI + `--experimental-wasm-growable-stacks` → `zigar-runtime` + `zigar-compiler` + `wazig` / `wazigl`**:
+   - Both `wazig` (`v0.17.0-wazig.4`, via `src/link/Wasm.zig`) and `wazigl` (`v0.17.0-wazigl.4`, via `--export-if-defined=__stack_pointer` in `src/link/Lld.zig`) now export `__stack_pointer` (`global[0]`) natively by default on reactor modules. `zigar-compiler` (`stripUnused()` and `ensureStackPointerExport()` in `zigar-compiler/src/wasm-decoding.js`, called from `transpile()` in both stripped and `Debug` modes) also ensures `__stack_pointer` (`global[0]`) is exported when compiling with stock `zig`.
    - `zigar-runtime` (`module-loading.js`, `call-marshaling-outbound.js`, `call-marshaling-inbound.js`) supports `{ useJSPI: true, continuationStackSize }`:
      - Wraps `_handleJscall` and WASI syscalls in `new WebAssembly.Suspending(...)` and `runThunk` / `runVariadicThunk` in `WebAssembly.promising(...)` (note: under `useJSPI: true`, outbound Zig calls return Promises, while async generators return `AsyncGenerator` directly).
      - Allocates and pools 16-byte-aligned linear shadow stacks via `allocateScratchMemory` (`continuationStackPool`, with `0xdeadbeef` stack-bottom canary checks), saving `exports.__stack_pointer.value` upon entering `wrapSuspending` and restoring it in the `.then(...)` handler before returning to V8's `WebAssembly.Suspending` resumption path.
@@ -164,7 +164,7 @@ All tested binaries validate, compile, instantiate, and execute with V8's `--exp
 
 | Ecosystem | Binary | Format | Size (`B`) | Core Modules | `global[0]` (`__stack_pointer`) | Exported `__stack_pointer` | V8 Growable Stacks Execution (`4 KB` initial stack) |
 | :--- | :--- | :--- | ---: | ---: | :--- | :--- | :--- |
-| **`wazig` `0.17.0-wazig.3`** | `stack_bench.wasm` | `core-module` | `1,676` | `1` | `mut i32 = 262144` | `true` (`--export=__stack_pointer`) | **PASS** (`depth = 2000`, async WASI `fd_read`/`fd_write`, stack restored) |
+| **`wazig` `0.17.0-wazig.4`** | `stack_bench.wasm` | `core-module` | `1,676` | `1` | `mut i32 = 262144` | `true` (default in `wazig` & `wazigl`) | **PASS** (`depth = 2000`, async WASI `fd_read`/`fd_write`, stack restored) |
 | **`zigar`** | `simple.wasm` | `core-module` | `45,955` | `1` | `mut i32 = 262144` | `true` | **PASS** (`allocateScratchMemory` = `327680` + JSPI `_initialize`) |
 | **`zigar`** | `read-file.wasm` | `core-module` | `56,393` | `1` | `mut i32 = 262144` | `true` | **PASS** (`allocateScratchMemory` = `327680` + JSPI `_initialize`) |
 | **`zigar`** | `thread.wasm` | `core-module` | `82,735` | `1` | `mut i32 = 262144` | `true` | **PASS** (`allocateScratchMemory` = `16777216` + JSPI `_initialize`) |

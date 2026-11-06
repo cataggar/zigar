@@ -1,12 +1,12 @@
 {
-  "timestamp": "2026-11-05T23:04:56.187Z",
+  "timestamp": "2026-11-06T23:06:09.292Z",
   "issue": 14,
   "workstream": "wasmfx-prototype",
   "environment": {
     "nodeVersion": "v24.21.0",
     "v8Version": "13.6.233.17-node.53",
     "wasmtimeVersion": "wasmtime 50.0.1 (c307ec81d 2026-10-29)",
-    "wazigVersion": "0.17.0-wazig.3",
+    "wazigVersion": "0.17.0-wazig.4",
     "platform": "linux",
     "arch": "arm64"
   },
@@ -357,7 +357,7 @@
         "-W function-references=y"
       ],
       "succeeded": true,
-      "compileTimeMs": 8.81,
+      "compileTimeMs": 8.02,
       "cwasmArtifactBytes": 19184,
       "symbols": [
         {
@@ -463,7 +463,7 @@
     }
   },
   "part3_dualStackContextSwitching": {
-    "wazigVersion": "0.17.0-wazig.3",
+    "wazigVersion": "0.17.0-wazig.4",
     "zigCompilationFlags": [
       "-target wasm32-wasi",
       "-O ReleaseSmall",
@@ -475,9 +475,9 @@
       "--wasm-stack-switching-stack-size=4"
     ],
     "wazigModuleSizes": {
-      "rawBytes": 1807,
-      "withExportedStackPointerBytes": 1791,
-      "compileTimeMs": 16018.07
+      "rawBytes": 1665,
+      "withExportedStackPointerBytes": 1665,
+      "compileTimeMs": 8437.72
     },
     "realWazigZigModule": {
       "label": "wazig_real_zig_module",
@@ -495,14 +495,14 @@
         "collidingAddresses": 56,
         "sampleCollisions": [
           {
-            "bufPtr": "0xffffb0",
+            "bufPtr": "0xffffc0",
             "fibersSharingAddress": [
               1,
               32
             ]
           },
           {
-            "bufPtr": "0xffff60",
+            "bufPtr": "0xffff80",
             "fibersSharingAddress": [
               2,
               13,
@@ -510,7 +510,7 @@
             ]
           },
           {
-            "bufPtr": "0xffff10",
+            "bufPtr": "0xffff40",
             "fibersSharingAddress": [
               3,
               14,
@@ -518,7 +518,7 @@
             ]
           },
           {
-            "bufPtr": "0xfffec0",
+            "bufPtr": "0xffff00",
             "fibersSharingAddress": [
               4,
               18,
@@ -527,7 +527,7 @@
             ]
           },
           {
-            "bufPtr": "0xfffe70",
+            "bufPtr": "0xfffec0",
             "fibersSharingAddress": [
               5,
               9,
@@ -539,37 +539,37 @@
         "sampleDepth20Addresses": [
           {
             "fiberId": 1,
-            "bufPtrHex": "0xffffb0",
-            "bufPtrDec": 16777136
+            "bufPtrHex": "0xffffc0",
+            "bufPtrDec": 16777152
           },
           {
             "fiberId": 2,
-            "bufPtrHex": "0xffff60",
-            "bufPtrDec": 16777056
+            "bufPtrHex": "0xffff80",
+            "bufPtrDec": 16777088
           },
           {
             "fiberId": 3,
-            "bufPtrHex": "0xffff10",
-            "bufPtrDec": 16776976
+            "bufPtrHex": "0xffff40",
+            "bufPtrDec": 16777024
           },
           {
             "fiberId": 4,
+            "bufPtrHex": "0xffff00",
+            "bufPtrDec": 16776960
+          },
+          {
+            "fiberId": 5,
             "bufPtrHex": "0xfffec0",
             "bufPtrDec": 16776896
           },
           {
-            "fiberId": 5,
-            "bufPtrHex": "0xfffe70",
-            "bufPtrDec": 16776816
-          },
-          {
             "fiberId": 6,
-            "bufPtrHex": "0xfffe20",
-            "bufPtrDec": 16776736
+            "bufPtrHex": "0xfffe80",
+            "bufPtrDec": 16776832
           }
         ],
-        "totalElapsedMs": 2.553,
-        "nsPerContinuationSwitch": 2553
+        "totalElapsedMs": 2.436,
+        "nsPerContinuationSwitch": 2436
       },
       "switchedMode": {
         "mode": "per_continuation_stack_pointer_switched",
@@ -587,47 +587,47 @@
         "sampleDepth20Addresses": [
           {
             "fiberId": 1,
-            "bufPtrHex": "0x1004350",
-            "bufPtrDec": 16794448
+            "bufPtrHex": "0x1004360",
+            "bufPtrDec": 16794464
           },
           {
             "fiberId": 2,
-            "bufPtrHex": "0x1008350",
-            "bufPtrDec": 16810832
+            "bufPtrHex": "0x1008360",
+            "bufPtrDec": 16810848
           },
           {
             "fiberId": 3,
-            "bufPtrHex": "0x100c350",
-            "bufPtrDec": 16827216
+            "bufPtrHex": "0x100c360",
+            "bufPtrDec": 16827232
           },
           {
             "fiberId": 4,
-            "bufPtrHex": "0x1010350",
-            "bufPtrDec": 16843600
+            "bufPtrHex": "0x1010360",
+            "bufPtrDec": 16843616
           },
           {
             "fiberId": 5,
-            "bufPtrHex": "0x1014350",
-            "bufPtrDec": 16859984
+            "bufPtrHex": "0x1014360",
+            "bufPtrDec": 16860000
           },
           {
             "fiberId": 6,
-            "bufPtrHex": "0x1018350",
-            "bufPtrDec": 16876368
+            "bufPtrHex": "0x1018360",
+            "bufPtrDec": 16876384
           }
         ],
-        "totalElapsedMs": 2.325,
-        "nsPerContinuationSwitch": 2325
+        "totalElapsedMs": 2.012,
+        "nsPerContinuationSwitch": 2012
       },
       "warmedThroughput20kSwitches": {
-        "sharedNsPerSwitch": 1461,
-        "switchedNsPerSwitch": 1611,
-        "overheadNsPerSwitch": 150
+        "sharedNsPerSwitch": 1515,
+        "switchedNsPerSwitch": 1461,
+        "overheadNsPerSwitch": -54
       },
       "rawGlobal0SaveRestoreBenchmark": {
         "iterations": 500000,
-        "totalMs": 19.478,
-        "nsPerSaveRestorePair": 38.96,
+        "totalMs": 19.444,
+        "nsPerSaveRestorePair": 38.89,
         "checksum": 33538048
       }
     },
@@ -720,8 +720,8 @@
             "bufPtrDec": 65920
           }
         ],
-        "totalElapsedMs": 2.295,
-        "nsPerContinuationSwitch": 2295
+        "totalElapsedMs": 2.424,
+        "nsPerContinuationSwitch": 2424
       },
       "switchedMode": {
         "mode": "per_continuation_stack_pointer_switched",
@@ -768,18 +768,18 @@
             "bufPtrDec": 180288
           }
         ],
-        "totalElapsedMs": 1.661,
-        "nsPerContinuationSwitch": 1661
+        "totalElapsedMs": 1.63,
+        "nsPerContinuationSwitch": 1630
       },
       "warmedThroughput20kSwitches": {
-        "sharedNsPerSwitch": 1038,
-        "switchedNsPerSwitch": 1313,
-        "overheadNsPerSwitch": 275
+        "sharedNsPerSwitch": 1004,
+        "switchedNsPerSwitch": 1264,
+        "overheadNsPerSwitch": 260
       },
       "rawGlobal0SaveRestoreBenchmark": {
         "iterations": 500000,
-        "totalMs": 19.387,
-        "nsPerSaveRestorePair": 38.77,
+        "totalMs": 21.044,
+        "nsPerSaveRestorePair": 42.09,
         "checksum": 114688
       }
     }

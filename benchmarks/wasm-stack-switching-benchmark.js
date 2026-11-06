@@ -40,17 +40,22 @@ const WAZIG_MASTER_CACHE = existsSync(path.join(CACHE_ROOT, 'wazig-master-caches
   ? path.join(CACHE_ROOT, 'wazig-master-caches', 'wazig')
   : path.join('/d/zigar-worktrees/.cache', 'wazig-master-caches', 'wazig');
 
+const LOCAL_BIN_DIR = path.join(os.homedir(), '.local', 'bin');
+if (existsSync(LOCAL_BIN_DIR) && !(process.env.PATH || '').split(':').includes(LOCAL_BIN_DIR)) {
+  process.env.PATH = `${LOCAL_BIN_DIR}:${process.env.PATH || ''}`;
+}
+
 const NODE24_BIN = process.env.NODE24_BIN || (existsSync('/opt/actions-runner/2.338.0/externals/node24/bin/node')
   ? '/opt/actions-runner/2.338.0/externals/node24/bin/node'
   : process.execPath);
-const WAZIG_BIN = process.env.WAZIG_BIN || (existsSync('/d/zig/wazig/bin/wazig') ? '/d/zig/wazig/bin/wazig' : '/home/g/.local/bin/wazig');
-const ZIG_BIN = process.env.ZIG_BIN || '/home/g/.local/bin/zig';
+const WAZIG_BIN = process.env.WAZIG_BIN || (existsSync(path.join(LOCAL_BIN_DIR, 'wazig')) ? path.join(LOCAL_BIN_DIR, 'wazig') : 'wazig');
+const ZIG_BIN = process.env.ZIG_BIN || (existsSync(path.join(LOCAL_BIN_DIR, 'zig')) ? path.join(LOCAL_BIN_DIR, 'zig') : 'zig');
 const WASM_TOOLS_BIN = process.env.WASM_TOOLS_BIN || '/d/jco/submodules/wasm-tools/target/release/wasm-tools';
 const JSCO_DIR = process.env.JSCO_DIR || '/d/jsco';
 const DEFAULT_JSON_OUT = path.join(__dirname, 'stack-switching-results.json');
 
 // Recursive Zig + WASI P1 (`fd_read`/`fd_write`) + JSPI (`async_yield`) benchmark kernel
-// compiled by `wazig` (`0.17.0-wazig.3`) with `-target wasm32-wasi -O ReleaseSmall -fno-entry -rdynamic --export=__stack_pointer`.
+// compiled by `wazig` (`0.17.0-wazig.4`) with `-target wasm32-wasi -O ReleaseSmall -fno-entry -rdynamic --export=__stack_pointer`.
 const STACK_BENCH_ZIG_SOURCE = `const std = @import("std");
 
 extern "wasi_snapshot_preview1" fn fd_read(fd: i32, iovs_ptr: [*]const std.os.wasi.iovec_t, iovs_len: usize, nread_ptr: *usize) i32;
@@ -359,7 +364,7 @@ function inspectWasmBinaryBuffer(buf) {
 }
 
 // ---------------------------------------------------------------------------
-// Compile `stack_bench.zig` via `wazig` (`0.17.0-wazig.3`)
+// Compile `stack_bench.zig` via `wazig` (`0.17.0-wazig.4`)
 // ---------------------------------------------------------------------------
 
 function compileWazigBenchmarkModule(workDir) {
@@ -854,7 +859,7 @@ async function runWorkerMode(mode, payloadJson) {
   if (mode === 'dim5-ecosystem') {
     const results = [];
 
-    // 1. Verify freshly compiled `wazig` (`0.17.0-wazig.3`) recursive async WASI `fd_read`/`fd_write` module
+    // 1. Verify freshly compiled `wazig` (`0.17.0-wazig.4`) recursive async WASI `fd_read`/`fd_write` module
     {
       let readCount = 0;
       let writeCount = 0;

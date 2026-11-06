@@ -13,7 +13,8 @@ permissions:
 env:
   GHR_VERSION: v0.10.2
   WASMTIME_VERSION: v50.0.1
-  WAZIG_VERSION: v0.17.0-wazig.3
+  WAZIG_VERSION: v0.17.0-wazig.4
+  WAZIGL_VERSION: v0.17.0-wazigl.4
   ZIG_VERSION: v0.17.0
 
 jobs:
@@ -220,6 +221,11 @@ jobs:
           WAZIG_END_MS=$(date +%s%3N)
           WAZIG_INSTALL_MS=$((WAZIG_END_MS - WAZIG_START_MS))
 
+          WAZIGL_START_MS=$(date +%s%3N)
+          ghr install --skip-attestation "cataggar/zig@${WAZIGL_VERSION}"
+          WAZIGL_END_MS=$(date +%s%3N)
+          WAZIGL_INSTALL_MS=$((WAZIGL_END_MS - WAZIGL_START_MS))
+
           ZIG_START_MS=$(date +%s%3N)
           ghr install --skip-attestation "cataggar/zig@${ZIG_VERSION}"
           ZIG_END_MS=$(date +%s%3N)
@@ -227,9 +233,11 @@ jobs:
 
           wasmtime --version
           wazig version
+          wazigl version
           zig version
 
           WAZIG_UNIT_SIZE=$(du -sh "$HOME/.local/share/ghr/tools/_v2/units/u-cataggar/u-zig/u-wazig/_unit" | cut -f1)
+          WAZIGL_UNIT_SIZE=$(du -sh "$HOME/.local/share/ghr/tools/_v2/units/u-cataggar/u-zig/u-wazigl/_unit" | cut -f1)
           ZIG_UNIT_SIZE=$(du -sh "$HOME/.local/share/ghr/tools/_v2/units/u-cataggar/u-zig/_unit" | cut -f1)
 
           {
@@ -238,6 +246,7 @@ jobs:
             echo "| Toolchain | Release | Install Time (ms) | Installed Size |"
             echo "| --- | --- | ---: | ---: |"
             echo "| \`wazig\` | \`cataggar/zig@${WAZIG_VERSION}\` | ${WAZIG_INSTALL_MS} ms | ${WAZIG_UNIT_SIZE} |"
+            echo "| \`wazigl\` (Wasm + LLVM) | \`cataggar/zig@${WAZIGL_VERSION}\` | ${WAZIGL_INSTALL_MS} ms | ${WAZIGL_UNIT_SIZE} |"
             echo "| \`wasmtime\` (runtime) | \`bytecodealliance/wasmtime@${WASMTIME_VERSION}\` | ${WASMTIME_INSTALL_MS} ms | - |"
             echo "| \`zig\` (native x86_64-linux) | \`cataggar/zig@${ZIG_VERSION}\` | ${ZIG_INSTALL_MS} ms | ${ZIG_UNIT_SIZE} |"
             echo ""

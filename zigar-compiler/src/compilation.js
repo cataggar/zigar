@@ -429,8 +429,12 @@ export async function createConfig(srcPath, modPath, options = {}) {
   const cHeaderPath = await findModuleFile(moduleDir, 'build.extra.h');
   // add package manager manifest
   const packageConfigPath = await findModuleFile(moduleDir, 'build.zig.zon');
+  const isWazigPath = Boolean(
+    (zigPathOption && basename(zigPathOption).startsWith('wazig')) ||
+    (!zigPathOption && process.env.ZIG_PATH && basename(process.env.ZIG_PATH).startsWith('wazig'))
+  );
   const useBuildExe = Boolean(
-    modulePath && (useBuildExeOption ?? (isWASM && !hasCustomBuildFile && !extraFilePath && !packageConfigPath && !zigArgsStr.trim() && useLLVM !== true))
+    modulePath && (useBuildExeOption ?? (isWASM && !hasCustomBuildFile && !extraFilePath && !packageConfigPath && !zigArgsStr.trim() && (useLLVM !== true || isWazigPath)))
   );
   let useWazig;
   let zigPath;
