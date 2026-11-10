@@ -1,11 +1,12 @@
 import { expect } from 'chai';
-import { existsSync, mkdirSync, rmSync } from 'fs';
+import { execFile } from 'child_process';
+import { cpSync, existsSync, mkdirSync, rmSync } from 'fs';
 import { readFile, writeFile } from 'fs/promises';
 import 'mocha-skip-if';
-import os from 'os';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
-import { compile } from '../src/compilation.js';
+import { promisify } from 'util';
+import { compile, runWit } from '../src/compilation.js';
 import { transpile } from '../src/transpilation.js';
 import {
   ensureStackPointerExport,
@@ -16,8 +17,11 @@ import {
   stripUnused,
 } from '../src/wasm-decoding.js';
 
+const execFileAsync = promisify(execFile);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const TMP_ROOT = join(os.tmpdir(), `wit-zigar-bridge-test-${process.pid}`);
+const WORKTREE_CACHE_DIR = resolve(__dirname, '../../.cache');
+const TMP_BASE = process.env.TMPDIR || join(WORKTREE_CACHE_DIR, 'tmp');
+const TMP_ROOT = join(TMP_BASE, `wit-zigar-bridge-test-${process.pid}`);
 const LOCAL_CACHE_DIR = join(TMP_ROOT, 'zig-cache');
 const GLOBAL_CACHE_DIR = process.env.ZIG_GLOBAL_CACHE_DIR || join(TMP_ROOT, 'zig-global-cache');
 const XDG_CACHE_DIR = process.env.XDG_CACHE_HOME || join(TMP_ROOT, 'xdg-cache');
@@ -33,13 +37,12 @@ const WAZIG_BIN = existsSync(join(LOCAL_BIN_DIR, 'wazig'))
   : (existsSync('/d/zig/wazig/bin/wazig') ? '/d/zig/wazig/bin/wazig' : 'wazig');
 const SERVICE_ZIG_PATH = fileURLToPath(new URL('./zig-samples/wit-zigar/service.zig', import.meta.url));
 
-for (const dir of [ TMP_ROOT, LOCAL_CACHE_DIR, GLOBAL_CACHE_DIR, XDG_CACHE_DIR, BUILD_DIR, MODULE_OUT_DIR ]) {
-  mkdirSync(dir, { recursive: true });
-}
-process.env.ZIG_LOCAL_CACHE_DIR = LOCAL_CACHE_DIR;
-process.env.ZIG_GLOBAL_CACHE_DIR = GLOBAL_CACHE_DIR;
-process.env.XDG_CACHE_HOME = XDG_CACHE_DIR;
-process.env.TMPDIR = TMP_ROOT;
+const prevEnv = {
+  ZIG_LOCAL_CACHE_DIR: process.env.ZIG_LOCAL_CACHE_DIR,
+  ZIG_GLOBAL_CACHE_DIR: process.env.ZIG_GLOBAL_CACHE_DIR,
+  XDG_CACHE_HOME: process.env.XDG_CACHE_HOME,
+  TMPDIR: process.env.TMPDIR,
+};
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -88,6 +91,14 @@ describe('wit-zigar + zigar + wazig End-to-End Bridge (Issue #19)', function() {
   let transpiledArtifacts;
 
   before(async function() {
+    for (const dir of [ TMP_ROOT, LOCAL_CACHE_DIR, GLOBAL_CACHE_DIR, XDG_CACHE_DIR, BUILD_DIR, MODULE_OUT_DIR ]) {
+      mkdirSync(dir, { recursive: true });
+    }
+    process.env.ZIG_LOCAL_CACHE_DIR = LOCAL_CACHE_DIR;
+    process.env.ZIG_GLOBAL_CACHE_DIR = GLOBAL_CACHE_DIR;
+    process.env.XDG_CACHE_HOME = XDG_CACHE_DIR;
+    process.env.TMPDIR = TMP_ROOT;
+
     transpiledArtifacts = await transpileAndImportService({
       optimize: 'ReleaseSmall',
       stripWASM: true,
@@ -100,6 +111,13 @@ describe('wit-zigar + zigar + wazig End-to-End Bridge (Issue #19)', function() {
 
   after(async function() {
     await serviceMod?.__zigar?.abandon();
+    for (const [ key, val ] of Object.entries(prevEnv)) {
+      if (val === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = val;
+      }
+    }
     rmSync(TMP_ROOT, { recursive: true, force: true });
   });
 
@@ -382,5 +400,145 @@ describe('wit-zigar + zigar + wazig End-to-End Bridge (Issue #19)', function() {
     for (let i = 1; i < sortedSp.length; i++) {
       expect(sortedSp[i] - sortedSp[i - 1]).to.be.at.least(8192);
     }
+  });
+
+  it('should execute zigar wit subcommand via runWit and CLI entry points (Issue #29)', async function() {
+    const witCliBuildDir = join(BUILD_DIR, 'wit-cli');
+    const witOpts = {
+      silent: true,
+      zigPath: WAZIG_BIN,
+      buildDir: witCliBuildDir,
+    };
+
+    // 1. Verify `zigar wit --help`
+    const helpRes = await runWit([ '--help' ], witOpts);
+    expect(helpRes.code).to.equal(0);
+    expect(helpRes.stdout).to.include('Usage:\n  zigar wit <file.wit | dir>');
+    expect(helpRes.stdout).to.include('zigar wit --wasi');
+    expect(helpRes.stdout).to.include('zigar wit --detect-zigar-abi');
+
+    // 2. Generate Zig bindings from sample.wit to an output file
+    const sampleWitPath = resolve(__dirname, '../../wit-zigar/test/fixtures/sample.wit');
+    const outZigPath = join(TMP_ROOT, 'generated-sample.zig');
+    const genFileRes = await runWit([ sampleWitPath, '-o', outZigPath ], witOpts);
+    expect(genFileRes.code).to.equal(0);
+    const generatedZig = await readFile(outZigPath, 'utf8');
+    expect(generatedZig).to.include('pub const world_name = "zigar:sample/sample-world@0.1.0";');
+    expect(generatedZig).to.include('pub const Rect = extern struct');
+    expect(generatedZig).to.include('pub const transform_rect_Fn');
+
+    // 3. Generate Memory64 WASI 0.3 bindings via `--wasi` and `--wasm64`
+    const wasiRes = await runWit([ '--wasi', 'wasi:cli/imports@0.3.0', '--wasm64' ], witOpts);
+    expect(wasiRes.code).to.equal(0);
+    expect(wasiRes.stdout).to.include('pub const world_name = "wasi:cli/imports@0.3.0";');
+    expect(wasiRes.stdout).to.include('pub const is_wasm64 = true;');
+    expect(wasiRes.stdout).to.include('pub const get_arguments_Fn');
+
+    // 4. Inspect Wasm binaries with and without a "zigar:abi" custom section
+    const minimalWasm = new Uint8Array([ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 ]);
+    const wasmWithoutAbiPath = join(TMP_ROOT, 'plain.wasm');
+    await writeFile(wasmWithoutAbiPath, minimalWasm);
+
+    const ifaceStr = Buffer.from('zigar:sample/guest-service@0.1.0', 'utf8');
+    const funcStr = Buffer.from('transform-rect', 'utf8');
+    const exportStr = Buffer.from('__zigar_fast_zigar:sample/guest-service@0.1.0#transform_rect', 'utf8');
+    const abiPayloadLen = 20 + 4 + ifaceStr.length + 4 + funcStr.length + 4 + exportStr.length + 20;
+    const abiPayloadBuf = new ArrayBuffer(abiPayloadLen);
+    const abiPayloadDV = new DataView(abiPayloadBuf);
+    const abiPayloadBytes = new Uint8Array(abiPayloadBuf);
+    let pos = 0;
+    abiPayloadBytes.set(Buffer.from('ZGAR', 'ascii'), pos); pos += 4;
+    abiPayloadDV.setUint16(pos, 1, true); pos += 2; // version = 1
+    abiPayloadDV.setUint16(pos, 4, true); pos += 2; // flags: zero_copy_slices = true
+    abiPayloadDV.setBigUint64(pos, 0x99n, true); pos += 8; // world_hash
+    abiPayloadDV.setUint32(pos, 1, true); pos += 4; // entry_count = 1
+    for (const s of [ ifaceStr, funcStr, exportStr ]) {
+      abiPayloadDV.setUint32(pos, s.length, true); pos += 4;
+      abiPayloadBytes.set(s, pos); pos += s.length;
+    }
+    abiPayloadDV.setBigUint64(pos, 0xcafe1234n, true); pos += 8; // abi_hash
+    abiPayloadDV.setUint32(pos, 52, true); pos += 4; // arg_struct_size
+    abiPayloadDV.setUint32(pos, 4, true); pos += 4; // arg_struct_align
+    abiPayloadDV.setUint32(pos, 2, true); pos += 4; // flags: FLAG_IS_BLITTABLE_ONLY
+
+    const parsedMinimal = parseBinary(new DataView(minimalWasm.buffer));
+    parsedMinimal.sections.push({
+      type: SectionType.Custom,
+      name: 'zigar:abi',
+      data: abiPayloadDV,
+    });
+    const repackedDV = repackBinary({
+      sections: parsedMinimal.sections,
+      size: parsedMinimal.size + abiPayloadLen + 32,
+    });
+    const wasmWithAbiPath = join(TMP_ROOT, 'with-zigar-abi.wasm');
+    await writeFile(
+      wasmWithAbiPath,
+      new Uint8Array(repackedDV.buffer, repackedDV.byteOffset, repackedDV.byteLength)
+    );
+
+    const detectPresentRes = await runWit([ '--detect-zigar-abi', wasmWithAbiPath ], witOpts);
+    expect(detectPresentRes.code).to.equal(0);
+    expect(detectPresentRes.stdout).to.include('zigar:abi v1');
+    expect(detectPresentRes.stdout).to.include(
+      'zigar:sample/guest-service@0.1.0#transform-rect -> __zigar_fast_zigar:sample/guest-service@0.1.0#transform_rect'
+    );
+
+    const detectAbsentRes = await runWit([ '--detect-zigar-abi', wasmWithoutAbiPath ], witOpts);
+    expect(detectAbsentRes.code).to.equal(0);
+    expect(detectAbsentRes.stdout).to.include('No "zigar:abi" section present.');
+
+    // 5. Directory input with deps/ and relative `-o` path using `cwd` option
+    const witDirRoot = join(TMP_ROOT, 'wit-dir-input');
+    mkdirSync(join(witDirRoot, 'deps', 'dep-pkg'), { recursive: true });
+    await writeFile(
+      join(witDirRoot, 'deps', 'dep-pkg', 'dep.wit'),
+      'package acme:dep-pkg@0.1.0;\ninterface shared {\n  record token { id: u64 }\n}\n',
+      'utf8'
+    );
+    await writeFile(
+      join(witDirRoot, 'main.wit'),
+      'package acme:app@0.1.0;\ninterface api {\n  use acme:dep-pkg/shared@0.1.0.{token};\n  verify: func(t: token) -> bool;\n}\nworld app-world {\n  import acme:dep-pkg/shared@0.1.0;\n  import api;\n}\n',
+      'utf8'
+    );
+    const dirRes = await runWit([ '.', '-o', 'rel-dir-out.zig' ], {
+      ...witOpts,
+      cwd: witDirRoot,
+    });
+    expect(dirRes.code).to.equal(0);
+    const relDirGenerated = await readFile(join(witDirRoot, 'rel-dir-out.zig'), 'utf8');
+    expect(relDirGenerated).to.include('pub const Token = extern struct');
+    expect(relDirGenerated).to.include('pub const verify_Fn');
+
+    // 6. Verify non-zero exit code on invalid / missing CLI arguments
+    const errRes = await runWit([ '--unknown-flag' ], witOpts);
+    expect(errRes.code).to.not.equal(0);
+    expect(errRes.stderr).to.include('UnknownOption');
+
+    // 7. End-to-end CLI binary execution for `zigar wit --help` and `node-zigar help`
+    cpSync(witCliBuildDir, join(TMP_ROOT, 'zigar-build'), { recursive: true });
+    const cliEnv = {
+      ...process.env,
+      TMPDIR: TMP_ROOT,
+      ZIG_PATH: WAZIG_BIN,
+    };
+    const zigarCliPath = resolve(__dirname, '../bin/cli.js');
+    const { stdout: zigarWitHelpStdout } = await execFileAsync(
+      process.execPath,
+      [ zigarCliPath, 'wit', '--help' ],
+      { env: cliEnv }
+    );
+    expect(zigarWitHelpStdout).to.include('Usage:\n  zigar wit <file.wit | dir>');
+    expect(zigarWitHelpStdout).to.include('zigar wit --wasi');
+    expect(zigarWitHelpStdout).to.include('zigar wit --detect-zigar-abi');
+
+    const nodeZigarCliPath = resolve(__dirname, '../../node-zigar/bin/cli.js');
+    const { stdout: nodeZigarHelpStdout } = await execFileAsync(
+      process.execPath,
+      [ nodeZigarCliPath, 'help' ],
+      { env: cliEnv }
+    );
+    expect(nodeZigarHelpStdout).to.include('wit [args]');
+    expect(nodeZigarHelpStdout).to.include('Generate Zig bindings from WIT or inspect zigar:abi sections');
   });
 });

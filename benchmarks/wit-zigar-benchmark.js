@@ -111,7 +111,7 @@ async function benchAsync(fn, iterations, warmup = Math.min(500, Math.max(50, Ma
 
 function buildInWasmAbiHarness() {
   const genZigPath = path.join(TMP_ROOT, 'generated_sample.zig');
-  // Generate bindings for wit-zigar/test/fixtures/sample.wit using zig run on wit-zigar CLI
+  // Generate bindings for wit-zigar/test/fixtures/sample.wit using zigar wit CLI
   execFileSync(
     'zig',
     [

@@ -8,6 +8,9 @@
     "./cjs": "./dist/index.cjs",
     "./transpiler": "./dist/transpiler.js"
   },
+  "bin": {
+    "zigar": "bin/cli.js"
+  },
   "type": "module",
   "directories": {
     "test": "test"
@@ -19,10 +22,13 @@
     "bench": "node ../benchmarks/wazig-benchmark.js",
     "debug": "DEV=1 TARGET=wasm BITS=32 MIXIN=track mocha --reporter spec --inspect-brk -- test/*.test.js",
     "coverage": "DEV=1 TARGET=wasm BITS=32 MIXIN=track c8 mocha -- test/*.test.js",
-    "rollup": "rollup -c rollup.config.js"
+    "rollup": "rollup -c rollup.config.js",
+    "prepack": "rm -rf zig/wit-zigar && mkdir -p zig/wit-zigar && cp -r ../wit-zigar/src zig/wit-zigar/src",
+    "postpack": "rm -rf zig/wit-zigar"
   },
   "files": [
     "dist/*",
+    "bin/*",
     "zig/*",
     "*.patch",
     "!**/.*"

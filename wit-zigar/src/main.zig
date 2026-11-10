@@ -1,21 +1,21 @@
-//! CLI entry point for `wit-zigar`: WIT-to-Zig binding generator.
+//! CLI entry point for `zigar wit` (`wit-zigar`): WIT-to-Zig binding generator.
 //!
 //! Usage:
-//!   wit-zigar <file.wit | dir> [--world <name>] [--wasm64] [-o <output.zig>]
-//!   wit-zigar --wasi <ns:pkg/world@ver> [--wasm64] [-o <output.zig>]
-//!   wit-zigar --detect-zigar-abi <path.wasm>
-//!   wit-zigar --help
+//!   zigar wit <file.wit | dir> [--world <name>] [--wasm64] [-o <output.zig>]
+//!   zigar wit --wasi <ns:pkg/world[@ver]> [--wasm64] [-o <output.zig>]
+//!   zigar wit --detect-zigar-abi <path.wasm>
+//!   zigar wit --help
 
 const std = @import("std");
 const bindgen = @import("bindgen.zig");
 const fast_abi = @import("fast_abi.zig");
 
-const usage_text =
+pub const usage_text =
     \\Usage:
-    \\  wit-zigar <file.wit | dir> [--world <name>] [--wasm64] [-o <output.zig>]
-    \\  wit-zigar --wasi <ns:pkg/world[@ver]> [--wasm64] [-o <output.zig>]
-    \\  wit-zigar --detect-zigar-abi <path.wasm>
-    \\  wit-zigar --help
+    \\  zigar wit <file.wit | dir> [--world <name>] [--wasm64] [-o <output.zig>]
+    \\  zigar wit --wasi <ns:pkg/world[@ver]> [--wasm64] [-o <output.zig>]
+    \\  zigar wit --detect-zigar-abi <path.wasm>
+    \\  zigar wit --help
     \\
     \\Options:
     \\  --world <name>             Select target WIT world name
@@ -181,7 +181,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         var file = try cwd.createFile(io, out_path, .{});
         defer file.close(io);
         var buf: [4096]u8 = undefined;
-        var fw = file.writer(io, &buf);
+        var fw = file.writerStreaming(io, &buf);
         try fw.interface.writeAll(generated);
         try fw.interface.flush();
     } else {
@@ -287,13 +287,16 @@ fn generateFromPath(
 fn writeStdout(io: std.Io, bytes: []const u8) !void {
     const stdout_file = std.Io.File.stdout();
     var buf: [4096]u8 = undefined;
-    var fw = stdout_file.writer(io, &buf);
+    var fw = stdout_file.writerStreaming(io, &buf);
     try fw.interface.writeAll(bytes);
     try fw.interface.flush();
 }
 
 test "cli main entry point and world spec parsing" {
     _ = &main;
+    try std.testing.expect(std.mem.indexOf(u8, usage_text, "zigar wit <file.wit | dir>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage_text, "zigar wit --wasi") != null);
+
     const spec = bindgen.parseWorldSpec("wasi:cli/command@0.3.0").?;
     try std.testing.expectEqualStrings("wasi", spec.namespace);
     try std.testing.expectEqualStrings("cli", spec.pkg_name);
@@ -302,11 +305,11 @@ test "cli main entry point and world spec parsing" {
 
     try std.testing.expectError(
         error.DuplicateInputPath,
-        parseCliArgs(&.{ "wit-zigar", "a.wit", "b.wit" }),
+        parseCliArgs(&.{ "zigar-wit", "a.wit", "b.wit" }),
     );
     try std.testing.expectError(
         error.ConflictingInputOptions,
-        parseCliArgs(&.{ "wit-zigar", "--wasi", "wasi:cli/imports@0.3.0", "a.wit" }),
+        parseCliArgs(&.{ "zigar-wit", "--wasi", "wasi:cli/imports@0.3.0", "a.wit" }),
     );
 
     const io = std.testing.io;
@@ -354,7 +357,7 @@ test "cli main entry point and world spec parsing" {
     try std.testing.expect(std.mem.indexOf(u8, generated, "pub const verify_Fn =") != null);
 
     // Test --detect-zigar-abi CLI parsing and formatting
-    const detect_args = try parseCliArgs(&.{ "wit-zigar", "--detect-zigar-abi", "guest.wasm" });
+    const detect_args = try parseCliArgs(&.{ "zigar-wit", "--detect-zigar-abi", "guest.wasm" });
     try std.testing.expectEqualStrings("guest.wasm", detect_args.detect_zigar_abi_path.?);
 
     const minimal_core = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };

@@ -829,6 +829,249 @@ async function test(srcPath, options) {
   return { code, stderr: await blob.text() };
 }
 
+const witWasmModuleCache = new Map();
+
+async function findWitZigarSrcDir() {
+  const candidates = [
+    node_url.fileURLToPath(new node_url.URL('../zig/wit-zigar/src', (typeof document === 'undefined' ? require('u' + 'rl').pathToFileURL(__filename).href : (_documentCurrentScript && _documentCurrentScript.tagName.toUpperCase() === 'SCRIPT' && _documentCurrentScript.src || new URL('index.cjs', document.baseURI).href)))),
+    node_url.fileURLToPath(new node_url.URL('../../wit-zigar/src', (typeof document === 'undefined' ? require('u' + 'rl').pathToFileURL(__filename).href : (_documentCurrentScript && _documentCurrentScript.tagName.toUpperCase() === 'SCRIPT' && _documentCurrentScript.src || new URL('index.cjs', document.baseURI).href)))),
+  ];
+  for (const dir of candidates) {
+    try {
+      const info = await fs.stat(node_path.join(dir, 'main.zig'));
+      if (info.isFile()) {
+        return dir;
+      }
+    } catch {}
+  }
+  throw new Error('Unable to locate wit-zigar source directory (main.zig)');
+}
+
+function resolveWitZigPath(zigPathOption, useWazigOption) {
+  if (zigPathOption !== undefined) {
+    return zigPathOption;
+  } else if (useWazigOption !== undefined) {
+    return useWazigOption ? (process.env.WA_ZIG_PATH || 'wazig') : (process.env.ZIG_PATH || 'zig');
+  } else if (process.env.ZIG_PATH) {
+    return process.env.ZIG_PATH;
+  } else if (process.env.USE_WAZIG !== undefined && process.env.USE_WAZIG !== '') {
+    const envUseWazig = !['0', 'false', 'no'].includes(process.env.USE_WAZIG.toLowerCase());
+    return envUseWazig ? 'wazig' : 'zig';
+  } else if (hasWazigCommand()) {
+    return 'wazig';
+  } else {
+    return 'zig';
+  }
+}
+
+async function runWit(args = [], options = {}) {
+  const {
+    cwd: runCwd = process.cwd(),
+    silent = false,
+    buildDir = node_path.join(os.tmpdir(), 'zigar-build'),
+    optimize = 'ReleaseSmall',
+    recompile = false,
+    zigPath: zigPathOption,
+    useWazig: useWazigOption,
+    onStart,
+    onEnd,
+  } = options;
+  const witZigarSrcDir = await findWitZigarSrcDir();
+  const zigPath = resolveWitZigPath(zigPathOption, useWazigOption);
+  const witBuildDir = node_path.join(buildDir, 'wit-zigar-cli-' + sha1(`${witZigarSrcDir}:${zigPath}`).slice(0, 8));
+  const wasmPath = node_path.join(witBuildDir, optimize, 'wit-zigar.wasm');
+  const metaPath = node_path.join(witBuildDir, optimize, 'wit-zigar.meta.json');
+  const pidPath = `${witBuildDir}.pid`;
+  await acquireLock(pidPath);
+  let wasmModule;
+  try {
+    const getWasmMTime = async () => {
+      try {
+        const stats = await fs.stat(wasmPath);
+        return stats.mtimeMs;
+      } catch {}
+    };
+    const getSavedMeta = async () => {
+      try {
+        return JSON.parse(await fs.readFile(metaPath, 'utf-8'));
+      } catch {
+        return null;
+      }
+    };
+    const [ wasmMTimeBefore, srcStats, savedMeta ] = await Promise.all([
+      getWasmMTime(),
+      getDirectoryStats(witZigarSrcDir),
+      getSavedMeta(),
+    ]);
+    const metaMatches = Boolean(
+      savedMeta &&
+      savedMeta.size === srcStats.size &&
+      savedMeta.mtimeMs === srcStats.mtimeMs &&
+      savedMeta.zigPath === zigPath
+    );
+    if (!wasmMTimeBefore || !metaMatches || wasmMTimeBefore < srcStats.mtimeMs || recompile === true) {
+      await stageDirectory(witZigarSrcDir, node_path.join(witBuildDir, 'src'), (name, isDir) => {
+        if (isDir) {
+          return !['.zig-cache', 'zig-cache', 'zig-out', 'node_modules'].includes(name);
+        }
+        return name.endsWith('.zig') || name.endsWith('.wit') || name.endsWith('.wasm') || name === 'NOTICE';
+      });
+      await createDirectory(node_path.join(witBuildDir, optimize));
+      const sharedCacheDir = node_path.join(buildDir, `.zig-cache-${sha1(zigPath).slice(0, 8)}`);
+      const localCacheDir = node_path.join(witBuildDir, '.zig-cache');
+      await syncCacheDir(sharedCacheDir, localCacheDir);
+      const zigArgs = [
+        'build-exe',
+        'src/main.zig',
+        '--cache-dir', '.zig-cache',
+        '--global-cache-dir', '.zig-cache',
+        '-target', 'wasm32-wasi',
+        '-O' + optimize,
+        '-fsingle-threaded',
+        `-femit-bin=${node_path.join(optimize, 'wit-zigar.wasm')}`,
+      ];
+      await runCompiler(zigPath, zigArgs, { cwd: witBuildDir, onStart, onEnd });
+      await syncCacheDir(localCacheDir, sharedCacheDir);
+      await fs.writeFile(metaPath, JSON.stringify({
+        size: srcStats.size,
+        mtimeMs: srcStats.mtimeMs,
+        zigPath,
+      }));
+    }
+    const wasmMTime = await getWasmMTime();
+    const cached = witWasmModuleCache.get(wasmPath);
+    if (cached && !recompile && cached.mtimeMs === wasmMTime && cached.srcMtimeMs === srcStats.mtimeMs && cached.srcSize === srcStats.size) {
+      wasmModule = cached.module;
+    } else {
+      const wasmBytes = await fs.readFile(wasmPath);
+      wasmModule = await WebAssembly.compile(wasmBytes);
+      witWasmModuleCache.set(wasmPath, {
+        mtimeMs: wasmMTime,
+        srcMtimeMs: srcStats.mtimeMs,
+        srcSize: srcStats.size,
+        module: wasmModule,
+      });
+    }
+  } finally {
+    await releaseLock(pidPath);
+  }
+  const hostRoot = node_path.parse(node_path.resolve(runCwd)).root || '/';
+  const toWasiPath = (p) => {
+    const resolved = node_path.resolve(runCwd, p);
+    const rel = node_path.relative(hostRoot, resolved);
+    if (node_path.isAbsolute(rel) || rel.startsWith('..')) {
+      throw new Error(`Path lies outside WASI preopen root (${hostRoot}): ${p}`);
+    }
+    return rel.split(node_path.sep).join('/') || '.';
+  };
+  const normalizedArgs = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = String(args[i]);
+    if (arg === '-o' || arg === '--detect-zigar-abi') {
+      normalizedArgs.push(arg);
+      if (i + 1 < args.length) {
+        normalizedArgs.push(toWasiPath(String(args[++i])));
+      }
+    } else if (arg === '--world' || arg === '--wasi') {
+      normalizedArgs.push(arg);
+      if (i + 1 < args.length) {
+        normalizedArgs.push(String(args[++i]));
+      }
+    } else if (!arg.startsWith('-')) {
+      normalizedArgs.push(toWasiPath(arg));
+    } else {
+      normalizedArgs.push(arg);
+    }
+  }
+  const origEmitWarning = process.emitWarning;
+  let WASI;
+  let wasi;
+  process.emitWarning = function(warning, ...warningArgs) {
+    const msg = typeof warning === 'string' ? warning : warning?.message;
+    if (String(msg).includes('WASI')) return;
+    return origEmitWarning.call(this, warning, ...warningArgs);
+  };
+  try {
+    ({ WASI } = await import('node:wasi'));
+    wasi = new WASI({
+      version: 'preview1',
+      args: [ 'zigar-wit', ...normalizedArgs ],
+      env: process.env,
+      preopens: { '/': hostRoot },
+      returnOnExit: true,
+    });
+  } finally {
+    process.emitWarning = origEmitWarning;
+  }
+  const rawImports = typeof wasi.getImportObject === 'function'
+    ? wasi.getImportObject()
+    : { wasi_snapshot_preview1: wasi.wasiImport };
+  const wasiImport = { ...rawImports.wasi_snapshot_preview1 };
+  const importObject = { ...rawImports, wasi_snapshot_preview1: wasiImport };
+  const origPathOpen = wasiImport.path_open;
+  if (typeof origPathOpen === 'function') {
+    wasiImport.path_open = (fd, dirflags, pathPtr, pathLen, oflags, fsRightsBase, fsRightsInheriting, fdflags, openedFdPtr) => {
+      return origPathOpen(fd, dirflags, pathPtr, pathLen, oflags, fsRightsBase, 0xfffffffn, fdflags, openedFdPtr);
+    };
+  }
+  wasiImport.proc_exit = (rval) => {
+    const exitErr = new Error(`WASI exit: ${rval}`);
+    exitErr.isWasiExit = true;
+    exitErr.code = rval >>> 0;
+    throw exitErr;
+  };
+  const origFdWrite = wasiImport.fd_write;
+  const stdoutChunks = [];
+  const stderrChunks = [];
+  let instance;
+  wasiImport.fd_write = (fd, iovsPtr, iovsLen, nwrittenPtr) => {
+    if (fd === 1 || fd === 2) {
+      const { buffer } = instance.exports.memory;
+      const view = new DataView(buffer);
+      let total = 0;
+      for (let i = 0; i < iovsLen; i++) {
+        const ptr = view.getUint32(iovsPtr + i * 8, true);
+        const len = view.getUint32(iovsPtr + i * 8 + 4, true);
+        if (len > 0) {
+          const chunk = Buffer.from(buffer.slice(ptr, ptr + len));
+          if (fd === 1) {
+            stdoutChunks.push(chunk);
+            if (!silent) {
+              process.stdout.write(chunk);
+            }
+          } else {
+            stderrChunks.push(chunk);
+            if (!silent) {
+              process.stderr.write(chunk);
+            }
+          }
+          total += len;
+        }
+      }
+      view.setUint32(nwrittenPtr, total, true);
+      return 0;
+    }
+    return origFdWrite(fd, iovsPtr, iovsLen, nwrittenPtr);
+  };
+  instance = await WebAssembly.instantiate(wasmModule, importObject);
+  let code = 0;
+  try {
+    const startResult = wasi.start(instance);
+    if (typeof startResult === 'number') {
+      code = startResult;
+    }
+  } catch (err) {
+    if (err?.isWasiExit) {
+      code = err.code;
+    } else {
+      throw err;
+    }
+  }
+  const stdout = Buffer.concat(stdoutChunks).toString('utf-8');
+  const stderr = Buffer.concat(stderrChunks).toString('utf-8');
+  return { code, stdout, stderr };
+}
+
 async function compile(srcPath, modPath, options) {
   const srcInfo = (srcPath) ? await fs.stat(srcPath) : null;
   if (srcInfo?.isDirectory()) {
@@ -1859,6 +2102,7 @@ exports.normalizePath = normalizePath;
 exports.optionsForCompile = optionsForCompile;
 exports.optionsForTranspile = optionsForTranspile;
 exports.processConfig = processConfig;
+exports.runWit = runWit;
 exports.showResult = showResult;
 exports.showStatus = showStatus;
 exports.test = test;
