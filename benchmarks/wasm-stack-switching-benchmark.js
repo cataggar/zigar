@@ -55,7 +55,7 @@ const JSCO_DIR = process.env.JSCO_DIR || '/d/jsco';
 const DEFAULT_JSON_OUT = path.join(__dirname, 'stack-switching-results.json');
 
 // Recursive Zig + WASI P1 (`fd_read`/`fd_write`) + JSPI (`async_yield`) benchmark kernel
-// compiled by `wazig` (`0.17.0-wazig.4`) with `-target wasm32-wasi -O ReleaseSmall -fno-entry -rdynamic --export=__stack_pointer`.
+// compiled by `wazig` (`0.17.0-wazig.6`) with `-target wasm32-wasi -O ReleaseSmall -fno-entry -rdynamic --export=__stack_pointer`.
 const STACK_BENCH_ZIG_SOURCE = `const std = @import("std");
 
 extern "wasi_snapshot_preview1" fn fd_read(fd: i32, iovs_ptr: [*]const std.os.wasi.iovec_t, iovs_len: usize, nread_ptr: *usize) i32;

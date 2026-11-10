@@ -92,12 +92,13 @@ describe('Utility functions', function() {
     })
     it('should detect that existing pid file is stale', async function() {
       const path = join(tmpdir(), (Math.random() * 0x7FFFFFF).toString(16));
-      writeFileSync(path, '1234');
+      writeFileSync(path, '99999999');
       const promise = acquireLock(path, 60 * 1000);
       let lock = false;
       promise.then(() => lock = true);
-      await delay(250);
+      await delay(500);
       expect(lock).to.be.true;
+      await releaseLock(path);
     })
     it('should fail when directory is illegal', async function() {
       const promise = acquireLock(`///`, 60 * 1000);

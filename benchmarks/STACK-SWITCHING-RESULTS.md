@@ -1,12 +1,13 @@
 # V8 `--experimental-wasm-growable-stacks` & `--experimental-wasm-wasmfx` — Benchmark & Prototype Results (`#14`)
 
-Empirical evaluation, prototype, and runtime integration of V8's WebAssembly stack-switching mechanisms across **`zigar-runtime`**, **`wazig` (`v0.17.0-wazig.4`)**, **`wazigl` (`v0.17.0-wazigl.4`)**, **`zig` (`0.17.0`)**, **`jsco` / `jco` (WASI P1/P2/P3)**, and **Wasmtime (`50.0.1`)**.
+Empirical evaluation, prototype, and runtime integration of V8's WebAssembly stack-switching mechanisms across **`zigar-runtime`**, **`wazig` (`v0.17.0-wazig.6`)**, **`wazigl` (`v0.17.0-wazigl.6`)**, **`zig` (`0.17.0`)**, **`jsco` / `jco` (WASI P1/P2/P3)**, and **Wasmtime (`50.0.1`)**.
 
 - **Runtime**: Node.js `v24.21.0` (V8 `13.6.233.17-node.53`, `linux-arm64`)
-- **Toolchains**: `wazig` `0.17.0-wazig.4`, `wazigl` `0.17.0-wazigl.4`, `zig` `0.17.0`, `wasmtime` `50.0.1 (c307ec81d 2026-10-29)`
+- **Toolchains**: `wazig` `0.17.0-wazig.6`, `wazigl` `0.17.0-wazigl.6`, `zig` `0.17.0`, `wasmtime` `50.0.1 (c307ec81d 2026-10-29)`
 - **Benchmark Scripts**:
   - [`benchmarks/wasm-stack-switching-benchmark.js`](./wasm-stack-switching-benchmark.js) → [`benchmarks/stack-switching-results.json`](./stack-switching-results.json)
   - [`benchmarks/wasmfx-prototype.js`](./wasmfx-prototype.js) → [`benchmarks/wasmfx-results.json`](./wasmfx-results.json)
+  - [`benchmarks/wit-zigar-benchmark.js`](./wit-zigar-benchmark.js) → [`benchmarks/wit-zigar-results.json`](./wit-zigar-results.json)
 
 ---
 
@@ -142,14 +143,14 @@ Zig, C, and Rust compile to WebAssembly using a **dual-stack ABI**:
 
 When `50` concurrent `wazig`-compiled Zig fibers (`depth = 20`, `1,000` total suspensions, each holding a `64 B` `[16]u32` stack frame on `__stack_pointer`) suspend and resolve out of order:
 
-| Mode (`wazig 0.17.0-wazig.4` `ReleaseSmall`, 50 Fibers × Depth 20) | Valid Fibers | Corrupted Fibers | Corruption Rate | Unique Frame Addresses (`expected = 1000`) | Colliding Frame Addresses | Warmed Throughput (`20k` Switches) |
+| Mode (`wazig 0.17.0-wazig.6` `ReleaseSmall`, 50 Fibers × Depth 20) | Valid Fibers | Corrupted Fibers | Corruption Rate | Unique Frame Addresses (`expected = 1000`) | Colliding Frame Addresses | Warmed Throughput (`20k` Switches) |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
 | **Shared `__stack_pointer` (Standard JSPI)** | `9 / 50` | **`41 / 50`** | **82.0%** | `808 / 1000` | **`56` collisions** (up to 4 fibers overwriting the same address) | `1,461 ns/switch` |
 | **Per-Continuation `__stack_pointer` Switched** | **`50 / 50`** | **`0 / 50`** | **0.0%** | **`1000 / 1000`** | **`0` collisions** | `1,611 ns/switch` (`+150 ns/switch` e2e; `38.96 ns` raw `global[0]` save+restore) |
 
 ### Architectural Split: `zigar-runtime` vs `wazig` / `wazigl` Compilers
 1. **JSPI + `--experimental-wasm-growable-stacks` → `zigar-runtime` + `zigar-compiler` + `wazig` / `wazigl`**:
-   - Both `wazig` (`v0.17.0-wazig.4`, via `src/link/Wasm.zig`) and `wazigl` (`v0.17.0-wazigl.4`, via `--export-if-defined=__stack_pointer` in `src/link/Lld.zig`) now export `__stack_pointer` (`global[0]`) natively by default on reactor modules. `zigar-compiler` (`stripUnused()` and `ensureStackPointerExport()` in `zigar-compiler/src/wasm-decoding.js`, called from `transpile()` in both stripped and `Debug` modes) also ensures `__stack_pointer` (`global[0]`) is exported when compiling with stock `zig`.
+   - Both `wazig` (`v0.17.0-wazig.6`, via `src/link/Wasm.zig`) and `wazigl` (`v0.17.0-wazigl.6`, via `--export-if-defined=__stack_pointer` in `src/link/Lld.zig`) now export `__stack_pointer` (`global[0]`) natively by default on reactor modules. `zigar-compiler` (`stripUnused()` and `ensureStackPointerExport()` in `zigar-compiler/src/wasm-decoding.js`, called from `transpile()` in both stripped and `Debug` modes) also ensures `__stack_pointer` (`global[0]`) is exported when compiling with stock `zig`.
    - `zigar-runtime` (`module-loading.js`, `call-marshaling-outbound.js`, `call-marshaling-inbound.js`) supports `{ useJSPI: true, continuationStackSize }`:
      - Wraps `_handleJscall` and WASI syscalls in `new WebAssembly.Suspending(...)` and `runThunk` / `runVariadicThunk` in `WebAssembly.promising(...)` (note: under `useJSPI: true`, outbound Zig calls return Promises, while async generators return `AsyncGenerator` directly).
      - Allocates and pools 16-byte-aligned linear shadow stacks via `allocateScratchMemory` (`continuationStackPool`, with `0xdeadbeef` stack-bottom canary checks), saving `exports.__stack_pointer.value` upon entering `wrapSuspending` and restoring it in the `.then(...)` handler before returning to V8's `WebAssembly.Suspending` resumption path.
@@ -164,7 +165,7 @@ All tested binaries validate, compile, instantiate, and execute with V8's `--exp
 
 | Ecosystem | Binary | Format | Size (`B`) | Core Modules | `global[0]` (`__stack_pointer`) | Exported `__stack_pointer` | V8 Growable Stacks Execution (`4 KB` initial stack) |
 | :--- | :--- | :--- | ---: | ---: | :--- | :--- | :--- |
-| **`wazig` `0.17.0-wazig.4`** | `stack_bench.wasm` | `core-module` | `1,676` | `1` | `mut i32 = 262144` | `true` (default in `wazig` & `wazigl`) | **PASS** (`depth = 2000`, async WASI `fd_read`/`fd_write`, stack restored) |
+| **`wazig` `0.17.0-wazig.6`** | `stack_bench.wasm` | `core-module` | `1,611` | `1` | `mut i32 = 262144` | `true` (default in `wazig` & `wazigl`) | **PASS** (`depth = 2000`, async WASI `fd_read`/`fd_write`, stack restored) |
 | **`zigar`** | `simple.wasm` | `core-module` | `45,955` | `1` | `mut i32 = 262144` | `true` | **PASS** (`allocateScratchMemory` = `327680` + JSPI `_initialize`) |
 | **`zigar`** | `read-file.wasm` | `core-module` | `56,393` | `1` | `mut i32 = 262144` | `true` | **PASS** (`allocateScratchMemory` = `327680` + JSPI `_initialize`) |
 | **`zigar`** | `thread.wasm` | `core-module` | `82,735` | `1` | `mut i32 = 262144` | `true` | **PASS** (`allocateScratchMemory` = `16777216` + JSPI `_initialize`) |
@@ -173,4 +174,29 @@ All tested binaries validate, compile, instantiate, and execute with V8's `--exp
 | **`jsco` (WASI P3)** | `jspi_deadlock_repro.wasm` | `component-model` | `104,835` | `4` | `mut i32 = 1048576` | `false` | **PASS** (`cabi_realloc` = `1056464`, `[async-lift]...#run-repro`, `7` suspensions) |
 | **`jsco / jco` (WASI P3)** | `p3_filesystem_file_read_write.component.wasm` | `component-model` | `7,952,911` | `4` | `mut i32 = 1048576` | `false` | **PASS** (`cabi_realloc` = `1077552`, `[async-lift]wasi:cli/run#run`, `7` suspensions) |
 | **`jsco / jco` (WASI P3)** | `p3_http_echo.component.wasm` | `component-model` | `7,777,461` | `4` | `mut i32 = 1048576` | `false` | **PASS** (`cabi_realloc` = `1074256`, `[async-lift]wasi:http/handler#handle`, `7` suspensions) |
+
+---
+
+## 8. `wit-zigar` Canonical ABI (`cabi_realloc`) vs `"zigar:abi"` Comptime Fast Path & `zigar` Bridge (`#8`, `#15`, `#18`, `#19`)
+
+Benchmark script: [`benchmarks/wit-zigar-benchmark.js`](./wit-zigar-benchmark.js) → [`benchmarks/wit-zigar-results.json`](./wit-zigar-results.json)
+
+### 8.1 `wit-zigar` Component Model Canonical ABI (`CanonLower` + `CanonLift` + `cabi_post`) vs `"zigar:abi"` Fast Path (`FastLower` + `FastLift`)
+
+| Workload | Canonical ABI Median (`ns/op`) | `"zigar:abi"` Fast Path Median (`ns/op`) | Speedup (`Canon / Fast`) | Canonical `cabi_realloc` Calls / Op | `"zigar:abi"` `cabi_realloc` Calls / Op |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| **1. `transform-rect` (Blittable Nested Record, `MAX_FLAT_PARAMS = 16` boundary)** | `99.38 ns` | **`41.77 ns`** | **2.38x faster** (`23.94M` vs `10.06M ops/s`) | `0` | `0` |
+| **2. `spill-seventeen` (17 `u32` Params > `MAX_FLAT_PARAMS = 16`, heap spill)** | `167.51 ns` | **`51.15 ns`** | **3.27x faster** (`19.55M` vs `5.97M ops/s`) | `1` (`68 B` heap spill) | **`0` (in-place pointer)** |
+| **3. `inspect-record` (Nested String + `[]const f64` Slice + `option<string>` + `result`)** | `1,041.13 ns` | **`710.16 ns`** | **1.47x faster** (`1.41M` vs `0.96M ops/s`) | `10` (`440 B` copied + `cabi_post`) | **`0` (zero-copy `(ptr, len)` descriptors)** |
+| **4. WASI P3 Async Subtask (`spawn` + `subtask_wait` + `EventLoop.tick` vs Sync `FastLift`)** | `459.40 ns` | **`51.02 ns`** | **9.00x faster** (`19.60M` vs `2.18M ops/s`) | Coroutine frame + event queue | Direct comptime call |
+
+### 8.2 `zigar-runtime` End-to-End Node.js V8 Call Marshaling (`useJSPI: false` vs `useJSPI: true`, `wazig 0.17.0-wazig.6` `ReleaseFast`)
+
+| Workload (`zigar-compiler` + `zigar-runtime` on V8 `13.6`) | Sync (`useJSPI: false`) Median (`ns/op`) | JSPI (`useJSPI: true`, `WebAssembly.promising`) Median (`ns/op`) | Ratio (`JSPI / Sync`) | Notes |
+| :--- | ---: | ---: | ---: | :--- |
+| **`addI32(a, b)` (Scalar `i32` call)** | **`41.66 ns`** (`24.00M ops/s`) | `828.27 ns` (`1.21M ops/s`) | `19.88x` | Global `WebAssembly.promising` wraps sync calls in a `Promise` (`~786 ns` JSPI wrapper overhead) |
+| **`transformRect(rect, dx, dy)` (Blittable `DataView` struct)** | **`898.37 ns`** (`1.11M ops/s`) | `1,580.78 ns` (`0.63M ops/s`) | `1.76x` | Fixed-layout `DataView` copy into linear scratch memory |
+| **`sumF64Slice(Float64Array(64))` (`[]const f64` slice)** | **`982.38 ns`** (`1.02M ops/s`) | `1,819.70 ns` (`0.55M ops/s`) | `1.85x` | Shadow-memory copy + `freeShadowMemory` |
+| **`checksumBytes(Uint8Array(256))` (`[]const u8` slice)** | **`1,012.71 ns`** (`0.99M ops/s`) | `1,880.76 ns` (`0.53M ops/s`) | `1.86x` | Shadow-memory copy + `freeShadowMemory` |
+
 

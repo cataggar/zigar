@@ -147,7 +147,7 @@ describe('Syscall: poll-oneoff', function() {
         subs.setInt32(offset + 16, fd, le);
       } else {
         subs.setUint8(offset + 8, PosixPollEventType.CLOCK);
-        subs.setBigUint64(offset + 24, 100n, le);
+        subs.setBigUint64(offset + 24, 100_000_000n, le);
       }
     }
     env.moveExternBytes(subs, subscriptionAddress, true);

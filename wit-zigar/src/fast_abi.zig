@@ -991,8 +991,16 @@ pub fn storeFastValue(
             }
             inline for (st.field_names, 0..) |fname, i| {
                 if (comptime st.field_attrs[i].@"comptime") continue;
+                const FT = st.field_types[i];
                 const f_off = comptime canon.fieldOffset(T, arch, i);
-                try storeFastValue(st.field_types[i], is_memory64, mem_ctx, addr + f_off, @field(val, fname), bump_off);
+                if (comptime isDirectBlittable(FT, is_memory64)) {
+                    if (comptime @sizeOf(FT) > 0) {
+                        const field_val = @field(val, fname);
+                        @memcpy(mem_ctx.memory[off + f_off ..][0..@sizeOf(FT)], std.mem.asBytes(&field_val));
+                    }
+                } else {
+                    try storeFastValue(FT, is_memory64, mem_ctx, addr + f_off, @field(val, fname), bump_off);
+                }
             }
         },
         .optional => |op| {
@@ -1001,13 +1009,12 @@ pub fn storeFastValue(
                 mem_ctx.memory[off] = 1;
                 try storeFastValue(op.child, is_memory64, mem_ctx, addr + pay_off, payload, bump_off);
             } else {
-                @memset(mem_ctx.memory[off..][0..layout.size], 0);
+                mem_ctx.memory[off] = 0;
             }
         },
         .@"union" => |un| {
             const disc_size = comptime canon.variantDiscSize(un.field_names.len);
             const pay_off = comptime canon.variantPayloadOffset(T, arch);
-            @memset(mem_ctx.memory[off..][0..layout.size], 0);
             const active_tag = std.meta.activeTag(val);
             inline for (un.field_names, 0..) |fname, case_idx| {
                 const tag_val = @field(un.tag_type.?, fname);
@@ -1034,7 +1041,6 @@ pub fn storeFastValue(
         },
         .error_union => |eu| {
             const pay_off = comptime canon.variantPayloadOffset(T, arch);
-            @memset(mem_ctx.memory[off..][0..layout.size], 0);
             if (val) |ok_val| {
                 mem_ctx.memory[off] = 0;
                 try storeFastValue(eu.payload, is_memory64, mem_ctx, addr + pay_off, ok_val, bump_off);
@@ -1045,6 +1051,11 @@ pub fn storeFastValue(
         },
         else => unreachable,
     }
+}
+
+fn isDirectBlittable(comptime T: type, comptime is_memory64: bool) bool {
+    const wl = wireLayoutOf(T, is_memory64);
+    return wl.is_blittable and @sizeOf(T) == wl.size and !needsFlagsWordMasking(T);
 }
 
 /// Load a Zig value of type `T` from `mem_ctx.memory` at linear-memory address
@@ -1083,30 +1094,38 @@ pub fn storeFastFrame(
     if (fl.frame_align > 1 and (frame_addr % fl.frame_align != 0)) {
         return error.UnalignedPointer;
     }
-    @memset(mem_ctx.memory[frame_offset..][0..fl.header_size], 0);
+    const frame_slice = mem_ctx.memory[frame_offset..][0..fl.frame_size];
     if (fl.has_return and fl.frame_size > 0) {
         const RetT = f.return_type orelse void;
         const rl = comptime wireLayoutOf(RetT, is_memory64);
-        @memset(mem_ctx.memory[frame_offset + fl.ret_offset ..][0..rl.size], 0);
+        if (comptime !rl.is_blittable or rl.has_indirect_slices) {
+            @memset(frame_slice[fl.ret_offset..][0..rl.size], 0);
+        }
     }
     inline for (0..f.param_types.len) |i| {
         const PT = f.param_types[i].?;
-        try storeFastValue(
-            PT,
-            is_memory64,
-            mem_ctx,
-            frame_addr + fl.param_offsets[i],
-            args[i],
-            bump_off,
-        );
+        if (comptime isDirectBlittable(PT, is_memory64)) {
+            if (comptime @sizeOf(PT) > 0) {
+                @memcpy(frame_slice[fl.param_offsets[i]..][0..@sizeOf(PT)], std.mem.asBytes(&args[i]));
+            }
+        } else {
+            try storeFastValue(
+                PT,
+                is_memory64,
+                mem_ctx,
+                frame_addr + fl.param_offsets[i],
+                args[i],
+                bump_off,
+            );
+        }
     }
     if (bump_off.* > effective_limit) return error.OutOfBounds;
     const bump_addr = mem_ctx.base_addr + bump_off.*;
     const limit_addr = mem_ctx.base_addr + effective_limit;
     if (bump_addr > std.math.maxInt(PtrT)) return error.OutOfBounds;
-    std.mem.writeInt(PtrT, mem_ctx.memory[frame_offset + fl.header_bump_offset ..][0..ptr_size], @intCast(bump_addr), .little);
+    std.mem.writeInt(PtrT, frame_slice[fl.header_bump_offset..][0..ptr_size], @intCast(bump_addr), .little);
     const encoded_limit: PtrT = if (limit_addr <= std.math.maxInt(PtrT)) @intCast(limit_addr) else 0;
-    std.mem.writeInt(PtrT, mem_ctx.memory[frame_offset + fl.header_limit_offset ..][0..ptr_size], encoded_limit, .little);
+    std.mem.writeInt(PtrT, frame_slice[fl.header_limit_offset..][0..ptr_size], encoded_limit, .little);
 }
 
 /// Load all function parameters of `FnType` from the `ArgStruct` frame at
@@ -1128,11 +1147,19 @@ pub fn loadFastFrame(
     if (fl.frame_align > 1 and (frame_addr % fl.frame_align != 0)) {
         return error.UnalignedPointer;
     }
+    const frame_slice = mem_ctx.memory[frame_offset..][0..fl.frame_size];
 
     var out: ArgsTuple = undefined;
     inline for (0..f.param_types.len) |i| {
         const PT = f.param_types[i].?;
-        out[i] = try loadFastValue(PT, is_memory64, mem_ctx, frame_addr + fl.param_offsets[i]);
+        if (comptime isDirectBlittable(PT, is_memory64)) {
+            out[i] = if (comptime @sizeOf(PT) == 0)
+                @as(PT, undefined)
+            else
+                std.mem.bytesToValue(PT, frame_slice[fl.param_offsets[i]..][0..@sizeOf(PT)]);
+        } else {
+            out[i] = try loadFastValue(PT, is_memory64, mem_ctx, frame_addr + fl.param_offsets[i]);
+        }
     }
     return out;
 }
@@ -1221,11 +1248,17 @@ pub fn fastScratchLen() callconv(.c) usize {
 pub fn StackFallbackAllocator(comptime size: usize) type {
     return struct {
         buffer: [size]u8 align(16) = undefined,
+        fallback_arena: std.heap.ArenaAllocator = undefined,
         bfa: std.heap.BufferFirstAllocator = undefined,
 
         pub fn get(self: *@This(), fallback_allocator: Allocator) Allocator {
-            self.bfa = std.heap.BufferFirstAllocator.init(&self.buffer, fallback_allocator);
+            self.fallback_arena = std.heap.ArenaAllocator.init(fallback_allocator);
+            self.bfa = std.heap.BufferFirstAllocator.init(&self.buffer, self.fallback_arena.allocator());
             return self.bfa.allocator();
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.fallback_arena.deinit();
         }
     };
 }
@@ -1339,6 +1372,14 @@ pub fn FastLower(comptime FnType: type, comptime is_memory64: bool) type {
 
             if (comptime ReturnType == void) {
                 return;
+            } else if (comptime isDirectBlittable(ReturnType, is_memory64)) {
+                return if (comptime @sizeOf(ReturnType) == 0)
+                    @as(ReturnType, undefined)
+                else
+                    std.mem.bytesToValue(
+                        ReturnType,
+                        mem_ctx.memory[aligned_frame_off + frame_layout.ret_offset ..][0..@sizeOf(ReturnType)],
+                    );
             } else {
                 const ret_addr = frame_addr + frame_layout.ret_offset;
                 return loadFastValue(ReturnType, is_memory64, mem_ctx, ret_addr);
@@ -1450,26 +1491,29 @@ pub fn FastLift(comptime FnType: type, comptime impl_fn: FnType, comptime is_mem
                 if (header_bump_off > mem_ctx.memory.len) return error.OutOfBounds;
             }
 
-            // Use a 4 KB stack buffer backed by `wasm_allocator` on Wasm (or
-            // `page_allocator` on non-Wasm) when `mem_ctx.allocator == null`,
-            // so large nested slices never fail with `OutOfMemory` at 4 KB.
-            const default_fallback = if (comptime builtin.cpu.arch.isWasm())
-                std.heap.wasm_allocator
-            else
-                std.heap.page_allocator;
-            var sfa = StackFallbackAllocator(4096){};
-            const backing_alloc = mem_ctx.allocator orelse sfa.get(default_fallback);
-            var lift_arena = std.heap.ArenaAllocator.init(backing_alloc);
-            defer lift_arena.deinit();
+            // Only initialize the 4 KB stack-buffer-first allocator when the
+            // function signature actually contains indirect slices. Allocations
+            // <= 4 KB are served directly from the stack buffer with zero heap
+            // calls; larger allocations spill into `sfa.fallback_arena` and are
+            // freed on `sfa.deinit()`.
+            var sfa: if (frame_layout.has_indirect_slices) StackFallbackAllocator(4096) else void = undefined;
+            defer if (comptime frame_layout.has_indirect_slices) sfa.deinit();
+            var lift_ctx_storage: if (frame_layout.has_indirect_slices) canon.MemoryContext else void = undefined;
+            const lift_ctx_ptr: *const canon.MemoryContext = if (comptime frame_layout.has_indirect_slices) blk: {
+                lift_ctx_storage = mem_ctx.*;
+                const default_fallback = if (comptime builtin.cpu.arch.isWasm())
+                    std.heap.wasm_allocator
+                else
+                    std.heap.page_allocator;
+                lift_ctx_storage.allocator = sfa.get(mem_ctx.allocator orelse default_fallback);
+                break :blk &lift_ctx_storage;
+            } else mem_ctx;
 
-            var lift_ctx = mem_ctx.*;
-            lift_ctx.allocator = lift_arena.allocator();
+            const prev_ctx_ptr = canon.getActiveMemoryContextPtr();
+            canon.setActiveMemoryContextPtr(lift_ctx_ptr);
+            defer canon.setActiveMemoryContextPtr(prev_ctx_ptr);
 
-            const prev_canon_ctx = canon.getActiveMemoryContext();
-            canon.setActiveMemoryContext(mem_ctx.*);
-            defer canon.setActiveMemoryContext(prev_canon_ctx);
-
-            const args = try loadFastFrame(FnType, is_memory64, &lift_ctx, frame_offset);
+            const args = try loadFastFrame(FnType, is_memory64, lift_ctx_ptr, frame_offset);
             const ret_val: ReturnType = @call(.auto, impl_fn, args);
 
             if (comptime ReturnType != void) {
@@ -1479,17 +1523,36 @@ pub fn FastLift(comptime FnType: type, comptime impl_fn: FnType, comptime is_mem
                 else
                     @max(mem_ctx.fast_bump_cursor, min_bump);
 
-                var store_ctx = mem_ctx.*;
+                const ret_addr = addr_usize + frame_layout.ret_offset;
                 if (raw_limit_addr != 0) {
                     if (raw_limit_addr < mem_ctx.base_addr) return error.OutOfBounds;
                     const limit_off = raw_limit_addr - mem_ctx.base_addr;
                     if (limit_off > mem_ctx.memory.len or limit_off < min_bump) return error.OutOfBounds;
-                    store_ctx.fast_scratch_limit = limit_off;
-                    store_ctx.memory = mem_ctx.memory[0..limit_off];
+                    if (comptime isDirectBlittable(ReturnType, is_memory64)) {
+                        if (comptime @sizeOf(ReturnType) > 0) {
+                            @memcpy(
+                                mem_ctx.memory[frame_offset + frame_layout.ret_offset ..][0..@sizeOf(ReturnType)],
+                                std.mem.asBytes(&ret_val),
+                            );
+                        }
+                    } else if (limit_off != mem_ctx.effectiveFastLimit()) {
+                        var store_ctx = mem_ctx.*;
+                        store_ctx.fast_scratch_limit = limit_off;
+                        store_ctx.memory = mem_ctx.memory[0..limit_off];
+                        try storeFastValue(ReturnType, is_memory64, &store_ctx, ret_addr, ret_val, &bump_off);
+                    } else {
+                        try storeFastValue(ReturnType, is_memory64, mem_ctx, ret_addr, ret_val, &bump_off);
+                    }
+                } else if (comptime isDirectBlittable(ReturnType, is_memory64)) {
+                    if (comptime @sizeOf(ReturnType) > 0) {
+                        @memcpy(
+                            mem_ctx.memory[frame_offset + frame_layout.ret_offset ..][0..@sizeOf(ReturnType)],
+                            std.mem.asBytes(&ret_val),
+                        );
+                    }
+                } else {
+                    try storeFastValue(ReturnType, is_memory64, mem_ctx, ret_addr, ret_val, &bump_off);
                 }
-
-                const ret_addr = addr_usize + frame_layout.ret_offset;
-                try storeFastValue(ReturnType, is_memory64, &store_ctx, ret_addr, ret_val, &bump_off);
                 mem_ctx.fast_bump_cursor = bump_off;
                 const new_bump_addr = mem_ctx.base_addr + bump_off;
                 if (new_bump_addr > std.math.maxInt(PtrT)) return error.OutOfBounds;

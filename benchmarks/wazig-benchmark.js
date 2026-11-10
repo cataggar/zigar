@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Comprehensive Benchmark & Comparison Suite:
- *   wazig (v0.17.0-wazig.4) & wazigl (v0.17.0-wazigl.4) vs standard zig (0.17.0)
+ *   wazig (v0.17.0-wazig.6) & wazigl (v0.17.0-wazigl.6) vs standard zig (0.17.0)
  *
  * Dimensions measured:
  *   1. Toolchain & Distribution Footprint (archive size, installed binary + lib/ size, file counts, CLI startup latency)
@@ -9,7 +9,7 @@
  *      in-process translate-c (Aro in wazig, Clang in wazigl) vs external Clang sub-binary in zig,
  *      pure-Zig libzigc.a, out-of-the-box multithreaded WASM)
  *   3. Output .wasm Binary Size (Raw & Stripped across Debug, ReleaseSmall, ReleaseFast, ReleaseSafe;
- *      comparing upstream -lc, LLVM pure-Zig, wazigl v0.17.0-wazigl.4, upstream -fno-llvm stage2_wasm, and wazig v0.17.0-wazig.4)
+ *      comparing upstream -lc, LLVM pure-Zig, wazigl v0.17.0-wazigl.6, upstream -fno-llvm stage2_wasm, and wazig v0.17.0-wazig.6)
  *   4. Runtime Execution Performance in V8 / Node.js (Benchmarks Game & Image Processing kernels)
  *
  * Usage:
@@ -221,8 +221,8 @@ async function inspectGhrWasmToolchain(cmd, fallbackWasmBytes) {
 async function benchmarkToolchainFootprint(quick) {
   console.error('[1/4] Measuring Toolchain & Distribution Footprint (wazig vs wazigl vs zig)...');
 
-  const wazigInfo = await inspectGhrWasmToolchain('wazig', 36_486_450);
-  const waziglInfo = await inspectGhrWasmToolchain('wazigl', 206_935_216);
+  const wazigInfo = await inspectGhrWasmToolchain('wazig', 31_784_824);
+  const waziglInfo = await inspectGhrWasmToolchain('wazigl', 202_396_035);
   const wazigLibDir = wazigInfo.libDir;
 
   const zigBin = await whichCmd('zig');
@@ -292,18 +292,21 @@ async function benchmarkToolchainFootprint(quick) {
     cliLatency[label] = computeStats(samples);
   }
 
-  // Known official GitHub release archive sizes (`cataggar/zig@v0.17.0-wazig.4`, `cataggar/zig@v0.17.0-wazigl.4`, and `0.17.0`)
-  const distWazigTarZst = '/d/zig/dist/wazig.tar.zst';
-  const distWaziglTarZst = '/d/zig/dist/wazigl.tar.zst';
-  const wazigTarZstBytes = existsSync(distWazigTarZst)
-    ? (await stat(distWazigTarZst)).size
-    : 8_879_436;
-  const waziglTarZstBytes = existsSync(distWaziglTarZst)
-    ? (await stat(distWaziglTarZst)).size
-    : 38_254_006;
+  // Known official GitHub release archive sizes (`cataggar/zig@v0.17.0-wazig.6`, `cataggar/zig@v0.17.0-wazigl.6`, and `0.17.0`)
+  const WAZIG_ARCHIVE_BYTES_BY_VERSION = {
+    '0.17.0-wazig.6': 8_468_078,
+    '0.17.0-wazig.5': 8_470_112,
+    '0.17.0-wazig.4': 8_879_436,
+  };
+  const WAZIGL_ARCHIVE_BYTES_BY_VERSION = {
+    '0.17.0-wazigl.6': 38_020_297,
+    '0.17.0-wazigl.4': 38_254_006,
+  };
+  const wazigTarZstBytes = WAZIG_ARCHIVE_BYTES_BY_VERSION[wazigInfo.version] ?? 8_468_078;
+  const waziglTarZstBytes = WAZIGL_ARCHIVE_BYTES_BY_VERSION[waziglInfo.version] ?? 38_020_297;
   const releaseArchives = {
     wazigTarZstBytes, // wazig.tar.zst (universal wasm64-wasip3, self-hosted stage2_wasm + Aro)
-    waziglTarZstBytes, // wazigl.tar.zst (universal wasm64-wasip3, Wasm-hosted LLVM 21 + Clang + lld)
+    waziglTarZstBytes, // wazigl.tar.zst (universal wasm64-wasip3, Wasm-hosted LLVM 22 + Clang + lld)
     zigAarch64LinuxTarXzBytes: 52_877_280,
     zigX86_64LinuxTarXzBytes: 57_332_648,
     zigAarch64MacosTarXzBytes: 53_985_220,
@@ -340,7 +343,7 @@ async function benchmarkToolchainFootprint(quick) {
       version: waziglInfo.version,
       binPath: sanitizeHome(waziglInfo.binPath),
       unitDir: sanitizeHome(waziglInfo.unitDir),
-      target: 'wasm64-wasip3 (universal, OS/arch-independent, Wasm-hosted LLVM 21 + in-process Clang + lld)',
+      target: 'wasm64-wasip3 (universal, OS/arch-independent, Wasm-hosted LLVM 22 + in-process Clang + lld)',
       archiveName: 'wazigl.tar.zst',
       archiveBytes: releaseArchives.waziglTarZstBytes,
       compilerBinaryBytes: waziglInfo.wasmBytes,
@@ -1667,7 +1670,7 @@ function generateMarkdownReport(data) {
     `- **Mode**: \`${meta.mode}\` (\`${meta.nodeVersion}\` on \`${meta.platform}/${meta.arch}\`, \`${meta.cpuModel}\`, ${meta.cpuCores} cores)`
   );
   lines.push(
-    `- **Toolchains**: \`wazig ${toolchain.wazig.version}\` (\`wasm64-wasip3\` self-hosted \`stage2_wasm\` + Aro via Wasmtime), \`wazigl ${waziglTc.version}\` (\`wasm64-wasip3\` Wasm-hosted LLVM 21 + Clang + lld via Wasmtime), vs \`zig ${toolchain.zig.version}\` (native \`${meta.arch}-${meta.platform}\` with LLVM 21)`
+    `- **Toolchains**: \`wazig ${toolchain.wazig.version}\` (\`wasm64-wasip3\` self-hosted \`stage2_wasm\` + Aro via Wasmtime), \`wazigl ${waziglTc.version}\` (\`wasm64-wasip3\` Wasm-hosted LLVM 22 + Clang + lld via Wasmtime), vs \`zig ${toolchain.zig.version}\` (native \`${meta.arch}-${meta.platform}\` with LLVM 21)`
   );
   lines.push('');
 
@@ -1678,7 +1681,7 @@ function generateMarkdownReport(data) {
   );
   lines.push(`| :--- | :--- | :--- | :--- | :--- |`);
   lines.push(
-    `| **Download Archive Size** | \`${formatBytes(toolchain.zig.archiveBytes)}\` per OS/arch (\`${formatBytes(toolchain.zig.desktop6ArchivesTotalBytes)}\` for 6 targets) | **\`${formatBytes(waziglTc.archiveBytes)}\`** (1 universal archive with LLVM 21 + Clang) | **\`${formatBytes(toolchain.wazig.archiveBytes)}\`** (1 universal archive, self-hosted \`stage2_wasm\`) | \`wazig\`: **${toolchain.ratios.archiveDownloadReductionVsLinuxArm64}x smaller** (**${toolchain.ratios.archiveDownloadReductionVs6DesktopTargets}x** vs 6 targets); \`wazigl\`: **${toolchain.ratios.waziglArchiveReductionVsLinuxArm64}x smaller** (**${toolchain.ratios.waziglArchiveReductionVs6DesktopTargets}x** vs 6 targets) |`
+    `| **Download Archive Size** | \`${formatBytes(toolchain.zig.archiveBytes)}\` per OS/arch (\`${formatBytes(toolchain.zig.desktop6ArchivesTotalBytes)}\` for 6 targets) | **\`${formatBytes(waziglTc.archiveBytes)}\`** (1 universal archive with LLVM 22 + Clang) | **\`${formatBytes(toolchain.wazig.archiveBytes)}\`** (1 universal archive, self-hosted \`stage2_wasm\`) | \`wazig\`: **${toolchain.ratios.archiveDownloadReductionVsLinuxArm64}x smaller** (**${toolchain.ratios.archiveDownloadReductionVs6DesktopTargets}x** vs 6 targets); \`wazigl\`: **${toolchain.ratios.waziglArchiveReductionVsLinuxArm64}x smaller** (**${toolchain.ratios.waziglArchiveReductionVs6DesktopTargets}x** vs 6 targets) |`
   );
   lines.push(
     `| **Installed Disk Footprint** | \`${formatBytes(toolchain.zig.totalUncompressedBytes)}\` (\`${toolchain.zig.totalFiles.toLocaleString('en-US')}\` files) | **\`${formatBytes(waziglTc.totalUncompressedBytes)}\`** (\`${waziglTc.totalFiles.toLocaleString('en-US')}\` files) | **\`${formatBytes(toolchain.wazig.totalUncompressedBytes)}\`** (\`${toolchain.wazig.totalFiles.toLocaleString('en-US')}\` files) | \`wazig\`: **${toolchain.ratios.totalUncompressedSizeReduction}x smaller**, **${toolchain.ratios.fileCountReduction}x fewer files**; \`wazigl\`: **${toolchain.ratios.waziglTotalUncompressedSizeReduction}x smaller**, **${toolchain.ratios.waziglFileCountReduction}x fewer files** |`
@@ -1731,7 +1734,7 @@ function generateMarkdownReport(data) {
   );
   lines.push(`| :--- | ---: | ---: | ---: | ---: | ---: |`);
   lines.push(
-    `| **Distribution Target** | \`wasm64-wasip3\` (Universal, self-hosted) | \`wasm64-wasip3\` (Universal, Wasm LLVM 21) | \`${os.arch()}-${os.platform()}\` (OS/arch-specific native) | **1 universal** | **1 universal** |`
+    `| **Distribution Target** | \`wasm64-wasip3\` (Universal, self-hosted) | \`wasm64-wasip3\` (Universal, Wasm LLVM 22) | \`${os.arch()}-${os.platform()}\` (OS/arch-specific native) | **1 universal** | **1 universal** |`
   );
   lines.push(
     `| **Compressed Archive (Single Platform)** | \`${formatBytes(toolchain.wazig.archiveBytes)}\` (\`wazig.tar.zst\`) | \`${formatBytes(waziglTc.archiveBytes)}\` (\`wazigl.tar.zst\`) | \`${formatBytes(toolchain.zig.archiveBytes)}\` (\`${toolchain.zig.archiveName}\`) | **${toolchain.ratios.archiveDownloadReductionVsLinuxArm64}x smaller** | **${toolchain.ratios.waziglArchiveReductionVsLinuxArm64}x smaller** |`
@@ -1756,7 +1759,7 @@ function generateMarkdownReport(data) {
   lines.push(`### 1.2 Head-to-Head: \`wazigl\` (\`${waziglTc.version}\`) vs Baseline \`zig\` (\`${toolchain.zig.version}\`)`);
   lines.push('');
   lines.push(
-    `\`wazigl\` compiles the full **Zig + LLVM 21 + Clang + LLD (\`wasm-ld\`)** pipeline into a single portable \`wasm64-wasip3\` module (\`wazigl.wasm\`). Compared directly against baseline \`zig ${toolchain.zig.version}\`:`
+    `\`wazigl\` compiles the full **Zig + LLVM 22 + Clang + LLD (\`wasm-ld\`)** pipeline into a single portable \`wasm64-wasip3\` module (\`wazigl.wasm\`). Compared directly against baseline \`zig ${toolchain.zig.version}\`:`
   );
   lines.push('');
   const dupeSizeMod = binarySizes.modules.find(m => m.id.startsWith('dupe'));
@@ -1815,12 +1818,12 @@ function generateMarkdownReport(data) {
 
   lines.push(
     `1. **Universal Wasm Distribution & Smaller Archive**: \`wazigl.tar.zst\` is **\`${formatBytes(waziglTc.archiveBytes)}\`** for all platforms vs **\`${formatBytes(toolchain.zig.archiveBytes)}\`–\`${formatBytes(toolchain.releaseArchives.zigX86_64WindowsZipBytes)}\`** per OS/arch for native \`zig\` (**${toolchain.ratios.waziglArchiveReductionVsLinuxArm64}x smaller** than Linux \`aarch64\`, **${toolchain.ratios.waziglArchiveReductionVsWindowsX64}x smaller** than Windows \`x86_64\`, and **${toolchain.ratios.waziglArchiveReductionVs6DesktopTargets}x smaller** across 6 desktop targets).\n` +
-      `2. **${toolchain.ratios.waziglTotalUncompressedSizeReduction}x Smaller Installed Disk Footprint & ${toolchain.ratios.waziglFileCountReduction}x Fewer Files**: Even with LLVM 21 + Clang + LLD linked into \`wazigl.wasm\` (\`${formatBytes(waziglTc.compilerBinaryBytes)}\`), pruning non-Wasm target libc/C++/intrinsic headers shrinks \`lib/\` from \`${formatBytes(toolchain.zig.libBytes)}\` (\`${toolchain.zig.libFiles.toLocaleString('en-US')}\` files) to \`${formatBytes(waziglTc.libBytes)}\` (\`${waziglTc.libFiles.toLocaleString('en-US')}\` files), reducing total installed size from \`${formatBytes(toolchain.zig.totalUncompressedBytes)}\` to \`${formatBytes(waziglTc.totalUncompressedBytes)}\`.\n` +
+      `2. **${toolchain.ratios.waziglTotalUncompressedSizeReduction}x Smaller Installed Disk Footprint & ${toolchain.ratios.waziglFileCountReduction}x Fewer Files**: Even with LLVM 22 + Clang + LLD linked into \`wazigl.wasm\` (\`${formatBytes(waziglTc.compilerBinaryBytes)}\`), pruning non-Wasm target libc/C++/intrinsic headers shrinks \`lib/\` from \`${formatBytes(toolchain.zig.libBytes)}\` (\`${toolchain.zig.libFiles.toLocaleString('en-US')}\` files) to \`${formatBytes(waziglTc.libBytes)}\` (\`${waziglTc.libFiles.toLocaleString('en-US')}\` files), reducing total installed size from \`${formatBytes(toolchain.zig.totalUncompressedBytes)}\` to \`${formatBytes(waziglTc.totalUncompressedBytes)}\`.\n` +
       `3. **${(compilation.translateCMicro.zig.coldMs / tcMicroWazigl.coldMs).toFixed(1)}x Faster Cold \`translate-c\` (In-Process Clang vs External Sub-Binary)**: Baseline \`zig 0.17.0\` compiles an external \`translate-c\` binary via LLVM on a cold cache (**\`${compilation.translateCMicro.zig.coldMs.toFixed(0)} ms\`**), whereas \`wazigl\` keeps Clang's \`translate-c\` linked in-process and translates C headers in **\`${tcMicroWazigl.coldMs.toFixed(0)} ms\`** cold (**\`${tcMicroWazigl.warmMs.toFixed(0)} ms\`** warm).\n` +
       `4. **Pure-Zig \`libzigc.a\` & Out-of-the-Box Multithreaded WASM (\`thread.zig\`, \`atomic.zig\`)**: Baseline \`zig 0.17.0\` fails on \`multithreaded: true\` WASM builds (\`WasmAllocator\` unimplemented) without manually applying \`wasi-thread.patch\`. \`wazigl\` ships with \`WasmAllocator\`, WASI thread startup trampolines, and pure-Zig \`libzigc.a\` out of the box.\n` +
       `5. **Default \`__stack_pointer\` Export in \`wasm-ld\`**: \`wazigl\`'s embedded \`lld\` (\`wasm-ld\`) exports \`__stack_pointer\` by default on reactor modules alongside LLVM codegen.\n` +
       `6. **Identical Pure-Zig \`.wasm\` Sizes (${rsWzlVsLcRangeStr} Smaller Than Upstream \`-lc\`) & Pure-Zig \`libzigc.a\`**: For pure-Zig modules across \`ReleaseSmall\`, \`ReleaseFast\`, and \`ReleaseSafe\`, \`wazigl\` produces byte-for-byte identical stripped \`.wasm\` sizes to native \`zig (Pure-Zig LLVM)\` (\`${rsWzlRangeStr}\` in \`ReleaseSmall\`, **${rsWzlVsLcRangeStr} smaller** than upstream \`zig (-lc + LLVM)\` \`${rsLcRangeStr}\`), while for \`-lc\` modules (\`dupe.zig\`), \`wazigl\`'s pure-Zig \`libzigc.a\` produces **\`${formatKB(dupeRsWazigl?.strippedBytes)}\`** stripped in \`ReleaseSmall\` vs **\`${formatKB(dupeRsZigLc?.strippedBytes)}\`** for upstream \`zig -lc\` (**${(dupeRsZigLc && dupeRsWazigl ? (dupeRsZigLc.strippedBytes / dupeRsWazigl.strippedBytes) : 1.02).toFixed(2)}x smaller** without compiling C files).\n` +
-      `7. **Full V8 Runtime Execution Parity with Native \`zig (LLVM)\`**: Because \`wazigl\` uses the same LLVM 21 optimization pipeline as native \`zig\`, its generated \`.wasm\` binaries run at **1.00x parity** with native \`zig (LLVM)\` across all 13 Benchmarks Game and Image Processing workloads in Node.js V8, while trading off ~${wzlWarmVsZbRangeStr} slower warm compilation speed than \`zig build\` (~${wzlWarmVsZbeRangeStr} slower than native \`zig build-exe\`, and **${wzlCImportColdRangeStr} faster** cold compilation on C-import modules) because LLVM 21 executes inside Wasmtime rather than natively.`
+      `7. **Full V8 Runtime Execution Parity with Native \`zig (LLVM)\`**: Because \`wazigl\` uses the Wasm-hosted LLVM 22 optimization pipeline, its generated \`.wasm\` binaries run at **1.00x parity** with native \`zig (LLVM)\` across all 13 Benchmarks Game and Image Processing workloads in Node.js V8, while trading off ~${wzlWarmVsZbRangeStr} slower warm compilation speed than \`zig build\` (~${wzlWarmVsZbeRangeStr} slower than native \`zig build-exe\`, and **${wzlCImportColdRangeStr} faster** cold compilation on C-import modules) because LLVM executes inside Wasmtime rather than natively.`
   );
   lines.push('');
 
@@ -1882,7 +1885,7 @@ function generateMarkdownReport(data) {
     `| **\`wazig build-exe\` (\`${toolchain.wazig.version}\`)** | **PASS (Out-of-the-Box)** | **PASS (Pure-Zig \`libzigc.a\`)** | Built-in \`WasmAllocator\`, \`wasi_thread_start\` trampoline, \`__tls_base\`, and \`stage2_wasm\` atomics without LLVM |`
   );
   lines.push(
-    `| **\`wazigl build-exe\` (\`${waziglTc.version}\`)** | **PASS (Out-of-the-Box)** | **PASS (Pure-Zig \`libzigc.a\`)** | Built-in \`WasmAllocator\`, Wasm-hosted LLVM 21 TLS/atomics, and pure-Zig \`libzigc.a\` |`
+    `| **\`wazigl build-exe\` (\`${waziglTc.version}\`)** | **PASS (Out-of-the-Box)** | **PASS (Pure-Zig \`libzigc.a\`)** | Built-in \`WasmAllocator\`, Wasm-hosted LLVM 22 TLS/atomics, and pure-Zig \`libzigc.a\` |`
   );
   lines.push(
     `| **Standard \`zig\` (\`${toolchain.zig.version}\`, stock install)** | **FAIL** | **PASS (Heavy musl \`libc.a\`)** | \`${compilation.stockZigMultithreadedError || 'error: unimplemented (WasmAllocator)'}\` — requires manually patching \`lib/std\` with \`wasi-thread.patch\` |`
@@ -1907,7 +1910,7 @@ function generateMarkdownReport(data) {
     : '1.4';
   lines.push(
     `- **Cold \`.zig-cache\`**: Fresh \`buildDir\` with an empty \`.zig-cache\` (compiles \`compiler_rt\`, \`std\`, \`libzigc.a\`, and the module from scratch; note that \`zig build\` Warm Shared below uses an already-warmed host global cache — on a truly cold CI runner with an empty global cache, \`zig build\` takes **~107,300 ms** on its first run to compile host \`libc\` + \`build.zig\` runner vs **~9,300–16,200 ms** for \`wazig build-exe\`, a **6.6x–11.5x cold speedup** for \`wazig\`).\n` +
-      `- **Warm Shared Cache (New Module)**: Compiling a new module when \`std\`, \`compiler_rt\`, and \`libzigc.a\` are already cached in \`buildDir\` (via \`zigar-compiler\`'s hardlinked shared cache). \`wazig build-exe\` (~${simpleWbeWarmS}s) is **~${simpleWbeVsZb}x faster** than upstream \`zig build\` (~${simpleZbWarmS}s) and **~${simpleWbeVsWlbe}x faster** than \`wazigl build-exe\` (~${simpleWlbeWarmS}s, which runs LLVM 21 inside Wasmtime).\n` +
+      `- **Warm Shared Cache (New Module)**: Compiling a new module when \`std\`, \`compiler_rt\`, and \`libzigc.a\` are already cached in \`buildDir\` (via \`zigar-compiler\`'s hardlinked shared cache). \`wazig build-exe\` (~${simpleWbeWarmS}s) is **~${simpleWbeVsZb}x faster** than upstream \`zig build\` (~${simpleZbWarmS}s) and **~${simpleWbeVsWlbe}x faster** than \`wazigl build-exe\` (~${simpleWlbeWarmS}s, which runs LLVM 22 inside Wasmtime).\n` +
       `- **Warm Incremental Rebuild**: Recompiling after a source edit in the same \`moduleBuildDir\`.`
   );
   lines.push('');
@@ -1949,7 +1952,7 @@ function generateMarkdownReport(data) {
     `Compares output \`.wasm\` sizes before (\`compile()\`) and after dead-code & reflection factory stripping (\`stripUnused()\`) across all 4 Zig optimization modes and 5 compiler configurations:\n` +
       `1. **Upstream \`zig\` (\`-lc\` + LLVM)**: Prior default where \`build.zig\` unconditionally linked \`libc\`.\n` +
       `2. **Standard \`zig\` (Pure-Zig + LLVM)**: \`useLibc: false\` with native LLVM 21 backend.\n` +
-      `3. **\`wazigl\` (\`${waziglTc.version}\`, Wasm-hosted LLVM + Pure-Zig \`libzigc.a\`)**: Wasm-hosted LLVM 21 backend matching native \`zig (Pure-Zig LLVM)\` on pure-Zig modules while shrinking \`-lc\` modules via pure-Zig \`libzigc.a\`.\n` +
+      `3. **\`wazigl\` (\`${waziglTc.version}\`, Wasm-hosted LLVM 22 + Pure-Zig \`libzigc.a\`)**: Wasm-hosted LLVM 22 backend matching native \`zig (Pure-Zig LLVM)\` on pure-Zig modules while shrinking \`-lc\` modules via pure-Zig \`libzigc.a\`.\n` +
       `4. **Standard \`zig\` (\`-fno-llvm\` \`stage2_wasm\`)**: Upstream self-hosted Wasm backend (**crashes \`stripUnused()\`** in \`Debug\`/\`ReleaseFast\`/\`ReleaseSafe\` due to unnormalized \`host.wasm.getFactoryThunk__func_*\` name section entries, **fails to link \`-lc\`**, and **fails to strip reflection metadata in \`ReleaseSmall\`** because \`getFactoryThunk\` is not inlined).\n` +
       `5. **\`wazig\` (\`${toolchain.wazig.version}\`)**: Self-hosted \`stage2_wasm\` enhanced with SROA, \`Optimizer.zig\` leaf inlining & peephole passes, MIR dead-store/copy-propagation, MemArg offset folding, local RLE compaction, and post-link dead-function/constant pruning.`
   );
@@ -2109,11 +2112,27 @@ function generateMarkdownReport(data) {
   const rtRatioRangeStr = rtRatios.length
     ? `${Math.min(...rtRatios).toFixed(2)}x–${Math.max(...rtRatios).toFixed(2)}x`
     : '1.08x–7.11x';
+  const dbgWzRawKiBs = binarySizes.modules
+    .map(m => m.byOptimize?.Debug?.wazig?.rawBytes)
+    .filter(Boolean)
+    .map(b => Math.round(b / 1024));
+  const dbgWzStripKiBs = binarySizes.modules
+    .map(m => m.byOptimize?.Debug?.wazig?.strippedBytes)
+    .filter(Boolean)
+    .map(b => Math.round(b / 1024));
+  const dbgWzRawRangeStr = dbgWzRawKiBs.length
+    ? `${Math.min(...dbgWzRawKiBs)}–${Math.max(...dbgWzRawKiBs)} KiB`
+    : '158–484 KiB';
+  const dbgWzStripRangeStr = dbgWzStripKiBs.length
+    ? `${Math.min(...dbgWzStripKiBs)}–${Math.max(...dbgWzStripKiBs)} KiB`
+    : '105–136 KiB';
+  const wazigArchiveMiBStr = (toolchain.wazig.archiveBytes / (1024 * 1024)).toFixed(2);
+  const waziglArchiveMiBStr = (waziglTc.archiveBytes / (1024 * 1024)).toFixed(2);
   lines.push(
-    `1. **Universal \`wasm64-wasip3\` Distribution (\`wazig\` 8.47 MiB & \`wazigl\` 36.48 MiB vs 50–100 MB Per-Platform Native \`zig\`)**: Both \`wazig\` (\`${formatBytes(toolchain.wazig.archiveBytes)}\` compressed, \`${formatBytes(toolchain.wazig.totalUncompressedBytes)}\` uncompressed across \`${toolchain.wazig.totalFiles.toLocaleString('en-US')}\` files) and \`wazigl\` (\`${formatBytes(waziglTc.archiveBytes)}\` compressed, \`${formatBytes(waziglTc.totalUncompressedBytes)}\` uncompressed across \`${waziglTc.totalFiles.toLocaleString('en-US')}\` files) run on any OS/CPU via Wasmtime — replacing 6 desktop OS/arch archives totaling \`${formatBytes(toolchain.zig.desktop6ArchivesTotalBytes)}\` (**${toolchain.ratios.archiveDownloadReductionVs6DesktopTargets}x smaller** with \`wazig\`, **${toolchain.ratios.waziglArchiveReductionVs6DesktopTargets}x smaller** with \`wazigl\`).\n` +
+    `1. **Universal \`wasm64-wasip3\` Distribution (\`wazig\` ${wazigArchiveMiBStr} MiB & \`wazigl\` ${waziglArchiveMiBStr} MiB vs 50–100 MB Per-Platform Native \`zig\`)**: Both \`wazig\` (\`${formatBytes(toolchain.wazig.archiveBytes)}\` compressed, \`${formatBytes(toolchain.wazig.totalUncompressedBytes)}\` uncompressed across \`${toolchain.wazig.totalFiles.toLocaleString('en-US')}\` files) and \`wazigl\` (\`${formatBytes(waziglTc.archiveBytes)}\` compressed, \`${formatBytes(waziglTc.totalUncompressedBytes)}\` uncompressed across \`${waziglTc.totalFiles.toLocaleString('en-US')}\` files) run on any OS/CPU via Wasmtime — replacing 6 desktop OS/arch archives totaling \`${formatBytes(toolchain.zig.desktop6ArchivesTotalBytes)}\` (**${toolchain.ratios.archiveDownloadReductionVs6DesktopTargets}x smaller** with \`wazig\`, **${toolchain.ratios.waziglArchiveReductionVs6DesktopTargets}x smaller** with \`wazigl\`).\n` +
       `2. **${tcSpeedupWazig}x Faster (\`wazig\`) & ${tcSpeedupWazigl}x Faster (\`wazigl\`) Cold \`translate-c\`**: Standard \`zig 0.17.0\` moved \`translate-c\` into an external sub-binary that takes **~${(compilation.translateCMicro.zig.coldMs / 1000).toFixed(1)} seconds** to compile on a cold cache. \`wazig\` embeds \`translate-c\` + Aro in-process (**~${compilation.translateCMicro.wazig.coldMs.toFixed(0)} ms** cold) and \`wazigl\` embeds \`translate-c\` + Clang in-process (**~${(tcMicroWazigl?.coldMs ?? 12980).toFixed(0)} ms** cold).\n` +
       `3. **Out-of-the-Box Multithreaded WASM & Pure-Zig \`libzigc.a\` in Both \`wazig\` and \`wazigl\`**: Stock \`zig 0.17.0\` fails on \`multithreaded: true\` WASM builds (\`WasmAllocator\` unimplemented) unless users manually patch their system Zig installation with \`wasi-thread.patch\`, and \`zig -fno-llvm\` fails both on multithreaded WASM (\`naked\` calling convention unsupported) and on \`-lc\` reactor modules (\`libc.a: undefined function: __main_argc_argv\`). Both \`wazig\` and \`wazigl\` support multithreaded WASM and \`-lc\` reactor modules out of the box.\n` +
-      `4. **Dramatically Smaller \`Debug\` & \`ReleaseSmall\` Binaries with Native \`__stack_pointer\` Export**: In \`Debug\` mode (Zigar's default development mode), \`wazig\` emits raw \`.wasm\` binaries **${dbgRawRatioRangeStr} smaller** than LLVM (\`185–632 KiB\` vs \`1.80–3.53 MiB\`) and stripped binaries **${dbgStripPctRangeStr} smaller** (\`123–156 KiB\` vs \`232–288 KiB\`). In \`ReleaseSmall\`, \`wazig\`'s SROA, leaf inlining, MIR peephole, and post-link optimizations produce **${rsNoLlvmRatioRangeStr} smaller** stripped binaries than upstream \`zig -fno-llvm\`, while \`wazigl\` matches native \`zig (Pure-Zig LLVM)\` byte-for-byte (**${rsWzlVsLcRangeStr} smaller** than upstream \`zig -lc\`) and links \`-lc\` modules via pure-Zig \`libzigc.a\`.\n` +
+      `4. **Dramatically Smaller \`Debug\` & \`ReleaseSmall\` Binaries with Native \`__stack_pointer\` Export**: In \`Debug\` mode (Zigar's default development mode), \`wazig\` emits raw \`.wasm\` binaries **${dbgRawRatioRangeStr} smaller** than LLVM (\`${dbgWzRawRangeStr}\` vs \`1.80–3.53 MiB\`) and stripped binaries **${dbgStripPctRangeStr} smaller** (\`${dbgWzStripRangeStr}\` vs \`232–288 KiB\`). In \`ReleaseSmall\`, \`wazig\`'s SROA, leaf inlining, MIR peephole, and post-link optimizations produce **${rsNoLlvmRatioRangeStr} smaller** stripped binaries than upstream \`zig -fno-llvm\`, while \`wazigl\` matches native \`zig (Pure-Zig LLVM)\` byte-for-byte (**${rsWzlVsLcRangeStr} smaller** than upstream \`zig -lc\`) and links \`-lc\` modules via pure-Zig \`libzigc.a\`.\n` +
       `5. **Complementary Compile-Time vs Runtime Tradeoff (\`wazig\` vs \`wazigl\`)**: \`wazig\` compiles new modules in **~${simpleWbeWarmS}s** (**~${simpleWbeVsZb}x faster** than \`zig build\` and **~${simpleWbeVsWlbe}x faster** than \`wazigl\`) while executing **${rtRatioRangeStr} faster** in V8 than upstream \`zig -fno-llvm\`. When full LLVM codegen optimization is required without a platform-native Zig/LLVM install, \`wazigl\` delivers **1.00x V8 runtime parity** and **1.00x output size parity** with native \`zig (LLVM)\` from a single portable Wasm binary.`
   );
   lines.push('');

@@ -1,9 +1,9 @@
 {
   "meta": {
-    "timestamp": "2026-11-06T22:49:42.008Z",
+    "timestamp": "2026-11-10T17:42:37.563Z",
     "mode": "quick",
-    "totalElapsedSec": 1686.57,
-    "nodeVersion": "v22.15.0",
+    "totalElapsedSec": 1398.52,
+    "nodeVersion": "v24.21.0",
     "platform": "linux",
     "arch": "arm64",
     "cpuModel": "unknown",
@@ -11,60 +11,60 @@
   },
   "toolchain": {
     "wazig": {
-      "version": "0.17.0-wazig.4",
+      "version": "0.17.0-wazig.6",
       "binPath": "~/.local/bin/wazig",
       "unitDir": "~/.local/share/ghr/tools/_v2/units/u-cataggar/u-zig/u-wazig/_unit",
       "target": "wasm64-wasip3 (universal, OS/arch-independent, self-hosted stage2_wasm + Aro, no LLVM)",
       "archiveName": "wazig.tar.zst",
-      "archiveBytes": 8879436,
-      "compilerBinaryBytes": 36632158,
-      "libBytes": 29921199,
+      "archiveBytes": 8468078,
+      "compilerBinaryBytes": 31784824,
+      "libBytes": 29939788,
       "libFiles": 1321,
-      "totalUncompressedBytes": 66553357,
+      "totalUncompressedBytes": 61724612,
       "totalFiles": 1322,
       "cliVersionLatencyMs": {
-        "median": 245.92,
-        "mean": 245.7,
-        "min": 241.22,
-        "max": 253.08,
-        "p95": 253.08,
+        "median": 205.54,
+        "mean": 205.89,
+        "min": 203.41,
+        "max": 209.61,
+        "p95": 209.61,
         "samples": [
-          248.58,
-          253.08,
-          245.93,
-          245.92,
-          242.78,
-          241.22,
-          242.4
+          205.32,
+          206.43,
+          204.41,
+          203.41,
+          209.61,
+          205.54,
+          206.53
         ]
       }
     },
     "wazigl": {
-      "version": "0.17.0-wazigl.4",
+      "version": "0.17.0-wazigl.6",
       "binPath": "~/.local/bin/wazigl",
       "unitDir": "~/.local/share/ghr/tools/_v2/units/u-cataggar/u-zig/u-wazigl/_unit",
-      "target": "wasm64-wasip3 (universal, OS/arch-independent, Wasm-hosted LLVM 21 + in-process Clang + lld)",
+      "target": "wasm64-wasip3 (universal, OS/arch-independent, Wasm-hosted LLVM 22 + in-process Clang + lld)",
       "archiveName": "wazigl.tar.zst",
-      "archiveBytes": 38254006,
-      "compilerBinaryBytes": 207075736,
-      "libBytes": 29921199,
+      "archiveBytes": 38020297,
+      "compilerBinaryBytes": 202396035,
+      "libBytes": 29939788,
       "libFiles": 1321,
-      "totalUncompressedBytes": 236996935,
+      "totalUncompressedBytes": 232335823,
       "totalFiles": 1322,
       "cliVersionLatencyMs": {
-        "median": 1404.78,
-        "mean": 1409.45,
-        "min": 1390.85,
-        "max": 1435.94,
-        "p95": 1435.94,
+        "median": 1336.44,
+        "mean": 1336.67,
+        "min": 1315.95,
+        "max": 1349.56,
+        "p95": 1349.56,
         "samples": [
-          1395.24,
-          1391.52,
-          1435.94,
-          1429.7,
-          1390.85,
-          1418.09,
-          1404.78
+          1336.44,
+          1349.56,
+          1348.55,
+          1334.53,
+          1347.93,
+          1315.95,
+          1323.7
         ]
       }
     },
@@ -82,38 +82,38 @@
       "totalUncompressedBytes": 360344860,
       "totalFiles": 19505,
       "cliVersionLatencyMs": {
-        "median": 4.02,
-        "mean": 4.01,
-        "min": 3.87,
-        "max": 4.22,
-        "p95": 4.22,
+        "median": 4.32,
+        "mean": 4.29,
+        "min": 4.17,
+        "max": 4.47,
+        "p95": 4.47,
         "samples": [
-          4.02,
-          4.1,
-          3.87,
-          4.03,
-          3.9,
-          3.91,
-          4.22
+          4.18,
+          4.18,
+          4.17,
+          4.32,
+          4.36,
+          4.47,
+          4.36
         ]
       }
     },
     "ratios": {
-      "archiveDownloadReductionVsLinuxArm64": 5.96,
-      "archiveDownloadReductionVsWindowsX64": 11.29,
-      "archiveDownloadReductionVs6DesktopTargets": 47.27,
-      "compilerBinarySizeReduction": 4.69,
+      "archiveDownloadReductionVsLinuxArm64": 6.24,
+      "archiveDownloadReductionVsWindowsX64": 11.84,
+      "archiveDownloadReductionVs6DesktopTargets": 49.57,
+      "compilerBinarySizeReduction": 5.4,
       "libDirSizeReduction": 6.27,
-      "totalUncompressedSizeReduction": 5.41,
+      "totalUncompressedSizeReduction": 5.84,
       "fileCountReduction": 14.75,
-      "waziglArchiveReductionVsLinuxArm64": 1.38,
-      "waziglArchiveReductionVsWindowsX64": 2.62,
-      "waziglArchiveReductionVs6DesktopTargets": 10.97,
-      "waziglCompilerBinaryRatio": 1.21,
-      "waziglTotalUncompressedSizeReduction": 1.52,
+      "waziglArchiveReductionVsLinuxArm64": 1.39,
+      "waziglArchiveReductionVsWindowsX64": 2.64,
+      "waziglArchiveReductionVs6DesktopTargets": 11.04,
+      "waziglCompilerBinaryRatio": 1.18,
+      "waziglTotalUncompressedSizeReduction": 1.55,
       "waziglFileCountReduction": 14.75,
-      "waziglVsWazigArchiveRatio": 4.31,
-      "waziglVsWazigUncompressedRatio": 3.56
+      "waziglVsWazigArchiveRatio": 4.49,
+      "waziglVsWazigUncompressedRatio": 3.76
     },
     "libBreakdown": [
       {
@@ -136,9 +136,9 @@
       },
       {
         "subdir": "lib/std",
-        "wazigBytes": 17363086,
+        "wazigBytes": 17381675,
         "wazigFiles": 568,
-        "waziglBytes": 17363086,
+        "waziglBytes": 17381675,
         "waziglFiles": 568,
         "zigBytes": 17163952,
         "zigFiles": 565
@@ -226,8 +226,8 @@
       }
     ],
     "releaseArchives": {
-      "wazigTarZstBytes": 8879436,
-      "waziglTarZstBytes": 38254006,
+      "wazigTarZstBytes": 8468078,
+      "waziglTarZstBytes": 38020297,
       "zigAarch64LinuxTarXzBytes": 52877280,
       "zigX86_64LinuxTarXzBytes": 57332648,
       "zigAarch64MacosTarXzBytes": 53985220,
@@ -241,18 +241,18 @@
     "translateCMicro": {
       "wazig": {
         "label": "wazig translate-c (in-process Aro)",
-        "coldMs": 243.3,
-        "warmMs": 244.1
+        "coldMs": 211.6,
+        "warmMs": 209
       },
       "wazigl": {
         "label": "wazigl translate-c (in-process Clang)",
-        "coldMs": 1437,
-        "warmMs": 1428.5
+        "coldMs": 1326.6,
+        "warmMs": 1318.7
       },
       "zig": {
         "label": "zig translate-c (external sub-binary)",
         "coldMs": 54624.6,
-        "warmMs": 5.3
+        "warmMs": 10.8
       }
     },
     "stockZigMultithreadedError": "~/.local/share/ghr/tools/_v2/units/u-cataggar/u-zig/_unit/zig-aarch64-linux-0.17.0/lib/std/heap.zig:18:74: error: unimplemented",
@@ -266,30 +266,30 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 2714.9,
-            "warmSharedCacheMs": 2683.4,
-            "warmIncrementalMs": 835.9,
+            "coldMs": 2839.7,
+            "warmSharedCacheMs": 2815,
+            "warmIncrementalMs": 883,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 9030.3,
-            "warmSharedCacheMs": 4104.8,
-            "warmIncrementalMs": 1937.9,
+            "coldMs": 7642.2,
+            "warmSharedCacheMs": 3642.7,
+            "warmIncrementalMs": 1678.5,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "wazigl_build_exe": {
-            "coldMs": 14664.7,
-            "warmSharedCacheMs": 10699.3,
-            "warmIncrementalMs": 4487.5,
+            "coldMs": 13351.6,
+            "warmSharedCacheMs": 9522.5,
+            "warmIncrementalMs": 4055.6,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 5606.3,
-            "warmSharedCacheMs": 5606.3,
-            "warmIncrementalMs": 709.7,
+            "coldMs": 5830.8,
+            "warmSharedCacheMs": 5830.8,
+            "warmIncrementalMs": 770.8,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           }
@@ -303,30 +303,30 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 2657.9,
-            "warmSharedCacheMs": 2626.4,
-            "warmIncrementalMs": 766.3,
+            "coldMs": 2746.8,
+            "warmSharedCacheMs": 2722,
+            "warmIncrementalMs": 803.2,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 8857.4,
-            "warmSharedCacheMs": 3931.9,
-            "warmIncrementalMs": 1718.6,
+            "coldMs": 7506.1,
+            "warmSharedCacheMs": 3506.6,
+            "warmIncrementalMs": 1548.1,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazigl_build_exe": {
-            "coldMs": 14437.5,
-            "warmSharedCacheMs": 10472,
-            "warmIncrementalMs": 4113.9,
+            "coldMs": 13037,
+            "warmSharedCacheMs": 9207.9,
+            "warmIncrementalMs": 3689.1,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 7126.4,
-            "warmSharedCacheMs": 7126.4,
-            "warmIncrementalMs": 816.3,
+            "coldMs": 7222,
+            "warmSharedCacheMs": 7222,
+            "warmIncrementalMs": 853.2,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           }
@@ -340,30 +340,30 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 2660.6,
-            "warmSharedCacheMs": 2629.1,
-            "warmIncrementalMs": 767.2,
+            "coldMs": 2683.6,
+            "warmSharedCacheMs": 2658.8,
+            "warmIncrementalMs": 764.5,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 8786.1,
-            "warmSharedCacheMs": 3860.7,
-            "warmIncrementalMs": 1712.1,
+            "coldMs": 7427.8,
+            "warmSharedCacheMs": 3428.3,
+            "warmIncrementalMs": 1451.9,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazigl_build_exe": {
-            "coldMs": 14448.3,
-            "warmSharedCacheMs": 10482.8,
-            "warmIncrementalMs": 4118.7,
+            "coldMs": 12823.2,
+            "warmSharedCacheMs": 8994.1,
+            "warmIncrementalMs": 3511.3,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 7129.1,
-            "warmSharedCacheMs": 7129.1,
-            "warmIncrementalMs": 817.2,
+            "coldMs": 7158.8,
+            "warmSharedCacheMs": 7158.8,
+            "warmIncrementalMs": 814.5,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           }
@@ -377,30 +377,30 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 57163.2,
-            "warmSharedCacheMs": 2738.7,
-            "warmIncrementalMs": 770.5,
+            "coldMs": 57289.6,
+            "warmSharedCacheMs": 2766.8,
+            "warmIncrementalMs": 816.5,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 9680.8,
-            "warmSharedCacheMs": 4620.5,
-            "warmIncrementalMs": 2496,
+            "coldMs": 8175.7,
+            "warmSharedCacheMs": 4169.6,
+            "warmIncrementalMs": 2186,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "wazigl_build_exe": {
-            "coldMs": 15884.4,
-            "warmSharedCacheMs": 11408.3,
-            "warmIncrementalMs": 5699.6,
+            "coldMs": 14288.7,
+            "warmSharedCacheMs": 10636.6,
+            "warmIncrementalMs": 5174.5,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 5573.9,
-            "warmSharedCacheMs": 5573.9,
-            "warmIncrementalMs": 665,
+            "coldMs": 5845.3,
+            "warmSharedCacheMs": 5845.3,
+            "warmIncrementalMs": 653.3,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           }
@@ -414,30 +414,30 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 59939.4,
-            "warmSharedCacheMs": 5514.9,
-            "warmIncrementalMs": 3561.5,
+            "coldMs": 60209.8,
+            "warmSharedCacheMs": 5687.1,
+            "warmIncrementalMs": 3526.9,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 19765.6,
-            "warmSharedCacheMs": 14705.3,
-            "warmIncrementalMs": 7605.9,
+            "coldMs": 12361.8,
+            "warmSharedCacheMs": 8355.7,
+            "warmIncrementalMs": 6493.7,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazigl_build_exe": {
-            "coldMs": 27448.9,
-            "warmSharedCacheMs": 22972.8,
-            "warmIncrementalMs": 26345.4,
+            "coldMs": 25515.4,
+            "warmSharedCacheMs": 21863.3,
+            "warmIncrementalMs": 22351.4,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 10014.9,
-            "warmSharedCacheMs": 10014.9,
-            "warmIncrementalMs": 3611.5,
+            "coldMs": 10187.1,
+            "warmSharedCacheMs": 10187.1,
+            "warmIncrementalMs": 3576.9,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           }
@@ -454,70 +454,31 @@
         "modes": {
           "zig_build_exe": {
             "coldMs": 6217.3,
-            "warmSharedCacheMs": 1629.7,
-            "warmIncrementalMs": 1642.2,
+            "warmSharedCacheMs": 1740.3,
+            "warmIncrementalMs": 1733.8,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 16188.8,
-            "warmSharedCacheMs": 2467.7,
-            "warmIncrementalMs": 2505.5,
+            "coldMs": 13556.8,
+            "warmSharedCacheMs": 1962.1,
+            "warmIncrementalMs": 1967.3,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "wazigl_build_exe": {
-            "coldMs": 30341,
-            "warmSharedCacheMs": 9646.5,
-            "warmIncrementalMs": 5689.4,
+            "coldMs": 27570.6,
+            "warmSharedCacheMs": 4739.5,
+            "warmIncrementalMs": 4725,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 6427,
-            "warmSharedCacheMs": 6427,
-            "warmIncrementalMs": 1575.2,
+            "coldMs": 6523,
+            "warmSharedCacheMs": 6523,
+            "warmIncrementalMs": 1635.8,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
-          }
-        }
-      },
-      {
-        "id": "thread",
-        "category": "Multithreaded WASM",
-        "relPath": "zig-samples/basic/thread.zig",
-        "options": {
-          "multithreaded": true
-        },
-        "StockZigSupportedOutOfBox": false,
-        "modes": {
-          "zig_build_exe": {
-            "coldMs": 3030.8,
-            "warmSharedCacheMs": 1061.7,
-            "warmIncrementalMs": 995.7,
-            "coldEstimatedFromCategory": true,
-            "requiresManualStdPatch": true
-          },
-          "wazig_build_exe": {
-            "coldMs": 12953.1,
-            "warmSharedCacheMs": 6150.2,
-            "warmIncrementalMs": 2236.6,
-            "coldEstimatedFromCategory": true,
-            "requiresManualStdPatch": false
-          },
-          "wazigl_build_exe": {
-            "coldMs": 11549.3,
-            "warmSharedCacheMs": 5355.3,
-            "warmIncrementalMs": 5145.3,
-            "coldEstimatedFromCategory": true,
-            "requiresManualStdPatch": false
-          },
-          "zig_build": {
-            "coldMs": 5561.7,
-            "warmSharedCacheMs": 5561.7,
-            "warmIncrementalMs": 1045.7,
-            "coldEstimatedFromCategory": true,
-            "requiresManualStdPatch": true
           }
         }
       },
@@ -531,30 +492,69 @@
         "StockZigSupportedOutOfBox": false,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 2752.7,
-            "warmSharedCacheMs": 783.6,
-            "warmIncrementalMs": 797.4,
+            "coldMs": 2892.1,
+            "warmSharedCacheMs": 793.2,
+            "warmIncrementalMs": 766.5,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": true
           },
           "wazig_build_exe": {
-            "coldMs": 8899.9,
-            "warmSharedCacheMs": 2097,
-            "warmIncrementalMs": 2381.9,
+            "coldMs": 7709,
+            "warmSharedCacheMs": 1561.2,
+            "warmIncrementalMs": 1593.8,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "wazigl_build_exe": {
-            "coldMs": 14905,
-            "warmSharedCacheMs": 8711,
-            "warmIncrementalMs": 4812.6,
+            "coldMs": 13604.9,
+            "warmSharedCacheMs": 3970.1,
+            "warmIncrementalMs": 4051.4,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 5283.6,
-            "warmSharedCacheMs": 5283.6,
-            "warmIncrementalMs": 847.4,
+            "coldMs": 5293.2,
+            "warmSharedCacheMs": 5293.2,
+            "warmIncrementalMs": 816.5,
+            "coldEstimatedFromCategory": true,
+            "requiresManualStdPatch": true
+          }
+        }
+      },
+      {
+        "id": "thread",
+        "category": "Multithreaded WASM",
+        "relPath": "zig-samples/basic/thread.zig",
+        "options": {
+          "multithreaded": true
+        },
+        "StockZigSupportedOutOfBox": false,
+        "modes": {
+          "zig_build_exe": {
+            "coldMs": 3102.4,
+            "warmSharedCacheMs": 1003.5,
+            "warmIncrementalMs": 968,
+            "coldEstimatedFromCategory": true,
+            "requiresManualStdPatch": true
+          },
+          "wazig_build_exe": {
+            "coldMs": 7967.4,
+            "warmSharedCacheMs": 1819.6,
+            "warmIncrementalMs": 1851.8,
+            "coldEstimatedFromCategory": true,
+            "requiresManualStdPatch": false
+          },
+          "wazigl_build_exe": {
+            "coldMs": 14594.2,
+            "warmSharedCacheMs": 5022.7,
+            "warmIncrementalMs": 5116.4,
+            "coldEstimatedFromCategory": true,
+            "requiresManualStdPatch": false
+          },
+          "zig_build": {
+            "coldMs": 5503.5,
+            "warmSharedCacheMs": 5503.5,
+            "warmIncrementalMs": 1018,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": true
           }
@@ -568,30 +568,30 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 2834.7,
-            "warmSharedCacheMs": 3251.4,
-            "warmIncrementalMs": 902.6,
+            "coldMs": 2849.2,
+            "warmSharedCacheMs": 2773.8,
+            "warmIncrementalMs": 874.7,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 9075.1,
-            "warmSharedCacheMs": 4105.8,
-            "warmIncrementalMs": 1887.7,
+            "coldMs": 7680.8,
+            "warmSharedCacheMs": 3540.7,
+            "warmIncrementalMs": 1638.2,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "wazigl_build_exe": {
-            "coldMs": 15013.2,
-            "warmSharedCacheMs": 11048.3,
-            "warmIncrementalMs": 4503.1,
+            "coldMs": 12927.9,
+            "warmSharedCacheMs": 9675,
+            "warmIncrementalMs": 4016.3,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 5835.3,
-            "warmSharedCacheMs": 5835.3,
-            "warmIncrementalMs": 778.2,
+            "coldMs": 5800,
+            "warmSharedCacheMs": 5800,
+            "warmIncrementalMs": 779.4,
             "coldEstimatedFromCategory": false,
             "requiresManualStdPatch": false
           }
@@ -605,30 +605,30 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 3202.2,
-            "warmSharedCacheMs": 3202.2,
-            "warmIncrementalMs": 1353.3,
+            "coldMs": 3337.9,
+            "warmSharedCacheMs": 3262.5,
+            "warmIncrementalMs": 1306,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 9771.4,
-            "warmSharedCacheMs": 4802.1,
-            "warmIncrementalMs": 2635.3,
+            "coldMs": 8365.9,
+            "warmSharedCacheMs": 4225.8,
+            "warmIncrementalMs": 2216.7,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazigl_build_exe": {
-            "coldMs": 14846,
-            "warmSharedCacheMs": 10881.1,
-            "warmIncrementalMs": 6751.7,
+            "coldMs": 14632.5,
+            "warmSharedCacheMs": 11379.6,
+            "warmIncrementalMs": 5996.7,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 7702.2,
-            "warmSharedCacheMs": 7702.2,
-            "warmIncrementalMs": 1403.3,
+            "coldMs": 7762.5,
+            "warmSharedCacheMs": 7762.5,
+            "warmIncrementalMs": 1356,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           }
@@ -642,30 +642,30 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 5246.6,
-            "warmSharedCacheMs": 5246.6,
-            "warmIncrementalMs": 3128.3,
+            "coldMs": 5410.9,
+            "warmSharedCacheMs": 5335.5,
+            "warmIncrementalMs": 3399.3,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 13622.8,
-            "warmSharedCacheMs": 8653.5,
-            "warmIncrementalMs": 6339.1,
+            "coldMs": 11383.6,
+            "warmSharedCacheMs": 7243.5,
+            "warmIncrementalMs": 5343.9,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazigl_build_exe": {
-            "coldMs": 21792.9,
-            "warmSharedCacheMs": 17828,
-            "warmIncrementalMs": 15607.2,
+            "coldMs": 21863.1,
+            "warmSharedCacheMs": 18610.2,
+            "warmIncrementalMs": 15608.3,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 9746.6,
-            "warmSharedCacheMs": 9746.6,
-            "warmIncrementalMs": 3178.3,
+            "coldMs": 9835.5,
+            "warmSharedCacheMs": 9835.5,
+            "warmIncrementalMs": 3449.3,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           }
@@ -679,30 +679,30 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 2953.4,
-            "warmSharedCacheMs": 2953.4,
-            "warmIncrementalMs": 998.8,
+            "coldMs": 2933.3,
+            "warmSharedCacheMs": 2858,
+            "warmIncrementalMs": 972.2,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 9222.3,
-            "warmSharedCacheMs": 4253,
-            "warmIncrementalMs": 2097.7,
+            "coldMs": 7862.9,
+            "warmSharedCacheMs": 3722.8,
+            "warmIncrementalMs": 1780.1,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazigl_build_exe": {
-            "coldMs": 14000.6,
-            "warmSharedCacheMs": 10035.7,
-            "warmIncrementalMs": 4983,
+            "coldMs": 13221.6,
+            "warmSharedCacheMs": 9968.7,
+            "warmIncrementalMs": 4464,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 7453.4,
-            "warmSharedCacheMs": 7453.4,
-            "warmIncrementalMs": 1048.8,
+            "coldMs": 7358,
+            "warmSharedCacheMs": 7358,
+            "warmIncrementalMs": 1022.2,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           }
@@ -716,30 +716,30 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 3327.5,
-            "warmSharedCacheMs": 3327.5,
-            "warmIncrementalMs": 1409.9,
+            "coldMs": 3448.2,
+            "warmSharedCacheMs": 3372.8,
+            "warmIncrementalMs": 1426.9,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 9893.8,
-            "warmSharedCacheMs": 4924.5,
-            "warmIncrementalMs": 2725.1,
+            "coldMs": 8453.5,
+            "warmSharedCacheMs": 4313.4,
+            "warmIncrementalMs": 2384.9,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazigl_build_exe": {
-            "coldMs": 15271.8,
-            "warmSharedCacheMs": 11306.9,
-            "warmIncrementalMs": 7034,
+            "coldMs": 15017.2,
+            "warmSharedCacheMs": 11764.3,
+            "warmIncrementalMs": 6551.8,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 7827.5,
-            "warmSharedCacheMs": 7827.5,
-            "warmIncrementalMs": 1459.9,
+            "coldMs": 7872.8,
+            "warmSharedCacheMs": 7872.8,
+            "warmIncrementalMs": 1476.9,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           }
@@ -753,30 +753,30 @@
         "StockZigSupportedOutOfBox": true,
         "modes": {
           "zig_build_exe": {
-            "coldMs": 4374.5,
-            "warmSharedCacheMs": 4374.5,
-            "warmIncrementalMs": 2481.3,
+            "coldMs": 4453.6,
+            "warmSharedCacheMs": 4378.2,
+            "warmIncrementalMs": 2414.9,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazig_build_exe": {
-            "coldMs": 11748.3,
-            "warmSharedCacheMs": 6778.9,
-            "warmIncrementalMs": 4518.6,
+            "coldMs": 9992,
+            "warmSharedCacheMs": 5851.9,
+            "warmIncrementalMs": 3859.1,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "wazigl_build_exe": {
-            "coldMs": 18829.5,
-            "warmSharedCacheMs": 14864.6,
-            "warmIncrementalMs": 12379.3,
+            "coldMs": 18524,
+            "warmSharedCacheMs": 15271.1,
+            "warmIncrementalMs": 11088.3,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           },
           "zig_build": {
-            "coldMs": 8874.5,
-            "warmSharedCacheMs": 8874.5,
-            "warmIncrementalMs": 2531.3,
+            "coldMs": 8878.2,
+            "warmSharedCacheMs": 8878.2,
+            "warmIncrementalMs": 2464.9,
             "coldEstimatedFromCategory": true,
             "requiresManualStdPatch": false
           }
@@ -844,8 +844,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 193819,
-              "strippedBytes": 126384,
+              "rawBytes": 165255,
+              "strippedBytes": 107317,
               "compileError": null,
               "stripError": null
             }
@@ -876,8 +876,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 108827,
-              "strippedBytes": 78021,
+              "rawBytes": 84858,
+              "strippedBytes": 61624,
               "compileError": null,
               "stripError": null
             }
@@ -908,8 +908,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 172235,
-              "strippedBytes": 113726,
+              "rawBytes": 134048,
+              "strippedBytes": 70735,
               "compileError": null,
               "stripError": null
             }
@@ -940,8 +940,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 174335,
-              "strippedBytes": 118462,
+              "rawBytes": 146521,
+              "strippedBytes": 100450,
               "compileError": null,
               "stripError": null
             }
@@ -978,8 +978,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 189764,
-              "strippedBytes": 126363,
+              "rawBytes": 162062,
+              "strippedBytes": 107380,
               "compileError": null,
               "stripError": null
             }
@@ -1010,8 +1010,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 106233,
-              "strippedBytes": 79104,
+              "rawBytes": 82841,
+              "strippedBytes": 62524,
               "compileError": null,
               "stripError": null
             }
@@ -1042,8 +1042,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 168365,
-              "strippedBytes": 114794,
+              "rawBytes": 131159,
+              "strippedBytes": 71624,
               "compileError": null,
               "stripError": null
             }
@@ -1074,8 +1074,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 170304,
-              "strippedBytes": 119286,
+              "rawBytes": 143353,
+              "strippedBytes": 101331,
               "compileError": null,
               "stripError": null
             }
@@ -1112,8 +1112,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 191797,
-              "strippedBytes": 127077,
+              "rawBytes": 163393,
+              "strippedBytes": 107824,
               "compileError": null,
               "stripError": null
             }
@@ -1144,8 +1144,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 107687,
-              "strippedBytes": 81123,
+              "rawBytes": 83724,
+              "strippedBytes": 64084,
               "compileError": null,
               "stripError": null
             }
@@ -1176,8 +1176,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 170142,
-              "strippedBytes": 116818,
+              "rawBytes": 132130,
+              "strippedBytes": 73222,
               "compileError": null,
               "stripError": null
             }
@@ -1208,8 +1208,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 172248,
-              "strippedBytes": 120183,
+              "rawBytes": 144682,
+              "strippedBytes": 101956,
               "compileError": null,
               "stripError": null
             }
@@ -1236,7 +1236,7 @@
             "zig_nollvm": {
               "rawBytes": null,
               "strippedBytes": null,
-              "compileError": "error: .zig-cache/o/74fe7bfac389e8c4dcbdac2ce89f5ed5/libc.a: undefined function: __main_argc_argv",
+              "compileError": "error: .zig-cache/o/263c246e6a5c13ac2eaabf5a04e8a9bd/libc.a: undefined function: __main_argc_argv",
               "stripError": null
             },
             "wazigl": {
@@ -1246,8 +1246,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 275458,
-              "strippedBytes": 156392,
+              "rawBytes": 228518,
+              "strippedBytes": 132745,
               "compileError": null,
               "stripError": null
             }
@@ -1278,8 +1278,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 168986,
-              "strippedBytes": 103961,
+              "rawBytes": 127871,
+              "strippedBytes": 83047,
               "compileError": null,
               "stripError": null
             }
@@ -1300,7 +1300,7 @@
             "zig_nollvm": {
               "rawBytes": null,
               "strippedBytes": null,
-              "compileError": "error: .zig-cache/o/e4d45ad6557dda2dd8db59c7b5a50785/libc.a: undefined function: __main_argc_argv",
+              "compileError": "error: .zig-cache/o/4d1ea8fbe29ac5159aab35b4a094b485/libc.a: undefined function: __main_argc_argv",
               "stripError": null
             },
             "wazigl": {
@@ -1310,8 +1310,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 272842,
-              "strippedBytes": 164403,
+              "rawBytes": 198935,
+              "strippedBytes": 100935,
               "compileError": null,
               "stripError": null
             }
@@ -1332,7 +1332,7 @@
             "zig_nollvm": {
               "rawBytes": null,
               "strippedBytes": null,
-              "compileError": "error: .zig-cache/o/93324c47dd9b481e2a7ffcaf074a396c/libc.a: undefined function: __main_argc_argv",
+              "compileError": "error: .zig-cache/o/7b3f5908dfb65ecabdd16e207a67722d/libc.a: undefined function: __main_argc_argv",
               "stripError": null
             },
             "wazigl": {
@@ -1342,8 +1342,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 255706,
-              "strippedBytes": 152392,
+              "rawBytes": 209611,
+              "strippedBytes": 129780,
               "compileError": null,
               "stripError": null
             }
@@ -1374,14 +1374,14 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazigl": {
-              "rawBytes": 3152738,
-              "strippedBytes": 228187,
+              "rawBytes": 3152122,
+              "strippedBytes": 227957,
               "compileError": null,
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 647397,
-              "strippedBytes": 156210,
+              "rawBytes": 495637,
+              "strippedBytes": 121914,
               "compileError": null,
               "stripError": null
             }
@@ -1406,14 +1406,14 @@
               "stripError": null
             },
             "wazigl": {
-              "rawBytes": 192610,
-              "strippedBytes": 43138,
+              "rawBytes": 192568,
+              "strippedBytes": 43096,
               "compileError": null,
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 416416,
-              "strippedBytes": 102850,
+              "rawBytes": 293644,
+              "strippedBytes": 76887,
               "compileError": null,
               "stripError": null
             }
@@ -1438,14 +1438,14 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazigl": {
-              "rawBytes": 2756647,
-              "strippedBytes": 49085,
+              "rawBytes": 2757123,
+              "strippedBytes": 49207,
               "compileError": null,
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 668668,
-              "strippedBytes": 141897,
+              "rawBytes": 483825,
+              "strippedBytes": 86022,
               "compileError": null,
               "stripError": null
             }
@@ -1470,14 +1470,14 @@
               "stripError": "Offset is outside the bounds of the DataView"
             },
             "wazigl": {
-              "rawBytes": 2381070,
+              "rawBytes": 2381014,
               "strippedBytes": 73735,
               "compileError": null,
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 625151,
-              "strippedBytes": 155476,
+              "rawBytes": 474298,
+              "strippedBytes": 122233,
               "compileError": null,
               "stripError": null
             }
@@ -1514,8 +1514,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 288430,
-              "strippedBytes": 129530,
+              "rawBytes": 233776,
+              "strippedBytes": 109750,
               "compileError": null,
               "stripError": null
             }
@@ -1546,8 +1546,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 176086,
-              "strippedBytes": 80824,
+              "rawBytes": 129306,
+              "strippedBytes": 63834,
               "compileError": null,
               "stripError": null
             }
@@ -1578,8 +1578,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 268840,
-              "strippedBytes": 116573,
+              "rawBytes": 200664,
+              "strippedBytes": 72943,
               "compileError": null,
               "stripError": null
             }
@@ -1610,8 +1610,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 269381,
-              "strippedBytes": 121783,
+              "rawBytes": 215452,
+              "strippedBytes": 103059,
               "compileError": null,
               "stripError": null
             }
@@ -1648,8 +1648,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 297268,
-              "strippedBytes": 133018,
+              "rawBytes": 242308,
+              "strippedBytes": 113240,
               "compileError": null,
               "stripError": null
             }
@@ -1680,8 +1680,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 181677,
-              "strippedBytes": 82747,
+              "rawBytes": 134077,
+              "strippedBytes": 65803,
               "compileError": null,
               "stripError": null
             }
@@ -1712,8 +1712,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 278207,
-              "strippedBytes": 118648,
+              "rawBytes": 211041,
+              "strippedBytes": 75020,
               "compileError": null,
               "stripError": null
             }
@@ -1744,8 +1744,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 277027,
-              "strippedBytes": 125540,
+              "rawBytes": 222824,
+              "strippedBytes": 106840,
               "compileError": null,
               "stripError": null
             }
@@ -1782,8 +1782,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 511857,
-              "strippedBytes": 159412,
+              "rawBytes": 401941,
+              "strippedBytes": 138743,
               "compileError": null,
               "stripError": null
             }
@@ -1814,8 +1814,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 328710,
-              "strippedBytes": 105189,
+              "rawBytes": 231685,
+              "strippedBytes": 87495,
               "compileError": null,
               "stripError": null
             }
@@ -1846,8 +1846,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 483509,
-              "strippedBytes": 143467,
+              "rawBytes": 348818,
+              "strippedBytes": 99053,
               "compileError": null,
               "stripError": null
             }
@@ -1878,8 +1878,8 @@
               "stripError": null
             },
             "wazig": {
-              "rawBytes": 491886,
-              "strippedBytes": 153803,
+              "rawBytes": 382684,
+              "strippedBytes": 134211,
               "compileError": null,
               "stripError": null
             }
@@ -1916,51 +1916,51 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 52.09,
-            "mean": 52,
-            "min": 51.64,
-            "max": 52.25,
-            "p95": 52.25,
+            "median": 50.75,
+            "mean": 50.79,
+            "min": 50.74,
+            "max": 50.88,
+            "p95": 50.88,
             "samples": [
-              52.09,
-              52.25,
-              51.64
+              50.88,
+              50.75,
+              50.74
             ]
           },
           "wazigl": {
-            "median": 49.45,
-            "mean": 49.39,
-            "min": 49.25,
-            "max": 49.46,
-            "p95": 49.46,
+            "median": 50.44,
+            "mean": 50.38,
+            "min": 50.23,
+            "max": 50.48,
+            "p95": 50.48,
             "samples": [
-              49.46,
-              49.25,
-              49.45
+              50.48,
+              50.23,
+              50.44
             ]
           },
           "zig_nollvm": {
-            "median": 99.92,
-            "mean": 99.78,
-            "min": 99.26,
-            "max": 100.15,
-            "p95": 100.15,
+            "median": 92.62,
+            "mean": 92.63,
+            "min": 92.5,
+            "max": 92.78,
+            "p95": 92.78,
             "samples": [
-              99.92,
-              100.15,
-              99.26
+              92.78,
+              92.62,
+              92.5
             ]
           },
           "zig_llvm": {
-            "median": 49.33,
-            "mean": 49.32,
-            "min": 49.17,
-            "max": 49.46,
-            "p95": 49.46,
+            "median": 50.48,
+            "mean": 50.4,
+            "min": 50.23,
+            "max": 50.5,
+            "p95": 50.5,
             "samples": [
-              49.33,
-              49.17,
-              49.46
+              50.48,
+              50.23,
+              50.5
             ]
           }
         }
@@ -1973,47 +1973,47 @@
         "timedIterations": 2,
         "compilers": {
           "wazig": {
-            "median": 311.46,
-            "mean": 311.46,
-            "min": 310.79,
-            "max": 312.13,
-            "p95": 312.13,
+            "median": 170.14,
+            "mean": 170.14,
+            "min": 169.44,
+            "max": 170.83,
+            "p95": 170.83,
             "samples": [
-              312.13,
-              310.79
+              170.83,
+              169.44
             ]
           },
           "wazigl": {
-            "median": 195.84,
-            "mean": 195.84,
-            "min": 195.01,
-            "max": 196.67,
-            "p95": 196.67,
+            "median": 189.72,
+            "mean": 189.72,
+            "min": 188.71,
+            "max": 190.73,
+            "p95": 190.73,
             "samples": [
-              196.67,
-              195.01
+              190.73,
+              188.71
             ]
           },
           "zig_nollvm": {
-            "median": 2213.57,
-            "mean": 2213.57,
-            "min": 2209.55,
-            "max": 2217.59,
-            "p95": 2217.59,
+            "median": 2048.67,
+            "mean": 2048.67,
+            "min": 2046.67,
+            "max": 2050.66,
+            "p95": 2050.66,
             "samples": [
-              2217.59,
-              2209.55
+              2050.66,
+              2046.67
             ]
           },
           "zig_llvm": {
-            "median": 196.1,
-            "mean": 196.1,
-            "min": 195.21,
-            "max": 196.98,
-            "p95": 196.98,
+            "median": 186.45,
+            "mean": 186.45,
+            "min": 185.77,
+            "max": 187.12,
+            "p95": 187.12,
             "samples": [
-              196.98,
-              195.21
+              187.12,
+              185.77
             ]
           }
         }
@@ -2026,51 +2026,51 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 82.6,
-            "mean": 82.59,
-            "min": 82.55,
-            "max": 82.61,
-            "p95": 82.61,
+            "median": 86.52,
+            "mean": 86.52,
+            "min": 86.42,
+            "max": 86.6,
+            "p95": 86.6,
             "samples": [
-              82.6,
-              82.61,
-              82.55
+              86.52,
+              86.6,
+              86.42
             ]
           },
           "wazigl": {
-            "median": 59.07,
-            "mean": 59.07,
-            "min": 59.05,
-            "max": 59.1,
-            "p95": 59.1,
+            "median": 59.47,
+            "mean": 59.47,
+            "min": 59.43,
+            "max": 59.51,
+            "p95": 59.51,
             "samples": [
-              59.1,
-              59.07,
-              59.05
+              59.51,
+              59.47,
+              59.43
             ]
           },
           "zig_nollvm": {
-            "median": 512.81,
-            "mean": 512.89,
-            "min": 512.76,
-            "max": 513.08,
-            "p95": 513.08,
+            "median": 454.5,
+            "mean": 454.7,
+            "min": 454.46,
+            "max": 455.16,
+            "p95": 455.16,
             "samples": [
-              512.81,
-              513.08,
-              512.76
+              455.16,
+              454.46,
+              454.5
             ]
           },
           "zig_llvm": {
-            "median": 59.1,
-            "mean": 59.11,
-            "min": 59.08,
-            "max": 59.16,
-            "p95": 59.16,
+            "median": 59.39,
+            "mean": 59.4,
+            "min": 59.37,
+            "max": 59.44,
+            "p95": 59.44,
             "samples": [
-              59.16,
-              59.08,
-              59.1
+              59.39,
+              59.44,
+              59.37
             ]
           }
         }
@@ -2083,51 +2083,51 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 75.69,
-            "mean": 75.66,
-            "min": 75.51,
-            "max": 75.76,
-            "p95": 75.76,
+            "median": 77.42,
+            "mean": 77.47,
+            "min": 77.38,
+            "max": 77.6,
+            "p95": 77.6,
             "samples": [
-              75.69,
-              75.76,
-              75.51
+              77.6,
+              77.42,
+              77.38
             ]
           },
           "wazigl": {
-            "median": 64.9,
-            "mean": 64.98,
-            "min": 64.86,
-            "max": 65.16,
-            "p95": 65.16,
+            "median": 67.49,
+            "mean": 67.48,
+            "min": 67.4,
+            "max": 67.56,
+            "p95": 67.56,
             "samples": [
-              65.16,
-              64.9,
-              64.86
+              67.56,
+              67.4,
+              67.49
             ]
           },
           "zig_nollvm": {
-            "median": 166.28,
-            "mean": 166.23,
-            "min": 166.14,
-            "max": 166.28,
-            "p95": 166.28,
+            "median": 147.44,
+            "mean": 147.54,
+            "min": 147.39,
+            "max": 147.77,
+            "p95": 147.77,
             "samples": [
-              166.28,
-              166.28,
-              166.14
+              147.77,
+              147.39,
+              147.44
             ]
           },
           "zig_llvm": {
-            "median": 64.86,
-            "mean": 64.84,
-            "min": 64.73,
-            "max": 64.93,
-            "p95": 64.93,
+            "median": 67.22,
+            "mean": 67.2,
+            "min": 67.15,
+            "max": 67.23,
+            "p95": 67.23,
             "samples": [
-              64.73,
-              64.86,
-              64.93
+              67.22,
+              67.23,
+              67.15
             ]
           }
         }
@@ -2140,51 +2140,51 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 34.63,
-            "mean": 34.65,
-            "min": 34.52,
-            "max": 34.79,
-            "p95": 34.79,
+            "median": 15.28,
+            "mean": 15.22,
+            "min": 15.08,
+            "max": 15.31,
+            "p95": 15.31,
             "samples": [
-              34.79,
-              34.63,
-              34.52
+              15.28,
+              15.31,
+              15.08
             ]
           },
           "wazigl": {
-            "median": 15.59,
-            "mean": 15.58,
-            "min": 15.53,
-            "max": 15.61,
-            "p95": 15.61,
+            "median": 14.11,
+            "mean": 14.11,
+            "min": 14.09,
+            "max": 14.14,
+            "p95": 14.14,
             "samples": [
-              15.53,
-              15.59,
-              15.61
+              14.14,
+              14.11,
+              14.09
             ]
           },
           "zig_nollvm": {
-            "median": 143.78,
-            "mean": 143.78,
-            "min": 143.78,
-            "max": 143.8,
-            "p95": 143.8,
+            "median": 124.35,
+            "mean": 124.36,
+            "min": 124.18,
+            "max": 124.55,
+            "p95": 124.55,
             "samples": [
-              143.78,
-              143.8,
-              143.78
+              124.55,
+              124.35,
+              124.18
             ]
           },
           "zig_llvm": {
-            "median": 15.57,
-            "mean": 15.59,
-            "min": 15.55,
-            "max": 15.65,
-            "p95": 15.65,
+            "median": 14.04,
+            "mean": 14.06,
+            "min": 14.03,
+            "max": 14.1,
+            "p95": 14.1,
             "samples": [
-              15.65,
-              15.57,
-              15.55
+              14.1,
+              14.04,
+              14.03
             ]
           }
         }
@@ -2197,51 +2197,51 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 103.57,
-            "mean": 100.24,
-            "min": 89.77,
-            "max": 107.38,
-            "p95": 107.38,
+            "median": 96.8,
+            "mean": 86.31,
+            "min": 53.89,
+            "max": 108.25,
+            "p95": 108.25,
             "samples": [
-              103.57,
-              89.77,
-              107.38
+              53.89,
+              96.8,
+              108.25
             ]
           },
           "wazigl": {
-            "median": 97.98,
-            "mean": 98.9,
-            "min": 97.05,
-            "max": 101.66,
-            "p95": 101.66,
+            "median": 84.14,
+            "mean": 76.7,
+            "min": 53.51,
+            "max": 92.44,
+            "p95": 92.44,
             "samples": [
-              97.98,
-              101.66,
-              97.05
+              84.14,
+              92.44,
+              53.51
             ]
           },
           "zig_nollvm": {
-            "median": 111.57,
-            "mean": 111.33,
-            "min": 107.92,
-            "max": 114.52,
-            "p95": 114.52,
+            "median": 93.96,
+            "mean": 89.17,
+            "min": 66.28,
+            "max": 107.27,
+            "p95": 107.27,
             "samples": [
-              111.57,
-              114.52,
-              107.92
+              66.28,
+              93.96,
+              107.27
             ]
           },
           "zig_llvm": {
-            "median": 102.28,
-            "mean": 101.4,
-            "min": 97.24,
-            "max": 104.68,
-            "p95": 104.68,
+            "median": 82.15,
+            "mean": 73.5,
+            "min": 42.69,
+            "max": 95.68,
+            "p95": 95.68,
             "samples": [
-              97.24,
-              104.68,
-              102.28
+              82.15,
+              95.68,
+              42.69
             ]
           }
         }
@@ -2254,51 +2254,51 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 4.27,
-            "mean": 4.27,
-            "min": 4.25,
-            "max": 4.3,
-            "p95": 4.3,
+            "median": 2.92,
+            "mean": 2.94,
+            "min": 2.9,
+            "max": 3.01,
+            "p95": 3.01,
             "samples": [
-              4.3,
-              4.27,
-              4.25
+              3.01,
+              2.92,
+              2.9
             ]
           },
           "wazigl": {
-            "median": 0.42,
-            "mean": 0.52,
-            "min": 0.28,
-            "max": 0.87,
-            "p95": 0.87,
+            "median": 0.4,
+            "mean": 0.36,
+            "min": 0.26,
+            "max": 0.42,
+            "p95": 0.42,
             "samples": [
               0.42,
-              0.87,
-              0.28
+              0.4,
+              0.26
             ]
           },
           "zig_nollvm": {
-            "median": 6.25,
-            "mean": 6.24,
-            "min": 6.21,
-            "max": 6.27,
-            "p95": 6.27,
+            "median": 5.86,
+            "mean": 5.88,
+            "min": 5.83,
+            "max": 5.96,
+            "p95": 5.96,
             "samples": [
-              6.25,
-              6.27,
-              6.21
+              5.96,
+              5.83,
+              5.86
             ]
           },
           "zig_llvm": {
-            "median": 0.33,
-            "mean": 0.29,
-            "min": 0.17,
+            "median": 0.36,
+            "mean": 0.32,
+            "min": 0.22,
             "max": 0.38,
             "p95": 0.38,
             "samples": [
               0.38,
-              0.33,
-              0.17
+              0.36,
+              0.22
             ]
           }
         }
@@ -2311,51 +2311,51 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 49.68,
-            "mean": 49.67,
-            "min": 49.6,
-            "max": 49.72,
-            "p95": 49.72,
+            "median": 30.58,
+            "mean": 30.61,
+            "min": 30.57,
+            "max": 30.67,
+            "p95": 30.67,
             "samples": [
-              49.72,
-              49.68,
-              49.6
+              30.67,
+              30.57,
+              30.58
             ]
           },
           "wazigl": {
-            "median": 2.99,
-            "mean": 3,
-            "min": 2.97,
-            "max": 3.04,
-            "p95": 3.04,
+            "median": 3.55,
+            "mean": 3.59,
+            "min": 3.54,
+            "max": 3.7,
+            "p95": 3.7,
             "samples": [
-              3.04,
-              2.99,
-              2.97
+              3.54,
+              3.55,
+              3.7
             ]
           },
           "zig_nollvm": {
-            "median": 72.8,
-            "mean": 74.08,
-            "min": 72.69,
-            "max": 76.74,
-            "p95": 76.74,
+            "median": 65.53,
+            "mean": 65.51,
+            "min": 65.42,
+            "max": 65.58,
+            "p95": 65.58,
             "samples": [
-              76.74,
-              72.69,
-              72.8
+              65.53,
+              65.58,
+              65.42
             ]
           },
           "zig_llvm": {
-            "median": 3.06,
-            "mean": 3.05,
-            "min": 3.04,
-            "max": 3.06,
-            "p95": 3.06,
+            "median": 3.51,
+            "mean": 3.53,
+            "min": 3.45,
+            "max": 3.62,
+            "p95": 3.62,
             "samples": [
-              3.04,
-              3.06,
-              3.06
+              3.51,
+              3.62,
+              3.45
             ]
           }
         }
@@ -2368,51 +2368,51 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 18.25,
-            "mean": 18.26,
-            "min": 18.22,
-            "max": 18.32,
-            "p95": 18.32,
+            "median": 11.24,
+            "mean": 11.19,
+            "min": 11.06,
+            "max": 11.26,
+            "p95": 11.26,
             "samples": [
-              18.25,
-              18.32,
-              18.22
+              11.26,
+              11.06,
+              11.24
             ]
           },
           "wazigl": {
-            "median": 1.17,
-            "mean": 1.2,
-            "min": 1.14,
-            "max": 1.29,
-            "p95": 1.29,
+            "median": 1.38,
+            "mean": 1.42,
+            "min": 1.37,
+            "max": 1.52,
+            "p95": 1.52,
             "samples": [
-              1.29,
-              1.17,
-              1.14
+              1.52,
+              1.38,
+              1.37
             ]
           },
           "zig_nollvm": {
-            "median": 28.01,
-            "mean": 27.92,
-            "min": 27.49,
-            "max": 28.25,
-            "p95": 28.25,
+            "median": 26.57,
+            "mean": 26.56,
+            "min": 26.53,
+            "max": 26.58,
+            "p95": 26.58,
             "samples": [
-              28.25,
-              28.01,
-              27.49
+              26.53,
+              26.57,
+              26.58
             ]
           },
           "zig_llvm": {
-            "median": 1.17,
-            "mean": 1.18,
-            "min": 1.13,
-            "max": 1.23,
-            "p95": 1.23,
+            "median": 1.43,
+            "mean": 1.43,
+            "min": 1.4,
+            "max": 1.45,
+            "p95": 1.45,
             "samples": [
-              1.17,
-              1.23,
-              1.13
+              1.45,
+              1.4,
+              1.43
             ]
           }
         }
@@ -2425,51 +2425,51 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 58.2,
-            "mean": 58.18,
-            "min": 58.13,
-            "max": 58.22,
-            "p95": 58.22,
+            "median": 27.56,
+            "mean": 27.56,
+            "min": 27.47,
+            "max": 27.64,
+            "p95": 27.64,
             "samples": [
-              58.2,
-              58.13,
-              58.22
+              27.56,
+              27.47,
+              27.64
             ]
           },
           "wazigl": {
-            "median": 4.09,
-            "mean": 4.1,
-            "min": 4.03,
-            "max": 4.17,
-            "p95": 4.17,
+            "median": 4.48,
+            "mean": 4.46,
+            "min": 4.37,
+            "max": 4.51,
+            "p95": 4.51,
             "samples": [
-              4.09,
-              4.03,
-              4.17
+              4.48,
+              4.51,
+              4.37
             ]
           },
           "zig_nollvm": {
-            "median": 84.7,
-            "mean": 84.75,
-            "min": 84.59,
-            "max": 84.97,
-            "p95": 84.97,
+            "median": 80.53,
+            "mean": 80.48,
+            "min": 80.34,
+            "max": 80.58,
+            "p95": 80.58,
             "samples": [
-              84.59,
-              84.97,
-              84.7
+              80.58,
+              80.53,
+              80.34
             ]
           },
           "zig_llvm": {
-            "median": 4.16,
-            "mean": 4.14,
-            "min": 4.09,
-            "max": 4.18,
-            "p95": 4.18,
+            "median": 4.32,
+            "mean": 4.31,
+            "min": 4.28,
+            "max": 4.32,
+            "p95": 4.32,
             "samples": [
-              4.16,
-              4.18,
-              4.09
+              4.32,
+              4.32,
+              4.28
             ]
           }
         }
@@ -2482,51 +2482,51 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 63.25,
-            "mean": 63.24,
-            "min": 63.19,
-            "max": 63.28,
-            "p95": 63.28,
+            "median": 30.16,
+            "mean": 30.16,
+            "min": 30.01,
+            "max": 30.33,
+            "p95": 30.33,
             "samples": [
-              63.19,
-              63.25,
-              63.28
+              30.33,
+              30.16,
+              30.01
             ]
           },
           "wazigl": {
-            "median": 6.4,
-            "mean": 6.41,
-            "min": 6.38,
-            "max": 6.45,
-            "p95": 6.45,
+            "median": 7.85,
+            "mean": 7.83,
+            "min": 7.79,
+            "max": 7.86,
+            "p95": 7.86,
             "samples": [
-              6.45,
-              6.4,
-              6.38
+              7.86,
+              7.85,
+              7.79
             ]
           },
           "zig_nollvm": {
-            "median": 82.31,
-            "mean": 82.34,
-            "min": 82.3,
-            "max": 82.41,
-            "p95": 82.41,
+            "median": 74.66,
+            "mean": 74.66,
+            "min": 74.63,
+            "max": 74.7,
+            "p95": 74.7,
             "samples": [
-              82.41,
-              82.3,
-              82.31
+              74.7,
+              74.63,
+              74.66
             ]
           },
           "zig_llvm": {
-            "median": 6.49,
-            "mean": 6.47,
-            "min": 6.37,
-            "max": 6.53,
-            "p95": 6.53,
+            "median": 7.66,
+            "mean": 7.68,
+            "min": 7.64,
+            "max": 7.74,
+            "p95": 7.74,
             "samples": [
-              6.53,
-              6.37,
-              6.49
+              7.66,
+              7.64,
+              7.74
             ]
           }
         }
@@ -2539,51 +2539,51 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 351.44,
-            "mean": 350.35,
-            "min": 348.12,
-            "max": 351.48,
-            "p95": 351.48,
+            "median": 134.16,
+            "mean": 134.27,
+            "min": 134.15,
+            "max": 134.5,
+            "p95": 134.5,
             "samples": [
-              348.12,
-              351.48,
-              351.44
+              134.5,
+              134.16,
+              134.15
             ]
           },
           "wazigl": {
-            "median": 25.82,
-            "mean": 25.85,
-            "min": 25.78,
-            "max": 25.94,
-            "p95": 25.94,
+            "median": 27.17,
+            "mean": 27.19,
+            "min": 27.17,
+            "max": 27.23,
+            "p95": 27.23,
             "samples": [
-              25.94,
-              25.82,
-              25.78
+              27.23,
+              27.17,
+              27.17
             ]
           },
           "zig_nollvm": {
-            "median": 458.44,
-            "mean": 458.8,
-            "min": 458.28,
-            "max": 459.68,
-            "p95": 459.68,
+            "median": 436.72,
+            "mean": 436.67,
+            "min": 436.46,
+            "max": 436.82,
+            "p95": 436.82,
             "samples": [
-              459.68,
-              458.44,
-              458.28
+              436.82,
+              436.72,
+              436.46
             ]
           },
           "zig_llvm": {
-            "median": 25.89,
-            "mean": 25.89,
-            "min": 25.82,
-            "max": 25.97,
-            "p95": 25.97,
+            "median": 27.09,
+            "mean": 27.11,
+            "min": 27.09,
+            "max": 27.16,
+            "p95": 27.16,
             "samples": [
-              25.97,
-              25.89,
-              25.82
+              27.09,
+              27.09,
+              27.16
             ]
           }
         }
@@ -2596,51 +2596,51 @@
         "timedIterations": 3,
         "compilers": {
           "wazig": {
-            "median": 413.38,
-            "mean": 413.69,
-            "min": 413.26,
-            "max": 414.43,
-            "p95": 414.43,
+            "median": 266.85,
+            "mean": 266.82,
+            "min": 266.74,
+            "max": 266.88,
+            "p95": 266.88,
             "samples": [
-              413.38,
-              413.26,
-              414.43
+              266.88,
+              266.85,
+              266.74
             ]
           },
           "wazigl": {
-            "median": 201.3,
-            "mean": 201.28,
-            "min": 201.18,
-            "max": 201.37,
-            "p95": 201.37,
+            "median": 181.36,
+            "mean": 181.36,
+            "min": 181.32,
+            "max": 181.4,
+            "p95": 181.4,
             "samples": [
-              201.37,
-              201.3,
-              201.18
+              181.4,
+              181.36,
+              181.32
             ]
           },
           "zig_nollvm": {
-            "median": 614.17,
-            "mean": 614.11,
-            "min": 613.84,
-            "max": 614.32,
-            "p95": 614.32,
+            "median": 488.46,
+            "mean": 488.47,
+            "min": 488.39,
+            "max": 488.55,
+            "p95": 488.55,
             "samples": [
-              614.32,
-              614.17,
-              613.84
+              488.55,
+              488.46,
+              488.39
             ]
           },
           "zig_llvm": {
-            "median": 201.15,
-            "mean": 201.14,
-            "min": 201.1,
-            "max": 201.16,
-            "p95": 201.16,
+            "median": 182.12,
+            "mean": 182.27,
+            "min": 182.06,
+            "max": 182.65,
+            "p95": 182.65,
             "samples": [
-              201.15,
-              201.16,
-              201.1
+              182.12,
+              182.06,
+              182.65
             ]
           }
         }

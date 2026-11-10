@@ -13,8 +13,8 @@ permissions:
 env:
   GHR_VERSION: v0.10.2
   WASMTIME_VERSION: v50.0.1
-  WAZIG_VERSION: v0.17.0-wazig.4
-  WAZIGL_VERSION: v0.17.0-wazigl.4
+  WAZIG_VERSION: v0.17.0-wazig.6
+  WAZIGL_VERSION: v0.17.0-wazigl.6
   ZIG_VERSION: v0.17.0
 
 jobs:
@@ -28,7 +28,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
 
       - name: Install dependencies and run tests
         run: cd zigar-runtime && npm ci && npm test
@@ -43,7 +43,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
 
       - name: Install ghr, wasmtime, wazig, and zig
         env:
@@ -79,6 +79,11 @@ jobs:
             ln -s ../../zigar-runtime node_modules/zigar-runtime
           )
 
+      - name: Run wit-zigar unit and bindgen tests
+        run: |
+          cd wit-zigar
+          zig build test
+
       - name: Run zigar-compiler tests (USE_WAZIG=1)
         env:
           USE_WAZIG: '1'
@@ -95,6 +100,7 @@ jobs:
             test/wasm-decoding.test.js \
             test/transpilation.test.js \
             test/compilation.test.js \
+            test/wit-zigar-bridge.test.js \
             --grep "compile code for Windows$|should fail when directory is illegal$" \
             --invert
 
@@ -115,7 +121,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
 
       - name: Install ghr, zig, wasmtime, and wazig
         env:
@@ -194,7 +200,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
 
       - name: Install and time toolchains (wazig vs zig)
         env:
@@ -270,6 +276,7 @@ jobs:
           TMPDIR: ${{ runner.temp }}
         run: |
           set -euo pipefail
+          node benchmarks/wit-zigar-benchmark.js
           node benchmarks/wazig-benchmark.js --quick --markdown "${RUNNER_TEMP}/bench-results.md" --json "${RUNNER_TEMP}/bench-results.json"
           cat "${RUNNER_TEMP}/bench-results.md" >> "$GITHUB_STEP_SUMMARY"
 

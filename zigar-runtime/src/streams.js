@@ -184,8 +184,7 @@ export class BlobReader extends AsyncReader {
 
   async pread(len, offset) {
     const slice = this.blob.slice(offset, offset + len);
-    const response = new Response(slice);
-    const buffer = await response.arrayBuffer();
+    const buffer = await slice.arrayBuffer();
     return new Uint8Array(buffer);
   }
   
