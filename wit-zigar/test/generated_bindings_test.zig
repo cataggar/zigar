@@ -1,6 +1,6 @@
 //! Build-time bindgen compilation and Canonical ABI round-trip tests.
 //!
-//! Imports Zig bindings generated at build time by the `wit-zigar` CLI from:
+//! Imports Zig bindings generated at build time by the `zigar wit` (`wit-zigar`) CLI from:
 //!   - `--wasi wasi:cli/imports@0.3.0` (`@import("generated_wasi_cli")`)
 //!   - `test/fixtures/sample.wit` (`@import("generated_sample")`)
 //! and exercises `canon.zig` comptime reflection and lift/lower thunks on the

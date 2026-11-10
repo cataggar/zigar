@@ -9,6 +9,7 @@ import {
   compile, findConfigFile, generateCode, getArch, getPlatform, hideStatus, optionsForCompile,
   processConfig, showResult, showStatus, test,
 } from 'zigar-compiler';
+import * as zigarCompiler from 'zigar-compiler';
 
 const require = createRequire(import.meta.url);
 
@@ -231,6 +232,16 @@ async function runTests(args) {
   }
 }
 
+async function runWitCommand(args) {
+  if (typeof zigarCompiler.runWit !== 'function') {
+    throw new Error('Installed zigar-compiler does not export runWit');
+  }
+  const { code } = await zigarCompiler.runWit(args);
+  if (code) {
+    process.exit(code);
+  }
+}
+
 function printHelp() {
   const lines = [
     'Usage: bunx bun-zigar [command]',
@@ -243,6 +254,7 @@ function printHelp() {
     '  extra         Create a barebone build.extra.zig in the current folder',
     '  preload       Add bun-zigar as preloaded module to bunfig.toml',
     '  test <path>   Run a Zig module\'s unit tests',
+    '  wit [args]    Generate Zig bindings from WIT or inspect zigar:abi sections',
     '',
     '  help          Show this message',
     '',
@@ -272,6 +284,9 @@ try {
       break;
     case 'test':
       await runTests(process.argv.slice(3));
+      break;
+    case 'wit':
+      await runWitCommand(process.argv.slice(3));
       break;
     case 'help':
     case undefined:
