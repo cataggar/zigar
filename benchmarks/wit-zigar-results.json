@@ -1,0 +1,125 @@
+{
+  "timestamp": "2026-11-10T17:11:28.935Z",
+  "wazigVersion": "0.17.0-wazig.6",
+  "nodeVersion": "v24.21.0",
+  "v8Version": "13.6.233.17-node.53",
+  "arch": "linux-arm64",
+  "inWasmAbi": {
+    "wasmSizeBytes": 299807,
+    "compileMs": 3392,
+    "spillSeventeen": {
+      "canonicalAbi": {
+        "iterations": 100,
+        "medianNsPerOp": 167.51,
+        "minNsPerOp": 165.54,
+        "opsPerSec": 5969793,
+        "cabiReallocPerCall": 1,
+        "cabiPostPerCall": 0
+      },
+      "zigarFastAbi": {
+        "iterations": 100,
+        "medianNsPerOp": 51.15,
+        "minNsPerOp": 48.31,
+        "opsPerSec": 19550342,
+        "cabiReallocPerCall": 0,
+        "cabiPostPerCall": 0
+      },
+      "speedupX": 3.27
+    },
+    "transformRect": {
+      "canonicalAbi": {
+        "iterations": 100,
+        "medianNsPerOp": 99.38,
+        "minNsPerOp": 99.25,
+        "opsPerSec": 10062387,
+        "cabiReallocPerCall": 1,
+        "cabiPostPerCall": 0
+      },
+      "zigarFastAbi": {
+        "iterations": 100,
+        "medianNsPerOp": 41.77,
+        "minNsPerOp": 38.85,
+        "opsPerSec": 23940627,
+        "cabiReallocPerCall": 0,
+        "cabiPostPerCall": 0
+      },
+      "speedupX": 2.38
+    },
+    "inspectRecord": {
+      "canonicalAbi": {
+        "iterations": 100,
+        "medianNsPerOp": 1041.13,
+        "minNsPerOp": 992.32,
+        "opsPerSec": 960495,
+        "cabiReallocPerCall": 10,
+        "cabiPostPerCall": 1
+      },
+      "zigarFastAbi": {
+        "iterations": 100,
+        "medianNsPerOp": 710.16,
+        "minNsPerOp": 651.78,
+        "opsPerSec": 1408133,
+        "cabiReallocPerCall": 0,
+        "cabiPostPerCall": 0
+      },
+      "speedupX": 1.47
+    },
+    "wasiP3AsyncSubtask": {
+      "iterations": 100,
+      "medianNsPerOp": 458.27,
+      "minNsPerOp": 431.44,
+      "opsPerSec": 2182120
+    }
+  },
+  "jsHostBoundary": {
+    "syncTranspileMs": 5172,
+    "jspiTranspileMs": 5196,
+    "syncUseJspiFalse": {
+      "transformRect": {
+        "iterations": 10000,
+        "medianNsPerOp": 15877.8,
+        "minNsPerOp": 10279.3,
+        "opsPerSec": 62981
+      },
+      "fastAbiRoundTrip": {
+        "iterations": 10000,
+        "medianNsPerOp": 16304.9,
+        "minNsPerOp": 14015.9,
+        "opsPerSec": 61331
+      },
+      "sumRectAreas16": {
+        "iterations": 5000,
+        "medianNsPerOp": 156101.4,
+        "minNsPerOp": 133409.9,
+        "opsPerSec": 6406
+      },
+      "canonAbiAsyncSubtask": {
+        "iterations": 10000,
+        "medianNsPerOp": 8463.8,
+        "minNsPerOp": 5941.7,
+        "opsPerSec": 118150
+      }
+    },
+    "jspiUseJspiTrue": {
+      "transformRect": {
+        "iterations": 5000,
+        "medianNsPerOp": 18477.8,
+        "minNsPerOp": 13510.2,
+        "opsPerSec": 54119
+      },
+      "fastAbiRoundTrip": {
+        "iterations": 5000,
+        "medianNsPerOp": 22070.2,
+        "minNsPerOp": 16835.2,
+        "opsPerSec": 45310
+      },
+      "concurrent16AsyncComputeWithHost": {
+        "batchSize": 16,
+        "medianNsPerCall": 53920.8,
+        "minNsPerCall": 48843.8,
+        "callsPerSec": 18546
+      },
+      "promisingVsSyncRatio": 1.16
+    }
+  }
+}

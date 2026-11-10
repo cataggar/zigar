@@ -220,7 +220,7 @@ export default mixin({
       }
       this.releaseZigView(dv);
       if (process.env.DEV) {
-        this.shadowMemoryBytes -= dv.byteLength;
+        this.shadowMemoryBytes -= len;
       }
     },
     obtainZigView(address, len, cache = true) {

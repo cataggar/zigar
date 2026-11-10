@@ -1287,7 +1287,7 @@ pub fn storeToMemory(comptime T: type, comptime arch: Arch, ctx: MemoryContext, 
 /// exhaust GP registers on `.stage2_aarch64`).
 pub fn loadStructFieldsFromMemory(comptime T: type, comptime arch: Arch, ctx: MemoryContext, addr: usize, out: *T) Error!void {
     const layout = comptime layoutOf(T, arch);
-    _ = try ctx.addrToOffset(addr, layout.size);
+    const off = try ctx.addrToOffset(addr, layout.size);
     if (comptime layout.alignment > 1) {
         if ((layout.size > 0 or addr != 0) and (addr % layout.alignment != 0)) {
             return error.UnalignedPointer;
@@ -1298,7 +1298,12 @@ pub fn loadStructFieldsFromMemory(comptime T: type, comptime arch: Arch, ctx: Me
         if (comptime st.field_attrs[i].@"comptime") continue;
         const FT = st.field_types[i];
         const f_off = comptime fieldOffset(T, arch, i);
-        if (comptime @typeInfo(FT) == .error_set) {
+        if (comptime layoutOf(FT, arch).is_blittable and @sizeOf(FT) == layoutOf(FT, arch).size and !needsFlagsWordMasking(FT)) {
+            @field(out.*, fname) = if (comptime @sizeOf(FT) == 0)
+                @as(FT, undefined)
+            else
+                std.mem.bytesToValue(FT, ctx.memory[off + f_off ..][0..@sizeOf(FT)]);
+        } else if (comptime @typeInfo(FT) == .error_set) {
             loadErrorSetFromMemory(FT, arch, ctx, addr + f_off, &@field(out.*, fname)) catch |err| {
                 inline for (0..i) |prev_i| {
                     if (comptime !st.field_attrs[prev_i].@"comptime") {
@@ -2116,6 +2121,7 @@ pub fn CoreFnType(comptime FnType: type, comptime opts: CallOptions) type {
 }
 
 threadlocal var active_memory_ctx: ?MemoryContext = null;
+threadlocal var active_memory_ctx_ptr: ?*const MemoryContext = null;
 threadlocal var last_async_task_return_ptr: ?usize = null;
 threadlocal var last_async_task_return_in_static_buf: bool = false;
 threadlocal var async_task_return_buf: [256]u8 align(16) = @splat(0);
@@ -2124,8 +2130,18 @@ pub fn setActiveMemoryContext(ctx: ?MemoryContext) void {
     active_memory_ctx = ctx;
 }
 
+pub fn setActiveMemoryContextPtr(ctx_ptr: ?*const MemoryContext) void {
+    active_memory_ctx_ptr = ctx_ptr;
+}
+
+pub fn getActiveMemoryContextPtr() ?*const MemoryContext {
+    return active_memory_ctx_ptr;
+}
+
 pub fn getActiveMemoryContext() ?MemoryContext {
-    return active_memory_ctx;
+    if (active_memory_ctx) |ctx| return ctx;
+    if (active_memory_ctx_ptr) |ptr| return ptr.*;
+    return null;
 }
 
 pub fn getLastAsyncTaskReturnPtr() ?usize {
@@ -2336,17 +2352,27 @@ pub inline fn liftCall(
     const RetT = ReturnType(FnType);
     const AddrT = AddrInt(opts.arch);
 
+    var lift_arena_state: ?std.heap.ArenaAllocator = if (ctx.allocator) |a|
+        std.heap.ArenaAllocator.init(a)
+    else
+        null;
+    defer if (lift_arena_state) |*a| a.deinit();
+    var arg_ctx = ctx;
+    if (lift_arena_state) |*a| {
+        arg_ctx.allocator = a.allocator();
+    }
+
     var zig_args: ArgsT = undefined;
     if (comptime !cls.params_spill) {
         var flat_args: FlatTuple(ArgsT, opts.arch) = undefined;
         inline for (0..cls.params_flat) |i| {
             flat_args[i] = core_args[i];
         }
-        zig_args = try liftFromFlat(ArgsT, opts.arch, ctx, flat_args);
+        zig_args = try liftFromFlat(ArgsT, opts.arch, arg_ctx, flat_args);
     } else {
         const raw_ptr: AddrT = @bitCast(core_args[0]);
         const params_ptr: usize = std.math.cast(usize, raw_ptr) orelse return error.OutOfBounds;
-        try loadStructFieldsFromMemory(ArgsT, opts.arch, ctx, params_ptr, &zig_args);
+        try loadStructFieldsFromMemory(ArgsT, opts.arch, arg_ctx, params_ptr, &zig_args);
     }
 
     const zig_ret: RetT = @call(.auto, handler, zig_args);

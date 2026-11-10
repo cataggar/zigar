@@ -560,6 +560,24 @@ describe('Feature: memory-mapping', function() {
         };
         expect(() => env.allocateShadowMemory(16, 4)).to.throw();
       })
+      it('should free shadow memory cleanly even if memory.grow detaches dv.buffer', function() {
+        const env = new Env();
+        env.memory = new WebAssembly.Memory({ initial: 1 });
+        env.allocateScratchMemory = function(len, align) {
+          return 0x1000;
+        };
+        const freed = [];
+        env.freeScratchMemory = function(address, len, align) {
+          freed.push({ address, len, align });
+        };
+        const dv = env.allocateShadowMemory(16, 4);
+        env.memory.grow(1); // detaches dv.buffer
+        expect(() => env.freeShadowMemory(dv)).to.not.throw();
+        expect(freed).to.deep.equal([ { address: 0x1000, len: 16, align: 4 } ]);
+        if (process.env.DEV) {
+          expect(env.shadowMemoryBytes).to.equal(0);
+        }
+      })
     })
     describe('getBufferAddress', function() {
       it('should return zero', function() {

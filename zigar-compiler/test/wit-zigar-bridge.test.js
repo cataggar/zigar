@@ -1,7 +1,8 @@
 import { expect } from 'chai';
-import { existsSync, mkdirSync } from 'fs';
+import { existsSync, mkdirSync, rmSync } from 'fs';
 import { readFile, writeFile } from 'fs/promises';
 import 'mocha-skip-if';
+import os from 'os';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { compile } from '../src/compilation.js';
@@ -16,26 +17,29 @@ import {
 } from '../src/wasm-decoding.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const WORKTREE_ROOT = resolve(__dirname, '../..');
-const LOCAL_CACHE_DIR = join(WORKTREE_ROOT, '.zig-cache');
-const GLOBAL_CACHE_DIR = join(WORKTREE_ROOT, '.zig-global-cache');
-const TMP_ROOT = join(WORKTREE_ROOT, '.tmp');
+const TMP_ROOT = join(os.tmpdir(), `wit-zigar-bridge-test-${process.pid}`);
+const LOCAL_CACHE_DIR = join(TMP_ROOT, 'zig-cache');
+const GLOBAL_CACHE_DIR = process.env.ZIG_GLOBAL_CACHE_DIR || join(TMP_ROOT, 'zig-global-cache');
+const XDG_CACHE_DIR = process.env.XDG_CACHE_HOME || join(TMP_ROOT, 'xdg-cache');
 const BUILD_DIR = join(TMP_ROOT, 'wit-zigar-build');
 const MODULE_OUT_DIR = join(TMP_ROOT, 'wit-zigar-modules');
 const RUNTIME_SRC_DIR = resolve(__dirname, '../../zigar-runtime/src');
-const WAZIG_BIN = existsSync('/d/zig/wazig/bin/wazig') ? '/d/zig/wazig/bin/wazig' : 'wazig';
-const WAZIG_TOOL_DIR = existsSync('/d/zig/wazig') ? '/d/zig/wazig' : undefined;
+const LOCAL_BIN_DIR = join(process.env.HOME || '/home/g', '.local', 'bin');
+if (existsSync(LOCAL_BIN_DIR) && !(process.env.PATH || '').split(':').includes(LOCAL_BIN_DIR)) {
+  process.env.PATH = `${LOCAL_BIN_DIR}:${process.env.PATH || ''}`;
+}
+const WAZIG_BIN = existsSync(join(LOCAL_BIN_DIR, 'wazig'))
+  ? join(LOCAL_BIN_DIR, 'wazig')
+  : (existsSync('/d/zig/wazig/bin/wazig') ? '/d/zig/wazig/bin/wazig' : 'wazig');
 const SERVICE_ZIG_PATH = fileURLToPath(new URL('./zig-samples/wit-zigar/service.zig', import.meta.url));
 
-for (const dir of [ LOCAL_CACHE_DIR, GLOBAL_CACHE_DIR, TMP_ROOT, BUILD_DIR, MODULE_OUT_DIR ]) {
+for (const dir of [ TMP_ROOT, LOCAL_CACHE_DIR, GLOBAL_CACHE_DIR, XDG_CACHE_DIR, BUILD_DIR, MODULE_OUT_DIR ]) {
   mkdirSync(dir, { recursive: true });
 }
 process.env.ZIG_LOCAL_CACHE_DIR = LOCAL_CACHE_DIR;
 process.env.ZIG_GLOBAL_CACHE_DIR = GLOBAL_CACHE_DIR;
+process.env.XDG_CACHE_HOME = XDG_CACHE_DIR;
 process.env.TMPDIR = TMP_ROOT;
-if (WAZIG_TOOL_DIR) {
-  process.env.GHR_TOOL_DIR = WAZIG_TOOL_DIR;
-}
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -96,6 +100,7 @@ describe('wit-zigar + zigar + wazig End-to-End Bridge (Issue #19)', function() {
 
   after(async function() {
     await serviceMod?.__zigar?.abandon();
+    rmSync(TMP_ROOT, { recursive: true, force: true });
   });
 
   it('should compile service.zig with wazig in Debug and ReleaseSmall, preserving "zigar:abi" custom section and __stack_pointer export', async function() {
@@ -303,6 +308,7 @@ describe('wit-zigar + zigar + wazig End-to-End Bridge (Issue #19)', function() {
     expect(sum2).to.equal(0x3345_6789);
   });
 
+  skip.if(typeof WebAssembly.Suspending !== 'function' || typeof WebAssembly.promising !== 'function').
   it('should execute 4 concurrent JSPI asyncComputeWithHost calls via Promise.all on isolated 16-byte-aligned continuation shadow stacks', async function() {
     const {
       asyncComputeWithHost,

@@ -14,7 +14,7 @@
  *     ELF64 `.cwasm` symbol table + `wasmtime objdump` inline `%rsp`/`%rbp`/`%rip` switch
  *     disassembly, and `aarch64` target diagnostic verification.
  *  3. Executable Dual-Stack (`__stack_pointer` / `global[0]`) Context-Switching Prototype
- *     and Benchmark on both a synthetic Wasm binary and a real `wazig` (`0.17.0-wazig.4`) compiled Zig `.wasm`
+ *     and Benchmark on both a synthetic Wasm binary and a real `wazig` (`0.17.0-wazig.6`) compiled Zig `.wasm`
  *     module (`-target wasm32-wasi -O ReleaseSmall -fno-entry -rdynamic`) across 50 concurrent
  *     out-of-order fibers (depth = 20, 1,000 suspensions), proving silent linear shadow stack
  *     corruption when sharing `global[0]` vs 100% isolation when switching `global[0]`.
