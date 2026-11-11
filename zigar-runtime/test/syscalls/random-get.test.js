@@ -19,5 +19,17 @@ describe('Syscall: random-get', function() {
       }
       expect(sum).to.not.equal(PosixError.NONE);
     })
+    it('should accept BigInt address and length when memory64 is enabled', function() {
+      const env = new Env();
+      env.memory = new WebAssembly.Memory({ initial: 1n, address: 'i64' });
+      env.memory64 = true;
+      expect(env.randomGet(0x1000n, 16n)).to.equal(0);
+      const dv = new DataView(env.memory.buffer, 0x1000, 16);
+      let sum = 0;
+      for (let i = 0; i < dv.byteLength; i++) {
+        sum += dv.getUint8(i);
+      }
+      expect(sum).to.not.equal(PosixError.NONE);
+    })
   }
 })

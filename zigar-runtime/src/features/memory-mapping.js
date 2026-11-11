@@ -2,8 +2,8 @@ import { mixin } from '../environment.js';
 import { AlignmentConflict } from '../errors.js';
 import { ALIGN, FALLBACK, MEMORY, ZIG } from '../symbols.js';
 import {
-  adjustAddress, alignForward, copyView, findSortedIndex, isInvalidAddress, isMisaligned,
-  usizeInvalid, usizeMax, usizeMin
+  adjustAddress, alignForward, copyView, findSortedIndex, isInvalidAddress, isInvalidUsize,
+  isMisaligned
 } from '../utils.js';
 
 export default mixin({
@@ -125,9 +125,11 @@ export default mixin({
     }
   },
   findMemory(context, address, count, size) {
-    if (isInvalidAddress(count)) {
-      count = 0;
-    }
+    const is64 = Boolean(this.memory64 || process.env.BITS == 64);
+    address = isInvalidAddress(address)
+      ? (is64 ? 0xaaaa_aaaa_aaaa_aaaan : 0xaaaa_aaaa)
+      : (is64 ? BigInt(address) : Number(address));
+    count = isInvalidAddress(count) ? 0 : Number(count);
     let len = count * (size ?? 0);
     const index = findMemoryIndex(this.memoryList, address, len);
     const entry = this.memoryList[index - 1];
@@ -171,9 +173,9 @@ export default mixin({
   releaseZigView(dv) {
     const zig = dv[ZIG];
     const address = zig?.address;
-    if (address && address !== usizeInvalid) {
+    if (address && !isInvalidUsize(address)) {
       // set address to invalid to avoid double free
-      zig.address = usizeInvalid;
+      zig.address = (this.memory64 || process.env.BITS == 64) ? -1n : -1;
       if (process.env.TARGET === 'node') {
         this.unregisterBuffer(adjustAddress(address, -dv.byteOffset));
       }
@@ -190,16 +192,18 @@ export default mixin({
   },
   ...(process.env.TARGET === 'wasm' ? {
     imports: {
-      allocateScratchMemory: { argType: 'ii', returnType: 'i' },
-      freeScratchMemory: { argType: 'iii' },
+      allocateScratchMemory: { argType: 'zi', returnType: 'a' },
+      freeScratchMemory: { argType: 'azi' },
     },
     exports: {
-      getViewAddress: { argType: 'v', returnType: 'i' },
+      getViewAddress: { argType: 'v', returnType: 'a' },
     },
     usizeMaxBuffer: new ArrayBuffer(0),
 
     allocateShadowMemory(len, align) {
-      const address = (len) ? this.allocateScratchMemory(len, align) : 0;
+      len = Number(len);
+      const zeroAddr = (this.memory64 || process.env.BITS == 64) ? 0n : 0;
+      const address = (len) ? this.allocateScratchMemory(len, align) : zeroAddr;
       if (!address && len) {
         throw new Error('Out of memory');
       }
@@ -224,16 +228,24 @@ export default mixin({
       }
     },
     obtainZigView(address, len, cache = true) {
+      len = Number(len);
+      const is64 = Boolean(this.memory64 || process.env.BITS == 64);
+      const minAddr = is64 ? 0n : 0;
+      const maxAddr = is64 ? 0xFFFF_FFFF_FFFF_FFFFn : 0xFFFF_FFFF;
       if (isInvalidAddress(address)) {
-        address = (len > 0) ? 0 : usizeMax;
+        address = (len > 0) ? minAddr : maxAddr;
+      } else if (address === -1 || address === -1n) {
+        address = maxAddr;
+      } else {
+        address = is64 ? BigInt(address) : Number(address);
       }
-      if (!address && len) {
+      if (!address && len > 0) {
         return null;
       }
       let { buffer } = this.memory;
-      if (address === usizeMax) {
+      if (address === maxAddr) {
         buffer = this.usizeMaxBuffer;
-        address = usizeMin;
+        address = minAddr;
         len = 0;
       }
       return this.obtainView(buffer, address, len, cache);
@@ -244,7 +256,7 @@ export default mixin({
         return this.getViewAddress(dv);
       } else if (dv.byteLength === 0) {
         // it's a null pointer/empty slice
-        return 0;
+        return (this.memory64 || process.env.BITS == 64) ? 0n : 0;
       }
       // JS buffers always need shadowing
       return this.getShadowAddress(context, target, cluster, writable);
@@ -255,7 +267,7 @@ export default mixin({
           throw new Error('Cannot obtain address of JavaScript buffer');
         }
       }
-      return 0;
+      return (this.memory64 || process.env.BITS == 64) ? 0n : 0;
     },
   } : process.env.TARGET === 'node' ? {
     imports: {
@@ -274,10 +286,18 @@ export default mixin({
       // nothing needs to happen
     },
     obtainZigView(address, len, cache = true) {
+      len = Number(len);
+      const is64 = Boolean(this.memory64 || process.env.BITS == 64);
+      const minAddr = is64 ? 0n : 0;
+      const maxAddr = is64 ? 0xFFFF_FFFF_FFFF_FFFFn : 0xFFFF_FFFF;
       if (isInvalidAddress(address)) {
-        address = (len > 0) ? 0 : usizeMax;
+        address = (len > 0) ? minAddr : maxAddr;
+      } else if (address === -1 || address === -1n) {
+        address = maxAddr;
+      } else {
+        address = is64 ? BigInt(address) : Number(address);
       }
-      if (!address && len) {
+      if (!address && len > 0) {
         return null;
       }
       let buffer, offset, index;

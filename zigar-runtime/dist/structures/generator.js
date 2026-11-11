@@ -2,13 +2,12 @@ import { StructurePurpose } from '../constants.js';
 import { mixin } from '../environment.js';
 import { TypeMismatch } from '../errors.js';
 import { YIELD, THROWING, GENERATOR, MEMORY, TRANSFORM, RESET, FINALIZE, RETURN } from '../symbols.js';
-import { usize } from '../utils.js';
 
 var generator = mixin({
   init() {
     this.generatorCallbackMap = new Map();
     this.generatorContextMap = new Map();
-    this.nextGeneratorContextId = usize(0x2000);
+    this.nextGeneratorContextId = 0x2000;
   },
   createGenerator(structure, args, func) {
     const { constructor, instance: { members } } = structure;
@@ -21,7 +20,8 @@ var generator = mixin({
       func = generator.push.bind(generator);
     }
     // create a handle referencing the function 
-    const contextId = this.nextGeneratorContextId++;
+    const id = this.nextGeneratorContextId++;
+    const contextId = (this.memory64 || "32" == 64) ? BigInt(id) : id;
     const ptr = this.obtainZigView(contextId, 0, false);
     this.generatorContextMap.set(contextId, { func, args });
     // use the same callback for all generators of a given type

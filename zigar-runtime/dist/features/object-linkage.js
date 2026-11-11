@@ -12,12 +12,14 @@ var objectLinkage = mixin({
         return;
       }
     }
+    const is64 = Boolean(this.memory64 || "32" == 64);
     for (const { object, handle } of this.variables) {
       const jsDV = object[MEMORY];
       // objects in WebAssembly have fixed addresses so the handle is the address
       // for native code module, locations of objects in memory can change depending on
       // where the shared library is loaded
-      const address = handle ;
+      const normalizedHandle = is64 ? BigInt(handle) : Number(handle);
+      const address = normalizedHandle ;
       let zigDV = object[MEMORY] = this.obtainZigView(address, jsDV.byteLength);
       if (writeBack) {
         copyView(zigDV, jsDV);
@@ -56,7 +58,7 @@ var objectLinkage = mixin({
   },
   ...({
     imports: {
-      recreateAddress: { argType: 'i', returnType: 'i' },
+      recreateAddress: { argType: 'a', returnType: 'a' },
     },
   } ),
   });

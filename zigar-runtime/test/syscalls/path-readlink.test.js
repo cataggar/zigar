@@ -165,5 +165,19 @@ describe('Syscall: path-readlink', function() {
       const result2 = f(PosixDescriptor.root, pathAddress, pathLen, bufferAddress, bufferLen, writtenAddress);
       expect(result2).to.equal(PosixError.ENOENT);
     })
+    it('should accept BigInt lengths and write 8-byte bufused when memory64 is enabled', async function() {
+      const env = new Env();
+      env.memory = new WebAssembly.Memory({ initial: 1n, address: 'i64' });
+      env.memory64 = true;
+      env.addListener('readlink', () => '/world.txt');
+      const path = new TextEncoder().encode('/hello.txt');
+      new Uint8Array(env.memory.buffer, 0x1000, path.length).set(path);
+      const raw = new DataView(env.memory.buffer);
+      raw.setUint32(0x3004, 0xaaaa_aaaa, env.littleEndian);
+      const result = env.pathReadlink(PosixDescriptor.root, 0x1000n, BigInt(path.length), 0x2000n, 6n, 0x3000n);
+      expect(result).to.equal(0);
+      expect(raw.getBigUint64(0x3000, env.littleEndian)).to.equal(6n);
+      expect(decodeText(new Uint8Array(env.memory.buffer, 0x2000, 6))).to.equal('/world');
+    })
   }
 })

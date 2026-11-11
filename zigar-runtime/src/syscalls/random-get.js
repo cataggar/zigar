@@ -3,8 +3,9 @@ import { createView } from '../utils.js';
 
 export default (process.env.TARGET === 'wasm') ? mixin({
   randomGet(bufAddress, bufLen) {
-    const dv = createView(bufLen);
-    for (let i = 0; i < bufLen; i++) {
+    const len = Number(bufLen);
+    const dv = createView(len);
+    for (let i = 0; i < len; i++) {
       dv.setUint8(i, Math.floor(256 * Math.random()));
     }
     this.moveExternBytes(dv, bufAddress, true);

@@ -8,12 +8,13 @@ var pollOneoff = mixin({
   pollOneoff(subscriptionAddress, eventAddress, subscriptionCount, eventCountAddress, canWait) {
     const subscriptionSize = 48;
     const eventSize = 32;
+    const count = Number(subscriptionCount);
     const results = [], promises = [];
     const le = this.littleEndian;
     return catchPosixError(canWait, PosixError.EBADF, () => {
-      const subscriptions = createView(subscriptionSize * subscriptionCount);
+      const subscriptions = createView(subscriptionSize * count);
       this.moveExternBytes(subscriptions, subscriptionAddress, false);
-      for (let i = 0; i < subscriptionCount; i++) {
+      for (let i = 0; i < count; i++) {
         const offset = i * subscriptionSize;
         const userdata = subscriptions.getBigUint64(offset, le);
         const tag = subscriptions.getUint8(offset + 8);
@@ -90,7 +91,7 @@ var pollOneoff = mixin({
         }
       }
       this.moveExternBytes(events, eventAddress, true);
-      this.copyUint32(eventCountAddress, eventCount);
+      this.copyUsize(eventCountAddress, eventCount);
     });
   },
 });

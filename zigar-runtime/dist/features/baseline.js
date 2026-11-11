@@ -2,6 +2,7 @@ import { structureNames } from '../constants.js';
 import { mixin } from '../environment.js';
 import { TypeMismatch } from '../errors.js';
 import { MEMORY, SLOTS, TYPE, ALIGN, SIZE, ENVIRONMENT } from '../symbols.js';
+import { defineProperties } from '../utils.js';
 
 const events = [ 
   'log', 'mkdir', 'stat', 'utimes', 'open', 'rename', 'readlink', 'rmdir', 'symlink', 'unlink'
@@ -12,6 +13,32 @@ var baseline = mixin({
     this.variables = [];
     this.listenerMap = new Map();
     this.envVariables = this.envVarArrays = null;
+    this.memory64 = false;
+    this.table64 = false;
+    const proto = Object.getPrototypeOf(this);
+    if (proto && !Object.hasOwn(proto, 'usizeByteSize')) {
+      defineProperties(proto, {
+        usizeMin: { get() { return this.getUsizeMin(); } },
+        usizeMax: { get() { return this.getUsizeMax(); } },
+        usizeInvalid: { get() { return this.getUsizeInvalid(); } },
+        usizeByteSize: { get() { return this.getUsizeByteSize(); } },
+      });
+    }
+  },
+  usize(n) {
+    return (this.memory64 || "32" == 64) ? BigInt(n) : Number(n);
+  },
+  getUsizeMin() {
+    return (this.memory64 || "32" == 64) ? 0n : 0;
+  },
+  getUsizeMax() {
+    return (this.memory64 || "32" == 64) ? 0xFFFF_FFFF_FFFF_FFFFn : 0xFFFF_FFFF;
+  },
+  getUsizeInvalid() {
+    return (this.memory64 || "32" == 64) ? -1n : -1;
+  },
+  getUsizeByteSize() {
+    return (this.memory64 || "32" == 64) ? 8 : 4;
   },
   getSpecialExports() {
     const check = (v) => {
@@ -64,6 +91,10 @@ var baseline = mixin({
   },
   recreateStructures(structures, settings) {
     Object.assign(this, settings);
+    if (settings?.memory64 !== undefined) {
+      this.memory64 = Boolean(settings.memory64);
+      this.table64 = Boolean(settings.table64 ?? settings.memory64);
+    }
     const insertObjects = (dest, placeholders) => {
       for (const [ slot, placeholder ] of Object.entries(placeholders)) {
         dest[slot] = createObject(placeholder);

@@ -7,7 +7,7 @@ export default mixin({
   pathFilestatSetTimesEvent: 'utimes',
   pathFilestatSetTimes(dirFd, lFlags, pathAddress, pathLen, atime, mtime, tFlags, canWait) {
     return catchPosixError(canWait, PosixError.ENOENT, () => {
-      const loc = this.obtainStreamLocation(dirFd, pathAddress, pathLen);
+      const loc = this.obtainStreamLocation(dirFd, pathAddress, Number(pathLen));
       const times = extractTimes(atime, mtime, tFlags);
       const flags = decodeFlags(lFlags, PosixLookupFlag) ;
       return this.triggerEvent('utimes', { ...loc, times, flags });

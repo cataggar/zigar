@@ -17,6 +17,7 @@ import {
   repackNames,
   stripUnused,
 } from '../src/wasm-decoding.js';
+import { compile, getModuleCachePath } from '../src/compilation.js';
 
 const littleEndian = true;
 
@@ -245,6 +246,82 @@ describe('WASM decoding', function() {
       ]);
       const dvImported = new DataView(importedGlobalWasm.buffer);
       expect(ensureStackPointerExport(dvImported)).to.equal(dvImported);
+
+      // Module where global[0] is mutable i64 (wasm64 __stack_pointer, valtype 0x7e)
+      const i64SpWasm = new Uint8Array([
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x06, 0x07, 0x01, 0x7e, 0x01, 0x42, 0x80, 0x08, 0x0b,
+        0x07, 0x01, 0x00,
+      ]);
+      const patchedI64 = ensureStackPointerExport(new DataView(i64SpWasm.buffer));
+      const modI64 = new WebAssembly.Module(new Uint8Array(patchedI64.buffer, patchedI64.byteOffset, patchedI64.byteLength));
+      expect(WebAssembly.Module.exports(modI64)).to.deep.include({ name: '__stack_pointer', kind: 'global' });
+    })
+    it('should strip i64.const getFactoryThunk and factory function with dynamic active element offset', function() {
+      // Type 0: () -> i64, Type 1: () -> void
+      // Functions:
+      //   0 (factoryFn, type 1): calls imported _createBool (wait: internal helper fn 1)
+      //   1 (unusedFactoryHelper, type 1): nop; end
+      //   2 (getFactoryThunk, type 0, exported): i64.const 5; end  (points to table slot 5 -> segment offset 5 + idx 0 = func 0)
+      //   3 (runThunk, type 1, exported): nop; end
+      //   4 (keptCallback, type 1, in table slot 6): nop; end
+      const typeData = new DataView(new Uint8Array([
+        0x02,
+        0x60, 0x00, 0x01, 0x7e,
+        0x60, 0x00, 0x00,
+      ]).buffer);
+      const tableData = new DataView(new Uint8Array([
+        0x01, 0x70, 0x04, 0x10, // 1 funcref table64, min=16
+      ]).buffer);
+      const globalData = new DataView(new Uint8Array([
+        0x01, 0x7e, 0x01, 0x42, 0x80, 0x80, 0x04, 0x0b, // mutable i64 __stack_pointer
+      ]).buffer);
+      const fnFactory = new DataView(new Uint8Array([ 0x00, 0x10, 0x01, 0x0b ]).buffer); // calls func 1
+      const fnHelper = new DataView(new Uint8Array([ 0x00, 0x0b ]).buffer);
+      const fnGetFactory = new DataView(new Uint8Array([ 0x00, 0x42, 0x05, 0x0b ]).buffer); // i64.const 5; end
+      const fnRunThunk = new DataView(new Uint8Array([ 0x00, 0x0b ]).buffer);
+      const fnKeptCb = new DataView(new Uint8Array([ 0x00, 0x0b ]).buffer);
+      const mod = {
+        size: 256,
+        sections: [
+          { type: SectionType.Type, data: typeData },
+          { type: SectionType.Function, types: [ 1, 1, 0, 1, 1 ] },
+          { type: SectionType.Table, data: tableData },
+          { type: SectionType.Global, data: globalData },
+          {
+            type: SectionType.Export,
+            exports: [
+              { name: 'getFactoryThunk', type: ObjectType.Function, index: 2 },
+              { name: 'runThunk', type: ObjectType.Function, index: 3 },
+            ],
+          },
+          {
+            type: SectionType.Element,
+            segments: [
+              {
+                type: 0,
+                expr: new DataView(new Uint8Array([ 0x42, 0x05, 0x0b ]).buffer), // i64.const 5; end
+                indices: [ 0, 4 ],
+              },
+            ],
+          },
+          {
+            type: SectionType.Code,
+            functions: [ fnFactory, fnHelper, fnGetFactory, fnRunThunk, fnKeptCb ],
+          },
+        ],
+      };
+      const dv = repackBinary(mod);
+      const stripped = stripUnused(dv);
+      const parsed = parseBinary(stripped);
+      const codeSec = parsed.sections.find(s => s.type === SectionType.Code);
+      // Only runThunk and keptCallback should remain (factoryFn, unusedFactoryHelper, getFactoryThunk all stripped!)
+      expect(codeSec.functions).to.have.lengthOf(2);
+      const compiled = new WebAssembly.Module(new Uint8Array(stripped.buffer, stripped.byteOffset, stripped.byteLength));
+      const exportNames = WebAssembly.Module.exports(compiled).map(e => e.name);
+      expect(exportNames).to.include('runThunk');
+      expect(exportNames).to.include('__stack_pointer');
+      expect(exportNames).to.not.include('getFactoryThunk');
     })
   })
   describe('parseNames', function() {
@@ -348,6 +425,8 @@ describe('WASM decoding', function() {
       const reparsed = parseBinary(dvImported);
       expect(reparsed.sections[0].imports[0].limits.min).to.equal(0x100000);
       expect(reparsed.sections[0].imports[0].limits.max).to.equal(0x200000);
+      expect(reparsed.sections[0].imports[0].limits.is64).to.be.true;
+      expect(reparsed.sections[0].imports[1].limits.is64).to.be.true;
       const limitsImported = extractLimits(dvImported);
       expect(limitsImported.memoryInitial).to.equal(0x100000);
       expect(limitsImported.memoryMax).to.equal(0x200000);
@@ -355,6 +434,61 @@ describe('WASM decoding', function() {
       expect(limitsImported.definedMemoryInitial).to.be.undefined;
       expect(limitsImported.memory64).to.be.true;
       expect(limitsImported.table64).to.be.true;
+
+      // 3. 32-bit limits expose is64: false
+      const imported32Module = {
+        size: 128,
+        sections: [
+          {
+            type: SectionType.Import,
+            imports: [
+              {
+                module: 'env',
+                name: 'memory',
+                type: ObjectType.Memory,
+                limits: { flags: 0x01, min: 2, max: 16 },
+              },
+            ],
+          },
+        ],
+      };
+      const dv32 = repackBinary(imported32Module);
+      const reparsed32 = parseBinary(dv32);
+      expect(reparsed32.sections[0].imports[0].limits.is64).to.be.false;
+    })
+    it('should decode, strip, and export __stack_pointer on real compiled wasm64-wasi binaries', async function() {
+      const simpleSrc = absolute('./zig-samples/basic/simple.zig');
+      const stOpts = { optimize: 'ReleaseSmall', arch: 'wasm64', platform: 'wasi', isWASM: true, memory64: true };
+      const stRes = await compile(simpleSrc, getModuleCachePath(simpleSrc, stOpts), stOpts);
+      const stBytes = await readFile(stRes.outputPath);
+      const stDV = new DataView(stBytes.buffer, stBytes.byteOffset, stBytes.byteLength);
+      const stLimits = extractLimits(stDV);
+      expect(stLimits.memory64).to.be.true;
+      expect(stLimits.table64).to.be.true;
+      expect(stLimits.definedMemoryMax).to.equal(65536);
+      expect(typeof stLimits.tableInitial).to.equal('number');
+      const stStripped = stripUnused(stDV);
+      expect(stStripped.byteLength).to.be.below(stDV.byteLength);
+      const stMod = await WebAssembly.compile(new Uint8Array(stStripped.buffer, stStripped.byteOffset, stStripped.byteLength));
+      const stExports = WebAssembly.Module.exports(stMod).map(e => e.name);
+      expect(stExports).to.include('__stack_pointer');
+      expect(stExports).to.not.include('getFactoryThunk');
+      const stUnstripped = ensureStackPointerExport(stDV);
+      const stUnstrippedMod = await WebAssembly.compile(new Uint8Array(stUnstripped.buffer, stUnstripped.byteOffset, stUnstripped.byteLength));
+      expect(WebAssembly.Module.exports(stUnstrippedMod).map(e => e.name)).to.include('__stack_pointer');
+
+      const atomicSrc = absolute('./zig-samples/basic/atomic.zig');
+      const mtOpts = { optimize: 'ReleaseSmall', arch: 'wasm64', platform: 'wasi', isWASM: true, memory64: true, multithreaded: true };
+      const mtRes = await compile(atomicSrc, getModuleCachePath(atomicSrc, mtOpts), mtOpts);
+      const mtBytes = await readFile(mtRes.outputPath);
+      const mtDV = new DataView(mtBytes.buffer, mtBytes.byteOffset, mtBytes.byteLength);
+      const mtLimits = extractLimits(mtDV);
+      expect(mtLimits.memory64).to.be.true;
+      expect(mtLimits.table64).to.be.true;
+      expect(mtLimits.memoryMax).to.equal(1024);
+      const mtStripped = stripUnused(mtDV);
+      const mtMod = await WebAssembly.compile(new Uint8Array(mtStripped.buffer, mtStripped.byteOffset, mtStripped.byteLength));
+      expect(WebAssembly.Module.exports(mtMod).map(e => e.name)).to.include('__stack_pointer');
     })
     it('should decode and repack call_ref (0x14), return_call_ref (0x15), and >4GB memory64 memarg offsets', function() {
       // Function body:

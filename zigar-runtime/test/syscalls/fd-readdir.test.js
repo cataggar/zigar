@@ -224,6 +224,21 @@ describe('Syscall: fd-readdir', function() {
         }
       }
     })
+    it('should accept BigInt buf/len and write 8-byte bufused when memory64 is enabled', async function() {
+      const env = new Env();
+      env.memory = new WebAssembly.Memory({ initial: 1n, address: 'i64' });
+      env.memory64 = true;
+      const map = new Map([[ 'hello.txt', {} ]]);
+      const dir = env.convertDirectory(map);
+      const fd = env.createStreamHandle(dir, [ PosixDescriptorRight.fd_readdir, 0 ]);
+      const raw = new DataView(env.memory.buffer);
+      raw.setUint32(0x2004, 0xaaaa_aaaa, env.littleEndian);
+      expect(env.fdReaddir(fd, 0x1000n, 20n, 0n, 0x2000n)).to.equal(PosixError.EINVAL);
+      const bufLen = BigInt(24 + 1 + 24 + 2 + 16);
+      const result = env.fdReaddir(fd, 0x1000n, bufLen, 0n, 0x2000n);
+      expect(result).to.equal(0);
+      expect(raw.getBigUint64(0x2000, env.littleEndian)).to.equal(BigInt(24 + 1 + 24 + 2));
+    })
   }
   if (process.env.TARGET === 'node') {
     it('should seek back to previous position when an entry too large to fit buffer', async function() {

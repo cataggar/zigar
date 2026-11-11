@@ -165,5 +165,27 @@ describe('Syscall: path-rename', function() {
       const result2 = f(PosixDescriptor.root, pathAddress, pathLen, PosixDescriptor.root, newPathAddress, newPathLen);
       expect(result2).to.equal(PosixError.ENOENT);
     })
+    it('should accept BigInt path pointers and lengths when memory64 is enabled', async function() {
+      const env = new Env();
+      env.memory = new WebAssembly.Memory({ initial: 1n, address: 'i64' });
+      env.memory64 = true;
+      let event;
+      env.addListener('rename', (evt) => {
+        event = evt;
+        return true;
+      });
+      const path = new TextEncoder().encode('/hello.txt');
+      const newPath = new TextEncoder().encode('/world.txt');
+      new Uint8Array(env.memory.buffer, 0x1000, path.length).set(path);
+      new Uint8Array(env.memory.buffer, 0x2000, newPath.length).set(newPath);
+      const result = env.pathRename(PosixDescriptor.root, 0x1000n, BigInt(path.length), PosixDescriptor.root, 0x2000n, BigInt(newPath.length));
+      expect(result).to.equal(0);
+      expect(event).to.eql({
+        parent: null,
+        path: 'hello.txt',
+        newParent: null,
+        newPath: 'world.txt',
+      });
+    })
   }
 })

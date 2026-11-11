@@ -1,12 +1,12 @@
 import { mixin } from '../environment.js';
 import { MEMORY, RESET } from '../symbols.js';
-import { usizeMax, usize } from '../utils.js';
+import '../utils.js';
 
 var allocator = mixin({
   init() {
     this.defaultAllocator = null;
     this.allocatorContextMap = new Map();
-    this.nextAllocatorContextId = usize(0x1000);
+    this.nextAllocatorContextId = 0x1000;
   },
   createDefaultAllocator(args, structure) {
     return this.defaultAllocator ??= this.createJsAllocator(args, structure, false);
@@ -24,11 +24,14 @@ var allocator = mixin({
     }
     this.destructors.push(() => this.freeFunction(vtable.alloc));
     this.destructors.push(() => this.freeFunction(vtable.free));
-    let contextId = usizeMax;
+    const is64 = Boolean(this.memory64 || "32" == 64);
+    const maxAddr = is64 ? 0xFFFF_FFFF_FFFF_FFFFn : 0xFFFF_FFFF;
+    let contextId = maxAddr;
     if (resettable) {
       // create list used to clean memory allocated for generator
       const list = [];
-      contextId = this.nextAllocatorContextId++;
+      const id = this.nextAllocatorContextId++;
+      contextId = is64 ? BigInt(id) : id;
       this.allocatorContextMap.set(contextId, list);
       args[RESET] = (done) => {
         for (const { address, len } of list) {
@@ -49,9 +52,12 @@ var allocator = mixin({
     return new Allocator({ ptr, vtable });
   },
   allocateHostMemory(ptr, len, ptrAlign) {
+    len = Number(len);
+    const is64 = Boolean(this.memory64 || "32" == 64);
+    const maxAddr = is64 ? 0xFFFF_FFFF_FFFF_FFFFn : 0xFFFF_FFFF;
     // see if we're dealing with a resettable allocator
     const contextId = this.getViewAddress(ptr['*'][MEMORY]);
-    const list = (contextId != usizeMax) ? this.allocatorContextMap.get(contextId) : null;
+    const list = (contextId !== maxAddr) ? this.allocatorContextMap.get(contextId) : null;
     const align = 1 << ptrAlign;
     const targetDV = this.allocateJSMemory(len, align);
     {

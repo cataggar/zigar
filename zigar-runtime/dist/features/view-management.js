@@ -2,7 +2,7 @@ import { StructureType } from '../constants.js';
 import { mixin } from '../environment.js';
 import { BufferSizeMismatch, ArrayLengthMismatch, BufferExpected } from '../errors.js';
 import { MEMORY, CACHE, ZIG, NO_CACHE, SENTINEL, SHAPE, TYPED_ARRAY, RESTORE } from '../symbols.js';
-import { copyView, isDetached, usizeInvalid, copyObject, isCompatibleInstanceOf, findElements } from '../utils.js';
+import { toBufferOffset, copyView, isInvalidUsize, isDetached, copyObject, isCompatibleInstanceOf, findElements } from '../utils.js';
 
 var viewManagement = mixin({
   init() {
@@ -105,7 +105,7 @@ var viewManagement = mixin({
       }
     }
     {
-      if (existing?.[ZIG]?.address === usizeInvalid) {
+      if (isInvalidUsize(existing?.[ZIG]?.address)) {
         // view was of previously freed memory
         existing = null;
       }
@@ -113,26 +113,30 @@ var viewManagement = mixin({
     return { existing, entry };
   },
   obtainView(buffer, offset, len, cache = true) {
+    const byteOffset = (offset !== undefined) ? toBufferOffset(offset) : undefined;
+    const byteLen = (len !== undefined) ? Number(len) : undefined;
     let dv;
     if (cache) {
-      const { existing, entry } = this.findViewAt(buffer, offset, len);
+      const { existing, entry } = this.findViewAt(buffer, byteOffset, byteLen);
       if (existing) {
         return existing;
       }
-      dv = new DataView(buffer, offset, len);
+      dv = new DataView(buffer, byteOffset, byteLen);
       if (entry) {
-        entry.set(`${offset}:${len}`, dv);
+        entry.set(`${byteOffset}:${byteLen}`, dv);
       } else {
         // just one view of this buffer for now
         this.viewMap.set(buffer, dv);
       }
     } else {
-      dv = new DataView(buffer, offset, len);
+      dv = new DataView(buffer, byteOffset, byteLen);
       dv[NO_CACHE] = true;
     }
     {
       if (buffer === this.memory?.buffer || buffer === this.usizeMaxBuffer) {
-        dv[ZIG] = { address: offset, len };
+        const is64 = Boolean(this.memory64 || "32" == 64);
+        const address = is64 ? BigInt(offset ?? 0) : Number(offset ?? 0);
+        dv[ZIG] = { address, len: byteLen };
       }
       return dv;
     }
@@ -161,8 +165,11 @@ var viewManagement = mixin({
       return this.obtainView(new ArrayBuffer(len), 0, len);
     },
     restoreView(dv) {
+      if (this.usingResizableBuffer) {
+        return dv;
+      }
       const zig = dv?.[ZIG];
-      if (zig && isDetached(dv.buffer)) {
+      if (zig && !isInvalidUsize(zig.address) && (isDetached(dv.buffer) || (this.memory && dv.buffer !== this.memory.buffer && dv.buffer !== this.usizeMaxBuffer))) {
         dv = this.obtainZigView(zig.address, zig.len);
         if (zig.align) {
           dv[ZIG].align = zig.align;
@@ -188,7 +195,7 @@ var viewManagement = mixin({
       const { memory } = this;
       const len = jsDV.byteLength;
       if (len === 0) return;
-      const zigDV = new DataView(memory.buffer, address, len);
+      const zigDV = new DataView(memory.buffer, toBufferOffset(address), Number(len));
       if (!(jsDV instanceof DataView)) {
         // assume it's a typed array
         jsDV = new DataView(jsDV.buffer, jsDV.byteOffset, jsDV.byteLength);

@@ -6,7 +6,7 @@ var pathCreateDirectory = mixin({
   pathCreateDirectoryEvent: 'mkdir',
   pathCreateDirectory(dirFd, pathAddress, pathLen, canWait) {
     return catchPosixError(canWait, PosixError.ENOENT, () => {
-      const loc = this.obtainStreamLocation(dirFd, pathAddress, pathLen);
+      const loc = this.obtainStreamLocation(dirFd, pathAddress, Number(pathLen));
       return this.triggerEvent('mkdir', loc, PosixError.ENOENT);
     }, (result) => {
       if (result === undefined) {

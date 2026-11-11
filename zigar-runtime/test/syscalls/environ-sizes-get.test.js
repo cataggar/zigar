@@ -122,5 +122,22 @@ describe('Syscall: environ-sizes-get', function() {
       expect(count).to.equal(2);
       expect(size).to.equal(8 + 10);
     })
+    it('should write 8-byte usize count and buf_size when memory64 is enabled', function() {
+      const env = new Env();
+      env.memory = new WebAssembly.Memory({ initial: 1n, address: 'i64' });
+      env.memory64 = true;
+      env.setObject('env', {
+        HELLO: 1,
+        WORLD: 123,
+      });
+      const le = env.littleEndian;
+      const raw = new DataView(env.memory.buffer);
+      raw.setUint32(0x1004, 0xaaaa_aaaa, le);
+      raw.setUint32(0x2004, 0xaaaa_aaaa, le);
+      const result = env.environSizesGet(0x1000n, 0x2000n);
+      expect(result).to.equal(0);
+      expect(raw.getBigUint64(0x1000, le)).to.equal(2n);
+      expect(raw.getBigUint64(0x2000, le)).to.equal(18n);
+    })
   }
 })

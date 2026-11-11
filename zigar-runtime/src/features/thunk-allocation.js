@@ -4,12 +4,12 @@ import { empty } from '../utils.js';
 export default mixin({
   ...(process.env.TARGET === 'wasm' ? {
     exports: {
-      allocateJsThunk: { argType: 'ii', returnType: 'i' },
-      freeJsThunk: { argType: 'ii', returnType: 'i' },
-      findJsThunk: { argType: 'ii', returnType: 'i' },
+      allocateJsThunk: { argType: 'az', returnType: 'a' },
+      freeJsThunk: { argType: 'aa', returnType: 'z' },
+      findJsThunk: { argType: 'aa', returnType: 'z' },
     },
     imports: {
-      identifyJsThunk: { argType: 'ii', returnType: 'i' },
+      identifyJsThunk: { argType: 'aa', returnType: 'z' },
     },
     init() {
       this.thunkSources = [];
@@ -21,7 +21,7 @@ export default mixin({
         memoryMax,
         tableInitial,
         multithreaded,
-      } = this.options;
+      } = this.options ?? {};
       const w = WebAssembly;
       const env = {}, wasi = {}, wasiPreview = {};
       const imports = { env, wasi, wasi_snapshot_preview1: wasiPreview };
@@ -34,17 +34,34 @@ export default mixin({
           }
         }
       }
-      env.memory = new w.Memory({
-        initial: memoryInitial ?? this.memory.buffer.byteLength / 65536,
+      const initialPages = memoryInitial ?? (this.memory.buffer.byteLength / 65536);
+      env.memory = new w.Memory(this.memory64 ? {
+        initial: BigInt(initialPages),
+        ...(memoryMax !== undefined ? { maximum: BigInt(memoryMax) } : undefined),
+        shared: multithreaded,
+        address: 'i64',
+      } : {
+        initial: initialPages,
         maximum: memoryMax,
         shared: multithreaded,
       });
-      const table = env.__indirect_function_table = new w.Table({
-        initial: tableInitial,
-        element: 'anyfunc',
-      });
+      let table;
+      const initialTable = tableInitial || this.initialTableLength;
+      if (initialTable) {
+        table = env.__indirect_function_table = new w.Table(this.table64 ? {
+          initial: BigInt(initialTable),
+          element: 'anyfunc',
+          address: 'i64',
+        } : {
+          initial: initialTable,
+          element: 'anyfunc',
+        });
+      }
       const { exports } = new w.Instance(this.executable, imports);
-      const { createJsThunk, destroyJsThunk, identifyJsThunk } = exports;
+      table ??= exports.__indirect_function_table;
+      const createJsThunk = exports.createJsThunk && this.importFunction(exports.createJsThunk, 'az', 'a');
+      const destroyJsThunk = exports.destroyJsThunk && this.importFunction(exports.destroyJsThunk, 'aa', 'z');
+      const identifyJsThunk = exports.identifyJsThunk && this.importFunction(exports.identifyJsThunk, 'aa', 'z');
       const source = {
         thunkCount: 0,
         createJsThunk,
@@ -68,32 +85,38 @@ export default mixin({
       // sourceAddress is an index into the function table of the source instance
       // we need to get the function object and place it into the main instance's
       // function table
-      const thunkObject = source.table.get(sourceAddress);
-      let thunkAddress = 0;
-      for (let i = this.table.length - 1; i >= this.initialTableLength; i--) {
-        if (!this.table.get(i)) {
-          thunkAddress = i;
+      const isSourceTable64 = typeof source.table.length === 'bigint';
+      const thunkObject = source.table.get(isSourceTable64 ? BigInt(sourceAddress) : Number(sourceAddress));
+      const isTable64 = typeof this.table.length === 'bigint';
+      const tableLen = Number(this.table.length);
+      const initialLen = Number(this.initialTableLength);
+      let thunkIndex = 0;
+      for (let i = tableLen - 1; i >= initialLen; i--) {
+        if (!this.table.get(isTable64 ? BigInt(i) : i)) {
+          thunkIndex = i;
           break;
         }
       }
-      if (!thunkAddress) {
-        thunkAddress = this.table.length;
-        this.table.grow(8);
+      if (!thunkIndex) {
+        thunkIndex = tableLen;
+        this.table.grow(isTable64 ? 8n : 8);
       }
-      this.table.set(thunkAddress, thunkObject);
+      this.table.set(isTable64 ? BigInt(thunkIndex) : thunkIndex, thunkObject);
       source.thunkCount++;
       // remember where the object is from
       this.thunkMap.set(thunkObject, { source, sourceAddress });
-      return thunkAddress;
+      return (this.memory64 || isTable64) ? BigInt(thunkIndex) : thunkIndex;
     },
     freeJsThunk(controllerAddress, thunkAddress) {
       let fnId = 0;
-      const thunkObject = this.table.get(thunkAddress);
-      this.table.set(thunkAddress, null);
+      const isTable64 = typeof this.table.length === 'bigint';
+      const tableIdx = isTable64 ? BigInt(thunkAddress) : Number(thunkAddress);
+      const thunkObject = this.table.get(tableIdx);
+      this.table.set(tableIdx, null);
       const entry = this.thunkMap.get(thunkObject);
       if (entry) {
         const { source, sourceAddress } = entry;
-        fnId = source.destroyJsThunk(controllerAddress, sourceAddress);
+        fnId = Number(source.destroyJsThunk(controllerAddress, sourceAddress));
         if (--source.thunkCount === 0) {
           const index = this.thunkSources.indexOf(source);
           if (index !== -1) {
@@ -106,12 +129,14 @@ export default mixin({
     },
     findJsThunk(controllerAddress, thunkAddress) {
       let fnId = 0;
-      const thunkObject = this.table.get(thunkAddress);
-      this.table.set(thunkAddress, null);
+      const isTable64 = typeof this.table.length === 'bigint';
+      const tableIdx = isTable64 ? BigInt(thunkAddress) : Number(thunkAddress);
+      const thunkObject = this.table.get(tableIdx);
+      this.table.set(tableIdx, null);
       const entry = this.thunkMap.get(thunkObject);
       if (entry) {
         const { source, sourceAddress } = entry;
-        fnId = source.identifyJsThunk(controllerAddress, sourceAddress);
+        fnId = Number(source.identifyJsThunk(controllerAddress, sourceAddress));
       }
       return fnId;
     },

@@ -2,7 +2,7 @@ import { MemberFlag } from '../constants.js';
 import { mixin } from '../environment.js';
 import { MisplacedSentinel, MissingSentinel } from '../errors.js';
 import { RESTORE, MEMORY } from '../symbols.js';
-import { defineValue } from '../utils.js';
+import { toBufferOffset, defineValue } from '../utils.js';
 
 var sentinel = mixin({
   defineSentinel(structure) {
@@ -60,9 +60,10 @@ var sentinel = mixin({
   ...({
     findSentinel(address, bytes) {
       const { memory } = this;
+      const start = toBufferOffset(address);
       const len = bytes.byteLength;
       const end = memory.buffer.byteLength - len + 1;
-      for (let i = address; i < end; i += len) {
+      for (let i = start; i < end; i += len) {
         const dv = new DataView(memory.buffer, i, len);
         let match = true;
         for (let j = 0; j < len; j++) {
@@ -74,7 +75,7 @@ var sentinel = mixin({
           }
         }
         if (match) {
-          return (i - address) / len;
+          return (i - start) / len;
         }
       }
     },

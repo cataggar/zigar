@@ -147,13 +147,21 @@ function findSortedIndex(array, value, cb) {
 }
 
 function isMisaligned(address, align) {
-  {
-    return (align) ? !!(address & (align - 1)) : false;
+  if (!align) {
+    return false;
+  }
+  if (typeof address === 'bigint') {
+    return !!(address & BigInt(align - 1));
+  } else {
+    return !!(address & (align - 1));
   }
 }
 
 function alignForward(address, align) {
-  {
+  if (typeof address === 'bigint') {
+    const mask = BigInt(align - 1);
+    return (address + mask) & ~mask;
+  } else {
     return (address + (align - 1)) & ~(align - 1);
   }
 }
@@ -163,8 +171,10 @@ const usizeMax = 0xFFFF_FFFF;
 const usizeInvalid = -1;
 const usizeByteSize = 4;
 
-function usize(number) {
-  {
+function usize(number, is64 = "32" == 64) {
+  if (is64) {
+    return BigInt(number);
+  } else {
     return Number(number);
   }
 }
@@ -179,27 +189,43 @@ function safeInt(bigInt) {
   return Number(bigInt);
 }
 
-function readUsize(dv, offset, le) {
-  {
+function readUsize(dv, offset, le, is64 = "32" == 64) {
+  if (is64) {
+    return dv.getBigUint64(offset, le);
+  } else {
     return dv.getUint32(offset, le);
   }
 }
 
-function readUsizeSafe(dv, offset, le) {
-  {
-    return readUsize(dv, offset, le);
+function readUsizeSafe(dv, offset, le, is64 = "32" == 64) {
+  if (is64) {
+    return safeInt(readUsize(dv, offset, le, true));
+  } else {
+    return readUsize(dv, offset, le, false);
   }
 }
 
 function isInvalidAddress(address) {
-  {
+  if (typeof address === 'bigint') {
+    return address === 0xaaaa_aaaa_aaaa_aaaan || address === -0x5555_5555_5555_5556n;
+  } else {
     return address === 0xaaaa_aaaa || address === -1431655766;
   }
 }
 
+function isInvalidUsize(address) {
+  return address === -1 || address === -1n;
+}
+
+function toBufferOffset(address) {
+  return (typeof address === 'bigint') ? safeInt(address) : address;
+}
+
 function adjustAddress(address, addend) {
-  {
-    return address + addend;
+  if (typeof address === 'bigint') {
+    return address + BigInt(addend);
+  } else {
+    return address + Number(addend);
   }
 }
 
@@ -400,4 +426,4 @@ function extractTimes(st_atim, st_mtim, fst_flags) {
   return times;
 }
 
-export { ObjectCache, adjustAddress, alignForward, always, clearView, copyObject, copyView, createView, decodeBase64, decodeEnum, decodeFlags, decodeText, defineProperties, defineProperty, defineValue, empty, encodeBase64, encodeText, extractTimes, findElements, findObjects, findSortedIndex, getEnumNumber, getErrorHandler, getLength, getPrimitiveName, getSelf, hasMethod, isCompatibleInstanceOf, isCompatibleType, isDetached, isInvalidAddress, isMisaligned, isPromise, markAsSpecial, maxSafeInteger, minSafeInteger, never, readUsize, readUsizeSafe, remove, safeInt, toString, transformIterable, usize, usizeByteSize, usizeInvalid, usizeMax, usizeMin };
+export { ObjectCache, adjustAddress, alignForward, always, clearView, copyObject, copyView, createView, decodeBase64, decodeEnum, decodeFlags, decodeText, defineProperties, defineProperty, defineValue, empty, encodeBase64, encodeText, extractTimes, findElements, findObjects, findSortedIndex, getEnumNumber, getErrorHandler, getLength, getPrimitiveName, getSelf, hasMethod, isCompatibleInstanceOf, isCompatibleType, isDetached, isInvalidAddress, isInvalidUsize, isMisaligned, isPromise, markAsSpecial, maxSafeInteger, minSafeInteger, never, readUsize, readUsizeSafe, remove, safeInt, toBufferOffset, toString, transformIterable, usize, usizeByteSize, usizeInvalid, usizeMax, usizeMin };

@@ -89,6 +89,33 @@ describe('Configuration', function() {
       expect(() => processConfig({ useJSPI: 'invalid' }, '/cfg.json', optionsForTranspile)).to.throw();
       expect(() => processConfig({ useJSPI: [ 42 ] }, '/cfg.json', optionsForTranspile)).to.throw();
     })
+    it('should extract and validate memory64 and useResizableBuffer options', function() {
+      const combinedOptions = { ...optionsForCompile, ...optionsForTranspile };
+      expect(extractOptions(
+        new URL('file:///hello.zig?memory64=1&use-resizable-buffer=0').searchParams,
+        combinedOptions,
+      )).to.eql({ memory64: true, useResizableBuffer: false });
+      expect(extractOptions(
+        new URL('file:///hello.zig?memory-64=1').searchParams,
+        optionsForCompile,
+      )).to.eql({ memory64: true });
+      expect(extractOptions(
+        new URL('file:///hello.zig?memory_64=0&use_resizable_buffer=1').searchParams,
+        optionsForTranspile,
+      )).to.eql({ memory64: false, useResizableBuffer: true });
+      expect(extractOptions(
+        new URL('file:///hello.zig?memory64=true&useResizableBuffer=false').searchParams,
+        optionsForTranspile,
+      )).to.eql({ memory64: true, useResizableBuffer: false });
+      expect(processConfig({ memory64: true }, '/cfg.json', optionsForCompile))
+        .to.eql({ memory64: true });
+      expect(processConfig({ memory64: true, useResizableBuffer: false }, '/cfg.json', optionsForTranspile))
+        .to.eql({ memory64: true, useResizableBuffer: false });
+      expect(processConfig({ memory64: false, useResizableBuffer: true }, '/cfg.json', combinedOptions))
+        .to.eql({ memory64: false, useResizableBuffer: true });
+      expect(() => processConfig({ memory64: 'yes' }, '/cfg.json', optionsForCompile)).to.throw();
+      expect(() => processConfig({ useResizableBuffer: 1 }, '/cfg.json', optionsForTranspile)).to.throw();
+    })
     it('should extract numeric options', function() {
       const { searchParams } = new URL('file:///home/someone/hello.zig?boo=100');
       const fakeOptions = {

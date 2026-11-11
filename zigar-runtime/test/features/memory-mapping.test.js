@@ -648,6 +648,62 @@ describe('Feature: memory-mapping', function() {
         expect(address).to.equal(usize(0x1234));
       })
     })
+    describe('memory64 polymorphic support', function() {
+      it('should accept both BigInt and Number in obtainZigView and isolate memory64 per Env', function() {
+        const env32 = new Env();
+        env32.memory = new WebAssembly.Memory({ initial: 1 });
+        const env64 = new Env();
+        env64.memory64 = true;
+        env64.memory = new WebAssembly.Memory({ initial: 1n, maximum: 2n, address: 'i64' });
+
+        // Contract with syscalls: obtainZigView accepts either BigInt or Number for address and len
+        const dv64FromNum = env64.obtainZigView(0x200, 16);
+        const dv64FromBig = env64.obtainZigView(0x200n, 16n);
+        expect(dv64FromBig).to.equal(dv64FromNum);
+        expect(dv64FromBig[ZIG].address).to.equal(0x200n);
+        expect(dv64FromBig[ZIG].len).to.equal(16);
+
+        const dv32FromBig = env32.obtainZigView(0x200n, 16n);
+        expect(dv32FromBig[ZIG].address).to.equal(0x200);
+        expect(dv32FromBig[ZIG].len).to.equal(16);
+
+        // Null & invalid/max sentinel handling in memory64
+        expect(env64.obtainZigView(0n, 8)).to.be.null;
+        expect(env64.obtainZigView(0, 8n)).to.be.null;
+        expect(env64.obtainZigView(0xaaaa_aaaa_aaaa_aaaan, 8)).to.be.null;
+        expect(env64.obtainZigView(-0x5555_5555_5555_5556n, 8)).to.be.null;
+        const emptyInvalid = env64.obtainZigView(0xaaaa_aaaa_aaaa_aaaan, 0);
+        expect(emptyInvalid.buffer).to.equal(env64.usizeMaxBuffer);
+        expect(emptyInvalid[ZIG].address).to.equal(0n);
+        const emptyMax = env64.obtainZigView(-1n, 0n);
+        expect(emptyMax.buffer).to.equal(env64.usizeMaxBuffer);
+
+        // Shadow allocation, cluster alignment, and releaseZigView in memory64
+        let nextScratch = 0x2000n;
+        env64.allocateScratchMemory = (len) => {
+          const addr = nextScratch;
+          nextScratch += BigInt(len);
+          return addr;
+        };
+        const freed = [];
+        env64.freeScratchMemory = (address, len, align) => {
+          freed.push({ address, len, align });
+        };
+        const context = env64.startContext();
+        const jsObj = { constructor: { [ALIGN]: 8 }, [MEMORY]: env64.allocateMemory(16, 8) };
+        const shadowAddr = env64.getTargetAddress(context, jsObj, null, true);
+        expect(shadowAddr).to.equal(0x2000n);
+        expect(env64.getTargetAddress(context, { [MEMORY]: env64.allocateMemory(0, 1) })).to.equal(0n);
+        expect(env64.getBufferAddress(env64.memory.buffer)).to.equal(0n);
+
+        const foundSub = env64.findMemory(context, 0x2004n, 4n, 2);
+        expect(foundSub.byteOffset).to.equal(4);
+        expect(foundSub.byteLength).to.equal(8);
+
+        env64.endContext();
+        expect(freed).to.deep.equal([ { address: 0x2000n, len: 16, align: 8 } ]);
+      })
+    })
   } else if (process.env.TARGET === 'node') {
     describe('allocateShadowMemory', function() {
       it('should allocate memory for dealing with misalignment', function() {

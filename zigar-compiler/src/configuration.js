@@ -48,6 +48,10 @@ export const optionsForCompile = {
     type: 'boolean',
     title: 'Enable multithreading',
   },
+  memory64: {
+    type: 'boolean',
+    title: 'Compile for 64-bit WebAssembly (wasm64)',
+  },
   buildDir: {
     type: 'string',
     title: 'Root directory where temporary build directories are placed',
@@ -135,6 +139,14 @@ export const optionsForTranspile = {
     type: 'number',
     title: 'Size of each JSPI continuation stack in bytes',
   },
+  memory64: {
+    type: 'boolean',
+    title: 'Compile for 64-bit WebAssembly (wasm64)',
+  },
+  useResizableBuffer: {
+    type: 'boolean',
+    title: 'Use resizable ArrayBuffer for WebAssembly memory',
+  },
 };
 
 const allOptions = {
@@ -166,7 +178,7 @@ export function extractOptions(searchParams, availableOptions) {
     } else {
       switch (option.type) {
         case 'boolean':
-          options[key] = !!parseInt(string);
+          options[key] = (string === 'true') ? true : (string === 'false') ? false : !!parseInt(string);
           break;
         case 'number':
           options[key] = parseInt(string);
@@ -181,7 +193,7 @@ export function extractOptions(searchParams, availableOptions) {
 
 function getCamelCase(name, names) {
   for (const nameCC of names) {
-    const nameSC = nameCC.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
+    const nameSC = nameCC.replace(/([a-z])([A-Z]|\d+)/g, '$1_$2').toLowerCase();
     const nameKC = nameSC.replace(/_/g, '-');
     if (name === nameKC || name === nameSC || name === nameCC) {
       return nameCC;

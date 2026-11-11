@@ -389,7 +389,7 @@ function generateCode(definition, params) {
     add(`import '${runtimeURL}/${mixinPath}';`);
   }
   // write out the structures as object literals
-  addStructureDefinitions(lines, definition);
+  addStructureDefinitions(lines, definition, moduleOptions);
   if (Object.keys(envVariables).length > 0) {
     add(`\n// set environment variables`);
     for (const [ name, value ] of Object.entries(envVariables)) {
@@ -466,7 +466,7 @@ function generateCode(definition, params) {
   return { code, exports, structures };
 }
 
-function addStructureDefinitions(lines, definition) {
+function addStructureDefinitions(lines, definition, moduleOptions) {
   const { structures, settings } = definition;
   const add = manageIndentation(lines);
   const defaultStructure = {
@@ -623,7 +623,7 @@ function addStructureDefinitions(lines, definition) {
         add(`memory: { ${pairs.join(', ')} },`);
         const { handle } = dv;
         if (handle !== undefined) {
-          add(`handle: ${handle},`);
+          add(`handle: ${typeof handle === 'bigint' ? `${handle}n` : handle},`);
         }
       }
       if (slots) {
@@ -706,8 +706,12 @@ function addStructureDefinitions(lines, definition) {
   add(`];`);
   const root = structures[structures.length - 1];
   add(`const root = ${structureNames.get(root)};`);
+  const effectiveSettings = (moduleOptions?.memory64 && !settings.memory64)
+    ? { ...settings, memory64: true }
+    : settings;
   add(`const settings = {`);
-  for (const [ name, value ] of Object.entries(settings)) {
+  for (const [ name, value ] of Object.entries(effectiveSettings)) {
+    if (name === 'memory64' && !value) continue;
     add(`${name}: ${value},`);
   }
   add(`};`);
@@ -784,6 +788,1046 @@ function* chunk(arr, n) {
   for (let i = 0; i < arr.length; i += n) {
     yield arr.slice(i, i + n);
   }
+}
+
+const MagicNumber = 0x6d736100;
+const Version = 1;
+const SectionType = {
+  Custom: 0,
+  Type: 1,
+  Import: 2,
+  Function: 3,
+  Global: 6,
+  Export: 7,
+  Start: 8,
+  Element: 9,
+  Code: 10};
+const ObjectType = {
+  Function: 0,
+  Table: 1,
+  Memory: 2,
+  Global: 3,
+};
+
+function fixWasm64TlsGlobals(binary) {
+  const { sections, size } = parseBinary(binary);
+  const typeSection = sections.find(s => s.type === SectionType.Type);
+  const importSection = sections.find(s => s.type === SectionType.Import);
+  const funcSection = sections.find(s => s.type === SectionType.Function);
+  const globalSection = sections.find(s => s.type === SectionType.Global);
+  const codeSection = sections.find(s => s.type === SectionType.Code);
+  if (!typeSection || !funcSection || !globalSection || !codeSection) {
+    return binary;
+  }
+  const globalTypes = [];
+  if (importSection) {
+    for (const imp of importSection.imports) {
+      if (imp.type === ObjectType.Global) {
+        globalTypes.push({ valtype: imp.valtype, mut: imp.mut });
+      }
+    }
+  }
+  {
+    const reader = createReader(globalSection.data);
+    const count = reader.readU32Leb128();
+    for (let i = 0; i < count; i++) {
+      const valtype = reader.readU8();
+      const mut = reader.readU8();
+      reader.readExpression();
+      globalTypes.push({ valtype, mut });
+    }
+  }
+  if (!globalTypes.some(g => g.valtype === 0x7e && g.mut === 0)) {
+    return binary;
+  }
+  const funcParams = [];
+  {
+    const reader = createReader(typeSection.data);
+    const count = reader.readU32Leb128();
+    for (let i = 0; i < count; i++) {
+      const form = reader.readU8();
+      if (form !== 0x60) return binary;
+      const params = reader.readArray(reader.readU8);
+      reader.readArray(reader.readU8);
+      funcParams.push(params);
+    }
+  }
+  let patched = 0;
+  for (let i = 0; i < codeSection.functions.length; i++) {
+    const code = codeSection.functions[i];
+    let hasGlobalGet = false;
+    for (let b = 0; b < code.byteLength; b++) {
+      if (code.getUint8(b) === 0x23) {
+        hasGlobalGet = true;
+        break;
+      }
+    }
+    if (!hasGlobalGet) continue;
+    const parsed = parseFunction(code);
+    const params = funcParams[funcSection.types[i]] ?? [];
+    let localTypes = null;
+    const getLocalType = (idx) => {
+      if (!localTypes) {
+        localTypes = [ ...params ];
+        for (const { number, type } of parsed.locals) {
+          for (let k = 0; k < number; k++) {
+            localTypes.push(type);
+          }
+        }
+      }
+      return localTypes[idx];
+    };
+    const ops = parsed.instructions;
+    let fnModified = false;
+    const newOps = [];
+    for (let j = 0; j < ops.length; j++) {
+      const op = ops[j];
+      newOps.push(op);
+      if (op.opcode === 0x23) {
+        const g = globalTypes[op.operand];
+        const next = ops[j + 1];
+        if (g && g.valtype === 0x7e && g.mut === 0 && next) {
+          const expectsI32 = next.opcode === 0xAC || next.opcode === 0xAD
+            || ((next.opcode === 0x21 || next.opcode === 0x22) && getLocalType(next.operand) === 0x7f);
+          if (expectsI32) {
+            newOps.push({ opcode: 0xA7, operand: undefined });
+            fnModified = true;
+            patched++;
+          }
+        }
+      }
+    }
+    if (fnModified) {
+      codeSection.functions[i] = repackFunction({
+        locals: parsed.locals,
+        instructions: newOps,
+        size: parsed.size + 16,
+      });
+    }
+  }
+  if (patched === 0) {
+    return binary;
+  }
+  return repackBinary({ sections, size: size + patched * 4 + 32 });
+}
+
+function parseBinary(binary) {
+  const {
+    eof,
+    readBytes,
+    readU8,
+    readU32,
+    readString,
+    readArray,
+    readU32Leb128,
+    readExpression,
+    readLimits,
+    readCustom,
+  } = createReader(binary);
+  const magic = readU32();
+  if (magic !== MagicNumber) {
+    throw new Error(`Incorrect magic number: ${magic.toString(16)}`);
+  }
+  const version = readU32();
+  if (version !== Version) {
+    throw new Error(`Incorrect version: ${version}`);
+  }
+  const sections = [];
+  while(!eof()) {
+    sections.push(readSection());
+  }
+  const size = binary.byteLength;
+  return { sections, size };
+
+  function readSection() {
+    const type = readU8();
+    const len = readU32Leb128();
+    switch(type) {
+      case SectionType.Custom:
+        const { name, data } = readCustom(len);
+        return { type, name, data };
+      case SectionType.Import: {
+        const imports = readArray(() => {
+          const module = readString();
+          const name = readString();
+          const type = readU8();
+          switch (type) {
+            case ObjectType.Function: {
+              const index = readU32Leb128();
+              return { module, name, type, index };
+            }
+            case ObjectType.Table: {
+              const reftype = readU8();
+              const limits = readLimits();
+              return { module, name, type, reftype, limits };
+            }
+            case ObjectType.Memory: {
+              const limits = readLimits();
+              return { module, name, type, limits };
+            }
+            case ObjectType.Global: {
+              const valtype = readU8();
+              const mut = readU8();
+              return { module, name, type, valtype, mut };
+            }
+            /* c8 ignore next 3 */
+            default: {
+              throw new Error(`Unknown object type: ${type}`);
+            }
+          }
+        });
+        return { type, imports };
+      }
+      case SectionType.Export: {
+        const exports = readArray(() => {
+          const name = readString();
+          const type = readU8();
+          const index = readU32Leb128();
+          return { name, type, index };
+        });
+        return { type, exports };
+      }
+      case SectionType.Function: {
+        const types = readArray(readU32Leb128);
+        return { type, types };
+      }
+      case SectionType.Code: {
+        const functions = readArray(() => {
+          const len = readU32Leb128();
+          return readBytes(len);
+        });
+        return { type, functions };
+      }
+      case SectionType.Element: {
+        const segments = readArray(() => {
+          const type = readU32Leb128();
+          switch (type) {
+            case 0: {
+              const expr = readExpression();
+              const indices = readArray(readU32Leb128);
+              return { type, expr, indices };
+            }
+            case 1: {
+              const kind = readU8();
+              const indices = readArray(readU32Leb128);
+              return { type, kind, indices };
+            }
+            case 2: {
+              const tableidx = readU32Leb128();
+              const expr = readExpression();
+              const kind = readU8();
+              const indices = readArray(readU32Leb128);
+              return { type, tableidx, expr, kind, indices };
+            }
+            case 3: {
+              const kind = readU8();
+              const indices = readArray(readU32Leb128);
+              return { type, kind, indices };
+            }
+            case 4: {
+              const expr = readExpression();
+              const entries = readArray(readExpression);
+              return { type, expr, entries };
+            }
+            case 5: {
+              const reftype = readU8();
+              const entries = readArray(readExpression);
+              return { type, reftype, entries };
+            }
+            case 6: {
+              const tableidx = readU32Leb128();
+              const expr = readExpression();
+              const reftype = readU8();
+              const entries = readArray(readExpression);
+              return { type, tableidx, expr, reftype, entries };
+            }
+            case 7: {
+              const reftype = readU8();
+              const entries = readArray(readExpression);
+              return { type, reftype, entries };
+            }
+          }
+        });
+        return { type, segments };
+      }
+      case SectionType.Start: {
+        const funcidx = readU32Leb128();
+        return { type, funcidx };
+      }
+      default: {
+        const data = readBytes(len);
+        return { type, data };
+      }
+    }
+    /* c8 ignore next -- unreachable */
+  }
+}
+
+function repackBinary(module) {
+  const {
+    finalize,
+    writeBytes,
+    writeU8,
+    writeU32,
+    writeLength,
+    writeString,
+    writeArray,
+    writeU32Leb128,
+    writeExpression,
+    writeLimits,
+    writeCustom,
+  } = createWriter(module.size);
+  writeU32(MagicNumber);
+  writeU32(Version);
+  for (const section of module.sections) {
+    writeSection(section);
+  }
+  return finalize();
+
+  function writeSection(section) {
+    writeU8(section.type);
+    writeLength(() => {
+      switch(section.type) {
+        case SectionType.Custom: {
+          writeCustom(section);
+        } break;
+        case SectionType.Import: {
+          writeArray(section.imports, (object) => {
+            writeString(object.module);
+            writeString(object.name);
+            writeU8(object.type);
+            switch (object.type) {
+              case ObjectType.Function: {
+                writeU32Leb128(object.index);
+              } break;
+              case ObjectType.Table: {
+                writeU8(object.reftype);
+                writeLimits(object.limits);
+              } break;
+              case ObjectType.Memory: {
+                writeLimits(object.limits);
+              } break;
+              case ObjectType.Global: {
+                writeU8(object.valtype);
+                writeU8(object.mut);
+              } break;
+            }
+          });
+        } break;
+        case SectionType.Export: {
+          writeArray(section.exports, (object) => {
+            writeString(object.name);
+            writeU8(object.type);
+            writeU32Leb128(object.index);
+          });
+        } break;
+        case SectionType.Function: {
+          writeArray(section.types, writeU32Leb128);
+        } break;
+        case SectionType.Code: {
+          writeArray(section.functions, (code) => {
+            writeU32Leb128(code.byteLength);
+            writeBytes(code);
+          });
+        } break;
+        case SectionType.Element: {
+          writeArray(section.segments, (segment) => {
+            writeU32Leb128(segment.type);
+            switch (segment.type) {
+              case 0: {
+                writeExpression(segment.expr);
+                writeArray(segment.indices, writeU32Leb128);
+              } break;
+              case 1: {
+                writeU8(segment.kind);
+                writeArray(segment.indices, writeU32Leb128);
+              } break;
+              case 2: {
+                writeU32Leb128(segment.tableidx);
+                writeExpression(segment.expr);
+                writeU8(segment.kind);
+                writeArray(segment.indices, writeU32Leb128);
+              } break;
+              case 3: {
+                writeU8(segment.kind);
+                writeArray(segment.indices, writeU32Leb128);
+              } break;
+              case 4: {
+                writeExpression(segment.expr);
+                writeArray(segment.entries, writeExpression);
+              } break;
+              case 5: {
+                writeU8(segment.reftype);
+                writeArray(segment.entries, writeExpression);
+              } break;
+              case 6: {
+                writeU32Leb128(segment.tableidx);
+                writeExpression(segment.expr);
+                writeU8(segment.reftype);
+                writeArray(segment.entries, writeExpression);
+              } break;
+              case 7: {
+                writeU8(segment.reftype);
+                writeArray(segment.entries, writeExpression);
+              } break;
+            }
+          });
+        } break;
+        case SectionType.Start: {
+          writeU32Leb128(section.funcidx);
+        } break;
+        default: {
+          writeBytes(section.data);
+        }
+      }
+    });
+  }
+}
+
+function createReader(dv) {
+  const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
+  let offset = 0;
+
+  function eof() {
+    return (offset >= dv.byteLength);
+  }
+
+  function skip(len) {
+    offset += len;
+  }
+
+  function readBytes(len) {
+    const bytes = new DataView(dv.buffer, dv.byteOffset + offset, len);
+    offset += len;
+    return bytes;
+  }
+
+  function readU8() {
+    return dv.getUint8(offset++);
+  }
+
+  function readU32() {
+    const value = dv.getUint32(offset, true);
+    offset += 4;
+    return value;
+  }
+
+  function readF64() {
+    const value = dv.getFloat64(offset, true);
+    offset += 8;
+    return value;
+  }
+
+  function readString() {
+    const len = readU32Leb128();
+    const bytes = new Uint8Array(dv.buffer, dv.byteOffset + offset, len);
+    offset += len;
+    return decoder.decode(bytes);
+  }
+
+  function readArray(cb) {
+    const len = readU32Leb128();
+    const array = [];
+    for (let i = 0; i < len; i++) {
+      array.push(cb());
+    }
+    return array;
+  }
+
+  function readU32Leb128() {
+    let value = 0;
+    let shift = 0;
+    while (true) {
+      const byte = readU8();
+      value |= (byte & 0x7f) << shift;
+      shift += 7;
+      if ((0x80 & byte) === 0) {
+        if (value < 0) {
+          value += 2 ** 32;
+        }
+        return value;
+      }
+    }
+  }
+
+  function readU64Leb128() {
+    let value = 0n;
+    let shift = 0n;
+    while (true) {
+      const byte = readU8();
+      value |= BigInt(byte & 0x7f) << shift;
+      shift += 7n;
+      if ((0x80 & byte) === 0) {
+        return (value > 0xFFFFFFFFn) ? value : Number(value);
+      }
+    }
+  }
+
+  function readI32Leb128() {
+    let value = 0;
+    let shift = 0;
+    while (true) {
+      const byte = dv.getUint8(offset++);
+      value |= (byte & 0x7f) << shift;
+      shift += 7;
+      if ((0x80 & byte) === 0) {
+        if (shift < 32 && (byte & 0x40) !== 0) {
+          return value | (-1 << shift);
+        }
+        return value;
+      }
+    }
+  }
+
+  function readI64Leb128() {
+    let value = 0n;
+    let shift = 0n;
+    while (true) {
+      const byte = dv.getUint8(offset++);
+      value |= BigInt(byte & 0x7f) << shift;
+      shift += 7n;
+      if ((0x80 & byte) === 0) {
+        if ((byte & 0x40) !== 0) {
+          return value | (~0n << shift);
+        }
+        return value;
+      }
+    }
+  }
+
+  function readExpression() {
+    const start = offset;
+    const { decodeNext } = createDecoder(self);
+    let op;
+    while (op = decodeNext()) {
+      if (op.opcode === 0x0B) {
+        break;
+      }
+    }
+    const len = offset - start;
+    return new DataView(dv.buffer, dv.byteOffset + start, len);
+  }
+
+  function readLimits() {
+    const flags = readU8();
+    const is64 = !!(flags & 0x04);
+    const min = is64 ? Number(readU64Leb128()) : readU32Leb128();
+    let max = undefined;
+    let shared = undefined;
+    if (flags & 0x01) {
+      max = is64 ? Number(readU64Leb128()) : readU32Leb128();
+    }
+    if (flags & 0x02) {
+      shared = true;
+    }
+    return { flags, min, max, shared, is64 };
+  }
+
+  function readCustom(len) {
+    const offsetBefore = offset;
+    const name = readString();
+    const nameLen = offset - offsetBefore;
+    const data = readBytes(len - nameLen);
+    return { name, data };
+  }
+
+  const self = {
+    eof,
+    skip,
+    readBytes,
+    readU8,
+    readU32,
+    readF64,
+    readString,
+    readArray,
+    readU32Leb128,
+    readU64Leb128,
+    readI32Leb128,
+    readI64Leb128,
+    readExpression,
+    readLimits,
+    readCustom,
+  };
+  return self;
+}
+
+function createWriter(maxSize) {
+  const dv = new DataView(new ArrayBuffer(maxSize));
+  const encoder = new TextEncoder();
+  let offset = 0, lengthChecking = false;
+
+  function finalize() {
+    return new DataView(dv.buffer, 0, offset);
+  }
+
+  function writeBytes(bytes) {
+    for (let i = 0; i < bytes.byteLength; i++) {
+      writeU8(bytes.getUint8(i));
+    }
+  }
+
+  function writeU8(value) {
+    if (!lengthChecking) {
+      dv.setUint8(offset, value);
+    }
+    offset++;
+  }
+
+  function writeU32(value) {
+    if (!lengthChecking) {
+      dv.setUint32(offset, value, true);
+    }
+    offset += 4;
+  }
+
+  function writeF64(value) {
+    if (!lengthChecking) {
+      dv.setFloat64(offset, value, true);
+    }
+    offset += 8;
+  }
+
+  function writeString(string) {
+    const bytes = encoder.encode(string);
+    writeU32Leb128(bytes.length);
+    for (const byte of bytes) {
+      writeU8(byte);
+    }
+  }
+
+  function writeArray(values, cb) {
+    writeU32Leb128(values.length);
+    for (const value of values) {
+      cb(value);
+    }
+  }
+
+  function writeU32Leb128(value) {
+    while (true) {
+      const byte = value & 0x7f;
+      value >>>= 7;
+      if (value === 0) {
+        writeU8(byte);
+        return;
+      }
+      writeU8(byte | 0x80);
+    }
+  }
+
+  function writeU64Leb128(value) {
+    let v = (typeof value === 'bigint') ? value : BigInt(value);
+    while (true) {
+      const byte = Number(v & 0x7fn);
+      v >>= 7n;
+      if (v === 0n) {
+        writeU8(byte);
+        return;
+      }
+      writeU8(byte | 0x80);
+    }
+  }
+
+  function writeI32Leb128(value) {
+    while (true) {
+      const byte = value & 0x7f;
+      value >>= 7;
+      if ((value === 0 && (byte & 0x40) === 0) || (value === -1 && (byte & 0x40) !== 0)) {
+        writeU8(byte);
+        return;
+      }
+      writeU8(byte | 0x80);
+    }
+  }
+
+  function writeI64Leb128(value) {
+    while (true) {
+      const byte = Number(value & 0x7fn);
+      value >>= 7n;
+      if ((value === 0n && (byte & 0x40) === 0) || (value === -1n && (byte & 0x40) !== 0)) {
+        writeU8(byte);
+        return;
+      }
+      writeU8(byte | 0x80);
+    }
+  }
+
+  function writeLength(cb) {
+    const saved = offset;
+    lengthChecking = true;
+    cb();
+    const length = offset - saved;
+    offset = saved;
+    lengthChecking = false;
+    writeU32Leb128(length);
+    cb();
+  }
+
+  function writeExpression(code) {
+    writeBytes(code);
+  }
+
+  function writeLimits(limits) {
+    const flags = limits.is64 ? (limits.flags | 0x04) : limits.flags;
+    writeU8(flags);
+    const writeVal = (flags & 0x04) ? writeU64Leb128 : writeU32Leb128;
+    writeVal(limits.min);
+    if (limits.max !== undefined) {
+      writeVal(limits.max);
+    }
+  }
+
+  function writeCustom({ name, data }) {
+    writeString(name);
+    writeBytes(data);
+  }
+
+  return {
+    finalize,
+    writeBytes,
+    writeU8,
+    writeU32,
+    writeF64,
+    writeString,
+    writeArray,
+    writeU32Leb128,
+    writeU64Leb128,
+    writeI32Leb128,
+    writeI64Leb128,
+    writeExpression,
+    writeLimits,
+    writeCustom,
+    writeLength,
+  };
+}
+
+function parseFunction(dv) {
+  const reader = createReader(dv);
+  const {
+    readU8,
+    readArray,
+    readU32Leb128,
+  } = reader;
+  // read locals first
+  const locals = readArray(() => {
+    const number = readU32Leb128();
+    const type = readU8();
+    return { number, type };
+  });
+  // decode the expression
+  const { decodeNext } = createDecoder(reader);
+  const instructions = [];
+  let op;
+  while (op = decodeNext()) {
+    instructions.push(op);
+  }
+  const size = dv.byteLength;
+  return { locals, instructions, size };
+}
+
+function createDecoder(reader) {
+  const {
+    eof,
+    readBytes,
+    readU8,
+    readArray,
+    readU32Leb128,
+    readU64Leb128,
+    readI32Leb128,
+    readI64Leb128,
+    readU32,
+    readF64,
+  } = reader;
+  const readOne = readU32Leb128;
+  const readTwo = () => [ readOne(), readU64Leb128() ];
+  const readMultiple = (count) => {
+    const indices = [];
+    for (let i = 0; i < count; i++) {
+      indices.push(readOne());
+    }
+    return indices;
+  };
+  const operandReaders = {
+    0x02: readI32Leb128,
+    0x03: readI32Leb128,
+    0x04: readI32Leb128,
+    0x0C: readOne,
+    0x0D: readOne,
+    0x0E: () => [ readArray(readOne), readU32Leb128() ],
+
+    0x10: readOne,
+    0x11: readTwo,
+    0x12: readOne,
+    0x13: readTwo,
+    0x14: readOne,
+    0x15: readOne,
+
+    0x1C: () => readArray(readU8),
+
+    0x20: readOne,
+    0x21: readOne,
+    0x22: readOne,
+    0x23: readOne,
+    0x24: readOne,
+    0x25: readOne,
+    0x26: readOne,
+    0x28: readTwo,
+    0x29: readTwo,
+    0x2A: readTwo,
+    0x2B: readTwo,
+    0x2C: readTwo,
+    0x2D: readTwo,
+    0x2E: readTwo,
+    0x2F: readTwo,
+
+    0x30: readTwo,
+    0x31: readTwo,
+    0x32: readTwo,
+    0x33: readTwo,
+    0x34: readTwo,
+    0x35: readTwo,
+    0x36: readTwo,
+    0x37: readTwo,
+    0x38: readTwo,
+    0x39: readTwo,
+    0x3A: readTwo,
+    0x3B: readTwo,
+    0x3C: readTwo,
+    0x3D: readTwo,
+    0x3E: readTwo,
+    0x3F: readOne,
+
+    0x40: readOne,
+    0x41: readI32Leb128,
+    0x42: readI64Leb128,
+    0x43: readU32,  // avoid precision loss due to float-to-double conversion
+    0x44: readF64,
+
+    0xD0: readU8,
+    0xD2: readOne,
+
+    0xFC: () => {
+      const op1 = readOne();
+      switch (op1) {
+        case 9:
+        case 11:
+        case 13:
+        case 15:
+        case 16:
+        case 17:
+          return [ op1, readOne() ];
+        case 8:
+        case 10:
+        case 12:
+        case 14:
+          return [ op1, readOne(), readOne() ];
+        default:
+          return op1;
+      }
+    },
+    0xFD: () => {
+      const op1 = readOne();
+      switch (op1) {
+        case 21:
+        case 22:
+        case 23:
+        case 24:
+        case 25:
+        case 26:
+        case 27:
+        case 28:
+        case 29:
+        case 30:
+        case 31:
+        case 32:
+        case 33:
+        case 34:
+          return [ op1, readOne() ];
+        case 0:
+        case 1:
+        case 2:
+        case 3:
+        case 5:
+        case 6:
+        case 7:
+        case 8:
+        case 9:
+        case 10:
+        case 11:
+        case 92:
+        case 93:
+          return [ op1, readOne(), readU64Leb128() ];
+        case 84:
+        case 85:
+        case 86:
+        case 87:
+        case 88:
+        case 89:
+        case 90:
+        case 91:
+          return [ op1, readOne(), readU64Leb128(), readOne() ];
+        case 12:
+          return [ op1, readBytes(16) ];
+        case 13:
+          return [ op1, ...readMultiple(16) ];
+        default:
+          return op1;
+      }
+    },
+    0xFE: () => {
+      const op1 = readOne();
+      switch (op1) {
+        /* c8 ignore next 2 */
+        case 3:
+          return [ op1, readU8() ];
+        default:
+          return [ op1, readOne(), readU64Leb128() ];
+      }
+    },
+  };
+
+  function decodeNext() {
+    if (eof()) {
+      return null;
+    }
+    const opcode = readU8();
+    const f = operandReaders[opcode];
+    const operand = f?.();
+    return { opcode, operand };
+  }
+
+  return { decodeNext };
+}
+
+function repackFunction({ locals, instructions, size }) {
+  const writer = createWriter(size);
+  const {
+    finalize,
+    writeU8,
+    writeArray,
+    writeU32Leb128,
+  } = writer;
+  writeArray(locals, ({ number, type }) => {
+    writeU32Leb128(number);
+    writeU8(type);
+  });
+  const { encodeNext } = createEncoder(writer);
+  for (const op of instructions) {
+    encodeNext(op);
+  }
+  return finalize();
+}
+
+function createEncoder(writer) {
+  const {
+    writeBytes,
+    writeU8,
+    writeArray,
+    writeU32Leb128,
+    writeU64Leb128,
+    writeI32Leb128,
+    writeI64Leb128,
+    writeU32,
+    writeF64,
+  } = writer;
+  const writeOne = writeU32Leb128;
+  const writeTwo = (op) => {
+    writeOne(op[0]);
+    writeU64Leb128(op[1]);
+  };
+  const writeMultiple = (indices) => {
+    for (const index of indices) {
+      writeU64Leb128(index);
+    }
+  };
+  const operandWriters = {
+    0x02: writeI32Leb128,
+    0x03: writeI32Leb128,
+    0x04: writeI32Leb128,
+    0x0C: writeOne,
+    0x0D: writeOne,
+    0x0E: (op) => [ writeArray(op[0], writeOne), writeOne(op[1]) ],
+
+    0x10: writeOne,
+    0x11: writeTwo,
+    0x12: writeOne,
+    0x13: writeTwo,
+    0x14: writeOne,
+    0x15: writeOne,
+    0x1C: (op) => writeArray(op, writeU8),
+
+    0x20: writeOne,
+    0x21: writeOne,
+    0x22: writeOne,
+    0x23: writeOne,
+    0x24: writeOne,
+    0x25: writeOne,
+    0x26: writeOne,
+    0x28: writeTwo,
+    0x29: writeTwo,
+    0x2A: writeTwo,
+    0x2B: writeTwo,
+    0x2C: writeTwo,
+    0x2D: writeTwo,
+    0x2E: writeTwo,
+    0x2F: writeTwo,
+
+    0x30: writeTwo,
+    0x31: writeTwo,
+    0x32: writeTwo,
+    0x33: writeTwo,
+    0x34: writeTwo,
+    0x35: writeTwo,
+    0x36: writeTwo,
+    0x37: writeTwo,
+    0x38: writeTwo,
+    0x39: writeTwo,
+    0x3A: writeTwo,
+    0x3B: writeTwo,
+    0x3C: writeTwo,
+    0x3D: writeTwo,
+    0x3E: writeTwo,
+    0x3F: writeOne,
+
+    0x40: writeOne,
+    0x41: writeI32Leb128,
+    0x42: writeI64Leb128,
+    0x43: writeU32,   // avoid precision loss due to float-to-double conversion
+    0x44: writeF64,
+
+    0xD0: writeU8,
+    0xD2: writeOne,
+
+    0xFC: (op) => {
+      if (op instanceof Array) {
+        writeMultiple(op);
+      } else {
+        writeOne(op);
+      }
+    },
+    0xFD: (op) => {
+      if (op instanceof Array) {
+        if (op[0] === 12) {
+          writeOne(op[0]);
+          writeBytes(op[1]);
+        } else {
+          writeMultiple(op);
+        }
+      } else {
+        writeOne(op);
+      }
+    },
+    0xFE: (op) => {
+      writeMultiple(op);
+    },
+  };
+
+  function encodeNext({ opcode, operand }) {
+    writeU8(opcode);
+    const f = operandWriters[opcode];
+    f?.(operand);
+  }
+
+  return { encodeNext };
 }
 
 const execFileAsync = promisify(execFile);
@@ -1113,11 +2157,21 @@ async function compile(srcPath, modPath, options) {
         if (sharedCacheDir) {
           await syncCacheDir(localCacheDir, sharedCacheDir);
         }
+        const emittedWasmPath = config.useBuildExe
+          ? join(moduleBuildDir, config.relOutputPath)
+          : outputPath;
+        if (config.arch === 'wasm64' && config.multithreaded) {
+          const rawBytes = await readFile(emittedWasmPath);
+          const rawDV = new DataView(rawBytes.buffer, rawBytes.byteOffset, rawBytes.byteLength);
+          const fixedDV = fixWasm64TlsGlobals(rawDV);
+          if (fixedDV !== rawDV) {
+            await writeFile(emittedWasmPath, new Uint8Array(fixedDV.buffer, fixedDV.byteOffset, fixedDV.byteLength));
+          }
+        }
         if (config.useBuildExe) {
-          const builtWasmPath = join(moduleBuildDir, config.relOutputPath);
-          if (builtWasmPath !== outputPath) {
+          if (emittedWasmPath !== outputPath) {
             await createDirectory(dirname(outputPath));
-            await copyFile(outputPath, builtWasmPath);
+            await copyFile(outputPath, emittedWasmPath);
           }
         }
       }
@@ -1334,7 +2388,7 @@ async function createProject(config, dir = config.moduleBuildDir) {
       }
       return name.endsWith('.zig') || name.endsWith('.h') || name.endsWith('.c');
     });
-    await createDirectory(join(dir, config.optimize));
+    await createDirectory(join(dir, dirname(config.relOutputPath)));
   } else {
     const buildFilePath = join(dir, 'build.zig');
     await copyFile(buildFilePath, config.buildFilePath);
@@ -1360,12 +2414,16 @@ function getCachePath(options) {
   return cacheDir;
 }
 
-function getModuleCachePath(srcPath, options) {
+function getModuleCachePath(srcPath, options = {}) {
   const {
     optimize,
+    memory64 = false,
+    arch,
   } = options;
+  const isWasm64 = Boolean(memory64 || arch === 'wasm64');
   const src = parse(srcPath);
-  const folder = basename(src.dir).slice(0, 16).trim() + '-' + sha1(src.dir).slice(0, 8);
+  const baseFolder = basename(src.dir).slice(0, 16).trim() + '-' + sha1(src.dir).slice(0, 8);
+  const folder = isWasm64 ? `${baseFolder}-wasm64` : baseFolder;
   const cacheDir = getCachePath(options);
   return join(cacheDir, folder, optimize, `${src.name}.zigar`);
 }
@@ -1381,15 +2439,17 @@ async function findModuleFile(moduleDir, fileName) {
 }
 
 async function createConfig(srcPath, modPath, options = {}) {
+  const memory64 = Boolean(options.memory64 || options.arch === 'wasm64');
+  const isWASM = Boolean(memory64 || options.isWASM || options.arch === 'wasm32');
+  const arch = memory64 ? 'wasm64' : (options.arch ?? (isWASM ? 'wasm32' : getArch()));
+  const platform = memory64 ? 'wasi' : (options.platform ?? (isWASM ? 'wasi' : getPlatform()));
   const {
-    platform = getPlatform(),
-    arch = getArch(),
     optimize = 'Debug',
-    isWASM = false,
     useLibc = isWASM ? false : true,
     useLLVM = null,
     useRedirection = true,
     usePthreadEmulation = false,
+    useResizableBuffer,
     clean = false,
     buildDir = join(os.tmpdir(), 'zigar-build'),
     buildDirSize = 4294967296,
@@ -1399,13 +2459,25 @@ async function createConfig(srcPath, modPath, options = {}) {
     multithreaded = (isWASM) ? false : true,
     persistent = false,
     stackSize = 256 * 1024,
-    maxMemory = (isWASM && multithreaded) ? 64 * 1024 * 1024 : undefined,
+    maxMemory: rawMaxMemory,
     evalBranchQuota = 2000000,
     omitFunctions = false,
     omitVariables = false,
     ignoreBuildFile = false,
     useBuildExe: useBuildExeOption,
   } = options;
+  let maxMemory;
+  if (rawMaxMemory === 0 || rawMaxMemory === null || rawMaxMemory === Infinity) {
+    maxMemory = undefined;
+  } else if (rawMaxMemory !== undefined) {
+    maxMemory = rawMaxMemory;
+  } else if (isWASM) {
+    if (multithreaded) {
+      maxMemory = 64 * 1024 * 1024;
+    } else if (useResizableBuffer !== false) {
+      maxMemory = (arch === 'wasm64') ? 4294967296 : 1073741824;
+    }
+  }
   const src = parse(srcPath ?? '');
   const mod = parse(modPath ?? '');
   const moduleName = mod.name || src.name;
@@ -1413,11 +2485,12 @@ async function createConfig(srcPath, modPath, options = {}) {
   const moduleDir = src.dir + sep;
   const modulePrefix = basename(moduleName).slice(0, 16);
   const moduleHash = sha1(moduleDir).slice(0, 8);
-  const moduleBuildDir = join(buildDir, modulePrefix + '-' + moduleHash);
+  const moduleBuildDir = join(buildDir, `${modulePrefix}-${moduleHash}${arch === 'wasm64' ? '-wasm64' : ''}`);
+  const relOutputPath = join(optimize, arch === 'wasm64' ? `${src.name}.wasm64.wasm` : `${src.name}.wasm`);
   const outputPath = (() => {
     if (!modPath && isWASM) {
       // save output in build folder
-      return join(moduleBuildDir, optimize, `${src.name}.wasm`);
+      return join(moduleBuildDir, relOutputPath);
     } else {
       const ext = getLibraryExt(platform);
       return join(modPath, `${platform}.${arch}.${ext}`);
@@ -1505,7 +2578,6 @@ async function createConfig(srcPath, modPath, options = {}) {
   const osTag = osTags[platform] ?? platform;
   const target = `${cpuArch}-${osTag}`;
   const cpu = multithreaded ? 'generic+atomics+bulk_memory' : 'generic';
-  const relOutputPath = join(optimize, `${src.name}.wasm`);
   let zigArgs;
   let translateCArgs = null;
   if (useBuildExe) {
@@ -1621,7 +2693,9 @@ async function createConfig(srcPath, modPath, options = {}) {
     useLLVM,
     useRedirection,
     usePthreadEmulation,
+    useResizableBuffer,
     isWASM,
+    memory64,
     multithreaded,
     persistent,
     stackSize,
@@ -1824,6 +2898,10 @@ const optionsForCompile = {
     type: 'boolean',
     title: 'Enable multithreading',
   },
+  memory64: {
+    type: 'boolean',
+    title: 'Compile for 64-bit WebAssembly (wasm64)',
+  },
   buildDir: {
     type: 'string',
     title: 'Root directory where temporary build directories are placed',
@@ -1911,6 +2989,14 @@ const optionsForTranspile = {
     type: 'number',
     title: 'Size of each JSPI continuation stack in bytes',
   },
+  memory64: {
+    type: 'boolean',
+    title: 'Compile for 64-bit WebAssembly (wasm64)',
+  },
+  useResizableBuffer: {
+    type: 'boolean',
+    title: 'Use resizable ArrayBuffer for WebAssembly memory',
+  },
 };
 
 const allOptions = {
@@ -1942,7 +3028,7 @@ function extractOptions(searchParams, availableOptions) {
     } else {
       switch (option.type) {
         case 'boolean':
-          options[key] = !!parseInt(string);
+          options[key] = (string === 'true') ? true : (string === 'false') ? false : !!parseInt(string);
           break;
         case 'number':
           options[key] = parseInt(string);
@@ -1957,7 +3043,7 @@ function extractOptions(searchParams, availableOptions) {
 
 function getCamelCase(name, names) {
   for (const nameCC of names) {
-    const nameSC = nameCC.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
+    const nameSC = nameCC.replace(/([a-z])([A-Z]|\d+)/g, '$1_$2').toLowerCase();
     const nameKC = nameSC.replace(/_/g, '-');
     if (name === nameKC || name === nameSC || name === nameCC) {
       return nameCC;

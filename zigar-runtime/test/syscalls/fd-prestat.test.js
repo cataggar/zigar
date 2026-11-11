@@ -20,6 +20,18 @@ describe('Syscall: fd-prestat-get', function() {
       const len1 = dv.getUint32(bufAddress + 4, true);
       expect(len1).to.equal(0);
     })
+    it('should write 16-byte prestat_t when memory64 is enabled', function() {
+      const env = new Env();
+      env.memory = new WebAssembly.Memory({ initial: 1n, address: 'i64' });
+      env.memory64 = true;
+      const bufAddress = 0x2000;
+      new Uint8Array(env.memory.buffer, bufAddress, 16).fill(0xff);
+      const result = env.fdPrestatGet(3, BigInt(bufAddress));
+      expect(result).to.equal(PosixError.NONE);
+      const dv = new DataView(env.memory.buffer);
+      expect(dv.getUint8(bufAddress)).to.equal(0);
+      expect(dv.getBigUint64(bufAddress + 8, true)).to.equal(0n);
+    })
     it('should return EBADF when descriptor is not 3', function() {
       const env = new Env();
       env.memory = new WebAssembly.Memory({ initial: 1 });

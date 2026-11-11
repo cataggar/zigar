@@ -1,13 +1,12 @@
 import { mixin } from '../environment.js';
 import { TypeMismatch } from '../errors.js';
 import { RETURN, PROMISE, MEMORY, ZIG, TRANSFORM, FINALIZE } from '../symbols.js';
-import { usize } from '../utils.js';
 
 var promise = mixin({
   init() {
     this.promiseCallbackMap = new Map();
     this.promiseContextMap = new Map();
-    this.nextPromiseContextId = usize(0x1000);
+    this.nextPromiseContextId = 0x1000;
   },
   // create promise struct for outbound call
   createPromise(structure, args, func) {
@@ -38,7 +37,8 @@ var promise = mixin({
       });
     }
     // create a handle referencing the function 
-    const contextId = this.nextPromiseContextId++;
+    const id = this.nextPromiseContextId++;
+    const contextId = (this.memory64 || "32" == 64) ? BigInt(id) : id;
     const ptr = this.obtainZigView(contextId, 0, false);
     this.promiseContextMap.set(contextId, { func, args });
     // use the same callback for all promises of a given type

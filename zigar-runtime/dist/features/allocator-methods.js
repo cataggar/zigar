@@ -2,7 +2,7 @@ import { StructureType } from '../constants.js';
 import { mixin } from '../environment.js';
 import { TypeMismatch, PreviouslyFreed } from '../errors.js';
 import { ZIG, MEMORY, TYPE, ALIGN } from '../symbols.js';
-import { copyView, usizeInvalid, encodeText } from '../utils.js';
+import { copyView, isInvalidUsize, encodeText } from '../utils.js';
 
 var allocatorMethods = mixin({
   defineAlloc() {
@@ -37,7 +37,7 @@ var allocatorMethods = mixin({
           throw new TypeMismatch('object containing allocated Zig memory', arg);
         }
         const { address } = zig;
-        if (address === usizeInvalid) {
+        if (isInvalidUsize(address)) {
           throw new PreviouslyFreed(arg);
         }
         const { vtable: { free }, ptr } = this;

@@ -51,7 +51,7 @@ import '../syscalls/path-unlink-file.js';
 import '../syscalls/poll-oneoff.js';
 import '../syscalls/proc-exit.js';
 import '../syscalls/random-get.js';
-import { decodeText, findObjects, adjustAddress } from '../utils.js';
+import { toBufferOffset, decodeText, findObjects, adjustAddress } from '../utils.js';
 import './baseline.js';
 import './object-linkage.js';
 import './stream-location.js';
@@ -77,6 +77,7 @@ var structureAcquisition = mixin({
     this.hasDeferred = false;
   },
   createView(address, len, copy, handle) {
+    len = Number(len);
     if (copy) {
       // copy content into JavaScript memory
       const dv = this.allocateJSMemory(len, 0);
@@ -88,7 +89,7 @@ var structureAcquisition = mixin({
       // link into Zig memory
       const dv = this.obtainZigView(address, len);
       {
-        dv[ZIG].handle = address;
+        dv[ZIG].handle = (this.memory64 || "32" == 64) ? BigInt(address) : Number(address);
       }
       return dv;
     }
@@ -187,10 +188,14 @@ var structureAcquisition = mixin({
   exportStructures() {
     this.prepareObjectsForExport();
     const { structures, runtimeSafety, littleEndian, ioRedirection, libc } = this;
-    return {
-      structures,
-      settings: { runtimeSafety, littleEndian, ioRedirection, libc },
-    };
+    const settings = { runtimeSafety, littleEndian, ioRedirection, libc };
+    if (this.memory64) {
+      settings.memory64 = true;
+      if (this.table64) {
+        settings.table64 = true;
+      }
+    }
+    return { structures, settings };
   },
   prepareObjectsForExport() {
     const list = [];
@@ -372,8 +377,8 @@ var structureAcquisition = mixin({
       createBool: { argType: 'b', returnType: 'v' },
       createInteger: { argType: 'ib', returnType: 'v' },
       createBigInteger: { argType: 'ib', returnType: 'v' },
-      createString: { argType: 'ii', returnType: 'v' },
-      createView: { argType: 'iib', returnType: 'v' },
+      createString: { argType: 'az', returnType: 'v' },
+      createView: { argType: 'azb', returnType: 'v' },
       createInstance: { argType: 'vvv', returnType: 'v' },
       createTemplate: { argType: 'vv', returnType: 'v' },
       createList: { argType: '', returnType: 'v' },
@@ -388,7 +393,7 @@ var structureAcquisition = mixin({
       enableCallback: { argType: 'vvv' },
     },
     imports: {
-      getFactoryThunk: { argType: '', returnType: 'i' },
+      getFactoryThunk: { argType: '', returnType: 'a' },
       getModuleAttributes: { argType: '', returnType: 'i' },
     },
     createBool(initializer) {
@@ -408,7 +413,7 @@ var structureAcquisition = mixin({
     },
     createString(address, len) {
       const { buffer } = this.memory;
-      const ta = new Uint8Array(buffer, address, len);
+      const ta = new Uint8Array(buffer, toBufferOffset(address), Number(len));
       return decodeText(ta);
     },
     createList() {

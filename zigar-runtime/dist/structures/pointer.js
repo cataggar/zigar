@@ -3,7 +3,7 @@ import { mixin } from '../environment.js';
 import { NoCastingToPointer, throwReadOnly, ConstantConstraint, ReadOnlyTarget, InvalidPointerTarget, PreviouslyFreed, NullPointer, InvalidSliceLength, ZigMemoryTargetRequired } from '../errors.js';
 import { getProxyType, getProxyTarget, getProxy } from '../proxies.js';
 import { CAST, ENVIRONMENT, PARENT, LAST_LENGTH, SLOTS, MEMORY, TYPE, TARGET, RESTORE, READ_ONLY, SETTERS, TYPED_ARRAY, ZIG, INITIALIZE, FINALIZE, PROXY, PROXY_TYPE, UPDATE, ADDRESS, LENGTH, VISIT, LAST_ADDRESS, MAX_LENGTH, SENTINEL, SIZE } from '../symbols.js';
-import { defineValue, isCompatibleInstanceOf, usizeInvalid, getSelf, isCompatibleType, findElements } from '../utils.js';
+import { defineValue, isCompatibleInstanceOf, isInvalidUsize, getSelf, isCompatibleType, findElements } from '../utils.js';
 
 var pointer = mixin({
   definePointer(structure, descriptors) {
@@ -92,7 +92,7 @@ var pointer = mixin({
           }
         }
       } else if (this[MEMORY][ZIG]) {
-        setAddress.call(this, 0);
+        setAddress.call(this, (thisEnv.memory64 || "32" == 64) ? 0n : 0);
         setLength?.call?.(this, 0);
       }
       this[SLOTS][0] = arg ?? null;
@@ -231,7 +231,7 @@ var pointer = mixin({
         }
       }
       const zig = arg?.[MEMORY]?.[ZIG];
-      if (zig?.address === usizeInvalid) {
+      if (isInvalidUsize(zig?.address)) {
         throw new PreviouslyFreed(arg);
       }
       this[TARGET] = arg;

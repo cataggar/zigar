@@ -6,11 +6,11 @@ export default mixin({
   pathRenameEvent: 'rename',
   pathRename(dirFd, pathAddress, pathLen, newDirFd, newPathAddress, newPathLen, canWait) {
     return catchPosixError(canWait, PosixError.ENOENT, () => {
-      const loc = this.obtainStreamLocation(dirFd, pathAddress, pathLen);
+      const loc = this.obtainStreamLocation(dirFd, pathAddress, Number(pathLen));
       const { 
         path: newPath, 
         parent: newParent,
-      } = this.obtainStreamLocation(newDirFd, newPathAddress, newPathLen);
+      } = this.obtainStreamLocation(newDirFd, newPathAddress, Number(newPathLen));
       return this.triggerEvent('rename', { ...loc, newParent, newPath }, PosixError.ENOENT);
     }, (result) => (result === undefined) ? PosixError.ENOTSUP : expectBoolean(result, PosixError.ENOENT));
   },

@@ -19,7 +19,7 @@ export default mixin({
     }
     let loc;
     return catchPosixError(canWait, PosixError.ENOENT, () => {
-      loc = this.obtainStreamLocation(dirFd, pathAddress, pathLen);
+      loc = this.obtainStreamLocation(dirFd, pathAddress, Number(pathLen));
       const rights = decodeFlags(fdRights[0], Right);
       const flags = {
         ...decodeFlags(lFlags, PosixLookupFlag),

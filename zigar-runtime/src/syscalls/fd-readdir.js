@@ -6,7 +6,8 @@ import './copy-int.js';
 
 export default mixin({
   fdReaddir(fd, bufAddress, bufLen, cookie, bufusedAddress, canWait) {
-    if (bufLen < 24) {
+    const len = Number(bufLen);
+    if (len < 24) {
       return PosixError.EINVAL;
     }
     let dir, async;
@@ -25,8 +26,8 @@ export default mixin({
       async = isPromise(result);
       return result;
     }, (dent) => {
-      const dv = createView(bufLen);
-      let remaining = bufLen;
+      const dv = createView(len);
+      let remaining = len;
       let p = 0;
       while (dent) {
         const { name, type = 'unknown', ino = 1 } = dent;
@@ -56,7 +57,7 @@ export default mixin({
         dent = (remaining > 24 + 16 && !async) ? dir.readdir() : null;
       }
       this.moveExternBytes(dv, bufAddress, true);
-      this.copyUint32(bufusedAddress, p);
+      this.copyUsize(bufusedAddress, p);
     }));
   },
   ...(process.env.TARGET === 'node' ? {

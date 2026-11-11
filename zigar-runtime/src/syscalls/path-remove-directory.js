@@ -6,7 +6,7 @@ export default mixin({
   pathRemoveDirectory: 'rmdir',
   pathRemoveDirectory(dirFd, pathAddress, pathLen, canWait) {
     return catchPosixError(canWait, PosixError.ENOENT, () => {
-      const loc = this.obtainStreamLocation(dirFd, pathAddress, pathLen);
+      const loc = this.obtainStreamLocation(dirFd, pathAddress, Number(pathLen));
       return this.triggerEvent('rmdir', loc, PosixError.ENOENT);
     }, (result) => (result === undefined) ? PosixError.ENOTSUP : expectBoolean(result, PosixError.ENOENT));
   },

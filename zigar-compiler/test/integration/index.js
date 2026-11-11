@@ -19,7 +19,7 @@ import * as ThreadHandling from './thread-handling/tests.js';
 import * as TypeHandling from './type-handling/tests.js';
 
 export function addTests(importModule, options) {
-  const isWasm = options?.target === 'wasm32' || process.env.TARGET === 'wasm';
+  const isWasm = options?.target === 'wasm32' || options?.target === 'wasm64' || process.env.TARGET === 'wasm';
   const zigCmd = process.env.ZIG_PATH || ((process.env.USE_WAZIG === '0' || process.env.USE_WAZIG === 'false') ? 'zig' : ((isWasm || process.env.USE_WAZIG === '1' || process.env.USE_WAZIG === 'true') ? 'wazig' : 'zig'));
   let compilerVersion;
   try {

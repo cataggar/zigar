@@ -492,4 +492,27 @@ describe('Syscall: poll-oneoff', function() {
     const eventCountDV = env.obtainZigView(eventCountAddress, 4);
     expect(eventCountDV.getUint32(0, le)).to.equal(1);
   })
+  if (process.env.TARGET === 'wasm') {
+    it('should accept BigInt inputs and write 8-byte nevents when memory64 is enabled', function() {
+      const env = new Env();
+      env.memory = new WebAssembly.Memory({ initial: 1n, address: 'i64' });
+      env.memory64 = true;
+      const le = env.littleEndian;
+      const raw = new DataView(env.memory.buffer);
+      const array = new Uint8Array(32);
+      const fds = [
+        env.createStreamHandle(env.convertReader(array), env.getDefaultRights('file'), 0),
+        env.createStreamHandle(env.convertReader(array), env.getDefaultRights('file'), 0),
+      ];
+      for (let i = 0; i < fds.length; i++) {
+        const offset = 0x1000 + i * 48;
+        raw.setUint8(offset + 8, PosixPollEventType.FD_READ);
+        raw.setInt32(offset + 16, fds[i], le);
+      }
+      raw.setUint32(0x3004, 0xaaaa_aaaa, le);
+      const result = env.pollOneoff(0x1000n, 0x2000n, 2n, 0x3000n, true);
+      expect(result).to.equal(PosixError.NONE);
+      expect(raw.getBigUint64(0x3000, le)).to.equal(2n);
+    })
+  }
 })

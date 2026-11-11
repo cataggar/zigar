@@ -96,5 +96,24 @@ describe('Syscall: environ-get', function() {
       const env2 = decodeText(array2);
       expect(env2).to.equal('WORLD=123');
     })
+    it('should write 64-bit environment pointers and sizes when memory64 is enabled', function() {
+      const env = new Env();
+      env.memory = new WebAssembly.Memory({ initial: 1n, address: 'i64' });
+      env.memory64 = true;
+      env.setObject('env', {
+        HELLO: 1,
+        WORLD: 123,
+      });
+      const le = env.littleEndian;
+      const raw = new DataView(env.memory.buffer);
+      expect(env.environSizesGet(0x3000n, 0x4000n)).to.equal(0);
+      expect(raw.getBigUint64(0x3000, le)).to.equal(2n);
+      expect(raw.getBigUint64(0x4000, le)).to.equal(18n);
+      expect(env.environGet(0x1000n, 0x2000n)).to.equal(0);
+      expect(raw.getBigUint64(0x1000, le)).to.equal(0x2000n);
+      expect(raw.getBigUint64(0x1008, le)).to.equal(0x2008n);
+      expect(decodeText(new Uint8Array(env.memory.buffer, 0x2000, 7))).to.equal('HELLO=1');
+      expect(decodeText(new Uint8Array(env.memory.buffer, 0x2008, 9))).to.equal('WORLD=123');
+    })
   }
 })
