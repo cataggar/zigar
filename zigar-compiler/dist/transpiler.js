@@ -2253,6 +2253,18 @@ const optionsForTranspile = {
     type: 'boolean',
     title: 'Provide emulated pthread functions',
   },
+  useJSPI: {
+    anyOf: [
+      { type: 'boolean' },
+      { type: 'string', enum: [ 'all', 'auto' ] },
+      { type: 'array', items: { type: 'string' } },
+    ],
+    title: 'Use JavaScript Promise Integration (JSPI)',
+  },
+  continuationStackSize: {
+    type: 'number',
+    title: 'Size of each JSPI continuation stack in bytes',
+  },
 };
 
 const allOptions = {
@@ -2271,6 +2283,16 @@ function extractOptions(searchParams, availableOptions) {
     }
     if (key === 'optimize') {
       options[key] = getCamelCase(string, [ 'Debug', 'ReleaseSafe', 'ReleaseFast', 'ReleaseSmall' ]);
+    } else if (key === 'useJSPI') {
+      if (string === '1' || string === 'true') {
+        options[key] = true;
+      } else if (string === '0' || string === 'false' || string === '') {
+        options[key] = false;
+      } else if (string === 'all' || string === 'auto') {
+        options[key] = string;
+      } else {
+        options[key] = string.split(',').map(s => s.trim()).filter(Boolean);
+      }
     } else {
       switch (option.type) {
         case 'boolean':
@@ -2324,6 +2346,23 @@ async function loadConfigFile(cfgPath, availableOptions) {
   return processConfig(json, cfgPath, availableOptions);
 }
 
+function matchesOptionSchema(value, schema) {
+  if (schema.anyOf) {
+    return schema.anyOf.some(s => matchesOptionSchema(value, s));
+  }
+  if (schema.type === 'array') {
+    if (!Array.isArray(value)) return false;
+    return !schema.items || value.every(item => matchesOptionSchema(item, schema.items));
+  }
+  if (typeof(value) !== schema.type) {
+    return false;
+  }
+  if (schema.enum && !schema.enum.includes(value)) {
+    return false;
+  }
+  return true;
+}
+
 function processConfig(object, cfgPath, availableOptions) {
   const options = {};
   for (let [ key, value ] of Object.entries(object)) {
@@ -2331,8 +2370,9 @@ function processConfig(object, cfgPath, availableOptions) {
     if (!option) {
       throw new UnknownOption(key);
     }
-    if (typeof(value) !== option.type) {
-      throw new Error(`${key} is expected to be a ${option.type}, received: ${value}`);
+    if (!matchesOptionSchema(value, option)) {
+      const expected = option.type ?? option.anyOf.map(s => s.type).join('|');
+      throw new Error(`${key} is expected to be a ${expected}, received: ${value}`);
     }
     if (key === 'sourceFiles') {
       const modules = {};
@@ -4212,9 +4252,37 @@ var callMarshalingOutbound = mixin({
     {
       this.trackingMixins = true;
     }
-    const success = (attrs)
-    ? this.runVariadicThunk(thunkAddress, fnAddress, argAddress, attrAddress, attrs.length)
-    : this.runThunk(thunkAddress, fnAddress, argAddress);
+    const runnerName = (attrs) ? 'runVariadicThunk' : 'runThunk';
+    const syncRunner = this[`${runnerName}Sync`] ;
+    let useSyncRunner = false;
+    if (syncRunner) {
+      if (this.comptime) {
+        useSyncRunner = true;
+      } else if (this.useJSPI && this.jspiMode !== 'all' && !this.customWASI) {
+        const fnSlot = Number(fnAddress);
+        if (this.asyncExportSet) {
+          useSyncRunner = !this.asyncExportSet.has(fn.name) && (!this.syncFuncSet || this.syncFuncSet.has(fnSlot));
+        } else if (this.syncFuncSet) {
+          useSyncRunner = this.syncFuncSet.has(fnSlot);
+        }
+      }
+    }
+    let success;
+    if (useSyncRunner) {
+      const prevContinuation = this.activeContinuation;
+      this.activeContinuation = null;
+      try {
+        success = (attrs)
+          ? this.runVariadicThunkSync(thunkAddress, fnAddress, argAddress, attrAddress, attrs.length)
+          : this.runThunkSync(thunkAddress, fnAddress, argAddress);
+      } finally {
+        this.activeContinuation = prevContinuation;
+      }
+    } else {
+      success = (attrs)
+        ? this.runVariadicThunk(thunkAddress, fnAddress, argAddress, attrAddress, attrs.length)
+        : this.runThunk(thunkAddress, fnAddress, argAddress);
+    }
     const finishCall = (success) => {
       if (!success) {
         if (!finalized) {
@@ -4970,6 +5038,18 @@ const MemoryType = {
 };
 
 const WA = WebAssembly;
+const ETIMEDOUT = PosixError.ETIMEDOUT ?? 73;
+
+const PURE_SYNC_WASI_IMPORTS$1 = new Set([
+  'clock_res_get',
+  'clock_time_get',
+  'environ_get',
+  'environ_sizes_get',
+  'random_get',
+  'fd_fdstat_get',
+  'fd_prestat_get',
+  'fd_prestat_dir_name',
+]);
 
 var moduleLoading = mixin({
   init() {
@@ -4988,6 +5068,10 @@ var moduleLoading = mixin({
       this.exportedFunctions = null;
       this.customWASI = null;
       this.useJSPI = false;
+      this.jspiMode = false;
+      this.syncFuncSet = null;
+      this.asyncExportSet = null;
+      this.pendingFutexTimers = new Set();
       this.continuationStackSize = 65536;
       this.continuationStackPool = [];
       this.activeContinuation = null;
@@ -5010,6 +5094,7 @@ var moduleLoading = mixin({
     },
     exports: {
       displayPanic: { argType: 'ii' },
+      futexWaitAsync: { argType: 'iii', returnType: 'i' },
     },
 
     getObjectIndex(object) {
@@ -5052,7 +5137,9 @@ var moduleLoading = mixin({
         ? retval.then(v => this.toWebAssembly(returnType, v))
         : this.toWebAssembly(returnType, retval);
       };
-      return (this.useJSPI && name === 'handleJscall') ? this.wrapSuspending(wrapper) : wrapper;
+      return (this.useJSPI && (name === 'handleJscall' || name === 'futexWaitAsync'))
+        ? this.wrapSuspending(wrapper)
+        : wrapper;
     },
     importFunction(fn, argType = '', returnType = '') {
       return (...args) => {
@@ -5267,6 +5354,10 @@ var moduleLoading = mixin({
         }
       }
       this.destructors.push(() => {
+        for (const timer of this.pendingFutexTimers) {
+          clearInterval(timer);
+        }
+        this.pendingFutexTimers.clear();
         for (const { address, size } of this.continuationStackPool) {
           exports.freeScratchMemory?.(address, size, 16);
         }
@@ -5283,8 +5374,21 @@ var moduleLoading = mixin({
         multithreaded,
         useJSPI = false,
         continuationStackSize,
+        syncFunctions,
+        syncTableIndices,
       } = this.options = options;
-      this.useJSPI = Boolean(useJSPI && typeof WA.Suspending === 'function' && typeof WA.promising === 'function');
+      const jspiSupported = typeof WA.Suspending === 'function' && typeof WA.promising === 'function';
+      this.useJSPI = Boolean(useJSPI && jspiSupported);
+      this.jspiMode = !this.useJSPI
+        ? false
+        : (useJSPI === 'all')
+          ? 'all'
+          : Array.isArray(useJSPI)
+            ? 'list'
+            : 'auto';
+      const syncList = syncFunctions ?? syncTableIndices;
+      this.syncFuncSet = (this.useJSPI && syncList) ? new Set(syncList.map(Number)) : null;
+      this.asyncExportSet = (this.useJSPI && Array.isArray(useJSPI)) ? new Set(useJSPI) : null;
       if (continuationStackSize) {
         this.continuationStackSize = (continuationStackSize + 15) & -16;
       }
@@ -5365,7 +5469,36 @@ var moduleLoading = mixin({
         };
         return isPromise(result) ? result.then(onResult) : onResult(result);
       };
-      return (this.useJSPI && name !== 'proc_exit') ? this.wrapSuspending(fn) : fn;
+      const shouldWrap = this.useJSPI && name !== 'proc_exit' && (
+        this.jspiMode === 'all' || !!this.customWASI || !PURE_SYNC_WASI_IMPORTS$1.has(name)
+      );
+      return shouldWrap ? this.wrapSuspending(fn) : fn;
+    },
+    futexWaitAsync(address, expected, timeoutNs) {
+      if (!this.activeContinuation || typeof Atomics.waitAsync !== 'function' || !(this.memory?.buffer instanceof SharedArrayBuffer)) {
+        return PosixError.ENOTSUP;
+      }
+      const index = (typeof address === 'bigint')
+        ? Number(BigInt.asUintN(64, address) >> 2n)
+        : (Number(address) >>> 2);
+      const timeoutMs = (timeoutNs < 0) ? Infinity : Number(timeoutNs) / 1e6;
+      const res = Atomics.waitAsync(new Int32Array(this.memory.buffer), index, Number(expected) | 0, timeoutMs);
+      if (!res.async) {
+        return (res.value === 'timed-out') ? ETIMEDOUT : PosixError.NONE;
+      }
+      const keepAlive = setInterval(empty, 0x3fffffff);
+      this.pendingFutexTimers.add(keepAlive);
+      const clearKeepAlive = () => {
+        clearInterval(keepAlive);
+        this.pendingFutexTimers.delete(keepAlive);
+      };
+      return res.value.then((v) => {
+        clearKeepAlive();
+        return (v === 'timed-out') ? ETIMEDOUT : PosixError.NONE;
+      }, (err) => {
+        clearKeepAlive();
+        throw err;
+      });
     },
     setCustomWASI(wasi) {
       this.customWASI = wasi;
@@ -7153,11 +7286,11 @@ var pollOneoff = mixin({
         switch (tag) {
           case PosixPollEventType.CLOCK: {
             let timeout = subscriptions.getBigUint64(offset + 24, le);
-            const array = new Int32Array(new SharedArrayBuffer(4));
             const onResult = resolveClock.bind(result);
             if (timeout === 0n) {
               onResult();
             } else {
+              const array = (this.sleepFutex ??= new Int32Array(new SharedArrayBuffer(4)));
               const millisec = Math.ceil(Number(timeout) / 1000000);
               promise = Atomics.waitAsync(array, 0, 0, millisec).value.then(onResult);
             }
@@ -7304,15 +7437,17 @@ var workerSupport = mixin({
     return worker.taddr;
   },
   createWorker() {
+    const callFutex = new Int32Array(new SharedArrayBuffer(8));
     const handler = (msg) => {
       switch (msg.type) {
         case 'call': {
-          const { module, name, args, futex } = msg;        
+          const { module, name, args, callId, futex } = msg;
           if (worker.canceled === 0) {
             const fn = this.exportedModules[module]?.[name];
             // add a true argument to indicate that waiting is possible
             const result = fn?.(...args, true);
-            const finish = (value) => worker.signal(futex, 1, value);
+            const ok = (callId !== undefined) ? -1 : 1;
+            const finish = (value) => worker.signal(callId, ok, value, futex);
             if (isPromise(result)) {
               result.then(finish);
             } else {
@@ -7321,7 +7456,8 @@ var workerSupport = mixin({
           } else {
             // a deferred cancellation has occurred--tell the worker to bail out from whatever 
             // it's currently doing
-            worker.signal(futex, 2);
+            const canceled = (callId !== undefined) ? -2 : 2;
+            worker.signal(callId, canceled, 0, futex);
           }
         } break;
         case 'terminate': {
@@ -7346,12 +7482,23 @@ var workerSupport = mixin({
     }
     // send WebAssembly start-up data
     const { executable, memory, options } = this;
-    worker.postMessage({ type: 'start', executable, memory, options });
-    worker.signal = (futex, response, result) => {
-      if (Atomics.load(futex, 0) === 0) {
-        Atomics.store(futex, 0, response);
-        Atomics.store(futex, 1, result|0);
-        Atomics.notify(futex, 0, 1);
+    worker.callFutex = callFutex;
+    worker.postMessage({ type: 'start', executable, memory, options, futex: callFutex });
+    worker.signal = (callId, response, result, customFutex) => {
+      if (customFutex && callId === undefined) {
+        if (Atomics.load(customFutex, 0) === 0) {
+          Atomics.store(customFutex, 1, result | 0);
+          Atomics.store(customFutex, 0, response);
+          Atomics.notify(customFutex, 0, 1);
+        }
+        return;
+      }
+      const target = customFutex ?? callFutex;
+      if (Atomics.load(target, 0) === callId) {
+        Atomics.store(target, 1, result | 0);
+        if (Atomics.compareExchange(target, 0, callId, response) === callId) {
+          Atomics.notify(target, 0, 1);
+        }
       }
     };
     worker.run = (tid, taddr) => {
@@ -7394,6 +7541,7 @@ function workerMain() {
   // this code must be entirely self-contained; don't call any imported functions
   const WA = WebAssembly;
   let port, instance;
+  let nextCallId = 0;
 
   if (typeof(self) === 'object') {
     // web worker
@@ -7410,33 +7558,49 @@ function workerMain() {
   function process(msg) {
     switch (msg.type) {
       case 'start': {
-        const { executable, memory, options } = msg;
+        let { executable, memory, options, futex } = msg;
+        const sendFutex = !futex;
+        futex ??= new Int32Array(new SharedArrayBuffer(8));
         const imports = { 
           env: { memory },
           wasi: {},
           wasi_snapshot_preview1: {},
         };
         const exit = () => { throw new Error('Exit') };
-        const wait = (futex, timeout) => {
-          const result = Atomics.wait(futex, 0, 0, timeout);
-          if (result !== 'timed-out') {            
-            if (Atomics.load(futex, 0) === 2) {
-              // thread was canceled
-              exit();
-            }
-            return Atomics.load(futex, 1);
-          } else {
-            return 0;
-          }
+        const beginCall = () => {
+          nextCallId = (nextCallId === 0x7fffffff) ? 1 : nextCallId + 1;
+          Atomics.store(futex, 0, nextCallId);
+          return nextCallId;
         };
-        const createFutex = () => new Int32Array(new SharedArrayBuffer(8));
+        const wait = (callId, timeout) => {
+          const res = Atomics.wait(futex, 0, callId, timeout);
+          let state;
+          if (res === 'timed-out') {
+            const prev = Atomics.compareExchange(futex, 0, callId, -3);
+            if (prev === callId) {
+              return 0;
+            }
+            state = prev;
+          } else {
+            state = Atomics.load(futex, 0);
+          }
+          if (state === -2) {
+            // thread was canceled
+            exit();
+          }
+          return Atomics.load(futex, 1);
+        };
         for (const { module, name, kind } of WA.Module.imports(executable)) {
           const ns = imports[module];
           if (kind === 'function' && ns) {
             ns[name] = (name === 'proc_exit') ? exit : function(...args) {
-              const futex = createFutex();
-              port.postMessage({ type: 'call', module, name, args, futex });
-              return wait(futex);
+              const callId = beginCall();
+              const callMsg = { type: 'call', module, name, args, callId };
+              if (sendFutex) {
+                callMsg.futex = futex;
+              }
+              port.postMessage(callMsg);
+              return wait(callId);
             };
             if (name === 'fd_write') {
               const write = ns[name];
@@ -7460,18 +7624,22 @@ function workerMain() {
                     array.set(vector, pos);
                     pos += len;
                   }
-                  const futex = createFutex();
-                  port.postMessage({ 
+                  const callId = beginCall();
+                  const callMsg = { 
                     type: 'call', 
                     module, 
                     name: `${name}_stderr`, 
                     args: [ array ],
-                    futex,
-                  }, [ array.buffer ]);
+                    callId,
+                  };
+                  if (sendFutex) {
+                    callMsg.futex = futex;
+                  }
+                  port.postMessage(callMsg, [ array.buffer ]);
                   // write the length, assuming the operation will succeed in the main thread
                   dv.setUint32(writtenAddress, total, true);
                   // block for only up to 50ms
-                  return wait(futex, 50000);
+                  return wait(callId, 50000);
                 } else {
                   return write(fd, iovsAddress, iovsCount, writtenAddress);
                 }
@@ -11872,6 +12040,8 @@ const SectionType = {
   Custom: 0,
   Import: 2,
   Function: 3,
+  Table: 4,
+  Memory: 5,
   Global: 6,
   Export: 7,
   Start: 8,
@@ -11883,6 +12053,16 @@ const ObjectType = {
   Memory: 2,
   Global: 3,
 };
+const PURE_SYNC_WASI_IMPORTS = new Set([
+  'clock_res_get',
+  'clock_time_get',
+  'environ_get',
+  'environ_sizes_get',
+  'random_get',
+  'fd_fdstat_get',
+  'fd_prestat_get',
+  'fd_prestat_dir_name',
+]);
 
 function stripUnused(binary, options = {}) {
   const {
@@ -12399,6 +12579,7 @@ function extractLimits(binary) {
   const {
     eof,
     skip,
+    readBytes,
     readU8,
     readU32,
     readString,
@@ -12415,52 +12596,297 @@ function extractLimits(binary) {
   if (version !== Version) {
     throw new Error(`Incorrect version: ${version}`);
   }
-  let memoryInitial, memoryMax, tableInitial, done = false;
-  while(!eof() && !done) {
+  let memoryInitial, memoryMax, tableInitial;
+  let definedMemoryInitial, definedMemoryMax;
+  let memory64 = false, table64 = false;
+  while (!eof()) {
     const type = readU8();
     const len = readU32Leb128();
     if (type === SectionType.Import) {
-      const count = readU32Leb128();
-      for (let i = 0; i < count && !done; i++) {
-        const module = readString();
-        const name = readString();
-        const type = readU8();
-        switch (type) {
+      const sub = createReader(readBytes(len));
+      const count = sub.readU32Leb128();
+      for (let i = 0; i < count; i++) {
+        const module = sub.readString();
+        const name = sub.readString();
+        const objType = sub.readU8();
+        switch (objType) {
           /* c8 ignore next 3 */
           case ObjectType.Function: {
-            readU32Leb128();
+            sub.readU32Leb128();
           } break;
           case ObjectType.Table: {
-            readU8();
-            const { min } = readLimits();
+            sub.readU8();
+            const { flags, min } = sub.readLimits();
             if (module === 'env' && name === '__indirect_function_table') {
               tableInitial = min;
+              if (flags & 0x04) {
+                table64 = true;
+              }
             }
           } break;
           case ObjectType.Memory: {
-            const { min, max } = readLimits();
+            const { flags, min, max } = sub.readLimits();
             if (module === 'env' && name === 'memory') {
               memoryInitial = min;
               memoryMax = max;
+              if (flags & 0x04) {
+                memory64 = true;
+              }
             }
           } break;
           /* c8 ignore next 4 */
           case ObjectType.Global: {
-            readU8();
-            readU8();
+            sub.readU8();
+            sub.readU8();
           } break;
           /* c8 ignore next 3 */
           default: {
-            throw new Error(`Unknown object type: ${type}`);
+            throw new Error(`Unknown object type: ${objType}`);
           }
         }
       }
-      done = tableInitial !== undefined && memoryInitial !== undefined;
+    } else if (type === SectionType.Table) {
+      const sub = createReader(readBytes(len));
+      const count = sub.readU32Leb128();
+      if (count > 0) {
+        const b0 = sub.readU8();
+        if (b0 === 0x40) {
+          sub.readU8();
+          sub.readU8();
+        }
+        const { flags } = sub.readLimits();
+        if (flags & 0x04) {
+          table64 = true;
+        }
+      }
+    } else if (type === SectionType.Memory) {
+      const sub = createReader(readBytes(len));
+      const count = sub.readU32Leb128();
+      if (count > 0) {
+        const { flags, min, max } = sub.readLimits();
+        definedMemoryInitial = min;
+        definedMemoryMax = max;
+        if (flags & 0x04) {
+          memory64 = true;
+        }
+      }
+      break;
     } else {
       skip(len);
+      if (type > SectionType.Memory && type !== SectionType.Custom) {
+        break;
+      }
     }
   }
-  return { memoryMax, memoryInitial, tableInitial };
+  return {
+    memoryMax,
+    memoryInitial,
+    tableInitial,
+    definedMemoryInitial,
+    definedMemoryMax,
+    memory64,
+    table64,
+  };
+}
+
+function isSuspendingImport(module, name) {
+  if (module === 'wasi_snapshot_preview1' && (name === 'proc_exit' || PURE_SYNC_WASI_IMPORTS.has(name))) {
+    return false;
+  }
+  if (module === 'env' && name !== '_handleJscall' && name !== '_futexWaitAsync') {
+    return false;
+  }
+  return true;
+}
+
+function evalConstOffsetExpr(expr) {
+  const { decodeNext } = createDecoder(createReader(expr));
+  const op1 = decodeNext();
+  const op2 = decodeNext();
+  if (op1 && op2 && op2.opcode === 0x0B) {
+    if (op1.opcode === 0x41 || op1.opcode === 0x42) {
+      return Number(op1.operand);
+    }
+  }
+  return null;
+}
+
+function evalElemFuncExpr(expr) {
+  const { decodeNext } = createDecoder(createReader(expr));
+  let op;
+  while (op = decodeNext()) {
+    if (op.opcode === 0xD2) {
+      return op.operand;
+    }
+    if (op.opcode === 0x0B) {
+      break;
+    }
+  }
+  return undefined;
+}
+
+function analyzeJspiSyncFunctions(binary) {
+  const { sections } = parseBinary(binary);
+  const importSection = sections.find(s => s.type === SectionType.Import);
+  const funcSection = sections.find(s => s.type === SectionType.Function);
+  const exportSection = sections.find(s => s.type === SectionType.Export);
+  const elemSection = sections.find(s => s.type === SectionType.Element);
+  const codeSection = sections.find(s => s.type === SectionType.Code);
+
+  const funcTypeIndex = [];
+  const importedSuspending = [];
+  if (importSection) {
+    for (const imp of importSection.imports) {
+      if (imp.type === ObjectType.Function) {
+        funcTypeIndex.push(imp.index);
+        importedSuspending.push(isSuspendingImport(imp.module, imp.name));
+      }
+    }
+  }
+  const importFuncCount = funcTypeIndex.length;
+  const internalCount = funcSection ? funcSection.types.length : 0;
+  if (funcSection) {
+    for (const typeIndex of funcSection.types) {
+      funcTypeIndex.push(typeIndex);
+    }
+  }
+  const totalFuncs = funcTypeIndex.length;
+
+  let runThunkIdx = null;
+  let runVariadicThunkIdx = null;
+  if (exportSection) {
+    for (const exp of exportSection.exports) {
+      if (exp.type === ObjectType.Function) {
+        if (exp.name === 'runThunk') {
+          runThunkIdx = exp.index;
+        } else if (exp.name === 'runVariadicThunk') {
+          runVariadicThunkIdx = exp.index;
+        }
+      }
+    }
+  }
+
+  const tableSlotToFuncIndex = new Map();
+  const indirectFuncIndices = new Set();
+  if (elemSection) {
+    for (const seg of elemSection.segments) {
+      const isActiveTable0 = seg.type === 0 || seg.type === 4
+        || ((seg.type === 2 || seg.type === 6) && seg.tableidx === 0);
+      const offset = isActiveTable0 ? evalConstOffsetExpr(seg.expr) : null;
+      if (seg.indices) {
+        for (let i = 0; i < seg.indices.length; i++) {
+          const funcIdx = seg.indices[i];
+          indirectFuncIndices.add(funcIdx);
+          if (offset !== null) {
+            tableSlotToFuncIndex.set(offset + i, funcIdx);
+          }
+        }
+      } else if (seg.entries) {
+        for (let i = 0; i < seg.entries.length; i++) {
+          const funcIdx = evalElemFuncExpr(seg.entries[i]);
+          if (funcIdx !== undefined) {
+            indirectFuncIndices.add(funcIdx);
+            if (offset !== null) {
+              tableSlotToFuncIndex.set(offset + i, funcIdx);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const directCalls = Array.from({ length: totalFuncs }, () => []);
+  const indirectTypes = Array.from({ length: totalFuncs }, () => []);
+  if (codeSection) {
+    for (let i = 0; i < internalCount; i++) {
+      const funcIdx = importFuncCount + i;
+      const code = codeSection.functions[i];
+      if (!code) continue;
+      const { instructions } = parseFunction(code);
+      const callsSet = new Set();
+      const typesSet = new Set();
+      for (const op of instructions) {
+        switch (op.opcode) {
+          case 0x10:
+          case 0x12:
+            callsSet.add(op.operand);
+            break;
+          case 0x11:
+          case 0x13:
+            typesSet.add(op.operand[0]);
+            break;
+          case 0x14:
+          case 0x15:
+            typesSet.add(op.operand);
+            break;
+          case 0xD2:
+            indirectFuncIndices.add(op.operand);
+            break;
+        }
+      }
+      directCalls[funcIdx] = [ ...callsSet ];
+      indirectTypes[funcIdx] = [ ...typesSet ];
+    }
+  }
+
+  const canSuspend = new Uint8Array(totalFuncs);
+  const typeCanSuspend = new Set();
+  for (let f = 0; f < importFuncCount; f++) {
+    if (importedSuspending[f]) {
+      canSuspend[f] = 1;
+      if (indirectFuncIndices.has(f)) {
+        typeCanSuspend.add(funcTypeIndex[f]);
+      }
+    }
+  }
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let f = importFuncCount; f < totalFuncs; f++) {
+      if (canSuspend[f]) continue;
+      let suspends = false;
+      for (const callee of directCalls[f]) {
+        if (canSuspend[callee]) {
+          suspends = true;
+          break;
+        }
+      }
+      if (!suspends) {
+        for (const t of indirectTypes[f]) {
+          if (typeCanSuspend.has(t)) {
+            suspends = true;
+            break;
+          }
+        }
+      }
+      if (suspends) {
+        canSuspend[f] = 1;
+        changed = true;
+        if (indirectFuncIndices.has(f)) {
+          typeCanSuspend.add(funcTypeIndex[f]);
+        }
+      }
+    }
+  }
+
+  const overheadSuspends = (idx) => {
+    if (idx === null) return false;
+    if (idx < importFuncCount) return !!canSuspend[idx];
+    return directCalls[idx].some(callee => canSuspend[callee]);
+  };
+  if (overheadSuspends(runThunkIdx) || overheadSuspends(runVariadicThunkIdx)) {
+    return [];
+  }
+
+  const syncTableIndices = [];
+  for (const [ slotIdx, funcIdx ] of tableSlotToFuncIndex) {
+    if (!canSuspend[funcIdx]) {
+      syncTableIndices.push(Number(slotIdx));
+    }
+  }
+  syncTableIndices.sort((a, b) => a - b);
+  return syncTableIndices;
 }
 
 function repackBinary(module) {
@@ -12650,6 +13076,19 @@ function createReader(dv) {
     }
   }
 
+  function readU64Leb128() {
+    let value = 0n;
+    let shift = 0n;
+    while (true) {
+      const byte = readU8();
+      value |= BigInt(byte & 0x7f) << shift;
+      shift += 7n;
+      if ((0x80 & byte) === 0) {
+        return (value > 0xFFFFFFFFn) ? value : Number(value);
+      }
+    }
+  }
+
   function readI32Leb128() {
     let value = 0;
     let shift = 0;
@@ -12697,16 +13136,17 @@ function createReader(dv) {
 
   function readLimits() {
     const flags = readU8();
-    const min = readU32Leb128();
+    const is64 = !!(flags & 0x04);
+    const min = is64 ? Number(readU64Leb128()) : readU32Leb128();
     let max = undefined;
     let shared = undefined;
     if (flags & 0x01) {
-      max = readU32Leb128();
+      max = is64 ? Number(readU64Leb128()) : readU32Leb128();
     }
     if (flags & 0x02) {
       shared = true;
     }
-    return { flags, min, max, shared };
+    return is64 ? { flags, min, max, shared, is64 } : { flags, min, max, shared };
   }
 
   function readCustom(len) {
@@ -12727,6 +13167,7 @@ function createReader(dv) {
     readString,
     readArray,
     readU32Leb128,
+    readU64Leb128,
     readI32Leb128,
     readI64Leb128,
     readExpression,
@@ -12799,6 +13240,19 @@ function createWriter(maxSize) {
     }
   }
 
+  function writeU64Leb128(value) {
+    let v = (typeof value === 'bigint') ? value : BigInt(value);
+    while (true) {
+      const byte = Number(v & 0x7fn);
+      v >>= 7n;
+      if (v === 0n) {
+        writeU8(byte);
+        return;
+      }
+      writeU8(byte | 0x80);
+    }
+  }
+
   function writeI32Leb128(value) {
     while (true) {
       const byte = value & 0x7f;
@@ -12840,9 +13294,10 @@ function createWriter(maxSize) {
 
   function writeLimits(limits) {
     writeU8(limits.flags);
-    writeU32Leb128(limits.min);
+    const writeVal = (limits.flags & 0x04) ? writeU64Leb128 : writeU32Leb128;
+    writeVal(limits.min);
     if (limits.max !== undefined) {
-      writeU32Leb128(limits.max);
+      writeVal(limits.max);
     }
   }
 
@@ -12860,6 +13315,7 @@ function createWriter(maxSize) {
     writeString,
     writeArray,
     writeU32Leb128,
+    writeU64Leb128,
     writeI32Leb128,
     writeI64Leb128,
     writeExpression,
@@ -12900,13 +13356,14 @@ function createDecoder(reader) {
     readU8,
     readArray,
     readU32Leb128,
+    readU64Leb128,
     readI32Leb128,
     readI64Leb128,
     readU32,
     readF64,
   } = reader;
   const readOne = readU32Leb128;
-  const readTwo = () => [ readOne(), readOne() ];
+  const readTwo = () => [ readOne(), readU64Leb128() ];
   const readMultiple = (count) => {
     const indices = [];
     for (let i = 0; i < count; i++) {
@@ -12926,6 +13383,8 @@ function createDecoder(reader) {
     0x11: readTwo,
     0x12: readOne,
     0x13: readTwo,
+    0x14: readOne,
+    0x15: readOne,
 
     0x1C: () => readArray(readU8),
 
@@ -13021,7 +13480,7 @@ function createDecoder(reader) {
         case 11:
         case 92:
         case 93:
-          return [ op1, readOne(), readOne() ];
+          return [ op1, readOne(), readU64Leb128() ];
         case 84:
         case 85:
         case 86:
@@ -13030,7 +13489,7 @@ function createDecoder(reader) {
         case 89:
         case 90:
         case 91:
-          return [ op1, readOne(), readOne(), readOne() ];
+          return [ op1, readOne(), readU64Leb128(), readOne() ];
         case 12:
           return [ op1, readBytes(16) ];
         case 13:
@@ -13046,7 +13505,7 @@ function createDecoder(reader) {
         case 3:
           return [ op1, readU8() ];
         default:
-          return [ op1, readOne(), readOne() ];
+          return [ op1, readOne(), readU64Leb128() ];
       }
     },
   };
@@ -13089,6 +13548,7 @@ function createEncoder(writer) {
     writeU8,
     writeArray,
     writeU32Leb128,
+    writeU64Leb128,
     writeI32Leb128,
     writeI64Leb128,
     writeU32,
@@ -13097,11 +13557,11 @@ function createEncoder(writer) {
   const writeOne = writeU32Leb128;
   const writeTwo = (op) => {
     writeOne(op[0]);
-    writeOne(op[1]);
+    writeU64Leb128(op[1]);
   };
   const writeMultiple = (indices) => {
     for (const index of indices) {
-      writeOne(index);
+      writeU64Leb128(index);
     }
   };
   const operandWriters = {
@@ -13116,6 +13576,8 @@ function createEncoder(writer) {
     0x11: writeTwo,
     0x12: writeOne,
     0x13: writeTwo,
+    0x14: writeOne,
+    0x15: writeOne,
     0x1C: (op) => writeArray(op, writeU8),
 
     0x20: writeOne,
@@ -13310,7 +13772,8 @@ async function transpile(srcPath, options) {
   Object.assign(compileOptions, { arch: 'wasm32', platform: 'wasi', isWASM: true });
   const { outputPath, sourcePaths } = await compile(srcPath, null, compileOptions);
   const content = await readFile(outputPath);
-  const { memoryMax, memoryInitial, tableInitial } = extractLimits(new DataView(content.buffer));
+  const rawDV = new DataView(content.buffer, content.byteOffset, content.byteLength);
+  const { memoryMax, memoryInitial, tableInitial } = extractLimits(rawDV);
   const { multithreaded = false } = compileOptions;
   const moduleOptions = {
     memoryMax,
@@ -13319,7 +13782,7 @@ async function transpile(srcPath, options) {
     multithreaded,
   };
   if (useJSPI) {
-    moduleOptions.useJSPI = true;
+    moduleOptions.useJSPI = useJSPI;
   }
   if (continuationStackSize !== undefined) {
     moduleOptions.continuationStackSize = continuationStackSize;
@@ -13354,7 +13817,10 @@ async function transpile(srcPath, options) {
   const runtimeURL = moduleResolver('zigar-runtime');
   let binarySource;
   if (env.hasMethods()) {
-    let dv = new DataView(content.buffer);
+    if (useJSPI && useJSPI !== 'all') {
+      moduleOptions.syncFunctions = analyzeJspiSyncFunctions(rawDV);
+    }
+    let dv = rawDV;
     if (stripWASM) {
       dv = stripUnused(dv, { keepNames });
     } else {

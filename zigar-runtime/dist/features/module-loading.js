@@ -3,6 +3,18 @@ import { mixin } from '../environment.js';
 import { decodeText, empty, defineProperty, defineValue, isPromise } from '../utils.js';
 
 const WA = WebAssembly;
+const ETIMEDOUT = PosixError.ETIMEDOUT ?? 73;
+
+const PURE_SYNC_WASI_IMPORTS = new Set([
+  'clock_res_get',
+  'clock_time_get',
+  'environ_get',
+  'environ_sizes_get',
+  'random_get',
+  'fd_fdstat_get',
+  'fd_prestat_get',
+  'fd_prestat_dir_name',
+]);
 
 var moduleLoading = mixin({
   init() {
@@ -21,6 +33,10 @@ var moduleLoading = mixin({
       this.exportedFunctions = null;
       this.customWASI = null;
       this.useJSPI = false;
+      this.jspiMode = false;
+      this.syncFuncSet = null;
+      this.asyncExportSet = null;
+      this.pendingFutexTimers = new Set();
       this.continuationStackSize = 65536;
       this.continuationStackPool = [];
       this.activeContinuation = null;
@@ -43,6 +59,7 @@ var moduleLoading = mixin({
     },
     exports: {
       displayPanic: { argType: 'ii' },
+      futexWaitAsync: { argType: 'iii', returnType: 'i' },
     },
 
     getObjectIndex(object) {
@@ -85,7 +102,9 @@ var moduleLoading = mixin({
         ? retval.then(v => this.toWebAssembly(returnType, v))
         : this.toWebAssembly(returnType, retval);
       };
-      return (this.useJSPI && name === 'handleJscall') ? this.wrapSuspending(wrapper) : wrapper;
+      return (this.useJSPI && (name === 'handleJscall' || name === 'futexWaitAsync'))
+        ? this.wrapSuspending(wrapper)
+        : wrapper;
     },
     importFunction(fn, argType = '', returnType = '') {
       return (...args) => {
@@ -300,6 +319,10 @@ var moduleLoading = mixin({
         }
       }
       this.destructors.push(() => {
+        for (const timer of this.pendingFutexTimers) {
+          clearInterval(timer);
+        }
+        this.pendingFutexTimers.clear();
         for (const { address, size } of this.continuationStackPool) {
           exports.freeScratchMemory?.(address, size, 16);
         }
@@ -316,8 +339,21 @@ var moduleLoading = mixin({
         multithreaded,
         useJSPI = false,
         continuationStackSize,
+        syncFunctions,
+        syncTableIndices,
       } = this.options = options;
-      this.useJSPI = Boolean(useJSPI && typeof WA.Suspending === 'function' && typeof WA.promising === 'function');
+      const jspiSupported = typeof WA.Suspending === 'function' && typeof WA.promising === 'function';
+      this.useJSPI = Boolean(useJSPI && jspiSupported);
+      this.jspiMode = !this.useJSPI
+        ? false
+        : (useJSPI === 'all')
+          ? 'all'
+          : Array.isArray(useJSPI)
+            ? 'list'
+            : 'auto';
+      const syncList = syncFunctions ?? syncTableIndices;
+      this.syncFuncSet = (this.useJSPI && syncList) ? new Set(syncList.map(Number)) : null;
+      this.asyncExportSet = (this.useJSPI && Array.isArray(useJSPI)) ? new Set(useJSPI) : null;
       if (continuationStackSize) {
         this.continuationStackSize = (continuationStackSize + 15) & -16;
       }
@@ -398,7 +434,36 @@ var moduleLoading = mixin({
         };
         return isPromise(result) ? result.then(onResult) : onResult(result);
       };
-      return (this.useJSPI && name !== 'proc_exit') ? this.wrapSuspending(fn) : fn;
+      const shouldWrap = this.useJSPI && name !== 'proc_exit' && (
+        this.jspiMode === 'all' || !!this.customWASI || !PURE_SYNC_WASI_IMPORTS.has(name)
+      );
+      return shouldWrap ? this.wrapSuspending(fn) : fn;
+    },
+    futexWaitAsync(address, expected, timeoutNs) {
+      if (!this.activeContinuation || typeof Atomics.waitAsync !== 'function' || !(this.memory?.buffer instanceof SharedArrayBuffer)) {
+        return PosixError.ENOTSUP;
+      }
+      const index = (typeof address === 'bigint')
+        ? Number(BigInt.asUintN(64, address) >> 2n)
+        : (Number(address) >>> 2);
+      const timeoutMs = (timeoutNs < 0) ? Infinity : Number(timeoutNs) / 1e6;
+      const res = Atomics.waitAsync(new Int32Array(this.memory.buffer), index, Number(expected) | 0, timeoutMs);
+      if (!res.async) {
+        return (res.value === 'timed-out') ? ETIMEDOUT : PosixError.NONE;
+      }
+      const keepAlive = setInterval(empty, 0x3fffffff);
+      this.pendingFutexTimers.add(keepAlive);
+      const clearKeepAlive = () => {
+        clearInterval(keepAlive);
+        this.pendingFutexTimers.delete(keepAlive);
+      };
+      return res.value.then((v) => {
+        clearKeepAlive();
+        return (v === 'timed-out') ? ETIMEDOUT : PosixError.NONE;
+      }, (err) => {
+        clearKeepAlive();
+        throw err;
+      });
     },
     setCustomWASI(wasi) {
       this.customWASI = wasi;
@@ -429,4 +494,4 @@ var moduleLoading = mixin({
 
 const throwError = () => { throw new Error(`Module was abandoned`) };
 
-export { moduleLoading as default };
+export { PURE_SYNC_WASI_IMPORTS, moduleLoading as default };

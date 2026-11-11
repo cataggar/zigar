@@ -758,6 +758,102 @@ describe('Feature: module-loading', function() {
         env.suspendedContinuationCount = 1;
         expect(() => env.runWithContinuation(() => {})).to.throw('Concurrent JSPI calls require __stack_pointer export');
       })
+      it('should selectively wrap WASI imports based on jspiMode and customWASI', async function() {
+        if (typeof WebAssembly.Suspending !== 'function' || typeof WebAssembly.promising !== 'function') {
+          this.skip();
+        }
+        const url = new URL('./wasm-samples/read-file.wasm', import.meta.url);
+        const buffer = await readFile(fileURLToPath(url));
+
+        // 1. Selective mode (useJSPI: true): pure sync WASI imports are NOT WebAssembly.Suspending,
+        //    whereas potentially async WASI imports (fd_read) ARE WebAssembly.Suspending.
+        const envAuto = new Env();
+        await envAuto.loadModule(buffer, {
+          memoryInitial: 257,
+          tableInitial: 210,
+          multithreaded: false,
+          useJSPI: true,
+          syncFunctions: [ 1, 3 ],
+        });
+        expect(envAuto.jspiMode).to.equal('auto');
+        expect([ ...envAuto.syncFuncSet ]).to.eql([ 1, 3 ]);
+        expect(envAuto.asyncExportSet).to.be.null;
+        expect(envAuto.getWASIHandler('clock_time_get')).to.not.be.an.instanceOf(WebAssembly.Suspending);
+        expect(envAuto.getWASIHandler('random_get')).to.not.be.an.instanceOf(WebAssembly.Suspending);
+        expect(envAuto.getWASIHandler('proc_exit')).to.not.be.an.instanceOf(WebAssembly.Suspending);
+        expect(envAuto.getWASIHandler('fd_read')).to.be.an.instanceOf(WebAssembly.Suspending);
+        envAuto.setCustomWASI({ wasiImport: {} });
+        expect(envAuto.getWASIHandler('clock_time_get')).to.be.an.instanceOf(WebAssembly.Suspending);
+        envAuto.abandonModule();
+
+        // 2. 'all' mode and string[] mode
+        const envAll = new Env();
+        await envAll.loadModule(buffer, {
+          memoryInitial: 257,
+          tableInitial: 210,
+          multithreaded: false,
+          useJSPI: 'all',
+        });
+        expect(envAll.useJSPI).to.be.true;
+        expect(envAll.jspiMode).to.equal('all');
+        expect(envAll.getWASIHandler('clock_time_get')).to.be.an.instanceOf(WebAssembly.Suspending);
+        expect(envAll.getWASIHandler('proc_exit')).to.not.be.an.instanceOf(WebAssembly.Suspending);
+        envAll.abandonModule();
+
+        const envList = new Env();
+        await envList.loadModule(buffer, {
+          memoryInitial: 257,
+          tableInitial: 210,
+          multithreaded: false,
+          useJSPI: [ 'readFile' ],
+          syncFunctions: [ 2 ],
+        });
+        expect(envList.useJSPI).to.be.true;
+        expect(envList.jspiMode).to.equal('list');
+        expect([ ...envList.asyncExportSet ]).to.eql([ 'readFile' ]);
+        expect([ ...envList.syncFuncSet ]).to.eql([ 2 ]);
+        envList.abandonModule();
+      })
+      it('should support futexWaitAsync for SharedArrayBuffer sync/async wakeups and timeouts', async function() {
+        const env = new Env();
+        env.memory = new WebAssembly.Memory({ initial: 1 });
+        // Returns ENOTSUP when activeContinuation is null or memory is not SharedArrayBuffer
+        expect(env.futexWaitAsync(64, 0, -1n)).to.equal(PosixError.ENOTSUP);
+        env.activeContinuation = {};
+        expect(env.futexWaitAsync(64, 0, -1n)).to.equal(PosixError.ENOTSUP);
+
+        // SharedArrayBuffer memory
+        env.memory = new WebAssembly.Memory({ initial: 1, maximum: 2, shared: true });
+        const i32 = new Int32Array(env.memory.buffer);
+        Atomics.store(i32, 16, 42); // byte offset 64 = index 16
+
+        // Value mismatch (!res.async, 'not-equal') -> PosixError.NONE (0), also accepts BigInt address
+        expect(env.futexWaitAsync(64n, 99, -1n)).to.equal(PosixError.NONE);
+
+        // Immediate timeout (timeoutNs = 0n -> !res.async, 'timed-out') -> ETIMEDOUT (73)
+        expect(env.futexWaitAsync(64, 42, 0n)).to.equal(73);
+
+        // Async wakeup via Atomics.notify -> resolves to PosixError.NONE (0)
+        const wakePromise = env.futexWaitAsync(64n, 42, -1n);
+        expect(wakePromise).to.be.an.instanceOf(Promise);
+        setTimeout(() => {
+          Atomics.store(i32, 16, 43);
+          Atomics.notify(i32, 16, 1);
+        }, 5);
+        expect(await wakePromise).to.equal(PosixError.NONE);
+
+        // Async timeout -> resolves to ETIMEDOUT (73)
+        const timeoutPromise = env.futexWaitAsync(64, 43, 5_000_000n);
+        expect(timeoutPromise).to.be.an.instanceOf(Promise);
+        expect(await timeoutPromise).to.equal(73);
+
+        // Exported as Suspending when useJSPI is true
+        if (typeof WebAssembly.Suspending === 'function') {
+          env.useJSPI = true;
+          const exported = env.exportFunctions();
+          expect(exported._futexWaitAsync).to.be.an.instanceOf(WebAssembly.Suspending);
+        }
+      })
     })
   } else if (process.env.TARGET === 'node') {
     describe('exportFunctions', function() {

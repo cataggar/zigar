@@ -23,11 +23,11 @@ export default mixin({
         switch (tag) {
           case PosixPollEventType.CLOCK: {
             let timeout = subscriptions.getBigUint64(offset + 24, le);
-            const array = new Int32Array(new SharedArrayBuffer(4));
             const onResult = resolveClock.bind(result);
             if (timeout === 0n) {
               onResult();
             } else {
+              const array = (this.sleepFutex ??= new Int32Array(new SharedArrayBuffer(4)));
               const millisec = Math.ceil(Number(timeout) / 1000000);
               promise = Atomics.waitAsync(array, 0, 0, millisec).value.then(onResult);
             }

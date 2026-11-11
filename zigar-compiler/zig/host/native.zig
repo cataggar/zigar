@@ -9,6 +9,7 @@ const exporter = @import("../export.zig");
 const Value = exporter.Value;
 const js_fn = @import("../thunk/js-fn.zig");
 const zig_fn = @import("../thunk/zig-fn.zig");
+pub const default_allocator = @import("../type/sharded-allocator.zig").allocator;
 pub const AbortSignal = @import("../type/abort-signal.zig").AbortSignal;
 pub const Generator = @import("../type/generator.zig").Generator;
 pub const GeneratorOf = @import("../type/generator.zig").GeneratorOf;

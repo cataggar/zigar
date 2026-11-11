@@ -4,8 +4,11 @@ import { fileURLToPath } from 'url';
 
 import {
   MagicNumber,
+  ObjectType,
   SectionType,
+  analyzeJspiSyncFunctions,
   ensureStackPointerExport,
+  extractLimits,
   parseBinary,
   parseFunction,
   parseNames,
@@ -286,6 +289,197 @@ describe('WASM decoding', function() {
       expect(parsed.moduleName).to.equal(moduleName);
       expect(parsed.functionNames).to.eql(functionNames);
       expect(parsed.localNames).to.eql(localNames);
+    })
+  })
+  describe('extractLimits and memory64/GC decoding', function() {
+    it('should populate memoryInitial/tableInitial strictly from imports and report defined/64-bit limits separately', function() {
+      // 1. Module with internally defined memory64 (min=0x10001, max=0x20000) and table64 (min=16)
+      //    flags: 0x05 = has_max (0x01) | is_64 (0x04), 0x04 = is_64
+      const defined64Module = {
+        size: 128,
+        sections: [
+          {
+            type: SectionType.Table,
+            // raw SectionType.Table bytes: 1 table, funcref 0x70, flags 0x04, min 16
+            data: new DataView(new Uint8Array([ 0x01, 0x70, 0x04, 0x10 ]).buffer),
+          },
+          {
+            type: SectionType.Memory,
+            // raw SectionType.Memory bytes: 1 memory, flags 0x05, min 0x10001 (0x81,0x80,0x04), max 0x20000 (0x80,0x80,0x08)
+            data: new DataView(new Uint8Array([ 0x01, 0x05, 0x81, 0x80, 0x04, 0x80, 0x80, 0x08 ]).buffer),
+          },
+        ],
+      };
+      const dvDefined = repackBinary(defined64Module);
+      const limitsDefined = extractLimits(dvDefined);
+      expect(limitsDefined.memoryInitial).to.be.undefined;
+      expect(limitsDefined.memoryMax).to.be.undefined;
+      expect(limitsDefined.tableInitial).to.be.undefined;
+      expect(limitsDefined.definedMemoryInitial).to.equal(0x10001);
+      expect(limitsDefined.definedMemoryMax).to.equal(0x20000);
+      expect(limitsDefined.memory64).to.be.true;
+      expect(limitsDefined.table64).to.be.true;
+
+      // 2. Module with imported memory64 (> 4GB pages: min=0x1_0000_0000 -> wait, use 0x100000 pages = 64GB) and imported table64
+      const imported64Module = {
+        size: 256,
+        sections: [
+          {
+            type: SectionType.Import,
+            imports: [
+              {
+                module: 'env',
+                name: 'memory',
+                type: ObjectType.Memory,
+                limits: { flags: 0x07, min: 0x100000, max: 0x200000, shared: true, is64: true },
+              },
+              {
+                module: 'env',
+                name: '__indirect_function_table',
+                type: ObjectType.Table,
+                reftype: 0x70,
+                limits: { flags: 0x04, min: 32, max: undefined, shared: undefined, is64: true },
+              },
+            ],
+          },
+        ],
+      };
+      const dvImported = repackBinary(imported64Module);
+      const reparsed = parseBinary(dvImported);
+      expect(reparsed.sections[0].imports[0].limits.min).to.equal(0x100000);
+      expect(reparsed.sections[0].imports[0].limits.max).to.equal(0x200000);
+      const limitsImported = extractLimits(dvImported);
+      expect(limitsImported.memoryInitial).to.equal(0x100000);
+      expect(limitsImported.memoryMax).to.equal(0x200000);
+      expect(limitsImported.tableInitial).to.equal(32);
+      expect(limitsImported.definedMemoryInitial).to.be.undefined;
+      expect(limitsImported.memory64).to.be.true;
+      expect(limitsImported.table64).to.be.true;
+    })
+    it('should decode and repack call_ref (0x14), return_call_ref (0x15), and >4GB memory64 memarg offsets', function() {
+      // Function body:
+      // 0 locals
+      // i64.const 0; i32.load align=2 offset=0x1_0000_0004 (LEB128: 0x84, 0x80, 0x80, 0x80, 0x10); drop
+      // i32.load align=2 offset=16 (small offset stays Number); drop
+      // call_ref type_idx=3
+      // return_call_ref type_idx=5
+      // atomic i32.atomic.load (0xFE 0x10) align=2 offset=0x2_0000_0000 (0x80, 0x80, 0x80, 0x80, 0x20)
+      // end
+      const rawBody = new Uint8Array([
+        0x00, // 0 locals
+        0x42, 0x00,
+        0x28, 0x02, 0x84, 0x80, 0x80, 0x80, 0x10,
+        0x1a,
+        0x41, 0x00,
+        0x28, 0x02, 0x10,
+        0x1a,
+        0x14, 0x03,
+        0x15, 0x05,
+        0xfe, 0x10, 0x02, 0x80, 0x80, 0x80, 0x80, 0x20,
+        0x0b,
+      ]);
+      const dv = new DataView(rawBody.buffer);
+      const parsed = parseFunction(dv);
+      expect(parsed.instructions[1]).to.eql({ opcode: 0x28, operand: [ 2, 0x100000004n ] });
+      expect(parsed.instructions[4]).to.eql({ opcode: 0x28, operand: [ 2, 16 ] });
+      expect(parsed.instructions[6]).to.eql({ opcode: 0x14, operand: 3 });
+      expect(parsed.instructions[7]).to.eql({ opcode: 0x15, operand: 5 });
+      expect(parsed.instructions[8]).to.eql({ opcode: 0xfe, operand: [ 0x10, 2, 0x200000000n ] });
+
+      const repacked = repackFunction(parsed);
+      expect([ ...new Uint8Array(repacked.buffer, repacked.byteOffset, repacked.byteLength) ])
+        .to.eql([ ...rawBody ]);
+    })
+  })
+  describe('analyzeJspiSyncFunctions', function() {
+    it('should statically classify pure/sync table functions vs direct and indirect suspending callers', function() {
+      // Imports (indices 0..4):
+      //   0: wasi_snapshot_preview1.clock_time_get (type 0) -> pure sync
+      //   1: env._createBool                       (type 0) -> pure sync
+      //   2: wasi_snapshot_preview1.fd_read        (type 0) -> SUSPENDING
+      //   3: env._handleJscall                     (type 1) -> SUSPENDING
+      //   4: env._futexWaitAsync                   (type 1) -> SUSPENDING
+      //
+      // Internal functions (indices 5..12):
+      //   5 (slot 1, type 2): pure leaf -> SYNC
+      //   6 (slot 2, type 2): calls clock_time_get (0) and _createBool (1) -> SYNC
+      //   7 (slot 3, type 2): calls fd_read (2) -> SUSPENDING
+      //   8 (slot 4, type 2): call_indirect type 3 (only func 11 has type 3, and func 11 is pure) -> SYNC
+      //   9 (slot 5, type 2): call_indirect type 4 (func 12 has type 4 and calls _handleJscall (3)) -> SUSPENDING
+      //  10 (slot 6, type 2): calls _futexWaitAsync (4) -> SUSPENDING
+      //  11 (slot 7, type 3): pure callback target -> SYNC
+      //  12 (slot 8, type 4): js-fn thunk calling _handleJscall (3) -> SUSPENDING
+      //  13 (exported as runThunk, type 0): call_indirect type 2 -> overhead has no direct suspending calls
+      const fnPure = new DataView(new Uint8Array([ 0x00, 0x0b ]).buffer);
+      const fnSyncImports = new DataView(new Uint8Array([ 0x00, 0x10, 0x00, 0x10, 0x01, 0x0b ]).buffer);
+      const fnFdRead = new DataView(new Uint8Array([ 0x00, 0x10, 0x02, 0x0b ]).buffer);
+      const fnIndirectSync = new DataView(new Uint8Array([ 0x00, 0x41, 0x07, 0x11, 0x03, 0x00, 0x0b ]).buffer);
+      const fnIndirectAsync = new DataView(new Uint8Array([ 0x00, 0x41, 0x08, 0x11, 0x04, 0x00, 0x0b ]).buffer);
+      const fnFutexAsync = new DataView(new Uint8Array([ 0x00, 0x10, 0x04, 0x0b ]).buffer);
+      const fnPureTarget = new DataView(new Uint8Array([ 0x00, 0x0b ]).buffer);
+      const fnJsThunk = new DataView(new Uint8Array([ 0x00, 0x10, 0x03, 0x0b ]).buffer);
+      const fnRunThunk = new DataView(new Uint8Array([ 0x00, 0x41, 0x01, 0x11, 0x02, 0x00, 0x0b ]).buffer);
+
+      const mod = {
+        size: 512,
+        sections: [
+          {
+            type: SectionType.Import,
+            imports: [
+              { module: 'wasi_snapshot_preview1', name: 'clock_time_get', type: ObjectType.Function, index: 0 },
+              { module: 'env', name: '_createBool', type: ObjectType.Function, index: 0 },
+              { module: 'wasi_snapshot_preview1', name: 'fd_read', type: ObjectType.Function, index: 0 },
+              { module: 'env', name: '_handleJscall', type: ObjectType.Function, index: 1 },
+              { module: 'env', name: '_futexWaitAsync', type: ObjectType.Function, index: 1 },
+            ],
+          },
+          {
+            type: SectionType.Function,
+            types: [ 2, 2, 2, 2, 2, 2, 3, 4, 0 ],
+          },
+          {
+            type: SectionType.Export,
+            exports: [
+              { name: 'runThunk', type: ObjectType.Function, index: 13 },
+            ],
+          },
+          {
+            type: SectionType.Element,
+            segments: [
+              {
+                type: 0,
+                expr: new DataView(new Uint8Array([ 0x41, 0x01, 0x0b ]).buffer), // offset = 1
+                indices: [ 5, 6, 7, 8, 9, 10, 11, 12 ],
+              },
+            ],
+          },
+          {
+            type: SectionType.Code,
+            functions: [
+              fnPure,
+              fnSyncImports,
+              fnFdRead,
+              fnIndirectSync,
+              fnIndirectAsync,
+              fnFutexAsync,
+              fnPureTarget,
+              fnJsThunk,
+              fnRunThunk,
+            ],
+          },
+        ],
+      };
+
+      const dv = repackBinary(mod);
+      const syncSlots = analyzeJspiSyncFunctions(dv);
+      expect(syncSlots).to.eql([ 1, 2, 4, 7 ]);
+
+      // If runThunk itself directly calls a suspending helper (e.g. fflush -> fd_read), no slot is sync
+      mod.sections[4].functions[8] = new DataView(new Uint8Array([
+        0x00, 0x41, 0x01, 0x11, 0x02, 0x00, 0x10, 0x07, 0x0b,
+      ]).buffer);
+      const dvWithFflush = repackBinary(mod);
+      expect(analyzeJspiSyncFunctions(dvWithFflush)).to.eql([]);
     })
   })
 })

@@ -1,5 +1,5 @@
 const std = @import("std");
-const wasm_allocator = std.heap.wasm_allocator;
+const wasm_allocator = @import("../type/sharded-allocator.zig").allocator;
 const E = std.os.wasi.errno_t;
 const builtin = @import("builtin");
 
@@ -11,6 +11,7 @@ const exporter = @import("../export.zig");
 const Value = exporter.Value;
 const js_fn = @import("../thunk/js-fn.zig");
 const zig_fn = @import("../thunk/zig-fn.zig");
+pub const default_allocator = wasm_allocator;
 pub const AbortSignal = @import("../type/abort-signal.zig").AbortSignal;
 pub const Generator = @import("../type/generator.zig").Generator;
 pub const GeneratorOf = @import("../type/generator.zig").GeneratorOf;
@@ -209,7 +210,7 @@ export fn initialize() void {
 }
 
 export fn allocateScratchMemory(len: usize, byte_align: u16) ?[*]u8 {
-    const a = getScratchAllocator();
+    const a = if (builtin.single_threaded or in_main_thread) getScratchAllocator() else wasm_allocator;
     const alignment = std.mem.Alignment.fromByteUnits(@max(1, byte_align));
     if (a.rawAlloc(len, alignment, 0)) |bytes| {
         return bytes;
@@ -219,9 +220,15 @@ export fn allocateScratchMemory(len: usize, byte_align: u16) ?[*]u8 {
 }
 
 export fn freeScratchMemory(bytes: [*]u8, len: usize, byte_align: u16) void {
-    const a = getScratchAllocator();
+    const slice = bytes[0..len];
     const alignment = std.mem.Alignment.fromByteUnits(@max(1, byte_align));
-    a.rawFree(bytes[0..len], alignment, 0);
+    const a = if (builtin.single_threaded)
+        getScratchAllocator()
+    else if (sfa_initialized.load(.acquire) and sfa.fba.ownsSlice(slice))
+        sfa.allocator()
+    else
+        wasm_allocator;
+    a.rawFree(slice, alignment, 0);
 }
 
 export fn getModuleAttributes() u32 {
@@ -252,13 +259,30 @@ const ScratchAllocator = struct {
 
     fallback: std.mem.Allocator,
     fba: std.heap.FixedBufferAllocator,
+    lock: std.atomic.Mutex = .unlocked,
 
     pub fn init(fallback: std.mem.Allocator, size: usize) Self {
         const buf = fallback.alloc(u8, size) catch unreachable;
+        // Reserve 1 trailing guard byte so zero-length slices at fba's end
+        // never alias an adjacent fallback allocation in ownsSlice().
         return .{
             .fallback = fallback,
-            .fba = std.heap.FixedBufferAllocator.init(buf),
+            .fba = std.heap.FixedBufferAllocator.init(buf[0 .. size - 1]),
         };
+    }
+
+    inline fn acquireLock(self: *Self) void {
+        if (!builtin.single_threaded) {
+            while (!self.lock.tryLock()) {
+                std.atomic.spinLoopHint();
+            }
+        }
+    }
+
+    inline fn releaseLock(self: *Self) void {
+        if (!builtin.single_threaded) {
+            self.lock.unlock();
+        }
     }
 
     pub fn allocator(self: *Self) std.mem.Allocator {
@@ -275,17 +299,22 @@ const ScratchAllocator = struct {
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        const fixed = self.fba.allocator();
-        if (fixed.rawAlloc(len, alignment, ra)) |buf| {
-            return buf;
-        } else {
-            return self.fallback.rawAlloc(len, alignment, ra);
+        {
+            self.acquireLock();
+            defer self.releaseLock();
+            const fixed = self.fba.allocator();
+            if (fixed.rawAlloc(len, alignment, ra)) |buf| {
+                return buf;
+            }
         }
+        return self.fallback.rawAlloc(len, alignment, ra);
     }
 
     fn resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        if (self.fba.ownsPtr(buf.ptr)) {
+        if (self.fba.ownsSlice(buf)) {
+            self.acquireLock();
+            defer self.releaseLock();
             const fixed = self.fba.allocator();
             return fixed.rawResize(buf, alignment, new_len, ra);
         } else {
@@ -295,7 +324,9 @@ const ScratchAllocator = struct {
 
     fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ra: usize) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        if (self.fba.ownsPtr(buf.ptr)) {
+        if (self.fba.ownsSlice(buf)) {
+            self.acquireLock();
+            defer self.releaseLock();
             const fixed = self.fba.allocator();
             return fixed.rawFree(buf, alignment, ra);
         } else {
@@ -305,7 +336,9 @@ const ScratchAllocator = struct {
 
     fn remap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        if (self.fba.ownsPtr(buf.ptr)) {
+        if (self.fba.ownsSlice(buf)) {
+            self.acquireLock();
+            defer self.releaseLock();
             const fixed = self.fba.allocator();
             return fixed.rawRemap(buf, alignment, new_len, ra);
         } else {
@@ -313,15 +346,29 @@ const ScratchAllocator = struct {
         }
     }
 };
-var sfa: ?ScratchAllocator = null;
-var scratch_allocator: ?std.mem.Allocator = null;
+var sfa: ScratchAllocator = undefined;
+var sfa_initialized: std.atomic.Value(bool) = .init(false);
+var sfa_init_lock: std.atomic.Mutex = .unlocked;
 
 fn getScratchAllocator() std.mem.Allocator {
-    if (scratch_allocator == null) {
-        sfa = ScratchAllocator.init(wasm_allocator, 64 * 1024);
-        scratch_allocator = sfa.?.allocator();
+    if (builtin.single_threaded) {
+        if (!sfa_initialized.raw) {
+            sfa = ScratchAllocator.init(wasm_allocator, 64 * 1024);
+            sfa_initialized.raw = true;
+        }
+        return sfa.allocator();
     }
-    return scratch_allocator.?;
+    if (!sfa_initialized.load(.acquire)) {
+        while (!sfa_init_lock.tryLock()) {
+            std.atomic.spinLoopHint();
+        }
+        defer sfa_init_lock.unlock();
+        if (!sfa_initialized.load(.monotonic)) {
+            sfa = ScratchAllocator.init(wasm_allocator, 64 * 1024);
+            sfa_initialized.store(true, .release);
+        }
+    }
+    return sfa.allocator();
 }
 
 comptime {
