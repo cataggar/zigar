@@ -1,4 +1,5 @@
-import { expect } from 'chai';
+import { expect, use } from 'chai';
+import chaiAsPromised from 'chai-as-promised';
 import { readFile } from 'fs/promises';
 import 'mocha-skip-if';
 import { fileURLToPath } from 'url';
@@ -8,6 +9,8 @@ import '../../src/mixins.js';
 import { ALIGN, MEMORY, RESTORE, SIZE, ZIG } from '../../src/symbols.js';
 import { copyView, defineProperties, usize } from '../../src/utils.js';
 import { captureError, delay } from '../test-utils.js';
+
+use(chaiAsPromised);
 
 const Env = defineEnvironment();
 
@@ -853,6 +856,231 @@ describe('Feature: module-loading', function() {
           const exported = env.exportFunctions();
           expect(exported._futexWaitAsync).to.be.an.instanceOf(WebAssembly.Suspending);
         }
+      })
+    })
+    describe('memory64, table64, and WASI64 support', function() {
+      it('should marshal BigInt addresses, lengths, and Value handles in memory64 mode without racing wasm32 Env', function() {
+        const env32 = new Env();
+        const env64 = new Env();
+        env64.memory64 = true;
+        env64.table64 = true;
+
+        expect(env32.usize(16)).to.equal(16);
+        expect(env64.usize(16)).to.equal(16n);
+        expect(env32.getUsizeByteSize()).to.equal(4);
+        expect(env64.getUsizeByteSize()).to.equal(8);
+        expect(env32.usizeMax).to.equal(0xFFFF_FFFF);
+        expect(env64.usizeMax).to.equal(0xFFFF_FFFF_FFFF_FFFFn);
+        expect(env32.usizeInvalid).to.equal(-1);
+        expect(env64.usizeInvalid).to.equal(-1n);
+
+        const obj = { answer: 42 };
+        const idx32 = env32.toWebAssembly('v', obj);
+        const idx64 = env64.toWebAssembly('v', obj);
+        expect(idx32).to.equal(1);
+        expect(idx64).to.equal(1n);
+        expect(env32.toWebAssembly('s', null)).to.equal(0);
+        expect(env64.toWebAssembly('s', null)).to.equal(0n);
+        expect(env32.fromWebAssembly('v', idx32)).to.equal(obj);
+        expect(env64.fromWebAssembly('v', idx64)).to.equal(obj);
+        expect(env64.fromWebAssembly('v', 0n)).to.be.undefined;
+
+        expect(env64.toWebAssembly('a', 0x1000)).to.equal(0x1000n);
+        expect(env64.fromWebAssembly('a', -1n)).to.equal(0xFFFF_FFFF_FFFF_FFFFn);
+        expect(env64.fromWebAssembly('a', -0x5555_5555_5555_5556n)).to.equal(0xaaaa_aaaa_aaaa_aaaan);
+        expect(env32.fromWebAssembly('a', -1)).to.equal(0xFFFF_FFFF);
+        expect(env64.toWebAssembly('z', 64)).to.equal(64n);
+        expect(env64.fromWebAssembly('z', 64n)).to.equal(64);
+      })
+      it('should instantiate a memory64 + table64 WebAssembly module, auto-detect 64-bit limits, and marshal BigInt calls', async function() {
+        const str = (s) => [ s.length, ...Buffer.from(s) ];
+        const section = (id, payload) => [ id, payload.length, ...payload ];
+        const types = [
+          0x06,
+          0x60, 0x00, 0x00,                   // 0: () -> ()
+          0x60, 0x00, 0x01, 0x7e,             // 1: () -> i64
+          0x60, 0x02, 0x7e, 0x7f, 0x01, 0x7e, // 2: (i64, i32) -> i64
+          0x60, 0x03, 0x7e, 0x7e, 0x7f, 0x00, // 3: (i64, i64, i32) -> ()
+          0x60, 0x02, 0x7e, 0x7e, 0x01, 0x7e, // 4: (i64, i64) -> i64
+          0x60, 0x01, 0x7e, 0x01, 0x7e,       // 5: (i64) -> i64
+        ];
+        const imports = [
+          0x04,
+          ...str('env'), ...str('memory'), 0x02, 0x05, 0x01, 0x04,
+          ...str('env'), ...str('__indirect_function_table'), 0x01, 0x70, 0x04, 0x02,
+          ...str('env'), ...str('_createString'), 0x00, 0x04,
+          ...str('env'), ...str('_getViewAddress'), 0x00, 0x05,
+        ];
+        const funcs = [ 0x05, 0x00, 0x01, 0x02, 0x03, 0x04 ];
+        const globals = [
+          0x02,
+          0x7e, 0x01, 0x42, 0x80, 0x80, 0x02, 0x0b, // __stack_pointer: mut i64 = 32768n
+          0x7e, 0x01, 0x42, 0x80, 0x80, 0x01, 0x0b, // scratch bump: mut i64 = 16384n
+        ];
+        const exports = [
+          0x06,
+          ...str('__stack_pointer'), 0x03, 0x00,
+          ...str('initialize'), 0x00, 0x02,
+          ...str('getFactoryThunk'), 0x00, 0x03,
+          ...str('allocateScratchMemory'), 0x00, 0x04,
+          ...str('freeScratchMemory'), 0x00, 0x05,
+          ...str('makeStr'), 0x00, 0x06,
+        ];
+        const bInit = [ 0x00, 0x0b ];
+        const bFactory = [ 0x00, 0x42, 0x80, 0x20, 0x0b ]; // i64.const 4096n
+        const bAlloc = [
+          0x01, 0x01, 0x7e,
+          0x23, 0x01, 0x22, 0x02,
+          0x20, 0x00, 0x7c, 0x24, 0x01,
+          0x20, 0x02, 0x0b,
+        ];
+        const bFree = [ 0x00, 0x0b ];
+        const bMakeStr = [ 0x00, 0x20, 0x00, 0x20, 0x01, 0x10, 0x00, 0x0b ];
+        const code = [
+          0x05,
+          bInit.length, ...bInit,
+          bFactory.length, ...bFactory,
+          bAlloc.length, ...bAlloc,
+          bFree.length, ...bFree,
+          bMakeStr.length, ...bMakeStr,
+        ];
+        const wasm64Bytes = new Uint8Array([
+          0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+          ...section(1, types),
+          ...section(2, imports),
+          ...section(3, funcs),
+          ...section(6, globals),
+          ...section(7, exports),
+          ...section(10, code),
+        ]);
+
+        // Load WITHOUT passing memory64/table64 explicitly to verify binary auto-detection
+        const env = new Env();
+        await env.loadModule(wasm64Bytes, {
+          memoryInitial: 1,
+          memoryMax: 4,
+          tableInitial: 2,
+          multithreaded: false,
+        });
+        expect(env.memory64).to.be.true;
+        expect(env.table64).to.be.true;
+        expect(typeof env.table.length).to.equal('bigint');
+        expect(env.initialStackPointer).to.equal(32768n);
+        expect(env.getFactoryThunk()).to.equal(4096n);
+
+        const scratchAddr = env.allocateScratchMemory(16, 8);
+        expect(scratchAddr).to.equal(16384n);
+        new Uint8Array(env.memory.buffer, Number(scratchAddr), 6).set(Buffer.from('zig64!'));
+        const handle = env.instance.exports.makeStr(scratchAddr, 6n);
+        expect(handle).to.equal(1n);
+        expect(env.fromWebAssembly('v', handle)).to.equal('zig64!');
+
+        const zigDV = env.obtainZigView(scratchAddr, 6);
+        const dvHandle = env.toWebAssembly('v', zigDV);
+        expect(dvHandle).to.be.a('bigint');
+        expect(env.exportFunctions()._getViewAddress(dvHandle)).to.equal(scratchAddr);
+
+        const [ panicLine ] = await captureError(() => {
+          env.displayPanic(scratchAddr, 6n);
+        });
+        expect(panicLine).to.equal('Zig panic: zig64!');
+
+        // Verify i64 __stack_pointer JSPI continuation stack switching & cleanup
+        let ranSp;
+        env.runWithContinuation(() => {
+          ranSp = env.stackPointerGlobal.value;
+          expect(typeof ranSp).to.equal('bigint');
+          expect(ranSp).to.not.equal(32768n);
+        });
+        expect(env.stackPointerGlobal.value).to.equal(32768n);
+        expect(env.continuationStackPool).to.have.lengthOf(1);
+
+        env.abandonModule();
+        expect(env.continuationStackPool).to.have.lengthOf(0);
+      })
+      it('should normalize pointer/usize BigInt parameters in WASI64 while preserving genuine 64-bit WASI parameters', function() {
+        const env = new Env();
+        env.memory64 = true;
+        env.memory = new WebAssembly.Memory({ initial: 1n, maximum: 2n, address: 'i64' });
+
+        const captured = {};
+        env.clockTimeGet = (...args) => { captured.clockTimeGet = args; return 0; };
+        env.fdPread = (...args) => { captured.fdPread = args; return 0; };
+        env.fdReaddir = (...args) => { captured.fdReaddir = args; return 0; };
+        env.fdSeek = (...args) => { captured.fdSeek = args; return 0; };
+        env.pathOpen = (...args) => { captured.pathOpen = args; return 0; };
+        env.randomGet = (...args) => { captured.randomGet = args; return 0; };
+
+        env.getWASIHandler('clock_time_get')(0, 1000n, 0x2000n);
+        expect(captured.clockTimeGet).to.eql([ 0, 1000n, 0x2000 ]);
+
+        env.getWASIHandler('fd_pread')(3, 0x1000n, 2n, 0x1_0000_0000n, 0x1080n);
+        expect(captured.fdPread).to.eql([ 3, 0x1000, 2, 0x1_0000_0000n, 0x1080 ]);
+
+        env.getWASIHandler('fd_readdir')(3, 0x2000n, 256n, 99n, 0x2200n);
+        expect(captured.fdReaddir).to.eql([ 3, 0x2000, 256, 99n, 0x2200 ]);
+
+        env.getWASIHandler('fd_seek')(3, -16n, 1, 0x3000n);
+        expect(captured.fdSeek).to.eql([ 3, -16n, 1, 0x3000 ]);
+
+        env.getWASIHandler('path_open')(3, 1, 0x1000n, 9n, 0, 0x1ffn, 0x3ffn, 0, 0x1100n);
+        expect(captured.pathOpen).to.eql([ 3, 1, 0x1000, 9, 0, 0x1ffn, 0x3ffn, 0, 0x1100 ]);
+
+        // Undefined/max-usize slice pointers normalize cleanly to Number sentinels
+        env.getWASIHandler('random_get')(-1n, 0n);
+        expect(captured.randomGet).to.eql([ -1, 0 ]);
+
+        // Custom WASI fallback receives raw un-normalized BigInt args
+        let customArgs;
+        env.setCustomWASI({
+          wasiImport: {
+            sock_accept(...args) {
+              customArgs = args;
+              return 0;
+            },
+          },
+        });
+        env.getWASIHandler('sock_accept')(3, 0, 0x4000n);
+        expect(customArgs).to.eql([ 3, 0, 0x4000n ]);
+      })
+    })
+    describe('enableResizableMemory', function() {
+      it('should enable Resizable ArrayBuffer when maximum is set and gracefully fallback otherwise', async function() {
+        const hasNativeRAB = typeof WebAssembly.Memory.prototype.toResizableBuffer === 'function';
+
+        // 1. Simulated & live Memory WITH maximum
+        const envWithMax = new Env();
+        const memWithMax = new WebAssembly.Memory({ initial: 1, maximum: 4 });
+        if (!hasNativeRAB) {
+          let rab = new ArrayBuffer(65536, { maxByteLength: 4 * 65536 });
+          memWithMax.toResizableBuffer = () => rab;
+        }
+        envWithMax.enableResizableMemory(memWithMax);
+        expect(envWithMax.usingResizableBuffer).to.be.true;
+        if (hasNativeRAB) {
+          expect(memWithMax.buffer.resizable).to.be.true;
+        }
+
+        // 2. Memory WITHOUT maximum -> graceful fallback (usingResizableBuffer === false)
+        const envNoMax = new Env();
+        const memNoMax = new WebAssembly.Memory({ initial: 1 });
+        if (!hasNativeRAB) {
+          memNoMax.toResizableBuffer = () => {
+            throw new TypeError('Memory must have a maximum');
+          };
+        }
+        envNoMax.enableResizableMemory(memNoMax);
+        expect(envNoMax.usingResizableBuffer).to.be.false;
+
+        // 3. Opt-out via useResizableBuffer: false
+        const envDisabled = new Env();
+        envDisabled.useResizableBuffer = false;
+        const memDisabled = new WebAssembly.Memory({ initial: 1, maximum: 4 });
+        if (!hasNativeRAB) {
+          memDisabled.toResizableBuffer = () => new ArrayBuffer(65536, { maxByteLength: 262144 });
+        }
+        envDisabled.enableResizableMemory(memDisabled);
+        expect(envDisabled.usingResizableBuffer).to.be.false;
       })
     })
   } else if (process.env.TARGET === 'node') {

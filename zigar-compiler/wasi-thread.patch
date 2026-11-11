@@ -206,8 +206,8 @@ diff -ruN std/std.zig std/std.zig
      /// compilation errors due to zig not being lazy enough.
      pub const logTerminalMode: fn () Io.Terminal.Mode = log.defaultTerminalMode;
 diff -ruN std/Thread.zig std/Thread.zig
---- std/Thread.zig	2026-09-08 03:57:21.000000000 +0200
-+++ std/Thread.zig	2026-09-14 13:11:47.824695851 +0200
+--- std/Thread.zig
++++ std/Thread.zig
 @@ -827,17 +827,25 @@
          allocator: std.mem.Allocator,
          /// The current state of the thread.
@@ -283,7 +283,7 @@ diff -ruN std/Thread.zig std/Thread.zig
          };
  
          const tid = spawnWasiThread(instance);
-@@ -1014,46 +1012,95 @@
+@@ -1014,46 +1012,103 @@
      }
  
      /// Called by the host environment after thread creation.
@@ -370,14 +370,22 @@ diff -ruN std/Thread.zig std/Thread.zig
 +            }
 +        };
 +        // Set the stack pointer then jump to the "clothed" portion of the function.
-+        asm volatile (
-+            \\ local.get 1
-+            \\ i32.load %[stack_address_offset]
-+            \\ global.set __stack_pointer
-+            \\ local.get 0
-+            \\ local.get 1
-+            \\ call %[cont]
-+            \\ return
++        asm volatile (if (target.cpu.arch == .wasm64)
++                \\ local.get 1
++                \\ i64.load %[stack_address_offset]
++                \\ global.set __stack_pointer
++                \\ local.get 0
++                \\ local.get 1
++                \\ call %[cont]
++                \\ return
++            else
++                \\ local.get 1
++                \\ i32.load %[stack_address_offset]
++                \\ global.set __stack_pointer
++                \\ local.get 0
++                \\ local.get 1
++                \\ call %[cont]
++                \\ return
 +            :
 +            : [stack_address_offset] "X" (@offsetOf(Instance, "stack_address")),
 +              [cont] "X" (&clothed.run),
@@ -419,16 +427,36 @@ diff -ruN std/Thread.zig std/Thread.zig
      }
  
      /// Asks the host to create a new thread for us.
-@@ -1076,6 +1123,17 @@
+@@ -1068,52 +1123,62 @@
+ 
+     /// Returns a pointer to the base of the TLS data segment for the current thread
+     inline fn __tls_base() [*]u8 {
+-        return asm (
+-            \\ .globaltype __tls_base, i32
+-            \\ global.get __tls_base
+-            \\ local.set %[ret]
++        return asm (if (target.cpu.arch == .wasm64)
++                \\ .globaltype __tls_base, i64
++                \\ global.get __tls_base
++                \\ local.set %[ret]
++            else
++                \\ .globaltype __tls_base, i32
++                \\ global.get __tls_base
++                \\ local.set %[ret]
+             : [ret] "=r" (-> [*]u8),
          );
      }
  
 +    /// Set the base of the TLS data segment for the current thread
 +    inline fn __tls_set_base(ptr: [*]u8) void {
-+        asm volatile (
-+            \\ .globaltype __tls_base, i32
-+            \\ local.get %[ptr]
-+            \\ global.set __tls_base
++        asm volatile (if (target.cpu.arch == .wasm64)
++                \\ .globaltype __tls_base, i64
++                \\ local.get %[ptr]
++                \\ global.set __tls_base
++            else
++                \\ .globaltype __tls_base, i32
++                \\ local.get %[ptr]
++                \\ global.set __tls_base
 +            :
 +            : [ptr] "r" (ptr),
 +        );
@@ -436,8 +464,38 @@ diff -ruN std/Thread.zig std/Thread.zig
 +
      /// Returns the size of the TLS segment
      inline fn __tls_size() u32 {
-         return asm volatile (
-@@ -1095,25 +1153,6 @@
+-        return asm volatile (
+-            \\ .globaltype __tls_size, i32, immutable
+-            \\ global.get __tls_size
+-            \\ local.set %[ret]
++        return asm volatile (if (target.cpu.arch == .wasm64)
++                \\ .globaltype __tls_size, i64, immutable
++                \\ global.get __tls_size
++                \\ i32.wrap_i64
++                \\ local.set %[ret]
++            else
++                \\ .globaltype __tls_size, i32, immutable
++                \\ global.get __tls_size
++                \\ local.set %[ret]
+             : [ret] "=r" (-> u32),
+         );
+     }
+ 
+     /// Returns the alignment of the TLS segment
+     inline fn __tls_align() u32 {
+-        return asm (
+-            \\ .globaltype __tls_align, i32, immutable
+-            \\ global.get __tls_align
+-            \\ local.set %[ret]
++        return asm (if (target.cpu.arch == .wasm64)
++                \\ .globaltype __tls_align, i64, immutable
++                \\ global.get __tls_align
++                \\ i32.wrap_i64
++                \\ local.set %[ret]
++            else
++                \\ .globaltype __tls_align, i32, immutable
++                \\ global.get __tls_align
++                \\ local.set %[ret]
              : [ret] "=r" (-> u32),
          );
      }

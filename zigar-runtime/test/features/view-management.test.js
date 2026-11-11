@@ -463,6 +463,129 @@ describe('Feature: view-management', function() {
         const dv = new DataView(new ArrayBuffer(0));
         env.moveExternBytes(dv, 0xabcd, true);
       })
+      it('should accept BigInt address in memory64 mode', function() {
+        const env = new Env();
+        env.memory64 = true;
+        env.memory = new WebAssembly.Memory({ initial: 1n, maximum: 2n, address: 'i64' });
+        const src = new DataView(new ArrayBuffer(4));
+        src.setUint32(0, 0x12345678, true);
+        env.moveExternBytes(src, 0x400n, true);
+        const dst = new DataView(new ArrayBuffer(4));
+        env.moveExternBytes(dst, 0x400n, false);
+        expect(dst.getUint32(0, true)).to.equal(0x12345678);
+      })
+    })
+    describe('restoreView and Resizable ArrayBuffer / Growable SharedArrayBuffer', function() {
+      it('should keep existing DataViews valid across memory.grow with zero detachment when usingResizableBuffer is true', function() {
+        const hasNativeRAB = typeof WebAssembly.Memory.prototype.toResizableBuffer === 'function';
+
+        // 1. Live WebAssembly.Memory.prototype.toResizableBuffer() when available (e.g. --experimental-wasm-rab-integration)
+        if (hasNativeRAB) {
+          for (const is64 of [ false, true ]) {
+            const env = new Env();
+            env.memory64 = is64;
+            env.memory = new WebAssembly.Memory(is64
+              ? { initial: 1n, maximum: 3n, address: 'i64' }
+              : { initial: 1, maximum: 3 });
+            env.enableResizableMemory(env.memory);
+            expect(env.usingResizableBuffer).to.be.true;
+            expect(env.memory.buffer.resizable).to.be.true;
+
+            const addr = is64 ? 0x100n : 0x100;
+            const dv = env.obtainZigView(addr, 8);
+            dv.setUint32(0, 0xcafebabe, true);
+            expect(dv[ZIG].address).to.equal(addr);
+
+            env.memory.grow(is64 ? 1n : 1);
+            expect(dv.buffer.detached).to.be.false;
+            expect(dv.buffer).to.equal(env.memory.buffer);
+            expect(dv.byteLength).to.equal(8);
+            expect(dv.getUint32(0, true)).to.equal(0xcafebabe);
+            expect(env.restoreView(dv)).to.equal(dv);
+            expect(env.obtainZigView(addr, 8)).to.equal(dv);
+          }
+        }
+
+        // 2. Simulated Resizable ArrayBuffer (always runs even without experimental V8 flag)
+        const simEnv = new Env();
+        const rab = new ArrayBuffer(65536, { maxByteLength: 3 * 65536 });
+        simEnv.memory = {
+          buffer: rab,
+          toResizableBuffer() { return rab; },
+          grow(pages) { rab.resize(rab.byteLength + pages * 65536); },
+        };
+        simEnv.enableResizableMemory(simEnv.memory);
+        expect(simEnv.usingResizableBuffer).to.be.true;
+        const simDV = simEnv.obtainZigView(256, 8);
+        simDV.setUint32(0, 0xdeadbeef, true);
+        simEnv.memory.grow(1);
+        expect(simDV.buffer.detached).to.be.false;
+        expect(simEnv.restoreView(simDV)).to.equal(simDV);
+        expect(simEnv.obtainZigView(256, 8)).to.equal(simDV);
+        expect(simDV.getUint32(0, true)).to.equal(0xdeadbeef);
+      })
+      it('should restore detached DataViews after memory.grow when RAB is unavailable or disabled', function() {
+        const env = new Env();
+        env.useResizableBuffer = false;
+        env.memory = new WebAssembly.Memory({ initial: 1, maximum: 2 });
+        env.enableResizableMemory(env.memory);
+        expect(env.usingResizableBuffer).to.be.false;
+
+        const dv = env.obtainZigView(128, 8);
+        dv[ZIG].align = 8;
+        dv.setUint32(0, 0x11223344, true);
+
+        env.memory.grow(1);
+        expect(dv.buffer.detached).to.be.true;
+
+        const restored = env.restoreView(dv);
+        expect(restored).to.not.equal(dv);
+        expect(restored.buffer).to.equal(env.memory.buffer);
+        expect(restored[ZIG].align).to.equal(8);
+        expect(restored.getUint32(0, true)).to.equal(0x11223344);
+      })
+      it('should restore SharedArrayBuffer views after memory.grow both with and without GSAB', function() {
+        const hasNativeRAB = typeof WebAssembly.Memory.prototype.toResizableBuffer === 'function';
+
+        // WITHOUT GSAB (usingResizableBuffer: false): old SAB is NOT detached, but dv.buffer !== memory.buffer
+        const envNonGSAB = new Env();
+        envNonGSAB.useResizableBuffer = false;
+        envNonGSAB.memory = new WebAssembly.Memory({ initial: 1, maximum: 3, shared: true });
+        envNonGSAB.enableResizableMemory(envNonGSAB.memory);
+        expect(envNonGSAB.usingResizableBuffer).to.be.false;
+
+        const oldDV = envNonGSAB.obtainZigView(64, 8);
+        oldDV[ZIG].align = 4;
+        oldDV.setUint32(0, 0x55667788, true);
+        const oldSAB = oldDV.buffer;
+
+        envNonGSAB.memory.grow(1);
+        expect(oldDV.buffer).to.equal(oldSAB);
+        expect(oldDV.buffer).to.not.equal(envNonGSAB.memory.buffer);
+
+        const restoredSABView = envNonGSAB.restoreView(oldDV);
+        expect(restoredSABView).to.not.equal(oldDV);
+        expect(restoredSABView.buffer).to.equal(envNonGSAB.memory.buffer);
+        expect(restoredSABView[ZIG].align).to.equal(4);
+        expect(restoredSABView.getUint32(0, true)).to.equal(0x55667788);
+
+        // WITH GSAB (usingResizableBuffer: true)
+        if (hasNativeRAB) {
+          const envGSAB = new Env();
+          envGSAB.memory = new WebAssembly.Memory({ initial: 1, maximum: 3, shared: true });
+          envGSAB.enableResizableMemory(envGSAB.memory);
+          expect(envGSAB.usingResizableBuffer).to.be.true;
+          expect(envGSAB.memory.buffer.growable).to.be.true;
+
+          const gsabDV = envGSAB.obtainZigView(64, 8);
+          gsabDV.setUint32(0, 0x99aabbcc, true);
+          envGSAB.memory.grow(1);
+          expect(gsabDV.buffer).to.equal(envGSAB.memory.buffer);
+          expect(envGSAB.restoreView(gsabDV)).to.equal(gsabDV);
+          expect(envGSAB.obtainZigView(64, 8)).to.equal(gsabDV);
+          expect(gsabDV.getUint32(0, true)).to.equal(0x99aabbcc);
+        }
+      })
     })
   }
 })

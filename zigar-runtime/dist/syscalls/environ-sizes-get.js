@@ -24,8 +24,8 @@ var environSizesGet = mixin({
     for (const array of env) {
       size += array.length;
     }    
-    this.copyUint32(environCountAddress, env.length);
-    this.copyUint32(environBufSizeAddress, size);
+    this.copyUsize(environCountAddress, env.length);
+    this.copyUsize(environBufSizeAddress, size);
     return 0;
   },
 });

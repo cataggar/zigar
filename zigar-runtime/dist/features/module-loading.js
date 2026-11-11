@@ -1,6 +1,6 @@
 import { PosixError } from '../constants.js';
 import { mixin } from '../environment.js';
-import { decodeText, empty, defineProperty, defineValue, isPromise } from '../utils.js';
+import { toBufferOffset, decodeText, empty, defineProperty, defineValue, isPromise, safeInt } from '../utils.js';
 
 const WA = WebAssembly;
 const ETIMEDOUT = PosixError.ETIMEDOUT ?? 73;
@@ -15,6 +15,35 @@ const PURE_SYNC_WASI_IMPORTS = new Set([
   'fd_prestat_get',
   'fd_prestat_dir_name',
 ]);
+
+const WASI64_BIGINT_ARGS = {
+  clock_time_get: 1 << 1,
+  fd_advise: (1 << 1) | (1 << 2),
+  fd_allocate: (1 << 1) | (1 << 2),
+  fd_fdstat_set_rights: (1 << 1) | (1 << 2),
+  fd_filestat_set_size: 1 << 1,
+  fd_filestat_set_times: (1 << 1) | (1 << 2),
+  fd_pread: 1 << 3,
+  fd_pwrite: 1 << 3,
+  fd_readdir: 1 << 3,
+  fd_seek: 1 << 1,
+  path_filestat_set_size: 1 << 4,
+  path_filestat_set_times: (1 << 4) | (1 << 5),
+  path_open: (1 << 5) | (1 << 6),
+};
+
+const WASM_IMPORT_SIGNATURES = {
+  runThunk: { argType: 'aaa', returnType: 'b' },
+  runVariadicThunk: { argType: 'aaaaz', returnType: 'b' },
+  createJsThunk: { argType: 'az', returnType: 'a' },
+  destroyJsThunk: { argType: 'aa', returnType: 'z' },
+  finalizeAsyncCall: { argType: 'ai' },
+};
+
+const WASM_EXPORT_SIGNATURES = {
+  handleJscall: { argType: 'zazb', returnType: 'i' },
+  releaseFunction: { argType: 'z' },
+};
 
 var moduleLoading = mixin({
   init() {
@@ -32,6 +61,8 @@ var moduleLoading = mixin({
       this.initialTableLength = 0;
       this.exportedFunctions = null;
       this.customWASI = null;
+      this.useResizableBuffer = true;
+      this.usingResizableBuffer = false;
       this.useJSPI = false;
       this.jspiMode = false;
       this.syncFuncSet = null;
@@ -58,10 +89,21 @@ var moduleLoading = mixin({
       initialize: { argType: '' },
     },
     exports: {
-      displayPanic: { argType: 'ii' },
-      futexWaitAsync: { argType: 'iii', returnType: 'i' },
+      displayPanic: { argType: 'az' },
+      futexWaitAsync: { argType: 'aii', returnType: 'i' },
     },
 
+    enableResizableMemory(memory) {
+      this.usingResizableBuffer = false;
+      if (this.useResizableBuffer !== false && typeof memory?.toResizableBuffer === 'function') {
+        try {
+          memory.toResizableBuffer();
+          this.usingResizableBuffer = true;
+        } catch {
+          this.usingResizableBuffer = false;
+        }
+      }
+    },
     getObjectIndex(object) {
       if (object != null) {
         let index = this.valueIndices.get(object);
@@ -78,7 +120,9 @@ var moduleLoading = mixin({
     fromWebAssembly(type, arg) {
       switch (type) {
         case 'v':
-        case 's': return this.valueMap.get(arg);
+        case 's': return this.valueMap.get(Number(arg));
+        case 'a': return this.memory64 ? BigInt.asUintN(64, BigInt(arg)) : (Number(arg) >>> 0);
+        case 'z': return (typeof arg === 'bigint') ? Number(BigInt.asUintN(64, arg)) : (Number(arg) >>> 0);
         case 'i': return arg;
         case 'b': return !!arg;
       }
@@ -86,7 +130,12 @@ var moduleLoading = mixin({
     toWebAssembly(type, arg) {
       switch (type) {
         case 'v':
-        case 's': return this.getObjectIndex(arg);
+        case 's': {
+          const idx = this.getObjectIndex(arg);
+          return this.memory64 ? BigInt(idx) : idx;
+        }
+        case 'a':
+        case 'z': return this.memory64 ? BigInt(arg ?? 0) : Number(arg ?? 0);
         case 'i': return arg;
         case 'b': return arg ? 1 : 0;
       }
@@ -120,7 +169,9 @@ var moduleLoading = mixin({
       const wrapper = (...args) => {
         const cont = this.activeContinuation;
         const spGlobal = this.stackPointerGlobal;
-        const savedSp = spGlobal ? spGlobal.value : 0;
+        const isSp64 = typeof spGlobal?.value === 'bigint';
+        const defaultSp = isSp64 ? BigInt(this.initialStackPointer) : this.initialStackPointer;
+        const savedSp = spGlobal ? spGlobal.value : defaultSp;
         if (cont && spGlobal) {
           cont.sp = savedSp;
         }
@@ -143,12 +194,12 @@ var moduleLoading = mixin({
             }
           }
           if (spGlobal) {
-            spGlobal.value = cont ? cont.parentSp : this.initialStackPointer;
+            spGlobal.value = cont ? cont.parentSp : defaultSp;
           }
           this.activeContinuation = cont ? cont.parentContinuation : null;
           if (cont) {
             cont.parentContinuation = null;
-            cont.parentSp = this.initialStackPointer;
+            cont.parentSp = defaultSp;
           }
           const resumeContinuation = () => {
             if (this.activeContinuation && this.activeContinuation !== cont && !this.activeContinuation.suspended) {
@@ -159,7 +210,7 @@ var moduleLoading = mixin({
                 cont.suspended = false;
                 this.suspendedContinuationCount--;
               }
-              cont.parentSp = spGlobal ? spGlobal.value : this.initialStackPointer;
+              cont.parentSp = spGlobal ? spGlobal.value : defaultSp;
               cont.parentContinuation = null;
               if (spGlobal) {
                 spGlobal.value = cont.sp;
@@ -193,15 +244,17 @@ var moduleLoading = mixin({
       if (!address) {
         throw new Error('Out of memory');
       }
-      if (this.memory && address + 4 <= this.memory.buffer.byteLength) {
-        const dv = new DataView(this.memory.buffer, address, 4);
+      const offset = toBufferOffset(address);
+      if (this.memory && offset + 4 <= this.memory.buffer.byteLength) {
+        const dv = new DataView(this.memory.buffer, offset, 4);
         dv.setUint32(0, 0xdeadbeef, true);
       }
       return { address, size };
     },
     freeContinuationStack(stack) {
-      if (this.memory && stack.address + 4 <= this.memory.buffer.byteLength) {
-        const dv = new DataView(this.memory.buffer, stack.address, 4);
+      const offset = toBufferOffset(stack.address);
+      if (this.memory && offset + 4 <= this.memory.buffer.byteLength) {
+        const dv = new DataView(this.memory.buffer, offset, 4);
         if (dv.getUint32(0, true) !== 0xdeadbeef) {
           this.freeScratchMemory?.(stack.address, stack.size, 16);
           throw new Error('Stack overflow');
@@ -218,17 +271,20 @@ var moduleLoading = mixin({
       if (!spGlobal && this.suspendedContinuationCount > 0) {
         throw new Error('Concurrent JSPI calls require __stack_pointer export');
       }
+      const isSp64 = typeof spGlobal?.value === 'bigint';
       const prevCont = this.activeContinuation;
       if (prevCont && spGlobal) {
         prevCont.sp = spGlobal.value;
       }
       const stack = (spGlobal && this.allocateScratchMemory) ? this.allocateContinuationStack() : null;
-      const stackTop = stack ? stack.address + stack.size : 0;
+      const stackTop = stack
+        ? (isSp64 ? BigInt(stack.address) + BigInt(stack.size) : Number(stack.address) + stack.size)
+        : (isSp64 ? 0n : 0);
       let finished = false;
       const cont = {
         stack,
         sp: stackTop,
-        parentSp: spGlobal ? spGlobal.value : 0,
+        parentSp: spGlobal ? spGlobal.value : (isSp64 ? 0n : 0),
         parentContinuation: prevCont,
         suspended: false,
         finish: null,
@@ -286,8 +342,11 @@ var moduleLoading = mixin({
     },
     exportFunctions() {
       const imports = {};
-      for (const [ name, { argType, returnType, alias } ] of Object.entries(this.exports)) {
-        const fn = this[alias ?? name];
+      for (const [ name, spec ] of Object.entries(this.exports)) {
+        const override = WASM_EXPORT_SIGNATURES[name];
+        const argType = override?.argType ?? spec.argType;
+        const returnType = override?.returnType ?? spec.returnType;
+        const fn = this[spec.alias ?? name];
         if (fn) {
           imports[`_${name}`] = this.exportFunction(fn, argType, returnType, name);
         }
@@ -295,17 +354,37 @@ var moduleLoading = mixin({
       return imports;
     },
     importFunctions(exports) {
-      if (!this.memory) {
+      if (!this.memory && exports.memory) {
         this.memory = exports.memory;
+        this.enableResizableMemory(this.memory);
+      }
+      if (!this.table && exports.__indirect_function_table) {
+        this.table = exports.__indirect_function_table;
+        if (!this.initialTableLength) {
+          this.initialTableLength = Number(this.table.length);
+        }
+        if (this.options?.table64 === undefined && typeof this.table.length === 'bigint') {
+          this.table64 = true;
+        }
+      }
+      if (this.options?.memory64 === undefined && !this.memory64 && typeof exports.__stack_pointer?.value === 'bigint') {
+        this.memory64 = true;
       }
       if (exports.__stack_pointer) {
         this.stackPointerGlobal = exports.__stack_pointer;
         this.initialStackPointer = exports.__stack_pointer.value;
-        if (!this.options?.continuationStackSize && this.initialStackPointer > 0) {
-          this.continuationStackSize = (this.initialStackPointer + 15) & -16;
+        const spNum = Number(this.initialStackPointer);
+        if (!this.options?.continuationStackSize && spNum > 0) {
+          this.continuationStackSize = (spNum + 15) & -16;
         }
       }
-      for (const [ name, { argType, returnType } ] of Object.entries(this.imports)) {
+      const freeScratch = exports.freeScratchMemory
+        ? this.importFunction(exports.freeScratchMemory, 'azi')
+        : null;
+      for (const [ name, spec ] of Object.entries(this.imports)) {
+        const override = WASM_IMPORT_SIGNATURES[name];
+        const argType = override?.argType ?? spec.argType;
+        const returnType = override?.returnType ?? spec.returnType;
         let fn = exports[name];
         if (fn) {
           if (this.useJSPI && (name === 'runThunk' || name === 'runVariadicThunk') && typeof WA.promising === 'function') {
@@ -324,24 +403,35 @@ var moduleLoading = mixin({
         }
         this.pendingFutexTimers.clear();
         for (const { address, size } of this.continuationStackPool) {
-          exports.freeScratchMemory?.(address, size, 16);
+          freeScratch?.(address, size, 16);
         }
         this.continuationStackPool.length = 0;
         this.activeContinuation = null;
         this.suspendedContinuationCount = 0;
       });
     },
-    async instantiateWebAssembly(source, options) {
+    async instantiateWebAssembly(source, options = {}) {
       const {
         memoryInitial,
         memoryMax,
         tableInitial,
         multithreaded,
+        memory64,
+        table64,
+        useResizableBuffer = true,
         useJSPI = false,
         continuationStackSize,
         syncFunctions,
         syncTableIndices,
       } = this.options = options;
+      this.useResizableBuffer = useResizableBuffer;
+      this.usingResizableBuffer = false;
+      if (memory64 !== undefined) {
+        this.memory64 = Boolean(memory64);
+        this.table64 = Boolean(table64 ?? memory64);
+      } else if (table64 !== undefined) {
+        this.table64 = Boolean(table64);
+      }
       const jspiSupported = typeof WA.Suspending === 'function' && typeof WA.promising === 'function';
       this.useJSPI = Boolean(useJSPI && jspiSupported);
       this.jspiMode = !this.useJSPI
@@ -358,6 +448,17 @@ var moduleLoading = mixin({
         this.continuationStackSize = (continuationStackSize + 15) & -16;
       }
       const res = await source;
+      if (memory64 === undefined) {
+        const detected = detectWasm64(res);
+        if (detected) {
+          if (detected.memory64) {
+            this.memory64 = true;
+          }
+          if (table64 === undefined && detected.table64) {
+            this.table64 = true;
+          }
+        }
+      }
       const suffix = (res[Symbol.toStringTag] === 'Response') ? 'Streaming' : '';
       const f = WA['compile' + suffix];
       const executable = this.executable = await f(res);
@@ -380,14 +481,25 @@ var moduleLoading = mixin({
       }
       debugger;
       if (memoryInitial) {
-        this.memory = env.memory = new WA.Memory({
+        this.memory = env.memory = new WA.Memory(this.memory64 ? {
+          initial: BigInt(memoryInitial),
+          ...(memoryMax !== undefined ? { maximum: BigInt(memoryMax) } : undefined),
+          shared: multithreaded,
+          address: 'i64',
+        } : {
           initial: memoryInitial,
           maximum: memoryMax,
           shared: multithreaded,
         });
+        this.enableResizableMemory(this.memory);
       }
       if (tableInitial) {
-        this.table = env.__indirect_function_table = new WA.Table({
+        this.table = env.__indirect_function_table = new WA.Table(this.table64 ? {
+          initial: BigInt(tableInitial),
+          element: 'anyfunc',
+          shared: multithreaded,
+          address: 'i64',
+        } : {
           initial: tableInitial,
           element: 'anyfunc',
           shared: multithreaded,
@@ -409,10 +521,14 @@ var moduleLoading = mixin({
       const method = this[nameCamelized];
       const handler = method?.bind?.(this);
       const eventName = this[nameCamelized + 'Event'];
-      const fn = (...args) => {
-        const callArgs = (this.activeContinuation && method && args.length < method.length)
-        ? [ ...args, true ]
-        : args;
+      const bigIntMask = WASI64_BIGINT_ARGS[name] ?? 0;
+      const fn = (...rawArgs) => {
+        const handlerArgs = this.memory64
+          ? normalizeWASI64Args(rawArgs, bigIntMask)
+          : rawArgs;
+        const callArgs = (this.activeContinuation && method && handlerArgs.length < method.length)
+        ? [ ...handlerArgs, true ]
+        : handlerArgs;
         const result = handler?.(...callArgs) ?? PosixError.ENOTSUP;
         const onResult = (result) => {
           if (result === PosixError.ENOTSUP || result === PosixError.ENOTCAPABLE) {
@@ -421,7 +537,7 @@ var moduleLoading = mixin({
             if (result === PosixError.ENOTSUP) {
               const custom = this.customWASI?.wasiImport?.[name];
               if (custom) {
-                return custom(...args);
+                return custom(...rawArgs);
               }
             }
             // if we can't fallback onto a custom handler, explain the failure
@@ -485,7 +601,7 @@ var moduleLoading = mixin({
       }
     },
     displayPanic(address, len) {
-      const array = new Uint8Array(this.memory.buffer, address, len);
+      const array = new Uint8Array(this.memory.buffer, toBufferOffset(address), Number(len));
       const msg = decodeText(array);
       console.error(`Zig panic: ${msg}`);
     },
@@ -494,4 +610,116 @@ var moduleLoading = mixin({
 
 const throwError = () => { throw new Error(`Module was abandoned`) };
 
-export { PURE_SYNC_WASI_IMPORTS, moduleLoading as default };
+function normalizeWASI64Args(args, bigIntMask) {
+  return args.map((arg, index) => {
+    if (typeof arg !== 'bigint' || (bigIntMask & (1 << index))) {
+      return arg;
+    }
+    const u = BigInt.asUintN(64, arg);
+    if (u === 0xaaaa_aaaa_aaaa_aaaan) {
+      return 0xaaaa_aaaa;
+    }
+    if (u === 0xffff_ffff_ffff_ffffn) {
+      return -1;
+    }
+    return safeInt(u);
+  });
+}
+
+function detectWasm64(source) {
+  let bytes;
+  if (source instanceof ArrayBuffer) {
+    bytes = new Uint8Array(source);
+  } else if (ArrayBuffer.isView(source)) {
+    bytes = new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+  } else {
+    return null;
+  }
+  if (bytes.length < 8 || bytes[0] !== 0x00 || bytes[1] !== 0x61 || bytes[2] !== 0x73 || bytes[3] !== 0x6d) {
+    return null;
+  }
+  let pos = 8;
+  const readUleb = () => {
+    let result = 0, shift = 0;
+    while (pos < bytes.length) {
+      const byte = bytes[pos++];
+      result |= (byte & 0x7f) << shift;
+      if ((byte & 0x80) === 0) return result >>> 0;
+      shift += 7;
+    }
+    return result >>> 0;
+  };
+  const skipLeb = () => {
+    while (pos < bytes.length && (bytes[pos++] & 0x80) !== 0) {}
+  };
+  let memory64 = false;
+  let table64 = false;
+  try {
+    while (pos < bytes.length) {
+      const sectionId = bytes[pos++];
+      const sectionSize = readUleb();
+      const sectionEnd = pos + sectionSize;
+      if (sectionEnd > bytes.length) break;
+      if (sectionId === 2) {
+        const count = readUleb();
+        for (let i = 0; i < count && pos < sectionEnd; i++) {
+          const modLen = readUleb();
+          pos += modLen;
+          const nameLen = readUleb();
+          pos += nameLen;
+          const kind = bytes[pos++];
+          if (kind === 0) {
+            skipLeb();
+          } else if (kind === 1) {
+            const rt = bytes[pos++];
+            if (rt === 0x63 || rt === 0x64) skipLeb();
+            const flags = readUleb();
+            if (flags & 0x04) table64 = true;
+            skipLeb();
+            if (flags & 0x01) skipLeb();
+          } else if (kind === 2) {
+            const flags = readUleb();
+            if (flags & 0x04) memory64 = true;
+            skipLeb();
+            if (flags & 0x01) skipLeb();
+          } else if (kind === 3) {
+            const vt = bytes[pos++];
+            if (vt === 0x63 || vt === 0x64) skipLeb();
+            pos += 1;
+          } else if (kind === 4) {
+            pos += 1;
+            skipLeb();
+          } else {
+            break;
+          }
+        }
+      } else if (sectionId === 4) {
+        const count = readUleb();
+        if (count > 0 && pos < sectionEnd) {
+          const b0 = bytes[pos++];
+          if (b0 === 0x40) {
+            pos += 1;
+            const rt = bytes[pos++];
+            if (rt === 0x63 || rt === 0x64) skipLeb();
+          } else if (b0 === 0x63 || b0 === 0x64) {
+            skipLeb();
+          }
+          const flags = readUleb();
+          if (flags & 0x04) table64 = true;
+        }
+      } else if (sectionId === 5) {
+        const count = readUleb();
+        if (count > 0 && pos < sectionEnd) {
+          const flags = readUleb();
+          if (flags & 0x04) memory64 = true;
+        }
+      }
+      if (sectionId >= 5) break;
+      pos = sectionEnd;
+    }
+  } catch {
+  }
+  return { memory64, table64 };
+}
+
+export { PURE_SYNC_WASI_IMPORTS, WASI64_BIGINT_ARGS, moduleLoading as default };

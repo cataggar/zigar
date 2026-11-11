@@ -163,5 +163,26 @@ describe('Syscall: path-symlink', function() {
       const result2 = f(pathAddress, pathLen, PosixDescriptor.root, newPathAddress, newPathLen);
       expect(result2).to.equal(PosixError.ENOENT);
     })
+    it('should accept BigInt target/path pointers and lengths when memory64 is enabled', async function() {
+      const env = new Env();
+      env.memory = new WebAssembly.Memory({ initial: 1n, address: 'i64' });
+      env.memory64 = true;
+      let event;
+      env.addListener('symlink', (evt) => {
+        event = evt;
+        return true;
+      });
+      const target = new TextEncoder().encode('/hello.txt');
+      const linkPath = new TextEncoder().encode('/world.txt');
+      new Uint8Array(env.memory.buffer, 0x1000, target.length).set(target);
+      new Uint8Array(env.memory.buffer, 0x2000, linkPath.length).set(linkPath);
+      const result = env.pathSymlink(0x1000n, BigInt(target.length), PosixDescriptor.root, 0x2000n, BigInt(linkPath.length));
+      expect(result).to.equal(0);
+      expect(event).to.eql({
+        parent: null,
+        path: 'world.txt',
+        target: '/hello.txt',
+      });
+    })
   }
 })

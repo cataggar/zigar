@@ -1,6 +1,6 @@
 import { mixin } from '../environment.js';
 import { MEMORY, ZIG } from '../symbols.js';
-import { copyView } from '../utils.js';
+import { copyView, toBufferOffset } from '../utils.js';
 
 export default mixin({
   ...(process.env.TARGET === 'wasm' ? {
@@ -12,8 +12,8 @@ export default mixin({
           value(shadowDV) {
             const dv = this[MEMORY];
             const { address } = shadowDV[ZIG];
-            const src = new DataView(thisEnv.memory.buffer, address + offset, byteSize);
-            const dest = new DataView(dv.buffer, dv.byteOffset + offset, byteSize);
+            const src = new DataView(thisEnv.memory.buffer, toBufferOffset(address) + offset, Number(byteSize));
+            const dest = new DataView(dv.buffer, dv.byteOffset + offset, Number(byteSize));
             copyView(dest, src);
           }
         };

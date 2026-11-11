@@ -1372,7 +1372,7 @@ pub fn pthread_spin_lock(
     lock: [*c]volatile pthread_spinlock_t,
 ) callconv(.c) c_int {
     const thread_id = pthread_self();
-    const lock_value: pthread_spinlock_t = @bitCast(thread_id);
+    const lock_value: pthread_spinlock_t = @bitCast(@as(u32, @truncate(thread_id)));
     while (true) {
         if (@cmpxchgWeak(pthread_spinlock_t, lock, 0, lock_value, .acq_rel, .monotonic) == null) {
             break;
@@ -1385,7 +1385,7 @@ pub fn pthread_spin_trylock(
     lock: [*c]volatile pthread_spinlock_t,
 ) callconv(.c) c_int {
     const thread_id = pthread_self();
-    const lock_value: pthread_spinlock_t = @bitCast(thread_id);
+    const lock_value: pthread_spinlock_t = @bitCast(@as(u32, @truncate(thread_id)));
     if (@cmpxchgWeak(pthread_spinlock_t, lock, 0, lock_value, .acq_rel, .monotonic) != null) {
         return errno(.BUSY);
     }
@@ -1396,7 +1396,7 @@ pub fn pthread_spin_unlock(
     lock: [*c]volatile pthread_spinlock_t,
 ) callconv(.c) c_int {
     const thread_id = pthread_self();
-    const lock_value: pthread_spinlock_t = @bitCast(thread_id);
+    const lock_value: pthread_spinlock_t = @bitCast(@as(u32, @truncate(thread_id)));
     if (@cmpxchgStrong(pthread_spinlock_t, lock, lock_value, 0, .acq_rel, .monotonic) != null) {
         return errno(.PERM);
     }

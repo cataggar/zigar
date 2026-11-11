@@ -4,13 +4,12 @@ import { TypeMismatch } from '../errors.js';
 import {
   FINALIZE, GENERATOR, MEMORY, RESET, RETURN, THROWING, TRANSFORM, YIELD
 } from '../symbols.js';
-import { usize } from '../utils.js';
 
 export default mixin({
   init() {
     this.generatorCallbackMap = new Map();
     this.generatorContextMap = new Map();
-    this.nextGeneratorContextId = usize(0x2000);
+    this.nextGeneratorContextId = 0x2000;
   },
   createGenerator(structure, args, func) {
     const { constructor, instance: { members } } = structure;
@@ -23,7 +22,8 @@ export default mixin({
       func = generator.push.bind(generator);
     }
     // create a handle referencing the function 
-    const contextId = this.nextGeneratorContextId++;
+    const id = this.nextGeneratorContextId++;
+    const contextId = (this.memory64 || process.env.BITS == 64) ? BigInt(id) : id;
     const ptr = this.obtainZigView(contextId, 0, false);
     this.generatorContextMap.set(contextId, { func, args });
     // use the same callback for all generators of a given type

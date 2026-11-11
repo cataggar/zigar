@@ -171,6 +171,26 @@ describe('Syscall: fd-read', function() {
       const read = readDV.getUint32(0, le);
       expect(read).to.equal(array.length);
     })
+    it('should support 16-byte iovec_t, BigInt inputs, and 8-byte read usize when memory64 is enabled', async function() {
+      const env = new Env();
+      env.memory = new WebAssembly.Memory({ initial: 1n, address: 'i64' });
+      env.memory64 = true;
+      const raw = new DataView(env.memory.buffer);
+      const le = env.littleEndian;
+      const array = new TextEncoder().encode('Hello world');
+      const reader = env.convertReader(array);
+      const fd = env.createStreamHandle(reader, env.getDefaultRights('file'), 0);
+      raw.setBigUint64(0x1000, 0x2000n, le);
+      raw.setBigUint64(0x1008, 5n, le);
+      raw.setBigUint64(0x1010, 0x2100n, le);
+      raw.setBigUint64(0x1018, 16n, le);
+      raw.setUint32(0x3004, 0xaaaa_aaaa, le);
+      const result = env.fdRead(fd, 0x1000n, 2n, 0x3000n);
+      expect(result).to.equal(PosixError.NONE);
+      expect(raw.getBigUint64(0x3000, le)).to.equal(BigInt(array.length));
+      expect(new TextDecoder().decode(new Uint8Array(env.memory.buffer, 0x2000, 5))).to.equal('Hello');
+      expect(new TextDecoder().decode(new Uint8Array(env.memory.buffer, 0x2100, 6))).to.equal(' world');
+    })
   }
   if (process.env.TARGET === 'node') {
     it('should read data from Uint8Array using a different function', async function() {

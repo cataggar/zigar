@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 
 import { MemberType, StructureType } from '../../zigar-runtime/src/constants.js';
-import { SLOTS } from '../../zigar-runtime/src/symbols.js';
+import { MEMORY, SLOTS } from '../../zigar-runtime/src/symbols.js';
 import { generateCode } from '../src/code-generation.js';
 
 describe('Code generation', function() {
@@ -274,6 +274,33 @@ describe('Code generation', function() {
       expect(code).to.contain('process.env.');
       expect(code).to.contain('ADDON_PATH');
       expect(code).to.contain('/tmp/somewhere');
+    })
+    it('should emit BigInt handle literals with trailing n suffix and memory64 settings', function() {
+      const dv64 = new DataView(new ArrayBuffer(8));
+      dv64.handle = 0x1_0000_1040n;
+      const dv32 = new DataView(new ArrayBuffer(4));
+      dv32.handle = 0x1040;
+      const structure = {
+        constructor: null,
+        type: StructureType.Struct,
+        name: 'Root64',
+        byteSize: 0,
+        instance: { members: [], template: { [MEMORY]: dv32 } },
+        static: { members: [], template: { [MEMORY]: dv64 } },
+      };
+      const def64 = { structures: [ structure ], settings: { ...settings, memory64: true } };
+      const moduleOptions = { memory64: true, table64: true, tableInitial: 128, multithreaded: false };
+      const { code: code64 } = generateCode(def64, { ...params, moduleOptions });
+      expect(code64).to.contain(`handle: ${0x1_0000_1040n}n,`);
+      expect(code64).to.contain(`handle: ${0x1040},`);
+      expect(code64).to.contain('memory64: true,');
+      expect(code64).to.contain('"memory64":true');
+      expect(code64).to.contain('"table64":true');
+
+      // Default wasm32 omits memory64 from settings
+      const def32 = { structures: [ structure ], settings: { ...settings, memory64: false } };
+      const { code: code32 } = generateCode(def32, { ...params, moduleOptions: { multithreaded: false } });
+      expect(code32).to.not.contain('memory64:');
     })
   })
 })

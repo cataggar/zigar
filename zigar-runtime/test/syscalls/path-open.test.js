@@ -279,5 +279,19 @@ describe('Syscall: path-open', function() {
         flags: { exclusive: true }
       });
     })
+    it('should accept BigInt path/len and keep 4-byte fd_t output when memory64 is enabled', async function() {
+      const env = new Env();
+      env.memory = new WebAssembly.Memory({ initial: 1n, address: 'i64' });
+      env.memory64 = true;
+      env.addListener('open', () => new Uint8Array(32));
+      const path = new TextEncoder().encode('/hello.txt');
+      new Uint8Array(env.memory.buffer, 0x1000, path.length).set(path);
+      const raw = new DataView(env.memory.buffer);
+      raw.setUint32(0x2004, 0xaaaa_aaaa, env.littleEndian);
+      const result = env.pathOpen(PosixDescriptor.root, 0, 0x1000n, BigInt(path.length), PosixOpenFlag.exclusive, PosixDescriptorRight.fd_read, 0n, 0, 0x2000n);
+      expect(result).to.equal(0);
+      expect(raw.getUint32(0x2000, env.littleEndian)).to.not.equal(0);
+      expect(raw.getUint32(0x2004, env.littleEndian)).to.equal(0xaaaa_aaaa);
+    })
   }
 })

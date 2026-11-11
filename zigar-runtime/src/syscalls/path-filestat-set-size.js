@@ -6,7 +6,7 @@ import { safeInt } from '../utils.js';
 export default mixin({
   pathFilestatSetSize(dirFd, pathAddress, pathLen, newSize, canWait) {
     return catchPosixError(canWait, PosixError.EPERM, () => {
-      const loc = this.obtainStreamLocation(dirFd, pathAddress, pathLen);
+      const loc = this.obtainStreamLocation(dirFd, pathAddress, Number(pathLen));
       const rights = { write: true };
       const flags = {
         exclusive: true,

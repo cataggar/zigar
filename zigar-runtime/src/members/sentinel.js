@@ -2,7 +2,7 @@ import { MemberFlag } from '../constants.js';
 import { mixin } from '../environment.js';
 import { MisplacedSentinel, MissingSentinel } from '../errors.js';
 import { MEMORY, RESTORE } from '../symbols.js';
-import { defineValue } from '../utils.js';
+import { defineValue, toBufferOffset } from '../utils.js';
 
 export default mixin({
   defineSentinel(structure) {
@@ -68,9 +68,10 @@ export default mixin({
   ...(process.env.TARGET === 'wasm' ? {
     findSentinel(address, bytes) {
       const { memory } = this;
+      const start = toBufferOffset(address);
       const len = bytes.byteLength;
       const end = memory.buffer.byteLength - len + 1;
-      for (let i = address; i < end; i += len) {
+      for (let i = start; i < end; i += len) {
         const dv = new DataView(memory.buffer, i, len);
         let match = true;
         for (let j = 0; j < len; j++) {
@@ -82,7 +83,7 @@ export default mixin({
           }
         }
         if (match) {
-          return (i - address) / len;
+          return (i - start) / len;
         }
       }
     },

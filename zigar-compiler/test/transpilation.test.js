@@ -288,6 +288,127 @@ describe('Transpilation', function() {
         rmSync(outDir, { recursive: true, force: true });
       }
     })
+    it('should transpile and execute wasm64 (memory64) modules across single-threaded RAB, table64 callbacks, multithreaded WorkQueue, and JSPI', async function() {
+      const __dirname = dirname(fileURLToPath(import.meta.url));
+      const runtimeDistDir = resolve(__dirname, '../../zigar-runtime/dist');
+      const tmpBase = process.env.TMPDIR || resolve(__dirname, '../../.cache/tmp');
+      const outDir = join(tmpBase, `transpile-wasm64-rab-${process.pid}`);
+      const srcDir = join(outDir, 'src');
+      mkdirSync(srcDir, { recursive: true });
+      let mod64, mt64, jspi64;
+      try {
+        const rewriteRuntimeImports = (code) => code
+          .replace(
+            /from\s+["']zigar-runtime["']/g,
+            `from ${JSON.stringify(pathToFileURL(join(runtimeDistDir, 'index.js')).href)}`,
+          )
+          .replace(
+            /import\s+["']zigar-runtime\/([^"']+)["']/g,
+            (_, subPath) => `import ${JSON.stringify(pathToFileURL(join(runtimeDistDir, subPath)).href)}`,
+          );
+
+        const loadWasm64 = async (zigPath, opts, tag) => {
+          const { code } = await transpile(zigPath, {
+            optimize: 'ReleaseSmall',
+            embedWASM: true,
+            stripWASM: true,
+            nodeCompat: true,
+            useWazig: true,
+            memory64: true,
+            buildDir: join(outDir, `build-${tag}`),
+            ...opts,
+          });
+          const mjsPath = join(outDir, `${tag}-${Date.now()}.mjs`);
+          await writeFile(mjsPath, rewriteRuntimeImports(code), 'utf8');
+          return import(pathToFileURL(mjsPath).href);
+        };
+
+        // 1. Single-threaded wasm64 + memory.grow() + table64 callbacks + WASI
+        const sample64Path = join(srcDir, 'wasm64_sample.zig');
+        await writeFile(sample64Path, [
+          'const std = @import("std");',
+          'pub const Pair = extern struct { a: usize, addr: u64 };',
+          'pub var global_pair: Pair = .{ .a = 7, .addr = 0x1234_5678_9abc_def0 };',
+          'pub fn getGlobalPairPtr() *Pair {',
+          '    return &global_pair;',
+          '}',
+          'pub fn makePair(x: usize) Pair {',
+          '    return .{ .a = x + 1, .addr = @intFromPtr(&global_pair) };',
+          '}',
+          'pub fn growAndSum(allocator: std.mem.Allocator, count: usize) !usize {',
+          '    const slice = try allocator.alloc(usize, count);',
+          '    defer allocator.free(slice);',
+          '    for (slice, 0..) |*item, i| item.* = i + 1;',
+          '    var total: usize = 0;',
+          '    for (slice) |item| total += item;',
+          '    return total;',
+          '}',
+          'pub fn invokeCallback(cb: *const fn (usize) usize, x: usize) usize {',
+          '    return cb(x) + 10;',
+          '}',
+        ].join('\n'), 'utf8');
+
+        mod64 = await loadWasm64(sample64Path, {}, 'single');
+        expect(mod64.default.global_pair.addr).to.equal(0x123456789abcdef0n);
+        const wasmViewBefore = mod64.getGlobalPairPtr()['*'].dataView;
+        const pairBefore = mod64.makePair(41);
+        expect(pairBefore.a).to.equal(42);
+        expect(typeof pairBefore.addr).to.equal('bigint');
+        expect(pairBefore.addr > 0n).to.be.true;
+
+        // Allocate > 4 MiB in wasm64 to trigger memory.grow()
+        const sum = mod64.growAndSum(600_000);
+        expect(sum).to.equal((600_000 * 600_001) / 2);
+        mod64.default.global_pair.addr = 0xfeed_face_cafe_beefn;
+        expect(mod64.default.global_pair.addr).to.equal(0xfeed_face_cafe_beefn);
+        if (typeof WebAssembly.Memory.prototype.toResizableBuffer === 'function') {
+          expect(wasmViewBefore.buffer.resizable).to.be.true;
+          expect(wasmViewBefore.buffer.detached).to.be.false;
+          expect(wasmViewBefore.getBigUint64(8, true)).to.equal(0xfeed_face_cafe_beefn);
+        }
+        expect(mod64.invokeCallback((v) => v * 3, 7)).to.equal(31);
+
+        // 2. Multithreaded wasm64 WorkQueue + shared memory64 / GSAB
+        const workQueuePath = fileURLToPath(new URL('./integration/thread-handling/use-work-queue.zig', import.meta.url));
+        mt64 = await loadWasm64(workQueuePath, { multithreaded: true }, 'mt');
+        await mt64.startup(2);
+        expect(await mt64.returnString()).to.equal('Hello world!');
+        await mt64.shutdown();
+        mt64 = null;
+
+        // 3. wasm64 + selective JSPI (sync fast-path + i64 __stack_pointer shadow stacks)
+        if (typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function') {
+          const servicePath = fileURLToPath(new URL('./zig-samples/wit-zigar/service.zig', import.meta.url));
+          jspi64 = await loadWasm64(servicePath, { useJSPI: true, continuationStackSize: 8192 }, 'jspi');
+          const syncMagic = jspi64.getZigarAbiMagic();
+          expect(syncMagic).to.not.be.an.instanceOf(Promise);
+          expect(syncMagic).to.equal(0x5241475a);
+
+          const hostCb = async (seq, delayMs) => {
+            await new Promise(r => setTimeout(r, delayMs));
+            return ((seq & 0xff) << 16) | (seq * 5);
+          };
+          const fibers = Array.from({ length: 4 }, (_, i) =>
+            jspi64.asyncComputeWithHost(
+              { origin: { x: i, y: i }, size: { x: 4, y: 5 } },
+              5,
+              hostCb,
+            )
+          );
+          for (const p of fibers) {
+            expect(p).to.be.an.instanceOf(Promise);
+          }
+          const results = await Promise.all(fibers);
+          expect(results).to.have.lengthOf(4);
+          expect(new Set(results.map(r => r.sp_before)).size).to.equal(4);
+        }
+      } finally {
+        await mod64?.__zigar?.abandon();
+        await mt64?.shutdown?.();
+        await jspi64?.__zigar?.abandon();
+        rmSync(outDir, { recursive: true, force: true });
+      }
+    })
 
   })
 })

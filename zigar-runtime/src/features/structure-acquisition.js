@@ -54,7 +54,7 @@ import pathUnlinkFile from '../syscalls/path-unlink-file.js';
 import pollOneoff from '../syscalls/poll-oneoff.js';
 import procExit from '../syscalls/proc-exit.js';
 import randomGet from '../syscalls/random-get.js';
-import { adjustAddress, decodeText, findObjects } from '../utils.js';
+import { adjustAddress, decodeText, findObjects, toBufferOffset } from '../utils.js';
 import baseline from './baseline.js';
 import objectLinkage from './object-linkage.js';
 import streamLocation from './stream-location.js';
@@ -80,6 +80,7 @@ export default mixin({
     this.hasDeferred = false;
   },
   createView(address, len, copy, handle) {
+    len = Number(len);
     if (copy) {
       // copy content into JavaScript memory
       const dv = this.allocateJSMemory(len, 0);
@@ -91,7 +92,7 @@ export default mixin({
       // link into Zig memory
       const dv = this.obtainZigView(address, len);
       if (process.env.TARGET === 'wasm') {
-        dv[ZIG].handle = address;
+        dv[ZIG].handle = (this.memory64 || process.env.BITS == 64) ? BigInt(address) : Number(address);
       } else {
         dv[ZIG].handle = handle;
       }
@@ -193,10 +194,14 @@ export default mixin({
   exportStructures() {
     this.prepareObjectsForExport();
     const { structures, runtimeSafety, littleEndian, ioRedirection, libc } = this;
-    return {
-      structures,
-      settings: { runtimeSafety, littleEndian, ioRedirection, libc },
-    };
+    const settings = { runtimeSafety, littleEndian, ioRedirection, libc };
+    if (process.env.TARGET === 'wasm' && this.memory64) {
+      settings.memory64 = true;
+      if (this.table64) {
+        settings.table64 = true;
+      }
+    }
+    return { structures, settings };
   },
   prepareObjectsForExport() {
     const list = [];
@@ -497,8 +502,8 @@ export default mixin({
       createBool: { argType: 'b', returnType: 'v' },
       createInteger: { argType: 'ib', returnType: 'v' },
       createBigInteger: { argType: 'ib', returnType: 'v' },
-      createString: { argType: 'ii', returnType: 'v' },
-      createView: { argType: 'iib', returnType: 'v' },
+      createString: { argType: 'az', returnType: 'v' },
+      createView: { argType: 'azb', returnType: 'v' },
       createInstance: { argType: 'vvv', returnType: 'v' },
       createTemplate: { argType: 'vv', returnType: 'v' },
       createList: { argType: '', returnType: 'v' },
@@ -513,7 +518,7 @@ export default mixin({
       enableCallback: { argType: 'vvv' },
     },
     imports: {
-      getFactoryThunk: { argType: '', returnType: 'i' },
+      getFactoryThunk: { argType: '', returnType: 'a' },
       getModuleAttributes: { argType: '', returnType: 'i' },
     },
     createBool(initializer) {
@@ -533,7 +538,7 @@ export default mixin({
     },
     createString(address, len) {
       const { buffer } = this.memory;
-      const ta = new Uint8Array(buffer, address, len);
+      const ta = new Uint8Array(buffer, toBufferOffset(address), Number(len));
       return decodeText(ta);
     },
     createList() {

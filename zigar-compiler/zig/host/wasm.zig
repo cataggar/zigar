@@ -77,12 +77,12 @@ pub fn setProperty(object: Value, key: []const u8, value: Value) !void {
 }
 
 pub fn getSlotValue(object: Value, slot: usize) !Value {
-    const keyValue = _createInteger(@bitCast(slot), true);
+    const keyValue = _createInteger(@bitCast(@as(u32, @intCast(slot))), true);
     return _getProperty(object, keyValue) orelse error.UnableToGetSlotValue;
 }
 
 pub fn setSlotValue(object: Value, slot: usize, value: ?Value) !void {
-    const keyValue = _createInteger(@bitCast(slot), true);
+    const keyValue = _createInteger(@bitCast(@as(u32, @intCast(slot))), true);
     return _setProperty(object, keyValue, value);
 }
 

@@ -51,7 +51,7 @@ export function generateCode(definition, params) {
     add(`import '${runtimeURL}/${mixinPath}';`);
   }
   // write out the structures as object literals
-  addStructureDefinitions(lines, definition);
+  addStructureDefinitions(lines, definition, moduleOptions);
   if (Object.keys(envVariables).length > 0) {
     add(`\n// set environment variables`);
     for (const [ name, value ] of Object.entries(envVariables)) {
@@ -128,7 +128,7 @@ export function generateCode(definition, params) {
   return { code, exports, structures };
 }
 
-function addStructureDefinitions(lines, definition) {
+function addStructureDefinitions(lines, definition, moduleOptions) {
   const { structures, settings } = definition;
   const add = manageIndentation(lines);
   const defaultStructure = {
@@ -285,7 +285,7 @@ function addStructureDefinitions(lines, definition) {
         add(`memory: { ${pairs.join(', ')} },`);
         const { handle } = dv;
         if (handle !== undefined) {
-          add(`handle: ${handle},`);
+          add(`handle: ${typeof handle === 'bigint' ? `${handle}n` : handle},`);
         }
       }
       if (slots) {
@@ -368,8 +368,12 @@ function addStructureDefinitions(lines, definition) {
   add(`];`)
   const root = structures[structures.length - 1];
   add(`const root = ${structureNames.get(root)};`);
+  const effectiveSettings = (moduleOptions?.memory64 && !settings.memory64)
+    ? { ...settings, memory64: true }
+    : settings;
   add(`const settings = {`);
-  for (const [ name, value ] of Object.entries(settings)) {
+  for (const [ name, value ] of Object.entries(effectiveSettings)) {
+    if (name === 'memory64' && !value) continue;
     add(`${name}: ${value},`);
   }
   add(`};`);

@@ -21,6 +21,8 @@ export async function transpile(srcPath, options) {
     keepNames = false,
     useJSPI = false,
     continuationStackSize,
+    memory64 = false,
+    useResizableBuffer,
     moduleResolver = (name) => name,
     wasmLoader,
     ...compileOptions
@@ -30,11 +32,22 @@ export async function transpile(srcPath, options) {
       throw new Error(`wasmLoader is a required option when embedWASM is false`);
     }
   }
-  Object.assign(compileOptions, { arch: 'wasm32', platform: 'wasi', isWASM: true });
+  Object.assign(compileOptions, {
+    arch: memory64 ? 'wasm64' : 'wasm32',
+    platform: 'wasi',
+    isWASM: true,
+    memory64,
+    useResizableBuffer,
+  });
   const { outputPath, sourcePaths } = await compile(srcPath, null, compileOptions);
   const content = await readFile(outputPath);
   const rawDV = new DataView(content.buffer, content.byteOffset, content.byteLength);
-  const { memoryMax, memoryInitial, tableInitial } = extractLimits(rawDV);
+  const limits = extractLimits(rawDV);
+  const isMemory64 = Boolean(memory64 || limits.memory64);
+  const isTable64 = Boolean(limits.table64);
+  const memoryMax = (limits.memoryMax !== undefined) ? Number(limits.memoryMax) : undefined;
+  const memoryInitial = (limits.memoryInitial !== undefined) ? Number(limits.memoryInitial) : undefined;
+  const tableInitial = (limits.tableInitial !== undefined) ? Number(limits.tableInitial) : undefined;
   const { multithreaded = false } = compileOptions;
   const moduleOptions = {
     memoryMax,
@@ -42,6 +55,15 @@ export async function transpile(srcPath, options) {
     tableInitial,
     multithreaded,
   };
+  if (isMemory64) {
+    moduleOptions.memory64 = true;
+  }
+  if (isTable64) {
+    moduleOptions.table64 = true;
+  }
+  if (useResizableBuffer === false) {
+    moduleOptions.useResizableBuffer = false;
+  }
   if (useJSPI) {
     moduleOptions.useJSPI = useJSPI;
   }
@@ -54,6 +76,11 @@ export async function transpile(srcPath, options) {
   await env.initPromise;
   env.acquireStructures();
   const definition = env.exportStructures();
+  if (isMemory64) {
+    definition.settings = { ...definition.settings, memory64: true };
+  } else if (definition.settings && !definition.settings.memory64) {
+    delete definition.settings.memory64;
+  }
   const usage = {};
   for (const [ name, mixin ] of Object.entries(mixins)) {
     if (env.mixinUsage.get(mixin) && name !== 'FeatureStructureAcquisition') {

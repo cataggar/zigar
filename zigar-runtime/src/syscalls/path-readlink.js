@@ -8,15 +8,15 @@ export default mixin({
   pathReadlinkEvent: 'readlink',
   pathReadlink(dirFd, pathAddress, pathLen, bufAddress, bufLen, writtenAddress, canWait) {
     return catchPosixError(canWait, PosixError.ENOENT, () => {
-      const loc = this.obtainStreamLocation(dirFd, pathAddress, pathLen);
+      const loc = this.obtainStreamLocation(dirFd, pathAddress, Number(pathLen));
       return this.triggerEvent('readlink', loc, PosixError.ENOENT);
     }, (result) => {
       if (result === undefined) return PosixError.ENOTSUP;
       if (result === false) return PosixError.ENOENT;
       if (typeof(result) !== 'string') throw new TypeMismatch('string', result);
-      const ta = encodeText(result).slice(0, bufLen);
+      const ta = encodeText(result).slice(0, Number(bufLen));
       this.moveExternBytes(ta, bufAddress, this.littleEndian);
-      this.copyUint32(writtenAddress, ta.length);
+      this.copyUsize(writtenAddress, ta.length);
     });
   },
   ...(process.env.TARGET === 'node' ? {

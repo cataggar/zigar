@@ -59,6 +59,18 @@ describe('Compilation', function() {
       expect(parts[4]).to.equal('Debug');
       expect(parts[5]).to.equal('hello.zigar');
     })
+    it('should isolate wasm64 cache path from wasm32 while keeping wasm32 unchanged', function() {
+      const srcPath = '/project/src/hello.zig';
+      const base = { optimize: 'ReleaseSmall', cacheDir: '/project/zigar-cache' };
+      const wasm32Path = getModuleCachePath(srcPath, { ...base, arch: 'wasm32', platform: 'wasi', isWASM: true });
+      const wasm64ByFlag = getModuleCachePath(srcPath, { ...base, memory64: true });
+      const wasm64ByArch = getModuleCachePath(srcPath, { ...base, arch: 'wasm64', platform: 'wasi', isWASM: true });
+      const nativePath = getModuleCachePath(srcPath, { ...base, arch: 'x64', platform: 'linux' });
+      expect(wasm32Path).to.equal(nativePath);
+      expect(wasm64ByFlag).to.equal(wasm64ByArch);
+      expect(wasm64ByFlag).to.not.equal(wasm32Path);
+      expect(wasm64ByFlag.endsWith(join('ReleaseSmall', 'hello.zigar'))).to.be.true;
+    })
   })
   describe('createConfig', function() {
     it('should return custom command when provided', async function() {
@@ -214,6 +226,53 @@ describe('Compilation', function() {
       expect(config.useWazig).to.be.true;
       expect(config.zigPath).to.equal('wazigl');
       expect(config.zigArgs).to.include('-fllvm');
+    })
+    it('should configure wasm64-wasi target, isolated paths, and default RAB maxMemory', async function() {
+      const srcPath = absolute('./zig-samples/basic/integers.zig');
+      const cfgWasm32 = await createConfig(srcPath, null, {
+        optimize: 'ReleaseSmall',
+        arch: 'wasm32',
+        platform: 'wasi',
+        isWASM: true,
+      });
+      const cfgWasm64 = await createConfig(srcPath, null, {
+        optimize: 'ReleaseSmall',
+        memory64: true,
+      });
+      expect(cfgWasm64.arch).to.equal('wasm64');
+      expect(cfgWasm64.platform).to.equal('wasi');
+      expect(cfgWasm64.isWASM).to.be.true;
+      expect(cfgWasm64.memory64).to.be.true;
+      expect(cfgWasm64.zigArgs).to.include('wasm64-wasi');
+      expect(cfgWasm64.moduleBuildDir).to.not.equal(cfgWasm32.moduleBuildDir);
+      expect(cfgWasm64.relOutputPath).to.not.equal(cfgWasm32.relOutputPath);
+      expect(cfgWasm64.outputPath).to.not.equal(cfgWasm32.outputPath);
+
+      // Default maxMemory for single-threaded RAB: 1 GiB on wasm32, 4 GiB on wasm64
+      expect(cfgWasm32.maxMemory).to.equal(1073741824);
+      expect(cfgWasm32.zigArgs).to.include('--max-memory=1073741824');
+      expect(cfgWasm64.maxMemory).to.equal(4294967296);
+      expect(cfgWasm64.zigArgs).to.include('--max-memory=4294967296');
+
+      // Multithreaded default maxMemory stays 64 MiB
+      const cfgMt32 = await createConfig(srcPath, null, { isWASM: true, multithreaded: true });
+      const cfgMt64 = await createConfig(srcPath, null, { memory64: true, multithreaded: true });
+      expect(cfgMt32.maxMemory).to.equal(64 * 1024 * 1024);
+      expect(cfgMt64.maxMemory).to.equal(64 * 1024 * 1024);
+
+      // useResizableBuffer: false leaves single-threaded WASM unbounded
+      const cfgNoRab32 = await createConfig(srcPath, null, { isWASM: true, useResizableBuffer: false });
+      const cfgNoRab64 = await createConfig(srcPath, null, { memory64: true, useResizableBuffer: false });
+      expect(cfgNoRab32.maxMemory).to.be.undefined;
+      expect(cfgNoRab64.maxMemory).to.be.undefined;
+      expect(cfgNoRab32.zigArgs.some(a => a.startsWith('--max-memory='))).to.be.false;
+
+      // Explicit unbounded sentinels (0, null, Infinity)
+      for (const sentinel of [ 0, null, Infinity ]) {
+        const cfgUnbounded = await createConfig(srcPath, null, { memory64: true, maxMemory: sentinel });
+        expect(cfgUnbounded.maxMemory).to.be.undefined;
+        expect(cfgUnbounded.zigArgs.some(a => a.startsWith('--max-memory='))).to.be.false;
+      }
     })
   })
   describe('compile', function() {
@@ -528,6 +587,28 @@ describe('Compilation', function() {
       expect(size).to.be.at.least(1000);
       expect(sourcePaths.some(p => p.includes('return-c-pointer.zig'))).to.be.true;
       expect(sourcePaths.some(p => p.includes('build.extra.h'))).to.be.true;
+    })
+    it('should compile single-threaded, multithreaded, and pthread-emulated WASM64 modules without colliding with WASM32', async function() {
+      const intPath = absolute('./zig-samples/basic/integers.zig');
+      const wasm32Opts = { optimize: 'ReleaseSmall', arch: 'wasm32', platform: 'wasi', isWASM: true, useWazig: true };
+      const wasm64Opts = { optimize: 'ReleaseSmall', arch: 'wasm64', platform: 'wasi', isWASM: true, memory64: true, useWazig: true };
+      const [ res32, res64 ] = await Promise.all([
+        compile(intPath, null, wasm32Opts),
+        compile(intPath, null, wasm64Opts),
+      ]);
+      expect(res32.outputPath).to.not.equal(res64.outputPath);
+      await WebAssembly.compile(await readFile(res32.outputPath));
+      await WebAssembly.compile(await readFile(res64.outputPath));
+
+      const atomicPath = absolute('./zig-samples/basic/atomic.zig');
+      const mtOpts = { ...wasm64Opts, multithreaded: true };
+      const mtRes = await compile(atomicPath, getModuleCachePath(atomicPath, mtOpts), mtOpts);
+      await WebAssembly.compile(await readFile(mtRes.outputPath));
+
+      const dupePath = absolute('./zig-samples/c-allocator/dupe.zig');
+      const pthreadOpts = { ...wasm64Opts, multithreaded: true, useLibc: true, usePthreadEmulation: true };
+      const pthreadRes = await compile(dupePath, getModuleCachePath(dupePath, pthreadOpts), pthreadOpts);
+      await WebAssembly.compile(await readFile(pthreadRes.outputPath));
     })
   })
   describe('test', function() {

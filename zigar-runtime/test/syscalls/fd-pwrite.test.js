@@ -90,6 +90,28 @@ describe('Syscall: fd-pwrite', function() {
       const subarray2 = array.slice(4 + string.length, 4 + string.length + string.length);
       expect(subarray2).to.eql(string);
     })
+    it('should support 16-byte ciovec_t, BigInt inputs, and 8-byte written usize when memory64 is enabled', async function() {
+      const env = new Env();
+      env.memory = new WebAssembly.Memory({ initial: 1n, address: 'i64' });
+      env.memory64 = true;
+      const raw = new DataView(env.memory.buffer);
+      const le = env.littleEndian;
+      const string = new TextEncoder().encode('ABCDEFG\n');
+      new Uint8Array(env.memory.buffer, 0x2000, string.length).set(string);
+      raw.setBigUint64(0x1000, 0x2000n, le);
+      raw.setBigUint64(0x1008, BigInt(string.length), le);
+      raw.setBigUint64(0x1010, 0x2000n, le);
+      raw.setBigUint64(0x1018, BigInt(string.length), le);
+      raw.setUint32(0x3004, 0xaaaa_aaaa, le);
+      const array = new Uint8Array(64);
+      const writer = env.convertWriter(array);
+      const fd = env.createStreamHandle(writer, [ PosixDescriptorRight.fd_write, 0 ]);
+      const result = env.fdPwrite(fd, 0x1000n, 2n, 4n, 0x3000n);
+      expect(result).to.equal(PosixError.NONE);
+      expect(raw.getBigUint64(0x3000, le)).to.equal(BigInt(string.length * 2));
+      expect(array.slice(4, 4 + string.length)).to.eql(string);
+      expect(array.slice(4 + string.length, 4 + string.length * 2)).to.eql(string);
+    })
   }
   if (process.env.TARGET === 'node') {
     it('should output text to an array using a different function', async function() {

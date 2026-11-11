@@ -8,9 +8,14 @@ var fdPrestatGet = mixin({
       if (fd === 3) {
         // descriptor 3 is the root directory, I think
         this.streamMap.set(fd, this.streamMap.get(PosixDescriptor.root));
-        const dv = createView(8);      
+        const is64 = Boolean(this.memory64 || "32" == 64);
+        const dv = createView(is64 ? 16 : 8);
         dv.setUint8(0, 0);
-        dv.setUint32(4, 0, this.littleEndian);
+        if (is64) {
+          dv.setBigUint64(8, 0n, this.littleEndian);
+        } else {
+          dv.setUint32(4, 0, this.littleEndian);
+        }
         this.moveExternBytes(dv, bufAddress, true);
         return 0;
       } else {

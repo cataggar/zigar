@@ -11,7 +11,7 @@ import {
   TYPED_ARRAY, UPDATE, VISIT, ZIG
 } from '../symbols.js';
 import {
-  defineValue, findElements, getSelf, isCompatibleInstanceOf, isCompatibleType, usizeInvalid
+  defineValue, findElements, getSelf, isCompatibleInstanceOf, isCompatibleType, isInvalidUsize
 } from '../utils.js';
 
 export default mixin({
@@ -101,7 +101,7 @@ export default mixin({
           }
         }
       } else if (this[MEMORY][ZIG]) {
-        setAddress.call(this, 0);
+        setAddress.call(this, (thisEnv.memory64 || process.env.BITS == 64) ? 0n : 0);
         setLength?.call?.(this, 0);
       }
       this[SLOTS][0] = arg ?? null;
@@ -240,7 +240,7 @@ export default mixin({
         }
       }
       const zig = arg?.[MEMORY]?.[ZIG];
-      if (zig?.address === usizeInvalid) {
+      if (isInvalidUsize(zig?.address)) {
         throw new PreviouslyFreed(arg);
       }
       this[TARGET] = arg;

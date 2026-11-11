@@ -35,34 +35,39 @@ var workerSupport = mixin({
       this.nextThreadId = 1;
     }
     const worker = this.createWorker();
-    worker.run(tid, taddr);
+    worker.run(tid, this.memory64 ? BigInt(taddr) : taddr);
     return tid;
   },
   cancelThread(tid, taddr, immediate) {
-    const worker = this.workers.find(w => w.tid === tid);
+    const id = Number(tid);
+    const worker = this.workers.find(w => w.tid === id);
     if (worker) {
+      const addr = this.memory64 ? BigInt(taddr) : taddr;
       if (immediate) {
         worker.end(true);
         // create a replacement worker that'll perform the thread clean-up
         const scab = this.createWorker();
-        scab.run(tid, taddr);
+        scab.run(id, addr);
       } else {
         // defer termination until thread reaches a cancellation point
-        worker.canceled = taddr;
+        worker.canceled = addr;
       }
     }
   }, 
   getThreadAddress(tid) {
-    const worker = this.workers.find(w => w.tid === tid);
-    return worker.taddr;
+    const id = Number(tid);
+    const worker = this.workers.find(w => w.tid === id);
+    return this.memory64 ? BigInt(worker.taddr) : worker.taddr;
   },
   createWorker() {
-    const callFutex = new Int32Array(new SharedArrayBuffer(8));
+    const sab = new SharedArrayBuffer(this.memory64 ? 16 : 8);
+    const callFutex = new Int32Array(sab, 0, 2);
+    const callResult64 = this.memory64 ? new BigInt64Array(sab, 8, 1) : null;
     const handler = (msg) => {
       switch (msg.type) {
         case 'call': {
           const { module, name, args, callId, futex } = msg;
-          if (worker.canceled === 0) {
+          if (worker.canceled === null) {
             const fn = this.exportedModules[module]?.[name];
             // add a true argument to indicate that waiting is possible
             const result = fn?.(...args, true);
@@ -81,7 +86,7 @@ var workerSupport = mixin({
           }
         } break;
         case 'terminate': {
-          if (worker.canceled !== 0) {
+          if (worker.canceled) {
             // run clean-up routine
             worker.run(worker.tid, worker.canceled);
           } else {
@@ -107,13 +112,28 @@ var workerSupport = mixin({
       worker.on('message', handler);
     }
     // send WebAssembly start-up data
-    const { executable, memory, options } = this;
+    const { executable, memory, options, memory64, table64 } = this;
+    const workerOptions = { ...options, memory64, table64 };
     worker.callFutex = callFutex;
-    worker.postMessage({ type: 'start', executable, memory, options, futex: callFutex });
+    worker.canceled = null;
+    worker.postMessage({ type: 'start', executable, memory, options: workerOptions, futex: callFutex });
+    const storeResult = (target, result) => {
+      if (typeof(result) === 'bigint') {
+        const res64 = (target === callFutex && callResult64)
+          ? callResult64
+          : (target.buffer.byteLength >= 16 ? new BigInt64Array(target.buffer, 8, 1) : null);
+        if (res64) {
+          Atomics.store(res64, 0, BigInt.asIntN(64, result));
+        }
+        Atomics.store(target, 1, Number(BigInt.asIntN(32, result)));
+      } else {
+        Atomics.store(target, 1, result | 0);
+      }
+    };
     worker.signal = (callId, response, result, customFutex) => {
       if (customFutex && callId === undefined) {
         if (Atomics.load(customFutex, 0) === 0) {
-          Atomics.store(customFutex, 1, result | 0);
+          storeResult(customFutex, result);
           Atomics.store(customFutex, 0, response);
           Atomics.notify(customFutex, 0, 1);
         }
@@ -121,17 +141,18 @@ var workerSupport = mixin({
       }
       const target = customFutex ?? callFutex;
       if (Atomics.load(target, 0) === callId) {
-        Atomics.store(target, 1, result | 0);
+        storeResult(target, result);
         if (Atomics.compareExchange(target, 0, callId, response) === callId) {
           Atomics.notify(target, 0, 1);
         }
       }
     };
     worker.run = (tid, taddr) => {
+      const addr = this.memory64 ? BigInt(taddr) : taddr;
       worker.tid = tid;
-      worker.taddr = taddr;
-      worker.canceled = 0;
-      worker.postMessage({ type: 'run', tid, taddr });
+      worker.taddr = addr;
+      worker.canceled = null;
+      worker.postMessage({ type: 'run', tid, taddr: addr });
     };
     worker.end = (force = false) => {
       if (force) {
@@ -185,8 +206,12 @@ function workerMain() {
     switch (msg.type) {
       case 'start': {
         let { executable, memory, options, futex } = msg;
+        const is64 = Boolean(options?.memory64);
         const sendFutex = !futex;
-        futex ??= new Int32Array(new SharedArrayBuffer(8));
+        futex ??= new Int32Array(new SharedArrayBuffer(is64 ? 16 : 8), 0, 2);
+        const result64 = (is64 && futex.buffer.byteLength >= 16)
+          ? new BigInt64Array(futex.buffer, 8, 1)
+          : null;
         const imports = { 
           env: { memory },
           wasi: {},
@@ -219,14 +244,21 @@ function workerMain() {
         for (const { module, name, kind } of WA.Module.imports(executable)) {
           const ns = imports[module];
           if (kind === 'function' && ns) {
+            const returnsI64 = is64 && module === 'wasi' && name === 'thread-address';
             ns[name] = (name === 'proc_exit') ? exit : function(...args) {
+              if (returnsI64 && result64) {
+                Atomics.store(result64, 0, 0n);
+              }
               const callId = beginCall();
               const callMsg = { type: 'call', module, name, args, callId };
               if (sendFutex) {
                 callMsg.futex = futex;
               }
               port.postMessage(callMsg);
-              return wait(callId);
+              const res = wait(callId);
+              return returnsI64
+                ? (result64 ? BigInt.asUintN(64, Atomics.load(result64, 0)) : BigInt(res >>> 0))
+                : res;
             };
             if (name === 'fd_write') {
               const write = ns[name];
@@ -234,11 +266,20 @@ function workerMain() {
                 if (fd === 2) {
                   // get the total length first
                   const dv = new DataView(memory.buffer);
+                  const iovsAddr = Number(iovsAddress);
+                  const count = Number(iovsCount);
+                  const writtenAddr = Number(writtenAddress);
+                  const ptrSize = is64 ? 8 : 4;
+                  const iovsSize = ptrSize * 2;
                   let total = 0;
                   const ops = [];
-                  for (let i = 0, offset = 0; i < iovsCount; i++, offset += 8) {
-                    const ptr = dv.getUint32(iovsAddress + offset, true);
-                    const len = dv.getUint32(iovsAddress + offset + 4, true);
+                  for (let i = 0, offset = 0; i < count; i++, offset += iovsSize) {
+                    const ptr = is64
+                      ? Number(dv.getBigUint64(iovsAddr + offset, true))
+                      : dv.getUint32(iovsAddr + offset, true);
+                    const len = is64
+                      ? Number(dv.getBigUint64(iovsAddr + offset + 8, true))
+                      : dv.getUint32(iovsAddr + offset + 4, true);
                     ops.push({ ptr, len });
                     total += len;
                   }
@@ -263,7 +304,11 @@ function workerMain() {
                   }
                   port.postMessage(callMsg, [ array.buffer ]);
                   // write the length, assuming the operation will succeed in the main thread
-                  dv.setUint32(writtenAddress, total, true);
+                  if (is64) {
+                    dv.setBigUint64(writtenAddr, BigInt(total), true);
+                  } else {
+                    dv.setUint32(writtenAddr, total, true);
+                  }
                   // block for only up to 50ms
                   return wait(callId, 50000);
                 } else {
@@ -273,11 +318,17 @@ function workerMain() {
             }
           }
         }
-        if (options.tableInitial) {
-          imports.env.__indirect_function_table = new WA.Table({
-            initial: options.tableInitial,
-            element: 'anyfunc',
-          });
+        if (options?.tableInitial) {
+          imports.env.__indirect_function_table = options.table64
+            ? new WA.Table({
+                initial: BigInt(options.tableInitial),
+                element: 'anyfunc',
+                address: 'i64',
+              })
+            : new WA.Table({
+                initial: options.tableInitial,
+                element: 'anyfunc',
+              });
         }
         instance = new WA.Instance(executable, imports);
       } break;

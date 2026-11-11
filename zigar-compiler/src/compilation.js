@@ -9,6 +9,7 @@ import {
   acquireLock, copyFile, copyZonFile, createDirectory, deleteDirectory, deleteFile, getArch,
   getDirectoryStats, getLibraryExt, getPlatform, releaseLock, sha1
 } from './utility-functions.js';
+import { fixWasm64TlsGlobals } from './wasm-decoding.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -337,11 +338,21 @@ export async function compile(srcPath, modPath, options) {
         if (sharedCacheDir) {
           await syncCacheDir(localCacheDir, sharedCacheDir);
         }
+        const emittedWasmPath = config.useBuildExe
+          ? join(moduleBuildDir, config.relOutputPath)
+          : outputPath;
+        if (config.arch === 'wasm64' && config.multithreaded) {
+          const rawBytes = await readFile(emittedWasmPath);
+          const rawDV = new DataView(rawBytes.buffer, rawBytes.byteOffset, rawBytes.byteLength);
+          const fixedDV = fixWasm64TlsGlobals(rawDV);
+          if (fixedDV !== rawDV) {
+            await writeFile(emittedWasmPath, new Uint8Array(fixedDV.buffer, fixedDV.byteOffset, fixedDV.byteLength));
+          }
+        }
         if (config.useBuildExe) {
-          const builtWasmPath = join(moduleBuildDir, config.relOutputPath);
-          if (builtWasmPath !== outputPath) {
+          if (emittedWasmPath !== outputPath) {
             await createDirectory(dirname(outputPath));
-            await copyFile(outputPath, builtWasmPath);
+            await copyFile(outputPath, emittedWasmPath);
           }
         }
       }
@@ -558,7 +569,7 @@ export async function createProject(config, dir = config.moduleBuildDir) {
       }
       return name.endsWith('.zig') || name.endsWith('.h') || name.endsWith('.c');
     });
-    await createDirectory(join(dir, config.optimize));
+    await createDirectory(join(dir, dirname(config.relOutputPath)));
   } else {
     const buildFilePath = join(dir, 'build.zig');
     await copyFile(buildFilePath, config.buildFilePath);
@@ -584,12 +595,16 @@ export function getCachePath(options) {
   return cacheDir;
 }
 
-export function getModuleCachePath(srcPath, options) {
+export function getModuleCachePath(srcPath, options = {}) {
   const {
     optimize,
+    memory64 = false,
+    arch,
   } = options;
+  const isWasm64 = Boolean(memory64 || arch === 'wasm64');
   const src = parse(srcPath);
-  const folder = basename(src.dir).slice(0, 16).trim() + '-' + sha1(src.dir).slice(0, 8);
+  const baseFolder = basename(src.dir).slice(0, 16).trim() + '-' + sha1(src.dir).slice(0, 8);
+  const folder = isWasm64 ? `${baseFolder}-wasm64` : baseFolder;
   const cacheDir = getCachePath(options);
   return join(cacheDir, folder, optimize, `${src.name}.zigar`);
 }
@@ -605,15 +620,17 @@ async function findModuleFile(moduleDir, fileName) {
 }
 
 export async function createConfig(srcPath, modPath, options = {}) {
+  const memory64 = Boolean(options.memory64 || options.arch === 'wasm64');
+  const isWASM = Boolean(memory64 || options.isWASM || options.arch === 'wasm32');
+  const arch = memory64 ? 'wasm64' : (options.arch ?? (isWASM ? 'wasm32' : getArch()));
+  const platform = memory64 ? 'wasi' : (options.platform ?? (isWASM ? 'wasi' : getPlatform()));
   const {
-    platform = getPlatform(),
-    arch = getArch(),
     optimize = 'Debug',
-    isWASM = false,
     useLibc = isWASM ? false : true,
     useLLVM = null,
     useRedirection = true,
     usePthreadEmulation = false,
+    useResizableBuffer,
     clean = false,
     buildDir = join(os.tmpdir(), 'zigar-build'),
     buildDirSize = 4294967296,
@@ -623,13 +640,25 @@ export async function createConfig(srcPath, modPath, options = {}) {
     multithreaded = (isWASM) ? false : true,
     persistent = false,
     stackSize = 256 * 1024,
-    maxMemory = (isWASM && multithreaded) ? 64 * 1024 * 1024 : undefined,
+    maxMemory: rawMaxMemory,
     evalBranchQuota = 2000000,
     omitFunctions = false,
     omitVariables = false,
     ignoreBuildFile = false,
     useBuildExe: useBuildExeOption,
   } = options;
+  let maxMemory;
+  if (rawMaxMemory === 0 || rawMaxMemory === null || rawMaxMemory === Infinity) {
+    maxMemory = undefined;
+  } else if (rawMaxMemory !== undefined) {
+    maxMemory = rawMaxMemory;
+  } else if (isWASM) {
+    if (multithreaded) {
+      maxMemory = 64 * 1024 * 1024;
+    } else if (useResizableBuffer !== false) {
+      maxMemory = (arch === 'wasm64') ? 4294967296 : 1073741824;
+    }
+  }
   const src = parse(srcPath ?? '');
   const mod = parse(modPath ?? '');
   const moduleName = mod.name || src.name;
@@ -637,11 +666,12 @@ export async function createConfig(srcPath, modPath, options = {}) {
   const moduleDir = src.dir + sep;
   const modulePrefix = basename(moduleName).slice(0, 16);
   const moduleHash = sha1(moduleDir).slice(0, 8);
-  const moduleBuildDir = join(buildDir, modulePrefix + '-' + moduleHash);
+  const moduleBuildDir = join(buildDir, `${modulePrefix}-${moduleHash}${arch === 'wasm64' ? '-wasm64' : ''}`);
+  const relOutputPath = join(optimize, arch === 'wasm64' ? `${src.name}.wasm64.wasm` : `${src.name}.wasm`);
   const outputPath = (() => {
     if (!modPath && isWASM) {
       // save output in build folder
-      return join(moduleBuildDir, optimize, `${src.name}.wasm`);
+      return join(moduleBuildDir, relOutputPath);
     } else {
       const ext = getLibraryExt(platform);
       return join(modPath, `${platform}.${arch}.${ext}`);
@@ -729,7 +759,6 @@ export async function createConfig(srcPath, modPath, options = {}) {
   const osTag = osTags[platform] ?? platform;
   const target = `${cpuArch}-${osTag}`;
   const cpu = multithreaded ? 'generic+atomics+bulk_memory' : 'generic';
-  const relOutputPath = join(optimize, `${src.name}.wasm`);
   let zigArgs;
   let translateCArgs = null;
   if (useBuildExe) {
@@ -845,7 +874,9 @@ export async function createConfig(srcPath, modPath, options = {}) {
     useLLVM,
     useRedirection,
     usePthreadEmulation,
+    useResizableBuffer,
     isWASM,
+    memory64,
     multithreaded,
     persistent,
     stackSize,

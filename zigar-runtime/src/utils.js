@@ -158,16 +158,20 @@ export function findSortedIndex(array, value, cb) {
 }
 
 export function isMisaligned(address, align) {
-  if (process.env.BITS == 64) {
-    return (align) ? !!(address & BigInt(align - 1)) : false;
+  if (!align) {
+    return false;
+  }
+  if (typeof address === 'bigint') {
+    return !!(address & BigInt(align - 1));
   } else {
-    return (align) ? !!(address & (align - 1)) : false;
+    return !!(address & (align - 1));
   }
 }
 
 export function alignForward(address, align) {
-  if (process.env.BITS == 64) {
-    return (address + BigInt(align - 1)) & ~BigInt(align - 1);
+  if (typeof address === 'bigint') {
+    const mask = BigInt(align - 1);
+    return (address + mask) & ~mask;
   } else {
     return (address + (align - 1)) & ~(align - 1);
   }
@@ -178,8 +182,8 @@ export const usizeMax = (process.env.BITS == 64) ? 0xFFFF_FFFF_FFFF_FFFFn : 0xFF
 export const usizeInvalid = (process.env.BITS == 64) ? -1n : -1;
 export const usizeByteSize = (process.env.BITS == 64) ? 8 : 4;
 
-export function usize(number) {
-  if (process.env.BITS == 64) {
+export function usize(number, is64 = process.env.BITS == 64) {
+  if (is64) {
     return BigInt(number);
   } else {
     return Number(number);
@@ -196,35 +200,43 @@ export function safeInt(bigInt) {
   return Number(bigInt);
 }
 
-export function readUsize(dv, offset, le) {
-  if (process.env.BITS == 64) {
+export function readUsize(dv, offset, le, is64 = process.env.BITS == 64) {
+  if (is64) {
     return dv.getBigUint64(offset, le);
   } else {
     return dv.getUint32(offset, le);
   }
 }
 
-export function readUsizeSafe(dv, offset, le) {
-  if (process.env.BITS == 64) {
-    return safeInt(readUsize(dv, offset, le));
+export function readUsizeSafe(dv, offset, le, is64 = process.env.BITS == 64) {
+  if (is64) {
+    return safeInt(readUsize(dv, offset, le, true));
   } else {
-    return readUsize(dv, offset, le);
+    return readUsize(dv, offset, le, false);
   }
 }
 
 export function isInvalidAddress(address) {
-  if (process.env.BITS == 64) {
-    return address === 0xaaaa_aaaa_aaaa_aaaan;
+  if (typeof address === 'bigint') {
+    return address === 0xaaaa_aaaa_aaaa_aaaan || address === -0x5555_5555_5555_5556n;
   } else {
     return address === 0xaaaa_aaaa || address === -0x5555_5556;
   }
 }
 
+export function isInvalidUsize(address) {
+  return address === -1 || address === -1n;
+}
+
+export function toBufferOffset(address) {
+  return (typeof address === 'bigint') ? safeInt(address) : address;
+}
+
 export function adjustAddress(address, addend) {
-  if (process.env.BITS == 64) {
+  if (typeof address === 'bigint') {
     return address + BigInt(addend);
   } else {
-    return address + addend;
+    return address + Number(addend);
   }
 }
 

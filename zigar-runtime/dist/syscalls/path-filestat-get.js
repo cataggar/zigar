@@ -9,7 +9,7 @@ var pathFilestatGet = mixin({
   pathFilestatGet(dirFd, lFlags, pathAddress, pathLen, bufAddress, canWait) {
     let infer = false;
     return catchPosixError(canWait, PosixError.ENOENT, () => {
-      const loc = this.obtainStreamLocation(dirFd, pathAddress, pathLen);
+      const loc = this.obtainStreamLocation(dirFd, pathAddress, Number(pathLen));
       let flags = {
         ...decodeFlags(lFlags, PosixLookupFlag),
       };

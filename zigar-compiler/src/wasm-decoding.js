@@ -115,10 +115,13 @@ export function stripUnused(binary, options = {}) {
     }
     const importSection = getSection(SectionType.Import);
     if (importSection) {
+      let fnIndex = 0;
       for (const object of importSection.imports) {
         if (object.type === ObjectType.Function) {
-          const fn = functions[object.index];
-          fn.name = object.name;
+          const fn = functions[fnIndex++];
+          if (!fn.name) {
+            fn.name = object.name;
+          }
         }
       }
     }
@@ -134,19 +137,37 @@ export function stripUnused(binary, options = {}) {
         // we know that getFactoryThunk loads its address, however
         // and that a function pointer is just an index into table 0
         const ops = fn.instructions;
-        const isConstEnd = (ops.length === 2 && ops[0].opcode === 0x41 && ops[1].opcode === 0x0B)
-          || (ops.length === 3 && ops[0].opcode === 0x41 && ops[1].opcode === 0x0F && ops[2].opcode === 0x0B);
+        const isConstOpcode = ops.length >= 2 && (ops[0].opcode === 0x41 || ops[0].opcode === 0x42);
+        const isConstEnd = isConstOpcode && (
+          (ops.length === 2 && ops[1].opcode === 0x0B) ||
+          (ops.length === 3 && ops[1].opcode === 0x0F && ops[2].opcode === 0x0B)
+        );
         if (isConstEnd) {
-          // 0x41 is i32.const
+          // 0x41 is i32.const, 0x42 is i64.const
           // 0x0F is return
           // 0x0B is end
-          const elemIndex = ops[0].operand;
+          const elemIndex = Number(ops[0].operand);
           const elemSection = getSection(SectionType.Element);
-          for (const segment of elemSection.segments) {
-            if (segment.indices) {
-              const funcIndex = segment.indices[elemIndex - 1];
-              const fn = functions[funcIndex];
-              fn.using = false;
+          if (elemSection) {
+            for (const segment of elemSection.segments) {
+              const isActiveTable0 = segment.type === 0 || segment.type === 4
+                || ((segment.type === 2 || segment.type === 6) && segment.tableidx === 0);
+              if (!isActiveTable0) continue;
+              const offset = evalConstOffsetExpr(segment.expr) ?? 1;
+              const idx = elemIndex - offset;
+              if (segment.indices && idx >= 0 && idx < segment.indices.length) {
+                const funcIndex = segment.indices[idx];
+                const targetFn = functions[funcIndex];
+                if (targetFn?.type === 'internal') {
+                  targetFn.using = false;
+                }
+              } else if (segment.entries && idx >= 0 && idx < segment.entries.length) {
+                const funcIndex = evalElemFuncExpr(segment.entries[idx]);
+                const targetFn = (funcIndex !== undefined) ? functions[funcIndex] : undefined;
+                if (targetFn?.type === 'internal') {
+                  targetFn.using = false;
+                }
+              }
             }
           }
         }
@@ -154,13 +175,16 @@ export function stripUnused(binary, options = {}) {
     }
   }
 
-  function useFunction(index) {
+  function useFunction(index, isRoot = false) {
     const fn = functions[index];
     /* c8 ignore next 3 */
     if (!fn) {
       throw new Error(`Function #${index} does not exist`);
     }
-    if (fn.using === undefined) {
+    if (isRoot && fn.using === false) {
+      return;
+    }
+    if (!fn.using) {
       fn.using = true;
       if (fn.type === 'internal') {
         // mark all functions called by this one as being in-use as well
@@ -183,7 +207,14 @@ export function stripUnused(binary, options = {}) {
     for (const segment of elemSection.segments) {
       if (segment.indices) {
         for (const index of segment.indices) {
-          useFunction(index);
+          useFunction(index, true);
+        }
+      } else if (segment.entries) {
+        for (const entry of segment.entries) {
+          const index = evalElemFuncExpr(entry);
+          if (index !== undefined) {
+            useFunction(index, true);
+          }
         }
       }
     }
@@ -194,7 +225,7 @@ export function stripUnused(binary, options = {}) {
   if (exportSection) {
     for (const object of exportSection.exports) {
       if (object.type === ObjectType.Function) {
-        useFunction(object.index);
+        useFunction(object.index, true);
       }
     }
   }
@@ -202,7 +233,7 @@ export function stripUnused(binary, options = {}) {
   // mark start function as being in-use
   const startSection = getSection(SectionType.Start);
   if (startSection) {
-    useFunction(startSection.funcidx);
+    useFunction(startSection.funcidx, true);
   }
 
   // assign new indices to functions
@@ -252,6 +283,24 @@ export function stripUnused(binary, options = {}) {
           return (fn.using) ? fn.newIndex : 0;
         });
         newElementSection.segments.push({ ...segment, indices });
+      } else if (segment.entries) {
+        const entries = segment.entries.map((entry) => {
+          const index = evalElemFuncExpr(entry);
+          if (index !== undefined) {
+            const fn = functions[index];
+            const writer = createWriter(16);
+            const { encodeNext } = createEncoder(writer);
+            if (fn.using) {
+              encodeNext({ opcode: 0xD2, operand: fn.newIndex });
+            } else {
+              encodeNext({ opcode: 0xD0, operand: 0x70 });
+            }
+            encodeNext({ opcode: 0x0B });
+            return writer.finalize();
+          }
+          return entry;
+        });
+        newElementSection.segments.push({ ...segment, entries });
         /* c8 ignore next 3 */
       } else {
         newElementSection.segments.push(segment);
@@ -277,11 +326,7 @@ export function stripUnused(binary, options = {}) {
     const globalSection = getSection(SectionType.Global);
     const hasImportedGlobal = importSection?.imports.some(o => o.type === ObjectType.Global);
     if (
-      globalSection?.data?.byteLength >= 3 &&
-      !hasImportedGlobal &&
-      globalSection.data.getUint8(0) >= 1 &&
-      globalSection.data.getUint8(1) === 0x7f &&
-      globalSection.data.getUint8(2) === 0x01 &&
+      hasMutableStackPointerGlobal0(globalSection, hasImportedGlobal) &&
       !newExportSection.exports.some(e => e.name === '__stack_pointer')
     ) {
       newExportSection.exports.push({ name: '__stack_pointer', type: ObjectType.Global, index: 0 });
@@ -370,6 +415,125 @@ export function stripUnused(binary, options = {}) {
   return repackBinary({ sections: newSections, size: size + 24 });
 }
 
+function hasMutableStackPointerGlobal0(globalSection, hasImportedGlobal) {
+  if (hasImportedGlobal || !globalSection?.data || globalSection.data.byteLength < 3) {
+    return false;
+  }
+  const reader = createReader(globalSection.data);
+  const count = reader.readU32Leb128();
+  if (count < 1 || reader.eof()) {
+    return false;
+  }
+  const valtype = reader.readU8();
+  if (reader.eof()) {
+    return false;
+  }
+  const mut = reader.readU8();
+  return (valtype === 0x7f || valtype === 0x7e) && mut === 0x01;
+}
+
+export function fixWasm64TlsGlobals(binary) {
+  const { sections, size } = parseBinary(binary);
+  const typeSection = sections.find(s => s.type === SectionType.Type);
+  const importSection = sections.find(s => s.type === SectionType.Import);
+  const funcSection = sections.find(s => s.type === SectionType.Function);
+  const globalSection = sections.find(s => s.type === SectionType.Global);
+  const codeSection = sections.find(s => s.type === SectionType.Code);
+  if (!typeSection || !funcSection || !globalSection || !codeSection) {
+    return binary;
+  }
+  const globalTypes = [];
+  if (importSection) {
+    for (const imp of importSection.imports) {
+      if (imp.type === ObjectType.Global) {
+        globalTypes.push({ valtype: imp.valtype, mut: imp.mut });
+      }
+    }
+  }
+  {
+    const reader = createReader(globalSection.data);
+    const count = reader.readU32Leb128();
+    for (let i = 0; i < count; i++) {
+      const valtype = reader.readU8();
+      const mut = reader.readU8();
+      reader.readExpression();
+      globalTypes.push({ valtype, mut });
+    }
+  }
+  if (!globalTypes.some(g => g.valtype === 0x7e && g.mut === 0)) {
+    return binary;
+  }
+  const funcParams = [];
+  {
+    const reader = createReader(typeSection.data);
+    const count = reader.readU32Leb128();
+    for (let i = 0; i < count; i++) {
+      const form = reader.readU8();
+      if (form !== 0x60) return binary;
+      const params = reader.readArray(reader.readU8);
+      reader.readArray(reader.readU8);
+      funcParams.push(params);
+    }
+  }
+  let patched = 0;
+  for (let i = 0; i < codeSection.functions.length; i++) {
+    const code = codeSection.functions[i];
+    let hasGlobalGet = false;
+    for (let b = 0; b < code.byteLength; b++) {
+      if (code.getUint8(b) === 0x23) {
+        hasGlobalGet = true;
+        break;
+      }
+    }
+    if (!hasGlobalGet) continue;
+    const parsed = parseFunction(code);
+    const params = funcParams[funcSection.types[i]] ?? [];
+    let localTypes = null;
+    const getLocalType = (idx) => {
+      if (!localTypes) {
+        localTypes = [ ...params ];
+        for (const { number, type } of parsed.locals) {
+          for (let k = 0; k < number; k++) {
+            localTypes.push(type);
+          }
+        }
+      }
+      return localTypes[idx];
+    };
+    const ops = parsed.instructions;
+    let fnModified = false;
+    const newOps = [];
+    for (let j = 0; j < ops.length; j++) {
+      const op = ops[j];
+      newOps.push(op);
+      if (op.opcode === 0x23) {
+        const g = globalTypes[op.operand];
+        const next = ops[j + 1];
+        if (g && g.valtype === 0x7e && g.mut === 0 && next) {
+          const expectsI32 = next.opcode === 0xAC || next.opcode === 0xAD
+            || ((next.opcode === 0x21 || next.opcode === 0x22) && getLocalType(next.operand) === 0x7f);
+          if (expectsI32) {
+            newOps.push({ opcode: 0xA7, operand: undefined });
+            fnModified = true;
+            patched++;
+          }
+        }
+      }
+    }
+    if (fnModified) {
+      codeSection.functions[i] = repackFunction({
+        locals: parsed.locals,
+        instructions: newOps,
+        size: parsed.size + 16,
+      });
+    }
+  }
+  if (patched === 0) {
+    return binary;
+  }
+  return repackBinary({ sections, size: size + patched * 4 + 32 });
+}
+
 export function ensureStackPointerExport(binary) {
   const { sections, size } = parseBinary(binary);
   const importSection = sections.find(s => s.type === SectionType.Import);
@@ -378,11 +542,7 @@ export function ensureStackPointerExport(binary) {
   const hasImportedGlobal = importSection?.imports.some(o => o.type === ObjectType.Global);
   if (
     exportSection &&
-    globalSection?.data?.byteLength >= 3 &&
-    !hasImportedGlobal &&
-    globalSection.data.getUint8(0) >= 1 &&
-    globalSection.data.getUint8(1) === 0x7f &&
-    globalSection.data.getUint8(2) === 0x01 &&
+    hasMutableStackPointerGlobal0(globalSection, hasImportedGlobal) &&
     !exportSection.exports.some(e => e.name === '__stack_pointer')
   ) {
     exportSection.exports.push({ name: '__stack_pointer', type: ObjectType.Global, index: 0 });
@@ -1114,7 +1274,7 @@ function createReader(dv) {
     if (flags & 0x02) {
       shared = true;
     }
-    return is64 ? { flags, min, max, shared, is64 } : { flags, min, max, shared };
+    return { flags, min, max, shared, is64 };
   }
 
   function readCustom(len) {
@@ -1261,8 +1421,9 @@ function createWriter(maxSize) {
   }
 
   function writeLimits(limits) {
-    writeU8(limits.flags);
-    const writeVal = (limits.flags & 0x04) ? writeU64Leb128 : writeU32Leb128;
+    const flags = limits.is64 ? (limits.flags | 0x04) : limits.flags;
+    writeU8(flags);
+    const writeVal = (flags & 0x04) ? writeU64Leb128 : writeU32Leb128;
     writeVal(limits.min);
     if (limits.max !== undefined) {
       writeVal(limits.max);

@@ -45,7 +45,7 @@ export default mixin({
     /* c8 ignore start */
     if (process.env.TARGET === 'node' && process.platform === 'win32') {
       // handle is pointer
-      fd = this.obtainZigView(usize(fd << 1), 0, false);
+      fd = this.obtainZigView(usize(fd << 1, Boolean(this.memory64 || process.env.BITS == 64)), 0, false);
     }
     /* c8 ignore end */
     return { handle: fd, flags };

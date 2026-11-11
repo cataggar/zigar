@@ -76,6 +76,43 @@ function buildThreadModule(importDefs, bodyInstructions) {
   return new WebAssembly.Module(bytes);
 }
 
+function buildThreadModule64(importDefs, bodyInstructions, { table64 = false } = {}) {
+  const types = [
+    [ 0x60, 0x02, 0x7f, 0x7e, 0x00 ],                   // 0: (i32, i64) -> ()
+    [ 0x60, 0x01, 0x7e, 0x01, 0x7f ],                   // 1: (i64) -> (i32)
+    [ 0x60, 0x04, 0x7f, 0x7e, 0x7e, 0x7e, 0x01, 0x7f ], // 2: (i32, i64, i64, i64) -> (i32)
+    [ 0x60, 0x01, 0x7f, 0x01, 0x7e ],                   // 3: (i32) -> (i64)
+  ];
+  const typePayload = [ ...uleb(types.length), ...types.flat() ];
+  const imports = [
+    // memory64 shared: limits flags = 0x07 (has_max | shared | is_64), initial=1, max=4
+    [ ...encodeStr('env'), ...encodeStr('memory'), 0x02, 0x07, 0x01, 0x04 ],
+    ...(table64 ? [
+      [ ...encodeStr('env'), ...encodeStr('__indirect_function_table'), 0x01, 0x70, 0x04, 0x04 ],
+    ] : []),
+    ...importDefs.map(({ module = 'wasi_snapshot_preview1', name, type }) => [
+      ...encodeStr(module),
+      ...encodeStr(name),
+      0x00,
+      type,
+    ]),
+  ];
+  const importPayload = [ ...uleb(imports.length), ...imports.flat() ];
+  const funcPayload = [ 0x01, 0x00 ];
+  const exportPayload = [ 0x01, ...encodeStr('wasi_thread_start'), 0x00, ...uleb(importDefs.length) ];
+  const funcBody = [ 0x00, ...bodyInstructions, 0x0b ];
+  const codePayload = [ 0x01, ...uleb(funcBody.length), ...funcBody ];
+  const bytes = new Uint8Array([
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    ...section(1, typePayload),
+    ...section(2, importPayload),
+    ...section(3, funcPayload),
+    ...section(7, exportPayload),
+    ...section(10, codePayload),
+  ]);
+  return new WebAssembly.Module(bytes);
+}
+
 if (process.env.TARGET === 'wasm') {
   describe('Feature: worker-support', function() {
     describe('spawnThread', function() {
@@ -344,6 +381,129 @@ if (process.env.TARGET === 'wasm') {
         expect(dv.getInt32(0x108, true)).to.equal(0);
         expect(dv.getInt32(0x200, true)).to.equal(777);
         expect(spawnedWorker.callFutex).to.equal(spawnedFutex);
+      })
+      it('should support memory64 stderr fd_write, table64, BigInt taddr, and 64-bit thread-address', async function() {
+        const env = new Env();
+        await delay(0);
+        const memory = new WebAssembly.Memory({ initial: 1n, maximum: 4n, shared: true, address: 'i64' });
+        const dv = new DataView(memory.buffer);
+        // Place "wasm" at 0x40 and "64!" at 0x48; two 16-byte ciovec_t entries at 0x50..0x70
+        new Uint8Array(memory.buffer, 0x40, 4).set(Buffer.from('wasm'));
+        new Uint8Array(memory.buffer, 0x48, 3).set(Buffer.from('64!'));
+        dv.setBigUint64(0x50, 0x40n, true);
+        dv.setBigUint64(0x58, 4n, true);
+        dv.setBigUint64(0x60, 0x48n, true);
+        dv.setBigUint64(0x68, 3n, true);
+        dv.setUint32(0x74, 0xdeadbeef, true);
+        dv.setUint32(0x7c, 0xdeadbeef, true);
+
+        const executable = buildThreadModule64([
+          { module: 'wasi', name: 'thread-address', type: 3 },
+          { name: 'fd_write', type: 2 },
+        ], [
+          // i64 [taddr + 0] = thread-address(tid)
+          0x20, 0x01, 0x20, 0x00, 0x10, 0x00, 0x37, 0x03, 0x00,
+          // i32 [taddr + 8] = fd_write(2, 0x50n, 2n, 0x70n)  -- workerMain 64-bit stderr fast-path
+          0x20, 0x01, 0x41, ...sleb(2), 0x42, ...sleb(0x50), 0x42, ...sleb(2), 0x42, ...sleb(0x70), 0x10, 0x01, 0x36, 0x02, 0x08,
+          // i32 [taddr + 12] = fd_write(1, 0x50n, 2n, 0x78n) -- forwarded BigInt host call
+          0x20, 0x01, 0x41, ...sleb(1), 0x42, ...sleb(0x50), 0x42, ...sleb(2), 0x42, ...sleb(0x78), 0x10, 0x01, 0x36, 0x02, 0x0c,
+        ], { table64: true });
+
+        const stderrChunks = [];
+        const stdoutLines = [];
+        env.executable = executable;
+        env.memory = memory;
+        env.memory64 = true;
+        env.table64 = true;
+        env.options = { tableInitial: 4 };
+        env.redirectStream('stdout', env.convertWriter(stdoutLines));
+        env.exportedModules = {
+          wasi: {
+            'thread-address': env.getThreadHandler('thread-address'),
+          },
+          wasi_snapshot_preview1: {
+            fd_write: env.fdWrite.bind(env),
+            fd_write_stderr: (bytes) => {
+              stderrChunks.push(Buffer.from(bytes).toString('utf8'));
+              return 0;
+            },
+          },
+        };
+
+        const spawn = env.getThreadHandler('thread-spawn');
+        const tid = spawn(0x100n);
+        expect(env.getThreadAddress(tid)).to.equal(0x100n);
+        while (env.workers.length > 0) {
+          await delay(5);
+        }
+
+        expect(stderrChunks).to.deep.equal([ 'wasm64!' ]);
+        expect(Buffer.from(stdoutLines[0]).toString('utf8')).to.equal('wasm64!');
+        expect(dv.getBigUint64(0x70, true)).to.equal(7n);
+        expect(dv.getBigUint64(0x78, true)).to.equal(7n);
+        expect(dv.getBigUint64(0x100, true)).to.equal(0x100n);
+        expect(dv.getInt32(0x108, true)).to.equal(0);
+        expect(dv.getInt32(0x10c, true)).to.equal(0);
+      })
+      it('should handle deferred thread cancellation with BigInt taddr on memory64', async function() {
+        const env = new Env();
+        await delay(0);
+        const memory = new WebAssembly.Memory({ initial: 1n, maximum: 4n, shared: true, address: 'i64' });
+        const dv = new DataView(memory.buffer);
+        const executable = buildThreadModule64([
+          { name: 'first_op', type: 1 },
+          { name: 'second_op', type: 1 },
+          { name: 'cleanup_op', type: 1 },
+        ], [
+          // if (taddr == 0x100n) {
+          0x20, 0x01, 0x42, ...sleb(0x100), 0x51, 0x04, 0x40,
+            // [0x100n] = first_op(taddr)
+            0x42, ...sleb(0x100), 0x20, 0x01, 0x10, 0x00, 0x36, 0x02, 0x00,
+            // [0x104n] = second_op(taddr) -- canceled here with -2!
+            0x42, ...sleb(0x104), 0x20, 0x01, 0x10, 0x01, 0x36, 0x02, 0x00,
+          // } else {
+          0x05,
+            // [taddr] = cleanup_op(taddr)
+            0x20, 0x01, 0x20, 0x01, 0x10, 0x02, 0x36, 0x02, 0x00,
+          // }
+          0x0b,
+        ]);
+
+        let secondOpCalled = false;
+        let currentTid;
+        env.executable = executable;
+        env.memory = memory;
+        env.memory64 = true;
+        env.options = {};
+        env.exportedModules = {
+          wasi_snapshot_preview1: {
+            first_op: (taddr) => {
+              expect(taddr).to.equal(0x100n);
+              env.cancelThread(currentTid, 0x200n, false);
+              return 111;
+            },
+            second_op: () => {
+              secondOpCalled = true;
+              return 222;
+            },
+            cleanup_op: (taddr) => {
+              expect(taddr).to.equal(0x200n);
+              return 777;
+            },
+          },
+        };
+
+        const worker = env.createWorker();
+        currentTid = 1;
+        worker.run(1, 0x100n);
+        while (env.workers.length > 0) {
+          await delay(5);
+        }
+
+        expect(secondOpCalled).to.be.false;
+        expect(dv.getInt32(0x100, true)).to.equal(111);
+        expect(dv.getInt32(0x104, true)).to.equal(0);
+        expect(dv.getInt32(0x200, true)).to.equal(777);
       })
     })
   })

@@ -9,7 +9,14 @@ export default mixin({
   },
   copyUint32(bufAddress, value) {
     const buf = createView(4);    
-    buf.setUint32(0, value, this.littleEndian);
+    buf.setUint32(0, Number(value), this.littleEndian);
     this.moveExternBytes(buf, bufAddress, true);
+  },
+  copyUsize(bufAddress, value) {
+    if (process.env.TARGET === 'wasm' && this.memory64) {
+      this.copyUint64(bufAddress, BigInt(value));
+    } else {
+      this.copyUint32(bufAddress, Number(value));
+    }
   },
 });
