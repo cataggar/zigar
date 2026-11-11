@@ -59,15 +59,17 @@ export default mixin({
     return worker.taddr;
   },
   createWorker() {
+    const callFutex = new Int32Array(new SharedArrayBuffer(8));
     const handler = (msg) => {
       switch (msg.type) {
         case 'call': {
-          const { module, name, args, futex } = msg;        
+          const { module, name, args, callId, futex } = msg;
           if (worker.canceled === 0) {
             const fn = this.exportedModules[module]?.[name];
             // add a true argument to indicate that waiting is possible
             const result = fn?.(...args, true);
-            const finish = (value) => worker.signal(futex, 1, value);
+            const ok = (callId !== undefined) ? -1 : 1;
+            const finish = (value) => worker.signal(callId, ok, value, futex);
             if (isPromise(result)) {
               result.then(finish);
             } else {
@@ -76,7 +78,8 @@ export default mixin({
           } else {
             // a deferred cancellation has occurred--tell the worker to bail out from whatever 
             // it's currently doing
-            worker.signal(futex, 2);
+            const canceled = (callId !== undefined) ? -2 : 2;
+            worker.signal(callId, canceled, 0, futex);
           }
         } break;
         case 'terminate': {
@@ -109,12 +112,23 @@ export default mixin({
     }
     // send WebAssembly start-up data
     const { executable, memory, options } = this;
-    worker.postMessage({ type: 'start', executable, memory, options });
-    worker.signal = (futex, response, result) => {
-      if (Atomics.load(futex, 0) === 0) {
-        Atomics.store(futex, 0, response);
-        Atomics.store(futex, 1, result|0);
-        Atomics.notify(futex, 0, 1);
+    worker.callFutex = callFutex;
+    worker.postMessage({ type: 'start', executable, memory, options, futex: callFutex });
+    worker.signal = (callId, response, result, customFutex) => {
+      if (customFutex && callId === undefined) {
+        if (Atomics.load(customFutex, 0) === 0) {
+          Atomics.store(customFutex, 1, result | 0);
+          Atomics.store(customFutex, 0, response);
+          Atomics.notify(customFutex, 0, 1);
+        }
+        return;
+      }
+      const target = customFutex ?? callFutex;
+      if (Atomics.load(target, 0) === callId) {
+        Atomics.store(target, 1, result | 0);
+        if (Atomics.compareExchange(target, 0, callId, response) === callId) {
+          Atomics.notify(target, 0, 1);
+        }
       }
     };
     worker.run = (tid, taddr) => {
@@ -168,6 +182,7 @@ function workerMain() {
   // this code must be entirely self-contained; don't call any imported functions
   const WA = WebAssembly;
   let port, instance;
+  let nextCallId = 0;
 
   if (typeof(self) === 'object') {
     // web worker
@@ -184,33 +199,49 @@ function workerMain() {
   function process(msg) {
     switch (msg.type) {
       case 'start': {
-        const { executable, memory, options } = msg;
+        let { executable, memory, options, futex } = msg;
+        const sendFutex = !futex;
+        futex ??= new Int32Array(new SharedArrayBuffer(8));
         const imports = { 
           env: { memory },
           wasi: {},
           wasi_snapshot_preview1: {},
         };
         const exit = () => { throw new Error('Exit') };
-        const wait = (futex, timeout) => {
-          const result = Atomics.wait(futex, 0, 0, timeout);
-          if (result !== 'timed-out') {            
-            if (Atomics.load(futex, 0) === 2) {
-              // thread was canceled
-              exit();
-            }
-            return Atomics.load(futex, 1);
-          } else {
-            return 0;
-          }
+        const beginCall = () => {
+          nextCallId = (nextCallId === 0x7fffffff) ? 1 : nextCallId + 1;
+          Atomics.store(futex, 0, nextCallId);
+          return nextCallId;
         };
-        const createFutex = () => new Int32Array(new SharedArrayBuffer(8));
+        const wait = (callId, timeout) => {
+          const res = Atomics.wait(futex, 0, callId, timeout);
+          let state;
+          if (res === 'timed-out') {
+            const prev = Atomics.compareExchange(futex, 0, callId, -3);
+            if (prev === callId) {
+              return 0;
+            }
+            state = prev;
+          } else {
+            state = Atomics.load(futex, 0);
+          }
+          if (state === -2) {
+            // thread was canceled
+            exit();
+          }
+          return Atomics.load(futex, 1);
+        };
         for (const { module, name, kind } of WA.Module.imports(executable)) {
           const ns = imports[module];
           if (kind === 'function' && ns) {
             ns[name] = (name === 'proc_exit') ? exit : function(...args) {
-              const futex = createFutex();
-              port.postMessage({ type: 'call', module, name, args, futex });
-              return wait(futex);
+              const callId = beginCall();
+              const callMsg = { type: 'call', module, name, args, callId };
+              if (sendFutex) {
+                callMsg.futex = futex;
+              }
+              port.postMessage(callMsg);
+              return wait(callId);
             };
             if (name === 'fd_write') {
               const write = ns[name];
@@ -234,18 +265,22 @@ function workerMain() {
                     array.set(vector, pos);
                     pos += len;
                   }
-                  const futex = createFutex();
-                  port.postMessage({ 
+                  const callId = beginCall();
+                  const callMsg = { 
                     type: 'call', 
                     module, 
                     name: `${name}_stderr`, 
                     args: [ array ],
-                    futex,
-                  }, [ array.buffer ]);
+                    callId,
+                  };
+                  if (sendFutex) {
+                    callMsg.futex = futex;
+                  }
+                  port.postMessage(callMsg, [ array.buffer ]);
                   // write the length, assuming the operation will succeed in the main thread
                   dv.setUint32(writtenAddress, total, true);
                   // block for only up to 50ms
-                  return wait(futex, 50000);
+                  return wait(callId, 50000);
                 } else {
                   return write(fd, iovsAddress, iovsCount, writtenAddress);
                 }

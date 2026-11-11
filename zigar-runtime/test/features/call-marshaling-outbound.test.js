@@ -1594,6 +1594,78 @@ describe('Feature: call-marshaling-outbound', function() {
         env.runThunk = async () => { throw new Exit(1); };
         await expect(env.invokeThunk(thunk, fn, new Arg())).to.eventually.be.rejectedWith(Exit);
       })
+      it('should selectively dispatch via runThunkSync and guard activeContinuation during sync calls', async function() {
+        const env = new Env();
+        env.allocateScratchMemory = () => 0x1000;
+        env.freeScratchMemory = () => {};
+        env.memory = new WebAssembly.Memory({ initial: 1 });
+        env.flushStdout = () => {};
+        env.useJSPI = true;
+        env.jspiMode = 'auto';
+        env.syncFuncSet = new Set([ 200 ]);
+
+        let syncCalls = 0, asyncCalls = 0;
+        let observedContDuringSync = 'uncalled';
+        env.runThunkSync = () => {
+          syncCalls++;
+          observedContDuringSync = env.activeContinuation;
+          return true;
+        };
+        env.runThunk = async () => {
+          asyncCalls++;
+          return true;
+        };
+
+        const Arg = function() {
+          this[MEMORY] = new DataView(new ArrayBuffer(16));
+          this[MEMORY][ALIGN] = 4;
+          this.retval = 77;
+        };
+        const thunk = { [MEMORY]: env.obtainZigView(usize(100), 0) };
+        const syncFn = Object.assign(() => {}, { [MEMORY]: env.obtainZigView(usize(200), 0) });
+        defineProperty(syncFn, 'name', { value: 'pureAdd' });
+        const asyncFn = Object.assign(() => {}, { [MEMORY]: env.obtainZigView(usize(201), 0) });
+        defineProperty(asyncFn, 'name', { value: 'ioRead' });
+
+        // Reentrant sync call while an outer JSPI continuation is active
+        const outerCont = { id: 'outer' };
+        env.activeContinuation = outerCont;
+        const syncRes = env.invokeThunk(thunk, syncFn, new Arg());
+        expect(syncRes).to.equal(77);
+        expect(syncCalls).to.equal(1);
+        expect(asyncCalls).to.equal(0);
+        expect(observedContDuringSync).to.be.null;
+        expect(env.activeContinuation).to.equal(outerCont);
+
+        // Non-sync function slot dispatches via async runThunk
+        const asyncRes = env.invokeThunk(thunk, asyncFn, new Arg());
+        expect(asyncRes).to.be.an.instanceOf(Promise);
+        expect(await asyncRes).to.equal(77);
+        expect(asyncCalls).to.equal(1);
+
+        // Explicit asyncExportSet overrides syncFuncSet for listed names
+        env.asyncExportSet = new Set([ 'pureAdd' ]);
+        const forcedAsync = env.invokeThunk(thunk, syncFn, new Arg());
+        expect(forcedAsync).to.be.an.instanceOf(Promise);
+        expect(await forcedAsync).to.equal(77);
+        env.asyncExportSet = null;
+
+        // jspiMode === 'all' forces async for runtime calls, but comptime (acquireStructures) still uses runThunkSync
+        env.jspiMode = 'all';
+        expect(env.invokeThunk(thunk, syncFn, new Arg())).to.be.an.instanceOf(Promise);
+        env.comptime = true;
+        expect(env.invokeThunk(thunk, syncFn, new Arg())).to.equal(77);
+        env.comptime = false;
+
+        // activeContinuation is restored even if runThunkSync throws
+        env.jspiMode = 'auto';
+        env.runThunkSync = () => {
+          expect(env.activeContinuation).to.be.null;
+          throw new Error('sync trap');
+        };
+        expect(() => env.invokeThunk(thunk, syncFn, new Arg())).to.throw('sync trap');
+        expect(env.activeContinuation).to.equal(outerCont);
+      })
     }
   })
 })

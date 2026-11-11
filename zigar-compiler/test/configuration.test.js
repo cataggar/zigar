@@ -12,6 +12,7 @@ import {
   loadConfigFile,
   optionsForCompile,
   optionsForTranspile,
+  processConfig,
 } from '../src/configuration.js';
 
 describe('Configuration', function() {
@@ -52,6 +53,41 @@ describe('Configuration', function() {
       expect(options).to.eql({
         useWazig: true,
       });
+    })
+    it('should extract useJSPI and continuationStackSize options', function() {
+      expect(extractOptions(
+        new URL('file:///hello.zig?use-jspi=1&continuation-stack-size=65536').searchParams,
+        optionsForTranspile,
+      )).to.eql({ useJSPI: true, continuationStackSize: 65536 });
+      expect(extractOptions(
+        new URL('file:///hello.zig?use-jspi=all').searchParams,
+        optionsForTranspile,
+      )).to.eql({ useJSPI: 'all' });
+      expect(extractOptions(
+        new URL('file:///hello.zig?use-jspi=auto').searchParams,
+        optionsForTranspile,
+      )).to.eql({ useJSPI: 'auto' });
+      expect(extractOptions(
+        new URL('file:///hello.zig?use-jspi=asyncFn,otherAsync').searchParams,
+        optionsForTranspile,
+      )).to.eql({ useJSPI: [ 'asyncFn', 'otherAsync' ] });
+      expect(extractOptions(
+        new URL('file:///hello.zig?use-jspi=0').searchParams,
+        optionsForTranspile,
+      )).to.eql({ useJSPI: false });
+    })
+    it('should validate useJSPI and continuationStackSize in processConfig', function() {
+      expect(processConfig({ useJSPI: true, continuationStackSize: 32768 }, '/cfg.json', optionsForTranspile))
+        .to.eql({ useJSPI: true, continuationStackSize: 32768 });
+      expect(processConfig({ useJSPI: 'all' }, '/cfg.json', optionsForTranspile))
+        .to.eql({ useJSPI: 'all' });
+      expect(processConfig({ useJSPI: 'auto' }, '/cfg.json', optionsForTranspile))
+        .to.eql({ useJSPI: 'auto' });
+      expect(processConfig({ useJSPI: [ 'foo', 'bar' ] }, '/cfg.json', optionsForTranspile))
+        .to.eql({ useJSPI: [ 'foo', 'bar' ] });
+      expect(() => processConfig({ useJSPI: 123 }, '/cfg.json', optionsForTranspile)).to.throw();
+      expect(() => processConfig({ useJSPI: 'invalid' }, '/cfg.json', optionsForTranspile)).to.throw();
+      expect(() => processConfig({ useJSPI: [ 42 ] }, '/cfg.json', optionsForTranspile)).to.throw();
     })
     it('should extract numeric options', function() {
       const { searchParams } = new URL('file:///home/someone/hello.zig?boo=100');

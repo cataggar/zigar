@@ -4,7 +4,12 @@ import { defineEnvironment } from '../../zigar-runtime/src/environment.js';
 import * as mixins from '../../zigar-runtime/src/mixins.js';
 import { generateCode } from './code-generation.js';
 import { compile } from './compilation.js';
-import { ensureStackPointerExport, extractLimits, stripUnused } from './wasm-decoding.js';
+import {
+  analyzeJspiSyncFunctions,
+  ensureStackPointerExport,
+  extractLimits,
+  stripUnused,
+} from './wasm-decoding.js';
 
 export async function transpile(srcPath, options) {
   const {
@@ -28,7 +33,8 @@ export async function transpile(srcPath, options) {
   Object.assign(compileOptions, { arch: 'wasm32', platform: 'wasi', isWASM: true });
   const { outputPath, sourcePaths } = await compile(srcPath, null, compileOptions);
   const content = await readFile(outputPath);
-  const { memoryMax, memoryInitial, tableInitial } = extractLimits(new DataView(content.buffer));
+  const rawDV = new DataView(content.buffer, content.byteOffset, content.byteLength);
+  const { memoryMax, memoryInitial, tableInitial } = extractLimits(rawDV);
   const { multithreaded = false } = compileOptions;
   const moduleOptions = {
     memoryMax,
@@ -37,7 +43,7 @@ export async function transpile(srcPath, options) {
     multithreaded,
   };
   if (useJSPI) {
-    moduleOptions.useJSPI = true;
+    moduleOptions.useJSPI = useJSPI;
   }
   if (continuationStackSize !== undefined) {
     moduleOptions.continuationStackSize = continuationStackSize;
@@ -72,7 +78,10 @@ export async function transpile(srcPath, options) {
   const runtimeURL = moduleResolver('zigar-runtime');
   let binarySource;
   if (env.hasMethods()) {
-    let dv = new DataView(content.buffer);
+    if (useJSPI && useJSPI !== 'all') {
+      moduleOptions.syncFunctions = analyzeJspiSyncFunctions(rawDV);
+    }
+    let dv = rawDV;
     if (stripWASM) {
       dv = stripUnused(dv, { keepNames });
     } else {

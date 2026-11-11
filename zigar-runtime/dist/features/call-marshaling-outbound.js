@@ -118,9 +118,37 @@ var callMarshalingOutbound = mixin({
     if (isAsync) {
       argStruct[FINALIZE] = finalize;
     }
-    const success = (attrs)
-    ? this.runVariadicThunk(thunkAddress, fnAddress, argAddress, attrAddress, attrs.length)
-    : this.runThunk(thunkAddress, fnAddress, argAddress);
+    const runnerName = (attrs) ? 'runVariadicThunk' : 'runThunk';
+    const syncRunner = this[`${runnerName}Sync`] ;
+    let useSyncRunner = false;
+    if (syncRunner) {
+      if (this.comptime) {
+        useSyncRunner = true;
+      } else if (this.useJSPI && this.jspiMode !== 'all' && !this.customWASI) {
+        const fnSlot = Number(fnAddress);
+        if (this.asyncExportSet) {
+          useSyncRunner = !this.asyncExportSet.has(fn.name) && (!this.syncFuncSet || this.syncFuncSet.has(fnSlot));
+        } else if (this.syncFuncSet) {
+          useSyncRunner = this.syncFuncSet.has(fnSlot);
+        }
+      }
+    }
+    let success;
+    if (useSyncRunner) {
+      const prevContinuation = this.activeContinuation;
+      this.activeContinuation = null;
+      try {
+        success = (attrs)
+          ? this.runVariadicThunkSync(thunkAddress, fnAddress, argAddress, attrAddress, attrs.length)
+          : this.runThunkSync(thunkAddress, fnAddress, argAddress);
+      } finally {
+        this.activeContinuation = prevContinuation;
+      }
+    } else {
+      success = (attrs)
+        ? this.runVariadicThunk(thunkAddress, fnAddress, argAddress, attrAddress, attrs.length)
+        : this.runThunk(thunkAddress, fnAddress, argAddress);
+    }
     const finishCall = (success) => {
       if (!success) {
         if (!finalized) {

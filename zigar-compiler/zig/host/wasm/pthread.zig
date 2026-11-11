@@ -1,5 +1,5 @@
 const std = @import("std");
-const wasm_allocator = std.heap.wasm_allocator;
+const wasm_allocator = @import("../../type/sharded-allocator.zig").allocator;
 const builtin = @import("builtin");
 const io = @import("../../system.zig").io;
 
@@ -163,14 +163,16 @@ const Pthread = struct {
 
     pub fn performExitCleanup(self: *@This()) void {
         // call destructors inserted by pthread_key_create()
-        _ = pthread_spin_lock(&key_list_spinlock);
-        defer _ = pthread_spin_unlock(&key_list_spinlock);
-        for (key_list.items, 0..) |item, index| {
-            if (!item.deleted) {
-                if (item.destructor) |destroy| {
-                    if (index < key_value_list.items.len) {
-                        if (key_value_list.items[index]) |ptr| {
-                            destroy(ptr);
+        {
+            _ = pthread_spin_lock(&key_list_spinlock);
+            defer _ = pthread_spin_unlock(&key_list_spinlock);
+            for (key_list.items, 0..) |item, index| {
+                if (!item.deleted) {
+                    if (item.destructor) |destroy| {
+                        if (index < key_value_list.items.len) {
+                            if (key_value_list.items[index]) |ptr| {
+                                destroy(ptr);
+                            }
                         }
                     }
                 }
@@ -179,6 +181,7 @@ const Pthread = struct {
         key_value_list.deinit(wasm_allocator);
         // remove from list if it's detached
         if (self.state.load(.unordered) == .detached) {
+            current = null;
             self.ref.dec();
         }
     }
@@ -1394,7 +1397,7 @@ pub fn pthread_spin_unlock(
 ) callconv(.c) c_int {
     const thread_id = pthread_self();
     const lock_value: pthread_spinlock_t = @bitCast(thread_id);
-    if (@cmpxchgWeak(pthread_spinlock_t, lock, lock_value, 0, .acq_rel, .monotonic) != null) {
+    if (@cmpxchgStrong(pthread_spinlock_t, lock, lock_value, 0, .acq_rel, .monotonic) != null) {
         return errno(.PERM);
     }
     return 0;
@@ -1680,13 +1683,13 @@ const PTHREAD_CANCELED: *anyopaque = @ptrFromInt(std.math.maxInt(usize));
 const SEM_FAILED: [*c]sem_t = @ptrFromInt(0);
 
 fn errno(e: std.posix.E) u16 {
-    return @intFromEnum(e);
+    return @backingInt(e);
 }
 
 fn semErrno(e: std.posix.E, retval: anytype) rv_type: {
     const T = @TypeOf(retval);
     break :rv_type if (T == comptime_int) c_int else T;
 } {
-    std.c._errno().* = @intFromEnum(e);
+    std.c._errno().* = @backingInt(e);
     return retval;
 }

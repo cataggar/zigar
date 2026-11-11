@@ -1,11 +1,12 @@
 import { expect, use } from 'chai';
 import chaiAsPromised from 'chai-as-promised';
-import { parse } from 'path';
-import { fileURLToPath } from 'url';
+import { mkdirSync, rmSync } from 'fs';
+import { writeFile } from 'fs/promises';
+import { dirname, join, parse, resolve } from 'path';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 use(chaiAsPromised);
 
-import { writeFile } from 'fs/promises';
 import { transpile } from '../src/transpilation.js';
 
 describe('Transpilation', function() {
@@ -176,6 +177,116 @@ describe('Transpilation', function() {
       const { code } = await transpile(path, options);
       expect(code).to.contain('"useJSPI":true');
       expect(code).to.contain('"continuationStackSize":131072');
+      expect(code).to.contain('"syncFunctions":[');
+
+      const { code: allCode } = await transpile(path, { ...options, useJSPI: 'all' });
+      expect(allCode).to.contain('"useJSPI":"all"');
+      expect(allCode).to.not.contain('"syncFunctions"');
+    })
+    it('should execute pure exports synchronously and callback exports across 16 concurrent JSPI fibers when useJSPI is true', async function() {
+      if (typeof WebAssembly.Suspending !== 'function' || typeof WebAssembly.promising !== 'function') {
+        this.skip();
+      }
+      const __dirname = dirname(fileURLToPath(import.meta.url));
+      const servicePath = fileURLToPath(new URL('./zig-samples/wit-zigar/service.zig', import.meta.url));
+      const runtimeSrcDir = resolve(__dirname, '../../zigar-runtime/src');
+      const tmpBase = process.env.TMPDIR || resolve(__dirname, '../../.cache/tmp');
+      const outDir = join(tmpBase, `transpile-selective-jspi-${process.pid}`);
+      mkdirSync(outDir, { recursive: true });
+      let serviceMod, listMod;
+      try {
+        const loadTranspiled = async (useJSPI, tag) => {
+          const { code } = await transpile(servicePath, {
+            optimize: 'ReleaseSmall',
+            embedWASM: true,
+            stripWASM: true,
+            useWazig: true,
+            useJSPI,
+            continuationStackSize: 8192,
+            buildDir: join(outDir, `build-${tag}`),
+          });
+          const resolvedCode = code
+            .replace(
+              /from\s+["']zigar-runtime["']/g,
+              `from ${JSON.stringify(pathToFileURL(join(runtimeSrcDir, 'index.js')).href)}`,
+            )
+            .replace(
+              /import\s+["']zigar-runtime\/([^"']+)["']/g,
+              (_, subPath) => `import ${JSON.stringify(pathToFileURL(join(runtimeSrcDir, subPath)).href)}`,
+            );
+          const mjsPath = join(outDir, `service-${tag}-${Date.now()}.mjs`);
+          await writeFile(mjsPath, resolvedCode, 'utf8');
+          return import(pathToFileURL(mjsPath).href);
+        };
+
+        serviceMod = await loadTranspiled(true, 'auto');
+        // Pure Zig exports return synchronously (NOT instanceof Promise), while `await` still works
+        const syncMagic = serviceMod.getZigarAbiMagic();
+        expect(syncMagic).to.not.be.an.instanceOf(Promise);
+        expect(syncMagic).to.equal(0x5241475a);
+
+        const syncRect = serviceMod.transformRect(
+          { origin: { x: 2, y: 3 }, size: { x: 4, y: 5 } },
+          1,
+          -1,
+          2,
+        );
+        expect(syncRect).to.not.be.an.instanceOf(Promise);
+        expect(syncRect.origin.x).to.equal(3);
+        expect(syncRect.origin.y).to.equal(2);
+        expect(syncRect.size.x).to.equal(8);
+        expect(syncRect.size.y).to.equal(10);
+
+        const awaitedRect = await serviceMod.transformRect(
+          { origin: { x: 2, y: 3 }, size: { x: 4, y: 5 } },
+          1,
+          -1,
+          2,
+        );
+        expect(awaitedRect.origin.x).to.equal(3);
+
+        // Callback/suspending export returns a Promise and suspends/resumes across 16 concurrent JSPI fibers
+        serviceMod.resetConcurrencyStats();
+        const hostCallback = async (taskSeq, delayMs) => {
+          // Reentrantly call a synchronous Zig export while inside an active JSPI callback
+          expect(serviceMod.getZigarAbiMagic()).to.equal(0x5241475a);
+          await new Promise(r => setTimeout(r, delayMs));
+          expect(serviceMod.getZigarAbiMagic()).to.equal(0x5241475a);
+          return ((taskSeq & 0xff) << 16) | (taskSeq * 3);
+        };
+        const promises = Array.from({ length: 16 }, (_, idx) => {
+          const delayMs = 5 + ((15 - idx) % 5) * 4;
+          return serviceMod.asyncComputeWithHost(
+            { origin: { x: idx, y: idx * 2 }, size: { x: 10, y: 20 } },
+            delayMs,
+            hostCallback,
+          );
+        });
+        for (const p of promises) {
+          expect(p).to.be.an.instanceOf(Promise);
+        }
+        const reports = await Promise.all(promises);
+        expect(reports).to.have.lengthOf(16);
+        const spSet = new Set(reports.map(r => r.sp_before));
+        expect(spSet.size).to.equal(16);
+        expect(serviceMod.getPeakConcurrent()).to.equal(16);
+
+        // Explicit string[] mode: listed pure export returns Promise while unlisted pure export stays sync
+        listMod = await loadTranspiled([ 'transformRect', 'asyncComputeWithHost' ], 'list');
+        expect(listMod.getZigarAbiMagic()).to.equal(0x5241475a);
+        const forcedAsyncRect = listMod.transformRect(
+          { origin: { x: 1, y: 2 }, size: { x: 3, y: 4 } },
+          0,
+          0,
+          1,
+        );
+        expect(forcedAsyncRect).to.be.an.instanceOf(Promise);
+        expect((await forcedAsyncRect).size.y).to.equal(4);
+      } finally {
+        await serviceMod?.__zigar?.abandon();
+        await listMod?.__zigar?.abandon();
+        rmSync(outDir, { recursive: true, force: true });
+      }
     })
 
   })

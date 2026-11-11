@@ -65,14 +65,19 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
         pub const InitError = @typeInfo(InitResult).error_union.error_set;
 
         pub fn init(self: *@This(), options: Options) !void {
-            switch (self.status) {
-                .uninitialized => {},
-                .initialized => return,
-                .deinitializing => return error.Deinitializing,
+            while (true) {
+                const prev = @cmpxchgStrong(Status, &self.status, .uninitialized, .initializing, .acq_rel, .acquire) orelse break;
+                switch (prev) {
+                    .uninitialized => unreachable,
+                    .initializing => std.atomic.spinLoopHint(),
+                    .initialized => return,
+                    .deinitializing => return error.Deinitializing,
+                }
             }
             const allocator = options.allocator;
             self.queue = .init(allocator, system.io);
-            self.init_remaining = options.n_jobs;
+            @atomicStore(usize, &self.thread_count, options.n_jobs, .monotonic);
+            @atomicStore(usize, &self.init_remaining, options.n_jobs, .monotonic);
             self.init_futex = std.atomic.Value(u32).init(0);
             self.init_result = {};
             self.init_promise = null;
@@ -80,15 +85,26 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
             if (@hasDecl(internal_ns, "onQueueInit")) {
                 const result = @call(.auto, internal_ns.onQueueInit, .{});
                 switch (@typeInfo(@TypeOf(result))) {
-                    .error_union => if (result) |_| {} else |err| return err,
+                    .error_union => if (result) |_| {} else |err| {
+                        self.queue.deinit();
+                        @atomicStore(Status, &self.status, .uninitialized, .release);
+                        return err;
+                    },
                     else => {},
                 }
             }
+            var spawned: usize = 0;
             errdefer {
-                if (@hasDecl(internal_ns, "onQueueDeinit")) {
-                    _ = @call(.auto, internal_ns.onQueueDeinit, .{});
-                }
+                const unspawned = options.n_jobs - spawned;
+                @atomicStore(Status, &self.status, .deinitializing, .release);
                 self.queue.stop();
+                if (@atomicRmw(usize, &self.thread_count, .Sub, unspawned, .acq_rel) == unspawned) {
+                    self.queue.deinit();
+                    if (@hasDecl(internal_ns, "onQueueDeinit")) {
+                        _ = @call(.auto, internal_ns.onQueueDeinit, .{});
+                    }
+                    @atomicStore(Status, &self.status, .uninitialized, .release);
+                }
             }
             const min_stack_size: usize = if (std.Thread.use_pthreads) switch (@bitSizeOf(usize)) {
                 32 => 4096,
@@ -105,9 +121,12 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
                     options.thread_end_params,
                 });
                 thread.detach();
-                self.thread_count += 1;
+                spawned += 1;
             }
-            self.status = .initialized;
+            if (options.n_jobs == 0) {
+                self.init_futex.store(1, .release);
+            }
+            _ = @cmpxchgStrong(Status, &self.status, .initializing, .initialized, .acq_rel, .acquire);
         }
 
         pub fn wait(self: *@This()) WaitResult {
@@ -124,40 +143,44 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
         }
 
         pub fn deinitAsync(self: *@This(), promise: ?Promise(void)) void {
-            switch (self.status) {
-                .initialized => {},
-                else => {
-                    if (promise) |p| p.resolve({});
-                    return;
-                },
+            while (true) {
+                const prev = @cmpxchgStrong(Status, &self.status, .initialized, .deinitializing, .acq_rel, .acquire) orelse break;
+                switch (prev) {
+                    .initialized => unreachable,
+                    .initializing => std.atomic.spinLoopHint(),
+                    .uninitialized, .deinitializing => {
+                        if (promise) |p| p.resolve({});
+                        return;
+                    },
+                }
             }
             self.deinit_promise = promise;
-            self.status = .deinitializing;
             self.queue.stop();
         }
 
         pub fn push(self: *@This(), comptime func: anytype, args: ArgsOf(func), dest: ?PromiseOrGenerator(func)) Error!void {
-            switch (self.status) {
-                .initialized => {},
-                else => {
-                    // see if we can do initialize automatically
-                    const can_auto_init = check: {
-                        if (@typeInfo(ThreadStartParams).@"struct".field_names.len > 0) break :check false;
-                        if (@typeInfo(ThreadEndParams).@"struct".field_names.len > 0) break :check false;
-                        if (self.status != .uninitialized) break :check false;
-                        break :check true;
-                    };
-                    if (can_auto_init) {
-                        self.init(.{ .n_jobs = 1 }) catch |err| {
-                            return switch (err) {
-                                error.OutOfMemory => error.OutOfMemory,
-                                else => error.Unexpected,
+            while (true) {
+                switch (@atomicLoad(Status, &self.status, .acquire)) {
+                    .initialized => break,
+                    .initializing => std.atomic.spinLoopHint(),
+                    .uninitialized => {
+                        // see if we can do initialize automatically
+                        const can_auto_init = comptime (@typeInfo(ThreadStartParams).@"struct".field_names.len == 0 and
+                            @typeInfo(ThreadEndParams).@"struct".field_names.len == 0);
+                        if (can_auto_init) {
+                            self.init(.{ .n_jobs = 1 }) catch |err| {
+                                return switch (err) {
+                                    error.OutOfMemory => error.OutOfMemory,
+                                    else => error.Unexpected,
+                                };
                             };
-                        };
-                    } else {
-                        return error.Unexpected;
-                    }
-                },
+                            break;
+                        } else {
+                            return error.Unexpected;
+                        }
+                    },
+                    .deinitializing => return error.Unexpected,
+                }
             }
             const key = comptime enumOf(func);
             const fieldName = @tagName(key);
@@ -170,7 +193,7 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
         }
 
         pub fn clear(self: *@This()) void {
-            switch (self.status) {
+            switch (@atomicLoad(Status, &self.status, .acquire)) {
                 .initialized => {},
                 else => return,
             }
@@ -292,11 +315,12 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
         }
 
         const def_allocator = switch (builtin.target.cpu.arch.isWasm()) {
-            true => std.heap.wasm_allocator,
+            true => @import("sharded-allocator.zig").allocator,
             false => std.heap.c_allocator,
         };
-        const Status = enum {
+        const Status = enum(u8) {
             uninitialized,
+            initializing,
             initialized,
             deinitializing,
         };
@@ -386,39 +410,49 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
                     }
                 }
             }
-            if (@atomicRmw(usize, &self.init_remaining, .Sub, 1, .monotonic) == 1) {
+            if (@atomicRmw(usize, &self.init_remaining, .Sub, 1, .acq_rel) == 1) {
                 if (@typeInfo(WaitResult) != .error_union or !std.meta.isError(self.init_result)) {
                     self.init_futex.store(1, .release);
                     std.Io.futexWake(system.io, u32, &self.init_futex.raw, std.math.maxInt(u32));
                     if (self.init_promise) |promise| promise.resolve(self.init_result);
                 } else {
                     // delay reporting error until threads have stopped
+                    while (true) {
+                        const cur = @atomicLoad(Status, &self.status, .acquire);
+                        if (cur == .deinitializing) break;
+                        if (@cmpxchgWeak(Status, &self.status, cur, .deinitializing, .acq_rel, .acquire) == null) break;
+                    }
                     self.queue.stop();
                 }
             }
             while (true) {
-                if (self.queue.pull()) |item| {
-                    invokeFunction(item);
-                } else switch (self.queue.stopped) {
-                    false => self.queue.wait(),
-                    true => break,
+                switch (self.queue.pullOrSnapshot()) {
+                    .item => |item| invokeFunction(item),
+                    .empty => |seq| self.queue.waitFor(seq),
+                    .stopped => break,
                 }
             }
             if (@hasDecl(ns, "onThreadEnd")) {
                 if (start_succeeded) _ = @call(.auto, ns.onThreadEnd, thread_end_params);
             }
-            if (@atomicRmw(usize, &self.thread_count, .Sub, 1, .monotonic) == 1) {
+            if (@atomicRmw(usize, &self.thread_count, .Sub, 1, .acq_rel) == 1) {
                 self.queue.deinit();
-                self.status = .uninitialized;
-                if (@typeInfo(WaitResult) == .error_union and std.meta.isError(self.init_result)) {
-                    self.init_futex.store(1, .release);
-                    std.Io.futexWake(system.io, u32, &self.init_futex.raw, std.math.maxInt(u32));
-                    if (self.init_promise) |promise| promise.resolve(self.init_result);
-                }
-                if (self.deinit_promise) |promise| promise.resolve({});
+                const init_result = self.init_result;
+                const init_promise = self.init_promise;
+                const deinit_promise = self.deinit_promise;
                 if (@hasDecl(internal_ns, "onQueueDeinit")) {
                     _ = @call(.auto, internal_ns.onQueueDeinit, .{});
                 }
+                const has_init_err = @typeInfo(WaitResult) == .error_union and std.meta.isError(init_result);
+                if (has_init_err) {
+                    self.init_futex.store(1, .release);
+                    std.Io.futexWake(system.io, u32, &self.init_futex.raw, std.math.maxInt(u32));
+                }
+                @atomicStore(Status, &self.status, .uninitialized, .release);
+                if (has_init_err) {
+                    if (init_promise) |promise| promise.resolve(init_result);
+                }
+                if (deinit_promise) |promise| promise.resolve({});
             }
         }
 
@@ -441,8 +475,13 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
 }
 
 test "WorkQueue.push()" {
+    if (builtin.single_threaded) return error.SkipZigTest;
     var thread_io = std.Io.Threaded.init_single_threaded;
-    system.io = thread_io.io();
+    if (@TypeOf(&system.io) == *std.Io) {
+        system.io = thread_io.io();
+    } else {
+        _ = &thread_io;
+    }
     const test_ns = struct {
         var total: i32 = 0;
 
@@ -472,8 +511,13 @@ test "WorkQueue.push()" {
 }
 
 test "WorkQueue.promisify()" {
+    if (builtin.single_threaded) return error.SkipZigTest;
     var thread_io = std.Io.Threaded.init_single_threaded;
-    system.io = thread_io.io();
+    if (@TypeOf(&system.io) == *std.Io) {
+        system.io = thread_io.io();
+    } else {
+        _ = &thread_io;
+    }
     const test_ns1 = struct {
         var total: i32 = 0;
 
@@ -530,4 +574,55 @@ test "WorkQueue.promisify()" {
     try expectEqual(1234, test_ns2.hello_result);
     try expectEqual(false, test_ns2.world_result);
     test_ns2.deinit();
+}
+
+test "WorkQueue: multi-worker burst across ring resizes and re-init" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var thread_io = std.Io.Threaded.init_single_threaded;
+    if (@TypeOf(&system.io) == *std.Io) {
+        system.io = thread_io.io();
+    } else {
+        _ = &thread_io;
+    }
+    const item_count: usize = 500;
+    const test_ns = struct {
+        var sum: std.atomic.Value(usize) = .init(0);
+        var done_count: std.atomic.Value(usize) = .init(0);
+        var done_futex: std.atomic.Value(u32) = .init(0);
+
+        pub fn add(num: usize) void {
+            _ = sum.fetchAdd(num, .acq_rel);
+            if (done_count.fetchAdd(1, .acq_rel) + 1 == item_count) {
+                done_futex.store(1, .release);
+                std.Io.futexWake(system.io, u32, &done_futex.raw, 1);
+            }
+        }
+
+        fn onShutdown(futex: *std.atomic.Value(u32), _: void) void {
+            futex.store(1, .release);
+            std.Io.futexWake(system.io, u32, &futex.raw, 1);
+        }
+    };
+    var wq: WorkQueue(test_ns, struct {}) = .{};
+    for (0..2) |_| {
+        test_ns.sum.store(0, .release);
+        test_ns.done_count.store(0, .release);
+        test_ns.done_futex.store(0, .release);
+
+        try wq.init(.{ .allocator = std.testing.allocator, .n_jobs = 4 });
+        wq.wait();
+
+        for (1..item_count + 1) |i| {
+            try wq.push(test_ns.add, .{i}, null);
+        }
+        while (test_ns.done_count.load(.acquire) < item_count) {
+            std.Io.futexWaitUncancelable(system.io, u32, &test_ns.done_futex.raw, 0);
+        }
+        try expectEqual(item_count * (item_count + 1) / 2, test_ns.sum.load(.acquire));
+
+        var shutdown_futex: std.atomic.Value(u32) = .init(0);
+        wq.deinitAsync(.init(&shutdown_futex, test_ns.onShutdown));
+        std.Io.futexWaitUncancelable(system.io, u32, &shutdown_futex.raw, 0);
+        try expectEqual(.uninitialized, @atomicLoad(@TypeOf(wq.status), &wq.status, .acquire));
+    }
 }

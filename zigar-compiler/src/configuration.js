@@ -123,6 +123,18 @@ export const optionsForTranspile = {
     type: 'boolean',
     title: 'Provide emulated pthread functions',
   },
+  useJSPI: {
+    anyOf: [
+      { type: 'boolean' },
+      { type: 'string', enum: [ 'all', 'auto' ] },
+      { type: 'array', items: { type: 'string' } },
+    ],
+    title: 'Use JavaScript Promise Integration (JSPI)',
+  },
+  continuationStackSize: {
+    type: 'number',
+    title: 'Size of each JSPI continuation stack in bytes',
+  },
 };
 
 const allOptions = {
@@ -141,6 +153,16 @@ export function extractOptions(searchParams, availableOptions) {
     }
     if (key === 'optimize') {
       options[key] = getCamelCase(string, [ 'Debug', 'ReleaseSafe', 'ReleaseFast', 'ReleaseSmall' ]);
+    } else if (key === 'useJSPI') {
+      if (string === '1' || string === 'true') {
+        options[key] = true;
+      } else if (string === '0' || string === 'false' || string === '') {
+        options[key] = false;
+      } else if (string === 'all' || string === 'auto') {
+        options[key] = string;
+      } else {
+        options[key] = string.split(',').map(s => s.trim()).filter(Boolean);
+      }
     } else {
       switch (option.type) {
         case 'boolean':
@@ -194,6 +216,23 @@ export async function loadConfigFile(cfgPath, availableOptions) {
   return processConfig(json, cfgPath, availableOptions);
 }
 
+function matchesOptionSchema(value, schema) {
+  if (schema.anyOf) {
+    return schema.anyOf.some(s => matchesOptionSchema(value, s));
+  }
+  if (schema.type === 'array') {
+    if (!Array.isArray(value)) return false;
+    return !schema.items || value.every(item => matchesOptionSchema(item, schema.items));
+  }
+  if (typeof(value) !== schema.type) {
+    return false;
+  }
+  if (schema.enum && !schema.enum.includes(value)) {
+    return false;
+  }
+  return true;
+}
+
 export function processConfig(object, cfgPath, availableOptions) {
   const options = {};
   for (let [ key, value ] of Object.entries(object)) {
@@ -201,8 +240,9 @@ export function processConfig(object, cfgPath, availableOptions) {
     if (!option) {
       throw new UnknownOption(key);
     }
-    if (typeof(value) !== option.type) {
-      throw new Error(`${key} is expected to be a ${option.type}, received: ${value}`);
+    if (!matchesOptionSchema(value, option)) {
+      const expected = option.type ?? option.anyOf.map(s => s.type).join('|');
+      throw new Error(`${key} is expected to be a ${expected}, received: ${value}`);
     }
     if (key === 'sourceFiles') {
       const modules = {};

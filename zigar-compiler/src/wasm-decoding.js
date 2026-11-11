@@ -21,6 +21,16 @@ export const ObjectType = {
   Memory: 2,
   Global: 3,
 };
+export const PURE_SYNC_WASI_IMPORTS = new Set([
+  'clock_res_get',
+  'clock_time_get',
+  'environ_get',
+  'environ_sizes_get',
+  'random_get',
+  'fd_fdstat_get',
+  'fd_prestat_get',
+  'fd_prestat_dir_name',
+]);
 
 export function stripUnused(binary, options = {}) {
   const {
@@ -537,6 +547,7 @@ export function extractLimits(binary) {
   const {
     eof,
     skip,
+    readBytes,
     readU8,
     readU32,
     readString,
@@ -553,52 +564,297 @@ export function extractLimits(binary) {
   if (version !== Version) {
     throw new Error(`Incorrect version: ${version}`);
   }
-  let memoryInitial, memoryMax, tableInitial, done = false;
-  while(!eof() && !done) {
+  let memoryInitial, memoryMax, tableInitial;
+  let definedMemoryInitial, definedMemoryMax;
+  let memory64 = false, table64 = false;
+  while (!eof()) {
     const type = readU8();
     const len = readU32Leb128();
     if (type === SectionType.Import) {
-      const count = readU32Leb128();
-      for (let i = 0; i < count && !done; i++) {
-        const module = readString();
-        const name = readString();
-        const type = readU8();
-        switch (type) {
+      const sub = createReader(readBytes(len));
+      const count = sub.readU32Leb128();
+      for (let i = 0; i < count; i++) {
+        const module = sub.readString();
+        const name = sub.readString();
+        const objType = sub.readU8();
+        switch (objType) {
           /* c8 ignore next 3 */
           case ObjectType.Function: {
-            readU32Leb128();
+            sub.readU32Leb128();
           } break;
           case ObjectType.Table: {
-            readU8();
-            const { min } = readLimits();
+            sub.readU8();
+            const { flags, min } = sub.readLimits();
             if (module === 'env' && name === '__indirect_function_table') {
               tableInitial = min;
+              if (flags & 0x04) {
+                table64 = true;
+              }
             }
           } break;
           case ObjectType.Memory: {
-            const { min, max } = readLimits();
+            const { flags, min, max } = sub.readLimits();
             if (module === 'env' && name === 'memory') {
               memoryInitial = min;
               memoryMax = max;
+              if (flags & 0x04) {
+                memory64 = true;
+              }
             }
           } break;
           /* c8 ignore next 4 */
           case ObjectType.Global: {
-            readU8();
-            readU8();
+            sub.readU8();
+            sub.readU8();
           } break;
           /* c8 ignore next 3 */
           default: {
-            throw new Error(`Unknown object type: ${type}`);
+            throw new Error(`Unknown object type: ${objType}`);
           }
         }
       }
-      done = tableInitial !== undefined && memoryInitial !== undefined;
+    } else if (type === SectionType.Table) {
+      const sub = createReader(readBytes(len));
+      const count = sub.readU32Leb128();
+      if (count > 0) {
+        const b0 = sub.readU8();
+        if (b0 === 0x40) {
+          sub.readU8();
+          sub.readU8();
+        }
+        const { flags } = sub.readLimits();
+        if (flags & 0x04) {
+          table64 = true;
+        }
+      }
+    } else if (type === SectionType.Memory) {
+      const sub = createReader(readBytes(len));
+      const count = sub.readU32Leb128();
+      if (count > 0) {
+        const { flags, min, max } = sub.readLimits();
+        definedMemoryInitial = min;
+        definedMemoryMax = max;
+        if (flags & 0x04) {
+          memory64 = true;
+        }
+      }
+      break;
     } else {
       skip(len);
+      if (type > SectionType.Memory && type !== SectionType.Custom) {
+        break;
+      }
     }
   }
-  return { memoryMax, memoryInitial, tableInitial };
+  return {
+    memoryMax,
+    memoryInitial,
+    tableInitial,
+    definedMemoryInitial,
+    definedMemoryMax,
+    memory64,
+    table64,
+  };
+}
+
+function isSuspendingImport(module, name) {
+  if (module === 'wasi_snapshot_preview1' && (name === 'proc_exit' || PURE_SYNC_WASI_IMPORTS.has(name))) {
+    return false;
+  }
+  if (module === 'env' && name !== '_handleJscall' && name !== '_futexWaitAsync') {
+    return false;
+  }
+  return true;
+}
+
+function evalConstOffsetExpr(expr) {
+  const { decodeNext } = createDecoder(createReader(expr));
+  const op1 = decodeNext();
+  const op2 = decodeNext();
+  if (op1 && op2 && op2.opcode === 0x0B) {
+    if (op1.opcode === 0x41 || op1.opcode === 0x42) {
+      return Number(op1.operand);
+    }
+  }
+  return null;
+}
+
+function evalElemFuncExpr(expr) {
+  const { decodeNext } = createDecoder(createReader(expr));
+  let op;
+  while (op = decodeNext()) {
+    if (op.opcode === 0xD2) {
+      return op.operand;
+    }
+    if (op.opcode === 0x0B) {
+      break;
+    }
+  }
+  return undefined;
+}
+
+export function analyzeJspiSyncFunctions(binary) {
+  const { sections } = parseBinary(binary);
+  const importSection = sections.find(s => s.type === SectionType.Import);
+  const funcSection = sections.find(s => s.type === SectionType.Function);
+  const exportSection = sections.find(s => s.type === SectionType.Export);
+  const elemSection = sections.find(s => s.type === SectionType.Element);
+  const codeSection = sections.find(s => s.type === SectionType.Code);
+
+  const funcTypeIndex = [];
+  const importedSuspending = [];
+  if (importSection) {
+    for (const imp of importSection.imports) {
+      if (imp.type === ObjectType.Function) {
+        funcTypeIndex.push(imp.index);
+        importedSuspending.push(isSuspendingImport(imp.module, imp.name));
+      }
+    }
+  }
+  const importFuncCount = funcTypeIndex.length;
+  const internalCount = funcSection ? funcSection.types.length : 0;
+  if (funcSection) {
+    for (const typeIndex of funcSection.types) {
+      funcTypeIndex.push(typeIndex);
+    }
+  }
+  const totalFuncs = funcTypeIndex.length;
+
+  let runThunkIdx = null;
+  let runVariadicThunkIdx = null;
+  if (exportSection) {
+    for (const exp of exportSection.exports) {
+      if (exp.type === ObjectType.Function) {
+        if (exp.name === 'runThunk') {
+          runThunkIdx = exp.index;
+        } else if (exp.name === 'runVariadicThunk') {
+          runVariadicThunkIdx = exp.index;
+        }
+      }
+    }
+  }
+
+  const tableSlotToFuncIndex = new Map();
+  const indirectFuncIndices = new Set();
+  if (elemSection) {
+    for (const seg of elemSection.segments) {
+      const isActiveTable0 = seg.type === 0 || seg.type === 4
+        || ((seg.type === 2 || seg.type === 6) && seg.tableidx === 0);
+      const offset = isActiveTable0 ? evalConstOffsetExpr(seg.expr) : null;
+      if (seg.indices) {
+        for (let i = 0; i < seg.indices.length; i++) {
+          const funcIdx = seg.indices[i];
+          indirectFuncIndices.add(funcIdx);
+          if (offset !== null) {
+            tableSlotToFuncIndex.set(offset + i, funcIdx);
+          }
+        }
+      } else if (seg.entries) {
+        for (let i = 0; i < seg.entries.length; i++) {
+          const funcIdx = evalElemFuncExpr(seg.entries[i]);
+          if (funcIdx !== undefined) {
+            indirectFuncIndices.add(funcIdx);
+            if (offset !== null) {
+              tableSlotToFuncIndex.set(offset + i, funcIdx);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const directCalls = Array.from({ length: totalFuncs }, () => []);
+  const indirectTypes = Array.from({ length: totalFuncs }, () => []);
+  if (codeSection) {
+    for (let i = 0; i < internalCount; i++) {
+      const funcIdx = importFuncCount + i;
+      const code = codeSection.functions[i];
+      if (!code) continue;
+      const { instructions } = parseFunction(code);
+      const callsSet = new Set();
+      const typesSet = new Set();
+      for (const op of instructions) {
+        switch (op.opcode) {
+          case 0x10:
+          case 0x12:
+            callsSet.add(op.operand);
+            break;
+          case 0x11:
+          case 0x13:
+            typesSet.add(op.operand[0]);
+            break;
+          case 0x14:
+          case 0x15:
+            typesSet.add(op.operand);
+            break;
+          case 0xD2:
+            indirectFuncIndices.add(op.operand);
+            break;
+        }
+      }
+      directCalls[funcIdx] = [ ...callsSet ];
+      indirectTypes[funcIdx] = [ ...typesSet ];
+    }
+  }
+
+  const canSuspend = new Uint8Array(totalFuncs);
+  const typeCanSuspend = new Set();
+  for (let f = 0; f < importFuncCount; f++) {
+    if (importedSuspending[f]) {
+      canSuspend[f] = 1;
+      if (indirectFuncIndices.has(f)) {
+        typeCanSuspend.add(funcTypeIndex[f]);
+      }
+    }
+  }
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let f = importFuncCount; f < totalFuncs; f++) {
+      if (canSuspend[f]) continue;
+      let suspends = false;
+      for (const callee of directCalls[f]) {
+        if (canSuspend[callee]) {
+          suspends = true;
+          break;
+        }
+      }
+      if (!suspends) {
+        for (const t of indirectTypes[f]) {
+          if (typeCanSuspend.has(t)) {
+            suspends = true;
+            break;
+          }
+        }
+      }
+      if (suspends) {
+        canSuspend[f] = 1;
+        changed = true;
+        if (indirectFuncIndices.has(f)) {
+          typeCanSuspend.add(funcTypeIndex[f]);
+        }
+      }
+    }
+  }
+
+  const overheadSuspends = (idx) => {
+    if (idx === null) return false;
+    if (idx < importFuncCount) return !!canSuspend[idx];
+    return directCalls[idx].some(callee => canSuspend[callee]);
+  };
+  if (overheadSuspends(runThunkIdx) || overheadSuspends(runVariadicThunkIdx)) {
+    return [];
+  }
+
+  const syncTableIndices = [];
+  for (const [ slotIdx, funcIdx ] of tableSlotToFuncIndex) {
+    if (!canSuspend[funcIdx]) {
+      syncTableIndices.push(Number(slotIdx));
+    }
+  }
+  syncTableIndices.sort((a, b) => a - b);
+  return syncTableIndices;
 }
 
 export function repackBinary(module) {
@@ -788,6 +1044,19 @@ function createReader(dv) {
     }
   }
 
+  function readU64Leb128() {
+    let value = 0n;
+    let shift = 0n;
+    while (true) {
+      const byte = readU8();
+      value |= BigInt(byte & 0x7f) << shift;
+      shift += 7n;
+      if ((0x80 & byte) === 0) {
+        return (value > 0xFFFFFFFFn) ? value : Number(value);
+      }
+    }
+  }
+
   function readI32Leb128() {
     let value = 0;
     let shift = 0;
@@ -835,16 +1104,17 @@ function createReader(dv) {
 
   function readLimits() {
     const flags = readU8();
-    const min = readU32Leb128();
-    let max = undefined
+    const is64 = !!(flags & 0x04);
+    const min = is64 ? Number(readU64Leb128()) : readU32Leb128();
+    let max = undefined;
     let shared = undefined;
     if (flags & 0x01) {
-      max = readU32Leb128();
+      max = is64 ? Number(readU64Leb128()) : readU32Leb128();
     }
     if (flags & 0x02) {
       shared = true;
     }
-    return { flags, min, max, shared };
+    return is64 ? { flags, min, max, shared, is64 } : { flags, min, max, shared };
   }
 
   function readCustom(len) {
@@ -865,6 +1135,7 @@ function createReader(dv) {
     readString,
     readArray,
     readU32Leb128,
+    readU64Leb128,
     readI32Leb128,
     readI64Leb128,
     readExpression,
@@ -937,6 +1208,19 @@ function createWriter(maxSize) {
     }
   }
 
+  function writeU64Leb128(value) {
+    let v = (typeof value === 'bigint') ? value : BigInt(value);
+    while (true) {
+      const byte = Number(v & 0x7fn);
+      v >>= 7n;
+      if (v === 0n) {
+        writeU8(byte);
+        return;
+      }
+      writeU8(byte | 0x80);
+    }
+  }
+
   function writeI32Leb128(value) {
     while (true) {
       const byte = value & 0x7f;
@@ -978,9 +1262,10 @@ function createWriter(maxSize) {
 
   function writeLimits(limits) {
     writeU8(limits.flags);
-    writeU32Leb128(limits.min);
+    const writeVal = (limits.flags & 0x04) ? writeU64Leb128 : writeU32Leb128;
+    writeVal(limits.min);
     if (limits.max !== undefined) {
-      writeU32Leb128(limits.max);
+      writeVal(limits.max);
     }
   }
 
@@ -998,6 +1283,7 @@ function createWriter(maxSize) {
     writeString,
     writeArray,
     writeU32Leb128,
+    writeU64Leb128,
     writeI32Leb128,
     writeI64Leb128,
     writeExpression,
@@ -1038,13 +1324,14 @@ function createDecoder(reader) {
     readU8,
     readArray,
     readU32Leb128,
+    readU64Leb128,
     readI32Leb128,
     readI64Leb128,
     readU32,
     readF64,
   } = reader;
   const readOne = readU32Leb128;
-  const readTwo = () => [ readOne(), readOne() ];
+  const readTwo = () => [ readOne(), readU64Leb128() ];
   const readMultiple = (count) => {
     const indices = [];
     for (let i = 0; i < count; i++) {
@@ -1064,6 +1351,8 @@ function createDecoder(reader) {
     0x11: readTwo,
     0x12: readOne,
     0x13: readTwo,
+    0x14: readOne,
+    0x15: readOne,
 
     0x1C: () => readArray(readU8),
 
@@ -1159,7 +1448,7 @@ function createDecoder(reader) {
         case 11:
         case 92:
         case 93:
-          return [ op1, readOne(), readOne() ];
+          return [ op1, readOne(), readU64Leb128() ];
         case 84:
         case 85:
         case 86:
@@ -1168,7 +1457,7 @@ function createDecoder(reader) {
         case 89:
         case 90:
         case 91:
-          return [ op1, readOne(), readOne(), readOne() ];
+          return [ op1, readOne(), readU64Leb128(), readOne() ];
         case 12:
           return [ op1, readBytes(16) ];
         case 13:
@@ -1184,7 +1473,7 @@ function createDecoder(reader) {
         case 3:
           return [ op1, readU8() ];
         default:
-          return [ op1, readOne(), readOne() ];
+          return [ op1, readOne(), readU64Leb128() ];
       }
     },
   }
@@ -1227,6 +1516,7 @@ function createEncoder(writer) {
     writeU8,
     writeArray,
     writeU32Leb128,
+    writeU64Leb128,
     writeI32Leb128,
     writeI64Leb128,
     writeU32,
@@ -1235,11 +1525,11 @@ function createEncoder(writer) {
   const writeOne = writeU32Leb128;
   const writeTwo = (op) => {
     writeOne(op[0]);
-    writeOne(op[1]);
+    writeU64Leb128(op[1]);
   };
   const writeMultiple = (indices) => {
     for (const index of indices) {
-      writeOne(index);
+      writeU64Leb128(index);
     }
   };
   const operandWriters = {
@@ -1254,6 +1544,8 @@ function createEncoder(writer) {
     0x11: writeTwo,
     0x12: writeOne,
     0x13: writeTwo,
+    0x14: writeOne,
+    0x15: writeOne,
     0x1C: (op) => writeArray(op, writeU8),
 
     0x20: writeOne,

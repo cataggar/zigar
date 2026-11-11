@@ -17,6 +17,10 @@ pub const thread = struct {
     pub const WorkQueue = host.WorkQueue;
 };
 
+pub const mem = struct {
+    pub const allocator = host.default_allocator;
+};
+
 pub const io = struct {
     pub const redirect = host.redirectIO;
 };

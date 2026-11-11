@@ -419,4 +419,77 @@ describe('Syscall: poll-oneoff', function() {
     const flags = eventDV.getUint16(24, le);
     expect(flags).to.equal(1);
   })
+  it('should reuse sleepFutex across multiple clock subscriptions', async function() {
+    const env = new Env();
+    if (process.env.TARGET === 'wasm') {
+      env.memory = new WebAssembly.Memory({ initial: 1 });
+    } else {
+      const map = new Map();
+      env.obtainExternBuffer = function(address, len) {
+        let buffer = map.get(address);
+        if (!buffer || buffer.byteLength < len) {
+          buffer = new ArrayBuffer(len);
+          map.set(address, buffer);
+        }
+        return buffer;
+      };
+      env.moveExternBytes = function(jsDV, address, to) {
+        const len = jsDV.byteLength;
+        const zigDV = this.obtainZigView(address, len);
+        if (!(jsDV instanceof DataView)) {
+          jsDV = new DataView(jsDV.buffer, jsDV.byteOffset, jsDV.byteLength);
+        }
+        copyView(to ? zigDV : jsDV, to ? jsDV : zigDV);
+      };
+      env.setSyscallTrap = () => {};
+      env.setRedirectionMask = () => {};
+    }
+    const le = env.littleEndian;
+    const subscriptionSize = 48;
+    const subscriptionAddress1 = usize(0x1000);
+    const subscriptionAddress2 = usize(0x1400);
+    const subscriptionAddress3 = usize(0x1800);
+    const eventAddress1 = usize(0x2000);
+    const eventAddress2 = usize(0x2400);
+    const eventAddress3 = usize(0x2800);
+    const eventCountAddress = usize(0x3000);
+
+    // Zero-duration clock subscription does not even need to allocate sleepFutex
+    const zeroSubs = createView(subscriptionSize);
+    zeroSubs.setUint8(8, PosixPollEventType.CLOCK);
+    zeroSubs.setBigUint64(24, 0n, le);
+    env.moveExternBytes(zeroSubs, subscriptionAddress1, true);
+    expect(env.pollOneoff(subscriptionAddress1, eventAddress1, 1, eventCountAddress, true)).to.equal(PosixError.NONE);
+    expect(env.sleepFutex).to.be.undefined;
+
+    // Concurrent non-zero clock subscriptions share a single 4-byte sleepFutex
+    const subs = createView(subscriptionSize * 2);
+    subs.setBigUint64(0, 11n, le);
+    subs.setUint8(8, PosixPollEventType.CLOCK);
+    subs.setBigUint64(24, 10_000_000n, le);
+    subs.setBigUint64(subscriptionSize, 22n, le);
+    subs.setUint8(subscriptionSize + 8, PosixPollEventType.CLOCK);
+    subs.setBigUint64(subscriptionSize + 24, 50_000_000n, le);
+    env.moveExternBytes(subs, subscriptionAddress2, true);
+
+    const p1 = env.pollOneoff(subscriptionAddress2, eventAddress2, 2, eventCountAddress, true);
+    expect(p1).to.be.a('promise');
+    const firstFutex = env.sleepFutex;
+    expect(firstFutex).to.be.an.instanceOf(Int32Array);
+    expect(firstFutex.buffer).to.be.an.instanceOf(SharedArrayBuffer);
+    expect(firstFutex.byteLength).to.equal(4);
+    expect(await p1).to.equal(PosixError.NONE);
+
+    // Subsequent pollOneoff call reuses the exact same sleepFutex
+    const singleSub = createView(subscriptionSize);
+    singleSub.setBigUint64(0, 33n, le);
+    singleSub.setUint8(8, PosixPollEventType.CLOCK);
+    singleSub.setBigUint64(24, 10_000_000n, le);
+    env.moveExternBytes(singleSub, subscriptionAddress3, true);
+    const p2 = env.pollOneoff(subscriptionAddress3, eventAddress3, 1, eventCountAddress, true);
+    expect(env.sleepFutex).to.equal(firstFutex);
+    expect(await p2).to.equal(PosixError.NONE);
+    const eventCountDV = env.obtainZigView(eventCountAddress, 4);
+    expect(eventCountDV.getUint32(0, le)).to.equal(1);
+  })
 })
