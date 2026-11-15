@@ -31,7 +31,7 @@ jobs:
           node-version: '24'
 
       - name: Install dependencies and run tests
-        run: cd zigar-runtime && npm ci && npm test
+        run: cd zigar-runtime && npm ci && npm run test:both
 
   zigar-compiler-wazig:
     name: zigar-compiler (USE_WAZIG=1)
@@ -191,6 +191,79 @@ jobs:
         run: |
           cd rollup-plugin-zigar
           npx mocha --no-warnings --timeout 600000 test/index.test.js
+
+  native-addons:
+    name: node-zigar & bun-zigar (Native JsValue)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install ghr and zig
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! command -v zstd >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y zstd
+          fi
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://github.com/cataggar/ghr/releases/download/${GHR_VERSION}/ghr-${GHR_VERSION#v}-linux-x64.tar.gz" \
+            | tar -xzf - --strip-components=2 -C "$HOME/.local/bin" "ghr-${GHR_VERSION#v}-linux-x64/bin/ghr"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          ghr install --skip-attestation "cataggar/zig@${ZIG_VERSION}"
+          zig version
+
+      - name: Run zigar.js.Ref(T) Zig unit tests
+        run: zig test zigar-compiler/zig/type/js.zig
+
+      - name: Install dependencies and link workspace packages
+        run: |
+          set -euo pipefail
+          (cd zigar-runtime && npm ci)
+          (cd zigar-compiler && npm ci)
+          (cd node-zigar-addon && npm ci)
+          (
+            cd node-zigar
+            npm ci
+            rm -rf node_modules/zigar-compiler node_modules/node-zigar-addon
+            ln -s ../../zigar-compiler node_modules/zigar-compiler
+            ln -s ../../node-zigar-addon node_modules/node-zigar-addon
+          )
+          (
+            cd bun-zigar
+            bun install --frozen-lockfile || bun install
+            rm -rf node_modules/zigar-compiler node_modules/node-zigar-addon
+            ln -s ../../zigar-compiler node_modules/zigar-compiler
+            ln -s ../../node-zigar-addon node_modules/node-zigar-addon
+          )
+
+      - name: Run node-zigar loader, worker, and native JsValue handle tests
+        env:
+          USE_WAZIG: '0'
+        run: |
+          cd node-zigar
+          npx mocha --loader=./dist/index.js --no-warnings --timeout 300000 \
+            test/index-cjs.test.js \
+            test/index.test.js \
+            test/worker.test.js \
+            test/js-value-handles.test.js
+
+      - name: Run bun-zigar native JsValue handle tests
+        env:
+          USE_WAZIG: '0'
+        run: |
+          cd bun-zigar
+          bun node_modules/mocha/bin/mocha.js --timeout 300000 -- test/js-value-handles.test.js
 
   benchmarks:
     name: Wazig vs Zig Benchmarks

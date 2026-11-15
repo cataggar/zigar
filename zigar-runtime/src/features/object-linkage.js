@@ -18,8 +18,9 @@ export default mixin({
       // objects in WebAssembly have fixed addresses so the handle is the address
       // for native code module, locations of objects in memory can change depending on
       // where the shared library is loaded
-      const normalizedHandle = is64 ? BigInt(handle) : Number(handle);
-      const address = (process.env.TARGET === 'wasm') ? normalizedHandle : this.recreateAddress(normalizedHandle);
+      const address = (process.env.TARGET === 'wasm')
+        ? (is64 ? BigInt(handle) : Number(handle))
+        : this.recreateAddress(Number(handle));
       let zigDV = object[MEMORY] = this.obtainZigView(address, jsDV.byteLength);
       if (writeBack) {
         copyView(zigDV, jsDV);

@@ -353,6 +353,7 @@ async function copyZonFile(srcPath, dstPath) {
 function generateCode(definition, params) {
   const { structures } = definition;
   const {
+    declareFeatures = false,
     runtimeURL,
     binarySource = null,
     topLevelAwait = true,
@@ -392,7 +393,7 @@ function generateCode(definition, params) {
     add(`import { createEnvironment } from ${JSON.stringify(runtimeURL)};`);
   }
   const effectiveMixinPaths = [ ...mixinPaths ];
-  if (!standaloneLoader && runtimeURL && structures.some(s => s.purpose === StructurePurpose.JsValue)) {
+  if (declareFeatures && !standaloneLoader && runtimeURL && structures.some(s => s.purpose === StructurePurpose.JsValue)) {
     for (const reqPath of [ 'features/js-value-registry.js', 'structures/js-value.js' ]) {
       if (!effectiveMixinPaths.includes(reqPath)) {
         effectiveMixinPaths.push(reqPath);

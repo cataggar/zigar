@@ -11,11 +11,13 @@ const RESERVED_TRUE = 3;
 const RESERVED_GLOBAL_THIS = 4;
 const FIRST_DYNAMIC_SLOT = FIRST_DYNAMIC_JS_VALUE_SLOT;
 
-const SLOT_MASK = 0x000FFFFF;
+const SLOT_INDEX_MASK = 0x00003FFF;
+const REALM_SHIFT = 14;
+const REALM_MASK = 0x3F;
 const GEN_SHIFT = 20;
 const GEN_MASK = 0x0FFF;
 const ACTIVE_BIT = 0x1000;
-const MAX_SLOTS = SLOT_MASK + 1;
+const MAX_SLOTS = SLOT_INDEX_MASK + 1;
 const INITIAL_CAPACITY = 64;
 
 const JS_TYPE_CODES = {
@@ -42,8 +44,12 @@ function initRegistryState(env) {
 
 var jsValueRegistry = mixin({
   init() {
+    this.jsValueRealmTag = 0;
     initRegistryState(this);
     this.destructors?.push(() => initRegistryState(this));
+  },
+  setJsValueRealmTag(tag) {
+    this.jsValueRealmTag = tag & REALM_MASK;
   },
   resetJsValueRegistry() {
     initRegistryState(this);
@@ -84,7 +90,7 @@ var jsValueRegistry = mixin({
     this.jsValueSlots[slot] = value;
     this.jsValueGenerations[slot] = ACTIVE_BIT | gen;
     this.jsValueActiveCount++;
-    const handle = ((gen << GEN_SHIFT) | slot) >>> 0;
+    const handle = ((gen << GEN_SHIFT) | (this.jsValueRealmTag << REALM_SHIFT) | slot) >>> 0;
     if (this.pendingJsHandles) {
       this.pendingJsHandles.push(handle);
     }
@@ -102,10 +108,11 @@ var jsValueRegistry = mixin({
     if (handle < FIRST_DYNAMIC_SLOT) {
       throw new InvalidJsValueHandle(handle);
     }
-    const slot = handle & SLOT_MASK;
+    const slot = handle & SLOT_INDEX_MASK;
+    const realm = (handle >>> REALM_SHIFT) & REALM_MASK;
     const gen = handle >>> GEN_SHIFT;
-    if (slot < FIRST_DYNAMIC_SLOT || slot >= this.jsValueNextSlot || gen === 0
-      || this.jsValueGenerations[slot] !== (ACTIVE_BIT | gen)) {
+    if (realm !== this.jsValueRealmTag || slot < FIRST_DYNAMIC_SLOT || slot >= this.jsValueNextSlot
+      || gen === 0 || this.jsValueGenerations[slot] !== (ACTIVE_BIT | gen)) {
       throw new InvalidJsValueHandle(handle);
     }
     return this.jsValueSlots[slot];
@@ -126,10 +133,11 @@ var jsValueRegistry = mixin({
     if (handle < FIRST_DYNAMIC_SLOT) {
       throw new InvalidJsValueHandle(handle);
     }
-    const slot = handle & SLOT_MASK;
+    const slot = handle & SLOT_INDEX_MASK;
+    const realm = (handle >>> REALM_SHIFT) & REALM_MASK;
     const gen = handle >>> GEN_SHIFT;
-    if (slot < FIRST_DYNAMIC_SLOT || slot >= this.jsValueNextSlot || gen === 0
-      || this.jsValueGenerations[slot] !== (ACTIVE_BIT | gen)) {
+    if (realm !== this.jsValueRealmTag || slot < FIRST_DYNAMIC_SLOT || slot >= this.jsValueNextSlot
+      || gen === 0 || this.jsValueGenerations[slot] !== (ACTIVE_BIT | gen)) {
       throw new InvalidJsValueHandle(handle);
     }
     this.jsValueGenerations[slot] = gen;
@@ -160,9 +168,11 @@ var jsValueRegistry = mixin({
     if (handle < FIRST_DYNAMIC_SLOT) {
       return false;
     }
-    const slot = handle & SLOT_MASK;
+    const slot = handle & SLOT_INDEX_MASK;
+    const realm = (handle >>> REALM_SHIFT) & REALM_MASK;
     const gen = handle >>> GEN_SHIFT;
-    return (slot >= FIRST_DYNAMIC_SLOT && slot < this.jsValueNextSlot && gen !== 0
+    return (realm === this.jsValueRealmTag && slot >= FIRST_DYNAMIC_SLOT
+      && slot < this.jsValueNextSlot && gen !== 0
       && this.jsValueGenerations[slot] === (ACTIVE_BIT | gen));
   },
   releaseJsValueIfValid(handle) {

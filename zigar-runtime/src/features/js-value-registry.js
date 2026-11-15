@@ -1,7 +1,7 @@
 import { FIRST_DYNAMIC_JS_VALUE_SLOT, MemberType, StructurePurpose, StructureType, UnionFlag } from '../constants.js';
 import { mixin } from '../environment.js';
 import { InvalidJsValueHandle } from '../errors.js';
-import { CAST, LENGTH, MEMORY, NAME, SLOTS, TARGET, VIVIFICATE, ZIG } from '../symbols.js';
+import { CAST, FALLBACK, LENGTH, MEMORY, NAME, SLOTS, TARGET, VIVIFICATE, ZIG } from '../symbols.js';
 import { hasJsValue } from '../utils.js';
 
 export const RESERVED_UNDEFINED = 0;
@@ -11,11 +11,13 @@ export const RESERVED_TRUE = 3;
 export const RESERVED_GLOBAL_THIS = 4;
 export const FIRST_DYNAMIC_SLOT = FIRST_DYNAMIC_JS_VALUE_SLOT;
 
-const SLOT_MASK = 0x000FFFFF;
+const SLOT_INDEX_MASK = 0x00003FFF;
+const REALM_SHIFT = 14;
+const REALM_MASK = 0x3F;
 const GEN_SHIFT = 20;
 const GEN_MASK = 0x0FFF;
 const ACTIVE_BIT = 0x1000;
-const MAX_SLOTS = SLOT_MASK + 1;
+const MAX_SLOTS = SLOT_INDEX_MASK + 1;
 const INITIAL_CAPACITY = 64;
 
 const JS_TYPE_CODES = {
@@ -42,8 +44,12 @@ function initRegistryState(env) {
 
 export default mixin({
   init() {
+    this.jsValueRealmTag = 0;
     initRegistryState(this);
     this.destructors?.push(() => initRegistryState(this));
+  },
+  setJsValueRealmTag(tag) {
+    this.jsValueRealmTag = tag & REALM_MASK;
   },
   resetJsValueRegistry() {
     initRegistryState(this);
@@ -84,7 +90,7 @@ export default mixin({
     this.jsValueSlots[slot] = value;
     this.jsValueGenerations[slot] = ACTIVE_BIT | gen;
     this.jsValueActiveCount++;
-    const handle = ((gen << GEN_SHIFT) | slot) >>> 0;
+    const handle = ((gen << GEN_SHIFT) | (this.jsValueRealmTag << REALM_SHIFT) | slot) >>> 0;
     if (this.pendingJsHandles) {
       this.pendingJsHandles.push(handle);
     }
@@ -102,10 +108,11 @@ export default mixin({
     if (handle < FIRST_DYNAMIC_SLOT) {
       throw new InvalidJsValueHandle(handle);
     }
-    const slot = handle & SLOT_MASK;
+    const slot = handle & SLOT_INDEX_MASK;
+    const realm = (handle >>> REALM_SHIFT) & REALM_MASK;
     const gen = handle >>> GEN_SHIFT;
-    if (slot < FIRST_DYNAMIC_SLOT || slot >= this.jsValueNextSlot || gen === 0
-      || this.jsValueGenerations[slot] !== (ACTIVE_BIT | gen)) {
+    if (realm !== this.jsValueRealmTag || slot < FIRST_DYNAMIC_SLOT || slot >= this.jsValueNextSlot
+      || gen === 0 || this.jsValueGenerations[slot] !== (ACTIVE_BIT | gen)) {
       throw new InvalidJsValueHandle(handle);
     }
     return this.jsValueSlots[slot];
@@ -126,10 +133,11 @@ export default mixin({
     if (handle < FIRST_DYNAMIC_SLOT) {
       throw new InvalidJsValueHandle(handle);
     }
-    const slot = handle & SLOT_MASK;
+    const slot = handle & SLOT_INDEX_MASK;
+    const realm = (handle >>> REALM_SHIFT) & REALM_MASK;
     const gen = handle >>> GEN_SHIFT;
-    if (slot < FIRST_DYNAMIC_SLOT || slot >= this.jsValueNextSlot || gen === 0
-      || this.jsValueGenerations[slot] !== (ACTIVE_BIT | gen)) {
+    if (realm !== this.jsValueRealmTag || slot < FIRST_DYNAMIC_SLOT || slot >= this.jsValueNextSlot
+      || gen === 0 || this.jsValueGenerations[slot] !== (ACTIVE_BIT | gen)) {
       throw new InvalidJsValueHandle(handle);
     }
     this.jsValueGenerations[slot] = gen;
@@ -160,9 +168,11 @@ export default mixin({
     if (handle < FIRST_DYNAMIC_SLOT) {
       return false;
     }
-    const slot = handle & SLOT_MASK;
+    const slot = handle & SLOT_INDEX_MASK;
+    const realm = (handle >>> REALM_SHIFT) & REALM_MASK;
     const gen = handle >>> GEN_SHIFT;
-    return (slot >= FIRST_DYNAMIC_SLOT && slot < this.jsValueNextSlot && gen !== 0
+    return (realm === this.jsValueRealmTag && slot >= FIRST_DYNAMIC_SLOT
+      && slot < this.jsValueNextSlot && gen !== 0
       && this.jsValueGenerations[slot] === (ACTIVE_BIT | gen));
   },
   releaseJsValueIfValid(handle) {
@@ -175,11 +185,17 @@ export default mixin({
       return;
     }
     const dv = refObj[MEMORY];
+    if (process.env.TARGET === 'node') {
+      dv[FALLBACK]?.(false, 0, 4);
+    }
     const handle = dv.getUint32(0, this.littleEndian);
     const value = this.getJsValue(handle);
     this.releaseJsValue(handle);
     refObj[TARGET] = value;
     dv.setUint32(0, RESERVED_UNDEFINED, this.littleEndian);
+    if (process.env.TARGET === 'node') {
+      dv[FALLBACK]?.(true, 0, 4);
+    }
   },
   consumeJsValueSlot(parent, slot, structure) {
     if (!hasJsValue(structure)) {
@@ -189,6 +205,9 @@ export default mixin({
     if (structure.purpose === StructurePurpose.JsValue) {
       this.consumeJsValueObject(obj);
       return;
+    }
+    if (process.env.TARGET === 'node') {
+      obj[MEMORY]?.[FALLBACK]?.(false);
     }
     switch (structure.type) {
       case StructureType.Struct: {
@@ -239,6 +258,8 @@ export default mixin({
     }
     if (process.env.TARGET === 'wasm' && this.restoreView) {
       dv = this.restoreView(dv);
+    } else if (process.env.TARGET === 'node') {
+      dv[FALLBACK]?.(false, offset, structure.byteSize);
     }
     const le = this.littleEndian;
     const visit = (s, base) => {
@@ -493,6 +514,17 @@ export default mixin({
       equalJsValue: { argType: 'ii', returnType: 'b' },
       getJsValueCount: { argType: '', returnType: 'i' },
     },
+  } : process.env.TARGET === 'node' ? {
+    exports: {
+      cloneJsValue: {},
+      releaseJsValue: {},
+      typeofJsValue: {},
+      instanceofJsValue: {},
+      equalJsValue: {},
+      getJsValueCount: {},
+      setJsValueRealmTag: {},
+    },
+  /* c8 ignore next */
   } : undefined),
 });
 

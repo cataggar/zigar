@@ -1353,7 +1353,9 @@ pub fn createCallback(
     const ns = struct {
         fn callback(env: Env, cb_info: CallbackInfo) callconv(.c) Value {
             return handleCall(env, cb_info) catch |err| {
-                env.throwError(null, getErrorMessage(err)) catch {};
+                if (!(env.isExceptionPending() catch false)) {
+                    env.throwError(null, getErrorMessage(err)) catch {};
+                }
                 return env.getUndefined() catch @panic("Cannot even get undefined");
             };
         }

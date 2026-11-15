@@ -16,6 +16,12 @@ pub const JsType = enum(u8) {
     function = 7,
 };
 
+pub const Error = error{
+    OffJsThread,
+    JsException,
+    HostUnavailable,
+};
+
 pub const Any = opaque {};
 pub const Unknown = opaque {};
 pub const Object = opaque {};
@@ -50,6 +56,7 @@ fn extractHandle(value: anytype) u32 {
 
 pub fn Js(comptime host: type) type {
     return struct {
+        pub const Error = module.Error;
         pub const JsType = module.JsType;
         pub const Any = module.Any;
         pub const Unknown = module.Unknown;
@@ -64,7 +71,19 @@ pub fn Js(comptime host: type) type {
         pub const reserved_global_this_handle = module.reserved_global_this_handle;
         pub const first_dynamic_slot = module.first_dynamic_slot;
 
+        pub fn isJsThread() bool {
+            return if (@hasDecl(host, "isJsThread")) host.isJsThread() else true;
+        }
+
         pub fn activeHandleCount() u32 {
+            return host.getJsValueCount();
+        }
+
+        pub fn tryActiveHandleCount() module.Error!u32 {
+            if (@hasDecl(host, "tryGetJsValueCount")) {
+                return host.tryGetJsValueCount();
+            }
+            if (!isJsThread()) return error.OffJsThread;
             return host.getJsValueCount();
         }
 
@@ -108,8 +127,32 @@ pub fn Js(comptime host: type) type {
                     return .{ .handle = host.cloneJsValue(self.handle) };
                 }
 
+                pub fn tryClone(self: Self) module.Error!Self {
+                    if (self.handle <= module.reserved_global_this_handle) {
+                        if (!isJsThread()) return error.OffJsThread;
+                        return self;
+                    }
+                    if (@hasDecl(host, "tryCloneJsValue")) {
+                        return .{ .handle = try host.tryCloneJsValue(self.handle) };
+                    }
+                    if (!isJsThread()) return error.OffJsThread;
+                    return .{ .handle = host.cloneJsValue(self.handle) };
+                }
+
                 pub fn deinit(self: Self) void {
                     if (self.handle <= module.reserved_global_this_handle) return;
+                    host.releaseJsValue(self.handle);
+                }
+
+                pub fn tryDeinit(self: Self) module.Error!void {
+                    if (self.handle <= module.reserved_global_this_handle) {
+                        if (!isJsThread()) return error.OffJsThread;
+                        return;
+                    }
+                    if (@hasDecl(host, "tryReleaseJsValue")) {
+                        return host.tryReleaseJsValue(self.handle);
+                    }
+                    if (!isJsThread()) return error.OffJsThread;
                     host.releaseJsValue(self.handle);
                 }
 
@@ -122,7 +165,27 @@ pub fn Js(comptime host: type) type {
                     };
                 }
 
+                pub fn tryTypeof(self: Self) module.Error!module.JsType {
+                    if (self.handle <= module.reserved_global_this_handle) {
+                        if (!isJsThread()) return error.OffJsThread;
+                        return self.typeof();
+                    }
+                    if (@hasDecl(host, "tryTypeofJsValue")) {
+                        return host.tryTypeofJsValue(self.handle);
+                    }
+                    if (!isJsThread()) return error.OffJsThread;
+                    return host.typeofJsValue(self.handle);
+                }
+
                 pub fn instanceof(self: Self, ctor: anytype) bool {
+                    return host.instanceofJsValue(self.handle, extractHandle(ctor));
+                }
+
+                pub fn tryInstanceof(self: Self, ctor: anytype) module.Error!bool {
+                    if (@hasDecl(host, "tryInstanceofJsValue")) {
+                        return host.tryInstanceofJsValue(self.handle, extractHandle(ctor));
+                    }
+                    if (!isJsThread()) return error.OffJsThread;
                     return host.instanceofJsValue(self.handle, extractHandle(ctor));
                 }
 
@@ -131,6 +194,19 @@ pub fn Js(comptime host: type) type {
                     if (self.handle <= module.reserved_global_this_handle and rhs_handle <= module.reserved_global_this_handle) {
                         return self.handle == rhs_handle;
                     }
+                    return host.equalJsValue(self.handle, rhs_handle);
+                }
+
+                pub fn tryEql(self: Self, other: anytype) module.Error!bool {
+                    const rhs_handle = extractHandle(other);
+                    if (self.handle <= module.reserved_global_this_handle and rhs_handle <= module.reserved_global_this_handle) {
+                        if (!isJsThread()) return error.OffJsThread;
+                        return self.handle == rhs_handle;
+                    }
+                    if (@hasDecl(host, "tryEqualJsValue")) {
+                        return host.tryEqualJsValue(self.handle, rhs_handle);
+                    }
+                    if (!isJsThread()) return error.OffJsThread;
                     return host.equalJsValue(self.handle, rhs_handle);
                 }
 
@@ -219,4 +295,54 @@ test "Js.Ref layout, reserved handles, and host dispatch" {
     casted.deinit();
     dyn.deinit();
     try expectEqual(@as(u32, 0), js.activeHandleCount());
+}
+
+test "Js.Ref fallible try* methods surface error.OffJsThread off JS thread" {
+    const OffThreadHost = struct {
+        var on_js_thread: bool = false;
+
+        pub fn isJsThread() bool {
+            return on_js_thread;
+        }
+
+        pub fn cloneJsValue(_: u32) u32 {
+            unreachable;
+        }
+
+        pub fn releaseJsValue(_: u32) void {
+            unreachable;
+        }
+
+        pub fn typeofJsValue(_: u32) JsType {
+            unreachable;
+        }
+
+        pub fn instanceofJsValue(_: u32, _: u32) bool {
+            unreachable;
+        }
+
+        pub fn equalJsValue(_: u32, _: u32) bool {
+            unreachable;
+        }
+
+        pub fn getJsValueCount() u32 {
+            unreachable;
+        }
+    };
+
+    const js = Js(OffThreadHost);
+    const ObjRef = js.Ref(js.Object);
+    const dyn: ObjRef = .{ .handle = (1 << 20) | 8 };
+
+    try expect(!js.isJsThread());
+    try std.testing.expectError(error.OffJsThread, js.tryActiveHandleCount());
+    try std.testing.expectError(error.OffJsThread, dyn.tryClone());
+    try std.testing.expectError(error.OffJsThread, dyn.tryDeinit());
+    try std.testing.expectError(error.OffJsThread, dyn.tryTypeof());
+    try std.testing.expectError(error.OffJsThread, dyn.tryInstanceof(dyn));
+    try std.testing.expectError(error.OffJsThread, dyn.tryEql(dyn));
+    try std.testing.expectError(error.OffJsThread, ObjRef.@"null".tryClone());
+    try std.testing.expectError(error.OffJsThread, ObjRef.@"null".tryDeinit());
+    try std.testing.expectError(error.OffJsThread, ObjRef.@"null".tryTypeof());
+    try std.testing.expectError(error.OffJsThread, ObjRef.@"null".tryEql(null));
 }

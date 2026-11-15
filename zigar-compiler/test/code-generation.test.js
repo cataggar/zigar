@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 
-import { MemberType, StructureType } from '../../zigar-runtime/src/constants.js';
+import { MemberType, StructurePurpose, StructureType } from '../../zigar-runtime/src/constants.js';
 import { MEMORY, SLOTS } from '../../zigar-runtime/src/symbols.js';
 import { generateCode } from '../src/code-generation.js';
 
@@ -301,6 +301,56 @@ describe('Code generation', function() {
       const def32 = { structures: [ structure ], settings: { ...settings, memory64: false } };
       const { code: code32 } = generateCode(def32, { ...params, moduleOptions: { multithreaded: false } });
       expect(code32).to.not.contain('memory64:');
+    })
+    it('should only emit JsValue feature subpath imports when declareFeatures is true', function() {
+      const jsValueStructure = {
+        constructor: null,
+        type: StructureType.Struct,
+        purpose: StructurePurpose.JsValue,
+        name: 'Ref(Any)',
+        signature: 0xbeef_1234n,
+        byteSize: 4,
+        isConst: false,
+        hasPointer: false,
+        instance: {
+          members: [
+            {
+              type: MemberType.Uint,
+              name: 'handle',
+              bitOffset: 0,
+              bitSize: 32,
+              byteSize: 4,
+            }
+          ],
+          methods: [],
+          template: null,
+        },
+        static: {
+          members: [],
+          methods: [],
+          template: null,
+        },
+      };
+      const def = { structures: [ jsValueStructure ], settings };
+
+      // WASM transpilation sets declareFeatures: true -> emits tree-shaken zigar-runtime subpath imports
+      const { code: wasmCode } = generateCode(def, {
+        declareFeatures: true,
+        runtimeURL: 'zigar-runtime',
+        mixinPaths: [],
+        binarySource: '"/mod.wasm"',
+      });
+      expect(wasmCode).to.contain('zigar-runtime/features/js-value-registry.js');
+      expect(wasmCode).to.contain('zigar-runtime/structures/js-value.js');
+
+      // Native node-zigar / bun-zigar loaders omit declareFeatures with runtimeURL -> no broken .cjs subpath imports
+      const { code: nativeCode } = generateCode(def, {
+        runtimeURL: 'file:///path/to/node-zigar-addon/dist/index.cjs',
+        binarySource: '"/mod.so"',
+      });
+      expect(nativeCode).to.contain('file:///path/to/node-zigar-addon/dist/index.cjs');
+      expect(nativeCode).to.not.contain('features/js-value-registry.js');
+      expect(nativeCode).to.not.contain('structures/js-value.js');
     })
   })
 })
