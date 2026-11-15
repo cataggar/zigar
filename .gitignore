@@ -85,6 +85,8 @@ jspm_packages/
 **/zig-out
 **/.zigar-cache
 **/.cache
+ts-zigar/component/dist/
+ts-zigar/component/.staging/
 **/build/*
 *.so
 *.o
