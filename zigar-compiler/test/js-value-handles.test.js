@@ -629,6 +629,59 @@ describe('JsValue Handle Registry & zigar.js.Ref(T) End-to-End Integration', fun
         expect(Object.is(mod.loadGlobalClone(), zigOwned)).to.be.true;
         mod.clearGlobal();
         expect(Number(mod.activeCount())).to.equal(0);
+
+        // 5. Nested TaggedValue inside Optional, ErrorUnion, Struct (full + default-template), and OuterUnion!
+        // 5a. `opt_tagged` (`?TaggedValue`): set `{ js: objA }` from JS and Zig, then set `= null` from JS -> 0 handles!
+        mod.default.opt_tagged = { js: objA };
+        expect(Number(mod.activeCount())).to.equal(1);
+        expect(Object.is(mod.default.opt_tagged.js, objA)).to.be.true;
+        mod.default.opt_tagged = null;
+        expect(mod.default.opt_tagged).to.be.null;
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        mod.zigSetOptTaggedJs(objA);
+        expect(Number(mod.activeCount())).to.equal(1);
+        expect(Object.is(mod.default.opt_tagged.js, objA)).to.be.true;
+        mod.default.opt_tagged = null;
+        expect(mod.default.opt_tagged).to.be.null;
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        // 5b. `eu_tagged` (`Error!TaggedValue`): set `.{ .js = objA }` from Zig (and JS), then set `= new Error('Rejected')` from JS -> 0 handles!
+        mod.zigSetEuTaggedJs(objA);
+        expect(Number(mod.activeCount())).to.equal(1);
+        expect(Object.is(mod.default.eu_tagged.js, objA)).to.be.true;
+        mod.default.eu_tagged = new Error('Rejected');
+        expect(() => mod.default.eu_tagged).to.throw(/Rejected/);
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        mod.default.eu_tagged = { js: objB };
+        expect(Number(mod.activeCount())).to.equal(1);
+        mod.default.eu_tagged = new Error('Rejected');
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        // 5c. `wrapper` (Struct with `TaggedValue` field): full overwrite AND default-template overwrite -> 0 handles!
+        mod.zigSetWrapperJs(objA, 1);
+        expect(Number(mod.activeCount())).to.equal(1);
+        expect(Object.is(mod.default.wrapper.t.js, objA)).to.be.true;
+        mod.default.wrapper = { t: { code: 9 }, n: 2 };
+        expect(mod.default.wrapper.t.code).to.equal(9);
+        expect(mod.default.wrapper.n).to.equal(2);
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        mod.zigSetWrapperJs(objB, 5);
+        expect(Number(mod.activeCount())).to.equal(1);
+        mod.default.wrapper = { n: 6 }; // omits `t`, applying default template `t = .{ .code = 0 }`
+        expect(mod.default.wrapper.t.code).to.equal(0);
+        expect(mod.default.wrapper.n).to.equal(6);
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        // 5d. `outer_union` (Union variant containing `TaggedValue`): switch to `.plain` -> 0 handles!
+        mod.zigSetOuterNestedJs(objA);
+        expect(Number(mod.activeCount())).to.equal(1);
+        expect(Object.is(mod.default.outer_union.nested.js, objA)).to.be.true;
+        mod.default.outer_union = { plain: 7 };
+        expect(mod.default.outer_union.plain).to.equal(7);
+        expect(Number(mod.activeCount())).to.equal(0);
       });
     });
   }

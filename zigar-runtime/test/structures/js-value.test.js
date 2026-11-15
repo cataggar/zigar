@@ -399,6 +399,32 @@ describe('Structure: js-value', function() {
     env.releaseJsValue(otherHandle);
     expect(env.getJsValueCount()).to.equal(0);
 
+    // Nested `?Tagged` (`Optional` containing tagged union): setting to `null` releases `.js` handle!
+    const optTaggedStruct = {
+      type: StructureType.Optional,
+      name: '?Tagged',
+      byteSize: 12,
+      align: 4,
+      flags: StructureFlag.HasValue | StructureFlag.HasObject | StructureFlag.HasSlot | OptionalFlag.HasSelector,
+      signature: 18n,
+      instance: {
+        members: [
+          { type: MemberType.Object, bitSize: 64, bitOffset: 0, byteSize: 8, slot: 0, structure: unionStruct },
+          { type: MemberType.Bool, bitSize: 1, bitOffset: 64, byteSize: 1, structure: boolStruct },
+        ],
+      },
+      static: {},
+    };
+    env.beginStructure(optTaggedStruct);
+    env.finishStructure(optTaggedStruct);
+    const OptTagged = optTaggedStruct.constructor;
+    const zigOptTaggedDV = allocZigDV(0x1060, 12);
+    const zigOptTagged = OptTagged(zigOptTaggedDV);
+    zigOptTagged.$ = { js: objA };
+    expect(env.getJsValueCount()).to.equal(1);
+    zigOptTagged.$ = null;
+    expect(env.getJsValueCount()).to.equal(0);
+
     // Consume retval slot on a synthetic ArgStruct holding Pair
     const argStructDef = {
       type: StructureType.ArgStruct,

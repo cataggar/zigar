@@ -275,7 +275,7 @@ const CACHE = symbol('cache');
 const SIZE = symbol('size');
 const BIT_SIZE = symbol('bit size');
 const ALIGN = symbol('align');
-const ENVIRONMENT$1 = symbol('environment');
+const ENVIRONMENT = symbol('environment');
 const ATTRIBUTES = symbol('attributes');
 const PRIMITIVE = symbol('primitive');
 const GETTERS = symbol('getters');
@@ -569,7 +569,7 @@ function findObjects(structures, SLOTS) {
 
 function isCompatibleType(TypeA, TypeB) {
   return (TypeA === TypeB)
-      || ((TypeA?.[SIGNATURE] === TypeB[SIGNATURE]) && (TypeA?.[ENVIRONMENT$1] !== TypeB?.[ENVIRONMENT$1]));
+      || ((TypeA?.[SIGNATURE] === TypeB[SIGNATURE]) && (TypeA?.[ENVIRONMENT] !== TypeB?.[ENVIRONMENT]));
 }
 
 function isCompatibleInstanceOf(object, Type) {
@@ -5867,7 +5867,7 @@ var baseline = mixin({
           const dv = this.obtainView(getBuffer(array), offset, length);
           const { handle } = placeholder;
           const { constructor } = structure;
-          const object = constructor.call(ENVIRONMENT$1, dv);
+          const object = constructor.call(ENVIRONMENT, dv);
           if (slots) {
             insertObjects(object[SLOTS], slots);
           }
@@ -7063,20 +7063,9 @@ var jsValueRegistry = mixin({
         break;
       }
       case StructureType.Union: {
-        if (structure.flags & UnionFlag.HasTag) {
-          const [ activeName ] = obj[PROPS];
-          const activeMember = structure.instance.members.find(m => m.name === activeName);
-          if (activeMember?.type === MemberType.Object) {
-            this.consumeJsValueSlot(obj, activeMember.slot, activeMember.structure);
-          }
-        } else if (structure.flags & UnionFlag.HasSelector) {
-          const members = structure.instance.members;
-          const selMember = members[members.length - 1];
-          const idx = readUintBytes(obj[MEMORY], selMember.bitOffset >> 3, selMember.byteSize, this.littleEndian);
-          const activeMember = members[idx];
-          if (activeMember?.type === MemberType.Object) {
-            this.consumeJsValueSlot(obj, activeMember.slot, activeMember.structure);
-          }
+        const activeMember = getActiveUnionMember(structure, obj[MEMORY], 0, this.littleEndian);
+        if (activeMember?.type === MemberType.Object) {
+          this.consumeJsValueSlot(obj, activeMember.slot, activeMember.structure);
         }
         break;
       }
@@ -7145,26 +7134,10 @@ var jsValueRegistry = mixin({
           break;
         }
         case StructureType.Union: {
-          if (s.flags & UnionFlag.HasSelector) {
-            const members = s.instance.members;
-            let activeMember;
-            if (s.flags & UnionFlag.HasTag) {
-              let activeName;
-              try {
-                const subDV = new DataView(dv.buffer, dv.byteOffset + base, s.byteSize);
-                const inst = s.constructor.call(ENVIRONMENT, subDV);
-                [ activeName ] = inst[PROPS];
-              } catch {}
-              activeMember = activeName && members.find(m => m.name === activeName);
-            } else {
-              const selMember = members[members.length - 1];
-              const idx = readUintBytes(dv, base + (selMember.bitOffset >> 3), selMember.byteSize, le);
-              activeMember = (idx < members.length - 1) ? members[idx] : undefined;
-            }
-            if (activeMember && activeMember.type === MemberType.Object
-              && activeMember.bitOffset !== undefined && hasJsValue(activeMember.structure)) {
-              visit(activeMember.structure, base + (activeMember.bitOffset >> 3));
-            }
+          const activeMember = getActiveUnionMember(s, dv, base, le);
+          if (activeMember && activeMember.type === MemberType.Object
+            && activeMember.bitOffset !== undefined && hasJsValue(activeMember.structure)) {
+            visit(activeMember.structure, base + (activeMember.bitOffset >> 3));
           }
           break;
         }
@@ -7214,8 +7187,10 @@ var jsValueRegistry = mixin({
         case StructureType.Optional: {
           const [ valueMember, presentMember ] = s.instance.members;
           const relPresent = (obj[MEMORY].byteOffset - rootDV.byteOffset) + (presentMember.bitOffset >> 3);
-          if (valueMember.type === MemberType.Object && hasJsValue(valueMember.structure)
-            && isNonZeroBytes(rootDV, relPresent, presentMember.byteSize)) {
+          const isPresent = (presentMember.bitSize === 1)
+            ? (rootDV.getUint8(relPresent) === 1)
+            : isNonZeroBytes(rootDV, relPresent, presentMember.byteSize);
+          if (valueMember.type === MemberType.Object && hasJsValue(valueMember.structure) && isPresent) {
             const child = obj[SLOTS][valueMember.slot] ?? obj[VIVIFICATE](valueMember.slot);
             visit(child, valueMember.structure);
           }
@@ -7232,26 +7207,11 @@ var jsValueRegistry = mixin({
           break;
         }
         case StructureType.Union: {
-          if (s.flags & UnionFlag.HasTag) {
-            let activeName;
-            try {
-              [ activeName ] = obj[PROPS];
-            } catch {}
-            const activeMember = activeName && s.instance.members.find(m => m.name === activeName);
-            if (activeMember?.type === MemberType.Object && hasJsValue(activeMember.structure)) {
-              const child = obj[SLOTS][activeMember.slot] ?? obj[VIVIFICATE](activeMember.slot);
-              visit(child, activeMember.structure);
-            }
-          } else if (s.flags & UnionFlag.HasSelector) {
-            const members = s.instance.members;
-            const selMember = members[members.length - 1];
-            const relSel = (obj[MEMORY].byteOffset - rootDV.byteOffset) + (selMember.bitOffset >> 3);
-            const idx = readUintBytes(rootDV, relSel, selMember.byteSize, le);
-            const activeMember = members[idx];
-            if (activeMember?.type === MemberType.Object && hasJsValue(activeMember.structure)) {
-              const child = obj[SLOTS][activeMember.slot] ?? obj[VIVIFICATE](activeMember.slot);
-              visit(child, activeMember.structure);
-            }
+          const relBase = obj[MEMORY].byteOffset - rootDV.byteOffset;
+          const activeMember = getActiveUnionMember(s, rootDV, relBase, le);
+          if (activeMember?.type === MemberType.Object && hasJsValue(activeMember.structure)) {
+            const child = obj[SLOTS][activeMember.slot] ?? obj[VIVIFICATE](activeMember.slot);
+            visit(child, activeMember.structure);
           }
           break;
         }
@@ -7400,6 +7360,35 @@ function readUintBytes(dv, byteOffset, byteSize, littleEndian) {
     value |= byte << shift;
   }
   return value >>> 0;
+}
+
+function readTagValue(dv, byteOffset, selMember, littleEndian) {
+  const signed = (selMember.type === MemberType.Int);
+  switch (selMember.byteSize) {
+    case 1: return signed ? dv.getInt8(byteOffset) : dv.getUint8(byteOffset);
+    case 2: return signed ? dv.getInt16(byteOffset, littleEndian) : dv.getUint16(byteOffset, littleEndian);
+    case 4: return signed ? dv.getInt32(byteOffset, littleEndian) : dv.getUint32(byteOffset, littleEndian);
+    case 8: return signed ? dv.getBigInt64(byteOffset, littleEndian) : dv.getBigUint64(byteOffset, littleEndian);
+    default: return readUintBytes(dv, byteOffset, selMember.byteSize, littleEndian);
+  }
+}
+
+function getActiveUnionMember(s, dv, base, littleEndian) {
+  if (!(s.flags & UnionFlag.HasSelector)) {
+    return undefined;
+  }
+  const members = s.instance.members;
+  const selMember = members[members.length - 1];
+  const selOffset = base + (selMember.bitOffset >> 3);
+  if (s.flags & UnionFlag.HasTag) {
+    const rawTag = readTagValue(dv, selOffset, selMember, littleEndian);
+    const item = selMember.structure?.constructor?.[CAST]?.(rawTag);
+    const activeName = item?.[NAME];
+    return (activeName !== undefined) ? members.find(m => m.name === activeName) : undefined;
+  } else {
+    const idx = readUintBytes(dv, selOffset, selMember.byteSize, littleEndian);
+    return (idx < members.length - 1) ? members[idx] : undefined;
+  }
 }
 
 var memoryMapping = mixin({
@@ -10729,7 +10718,7 @@ var structureAcquisition = mixin({
       return new Deferred(structure, dv, slots);
     }
     const { constructor } = structure;
-    const object = constructor.call(ENVIRONMENT$1, dv);
+    const object = constructor.call(ENVIRONMENT, dv);
     if (slots) {
       Object.assign(object[SLOTS], slots);
     }
@@ -12545,7 +12534,7 @@ var all$1 = mixin({
       toJSON: this.defineToJSON(),
       valueOf: this.defineValueOf(),
       [SIGNATURE]: defineValue(signature),
-      [ENVIRONMENT$1]: defineValue(this),
+      [ENVIRONMENT]: defineValue(this),
       [ALIGN]: defineValue(align),
       [SIZE]: defineValue(byteSize),
       [TYPE]: defineValue(type),
@@ -13626,7 +13615,7 @@ var _function = mixin({
           dv = thisEnv.getFunctionThunk(arg, constructor[CONTROLLER]);
         }
       } else {
-        if (this !== ENVIRONMENT$1) {
+        if (this !== ENVIRONMENT) {
           // casting from buffer to function is allowed only if request comes from the runtime
           throw new NoCastingToFunction();
         }
@@ -13829,7 +13818,7 @@ var pointer = mixin({
             : 1;
           if (address !== this[LAST_ADDRESS] || length !== this[LAST_LENGTH]) {
             const dv = thisEnv.findMemory(context, address, length, Target[SIZE]);
-            const newTarget = (dv) ? Target.call(ENVIRONMENT$1, dv) : null;
+            const newTarget = (dv) ? Target.call(ENVIRONMENT, dv) : null;
             this[SLOTS][0] = newTarget;
             this[LAST_ADDRESS] = address;
             this[LAST_LENGTH] = length;
@@ -13944,7 +13933,7 @@ var pointer = mixin({
       ? thisEnv.obtainZigView(zig.address, byteLength)
       : thisEnv.obtainView(dv.buffer, dv.byteOffset, byteLength);
       const Target = targetStructure.constructor;
-      this[SLOTS][0] = Target.call(ENVIRONMENT$1, newDV);
+      this[SLOTS][0] = Target.call(ENVIRONMENT, newDV);
       setLength?.call?.(this, len);
     };
     const thisEnv = this;
@@ -13958,7 +13947,7 @@ var pointer = mixin({
         arg = arg[SLOTS][0];
       } else if (flags & PointerFlag.IsMultiple) {
         if (isCompatiblePointer(arg, Target, flags)) {
-          arg = Target.call(ENVIRONMENT$1, arg[SLOTS][0][MEMORY]);
+          arg = Target.call(ENVIRONMENT, arg[SLOTS][0][MEMORY]);
         }
       } else if (targetType === StructureType.Slice && (targetFlags & SliceFlag.IsOpaque) && arg) {
         if (arg.constructor[TYPE] === StructureType.Pointer) {
@@ -13986,10 +13975,10 @@ var pointer = mixin({
         }
       } else if (isCompatibleInstanceOf(arg, Target)) {
         // compatible object from a different module
-        arg = Target.call(ENVIRONMENT$1, arg[MEMORY]);
+        arg = Target.call(ENVIRONMENT, arg[MEMORY]);
       } else if (flags & PointerFlag.IsSingle && flags & PointerFlag.IsMultiple && arg instanceof Target.child) {
         // C pointer
-        const slice = Target.call(ENVIRONMENT$1, arg[MEMORY]);
+        const slice = Target.call(ENVIRONMENT, arg[MEMORY]);
         if (targetContainsJsValue && !arg[MEMORY]?.[ZIG]) {
           slice[SLOTS][0] = arg;
         }
@@ -13997,7 +13986,7 @@ var pointer = mixin({
       } else if (isCompatibleBuffer(arg, Target)) {
         // autocast to target type
         const dv = thisEnv.extractView(targetStructure, arg);
-        arg = Target.call(ENVIRONMENT$1, dv);
+        arg = Target.call(ENVIRONMENT, dv);
       } else if (arg != undefined && !arg[MEMORY]) {
         if (flags & PointerFlag.IsSingle && flags & PointerFlag.IsMultiple) {
           // C pointer
@@ -14125,7 +14114,7 @@ var pointer = mixin({
     }
     staticDescriptors[CAST] = {
       value(arg, options) {
-        if (this === ENVIRONMENT$1 || this === PARENT || arg instanceof constructor) {
+        if (this === ENVIRONMENT || this === PARENT || arg instanceof constructor) {
           // casting from buffer to pointer is allowed only if request comes from the runtime
           // casting from writable to read-only is also allowed
           return false;
@@ -14542,6 +14531,15 @@ var union = mixin({
         const index = getSelector.call(this);
         return valueMembers[index].name;
       };
+    const findActiveField = (flags & UnionFlag.HasTag)
+    ? function() {
+        const rawTag = getSelectorNumber.call(this);
+        return selectorMember.structure.constructor[CAST](rawTag)?.[NAME];
+      }
+    : function() {
+        const index = getSelectorNumber.call(this);
+        return valueMembers[index]?.name;
+      };
     const setActiveField = (flags & UnionFlag.HasTag)
     ? function(name) {
         const { constructor } = selectorMember.structure;
@@ -14627,10 +14625,7 @@ var union = mixin({
             const inZig = Boolean(this[MEMORY]?.[ZIG]);
             let prevName = name;
             if (inZig && !thisEnv.writingUninitZig) {
-              prevName = undefined;
-              try {
-                prevName = getActiveField.call(this);
-              } catch {}
+              prevName = findActiveField.call(this);
               const prevMember = prevName !== undefined && valueMembers.find(m => m.name === prevName);
               if (prevMember && prevName !== name && prevMember.type === MemberType.Object
                 && prevMember.bitOffset !== undefined && hasJsValue(prevMember.structure)) {

@@ -42,6 +42,16 @@ pub const Mixed = extern struct {
 
 pub const RefSlice = []Ref(js.Any);
 
+pub const TaggedWrapper = struct {
+    t: TaggedValue = .{ .code = 0 },
+    n: u32,
+};
+
+pub const OuterUnion = union(enum) {
+    nested: TaggedValue,
+    plain: u32,
+};
+
 pub var exported_ref: Ref(js.Any) = .@"null";
 pub var exported_pair: Pair = .{
     .first = .@"null",
@@ -50,6 +60,10 @@ pub var exported_pair: Pair = .{
 pub var uninit_ref: Ref(js.Any) = undefined;
 pub var uninit_pair: Pair = undefined;
 pub var uninit_tagged: TaggedValue = undefined;
+pub var opt_tagged: ?TaggedValue = null;
+pub var eu_tagged: Error!TaggedValue = .{ .code = 0 };
+pub var wrapper: TaggedWrapper = .{ .t = .{ .code = 0 }, .n = 0 };
+pub var outer_union: OuterUnion = .{ .plain = 0 };
 
 var saved_ref: Ref(js.Object) = .@"null";
 
@@ -347,6 +361,45 @@ pub fn zigSetExportedRef(v: Ref(js.Any)) void {
 
 pub fn zigSetUninitTaggedJs(v: Ref(js.Any)) void {
     uninit_tagged = .{ .js = v };
+}
+
+pub fn zigSetOptTaggedJs(v: Ref(js.Any)) void {
+    if (opt_tagged) |prev| {
+        switch (prev) {
+            .js => |r| r.deinit(),
+            .code => {},
+        }
+    }
+    opt_tagged = .{ .js = v };
+}
+
+pub fn zigSetEuTaggedJs(v: Ref(js.Any)) void {
+    if (eu_tagged) |prev| {
+        switch (prev) {
+            .js => |r| r.deinit(),
+            .code => {},
+        }
+    } else |_| {}
+    eu_tagged = .{ .js = v };
+}
+
+pub fn zigSetWrapperJs(v: Ref(js.Any), n: u32) void {
+    switch (wrapper.t) {
+        .js => |r| r.deinit(),
+        .code => {},
+    }
+    wrapper = .{ .t = .{ .js = v }, .n = n };
+}
+
+pub fn zigSetOuterNestedJs(v: Ref(js.Any)) void {
+    switch (outer_union) {
+        .nested => |prev| switch (prev) {
+            .js => |r| r.deinit(),
+            .code => {},
+        },
+        .plain => {},
+    }
+    outer_union = .{ .nested = .{ .js = v } };
 }
 
 pub fn leaveStaleDeinitInUninitRefAndReuseSlot(

@@ -1,7 +1,7 @@
 import { UnionFlag, StructurePurpose, StructureFlag, VisitorFlag, MemberType } from '../constants.js';
 import { mixin } from '../environment.js';
 import { MultipleUnionInitializers, MissingUnionInitializer, InvalidInitializer, InactiveUnionProperty, InaccessiblePointer } from '../errors.js';
-import { NAME, VISIT, SETTERS, KEYS, RESTRICT, INITIALIZE, TAG, VIVIFICATE, ENTRIES, PROPS, GETTERS, TARGET, MEMORY, ZIG, SLOTS } from '../symbols.js';
+import { NAME, CAST, VISIT, SETTERS, KEYS, RESTRICT, INITIALIZE, TAG, VIVIFICATE, ENTRIES, PROPS, GETTERS, TARGET, MEMORY, ZIG, SLOTS } from '../symbols.js';
 import { defineValue, hasJsValue, isCompatibleInstanceOf, copyObject, empty, defineProperties } from '../utils.js';
 
 var union = mixin({
@@ -26,6 +26,15 @@ var union = mixin({
     : function() {
         const index = getSelector.call(this);
         return valueMembers[index].name;
+      };
+    const findActiveField = (flags & UnionFlag.HasTag)
+    ? function() {
+        const rawTag = getSelectorNumber.call(this);
+        return selectorMember.structure.constructor[CAST](rawTag)?.[NAME];
+      }
+    : function() {
+        const index = getSelectorNumber.call(this);
+        return valueMembers[index]?.name;
       };
     const setActiveField = (flags & UnionFlag.HasTag)
     ? function(name) {
@@ -112,10 +121,7 @@ var union = mixin({
             const inZig = Boolean(this[MEMORY]?.[ZIG]);
             let prevName = name;
             if (inZig && !thisEnv.writingUninitZig) {
-              prevName = undefined;
-              try {
-                prevName = getActiveField.call(this);
-              } catch {}
+              prevName = findActiveField.call(this);
               const prevMember = prevName !== undefined && valueMembers.find(m => m.name === prevName);
               if (prevMember && prevName !== name && prevMember.type === MemberType.Object
                 && prevMember.bitOffset !== undefined && hasJsValue(prevMember.structure)) {
