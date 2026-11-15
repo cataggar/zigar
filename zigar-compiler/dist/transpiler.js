@@ -290,6 +290,7 @@ const CONTROLLER = symbol('controller');
 const PROXY_TYPE = symbol('proxy type');
 const READ_ONLY = symbol('read only');
 const NO_CACHE = symbol('no cache');
+const JS_VALUE = symbol('js value');
 
 const UPDATE = symbol('update');
 const RESTORE = symbol('restore');
@@ -6243,29 +6244,54 @@ var callMarshalingOutbound = mixin({
     const fnAddress = this.getViewAddress(fn[MEMORY]);
     const isAsync = FINALIZE in argStruct;
     const hasPointers = VISIT in argStruct;
-    if (hasPointers) {
-      this.updatePointerAddresses(context, argStruct);
-    }
-    // return address of shadow for argumnet struct
-    const argAddress = this.getShadowAddress(context, argStruct, null, false)
-    ;
-    // get address of attributes if function variadic
-    const attrAddress = (attrs) ? this.getShadowAddress(context, attrs) : 0
-    ;
-    this.updateShadows(context);
-    let finalized = false;
-    const finalize = () => {
-      this.updateShadowTargets(context);
-      // create objects that pointers point to
+    let argAddress, attrAddress;
+    try {
       if (hasPointers) {
-        this.updatePointerTargets(context, argStruct);
+        this.updatePointerAddresses(context, argStruct);
       }
-      this.flushStreams?.();
+      // return address of shadow for argumnet struct
+      argAddress = ("wasm" === 'wasm')
+      ? this.getShadowAddress(context, argStruct, null, false)
+      : this.getViewAddress(argStruct[MEMORY]);
+      // get address of attributes if function variadic
+      attrAddress = ("wasm" === 'wasm')
+      ? (attrs) ? this.getShadowAddress(context, attrs) : 0
+      : (attrs) ? this.getViewAddress(attrs[MEMORY]) : 0;
+      this.updateShadows(context);
+    } catch (err) {
+      if (context.jsValueTargets) {
+        this.finalizeJsValueTargets(context, { abortOnly: true, failed: true });
+      }
       this.endContext();
-      finalized = true;
+      throw err;
+    }
+    let finalized = false;
+    const finalize = (failed = false, retvalStruct = null) => {
+      let finalizeErr = null;
+      try {
+        this.updateShadowTargets(context);
+        if (context.jsValueTargets) {
+          this.finalizeJsValueTargets(context, { failed, retvalStruct });
+        } else if (!failed && retvalStruct) {
+          this.consumeJsValueRetval?.(retvalStruct);
+        }
+        // create objects that pointers point to
+        if (hasPointers) {
+          this.updatePointerTargets(context, argStruct);
+        }
+      } catch (err) {
+        finalizeErr = err;
+      } finally {
+        this.flushStreams?.();
+        this.endContext();
+        finalized = true;
+      }
+      if (finalizeErr && !failed) {
+        throw finalizeErr;
+      }
     };
     if (isAsync) {
-      argStruct[FINALIZE] = finalize;
+      argStruct[FINALIZE] = () => finalize(false);
     }
     {
       this.trackingMixins = true;
@@ -6304,14 +6330,14 @@ var callMarshalingOutbound = mixin({
       }
     } catch (err) {
       if (!finalized) {
-        finalize();
+        finalize(!(err instanceof Exit && err.code === 0));
       }
       throw err;
     }
     const finishCall = (success) => {
       if (!success) {
         if (!finalized) {
-          finalize();
+          finalize(true);
         }
         throw new ZigError();
       }
@@ -6350,11 +6376,9 @@ var callMarshalingOutbound = mixin({
         // this would be undefined if a callback function is used instead
         return argStruct[PROMISE] ?? argStruct[GENERATOR];
       } else {
-        finalize();
         try {
-          if (argStruct[VIVIFICATE]?.retvalHasJsValue) {
-            this.consumeJsValueRetval?.(argStruct);
-          }
+          const retvalStruct = argStruct[VIVIFICATE]?.retvalHasJsValue ? argStruct : null;
+          finalize(false, retvalStruct);
           const { retval } = argStruct;
           return (transform) ? transform(retval) : retval;
         } catch (err) {
@@ -6364,10 +6388,11 @@ var callMarshalingOutbound = mixin({
     };
     if (isPromise(success)) {
       const promise = success.then(finishCall, (err) => {
+        const isCleanExit = (err instanceof Exit && err.code === 0);
         if (!finalized) {
-          finalize();
+          finalize(!isCleanExit);
         }
-        if (err instanceof Exit && err.code === 0) {
+        if (isCleanExit) {
           return;
         }
         throw err;
@@ -6860,6 +6885,7 @@ function initRegistryState(env) {
   env.jsValueActiveCount = 0;
   env.pendingJsHandles = null;
   env.writingUninitZig = false;
+  env.zigJsOwnedSlots = new Map();
 }
 
 var jsValueRegistry = mixin({
@@ -6977,6 +7003,43 @@ var jsValueRegistry = mixin({
   getJsValueCount() {
     return this.jsValueActiveCount;
   },
+  isValidJsValueHandle(handle) {
+    handle >>>= 0;
+    if (handle < FIRST_DYNAMIC_SLOT) {
+      return false;
+    }
+    const slot = handle & SLOT_MASK;
+    const gen = handle >>> GEN_SHIFT;
+    return (slot >= FIRST_DYNAMIC_SLOT && slot < this.jsValueNextSlot && gen !== 0
+      && this.jsValueGenerations[slot] === (ACTIVE_BIT | gen));
+  },
+  releaseZigOwnedHandleAt(dv, base = 0) {
+    const zig = dv?.[ZIG];
+    if (!zig || zig.address === undefined || this.zigJsOwnedSlots.size === 0) {
+      return;
+    }
+    const key = BigInt(zig.address) + BigInt(base);
+    const trackedHandle = this.zigJsOwnedSlots.get(key);
+    if (trackedHandle !== undefined) {
+      this.zigJsOwnedSlots.delete(key);
+      const memHandle = dv.getUint32(base, this.littleEndian) >>> 0;
+      if (memHandle === trackedHandle && this.isValidJsValueHandle(trackedHandle)) {
+        this.releaseJsValue(trackedHandle);
+      }
+    }
+  },
+  recordZigOwnedHandleAt(dv, base, handle) {
+    const zig = dv?.[ZIG];
+    if (!zig || zig.address === undefined) {
+      return;
+    }
+    const key = BigInt(zig.address) + BigInt(base);
+    if ((handle >>> 0) >= FIRST_DYNAMIC_SLOT) {
+      this.zigJsOwnedSlots.set(key, handle >>> 0);
+    } else {
+      this.zigJsOwnedSlots.delete(key);
+    }
+  },
   consumeJsValueObject(refObj) {
     if (!refObj || Object.hasOwn(refObj, TARGET)) {
       return;
@@ -7052,75 +7115,220 @@ var jsValueRegistry = mixin({
     }
   },
   releaseZigJsValues(structure, dv, offset = 0) {
-    if (!dv?.[ZIG] || this.writingUninitZig || !hasJsValue(structure)) {
+    if (!dv?.[ZIG] || this.writingUninitZig || this.zigJsOwnedSlots.size === 0 || !hasJsValue(structure)) {
       return;
     }
-    const le = this.littleEndian;
-    const visit = (s, base) => {
-      if (s.purpose === StructurePurpose.JsValue) {
-        const handle = dv.getUint32(base, le);
-        if (handle >= FIRST_DYNAMIC_SLOT) {
-          this.releaseJsValue(handle);
+    if (this.restoreView) {
+      dv = this.restoreView(dv);
+    }
+    const byteSize = structure.byteSize ?? 0;
+    const startAddr = BigInt(dv[ZIG].address) + BigInt(offset);
+    const endAddr = startAddr + BigInt(byteSize);
+    for (const [ key, trackedHandle ] of this.zigJsOwnedSlots) {
+      if (key >= startAddr && key < endAddr) {
+        this.zigJsOwnedSlots.delete(key);
+        const relOffset = offset + Number(key - startAddr);
+        if (relOffset >= 0 && relOffset + 4 <= dv.byteLength) {
+          const memHandle = dv.getUint32(relOffset, this.littleEndian) >>> 0;
+          if (memHandle === trackedHandle && this.isValidJsValueHandle(trackedHandle)) {
+            this.releaseJsValue(trackedHandle);
+          }
         }
+      }
+    }
+  },
+  walkActiveJsValueLeaves(rootObj, structure, rootDV, callback) {
+    const le = this.littleEndian;
+    const visit = (obj, s) => {
+      if (s.purpose === StructurePurpose.JsValue) {
+        const relOffset = obj[MEMORY].byteOffset - rootDV.byteOffset;
+        callback(obj, relOffset);
         return;
       }
       switch (s.type) {
         case StructureType.Struct: {
-          for (const m of s.instance.members) {
-            if (m.type === MemberType.Object && m.bitOffset !== undefined && hasJsValue(m.structure)) {
-              visit(m.structure, base + (m.bitOffset >> 3));
+          for (const member of s.instance.members) {
+            if (member.type === MemberType.Object && hasJsValue(member.structure)) {
+              const child = obj[SLOTS][member.slot] ?? obj[VIVIFICATE](member.slot);
+              visit(child, member.structure);
             }
           }
           break;
         }
         case StructureType.Array: {
-          const [ elem ] = s.instance.members;
-          if (hasJsValue(elem.structure)) {
+          const [ elementMember ] = s.instance.members;
+          if (elementMember.type === MemberType.Object && hasJsValue(elementMember.structure)) {
             for (let i = 0; i < s.length; i++) {
-              visit(elem.structure, base + i * elem.byteSize);
+              const child = obj[SLOTS][i] ?? obj[VIVIFICATE](i);
+              visit(child, elementMember.structure);
+            }
+          }
+          break;
+        }
+        case StructureType.Slice: {
+          const [ elementMember ] = s.instance.members;
+          if (elementMember.type === MemberType.Object && hasJsValue(elementMember.structure)) {
+            const len = obj[LENGTH] ?? obj.length;
+            for (let i = 0; i < len; i++) {
+              const child = obj[SLOTS][i] ?? obj[VIVIFICATE](i);
+              visit(child, elementMember.structure);
             }
           }
           break;
         }
         case StructureType.Optional: {
-          const [ valMember, presentMember ] = s.instance.members;
-          if (hasJsValue(valMember.structure)
-            && isNonZeroBytes(dv, base + (presentMember.bitOffset >> 3), presentMember.byteSize)) {
-            visit(valMember.structure, base + (valMember.bitOffset >> 3));
+          const [ valueMember, presentMember ] = s.instance.members;
+          const relPresent = (obj[MEMORY].byteOffset - rootDV.byteOffset) + (presentMember.bitOffset >> 3);
+          if (valueMember.type === MemberType.Object && hasJsValue(valueMember.structure)
+            && isNonZeroBytes(rootDV, relPresent, presentMember.byteSize)) {
+            const child = obj[SLOTS][valueMember.slot] ?? obj[VIVIFICATE](valueMember.slot);
+            visit(child, valueMember.structure);
           }
           break;
         }
         case StructureType.ErrorUnion: {
-          const [ valMember, errMember ] = s.instance.members;
-          if (hasJsValue(valMember.structure)
-            && !isNonZeroBytes(dv, base + (errMember.bitOffset >> 3), errMember.byteSize)) {
-            visit(valMember.structure, base + (valMember.bitOffset >> 3));
+          const [ valueMember, errorMember ] = s.instance.members;
+          const relErr = (obj[MEMORY].byteOffset - rootDV.byteOffset) + (errorMember.bitOffset >> 3);
+          if (valueMember.type === MemberType.Object && hasJsValue(valueMember.structure)
+            && !isNonZeroBytes(rootDV, relErr, errorMember.byteSize)) {
+            const child = obj[SLOTS][valueMember.slot] ?? obj[VIVIFICATE](valueMember.slot);
+            visit(child, valueMember.structure);
           }
           break;
         }
         case StructureType.Union: {
-          if (s.flags & UnionFlag.HasSelector) {
-            const members = s.instance.members;
-            let activeMember;
-            if (s.flags & UnionFlag.HasTag) {
-              const subDV = new DataView(dv.buffer, dv.byteOffset + base, s.byteSize);
-              const inst = s.constructor.call(ENVIRONMENT, subDV);
-              const [ activeName ] = inst[PROPS];
-              activeMember = members.find(m => m.name === activeName);
-            } else {
-              const selMember = members[members.length - 1];
-              const idx = readUintBytes(dv, base + (selMember.bitOffset >> 3), selMember.byteSize, le);
-              activeMember = members[idx];
+          if (s.flags & UnionFlag.HasTag) {
+            let activeName;
+            try {
+              [ activeName ] = obj[PROPS];
+            } catch {}
+            const activeMember = activeName && s.instance.members.find(m => m.name === activeName);
+            if (activeMember?.type === MemberType.Object && hasJsValue(activeMember.structure)) {
+              const child = obj[SLOTS][activeMember.slot] ?? obj[VIVIFICATE](activeMember.slot);
+              visit(child, activeMember.structure);
             }
-            if (activeMember && activeMember.type === MemberType.Object && hasJsValue(activeMember.structure)) {
-              visit(activeMember.structure, base + (activeMember.bitOffset >> 3));
+          } else if (s.flags & UnionFlag.HasSelector) {
+            const members = s.instance.members;
+            const selMember = members[members.length - 1];
+            const relSel = (obj[MEMORY].byteOffset - rootDV.byteOffset) + (selMember.bitOffset >> 3);
+            const idx = readUintBytes(rootDV, relSel, selMember.byteSize, le);
+            const activeMember = members[idx];
+            if (activeMember?.type === MemberType.Object && hasJsValue(activeMember.structure)) {
+              const child = obj[SLOTS][activeMember.slot] ?? obj[VIVIFICATE](activeMember.slot);
+              visit(child, activeMember.structure);
             }
           }
           break;
         }
       }
     };
-    visit(structure, offset);
+    visit(rootObj, structure);
+  },
+  prepareJsValueTarget(context, target, structure, writable) {
+    const rootDV = target?.[MEMORY];
+    if (!rootDV || rootDV[ZIG] || !hasJsValue(structure)) {
+      return;
+    }
+    let map = context.jsValueTargets;
+    if (!map) {
+      map = context.jsValueTargets = new Map();
+    }
+    const existing = map.get(target);
+    if (existing) {
+      existing.writable ||= writable;
+      return;
+    }
+    const le = this.littleEndian;
+    const preHandles = new Map();
+    const prevPending = this.pendingJsHandles;
+    this.pendingJsHandles = null;
+    try {
+      this.walkActiveJsValueLeaves(target, structure, rootDV, (refObj, relOffset) => {
+        const jsVal = Object.hasOwn(refObj, TARGET)
+          ? refObj[TARGET]
+          : this.getJsValue(rootDV.getUint32(relOffset, le));
+        refObj[TARGET] = jsVal;
+        const handle = this.allocJsValue(jsVal);
+        rootDV.setUint32(relOffset, handle, le);
+        preHandles.set(relOffset, { refObj, handle });
+      });
+    } catch (err) {
+      for (const [ relOffset, { handle } ] of preHandles) {
+        rootDV.setUint32(relOffset, RESERVED_UNDEFINED, le);
+        if (this.isValidJsValueHandle(handle)) {
+          this.releaseJsValue(handle);
+        }
+      }
+      throw err;
+    } finally {
+      this.pendingJsHandles = prevPending;
+    }
+    map.set(target, { structure, writable, preHandles });
+  },
+  finalizeJsValueTargets(context, { abortOnly = false, failed = false, retvalStruct = null } = {}) {
+    const map = context.jsValueTargets;
+    if (!map) {
+      return;
+    }
+    context.jsValueTargets = null;
+    const le = this.littleEndian;
+    const handlesToRelease = new Set();
+    let resolveErr = null;
+    if (!abortOnly) {
+      for (const [ target, { structure, writable, preHandles } ] of map) {
+        if (!writable) {
+          continue;
+        }
+        const rootDV = target[MEMORY];
+        this.walkActiveJsValueLeaves(target, structure, rootDV, (refObj, relOffset) => {
+          const postHandle = rootDV.getUint32(relOffset, le) >>> 0;
+          const preEntry = preHandles.get(relOffset);
+          if (postHandle >= FIRST_DYNAMIC_SLOT) {
+            if (this.isValidJsValueHandle(postHandle)) {
+              refObj[TARGET] = this.getJsValue(postHandle);
+              handlesToRelease.add(postHandle);
+            } else if (preEntry && postHandle === preEntry.handle) {
+              refObj[TARGET] = undefined;
+            } else if (!failed && !resolveErr) {
+              resolveErr = new InvalidJsValueHandle(postHandle);
+            }
+          } else {
+            try {
+              refObj[TARGET] = this.getJsValue(postHandle);
+            } catch (err) {
+              if (!failed && !resolveErr) resolveErr = err;
+            }
+          }
+          rootDV.setUint32(relOffset, RESERVED_UNDEFINED, le);
+        });
+      }
+      if (!failed && retvalStruct) {
+        try {
+          this.consumeJsValueRetval(retvalStruct);
+        } catch (err) {
+          if (!resolveErr) resolveErr = err;
+        }
+      }
+    }
+    for (const [ target, { writable, preHandles } ] of map) {
+      const rootDV = target[MEMORY];
+      for (const [ relOffset, { handle } ] of preHandles) {
+        if (!writable || abortOnly) {
+          rootDV.setUint32(relOffset, RESERVED_UNDEFINED, le);
+        }
+        if (handle >= FIRST_DYNAMIC_SLOT) {
+          handlesToRelease.add(handle);
+        }
+      }
+    }
+    for (const handle of handlesToRelease) {
+      if (this.isValidJsValueHandle(handle)) {
+        this.releaseJsValue(handle);
+      }
+    }
+    if (resolveErr && !failed) {
+      throw resolveErr;
+    }
   },
   consumeJsValueRetval(argStruct) {
     const retvalMember = argStruct?.[VIVIFICATE]?.retvalMember;
@@ -8247,6 +8455,10 @@ var pointerSynchronization = mixin({
       if (target) {
         const cluster = clusterMap.get(target);
         const writable = cluster?.writable ?? !pointer.constructor.const;
+        const jsTargetStructure = pointer.constructor[JS_VALUE];
+        if (jsTargetStructure) {
+          this.prepareJsValueTarget(context, target, jsTargetStructure, !pointer.constructor.const);
+        }
         pointer[ADDRESS] = this.getTargetAddress(context, target, cluster, writable);
         if (LENGTH in pointer) {
           pointer[LENGTH] = target.length;
@@ -9158,16 +9370,19 @@ var jsValue = mixin({
       if (arg && typeof(arg) === 'object' && arg.constructor?.[PURPOSE] === StructurePurpose.JsValue) {
         value = arg.$;
       }
-      const inZigMemory = Boolean(this[MEMORY]?.[ZIG]);
+      const dv = (this[RESTORE]) ? this[RESTORE]() : this[MEMORY];
+      const inZigMemory = Boolean(dv?.[ZIG]);
       if (inZigMemory || thisEnv.pendingJsHandles !== null) {
         if (Object.hasOwn(this, TARGET)) {
           delete this[TARGET];
         }
-        const prevHandle = (inZigMemory && !thisEnv.writingUninitZig) ? (getHandle.call(this) >>> 0) : 0;
+        if (inZigMemory && !thisEnv.writingUninitZig) {
+          thisEnv.releaseZigOwnedHandleAt(dv, 0);
+        }
         const handle = thisEnv.allocJsValue(value);
         setHandle.call(this, handle);
-        if (prevHandle >= FIRST_DYNAMIC_JS_VALUE_SLOT) {
-          thisEnv.releaseJsValue(prevHandle);
+        if (inZigMemory && !thisEnv.writingUninitZig) {
+          thisEnv.recordZigOwnedHandleAt(dv, 0, handle);
         }
       } else {
         this[TARGET] = value;
@@ -13253,22 +13468,12 @@ var errorUnion = mixin({
     const ErrorSet = errorMember.structure.constructor;
     const { bitOffset, byteSize, slot: valueSlot } = valueMember;
     const assignValue = function(val, allocator) {
-      if (containsJsValue && this[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig && getErrorNumber.call(this) !== 0) {
-        const prevUninit = thisEnv.writingUninitZig;
-        thisEnv.writingUninitZig = true;
-        try {
-          setValue.call(this, val, allocator);
-        } finally {
-          thisEnv.writingUninitZig = prevUninit;
-        }
-      } else {
-        setValue.call(this, val, allocator);
-      }
+      setValue.call(this, val, allocator);
       setErrorNumber.call(this, 0);
     };
     const assignError = function(errVal) {
       if (containsJsValue) {
-        if (this[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig && !getErrorNumber.call(this)) {
+        if (this[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig) {
           thisEnv.releaseZigJsValues(valueMember.structure, this[MEMORY], bitOffset >> 3);
         }
         if (this[SLOTS] && valueSlot !== undefined) {
@@ -13472,21 +13677,11 @@ var optional = mixin({
     const isValueVoid = valueMember.type === MemberType.Void;
     const { bitOffset, byteSize, slot: valueSlot } = valueMember;
     const assignPresentValue = function(val, allocator) {
-      if (containsJsValue && this[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig && !getPresent.call(this)) {
-        const prevUninit = thisEnv.writingUninitZig;
-        thisEnv.writingUninitZig = true;
-        try {
-          setValue.call(this, val, allocator);
-        } finally {
-          thisEnv.writingUninitZig = prevUninit;
-        }
-      } else {
-        setValue.call(this, val, allocator);
-      }
+      setValue.call(this, val, allocator);
     };
     const clearPresentValue = function() {
       if (containsJsValue) {
-        if (this[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig && getPresent.call(this)) {
+        if (this[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig) {
           thisEnv.releaseZigJsValues(valueMember.structure, this[MEMORY], bitOffset >> 3);
         }
         if (this[SLOTS] && valueSlot !== undefined) {
@@ -13730,18 +13925,16 @@ var pointer = mixin({
             throw new ReadOnlyTarget(structure);
           }
         }
-        if (targetContainsJsValue && !arg[MEMORY]?.[ZIG] && thisEnv.pendingJsHandles !== null) {
-          const autoObj = arg = new Target(arg, { allocator });
-          if (targetFlags & StructureFlag.HasProxy) {
-            arg = getProxyTarget(autoObj).target;
-          }
-        }
       } else if (isCompatibleInstanceOf(arg, Target)) {
         // compatible object from a different module
         arg = Target.call(ENVIRONMENT, arg[MEMORY]);
       } else if (flags & PointerFlag.IsSingle && flags & PointerFlag.IsMultiple && arg instanceof Target.child) {
         // C pointer
-        arg = Target.call(ENVIRONMENT, arg[MEMORY]);
+        const slice = Target.call(ENVIRONMENT, arg[MEMORY]);
+        if (targetContainsJsValue && !arg[MEMORY]?.[ZIG]) {
+          slice[SLOTS][0] = arg;
+        }
+        arg = slice;
       } else if (isCompatibleBuffer(arg, Target)) {
         // autocast to target type
         const dv = thisEnv.extractView(targetStructure, arg);
@@ -13769,7 +13962,18 @@ var pointer = mixin({
           throw new InvalidPointerTarget(structure, arg);
         }
         // autovivificate target object
-        const autoObj = arg = new Target(arg, { allocator });
+        let autoObj;
+        if (targetContainsJsValue && !allocator) {
+          const prevPending = thisEnv.pendingJsHandles;
+          thisEnv.pendingJsHandles = null;
+          try {
+            autoObj = arg = new Target(arg);
+          } finally {
+            thisEnv.pendingJsHandles = prevPending;
+          }
+        } else {
+          autoObj = arg = new Target(arg, { allocator });
+        }
         if (targetFlags & StructureFlag.HasProxy) {
           // point to the actual object instead of the proxy
           arg = getProxyTarget(autoObj).target;
@@ -13857,6 +14061,9 @@ var pointer = mixin({
       get() { return targetStructure.constructor }
     };
     staticDescriptors.const = defineValue(!!(flags & PointerFlag.IsConst));
+    if (hasJsValue(targetStructure)) {
+      staticDescriptors[JS_VALUE] = defineValue(targetStructure);
+    }
     staticDescriptors[CAST] = {
       value(arg, options) {
         if (this === ENVIRONMENT || this === PARENT || arg instanceof constructor) {
@@ -14056,7 +14263,19 @@ var slice = mixin({
     descriptors.subarray = {
       value(begin, end) {
         const dv = getSubArrayView.call(this, begin, end);
-        return constructor(dv);
+        const sub = constructor(dv);
+        if (containsJsValue && !this[MEMORY]?.[ZIG] && this[SLOTS]) {
+          const [ subTarget ] = removeProxy(sub);
+          const startIdx = (dv.byteOffset - this[MEMORY].byteOffset) / elementSize;
+          const count = dv.byteLength / elementSize;
+          for (let i = 0; i < count; i++) {
+            const slotObj = this[SLOTS][startIdx + i];
+            if (slotObj) {
+              subTarget[SLOTS][i] = slotObj;
+            }
+          }
+        }
+        return sub;
       },
     };
     descriptors.slice = {
@@ -14064,6 +14283,10 @@ var slice = mixin({
         const {
           zig = false
         } = options;
+        if (containsJsValue) {
+          const sub = this.subarray(begin, end);
+          return new constructor(sub, zig ? { allocator: zig } : undefined);
+        }
         const dv1 = getSubArrayView.call(this, begin, end);
         const dv2 = thisEnv.allocateMemory(dv1.byteLength, align, zig);
         const slice = constructor(dv2);
@@ -14343,19 +14566,10 @@ var union = mixin({
       ? (containsJsValue
         ? function(value) {
             const inZig = Boolean(this[MEMORY]?.[ZIG]);
-            const prevName = (inZig && !thisEnv.writingUninitZig) ? getActiveField.call(this) : name;
-            if (prevName !== name) {
-              const prevMember = valueMembers.find(m => m.name === prevName);
-              if (prevMember) {
-                if (inZig && !thisEnv.writingUninitZig && prevMember.type === MemberType.Object
-                  && prevMember.bitOffset !== undefined && hasJsValue(prevMember.structure)) {
-                  thisEnv.releaseZigJsValues(prevMember.structure, this[MEMORY], prevMember.bitOffset >> 3);
-                }
-                if (this[SLOTS] && prevMember.slot !== undefined) {
-                  delete this[SLOTS][prevMember.slot];
-                }
-              }
-            } else if (!inZig && this[SLOTS]) {
+            if (inZig && !thisEnv.writingUninitZig) {
+              thisEnv.releaseZigJsValues(structure, this[MEMORY], 0);
+            }
+            if (this[SLOTS]) {
               for (const m of valueMembers) {
                 if (m.name !== name && m.slot !== undefined) {
                   delete this[SLOTS][m.slot];
@@ -14364,17 +14578,7 @@ var union = mixin({
             }
             setActiveField.call(this, name);
             this[VISIT]?.('clear', VisitorFlag.IgnoreUncreated);
-            if (inZig && !thisEnv.writingUninitZig && prevName !== name) {
-              const prevUninit = thisEnv.writingUninitZig;
-              thisEnv.writingUninitZig = true;
-              try {
-                setValue.call(this, value);
-              } finally {
-                thisEnv.writingUninitZig = prevUninit;
-              }
-            } else {
-              setValue.call(this, value);
-            }
+            setValue.call(this, value);
           }
         : function(value) {
             setActiveField.call(this, name);

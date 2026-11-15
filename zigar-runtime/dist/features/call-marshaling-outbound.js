@@ -118,29 +118,54 @@ var callMarshalingOutbound = mixin({
     const fnAddress = this.getViewAddress(fn[MEMORY]);
     const isAsync = FINALIZE in argStruct;
     const hasPointers = VISIT in argStruct;
-    if (hasPointers) {
-      this.updatePointerAddresses(context, argStruct);
-    }
-    // return address of shadow for argumnet struct
-    const argAddress = this.getShadowAddress(context, argStruct, null, false)
-    ;
-    // get address of attributes if function variadic
-    const attrAddress = (attrs) ? this.getShadowAddress(context, attrs) : 0
-    ;
-    this.updateShadows(context);
-    let finalized = false;
-    const finalize = () => {
-      this.updateShadowTargets(context);
-      // create objects that pointers point to
+    let argAddress, attrAddress;
+    try {
       if (hasPointers) {
-        this.updatePointerTargets(context, argStruct);
+        this.updatePointerAddresses(context, argStruct);
       }
-      this.flushStreams?.();
+      // return address of shadow for argumnet struct
+      argAddress = ("wasm" === 'wasm')
+      ? this.getShadowAddress(context, argStruct, null, false)
+      : this.getViewAddress(argStruct[MEMORY]);
+      // get address of attributes if function variadic
+      attrAddress = ("wasm" === 'wasm')
+      ? (attrs) ? this.getShadowAddress(context, attrs) : 0
+      : (attrs) ? this.getViewAddress(attrs[MEMORY]) : 0;
+      this.updateShadows(context);
+    } catch (err) {
+      if (context.jsValueTargets) {
+        this.finalizeJsValueTargets(context, { abortOnly: true, failed: true });
+      }
       this.endContext();
-      finalized = true;
+      throw err;
+    }
+    let finalized = false;
+    const finalize = (failed = false, retvalStruct = null) => {
+      let finalizeErr = null;
+      try {
+        this.updateShadowTargets(context);
+        if (context.jsValueTargets) {
+          this.finalizeJsValueTargets(context, { failed, retvalStruct });
+        } else if (!failed && retvalStruct) {
+          this.consumeJsValueRetval?.(retvalStruct);
+        }
+        // create objects that pointers point to
+        if (hasPointers) {
+          this.updatePointerTargets(context, argStruct);
+        }
+      } catch (err) {
+        finalizeErr = err;
+      } finally {
+        this.flushStreams?.();
+        this.endContext();
+        finalized = true;
+      }
+      if (finalizeErr && !failed) {
+        throw finalizeErr;
+      }
     };
     if (isAsync) {
-      argStruct[FINALIZE] = finalize;
+      argStruct[FINALIZE] = () => finalize(false);
     }
     const runnerName = (attrs) ? 'runVariadicThunk' : 'runThunk';
     const syncRunner = this[`${runnerName}Sync`] ;
@@ -176,14 +201,14 @@ var callMarshalingOutbound = mixin({
       }
     } catch (err) {
       if (!finalized) {
-        finalize();
+        finalize(!(err instanceof Exit && err.code === 0));
       }
       throw err;
     }
     const finishCall = (success) => {
       if (!success) {
         if (!finalized) {
-          finalize();
+          finalize(true);
         }
         throw new ZigError();
       }
@@ -222,11 +247,9 @@ var callMarshalingOutbound = mixin({
         // this would be undefined if a callback function is used instead
         return argStruct[PROMISE] ?? argStruct[GENERATOR];
       } else {
-        finalize();
         try {
-          if (argStruct[VIVIFICATE]?.retvalHasJsValue) {
-            this.consumeJsValueRetval?.(argStruct);
-          }
+          const retvalStruct = argStruct[VIVIFICATE]?.retvalHasJsValue ? argStruct : null;
+          finalize(false, retvalStruct);
           const { retval } = argStruct;
           return (transform) ? transform(retval) : retval;
         } catch (err) {
@@ -236,10 +259,11 @@ var callMarshalingOutbound = mixin({
     };
     if (isPromise(success)) {
       const promise = success.then(finishCall, (err) => {
+        const isCleanExit = (err instanceof Exit && err.code === 0);
         if (!finalized) {
-          finalize();
+          finalize(!isCleanExit);
         }
-        if (err instanceof Exit && err.code === 0) {
+        if (isCleanExit) {
           return;
         }
         throw err;

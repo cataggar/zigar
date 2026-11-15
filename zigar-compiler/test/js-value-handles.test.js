@@ -20,13 +20,14 @@ async function compileAndImport(zigPath, options = {}) {
     useJSPI = false,
     useWazig = true,
     stripUnused = true,
+    optimize = 'ReleaseSmall',
   } = options;
   const result = await transpile(zigPath, {
     nodeCompat: false,
     embedWASM: true,
     topLevelAwait: true,
     stripUnused,
-    optimize: 'ReleaseSmall',
+    optimize,
     memory64,
     useJSPI,
     useWazig,
@@ -464,8 +465,160 @@ describe('JsValue Handle Registry & zigar.js.Ref(T) End-to-End Integration', fun
         expect(() => mod.takeRefAndUint({ outboundRollback: true }, 'not-a-uint')).to.throw(Error);
         expect(Number(mod.activeCount())).to.equal(0);
       });
+
+      it('should sync mutations and release borrowed handles for pointer and slice arguments (*Pair, *Mixed, *const Pair, []const Ref)', async function() {
+        const objA = { a: 1 };
+        const objB = { b: 2 };
+        const objC = new CustomWidget('replaced');
+        const objD = { d: 4 };
+
+        // 1. `setFirst(p: *Pair, v: Ref(Any))` updates caller's `pair.first` and leaks 0 handles
+        const pair = new mod.Pair({ first: objA, second: objB });
+        expect(Number(mod.activeCount())).to.equal(0);
+        mod.setFirst(pair, objC);
+        expect(Object.is(pair.first, objC)).to.be.true;
+        expect(Object.is(pair.second, objB)).to.be.true;
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        // In-place swap (`p.first <-> p.second`) resolves both handles before releasing either
+        mod.swapInPlace(pair);
+        expect(Object.is(pair.first, objB)).to.be.true;
+        expect(Object.is(pair.second, objC)).to.be.true;
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        // Returning old `p.first` while setting new `p.first = objD` transfers both cleanly
+        const taken = mod.takeFirstAndSet(pair, objD);
+        expect(Object.is(taken, objB)).to.be.true;
+        expect(Object.is(pair.first, objD)).to.be.true;
+        expect(Object.is(pair.second, objC)).to.be.true;
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        // 2. `setNum(p: *Mixed, n: u32)` updates non-Ref field `m.num` in place with 0 leaked handles
+        const m = new mod.Mixed({ ref: objA, num: 1 });
+        expect(Number(mod.activeCount())).to.equal(0);
+        mod.setNum(m, 42);
+        expect(m.num).to.equal(42);
+        expect(Object.is(m.ref, objA)).to.be.true;
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        mod.setMixedBoth(m, objC, 99);
+        expect(m.num).to.equal(99);
+        expect(Object.is(m.ref, objC)).to.be.true;
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        // 3. `ptrFirstType(p: *const Pair)` with both plain JS object and `new mod.Pair(...)` leaks 0 handles
+        expect(String(mod.ptrFirstType({ first: objA, second: objB }))).to.equal('object');
+        expect(Number(mod.activeCount())).to.equal(0);
+        expect(String(mod.ptrFirstType(new mod.Pair({ first: () => {}, second: objB })))).to.equal('function');
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        // 4. `sliceLen(items: []const Ref(Any))` and mutable `[]Ref(Any)` slice sync
+        expect(Number(mod.sliceLen([ objA, objB ]))).to.equal(2);
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        expect(Number(mod.sliceLen([ objA, 'str', 123, null, undefined ]))).to.equal(5);
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        const mutSlice = new mod.RefSlice([ objA, objB ]);
+        expect(Number(mod.activeCount())).to.equal(0);
+        mod.sliceReplaceElem(mutSlice, 1, objC);
+        expect(Object.is(mutSlice[0], objA)).to.be.true;
+        expect(Object.is(mutSlice[1], objC)).to.be.true;
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        // Mutable tagged union pointer switching from `.js` to `.code` preserves `.code` value and leaks 0 handles
+        const tagged = new mod.TaggedValue({ js: objA });
+        mod.switchTaggedToCode(tagged, 777);
+        expect(tagged.code).to.equal(777);
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        // Async/callback pointer mutation (covers JSPI suspension + resume finalize path)
+        const asyncPair = new mod.Pair({ first: objA, second: objB });
+        await mod.callAsyncMutatePair(asyncPair, objD, (cur) => {
+          expect(Object.is(cur, objA)).to.be.true;
+          return objC;
+        });
+        expect(Object.is(asyncPair.first, objC)).to.be.true;
+        expect(Object.is(asyncPair.second, objD)).to.be.true;
+        expect(Number(mod.activeCount())).to.equal(0);
+      });
+
+      it('should safely assign from JS to uninitialized Zig globals (pub var uninit_ref = undefined)', function() {
+        const obj1 = { x: 1 };
+        const obj2 = { x: 2 };
+
+        // Test initial `= undefined` state AND explicit `0xaa` (`0xaaaaaaaa`) uninitialized fill
+        for (const poison of [ false, true ]) {
+          if (poison) {
+            mod.poisonUninitVarsWith0xAA();
+          }
+          mod.default.uninit_ref = obj1;
+          expect(Object.is(mod.default.uninit_ref, obj1)).to.be.true;
+          expect(Number(mod.activeCount())).to.equal(1);
+
+          mod.default.uninit_ref = obj2;
+          expect(Object.is(mod.default.uninit_ref, obj2)).to.be.true;
+          expect(Number(mod.activeCount())).to.equal(1);
+
+          mod.default.uninit_ref = undefined;
+          expect(mod.default.uninit_ref).to.be.undefined;
+          expect(Number(mod.activeCount())).to.equal(0);
+
+          mod.default.uninit_pair = { first: obj1, second: obj2 };
+          expect(Object.is(mod.default.uninit_pair.first, obj1)).to.be.true;
+          expect(Object.is(mod.default.uninit_pair.second, obj2)).to.be.true;
+          expect(Number(mod.activeCount())).to.equal(2);
+          mod.default.uninit_pair = { first: undefined, second: null };
+          expect(Number(mod.activeCount())).to.equal(0);
+
+          mod.default.uninit_tagged = { js: obj1 };
+          expect(Object.is(mod.default.uninit_tagged.js, obj1)).to.be.true;
+          expect(Number(mod.activeCount())).to.equal(1);
+          mod.default.uninit_tagged = { code: 123 };
+          expect(mod.default.uninit_tagged.code).to.equal(123);
+          expect(Number(mod.activeCount())).to.equal(0);
+        }
+
+        // Verify uninitialized Zig memory whose raw bytes happen to collide with a live handle
+        // owned by Zig (`saved_ref`) never frees Zig's handle when JS assigns to `collision_ref`!
+        const zigOwned = new CustomWidget('zig-owned');
+        mod.storeGlobal(zigOwned);
+        expect(Number(mod.activeCount())).to.equal(1);
+        mod.plantSavedHandleInCollisionVar();
+
+        mod.default.collision_ref = obj1;
+        expect(Number(mod.activeCount())).to.equal(2);
+        expect(Object.is(mod.loadGlobalClone(), zigOwned)).to.be.true;
+        expect(Object.is(mod.default.collision_ref, obj1)).to.be.true;
+
+        mod.default.collision_ref = undefined;
+        expect(Number(mod.activeCount())).to.equal(1);
+        expect(Object.is(mod.loadGlobalClone(), zigOwned)).to.be.true;
+        mod.clearGlobal();
+        expect(Number(mod.activeCount())).to.equal(0);
+      });
     });
   }
+
+  it('should handle real Zig Debug-mode 0xaa uninitialized globals without InvalidJsValueHandle', async function() {
+    const { mod } = await compileAndImport(samplePath, {
+      memory64: false,
+      useWazig: true,
+      useJSPI: false,
+      optimize: 'Debug',
+    });
+    const obj1 = { debug: 1 };
+    const obj2 = { debug: 2 };
+    mod.default.uninit_ref = obj1;
+    expect(Object.is(mod.default.uninit_ref, obj1)).to.be.true;
+    expect(Number(mod.activeCount())).to.equal(1);
+    mod.default.uninit_ref = obj2;
+    expect(Object.is(mod.default.uninit_ref, obj2)).to.be.true;
+    expect(Number(mod.activeCount())).to.equal(1);
+    mod.default.uninit_ref = undefined;
+    expect(mod.default.uninit_ref).to.be.undefined;
+    expect(Number(mod.activeCount())).to.equal(0);
+  });
 
   it('should omit JsValue runtime imports when compiling modules without Ref(T)', async function() {
     const simplePath = resolve(testDir, './zig-samples/basic/simple.zig');

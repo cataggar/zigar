@@ -1,7 +1,7 @@
-import { FIRST_DYNAMIC_JS_VALUE_SLOT, StructurePurpose } from '../constants.js';
+import { StructurePurpose } from '../constants.js';
 import { mixin } from '../environment.js';
 import { throwReadOnly } from '../errors.js';
-import { ENTRIES, INITIALIZE, MEMORY, PROPS, PURPOSE, READ_ONLY, TARGET, ZIG } from '../symbols.js';
+import { ENTRIES, INITIALIZE, MEMORY, PROPS, PURPOSE, READ_ONLY, RESTORE, TARGET, ZIG } from '../symbols.js';
 import { defineValue } from '../utils.js';
 
 export default mixin({
@@ -26,16 +26,19 @@ export default mixin({
       if (arg && typeof(arg) === 'object' && arg.constructor?.[PURPOSE] === StructurePurpose.JsValue) {
         value = arg.$;
       }
-      const inZigMemory = Boolean(this[MEMORY]?.[ZIG]);
+      const dv = (process.env.TARGET === 'wasm' && this[RESTORE]) ? this[RESTORE]() : this[MEMORY];
+      const inZigMemory = Boolean(dv?.[ZIG]);
       if (inZigMemory || thisEnv.pendingJsHandles !== null) {
         if (Object.hasOwn(this, TARGET)) {
           delete this[TARGET];
         }
-        const prevHandle = (inZigMemory && !thisEnv.writingUninitZig) ? (getHandle.call(this) >>> 0) : 0;
+        if (inZigMemory && !thisEnv.writingUninitZig) {
+          thisEnv.releaseZigOwnedHandleAt(dv, 0);
+        }
         const handle = thisEnv.allocJsValue(value);
         setHandle.call(this, handle);
-        if (prevHandle >= FIRST_DYNAMIC_JS_VALUE_SLOT) {
-          thisEnv.releaseJsValue(prevHandle);
+        if (inZigMemory && !thisEnv.writingUninitZig) {
+          thisEnv.recordZigOwnedHandleAt(dv, 0, handle);
         }
       } else {
         this[TARGET] = value;

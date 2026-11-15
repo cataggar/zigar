@@ -1,4 +1,4 @@
-import { MemberType, StructureFlag, StructurePurpose, UnionFlag, VisitorFlag } from '../constants.js';
+import { StructureFlag, StructurePurpose, UnionFlag, VisitorFlag } from '../constants.js';
 import { mixin } from '../environment.js';
 import {
   InaccessiblePointer, InactiveUnionProperty, InvalidInitializer, MissingUnionInitializer,
@@ -118,19 +118,10 @@ export default mixin({
       ? (containsJsValue
         ? function(value) {
             const inZig = Boolean(this[MEMORY]?.[ZIG]);
-            const prevName = (inZig && !thisEnv.writingUninitZig) ? getActiveField.call(this) : name;
-            if (prevName !== name) {
-              const prevMember = valueMembers.find(m => m.name === prevName);
-              if (prevMember) {
-                if (inZig && !thisEnv.writingUninitZig && prevMember.type === MemberType.Object
-                  && prevMember.bitOffset !== undefined && hasJsValue(prevMember.structure)) {
-                  thisEnv.releaseZigJsValues(prevMember.structure, this[MEMORY], prevMember.bitOffset >> 3);
-                }
-                if (this[SLOTS] && prevMember.slot !== undefined) {
-                  delete this[SLOTS][prevMember.slot];
-                }
-              }
-            } else if (!inZig && this[SLOTS]) {
+            if (inZig && !thisEnv.writingUninitZig) {
+              thisEnv.releaseZigJsValues(structure, this[MEMORY], 0);
+            }
+            if (this[SLOTS]) {
               for (const m of valueMembers) {
                 if (m.name !== name && m.slot !== undefined) {
                   delete this[SLOTS][m.slot];
@@ -139,17 +130,7 @@ export default mixin({
             }
             setActiveField.call(this, name);
             this[VISIT]?.('clear', VisitorFlag.IgnoreUncreated);
-            if (inZig && !thisEnv.writingUninitZig && prevName !== name) {
-              const prevUninit = thisEnv.writingUninitZig;
-              thisEnv.writingUninitZig = true;
-              try {
-                setValue.call(this, value);
-              } finally {
-                thisEnv.writingUninitZig = prevUninit;
-              }
-            } else {
-              setValue.call(this, value);
-            }
+            setValue.call(this, value);
           }
         : function(value) {
             setActiveField.call(this, name);

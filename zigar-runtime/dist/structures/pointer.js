@@ -2,7 +2,7 @@ import { PointerFlag, StructureType, SliceFlag, StructureFlag, ProxyType } from 
 import { mixin } from '../environment.js';
 import { NoCastingToPointer, throwReadOnly, ConstantConstraint, ReadOnlyTarget, InvalidPointerTarget, PreviouslyFreed, NullPointer, InvalidSliceLength, ZigMemoryTargetRequired } from '../errors.js';
 import { getProxyType, getProxyTarget, getProxy } from '../proxies.js';
-import { CAST, ENVIRONMENT, PARENT, LAST_LENGTH, SLOTS, MEMORY, TYPE, TARGET, RESTORE, READ_ONLY, ZIG, SETTERS, TYPED_ARRAY, INITIALIZE, FINALIZE, PROXY, PROXY_TYPE, UPDATE, ADDRESS, LENGTH, VISIT, LAST_ADDRESS, MAX_LENGTH, SENTINEL, SIZE } from '../symbols.js';
+import { JS_VALUE, CAST, ENVIRONMENT, PARENT, LAST_LENGTH, SLOTS, MEMORY, TYPE, TARGET, RESTORE, READ_ONLY, ZIG, SETTERS, TYPED_ARRAY, INITIALIZE, FINALIZE, PROXY, PROXY_TYPE, UPDATE, ADDRESS, LENGTH, VISIT, LAST_ADDRESS, MAX_LENGTH, SENTINEL, SIZE } from '../symbols.js';
 import { defineValue, hasJsValue, isCompatibleInstanceOf, isInvalidUsize, getSelf, isCompatibleType, findElements } from '../utils.js';
 
 var pointer = mixin({
@@ -188,18 +188,16 @@ var pointer = mixin({
             throw new ReadOnlyTarget(structure);
           }
         }
-        if (targetContainsJsValue && !arg[MEMORY]?.[ZIG] && thisEnv.pendingJsHandles !== null) {
-          const autoObj = arg = new Target(arg, { allocator });
-          if (targetFlags & StructureFlag.HasProxy) {
-            arg = getProxyTarget(autoObj).target;
-          }
-        }
       } else if (isCompatibleInstanceOf(arg, Target)) {
         // compatible object from a different module
         arg = Target.call(ENVIRONMENT, arg[MEMORY]);
       } else if (flags & PointerFlag.IsSingle && flags & PointerFlag.IsMultiple && arg instanceof Target.child) {
         // C pointer
-        arg = Target.call(ENVIRONMENT, arg[MEMORY]);
+        const slice = Target.call(ENVIRONMENT, arg[MEMORY]);
+        if (targetContainsJsValue && !arg[MEMORY]?.[ZIG]) {
+          slice[SLOTS][0] = arg;
+        }
+        arg = slice;
       } else if (isCompatibleBuffer(arg, Target)) {
         // autocast to target type
         const dv = thisEnv.extractView(targetStructure, arg);
@@ -227,7 +225,18 @@ var pointer = mixin({
           throw new InvalidPointerTarget(structure, arg);
         }
         // autovivificate target object
-        const autoObj = arg = new Target(arg, { allocator });
+        let autoObj;
+        if (targetContainsJsValue && !allocator) {
+          const prevPending = thisEnv.pendingJsHandles;
+          thisEnv.pendingJsHandles = null;
+          try {
+            autoObj = arg = new Target(arg);
+          } finally {
+            thisEnv.pendingJsHandles = prevPending;
+          }
+        } else {
+          autoObj = arg = new Target(arg, { allocator });
+        }
         if (targetFlags & StructureFlag.HasProxy) {
           // point to the actual object instead of the proxy
           arg = getProxyTarget(autoObj).target;
@@ -315,6 +324,9 @@ var pointer = mixin({
       get() { return targetStructure.constructor }
     };
     staticDescriptors.const = defineValue(!!(flags & PointerFlag.IsConst));
+    if (hasJsValue(targetStructure)) {
+      staticDescriptors[JS_VALUE] = defineValue(targetStructure);
+    }
     staticDescriptors[CAST] = {
       value(arg, options) {
         if (this === ENVIRONMENT || this === PARENT || arg instanceof constructor) {

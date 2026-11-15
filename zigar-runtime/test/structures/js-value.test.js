@@ -660,4 +660,177 @@ describe('Structure: js-value', function() {
     expect(() => new FnArgs([ liveObj, 'not-a-u32' ])).to.throw(Error);
     expect(env.getJsValueCount()).to.equal(0);
   });
+
+  it('should safely overwrite uninitialized 0xaaaaaaaa Zig globals and avoid handle-collision frees', function() {
+    const env = new Env();
+    const { u32, jsRef } = defineBasicTypes(env);
+    const Ref = jsRef.constructor;
+
+    const pairStruct = {
+      type: StructureType.Struct,
+      name: 'Pair',
+      byteSize: 8,
+      align: 4,
+      flags: StructureFlag.HasObject | StructureFlag.HasSlot | StructFlag.IsExtern,
+      signature: 40n,
+      instance: {
+        members: [
+          { name: 'first', type: MemberType.Object, bitSize: 32, bitOffset: 0, byteSize: 4, slot: 0, structure: jsRef },
+          { name: 'second', type: MemberType.Object, bitSize: 32, bitOffset: 32, byteSize: 4, slot: 1, structure: jsRef },
+        ],
+      },
+      static: {},
+    };
+    env.beginStructure(pairStruct);
+    env.finishStructure(pairStruct);
+    const Pair = pairStruct.constructor;
+
+    const allocZigDV = createZigBufferSetup(env);
+
+    // Uninitialized `pub var uninit_ref: Ref(Any) = undefined;` filled with 0xaa (0xaaaaaaaa)
+    const uninitRefDV = allocZigDV(0x3000, 4);
+    new Uint8Array(uninitRefDV.buffer, uninitRefDV.byteOffset, 4).fill(0xaa);
+    const uninitRef = Ref(uninitRefDV);
+
+    const obj1 = { x: 1 };
+    const obj2 = { x: 2 };
+    uninitRef.$ = obj1;
+    expect(uninitRef.$).to.equal(obj1);
+    expect(env.getJsValueCount()).to.equal(1);
+
+    uninitRef.$ = obj2;
+    expect(uninitRef.$).to.equal(obj2);
+    expect(env.getJsValueCount()).to.equal(1);
+
+    uninitRef.$ = undefined;
+    expect(uninitRef.$).to.be.undefined;
+    expect(env.getJsValueCount()).to.equal(0);
+
+    // Uninitialized bytes colliding with an unrelated live handle must NEVER release that handle!
+    const innocentObj = { keepAlive: true };
+    const innocentHandle = env.allocJsValue(innocentObj);
+    expect(env.getJsValueCount()).to.equal(1);
+
+    const collisionDV = allocZigDV(0x3010, 4);
+    collisionDV.setUint32(0, innocentHandle, env.littleEndian);
+    const collisionRef = Ref(collisionDV);
+    collisionRef.$ = obj1;
+    expect(env.getJsValueCount()).to.equal(2);
+    expect(env.getJsValue(innocentHandle)).to.equal(innocentObj);
+    expect(collisionRef.$).to.equal(obj1);
+
+    collisionRef.$ = undefined;
+    expect(env.getJsValueCount()).to.equal(1);
+    expect(env.getJsValue(innocentHandle)).to.equal(innocentObj);
+    env.releaseJsValue(innocentHandle);
+    expect(env.getJsValueCount()).to.equal(0);
+
+    // Uninitialized `Pair` filled with 0xaa overwritten from JS
+    const uninitPairDV = allocZigDV(0x3020, 8);
+    new Uint8Array(uninitPairDV.buffer, uninitPairDV.byteOffset, 8).fill(0xaa);
+    const uninitPair = Pair(uninitPairDV);
+    uninitPair.$ = { first: obj1, second: obj2 };
+    expect(env.getJsValueCount()).to.equal(2);
+    expect(uninitPair.first).to.equal(obj1);
+    expect(uninitPair.second).to.equal(obj2);
+    uninitPair.$ = { first: undefined, second: null };
+    expect(env.getJsValueCount()).to.equal(0);
+
+    // Suppress unused variable lint if needed
+    expect(u32.byteSize).to.equal(4);
+  });
+
+  it('should materialize call-scoped borrowed handles for pointer/slice targets and sync mutations back', function() {
+    const env = new Env();
+    const { u32, jsRef } = defineBasicTypes(env);
+
+    const pairStruct = {
+      type: StructureType.Struct,
+      name: 'Pair',
+      byteSize: 8,
+      align: 4,
+      flags: StructureFlag.HasObject | StructureFlag.HasSlot | StructFlag.IsExtern,
+      signature: 50n,
+      instance: {
+        members: [
+          { name: 'first', type: MemberType.Object, bitSize: 32, bitOffset: 0, byteSize: 4, slot: 0, structure: jsRef },
+          { name: 'second', type: MemberType.Object, bitSize: 32, bitOffset: 32, byteSize: 4, slot: 1, structure: jsRef },
+        ],
+      },
+      static: {},
+    };
+    env.beginStructure(pairStruct);
+    env.finishStructure(pairStruct);
+    const Pair = pairStruct.constructor;
+
+    const mixedStruct = {
+      type: StructureType.Struct,
+      name: 'Mixed',
+      byteSize: 8,
+      align: 4,
+      flags: StructureFlag.HasObject | StructureFlag.HasSlot | StructFlag.IsExtern,
+      signature: 51n,
+      instance: {
+        members: [
+          { name: 'ref', type: MemberType.Object, bitSize: 32, bitOffset: 0, byteSize: 4, slot: 0, structure: jsRef },
+          { name: 'num', type: MemberType.Uint, bitSize: 32, bitOffset: 32, byteSize: 4, structure: u32 },
+        ],
+      },
+      static: {},
+    };
+    env.beginStructure(mixedStruct);
+    env.finishStructure(mixedStruct);
+    const Mixed = mixedStruct.constructor;
+
+    const a = { a: 1 };
+    const b = { b: 2 };
+    const c = { c: 3 };
+
+    // Writable `*Pair`: Zig deinits `first` and writes `c`'s handle
+    const pair = new Pair({ first: a, second: b });
+    expect(env.getJsValueCount()).to.equal(0);
+    const ctx1 = {};
+    env.prepareJsValueTarget(ctx1, pair, pairStruct, true);
+    expect(env.getJsValueCount()).to.equal(2);
+    const preFirst = pair[MEMORY].getUint32(0, env.littleEndian);
+    env.releaseJsValue(preFirst);
+    const newHandle = env.allocJsValue(c);
+    pair[MEMORY].setUint32(0, newHandle, env.littleEndian);
+    env.finalizeJsValueTargets(ctx1);
+    expect(pair.first).to.equal(c);
+    expect(pair.second).to.equal(b);
+    expect(env.getJsValueCount()).to.equal(0);
+
+    // Writable `*Pair` in-place swap (`p.first <-> p.second`) must read both before releasing!
+    const ctxSwap = {};
+    env.prepareJsValueTarget(ctxSwap, pair, pairStruct, true);
+    const h0 = pair[MEMORY].getUint32(0, env.littleEndian);
+    const h1 = pair[MEMORY].getUint32(4, env.littleEndian);
+    pair[MEMORY].setUint32(0, h1, env.littleEndian);
+    pair[MEMORY].setUint32(4, h0, env.littleEndian);
+    env.finalizeJsValueTargets(ctxSwap);
+    expect(pair.first).to.equal(b);
+    expect(pair.second).to.equal(c);
+    expect(env.getJsValueCount()).to.equal(0);
+
+    // Writable `*Mixed`: Zig mutates `num = 42` without touching `ref`
+    const mixed = new Mixed({ ref: a, num: 1 });
+    const ctxMixed = {};
+    env.prepareJsValueTarget(ctxMixed, mixed, mixedStruct, true);
+    expect(env.getJsValueCount()).to.equal(1);
+    mixed[MEMORY].setUint32(4, 42, env.littleEndian);
+    env.finalizeJsValueTargets(ctxMixed);
+    expect(mixed.ref).to.equal(a);
+    expect(mixed.num).to.equal(42);
+    expect(env.getJsValueCount()).to.equal(0);
+
+    // Const `*const Pair`: borrowed handles released cleanly
+    const ctxConst = {};
+    env.prepareJsValueTarget(ctxConst, pair, pairStruct, false);
+    expect(env.getJsValueCount()).to.equal(2);
+    env.finalizeJsValueTargets(ctxConst);
+    expect(pair.first).to.equal(b);
+    expect(pair.second).to.equal(c);
+    expect(env.getJsValueCount()).to.equal(0);
+  });
 });

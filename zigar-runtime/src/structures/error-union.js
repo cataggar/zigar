@@ -29,22 +29,12 @@ export default mixin({
     const ErrorSet = errorMember.structure.constructor;
     const { bitOffset, byteSize, slot: valueSlot } = valueMember;
     const assignValue = function(val, allocator) {
-      if (containsJsValue && this[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig && getErrorNumber.call(this) !== 0) {
-        const prevUninit = thisEnv.writingUninitZig;
-        thisEnv.writingUninitZig = true;
-        try {
-          setValue.call(this, val, allocator);
-        } finally {
-          thisEnv.writingUninitZig = prevUninit;
-        }
-      } else {
-        setValue.call(this, val, allocator);
-      }
+      setValue.call(this, val, allocator);
       setErrorNumber.call(this, 0);
     };
     const assignError = function(errVal) {
       if (containsJsValue) {
-        if (this[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig && !getErrorNumber.call(this)) {
+        if (this[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig) {
           thisEnv.releaseZigJsValues(valueMember.structure, this[MEMORY], bitOffset >> 3);
         }
         if (this[SLOTS] && valueSlot !== undefined) {

@@ -25,21 +25,11 @@ var optional = mixin({
     const isValueVoid = valueMember.type === MemberType.Void;
     const { bitOffset, byteSize, slot: valueSlot } = valueMember;
     const assignPresentValue = function(val, allocator) {
-      if (containsJsValue && this[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig && !getPresent.call(this)) {
-        const prevUninit = thisEnv.writingUninitZig;
-        thisEnv.writingUninitZig = true;
-        try {
-          setValue.call(this, val, allocator);
-        } finally {
-          thisEnv.writingUninitZig = prevUninit;
-        }
-      } else {
-        setValue.call(this, val, allocator);
-      }
+      setValue.call(this, val, allocator);
     };
     const clearPresentValue = function() {
       if (containsJsValue) {
-        if (this[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig && getPresent.call(this)) {
+        if (this[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig) {
           thisEnv.releaseZigJsValues(valueMember.structure, this[MEMORY], bitOffset >> 3);
         }
         if (this[SLOTS] && valueSlot !== undefined) {

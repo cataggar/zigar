@@ -1,6 +1,6 @@
 import { VisitorFlag } from '../constants.js';
 import { mixin } from '../environment.js';
-import { ADDRESS, LENGTH, MEMORY, SLOTS, UPDATE, VISIT, ZIG } from '../symbols.js';
+import { ADDRESS, JS_VALUE, LENGTH, MEMORY, SLOTS, UPDATE, VISIT, ZIG } from '../symbols.js';
 import { findSortedIndex } from '../utils.js';
 
 export default mixin({
@@ -57,6 +57,10 @@ export default mixin({
       if (target) {
         const cluster = clusterMap.get(target);
         const writable = cluster?.writable ?? !pointer.constructor.const;
+        const jsTargetStructure = pointer.constructor[JS_VALUE];
+        if (jsTargetStructure) {
+          this.prepareJsValueTarget(context, target, jsTargetStructure, !pointer.constructor.const);
+        }
         pointer[ADDRESS] = this.getTargetAddress(context, target, cluster, writable);
         if (LENGTH in pointer) {
           pointer[LENGTH] = target.length;

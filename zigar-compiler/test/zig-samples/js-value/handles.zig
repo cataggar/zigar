@@ -35,11 +35,22 @@ pub const RefWithUint = extern struct {
     num: u32,
 };
 
+pub const Mixed = extern struct {
+    ref: Ref(js.Any),
+    num: u32,
+};
+
+pub const RefSlice = []Ref(js.Any);
+
 pub var exported_ref: Ref(js.Any) = .@"null";
 pub var exported_pair: Pair = .{
     .first = .@"null",
     .second = .@"null",
 };
+pub var uninit_ref: Ref(js.Any) = undefined;
+pub var uninit_pair: Pair = undefined;
+pub var uninit_tagged: TaggedValue = undefined;
+pub var collision_ref: Ref(js.Any) = undefined;
 
 var saved_ref: Ref(js.Object) = .@"null";
 
@@ -258,3 +269,77 @@ pub fn triggerAbaStaleUse(first: Ref(js.Object), replacement: Ref(js.Object)) js
     // `saved_ref` is now live in the SAME slot index as `stale` with incremented generation!
     return stale.typeof();
 }
+
+pub fn setFirst(p: *Pair, v: Ref(js.Any)) void {
+    p.first.deinit();
+    p.first = v;
+}
+
+pub fn swapInPlace(p: *Pair) void {
+    const tmp = p.first;
+    p.first = p.second;
+    p.second = tmp;
+}
+
+pub fn takeFirstAndSet(p: *Pair, v: Ref(js.Any)) Ref(js.Any) {
+    const old = p.first;
+    p.first = v;
+    return old;
+}
+
+pub fn setNum(p: *Mixed, n: u32) void {
+    p.num = n;
+}
+
+pub fn setMixedBoth(p: *Mixed, v: Ref(js.Any), n: u32) void {
+    p.ref.deinit();
+    p.ref = v;
+    p.num = n;
+}
+
+pub fn ptrFirstType(p: *const Pair) js.JsType {
+    return p.first.typeof();
+}
+
+pub fn sliceLen(items: []const Ref(js.Any)) usize {
+    for (items) |item| {
+        _ = item.typeof();
+    }
+    return items.len;
+}
+
+pub fn sliceReplaceElem(items: []Ref(js.Any), idx: usize, v: Ref(js.Any)) void {
+    items[idx].deinit();
+    items[idx] = v;
+}
+
+pub fn switchTaggedToCode(t: *TaggedValue, code: i32) void {
+    switch (t.*) {
+        .js => |r| r.deinit(),
+        .code => {},
+    }
+    t.* = .{ .code = code };
+}
+
+pub fn callAsyncMutatePair(
+    p: *Pair,
+    v: Ref(js.Any),
+    cb: *const fn (Ref(js.Any)) Ref(js.Any),
+) void {
+    const next = cb(p.first);
+    p.first.deinit();
+    p.second.deinit();
+    p.first = next;
+    p.second = v;
+}
+
+pub fn poisonUninitVarsWith0xAA() void {
+    @memset(std.mem.asBytes(&uninit_ref), 0xaa);
+    @memset(std.mem.asBytes(&uninit_pair), 0xaa);
+    @memset(std.mem.asBytes(&uninit_tagged), 0xaa);
+}
+
+pub fn plantSavedHandleInCollisionVar() void {
+    @as(*u32, @ptrCast(&collision_ref)).* = saved_ref.handle;
+}
+
