@@ -6,10 +6,10 @@ import { MissingInitializers, NoInitializer, NoProperty, throwNoSupport } from '
 import { removeProxy } from '../proxies.js';
 import {
   ALIGN, CACHE, CAST, ENTRIES, ENVIRONMENT, FINALIZE, FLAGS, INITIALIZE, KEYS, MEMORY, PROPS,
-  PROXY, RESTORE, RESTRICT, SETTERS, SHAPE, SIGNATURE, SIZE, SLOTS, TRANSFORM, TYPE, TYPED_ARRAY,
-  UPDATE
+  PROXY, PURPOSE, RESTORE, RESTRICT, SETTERS, SHAPE, SIGNATURE, SIZE, SLOTS, TRANSFORM, TYPE,
+  TYPED_ARRAY, UPDATE, ZIG
 } from '../symbols.js';
-import { copyObject, defineProperties, defineProperty, defineValue, ObjectCache } from '../utils.js';
+import { clearView, copyObject, defineProperties, defineProperty, defineValue, hasJsValue, ObjectCache } from '../utils.js';
 
 export default mixin({
   defineStructure(structure) {
@@ -56,6 +56,7 @@ export default mixin({
     const {
       name,
       type,
+      purpose,
       constructor,
       align,
       byteSize,
@@ -73,6 +74,7 @@ export default mixin({
       [ALIGN]: defineValue(align),
       [SIZE]: defineValue(byteSize),
       [TYPE]: defineValue(type),
+      [PURPOSE]: defineValue(purpose),
       [FLAGS]: defineValue(flags),
       [PROPS]: defineValue(props),
       [TYPED_ARRAY]: defineValue(this.getTypedArray(structure)),
@@ -170,6 +172,7 @@ export default mixin({
       }
     }
     const cache = new ObjectCache();
+    const containsJsValue = hasJsValue(structure);
     const thisEnv = this;
     const constructor = function(arg, options = {}) {
       const {
@@ -189,12 +192,25 @@ export default mixin({
           // provided by defineStructureSlice(); the slice is different from other structures
           // as it does not have a zig size; memory is allocated by the slice initializer
           // based on the argument given
-          self[INITIALIZE](arg, allocator);
+          if (containsJsValue && allocator) {
+            const prevUninit = thisEnv.writingUninitZig;
+            thisEnv.writingUninitZig = true;
+            try {
+              self[INITIALIZE](arg, allocator);
+            } finally {
+              thisEnv.writingUninitZig = prevUninit;
+            }
+          } else {
+            self[INITIALIZE](arg, allocator);
+          }
           dv = self[MEMORY];
         } else {
           // don't use allocator to create storage for pointer
           const a = (type !== StructureType.Pointer) ? allocator : null;
           self[MEMORY] = dv = thisEnv.allocateMemory(byteSize, align, a);
+          if (containsJsValue && dv?.[ZIG]) {
+            clearView(dv, 0, dv.byteLength);
+          }
         }
       } else {
         if (CAST in constructor) {
@@ -230,7 +246,17 @@ export default mixin({
         if (creating) {
           // initialize object unless that's done already
           if (!(SHAPE in self)) {
-            self[INITIALIZE](arg, allocator);
+            if (containsJsValue && dv?.[ZIG]) {
+              const prevUninit = thisEnv.writingUninitZig;
+              thisEnv.writingUninitZig = true;
+              try {
+                self[INITIALIZE](arg, allocator);
+              } finally {
+                thisEnv.writingUninitZig = prevUninit;
+              }
+            } else {
+              self[INITIALIZE](arg, allocator);
+            }
           }
         }
         if (FINALIZE in self) {
@@ -261,7 +287,11 @@ export default mixin({
     }
   },
   createApplier(structure) {
-    const { instance: { template } } = structure;
+    const { instance: { members, template } } = structure;
+    const jsValueMembers = hasJsValue(structure) && members
+      ? members.filter(m => m.name && m.type === MemberType.Object && hasJsValue(m.structure))
+      : null;
+    const thisEnv = this;
     return function(arg, allocator) {
       const [ argNoProxy ] = removeProxy(arg);
       const [ self ] = removeProxy(this);
@@ -315,6 +345,18 @@ export default mixin({
       if (normalFound < normalCount && specialFound === 0) {
         if (template) {
           if (template[MEMORY]) {
+            if (jsValueMembers) {
+              for (const m of jsValueMembers) {
+                if (!(m.name in argNoProxy)) {
+                  if (self[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig && m.bitOffset !== undefined) {
+                    thisEnv.releaseZigJsValues(m.structure, self[MEMORY], m.bitOffset >> 3);
+                  }
+                  if (self[SLOTS] && m.slot !== undefined) {
+                    delete self[SLOTS][m.slot];
+                  }
+                }
+              }
+            }
             copyObject(self, template);
           }
         }

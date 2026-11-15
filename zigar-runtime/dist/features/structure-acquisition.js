@@ -1,9 +1,10 @@
 import { SENTINEL, SLOTS, MEMORY, ZIG, PROPS, VISIT, ENVIRONMENT } from '../symbols.js';
-import { SliceFlag, StructureType, PointerFlag, ErrorSetFlag, StructFlag, MemberType, PrimitiveFlag, structureNames, ModuleAttribute, StructureFlag } from '../constants.js';
+import { SliceFlag, StructureType, PointerFlag, ErrorSetFlag, StructurePurpose, StructFlag, MemberType, PrimitiveFlag, structureNames, ModuleAttribute, StructureFlag } from '../constants.js';
 import { mixin } from '../environment.js';
 import './call-marshaling-inbound.js';
 import './call-marshaling-outbound.js';
 import './dir-conversion.js';
+import './js-value-registry.js';
 import './module-loading.js';
 import './pointer-synchronization.js';
 import './reader-conversion.js';
@@ -14,6 +15,7 @@ import '../structures/allocator.js';
 import '../structures/dir.js';
 import '../structures/file.js';
 import '../structures/generator.js';
+import '../structures/js-value.js';
 import '../structures/promise.js';
 import '../syscalls/clock-res-get.js';
 import '../syscalls/clock-time-get.js';
@@ -290,6 +292,7 @@ var structureAcquisition = mixin({
     return `[${length}]${element.structure.name}`;
   },
   getStructName(s) {
+    if (s.purpose === StructurePurpose.JsValue) return 'JsValue';
     for (const name of ['Allocator', 'Promise', 'Generator', 'Read', 'Writer']) {
       if (s.flags & StructFlag[`Is${name}`]) return name;
     }

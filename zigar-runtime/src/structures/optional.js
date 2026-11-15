@@ -1,7 +1,7 @@
 import { MemberType, OptionalFlag, StructureFlag, VisitorFlag } from '../constants.js';
 import { mixin } from '../environment.js';
-import { INITIALIZE, MEMORY, VISIT, VIVIFICATE } from '../symbols.js';
-import { clearView, copyObject, defineValue, isCompatibleInstanceOf } from '../utils.js';
+import { INITIALIZE, MEMORY, RESTORE, SLOTS, VISIT, VIVIFICATE, ZIG } from '../symbols.js';
+import { clearView, copyObject, defineValue, hasJsValue, isCompatibleInstanceOf } from '../utils.js';
 
 export default mixin({
   defineOptional(structure, descriptors) {
@@ -9,6 +9,8 @@ export default mixin({
       instance: { members: [ valueMember, presentMember ] },
       flags,
     } = structure;
+    const containsJsValue = hasJsValue(structure);
+    const thisEnv = this;
     const { get: getValue, set: setValue } = this.defineMember(valueMember);
     const { get: getPresent, set: setPresent } = this.defineMember(presentMember);
     const get = function() {
@@ -21,9 +23,42 @@ export default mixin({
       }
     };
     const isValueVoid = valueMember.type === MemberType.Void;
-    const { bitOffset, byteSize } = valueMember;
+    const { bitOffset, byteSize, slot: valueSlot } = valueMember;
+    const isCurrentlyPresent = (presentMember.bitSize === 1)
+    ? function() {
+        const dv = (process.env.TARGET === 'wasm' && this[RESTORE]) ? this[RESTORE]() : this[MEMORY];
+        return dv.getUint8(presentMember.bitOffset >> 3) === 1;
+      }
+    : getPresent;
+    const assignPresentValue = function(val, allocator) {
+      if (containsJsValue && this[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig && !isCurrentlyPresent.call(this)) {
+        const prevUninit = thisEnv.writingUninitZig;
+        thisEnv.writingUninitZig = true;
+        try {
+          setValue.call(this, val, allocator);
+        } finally {
+          thisEnv.writingUninitZig = prevUninit;
+        }
+      } else {
+        setValue.call(this, val, allocator);
+      }
+    };
+    const clearPresentValue = function() {
+      if (containsJsValue) {
+        if (this[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig && isCurrentlyPresent.call(this)) {
+          thisEnv.releaseZigJsValues(valueMember.structure, this[MEMORY], bitOffset >> 3);
+        }
+        if (this[SLOTS] && valueSlot !== undefined) {
+          delete this[SLOTS][valueSlot];
+        }
+      }
+      setPresent.call(this, 0);
+      if (flags & OptionalFlag.HasSelector) {
+        clearView(this[MEMORY], bitOffset >> 3, byteSize);
+      }
+    };
     const initializer = this.createInitializer(function(arg, allocator) {
-      if (isCompatibleInstanceOf(arg, constructor)) {
+      if (isCompatibleInstanceOf(arg, constructor) && !containsJsValue) {
         copyObject(this, arg);
         if (flags & StructureFlag.HasPointer) {
           // don't bother copying pointers when it's empty
@@ -31,16 +66,22 @@ export default mixin({
             this[VISIT]('copy', VisitorFlag.Vivificate, arg);
           }
         }
-      } else if (arg === null) {
-        setPresent.call(this, 0);
-        if (flags & OptionalFlag.HasSelector) {
-          clearView(this[MEMORY], bitOffset >> 3, byteSize);
+      } else if (isCompatibleInstanceOf(arg, constructor)) {
+        if (getPresent.call(arg)) {
+          assignPresentValue.call(this, getValue.call(arg), allocator);
+          if (flags & OptionalFlag.HasSelector) {
+            setPresent.call(this, 1);
+          }
+        } else {
+          clearPresentValue.call(this);
         }
+      } else if (arg === null) {
+        clearPresentValue.call(this);
         // clear references so objects can be garbage-collected
         this[VISIT]?.('clear', VisitorFlag.IgnoreUncreated);
       } else if (arg !== undefined || isValueVoid) {
         // call setValue() first, in case it throws
-        setValue.call(this, arg, allocator);
+        assignPresentValue.call(this, arg, allocator);
         if (flags & OptionalFlag.HasSelector) {
           setPresent.call(this, 1);
         } else if (flags & StructureFlag.HasPointer) {

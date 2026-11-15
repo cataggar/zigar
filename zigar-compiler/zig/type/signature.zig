@@ -1,6 +1,8 @@
 const std = @import("std");
 const expectEqual = std.testing.expectEqual;
 
+const util = @import("util.zig");
+
 pub fn get(comptime T: type) u64 {
     return calculate(T, .{});
 }
@@ -14,6 +16,9 @@ fn calculate(comptime T: type, comptime checking: anytype) u64 {
                 .@"packed" => "packed struct",
                 else => "struct",
             });
+            if (comptime util.getInternalType(T) == .js_value) {
+                xxhash.update(":js_value");
+            }
             if (st.backing_integer) |BIT| {
                 xxhash.update("(");
                 xxhash.update(std.mem.asBytes(&calculate(BIT, checking)));
@@ -154,4 +159,10 @@ fn calculate(comptime T: type, comptime checking: anytype) u64 {
 test "get" {
     try expectEqual(get(struct { a: u32 }), get(struct { a: u32 }));
     try expectEqual(get(struct { a: *@This() }), get(struct { a: *@This() }));
+    const PlainHandle = extern struct { handle: u32 };
+    const JsHandle = extern struct {
+        pub const internal_type: util.InternalType = .js_value;
+        handle: u32,
+    };
+    try std.testing.expect(get(PlainHandle) != get(JsHandle));
 }

@@ -101,6 +101,7 @@ jobs:
             test/transpilation.test.js \
             test/compilation.test.js \
             test/wit-zigar-bridge.test.js \
+            test/js-value-handles.test.js \
             --grep "compile code for Windows$|should fail when directory is illegal$" \
             --invert
 
@@ -180,6 +181,7 @@ jobs:
             test/wasm-decoding.test.js \
             test/transpilation.test.js \
             test/compilation.test.js \
+            test/js-value-handles.test.js \
             --grep "compile code for Windows$|should fail when directory is illegal$" \
             --invert
 

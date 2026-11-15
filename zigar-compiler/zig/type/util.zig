@@ -213,6 +213,7 @@ pub const InternalType = enum {
     web_image,
     web_hdr_image,
     gd_image,
+    js_value,
 };
 
 pub fn getInternalType(comptime OT: ?type) ?InternalType {

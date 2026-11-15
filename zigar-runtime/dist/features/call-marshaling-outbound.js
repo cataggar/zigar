@@ -1,7 +1,7 @@
 import { StructureType, StructurePurpose, MemberType } from '../constants.js';
 import { mixin } from '../environment.js';
 import { Exit, UndefinedArgument, adjustArgumentError, ZigError } from '../errors.js';
-import { ATTRIBUTES, MEMORY, FINALIZE, GENERATOR, RETURN, SETTERS, VISIT, UPDATE, TRANSFORM, PROMISE, ALLOCATOR } from '../symbols.js';
+import { ATTRIBUTES, MEMORY, FINALIZE, GENERATOR, RETURN, SETTERS, VISIT, UPDATE, TRANSFORM, VIVIFICATE, PROMISE, ALLOCATOR } from '../symbols.js';
 import { isPromise } from '../utils.js';
 
 var callMarshalingOutbound = mixin({
@@ -36,54 +36,78 @@ var callMarshalingOutbound = mixin({
     let destIndex = 0, srcIndex = 0;
     let allocatorCount = 0;
     const setters = argStruct[SETTERS];
-    for (const { type, structure } of members) {
-      let arg, promise, generator, signal;
-      if (structure.type === StructureType.Struct) {
-        switch (structure.purpose) {
-          case StructurePurpose.Allocator:
-            // use programmer-supplied allocator if found in options object, handling rare scenarios
-            // where a function uses multiple allocators
-            const allocator = (++allocatorCount === 1)
-            ? options?.['allocator'] ?? options?.['allocator1']
-            : options?.[`allocator${allocatorCount}`];
-            // otherwise use default allocator which allocates relocatable memory from JS engine
-            arg = allocator ?? this.createDefaultAllocator(argStruct, structure);
-            break;
-          case StructurePurpose.Promise:
-            promise ||= this.createPromise(structure, argStruct, options?.['callback']);
-            arg = promise;
-            break;
-          case StructurePurpose.Generator:
-            generator ||= this.createGenerator(structure, argStruct, options?.['callback']);
-            arg = generator;
-            break;
-          case StructurePurpose.AbortSignal:
-            // create an Int32Array with one element, hooking it up to the programmer-supplied
-            // AbortSignal object if found
-            signal ||= this.createSignal(structure, options?.['signal']);
-            arg = signal;
-            break;
-          case StructurePurpose.File:
-            arg = this.createFile(argList[srcIndex++]);
-            break;
-          case StructurePurpose.Directory:
-            arg = this.createDirectory(argList[srcIndex++]);
-            break;
+    const allocatedHandles = (this.allocJsValue) ? [] : null;
+    const prevPending = this.pendingJsHandles;
+    if (allocatedHandles) {
+      this.pendingJsHandles = allocatedHandles;
+    }
+    try {
+      for (const { type, structure } of members) {
+        let arg, promise, generator, signal, hasArg = false;
+        if (structure.type === StructureType.Struct) {
+          switch (structure.purpose) {
+            case StructurePurpose.Allocator:
+              // use programmer-supplied allocator if found in options object, handling rare scenarios
+              // where a function uses multiple allocators
+              const allocator = (++allocatorCount === 1)
+              ? options?.['allocator'] ?? options?.['allocator1']
+              : options?.[`allocator${allocatorCount}`];
+              // otherwise use default allocator which allocates relocatable memory from JS engine
+              arg = allocator ?? this.createDefaultAllocator(argStruct, structure);
+              hasArg = true;
+              break;
+            case StructurePurpose.Promise:
+              promise ||= this.createPromise(structure, argStruct, options?.['callback']);
+              arg = promise;
+              hasArg = true;
+              break;
+            case StructurePurpose.Generator:
+              generator ||= this.createGenerator(structure, argStruct, options?.['callback']);
+              arg = generator;
+              hasArg = true;
+              break;
+            case StructurePurpose.AbortSignal:
+              // create an Int32Array with one element, hooking it up to the programmer-supplied
+              // AbortSignal object if found
+              signal ||= this.createSignal(structure, options?.['signal']);
+              arg = signal;
+              hasArg = true;
+              break;
+            case StructurePurpose.File:
+              arg = this.createFile(argList[srcIndex++]);
+              hasArg = true;
+              break;
+            case StructurePurpose.Directory:
+              arg = this.createDirectory(argList[srcIndex++]);
+              hasArg = true;
+              break;
+          }
+        }
+        if (!hasArg) {
+          // just a regular argument
+          arg = argList[srcIndex++];
+          // only void and JsValue allow the value of undefined
+          if (arg === undefined && type !== MemberType.Void && structure.purpose !== StructurePurpose.JsValue) {
+            throw new UndefinedArgument();
+          }
+        }
+        try {
+          const set = setters[destIndex++];
+          set.call(argStruct, arg, argAlloc);
+        } catch (err) {
+          throw adjustArgumentError(err, destIndex - 1);
         }
       }
-      if (arg === undefined) {
-        // just a regular argument
-        arg = argList[srcIndex++];
-        // only void has the value of undefined
-        if (arg === undefined && type !== MemberType.Void) {
-          throw new UndefinedArgument();
+    } catch (err) {
+      if (allocatedHandles) {
+        for (const handle of allocatedHandles) {
+          this.releaseJsValue(handle);
         }
       }
-      try {
-        const set = setters[destIndex++];
-        set.call(argStruct, arg, argAlloc);
-      } catch (err) {
-        throw adjustArgumentError(err, destIndex - 1);
+      throw err;
+    } finally {
+      if (allocatedHandles) {
+        this.pendingJsHandles = prevPending;
       }
     }
   },
@@ -94,29 +118,54 @@ var callMarshalingOutbound = mixin({
     const fnAddress = this.getViewAddress(fn[MEMORY]);
     const isAsync = FINALIZE in argStruct;
     const hasPointers = VISIT in argStruct;
-    if (hasPointers) {
-      this.updatePointerAddresses(context, argStruct);
-    }
-    // return address of shadow for argumnet struct
-    const argAddress = this.getShadowAddress(context, argStruct, null, false)
-    ;
-    // get address of attributes if function variadic
-    const attrAddress = (attrs) ? this.getShadowAddress(context, attrs) : 0
-    ;
-    this.updateShadows(context);
-    let finalized = false;
-    const finalize = () => {
-      this.updateShadowTargets(context);
-      // create objects that pointers point to
+    let argAddress, attrAddress;
+    try {
       if (hasPointers) {
-        this.updatePointerTargets(context, argStruct);
+        this.updatePointerAddresses(context, argStruct);
       }
-      this.flushStreams?.();
+      // return address of shadow for argumnet struct
+      argAddress = ("wasm" === 'wasm')
+      ? this.getShadowAddress(context, argStruct, null, false)
+      : this.getViewAddress(argStruct[MEMORY]);
+      // get address of attributes if function variadic
+      attrAddress = ("wasm" === 'wasm')
+      ? (attrs) ? this.getShadowAddress(context, attrs) : 0
+      : (attrs) ? this.getViewAddress(attrs[MEMORY]) : 0;
+      this.updateShadows(context);
+    } catch (err) {
+      if (context.jsValueTargets) {
+        this.finalizeJsValueTargets(context, { abortOnly: true, failed: true });
+      }
       this.endContext();
-      finalized = true;
+      throw err;
+    }
+    let finalized = false;
+    const finalize = (failed = false, retvalStruct = null) => {
+      let finalizeErr = null;
+      try {
+        this.updateShadowTargets(context);
+        if (context.jsValueTargets) {
+          this.finalizeJsValueTargets(context, { failed, retvalStruct });
+        } else if (!failed && retvalStruct) {
+          this.consumeJsValueRetval?.(retvalStruct);
+        }
+        // create objects that pointers point to
+        if (hasPointers) {
+          this.updatePointerTargets(context, argStruct);
+        }
+      } catch (err) {
+        finalizeErr = err;
+      } finally {
+        this.flushStreams?.();
+        this.endContext();
+        finalized = true;
+      }
+      if (finalizeErr && !failed) {
+        throw finalizeErr;
+      }
     };
     if (isAsync) {
-      argStruct[FINALIZE] = finalize;
+      argStruct[FINALIZE] = () => finalize(false);
     }
     const runnerName = (attrs) ? 'runVariadicThunk' : 'runThunk';
     const syncRunner = this[`${runnerName}Sync`] ;
@@ -134,25 +183,32 @@ var callMarshalingOutbound = mixin({
       }
     }
     let success;
-    if (useSyncRunner) {
-      const prevContinuation = this.activeContinuation;
-      this.activeContinuation = null;
-      try {
+    try {
+      if (useSyncRunner) {
+        const prevContinuation = this.activeContinuation;
+        this.activeContinuation = null;
+        try {
+          success = (attrs)
+            ? this.runVariadicThunkSync(thunkAddress, fnAddress, argAddress, attrAddress, attrs.length)
+            : this.runThunkSync(thunkAddress, fnAddress, argAddress);
+        } finally {
+          this.activeContinuation = prevContinuation;
+        }
+      } else {
         success = (attrs)
-          ? this.runVariadicThunkSync(thunkAddress, fnAddress, argAddress, attrAddress, attrs.length)
-          : this.runThunkSync(thunkAddress, fnAddress, argAddress);
-      } finally {
-        this.activeContinuation = prevContinuation;
+          ? this.runVariadicThunk(thunkAddress, fnAddress, argAddress, attrAddress, attrs.length)
+          : this.runThunk(thunkAddress, fnAddress, argAddress);
       }
-    } else {
-      success = (attrs)
-        ? this.runVariadicThunk(thunkAddress, fnAddress, argAddress, attrAddress, attrs.length)
-        : this.runThunk(thunkAddress, fnAddress, argAddress);
+    } catch (err) {
+      if (!finalized) {
+        finalize(!(err instanceof Exit && err.code === 0));
+      }
+      throw err;
     }
     const finishCall = (success) => {
       if (!success) {
         if (!finalized) {
-          finalize();
+          finalize(true);
         }
         throw new ZigError();
       }
@@ -169,6 +225,9 @@ var callMarshalingOutbound = mixin({
         // if a function has returned a value or failed synchronmously, the promise is resolved immediately
         if (!finalized) {
           try {
+            if (argStruct[VIVIFICATE]?.retvalHasJsValue) {
+              this.consumeJsValueRetval?.(argStruct);
+            }
             retval = argStruct.retval;
           } catch (err) {
             retval = new ZigError(err, 1);
@@ -188,8 +247,9 @@ var callMarshalingOutbound = mixin({
         // this would be undefined if a callback function is used instead
         return argStruct[PROMISE] ?? argStruct[GENERATOR];
       } else {
-        finalize();
         try {
+          const retvalStruct = argStruct[VIVIFICATE]?.retvalHasJsValue ? argStruct : null;
+          finalize(false, retvalStruct);
           const { retval } = argStruct;
           return (transform) ? transform(retval) : retval;
         } catch (err) {
@@ -199,10 +259,11 @@ var callMarshalingOutbound = mixin({
     };
     if (isPromise(success)) {
       const promise = success.then(finishCall, (err) => {
+        const isCleanExit = (err instanceof Exit && err.code === 0);
         if (!finalized) {
-          finalize();
+          finalize(!isCleanExit);
         }
-        if (err instanceof Exit && err.code === 0) {
+        if (isCleanExit) {
           return;
         }
         throw err;

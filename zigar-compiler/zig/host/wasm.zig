@@ -17,6 +17,7 @@ pub const Generator = @import("../type/generator.zig").Generator;
 pub const GeneratorOf = @import("../type/generator.zig").GeneratorOf;
 pub const GeneratorArgOf = @import("../type/generator.zig").GeneratorArgOf;
 pub const image = @import("../type/image.zig");
+pub const js = @import("../type/js.zig").Js(@This());
 pub const Promise = @import("../type/promise.zig").Promise;
 pub const PromiseOf = @import("../type/promise.zig").PromiseOf;
 pub const PromiseArgOf = @import("../type/promise.zig").PromiseArgOf;
@@ -249,6 +250,30 @@ pub fn getFactoryThunk(comptime module: type) usize {
     return @intFromPtr(exporter.getFactoryThunk(@This(), module));
 }
 
+pub fn cloneJsValue(handle: u32) u32 {
+    return _cloneJsValue(handle);
+}
+
+pub fn releaseJsValue(handle: u32) void {
+    _releaseJsValue(handle);
+}
+
+pub fn typeofJsValue(handle: u32) js.JsType {
+    return @enumFromInt(@as(u8, @intCast(_typeofJsValue(handle))));
+}
+
+pub fn instanceofJsValue(handle: u32, ctor_handle: u32) bool {
+    return _instanceofJsValue(handle, ctor_handle);
+}
+
+pub fn equalJsValue(lhs_handle: u32, rhs_handle: u32) bool {
+    return _equalJsValue(lhs_handle, rhs_handle);
+}
+
+pub fn getJsValueCount() u32 {
+    return _getJsValueCount();
+}
+
 pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, _: ?usize) noreturn {
     _displayPanic(msg.ptr, msg.len);
     std.process.abort();
@@ -426,6 +451,12 @@ extern "env" fn _releaseFunction(fn_id: usize) void;
 extern "env" fn _allocateJsThunk(controller_address: usize, fn_id: usize) usize;
 extern "env" fn _freeJsThunk(controller_address: usize, thunk_address: usize) usize;
 extern "env" fn _findJsThunk(controller_address: usize, thunk_address: usize) usize;
+extern "env" fn _cloneJsValue(handle: u32) u32;
+extern "env" fn _releaseJsValue(handle: u32) void;
+extern "env" fn _typeofJsValue(handle: u32) u32;
+extern "env" fn _instanceofJsValue(handle: u32, ctor_handle: u32) bool;
+extern "env" fn _equalJsValue(lhs_handle: u32, rhs_handle: u32) bool;
+extern "env" fn _getJsValueCount() u32;
 extern "env" fn _displayPanic(bytes: [*]const u8, len: usize) void;
 
 comptime {

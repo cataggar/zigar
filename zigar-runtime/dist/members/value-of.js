@@ -1,6 +1,6 @@
-import { StructureType, StructFlag } from '../constants.js';
+import { StructureType, StructurePurpose, StructFlag } from '../constants.js';
 import { mixin } from '../environment.js';
-import { TYPE, ENTRIES, FLAGS } from '../symbols.js';
+import { ENTRIES, TYPE, PURPOSE, FLAGS } from '../symbols.js';
 import { getErrorHandler } from '../utils.js';
 
 var valueOf = mixin({
@@ -22,7 +22,9 @@ function normalizeObject(object, forJSON) {
   const resultMap = new Map();
   const process = function(value) {
     // handle type (i.e. constructor) like a struct
-    const type = (typeof(value) === 'function') ? StructureType.Struct : value?.constructor?.[TYPE];
+    const type = (typeof(value) === 'function')
+      ? ((ENTRIES in value) ? StructureType.Struct : undefined)
+      : value?.constructor?.[TYPE];
     if (type === undefined) {
       if (forJSON) {
         if (typeof(value) === 'bigint' && INT_MIN <= value && value <= INT_MAX) {
@@ -38,8 +40,12 @@ function normalizeObject(object, forJSON) {
       let entries;
       switch (type) {
         case StructureType.Struct:
-          entries = value[ENTRIES](options);
-          result = (value.constructor[FLAGS] & StructFlag.IsTuple) ? [] : {};
+          if (value.constructor?.[PURPOSE] === StructurePurpose.JsValue) {
+            result = handleError(() => value.$);
+          } else {
+            entries = value[ENTRIES](options);
+            result = (value.constructor[FLAGS] & StructFlag.IsTuple) ? [] : {};
+          }
           break;
         case StructureType.Union:
           entries = value[ENTRIES](options);

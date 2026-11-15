@@ -1,4 +1,4 @@
-import { MemberType } from './constants.js';
+import { MemberType, StructurePurpose, StructureType } from './constants.js';
 import { ENVIRONMENT, FALLBACK, LENGTH, MEMORY, NO_CACHE, RESTORE, SIGNATURE } from './symbols.js';
 
 export function defineProperty(object, name, descriptor) {
@@ -308,6 +308,31 @@ export function isCompatibleType(TypeA, TypeB) {
 
 export function isCompatibleInstanceOf(object, Type) {
   return (object instanceof Type) || isCompatibleType(object?.constructor, Type);
+}
+
+export function hasJsValue(structure, seen = new Set()) {
+  if (!structure || seen.has(structure)) {
+    return false;
+  }
+  if (structure.purpose === StructurePurpose.JsValue) {
+    return true;
+  }
+  seen.add(structure);
+  switch (structure.type) {
+    case StructureType.Struct:
+    case StructureType.Union:
+    case StructureType.Optional:
+    case StructureType.ErrorUnion:
+    case StructureType.Array:
+    case StructureType.Slice:
+      for (const member of structure.instance?.members ?? []) {
+        if (member.type === MemberType.Object && hasJsValue(member.structure, seen)) {
+          return true;
+        }
+      }
+      break;
+  }
+  return false;
 }
 
 export function hasMethod(object, name) {

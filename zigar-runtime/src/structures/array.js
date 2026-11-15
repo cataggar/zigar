@@ -5,7 +5,9 @@ import { getProxy } from '../proxies.js';
 import {
   ENTRIES, FINALIZE, INITIALIZE, PROXY, PROXY_TYPE, SENTINEL, VISIT, VIVIFICATE
 } from '../symbols.js';
-import { copyObject, defineValue, isCompatibleInstanceOf, transformIterable } from '../utils.js';
+import {
+  copyObject, defineValue, hasJsValue, isCompatibleInstanceOf, transformIterable
+} from '../utils.js';
 
 export default mixin({
   defineArray(structure, descriptors) {
@@ -14,6 +16,7 @@ export default mixin({
       instance: { members: [ member ] },
       flags,
     } = structure;
+    const containsJsValue = hasJsValue(structure);
     if (process.env.DEV) {
       /* c8 ignore start */
       if (member.bitOffset !== undefined) {
@@ -29,7 +32,7 @@ export default mixin({
     const { set } = descriptor;
     const constructor = this.createConstructor(structure);
     const initializer = this.createInitializer(function(arg, allocator) {
-      if (isCompatibleInstanceOf(arg, constructor)) {
+      if (isCompatibleInstanceOf(arg, constructor) && !containsJsValue) {
         copyObject(this, arg);
         if (flags & StructureFlag.HasPointer) {
           this[VISIT]('copy', VisitorFlag.Vivificate, arg);

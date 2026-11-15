@@ -1,8 +1,8 @@
-import { UnionFlag, StructurePurpose, StructureFlag, VisitorFlag } from '../constants.js';
+import { UnionFlag, StructurePurpose, StructureFlag, VisitorFlag, MemberType } from '../constants.js';
 import { mixin } from '../environment.js';
 import { MultipleUnionInitializers, MissingUnionInitializer, InvalidInitializer, InactiveUnionProperty, InaccessiblePointer } from '../errors.js';
-import { NAME, VISIT, SETTERS, KEYS, RESTRICT, INITIALIZE, TAG, VIVIFICATE, ENTRIES, PROPS, GETTERS, TARGET } from '../symbols.js';
-import { defineValue, isCompatibleInstanceOf, copyObject, empty, defineProperties } from '../utils.js';
+import { NAME, CAST, VISIT, SETTERS, KEYS, RESTRICT, INITIALIZE, TAG, VIVIFICATE, ENTRIES, PROPS, GETTERS, TARGET, MEMORY, ZIG, SLOTS } from '../symbols.js';
+import { defineValue, hasJsValue, isCompatibleInstanceOf, copyObject, empty, defineProperties } from '../utils.js';
 
 var union = mixin({
   defineUnion(structure, descriptors) {
@@ -11,6 +11,8 @@ var union = mixin({
       flags,
       instance: { members },
     } = structure;
+    const containsJsValue = hasJsValue(structure);
+    const thisEnv = this;
     const exclusion = !!(flags & UnionFlag.HasSelector);
     const valueMembers = (exclusion) ? members.slice(0, -1) : members;
     const selectorMember = (exclusion) ? members[members.length - 1] : null;
@@ -24,6 +26,15 @@ var union = mixin({
     : function() {
         const index = getSelector.call(this);
         return valueMembers[index].name;
+      };
+    const findActiveField = (flags & UnionFlag.HasTag)
+    ? function() {
+        const rawTag = getSelectorNumber.call(this);
+        return selectorMember.structure.constructor[CAST](rawTag)?.[NAME];
+      }
+    : function() {
+        const index = getSelectorNumber.call(this);
+        return valueMembers[index]?.name;
       };
     const setActiveField = (flags & UnionFlag.HasTag)
     ? function(name) {
@@ -45,11 +56,14 @@ var union = mixin({
             break;
         }
       }      
-      if (isCompatibleInstanceOf(arg, constructor)) {
+      if (isCompatibleInstanceOf(arg, constructor) && (!containsJsValue || !exclusion)) {
         copyObject(this, arg);
         if (flags & StructureFlag.HasPointer) {
           this[VISIT]('copy', VisitorFlag.Vivificate, arg);
         }
+      } else if (isCompatibleInstanceOf(arg, constructor)) {
+        const active = getActiveField.call(arg);
+        propApplier.call(this, { [active]: arg[active] }, allocator);
       } else if (arg && typeof(arg) === 'object') {
         let found = 0;
         for (const key of props) {
@@ -102,11 +116,44 @@ var union = mixin({
         }
       : setValue;
       const init = (exclusion && setValue)
-      ? function(value) {
-          setActiveField.call(this, name);
-          this[VISIT]?.('clear', VisitorFlag.IgnoreUncreated);
-          setValue.call(this, value);
-        }
+      ? (containsJsValue
+        ? function(value) {
+            const inZig = Boolean(this[MEMORY]?.[ZIG]);
+            let prevName = name;
+            if (inZig && !thisEnv.writingUninitZig) {
+              prevName = findActiveField.call(this);
+              const prevMember = prevName !== undefined && valueMembers.find(m => m.name === prevName);
+              if (prevMember && prevName !== name && prevMember.type === MemberType.Object
+                && prevMember.bitOffset !== undefined && hasJsValue(prevMember.structure)) {
+                thisEnv.releaseZigJsValues(prevMember.structure, this[MEMORY], prevMember.bitOffset >> 3);
+              }
+            }
+            if (this[SLOTS]) {
+              for (const m of valueMembers) {
+                if (m.name !== name && m.slot !== undefined) {
+                  delete this[SLOTS][m.slot];
+                }
+              }
+            }
+            setActiveField.call(this, name);
+            this[VISIT]?.('clear', VisitorFlag.IgnoreUncreated);
+            if (inZig && !thisEnv.writingUninitZig && prevName !== name) {
+              const prevUninit = thisEnv.writingUninitZig;
+              thisEnv.writingUninitZig = true;
+              try {
+                setValue.call(this, value);
+              } finally {
+                thisEnv.writingUninitZig = prevUninit;
+              }
+            } else {
+              setValue.call(this, value);
+            }
+          }
+        : function(value) {
+            setActiveField.call(this, name);
+            this[VISIT]?.('clear', VisitorFlag.IgnoreUncreated);
+            setValue.call(this, value);
+          })
       : setValue;
       descriptors[name] = { get, set };
       setters[name] = init;

@@ -14,6 +14,7 @@ export const PARENT = symbol('parent');
 export const ZIG = symbol('zig');
 export const NAME = symbol('name');
 export const TYPE = symbol('type');
+export const PURPOSE = symbol('purpose');
 export const FLAGS = symbol('flags');
 export const CLASS = symbol('class');
 export const TAG = symbol('tag');
@@ -48,6 +49,7 @@ export const CONTROLLER = symbol('controller');
 export const PROXY_TYPE = symbol('proxy type');
 export const READ_ONLY = symbol('read only');
 export const NO_CACHE = symbol('no cache');
+export const JS_VALUE = symbol('js value');
 
 export const UPDATE = symbol('update');
 export const RESTORE = symbol('restore');

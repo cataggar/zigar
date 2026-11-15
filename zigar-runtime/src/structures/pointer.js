@@ -6,12 +6,12 @@ import {
 } from '../errors.js';
 import { getProxy, getProxyTarget, getProxyType } from '../proxies.js';
 import {
-  ADDRESS, CAST, ENVIRONMENT, FINALIZE, INITIALIZE, LAST_ADDRESS, LAST_LENGTH, LENGTH, MAX_LENGTH,
+  ADDRESS, CAST, ENVIRONMENT, FINALIZE, INITIALIZE, JS_VALUE, LAST_ADDRESS, LAST_LENGTH, LENGTH, MAX_LENGTH,
   MEMORY, PARENT, PROXY, PROXY_TYPE, READ_ONLY, RESTORE, SENTINEL, SETTERS, SIZE, SLOTS, TARGET, TYPE,
   TYPED_ARRAY, UPDATE, VISIT, ZIG
 } from '../symbols.js';
 import {
-  defineValue, findElements, getSelf, isCompatibleInstanceOf, isCompatibleType, isInvalidUsize
+  defineValue, findElements, getSelf, hasJsValue, isCompatibleInstanceOf, isCompatibleType, isInvalidUsize
 } from '../utils.js';
 
 export default mixin({
@@ -22,6 +22,7 @@ export default mixin({
       instance: { members },
     } = structure;
     const { structure: targetStructure } = members[0];
+    const targetContainsJsValue = hasJsValue(targetStructure);
     const {
       type: targetType,
       flags: targetFlags,
@@ -201,7 +202,11 @@ export default mixin({
         arg = Target.call(ENVIRONMENT, arg[MEMORY]);
       } else if (flags & PointerFlag.IsSingle && flags & PointerFlag.IsMultiple && arg instanceof Target.child) {
         // C pointer
-        arg = Target.call(ENVIRONMENT, arg[MEMORY]);
+        const slice = Target.call(ENVIRONMENT, arg[MEMORY]);
+        if (targetContainsJsValue && !arg[MEMORY]?.[ZIG]) {
+          slice[SLOTS][0] = arg;
+        }
+        arg = slice;
       } else if (isCompatibleBuffer(arg, Target)) {
         // autocast to target type
         const dv = thisEnv.extractView(targetStructure, arg);
@@ -229,7 +234,18 @@ export default mixin({
           throw new InvalidPointerTarget(structure, arg);
         }
         // autovivificate target object
-        const autoObj = arg = new Target(arg, { allocator });
+        let autoObj;
+        if (targetContainsJsValue && !allocator) {
+          const prevPending = thisEnv.pendingJsHandles;
+          thisEnv.pendingJsHandles = null;
+          try {
+            autoObj = arg = new Target(arg);
+          } finally {
+            thisEnv.pendingJsHandles = prevPending;
+          }
+        } else {
+          autoObj = arg = new Target(arg, { allocator });
+        }
         if (targetFlags & StructureFlag.HasProxy) {
           // point to the actual object instead of the proxy
           arg = getProxyTarget(autoObj).target;
@@ -317,6 +333,9 @@ export default mixin({
       get() { return targetStructure.constructor }
     };
     staticDescriptors.const = defineValue(!!(flags & PointerFlag.IsConst));
+    if (hasJsValue(targetStructure)) {
+      staticDescriptors[JS_VALUE] = defineValue(targetStructure);
+    }
     staticDescriptors[CAST] = {
       value(arg, options) {
         if (this === ENVIRONMENT || this === PARENT || arg instanceof constructor) {

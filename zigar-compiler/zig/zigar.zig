@@ -36,5 +36,7 @@ pub const image = struct {
     pub const Web = host.image.WebImage;
 };
 
+pub const js = host.js;
+
 const std = @import("std");
 const host = @import("root").host;

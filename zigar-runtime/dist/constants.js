@@ -27,8 +27,11 @@ const StructurePurpose = {
   Directory: 7,
   AnyImage: 8,
   WebImage: 9,
-  GdImage: 10,
+  WebHdrImage: 10,
+  GdImage: 11,
+  JsValue: 12,
 };
+const FIRST_DYNAMIC_JS_VALUE_SLOT = 8;
 const structureNames = Object.keys(StructureType);
 const StructureFlag = {
   HasValue: 1 << 0,
@@ -236,4 +239,4 @@ const PosixPollEventType = {
   FD_WRITE: 2,
 };
 
-export { ArgStructFlag, ArrayFlag, EnumFlag, ErrorSetFlag, MemberFlag, MemberType, ModuleAttribute, OptionalFlag, PointerFlag, PosixDescriptor, PosixDescriptorFlag, PosixDescriptorRight, PosixError, PosixFileType, PosixLockType, PosixLookupFlag, PosixOpenFlag, PosixPollEventType, PrimitiveFlag, ProxyType, SliceFlag, StructFlag, StructureFlag, StructurePurpose, StructureType, UnionFlag, VectorFlag, VisitorFlag, memberNames, structureNames };
+export { ArgStructFlag, ArrayFlag, EnumFlag, ErrorSetFlag, FIRST_DYNAMIC_JS_VALUE_SLOT, MemberFlag, MemberType, ModuleAttribute, OptionalFlag, PointerFlag, PosixDescriptor, PosixDescriptorFlag, PosixDescriptorRight, PosixError, PosixFileType, PosixLockType, PosixLookupFlag, PosixOpenFlag, PosixPollEventType, PrimitiveFlag, ProxyType, SliceFlag, StructFlag, StructureFlag, StructurePurpose, StructureType, UnionFlag, VectorFlag, VisitorFlag, memberNames, structureNames };

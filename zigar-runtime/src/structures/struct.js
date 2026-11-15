@@ -2,16 +2,20 @@ import { MemberFlag, StructFlag, StructureFlag, StructurePurpose } from '../cons
 import { mixin } from '../environment.js';
 import { InvalidInitializer } from '../errors.js';
 import { ENTRIES, INITIALIZE, KEYS, PROPS, SETTERS, VISIT, VIVIFICATE } from '../symbols.js';
-import { copyObject, defineValue, getSelf, isCompatibleInstanceOf } from '../utils.js';
+import { copyObject, defineValue, getSelf, hasJsValue, isCompatibleInstanceOf } from '../utils.js';
 
 export default mixin({
   defineStruct(structure, descriptors) {
+    if (structure.purpose === StructurePurpose.JsValue) {
+      return this.defineJsValue(structure, descriptors);
+    }
     const {
       purpose,
       flags,
       length,
       instance: { members },
     } = structure;
+    const containsJsValue = hasJsValue(structure);
     const backingIntMember = members.find(m => m.flags & MemberFlag.IsBackingInt);
     const backingInt = backingIntMember && this.defineMember(backingIntMember);
     const propApplier = this.createApplier(structure);
@@ -22,10 +26,17 @@ export default mixin({
       } else if (purpose == StructurePurpose.Directory) {
         arg = thisEnv.createDirectory(arg);
       }
-      if (isCompatibleInstanceOf(arg, constructor)) {
+      if (isCompatibleInstanceOf(arg, constructor) && !containsJsValue) {
         copyObject(this, arg);
         if (flags & StructureFlag.HasPointer) {
           this[VISIT]('copy', 0, arg);
+        }
+      } else if (isCompatibleInstanceOf(arg, constructor)) {
+        for (const name of keys) {
+          const set = setters[name];
+          if (!set.special) {
+            set.call(this, arg[name], allocator);
+          }
         }
       } else if (arg && typeof(arg) === 'object') {
         propApplier.call(this, arg, allocator);

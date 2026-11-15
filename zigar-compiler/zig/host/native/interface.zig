@@ -108,6 +108,7 @@ pub const StructurePurpose = enum {
     web_image,
     web_hdr_image,
     gd_image,
+    js_value,
 
     pub fn isOptional(self: @This()) bool {
         return switch (self) {

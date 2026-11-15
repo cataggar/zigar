@@ -1,13 +1,13 @@
 import { ProxyType, SliceFlag, StructureFlag, VisitorFlag } from '../constants.js';
 import { mixin } from '../environment.js';
 import { ArrayLengthMismatch, InvalidArrayInitializer } from '../errors.js';
-import { getProxy } from '../proxies.js';
+import { getProxy, removeProxy } from '../proxies.js';
 import {
-  ENTRIES, FINALIZE, INITIALIZE, LENGTH, MEMORY, PROXY, PROXY_TYPE, SENTINEL, SHAPE, VISIT,
-  VIVIFICATE
+  ENTRIES, FINALIZE, INITIALIZE, LENGTH, MEMORY, PROXY, PROXY_TYPE, SENTINEL, SHAPE, SLOTS, VISIT,
+  VIVIFICATE, ZIG
 } from '../symbols.js';
 import {
-  copyObject, copyView, defineValue, isCompatibleInstanceOf, transformIterable
+  copyObject, copyView, defineValue, hasJsValue, isCompatibleInstanceOf, transformIterable
 } from '../utils.js';
 
 export default mixin({
@@ -19,6 +19,7 @@ export default mixin({
         members: [ member ],
       },
     } = structure;
+    const containsJsValue = hasJsValue(structure);
     /* c8 ignore start */
     if (process.env.DEV) {
       if (member.bitOffset !== undefined) {
@@ -49,7 +50,7 @@ export default mixin({
     // constructor or by a member setter (i.e. after object's shape has been established)
     const propApplier = this.createApplier(structure);
     const initializer = this.createInitializer(function(arg, allocator) {
-      if (isCompatibleInstanceOf(arg, constructor)) {
+      if (isCompatibleInstanceOf(arg, constructor) && !containsJsValue) {
         if (!this[MEMORY]) {
           shapeDefiner.call(this, null, arg.length, allocator);
         } else {
@@ -118,7 +119,19 @@ export default mixin({
     descriptors.subarray = {
       value(begin, end) {
         const dv = getSubArrayView.call(this, begin, end);
-        return constructor(dv);
+        const sub = constructor(dv);
+        if (containsJsValue && !this[MEMORY]?.[ZIG] && this[SLOTS]) {
+          const [ subTarget ] = removeProxy(sub);
+          const startIdx = (dv.byteOffset - this[MEMORY].byteOffset) / elementSize;
+          const count = dv.byteLength / elementSize;
+          for (let i = 0; i < count; i++) {
+            const slotObj = this[SLOTS][startIdx + i];
+            if (slotObj) {
+              subTarget[SLOTS][i] = slotObj;
+            }
+          }
+        }
+        return sub;
       },
     };
     descriptors.slice = {
@@ -126,6 +139,10 @@ export default mixin({
         const {
           zig = false
         } = options;
+        if (containsJsValue) {
+          const sub = this.subarray(begin, end);
+          return new constructor(sub, zig ? { allocator: zig } : undefined);
+        }
         const dv1 = getSubArrayView.call(this, begin, end);
         const dv2 = thisEnv.allocateMemory(dv1.byteLength, align, zig);
         const slice = constructor(dv2);
