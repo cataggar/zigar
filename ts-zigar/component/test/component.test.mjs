@@ -478,11 +478,25 @@ describe("TypeScript 7.1-next Go WASM Component (zigar:typescript@7.1.0)", () =>
     try {
       const source = [
         "export class Foo {",
+        "  n: number = 1;",
+        "  static sn: string = 'ok';",
         "  m(): this {",
         "    return this;",
         "  }",
+        "  mt(): typeof this {",
+        "    return this;",
+        "  }",
+        "  mn(): typeof this.n {",
+        "    return this.n;",
+        "  }",
         "  static s() {",
         "    return this;",
+        "  }",
+        "  static smt(): typeof this {",
+        "    return this;",
+        "  }",
+        "  static smn(): typeof this.sn {",
+        "    return this.sn;",
         "  }",
         "}",
         "export class B extends Foo {",
@@ -528,13 +542,40 @@ describe("TypeScript 7.1-next Go WASM Component (zigar:typescript@7.1.0)", () =>
           assert.equal(checker.inspectTypeAt("/this-super.ts", instThisOffset)?.typeText, "this");
           assert.equal(checker.inspectSymbolAt("/this-super.ts", instThisOffset)?.typeText, "this");
 
-          // 3. `return this;` in static method `static s()` -> `"typeof Foo"`
+          // 3. `typeof this` and `typeof this.n` in instance methods -> `"this"` on `this` (and `"number"` on `n`)
+          const instTypeofThisOffset = byteOffsetOf("mt(): typeof this", "this");
+          assert.equal(checker.typeToString("/this-super.ts", instTypeofThisOffset), "this");
+          assert.equal(checker.inspectTypeAt("/this-super.ts", instTypeofThisOffset)?.typeText, "this");
+          assert.equal(checker.inspectSymbolAt("/this-super.ts", instTypeofThisOffset)?.typeText, "this");
+
+          const instTypeofThisPropOffset = byteOffsetOf("mn(): typeof this.n", "this");
+          assert.equal(checker.typeToString("/this-super.ts", instTypeofThisPropOffset), "this");
+          assert.equal(checker.inspectTypeAt("/this-super.ts", instTypeofThisPropOffset)?.typeText, "this");
+          assert.equal(checker.inspectSymbolAt("/this-super.ts", instTypeofThisPropOffset)?.typeText, "this");
+
+          const instPropInQueryOffset = byteOffsetOf("mn(): typeof this.n", ".n") + 1;
+          assert.equal(checker.typeToString("/this-super.ts", instPropInQueryOffset), "number");
+
+          // 4. `return this;`, `typeof this`, and `typeof this.sn` in static methods -> `"typeof Foo"` on `this`
           const staticThisOffset = byteOffsetOf("static s() {\n    return this;", "return this;") + "return ".length;
           assert.equal(checker.typeToString("/this-super.ts", staticThisOffset), "typeof Foo");
           assert.equal(checker.inspectTypeAt("/this-super.ts", staticThisOffset)?.typeText, "typeof Foo");
           assert.equal(checker.inspectSymbolAt("/this-super.ts", staticThisOffset)?.typeText, "typeof Foo");
 
-          // 4. `super` in derived instance method `q() { return super.m(); }` -> `"Foo"`
+          const staticTypeofThisOffset = byteOffsetOf("static smt(): typeof this", "this");
+          assert.equal(checker.typeToString("/this-super.ts", staticTypeofThisOffset), "typeof Foo");
+          assert.equal(checker.inspectTypeAt("/this-super.ts", staticTypeofThisOffset)?.typeText, "typeof Foo");
+          assert.equal(checker.inspectSymbolAt("/this-super.ts", staticTypeofThisOffset)?.typeText, "typeof Foo");
+
+          const staticTypeofThisPropOffset = byteOffsetOf("static smn(): typeof this.sn", "this");
+          assert.equal(checker.typeToString("/this-super.ts", staticTypeofThisPropOffset), "typeof Foo");
+          assert.equal(checker.inspectTypeAt("/this-super.ts", staticTypeofThisPropOffset)?.typeText, "typeof Foo");
+          assert.equal(checker.inspectSymbolAt("/this-super.ts", staticTypeofThisPropOffset)?.typeText, "typeof Foo");
+
+          const staticPropInQueryOffset = byteOffsetOf("static smn(): typeof this.sn", "sn");
+          assert.equal(checker.typeToString("/this-super.ts", staticPropInQueryOffset), "string");
+
+          // 5. `super` in derived instance method `q() { return super.m(); }` -> `"Foo"`
           const superOffset = byteOffsetOf("super.m()", "super");
           assert.equal(checker.typeToString("/this-super.ts", superOffset), "Foo");
           assert.equal(checker.inspectTypeAt("/this-super.ts", superOffset)?.typeText, "Foo");
@@ -542,6 +583,9 @@ describe("TypeScript 7.1-next Go WASM Component (zigar:typescript@7.1.0)", () =>
           assert.ok(superSym);
           assert.equal(superSym.name, "Foo");
           assert.equal(superSym.typeText, "Foo");
+
+          // Ensure no spurious diagnostics were mutated onto the program during inspection
+          assert.deepEqual(program.getSemanticDiagnostics(), []);
         } finally {
           checker.drop();
         }

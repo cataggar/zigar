@@ -188,9 +188,25 @@ func (self *Checker) resolveAtOffset(fileName string, offset uint32) (*ast.Node,
 		node = node.Parent
 	}
 
-	sym := self.tc.GetSymbolAtLocation(node)
-	if sym == nil && node.Parent != nil && ast.IsDeclaration(node.Parent) && ast.GetNameOfDeclaration(node.Parent) == node {
-		sym = self.tc.GetSymbolOfDeclaration(node.Parent)
+	isThisInQuery := ast.IsThisInTypeQuery(node)
+	isThisOrSuper := isThisOrSuperNode(node)
+
+	var sym *ast.Symbol
+	var t *checker.Type
+	if isThisInQuery && node.Parent != nil && node.Parent.Kind == ast.KindTypeQuery {
+		t = self.typeAtToken(node)
+		if container := ast.GetThisContainer(node, false /*includeArrowFunctions*/, false /*includeClassComputedPropertyName*/); container != nil && ast.IsStatic(container) {
+			if t != nil {
+				sym = t.Symbol()
+			}
+		} else {
+			sym = self.tc.GetSymbolAtLocation(node)
+		}
+	} else {
+		sym = self.tc.GetSymbolAtLocation(node)
+		if sym == nil && node.Parent != nil && ast.IsDeclaration(node.Parent) && ast.GetNameOfDeclaration(node.Parent) == node {
+			sym = self.tc.GetSymbolOfDeclaration(node.Parent)
+		}
 	}
 
 	targetSym := sym
@@ -200,10 +216,7 @@ func (self *Checker) resolveAtOffset(fileName string, offset uint32) (*ast.Node,
 		}
 	}
 
-	isThisOrSuper := node.Kind == ast.KindThisKeyword || node.Kind == ast.KindThisType || node.Kind == ast.KindSuperKeyword
-
-	var t *checker.Type
-	if targetSym != nil && !isThisOrSuper {
+	if t == nil && targetSym != nil && !isThisOrSuper {
 		if targetSym.Flags()&ast.SymbolFlagsValue != 0 {
 			t = self.tc.GetTypeOfSymbolAtLocation(targetSym, node)
 		} else if targetSym.Flags()&ast.SymbolFlagsType != 0 {
@@ -218,17 +231,20 @@ func (self *Checker) resolveAtOffset(fileName string, offset uint32) (*ast.Node,
 	return node, sym, t
 }
 
+func isThisOrSuperNode(node *ast.Node) bool {
+	if node == nil {
+		return false
+	}
+	return node.Kind == ast.KindThisKeyword ||
+		node.Kind == ast.KindThisType ||
+		node.Kind == ast.KindSuperKeyword ||
+		ast.IsThisInTypeQuery(node)
+}
+
 func (self *Checker) typeAtToken(node *ast.Node) *checker.Type {
 	typeNode := node
-	if node.Parent != nil {
-		switch node.Parent.Kind {
-		case ast.KindLiteralType, ast.KindThisType:
-			typeNode = node.Parent
-		case ast.KindTypeQuery:
-			if node.Kind == ast.KindThisKeyword {
-				typeNode = node.Parent
-			}
-		}
+	if node.Parent != nil && (node.Parent.Kind == ast.KindLiteralType || node.Parent.Kind == ast.KindThisType) {
+		typeNode = node.Parent
 	}
 	return self.tc.GetTypeAtLocation(typeNode)
 }
@@ -241,11 +257,8 @@ func (self *Checker) buildSymbolInfo(sym *ast.Symbol, location *ast.Node) zigar_
 		}
 	}
 
-	isThisOrSuper := location != nil &&
-		(location.Kind == ast.KindThisKeyword || location.Kind == ast.KindThisType || location.Kind == ast.KindSuperKeyword)
-
 	var symType *checker.Type
-	if isThisOrSuper {
+	if isThisOrSuperNode(location) {
 		symType = self.typeAtToken(location)
 	} else if resolvedSym.Flags()&ast.SymbolFlagsValue != 0 {
 		if location != nil {
