@@ -195,12 +195,10 @@ func (self *Checker) resolveAtOffset(fileName string, offset uint32) (*ast.Node,
 	var t *checker.Type
 	if isThisInQuery && node.Parent != nil && node.Parent.Kind == ast.KindTypeQuery {
 		t = self.typeAtToken(node)
-		if container := ast.GetThisContainer(node, false /*includeArrowFunctions*/, false /*includeClassComputedPropertyName*/); container != nil && ast.IsStatic(container) {
-			if t != nil {
-				sym = t.Symbol()
-			}
-		} else {
+		if canGetSymbolForBareTypeofThis(node) {
 			sym = self.tc.GetSymbolAtLocation(node)
+		} else if t != nil {
+			sym = t.Symbol()
 		}
 	} else {
 		sym = self.tc.GetSymbolAtLocation(node)
@@ -239,6 +237,23 @@ func isThisOrSuperNode(node *ast.Node) bool {
 		node.Kind == ast.KindThisType ||
 		node.Kind == ast.KindSuperKeyword ||
 		ast.IsThisInTypeQuery(node)
+}
+
+func canGetSymbolForBareTypeofThis(node *ast.Node) bool {
+	container := ast.GetThisContainer(node, false /*includeArrowFunctions*/, false /*includeClassComputedPropertyName*/)
+	if container == nil {
+		return false
+	}
+	if ast.IsFunctionLike(container) && ast.GetThisParameter(container) != nil {
+		return true
+	}
+	parent := container.Parent
+	if parent != nil && (ast.IsClassLike(parent) || ast.IsInterfaceDeclaration(parent)) {
+		if !ast.IsStatic(container) && (!ast.IsConstructorDeclaration(container) || ast.IsNodeDescendantOf(node, container.Body())) {
+			return true
+		}
+	}
+	return false
 }
 
 func (self *Checker) typeAtToken(node *ast.Node) *checker.Type {

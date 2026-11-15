@@ -477,6 +477,7 @@ describe("TypeScript 7.1-next Go WASM Component (zigar:typescript@7.1.0)", () =>
     const vfs = ts.createVfs(true);
     try {
       const source = [
+        "export interface Bar { tag: string }",
         "export class Foo {",
         "  n: number = 1;",
         "  static sn: string = 'ok';",
@@ -498,12 +499,22 @@ describe("TypeScript 7.1-next Go WASM Component (zigar:typescript@7.1.0)", () =>
         "  static smn(): typeof this.sn {",
         "    return this.sn;",
         "  }",
+        "  static p(this: Bar): typeof this {",
+        "    return this;",
+        "  }",
         "}",
         "export class B extends Foo {",
         "  q() {",
         "    return super.m();",
         "  }",
         "}",
+        "export const typedObj: { a: number; m(): unknown } = {",
+        "  a: 1,",
+        "  m() {",
+        "    let y: typeof this = this;",
+        "    return y;",
+        "  },",
+        "};",
         "",
       ].join("\n");
 
@@ -575,7 +586,22 @@ describe("TypeScript 7.1-next Go WASM Component (zigar:typescript@7.1.0)", () =>
           const staticPropInQueryOffset = byteOffsetOf("static smn(): typeof this.sn", "sn");
           assert.equal(checker.typeToString("/this-super.ts", staticPropInQueryOffset), "string");
 
-          // 5. `super` in derived instance method `q() { return super.m(); }` -> `"Foo"`
+          // 5. `static p(this: Bar): typeof this` -> explicit `this` parameter symbol `{"name":"this","typeText":"Bar"}`
+          const staticExplicitThisQueryOffset = byteOffsetOf("static p(this: Bar): typeof this", "typeof this") + "typeof ".length;
+          assert.equal(checker.typeToString("/this-super.ts", staticExplicitThisQueryOffset), "Bar");
+          assert.equal(checker.inspectTypeAt("/this-super.ts", staticExplicitThisQueryOffset)?.typeText, "Bar");
+          const explicitThisSym = checker.inspectSymbolAt("/this-super.ts", staticExplicitThisQueryOffset);
+          assert.ok(explicitThisSym);
+          assert.equal(explicitThisSym.name, "this");
+          assert.equal(explicitThisSym.typeText, "Bar");
+
+          // 6. Object literal method `let y: typeof this = this;` -> no spurious `this`-type diagnostic
+          const objTypeofThisOffset = byteOffsetOf("let y: typeof this", "typeof this") + "typeof ".length;
+          assert.ok(checker.typeToString("/this-super.ts", objTypeofThisOffset));
+          assert.ok(checker.inspectTypeAt("/this-super.ts", objTypeofThisOffset));
+          checker.inspectSymbolAt("/this-super.ts", objTypeofThisOffset);
+
+          // 7. `super` in derived instance method `q() { return super.m(); }` -> `"Foo"`
           const superOffset = byteOffsetOf("super.m()", "super");
           assert.equal(checker.typeToString("/this-super.ts", superOffset), "Foo");
           assert.equal(checker.inspectTypeAt("/this-super.ts", superOffset)?.typeText, "Foo");
@@ -591,6 +617,32 @@ describe("TypeScript 7.1-next Go WASM Component (zigar:typescript@7.1.0)", () =>
         }
       } finally {
         program.drop();
+      }
+
+      // Also verify unannotated `const o = { m() { let y: typeof this = this; return y; } };` under strict: false
+      const objSource = "const o = { m() { let y: typeof this = this; return y; } };\n";
+      vfs.writeFile("/obj-typeof-this.ts", objSource);
+      const objProgRes = ts.createProgram(vfs, ["/obj-typeof-this.ts"], {
+        target: "es2024",
+        module: "esnext",
+        moduleResolution: "bundler",
+        strict: false,
+      });
+      assert.equal(objProgRes.ok, true);
+      try {
+        assert.deepEqual(objProgRes.value.getSemanticDiagnostics(), []);
+        const objChecker = objProgRes.value.getChecker();
+        try {
+          const offset = objSource.indexOf("typeof this") + "typeof ".length;
+          assert.equal(objChecker.typeToString("/obj-typeof-this.ts", offset), "any");
+          assert.equal(objChecker.inspectTypeAt("/obj-typeof-this.ts", offset)?.typeText, "any");
+          assert.equal(objChecker.inspectSymbolAt("/obj-typeof-this.ts", offset), null);
+          assert.deepEqual(objProgRes.value.getSemanticDiagnostics(), []);
+        } finally {
+          objChecker.drop();
+        }
+      } finally {
+        objProgRes.value.drop();
       }
     } finally {
       vfs.drop();
