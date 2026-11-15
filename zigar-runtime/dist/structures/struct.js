@@ -1,17 +1,21 @@
-import { MemberFlag, StructurePurpose, StructureFlag, StructFlag } from '../constants.js';
+import { StructurePurpose, MemberFlag, StructureFlag, StructFlag } from '../constants.js';
 import { mixin } from '../environment.js';
 import { InvalidInitializer } from '../errors.js';
-import { VISIT, SETTERS, KEYS, INITIALIZE, VIVIFICATE, ENTRIES, PROPS } from '../symbols.js';
-import { isCompatibleInstanceOf, copyObject, getSelf, defineValue } from '../utils.js';
+import { MEMORY, ZIG, VISIT, SETTERS, KEYS, INITIALIZE, VIVIFICATE, ENTRIES, PROPS } from '../symbols.js';
+import { hasJsValue, isCompatibleInstanceOf, copyObject, getSelf, defineValue } from '../utils.js';
 
 var struct = mixin({
   defineStruct(structure, descriptors) {
+    if (structure.purpose === StructurePurpose.JsValue) {
+      return this.defineJsValue(structure, descriptors);
+    }
     const {
       purpose,
       flags,
       length,
       instance: { members },
     } = structure;
+    const containsJsValue = hasJsValue(structure);
     const backingIntMember = members.find(m => m.flags & MemberFlag.IsBackingInt);
     const backingInt = backingIntMember && this.defineMember(backingIntMember);
     const propApplier = this.createApplier(structure);
@@ -22,7 +26,7 @@ var struct = mixin({
       } else if (purpose == StructurePurpose.Directory) {
         arg = thisEnv.createDirectory(arg);
       }
-      if (isCompatibleInstanceOf(arg, constructor)) {
+      if (isCompatibleInstanceOf(arg, constructor) && (!containsJsValue || arg[MEMORY]?.[ZIG])) {
         copyObject(this, arg);
         if (flags & StructureFlag.HasPointer) {
           this[VISIT]('copy', 0, arg);

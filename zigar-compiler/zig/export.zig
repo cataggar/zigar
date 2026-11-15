@@ -154,6 +154,7 @@ fn Factory(comptime host: type, comptime module: type) type {
                         .is_clamped_array = canBeClampedArray(T),
                         .is_opaque = T.is_opaque,
                     } else .{
+                        .has_value = getStructurePurpose(T) == .js_value,
                         .has_object = has_object,
                         .has_slot = has_slot,
                         .has_pointer = pointer.has(T),

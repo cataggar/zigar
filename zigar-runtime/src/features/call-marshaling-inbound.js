@@ -110,7 +110,7 @@ export default mixin({
           // error unions will throw on access, in which case we pass the error as the argument
           try {
             let arg = this[srcIndex];
-            if (type === MemberType.Object && arg?.[MEMORY]?.[ZIG]) {
+            if (type === MemberType.Object && structure.purpose !== StructurePurpose.JsValue && arg?.[MEMORY]?.[ZIG]) {
               // create copy in JS memory
               arg = new arg.constructor(arg);
             }

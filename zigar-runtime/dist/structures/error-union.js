@@ -1,8 +1,8 @@
-import { MemberType, StructureFlag, VisitorFlag } from '../constants.js';
+import { MemberType, StructurePurpose, StructureFlag, VisitorFlag } from '../constants.js';
 import { mixin } from '../environment.js';
 import { NotInErrorSet, isErrorJSON } from '../errors.js';
-import { VISIT, CLASS, INITIALIZE, VIVIFICATE, MEMORY } from '../symbols.js';
-import { isCompatibleInstanceOf, copyObject, defineValue, clearView } from '../utils.js';
+import { MEMORY, ZIG, VISIT, CLASS, INITIALIZE, VIVIFICATE } from '../symbols.js';
+import { hasJsValue, isCompatibleInstanceOf, copyObject, defineValue, clearView } from '../utils.js';
 
 var errorUnion = mixin({
   defineErrorUnion(structure, descriptors) {
@@ -10,6 +10,7 @@ var errorUnion = mixin({
       instance: { members: [ valueMember, errorMember ] },
       flags,
     } = structure;
+    const containsJsValue = hasJsValue(structure);
     const { get: getValue, set: setValue } = this.defineMember(valueMember);
     const { get: getError, set: setError } = this.defineMember(errorMember);
     const { get: getErrorNumber, set: setErrorNumber } = this.defineMember(errorMember, false);
@@ -21,7 +22,8 @@ var errorUnion = mixin({
         return getValue.call(this);
       }
     };
-    const isValueVoid = valueMember.type === MemberType.Void;
+    const isValueVoid = valueMember.type === MemberType.Void
+      || valueMember.structure?.purpose === StructurePurpose.JsValue;
     const ErrorSet = errorMember.structure.constructor;
     const { bitOffset, byteSize } = valueMember;
     const clearValue = function() {
@@ -30,12 +32,20 @@ var errorUnion = mixin({
     };
     const propApplier = this.createApplier(structure);
     const initializer = this.createInitializer(function(arg, allocator) {
-      if (isCompatibleInstanceOf(arg, constructor)) {
+      if (isCompatibleInstanceOf(arg, constructor) && (!containsJsValue || arg[MEMORY]?.[ZIG])) {
         copyObject(this, arg);
         if (flags & StructureFlag.HasPointer) {
           if (!getErrorNumber.call(this)) {
             this[VISIT]('copy', 0, arg);
           }
+        }
+      } else if (isCompatibleInstanceOf(arg, constructor)) {
+        if (getErrorNumber.call(arg)) {
+          setError.call(this, getError.call(arg));
+          clearValue.call(this);
+        } else {
+          setValue.call(this, getValue.call(arg), allocator);
+          setErrorNumber.call(this, 0);
         }
       } else if (arg instanceof ErrorSet[CLASS] && ErrorSet(arg)) {
         setError.call(this, arg);

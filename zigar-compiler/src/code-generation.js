@@ -47,7 +47,15 @@ export function generateCode(definition, params) {
     // loading through node-zigar/bun-zigar
     add(`import { createEnvironment } from ${JSON.stringify(runtimeURL)};`);
   }
-  for (const mixinPath of mixinPaths) {
+  const effectiveMixinPaths = [ ...mixinPaths ];
+  if (!standaloneLoader && runtimeURL && structures.some(s => s.purpose === StructurePurpose.JsValue)) {
+    for (const reqPath of [ 'features/js-value-registry.js', 'structures/js-value.js' ]) {
+      if (!effectiveMixinPaths.includes(reqPath)) {
+        effectiveMixinPaths.push(reqPath);
+      }
+    }
+  }
+  for (const mixinPath of effectiveMixinPaths) {
     add(`import '${runtimeURL}/${mixinPath}';`);
   }
   // write out the structures as object literals

@@ -7,6 +7,7 @@ import { mixin } from '../environment.js';
 import callMarshalingInbound from '../features/call-marshaling-inbound.js';
 import callMarshalingOutbound from '../features/call-marshaling-outbound.js';
 import dirConversion from '../features/dir-conversion.js';
+import jsValueRegistry from '../features/js-value-registry.js';
 import moduleLoading from '../features/module-loading.js';
 import pointerSynchronization from '../features/pointer-synchronization.js';
 import readerConversion from '../features/reader-conversion.js';
@@ -17,6 +18,7 @@ import allocator from '../structures/allocator.js';
 import dir from '../structures/dir.js';
 import file from '../structures/file.js';
 import generator from '../structures/generator.js';
+import jsValue from '../structures/js-value.js';
 import promise from '../structures/promise.js';
 import clockResGet from '../syscalls/clock-res-get.js';
 import clockTimeGet from '../syscalls/clock-time-get.js';
@@ -250,6 +252,18 @@ export default mixin({
         this.use(callMarshalingOutbound);
         this.use(pointerSynchronization);
       }
+      for (const name of Object.keys(this.exportedModules.env ?? {})) {
+        switch (name) {
+          case '_cloneJsValue':
+          case '_releaseJsValue':
+          case '_typeofJsValue':
+          case '_instanceofJsValue':
+          case '_equalJsValue':
+          case '_getJsValueCount':
+            this.use(jsValueRegistry);
+            break;
+        }
+      }
       for (const name of Object.keys(this.exportedModules.wasi)) {
         switch (name) {
           case 'thread-spawn': this.use(workerSupport); break;
@@ -315,6 +329,10 @@ export default mixin({
         }
       }
       for (const structure of this.structures) {
+        if (structure.purpose === StructurePurpose.JsValue) {
+          this.use(jsValue);
+          this.use(jsValueRegistry);
+        }
         if (structure.type === StructureType.ArgStruct) {
           for (const { structure: { purpose } } of structure.instance.members) {
             switch (purpose) {
@@ -415,6 +433,7 @@ export default mixin({
     return `[${length}]${element.structure.name}`;
   },
   getStructName(s) {
+    if (s.purpose === StructurePurpose.JsValue) return 'JsValue';
     for (const name of ['Allocator', 'Promise', 'Generator', 'Read', 'Writer']) {
       if (s.flags & StructFlag[`Is${name}`]) return name;
     }

@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
+import { StructurePurpose } from '../../zigar-runtime/src/constants.js';
 import { defineEnvironment } from '../../zigar-runtime/src/environment.js';
 import * as mixins from '../../zigar-runtime/src/mixins.js';
 import { generateCode } from './code-generation.js';
@@ -86,6 +87,10 @@ export async function transpile(srcPath, options) {
     if (env.mixinUsage.get(mixin) && name !== 'FeatureStructureAcquisition') {
       usage[name] = true;
     }
+  }
+  if (definition.structures.some(s => s.purpose === StructurePurpose.JsValue)) {
+    usage.StructureJsValue = true;
+    usage.FeatureJsValueRegistry = true;
   }
   if (nodeCompat && usage.FeatureWorkerSupport) {
     usage.FeatureWorkerSupportCompat = true;

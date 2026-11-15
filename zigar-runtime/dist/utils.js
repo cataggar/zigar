@@ -1,4 +1,4 @@
-import { MemberType } from './constants.js';
+import { MemberType, StructurePurpose, StructureType } from './constants.js';
 import { SIGNATURE, ENVIRONMENT, RESTORE, LENGTH, NO_CACHE } from './symbols.js';
 
 function defineProperty(object, name, descriptor) {
@@ -299,6 +299,30 @@ function isCompatibleInstanceOf(object, Type) {
   return (object instanceof Type) || isCompatibleType(object?.constructor, Type);
 }
 
+function hasJsValue(structure, seen = new Set()) {
+  if (!structure || seen.has(structure)) {
+    return false;
+  }
+  if (structure.purpose === StructurePurpose.JsValue) {
+    return true;
+  }
+  seen.add(structure);
+  switch (structure.type) {
+    case StructureType.Struct:
+    case StructureType.Union:
+    case StructureType.Optional:
+    case StructureType.ErrorUnion:
+    case StructureType.Array:
+      for (const member of structure.instance?.members ?? []) {
+        if (member.type === MemberType.Object && hasJsValue(member.structure, seen)) {
+          return true;
+        }
+      }
+      break;
+  }
+  return false;
+}
+
 function hasMethod(object, name) {
   return typeof(object?.[name]) === 'function';
 }
@@ -426,4 +450,4 @@ function extractTimes(st_atim, st_mtim, fst_flags) {
   return times;
 }
 
-export { ObjectCache, adjustAddress, alignForward, always, clearView, copyObject, copyView, createView, decodeBase64, decodeEnum, decodeFlags, decodeText, defineProperties, defineProperty, defineValue, empty, encodeBase64, encodeText, extractTimes, findElements, findObjects, findSortedIndex, getEnumNumber, getErrorHandler, getLength, getPrimitiveName, getSelf, hasMethod, isCompatibleInstanceOf, isCompatibleType, isDetached, isInvalidAddress, isInvalidUsize, isMisaligned, isPromise, markAsSpecial, maxSafeInteger, minSafeInteger, never, readUsize, readUsizeSafe, remove, safeInt, toBufferOffset, toString, transformIterable, usize, usizeByteSize, usizeInvalid, usizeMax, usizeMin };
+export { ObjectCache, adjustAddress, alignForward, always, clearView, copyObject, copyView, createView, decodeBase64, decodeEnum, decodeFlags, decodeText, defineProperties, defineProperty, defineValue, empty, encodeBase64, encodeText, extractTimes, findElements, findObjects, findSortedIndex, getEnumNumber, getErrorHandler, getLength, getPrimitiveName, getSelf, hasJsValue, hasMethod, isCompatibleInstanceOf, isCompatibleType, isDetached, isInvalidAddress, isInvalidUsize, isMisaligned, isPromise, markAsSpecial, maxSafeInteger, minSafeInteger, never, readUsize, readUsizeSafe, remove, safeInt, toBufferOffset, toString, transformIterable, usize, usizeByteSize, usizeInvalid, usizeMax, usizeMin };

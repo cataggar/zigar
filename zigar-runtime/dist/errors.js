@@ -433,6 +433,12 @@ class UnexpectedGenerator extends TypeError {
   }
 }
 
+class InvalidJsValueHandle extends TypeError {
+  constructor(handle) {
+    super(`Invalid or released JS value handle: 0x${(handle >>> 0).toString(16)}`);
+  }
+}
+
 class InvalidFileDescriptor extends Error {
   errno = PosixError.EBADF;
 
@@ -678,4 +684,4 @@ function formatList(list, conj = 'or') {
   }
 }
 
-export { AccessingOpaque, AlignmentConflict, ArgumentCountMismatch, ArrayLengthMismatch, AssigningToConstant, BufferExpected, BufferSizeMismatch, ConstantConstraint, CreatingOpaque, Deadlock, EnumExpected, ErrorExpected, Exit, IllegalSeek, InaccessiblePointer, InactiveUnionProperty, InvalidArgument, InvalidArrayInitializer, InvalidEnumValue, InvalidFileDescriptor, InvalidInitializer, InvalidIntConversion, InvalidPath, InvalidPointerTarget, InvalidSliceLength, InvalidStream, InvalidType, InvalidVariadicArgument, MisplacedSentinel, MissingEventListener, MissingInitializers, MissingSentinel, MissingStreamMethod, MissingUnionInitializer, MultipleUnionInitializers, MustBeOverridden, NoCastingToFunction, NoCastingToPointer, NoInitializer, NoProperty, NotInErrorSet, NotOnByteBoundary, NotUndefined, NullPointer, OutOfBound, Overflow, PreviouslyFreed, ReadOnly, ReadOnlyTarget, TooManyFiles, TypeMismatch, UndefinedArgument, UnexpectedGenerator, Unsupported, WouldBlock, ZigError, ZigMemoryTargetRequired, addArticle, adjustArgumentError, article, catchPosixError, checkAccessRight, checkInefficientAccess, checkStreamMethod, deanimalizeErrorName, expectBoolean, formatList, getDescription, isErrorJSON, replaceRangeError, throwNoSupport, throwReadOnly };
+export { AccessingOpaque, AlignmentConflict, ArgumentCountMismatch, ArrayLengthMismatch, AssigningToConstant, BufferExpected, BufferSizeMismatch, ConstantConstraint, CreatingOpaque, Deadlock, EnumExpected, ErrorExpected, Exit, IllegalSeek, InaccessiblePointer, InactiveUnionProperty, InvalidArgument, InvalidArrayInitializer, InvalidEnumValue, InvalidFileDescriptor, InvalidInitializer, InvalidIntConversion, InvalidJsValueHandle, InvalidPath, InvalidPointerTarget, InvalidSliceLength, InvalidStream, InvalidType, InvalidVariadicArgument, MisplacedSentinel, MissingEventListener, MissingInitializers, MissingSentinel, MissingStreamMethod, MissingUnionInitializer, MultipleUnionInitializers, MustBeOverridden, NoCastingToFunction, NoCastingToPointer, NoInitializer, NoProperty, NotInErrorSet, NotOnByteBoundary, NotUndefined, NullPointer, OutOfBound, Overflow, PreviouslyFreed, ReadOnly, ReadOnlyTarget, TooManyFiles, TypeMismatch, UndefinedArgument, UnexpectedGenerator, Unsupported, WouldBlock, ZigError, ZigMemoryTargetRequired, addArticle, adjustArgumentError, article, catchPosixError, checkAccessRight, checkInefficientAccess, checkStreamMethod, deanimalizeErrorName, expectBoolean, formatList, getDescription, isErrorJSON, replaceRangeError, throwNoSupport, throwReadOnly };

@@ -2,7 +2,7 @@ import { ArgStructFlag, StructureType, MemberFlag, StructureFlag } from '../cons
 import { mixin } from '../environment.js';
 import { ArgumentCountMismatch } from '../errors.js';
 import { THROWING, VIVIFICATE, VISIT, RETURN, ALLOCATOR, UPDATE, MEMORY, SLOTS, FINALIZE } from '../symbols.js';
-import { defineProperty, defineValue } from '../utils.js';
+import { defineProperty, defineValue, hasJsValue } from '../utils.js';
 
 var argStruct = mixin({
   defineArgStruct(structure, descriptors) {
@@ -73,7 +73,14 @@ var argStruct = mixin({
     }
     const retvalSetter = descriptors.retval.set;
     descriptors.length = defineValue(argMembers.length);
-    descriptors[VIVIFICATE] = (flags & StructureFlag.HasObject) && this.defineVivificatorStruct(structure);
+    if (flags & StructureFlag.HasObject) {
+      descriptors[VIVIFICATE] = this.defineVivificatorStruct(structure);
+      if (descriptors[VIVIFICATE]?.value) {
+        const retvalMember = members[0];
+        descriptors[VIVIFICATE].value.retvalMember = retvalMember;
+        descriptors[VIVIFICATE].value.retvalHasJsValue = hasJsValue(retvalMember?.structure);
+      }
+    }
     descriptors[VISIT] = (flags & StructureFlag.HasPointer) && this.defineVisitorArgStruct(members);
     descriptors[RETURN] = defineValue(function(value) {
       // pass allocator associated with argument to setter

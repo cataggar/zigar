@@ -1,8 +1,8 @@
 import { UnionFlag, StructurePurpose, StructureFlag, VisitorFlag } from '../constants.js';
 import { mixin } from '../environment.js';
 import { MultipleUnionInitializers, MissingUnionInitializer, InvalidInitializer, InactiveUnionProperty, InaccessiblePointer } from '../errors.js';
-import { NAME, VISIT, SETTERS, KEYS, RESTRICT, INITIALIZE, TAG, VIVIFICATE, ENTRIES, PROPS, GETTERS, TARGET } from '../symbols.js';
-import { defineValue, isCompatibleInstanceOf, copyObject, empty, defineProperties } from '../utils.js';
+import { NAME, MEMORY, ZIG, VISIT, SETTERS, KEYS, RESTRICT, INITIALIZE, TAG, VIVIFICATE, ENTRIES, PROPS, GETTERS, TARGET } from '../symbols.js';
+import { defineValue, hasJsValue, isCompatibleInstanceOf, copyObject, empty, defineProperties } from '../utils.js';
 
 var union = mixin({
   defineUnion(structure, descriptors) {
@@ -11,6 +11,7 @@ var union = mixin({
       flags,
       instance: { members },
     } = structure;
+    const containsJsValue = hasJsValue(structure);
     const exclusion = !!(flags & UnionFlag.HasSelector);
     const valueMembers = (exclusion) ? members.slice(0, -1) : members;
     const selectorMember = (exclusion) ? members[members.length - 1] : null;
@@ -45,11 +46,14 @@ var union = mixin({
             break;
         }
       }      
-      if (isCompatibleInstanceOf(arg, constructor)) {
+      if (isCompatibleInstanceOf(arg, constructor) && (!containsJsValue || arg[MEMORY]?.[ZIG] || !(flags & UnionFlag.HasTag))) {
         copyObject(this, arg);
         if (flags & StructureFlag.HasPointer) {
           this[VISIT]('copy', VisitorFlag.Vivificate, arg);
         }
+      } else if (isCompatibleInstanceOf(arg, constructor)) {
+        const active = getActiveField.call(arg);
+        propApplier.call(this, { [active]: arg[active] }, allocator);
       } else if (arg && typeof(arg) === 'object') {
         let found = 0;
         for (const key of props) {

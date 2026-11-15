@@ -27,7 +27,9 @@ const StructurePurpose = {
   Directory: 7,
   AnyImage: 8,
   WebImage: 9,
-  GdImage: 10,
+  WebHdrImage: 10,
+  GdImage: 11,
+  JsValue: 12,
 };
 const structureNames = Object.keys(StructureType);
 const StructureFlag = {

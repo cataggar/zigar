@@ -433,6 +433,12 @@ export class UnexpectedGenerator extends TypeError {
   }
 }
 
+export class InvalidJsValueHandle extends TypeError {
+  constructor(handle) {
+    super(`Invalid or released JS value handle: 0x${(handle >>> 0).toString(16)}`);
+  }
+}
+
 export class InvalidFileDescriptor extends Error {
   errno = PosixError.EBADF;
 

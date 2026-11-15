@@ -15,6 +15,7 @@ pub const Generator = @import("../type/generator.zig").Generator;
 pub const GeneratorOf = @import("../type/generator.zig").GeneratorOf;
 pub const GeneratorArgOf = @import("../type/generator.zig").GeneratorArgOf;
 pub const image = @import("../type/image.zig");
+pub const js = @import("../type/js.zig").Js(@This());
 pub const Promise = @import("../type/promise.zig").Promise;
 pub const PromiseOf = @import("../type/promise.zig").PromiseOf;
 pub const PromiseArgOf = @import("../type/promise.zig").PromiseArgOf;
@@ -383,6 +384,30 @@ threadlocal var redirection_suppressed: bool = false;
 
 pub fn isRedirectingStderr() bool {
     return !redirection_suppressed;
+}
+
+pub fn cloneJsValue(_: u32) u32 {
+    @panic("JsValue native host bridge not supported yet");
+}
+
+pub fn releaseJsValue(_: u32) void {
+    @panic("JsValue native host bridge not supported yet");
+}
+
+pub fn typeofJsValue(_: u32) js.JsType {
+    @panic("JsValue native host bridge not supported yet");
+}
+
+pub fn instanceofJsValue(_: u32, _: u32) bool {
+    @panic("JsValue native host bridge not supported yet");
+}
+
+pub fn equalJsValue(_: u32, _: u32) bool {
+    @panic("JsValue native host bridge not supported yet");
+}
+
+pub fn getJsValueCount() u32 {
+    return 0;
 }
 
 pub fn isRedirecting(comptime literal: @TypeOf(.enum_literal)) bool {

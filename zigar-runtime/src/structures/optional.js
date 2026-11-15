@@ -1,7 +1,7 @@
 import { MemberType, OptionalFlag, StructureFlag, VisitorFlag } from '../constants.js';
 import { mixin } from '../environment.js';
-import { INITIALIZE, MEMORY, VISIT, VIVIFICATE } from '../symbols.js';
-import { clearView, copyObject, defineValue, isCompatibleInstanceOf } from '../utils.js';
+import { INITIALIZE, MEMORY, VISIT, VIVIFICATE, ZIG } from '../symbols.js';
+import { clearView, copyObject, defineValue, hasJsValue, isCompatibleInstanceOf } from '../utils.js';
 
 export default mixin({
   defineOptional(structure, descriptors) {
@@ -9,6 +9,7 @@ export default mixin({
       instance: { members: [ valueMember, presentMember ] },
       flags,
     } = structure;
+    const containsJsValue = hasJsValue(structure);
     const { get: getValue, set: setValue } = this.defineMember(valueMember);
     const { get: getPresent, set: setPresent } = this.defineMember(presentMember);
     const get = function() {
@@ -23,12 +24,24 @@ export default mixin({
     const isValueVoid = valueMember.type === MemberType.Void;
     const { bitOffset, byteSize } = valueMember;
     const initializer = this.createInitializer(function(arg, allocator) {
-      if (isCompatibleInstanceOf(arg, constructor)) {
+      if (isCompatibleInstanceOf(arg, constructor) && (!containsJsValue || arg[MEMORY]?.[ZIG])) {
         copyObject(this, arg);
         if (flags & StructureFlag.HasPointer) {
           // don't bother copying pointers when it's empty
           if (getPresent.call(this)) {
             this[VISIT]('copy', VisitorFlag.Vivificate, arg);
+          }
+        }
+      } else if (isCompatibleInstanceOf(arg, constructor)) {
+        if (getPresent.call(arg)) {
+          setValue.call(this, getValue.call(arg), allocator);
+          if (flags & OptionalFlag.HasSelector) {
+            setPresent.call(this, 1);
+          }
+        } else {
+          setPresent.call(this, 0);
+          if (flags & OptionalFlag.HasSelector) {
+            clearView(this[MEMORY], bitOffset >> 3, byteSize);
           }
         }
       } else if (arg === null) {

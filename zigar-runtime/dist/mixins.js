@@ -20,6 +20,7 @@ export { default as FeatureCallMarshalingInbound } from './features/call-marshal
 export { default as FeatureCallMarshalingOutbound } from './features/call-marshaling-outbound.js';
 export { default as FeatureDirConversion } from './features/dir-conversion.js';
 export { default as FeatureIntConversion } from './features/int-conversion.js';
+export { default as FeatureJsValueRegistry } from './features/js-value-registry.js';
 export { default as FeatureMemoryMapping } from './features/memory-mapping.js';
 export { default as FeatureModuleLoading } from './features/module-loading.js';
 export { default as FeatureObjectLinkage } from './features/object-linkage.js';
@@ -76,6 +77,7 @@ export { default as StructureErrorUnion } from './structures/error-union.js';
 export { default as StructureFile } from './structures/file.js';
 export { default as StructureFunction } from './structures/function.js';
 export { default as StructureGenerator } from './structures/generator.js';
+export { default as StructureJsValue } from './structures/js-value.js';
 export { default as StructureOpaque } from './structures/opaque.js';
 export { default as StructureOptional } from './structures/optional.js';
 export { default as StructurePointer } from './structures/pointer.js';

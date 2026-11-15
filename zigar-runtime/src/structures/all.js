@@ -6,8 +6,8 @@ import { MissingInitializers, NoInitializer, NoProperty, throwNoSupport } from '
 import { removeProxy } from '../proxies.js';
 import {
   ALIGN, CACHE, CAST, ENTRIES, ENVIRONMENT, FINALIZE, FLAGS, INITIALIZE, KEYS, MEMORY, PROPS,
-  PROXY, RESTORE, RESTRICT, SETTERS, SHAPE, SIGNATURE, SIZE, SLOTS, TRANSFORM, TYPE, TYPED_ARRAY,
-  UPDATE
+  PROXY, PURPOSE, RESTORE, RESTRICT, SETTERS, SHAPE, SIGNATURE, SIZE, SLOTS, TRANSFORM, TYPE,
+  TYPED_ARRAY, UPDATE
 } from '../symbols.js';
 import { copyObject, defineProperties, defineProperty, defineValue, ObjectCache } from '../utils.js';
 
@@ -56,6 +56,7 @@ export default mixin({
     const {
       name,
       type,
+      purpose,
       constructor,
       align,
       byteSize,
@@ -73,6 +74,7 @@ export default mixin({
       [ALIGN]: defineValue(align),
       [SIZE]: defineValue(byteSize),
       [TYPE]: defineValue(type),
+      [PURPOSE]: defineValue(purpose),
       [FLAGS]: defineValue(flags),
       [PROPS]: defineValue(props),
       [TYPED_ARRAY]: defineValue(this.getTypedArray(structure)),

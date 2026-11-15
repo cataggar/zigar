@@ -5,11 +5,11 @@ import {
   MultipleUnionInitializers,
 } from '../errors.js';
 import {
-  ENTRIES, GETTERS, INITIALIZE, KEYS, NAME, PROPS, RESTRICT, SETTERS, TAG, TARGET, VISIT,
-  VIVIFICATE
+  ENTRIES, GETTERS, INITIALIZE, KEYS, MEMORY, NAME, PROPS, RESTRICT, SETTERS, TAG, TARGET, VISIT,
+  VIVIFICATE, ZIG
 } from '../symbols.js';
 import {
-  copyObject, defineProperties, defineValue, empty, isCompatibleInstanceOf
+  copyObject, defineProperties, defineValue, empty, hasJsValue, isCompatibleInstanceOf
 } from '../utils.js';
 
 export default mixin({
@@ -19,6 +19,7 @@ export default mixin({
       flags,
       instance: { members },
     } = structure;
+    const containsJsValue = hasJsValue(structure);
     const exclusion = !!(flags & UnionFlag.HasSelector);
     const valueMembers = (exclusion) ? members.slice(0, -1) : members;
     const selectorMember = (exclusion) ? members[members.length - 1] : null;
@@ -53,11 +54,14 @@ export default mixin({
             break;
         }
       }      
-      if (isCompatibleInstanceOf(arg, constructor)) {
+      if (isCompatibleInstanceOf(arg, constructor) && (!containsJsValue || arg[MEMORY]?.[ZIG] || !(flags & UnionFlag.HasTag))) {
         copyObject(this, arg);
         if (flags & StructureFlag.HasPointer) {
           this[VISIT]('copy', VisitorFlag.Vivificate, arg);
         }
+      } else if (isCompatibleInstanceOf(arg, constructor)) {
+        const active = getActiveField.call(arg);
+        propApplier.call(this, { [active]: arg[active] }, allocator);
       } else if (arg && typeof(arg) === 'object') {
         let found = 0;
         for (const key of props) {

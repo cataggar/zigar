@@ -2,7 +2,7 @@ import { StructureType, MemberType, MemberFlag, structureNames, StructureFlag, P
 import { mixin } from '../environment.js';
 import { throwNoSupport, NoProperty, MissingInitializers, NoInitializer } from '../errors.js';
 import { removeProxy } from '../proxies.js';
-import { KEYS, SETTERS, MEMORY, SLOTS, CACHE, RESTORE, PROPS, ENTRIES, TYPED_ARRAY, FLAGS, TYPE, SIZE, ALIGN, ENVIRONMENT, SIGNATURE, TRANSFORM, SHAPE, INITIALIZE, CAST, RESTRICT, FINALIZE, PROXY, UPDATE } from '../symbols.js';
+import { KEYS, SETTERS, MEMORY, SLOTS, CACHE, RESTORE, PROPS, ENTRIES, TYPED_ARRAY, FLAGS, PURPOSE, TYPE, SIZE, ALIGN, ENVIRONMENT, SIGNATURE, TRANSFORM, SHAPE, INITIALIZE, CAST, RESTRICT, FINALIZE, PROXY, UPDATE } from '../symbols.js';
 import { copyObject, ObjectCache, defineProperty, defineValue, defineProperties } from '../utils.js';
 
 var all = mixin({
@@ -43,6 +43,7 @@ var all = mixin({
     const {
       name,
       type,
+      purpose,
       constructor,
       align,
       byteSize,
@@ -60,6 +61,7 @@ var all = mixin({
       [ALIGN]: defineValue(align),
       [SIZE]: defineValue(byteSize),
       [TYPE]: defineValue(type),
+      [PURPOSE]: defineValue(purpose),
       [FLAGS]: defineValue(flags),
       [PROPS]: defineValue(props),
       [TYPED_ARRAY]: defineValue(this.getTypedArray(structure)),

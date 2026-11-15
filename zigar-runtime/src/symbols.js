@@ -14,6 +14,7 @@ export const PARENT = symbol('parent');
 export const ZIG = symbol('zig');
 export const NAME = symbol('name');
 export const TYPE = symbol('type');
+export const PURPOSE = symbol('purpose');
 export const FLAGS = symbol('flags');
 export const CLASS = symbol('class');
 export const TAG = symbol('tag');
