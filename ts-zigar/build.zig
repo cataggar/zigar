@@ -185,6 +185,23 @@ pub fn build(b: *std.Build) void {
     run_opt_comp_tests.setCwd(b.path(""));
     run_opt_comp_tests.has_side_effects = true;
 
+    const opt_host_test_mod = b.createModule(.{
+        .root_source_file = b.path("test/component_host_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+    });
+    opt_host_test_mod.addImport("ts_zigar", ts_zigar_mod);
+    opt_host_test_mod.addOptions("build_options", opt_comp_opts);
+
+    const opt_host_tests = b.addTest(.{
+        .root_module = opt_host_test_mod,
+        .use_llvm = use_llvm,
+    });
+    const run_opt_host_tests = b.addRunArtifact(opt_host_tests);
+    run_opt_host_tests.setCwd(b.path(""));
+    run_opt_host_tests.has_side_effects = true;
+
     // Dedicated strict component validation + Node.js 26 integration test step (`zig build test-component`)
     const req_comp_opts = b.addOptions();
     req_comp_opts.addOption([]const u8, "component_wasm_path", component_wasm_rel);
@@ -208,6 +225,24 @@ pub fn build(b: *std.Build) void {
     run_req_comp_tests.has_side_effects = true;
     run_req_comp_tests.step.dependOn(&build_component_cmd.step);
 
+    const req_host_test_mod = b.createModule(.{
+        .root_source_file = b.path("test/component_host_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+    });
+    req_host_test_mod.addImport("ts_zigar", ts_zigar_mod);
+    req_host_test_mod.addOptions("build_options", req_comp_opts);
+
+    const req_host_tests = b.addTest(.{
+        .root_module = req_host_test_mod,
+        .use_llvm = use_llvm,
+    });
+    const run_req_host_tests = b.addRunArtifact(req_host_tests);
+    run_req_host_tests.setCwd(b.path(""));
+    run_req_host_tests.has_side_effects = true;
+    run_req_host_tests.step.dependOn(&build_component_cmd.step);
+
     const run_node_comp_tests = b.addSystemCommand(&.{
         "node",
         "--test",
@@ -219,10 +254,12 @@ pub fn build(b: *std.Build) void {
 
     const test_component_step = b.step("test-component", "Build and validate typescript-compiler.component.wasm with wit-zigar and Node.js 26");
     test_component_step.dependOn(&run_req_comp_tests.step);
+    test_component_step.dependOn(&run_req_host_tests.step);
     test_component_step.dependOn(&run_node_comp_tests.step);
 
     const test_step = b.step("test", "Verify typescript.wit codegen, Canonical ABI, wasm32/wasm64 cross-compilation, and component loader");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&wasm_check_files.step);
     test_step.dependOn(&run_opt_comp_tests.step);
+    test_step.dependOn(&run_opt_host_tests.step);
 }

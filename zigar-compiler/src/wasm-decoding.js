@@ -818,6 +818,9 @@ export function extractLimits(binary) {
 }
 
 function isSuspendingImport(module, name) {
+  if (module === 'zigar:component-host') {
+    return false;
+  }
   if (module === 'wasi_snapshot_preview1' && (name === 'proc_exit' || PURE_SYNC_WASI_IMPORTS.has(name))) {
     return false;
   }

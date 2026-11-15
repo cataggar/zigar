@@ -149,6 +149,12 @@ pub fn loadVerbatim(data: []const u8, allocator: std.mem.Allocator) LoadError!ct
     return loadInner(data, allocator, .{ .capture_layout = true });
 }
 
+/// Like `loadVerbatim`, additionally enforcing `strict = true` so unsupported
+/// component sections fail rather than being skipped.
+pub fn loadStrictVerbatim(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Component {
+    return loadInner(data, allocator, .{ .capture_layout = true, .strict = true });
+}
+
 const LoadOptions = struct {
     capture_layout: bool = false,
     strict: bool = false,
