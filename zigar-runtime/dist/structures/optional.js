@@ -1,6 +1,6 @@
 import { MemberType, StructureFlag, VisitorFlag, OptionalFlag } from '../constants.js';
 import { mixin } from '../environment.js';
-import { VISIT, INITIALIZE, VIVIFICATE, MEMORY, ZIG, SLOTS } from '../symbols.js';
+import { RESTORE, MEMORY, VISIT, INITIALIZE, VIVIFICATE, ZIG, SLOTS } from '../symbols.js';
 import { hasJsValue, isCompatibleInstanceOf, copyObject, defineValue, clearView } from '../utils.js';
 
 var optional = mixin({
@@ -24,12 +24,28 @@ var optional = mixin({
     };
     const isValueVoid = valueMember.type === MemberType.Void;
     const { bitOffset, byteSize, slot: valueSlot } = valueMember;
+    const isCurrentlyPresent = (presentMember.bitSize === 1)
+    ? function() {
+        const dv = (this[RESTORE]) ? this[RESTORE]() : this[MEMORY];
+        return dv.getUint8(presentMember.bitOffset >> 3) === 1;
+      }
+    : getPresent;
     const assignPresentValue = function(val, allocator) {
-      setValue.call(this, val, allocator);
+      if (containsJsValue && this[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig && !isCurrentlyPresent.call(this)) {
+        const prevUninit = thisEnv.writingUninitZig;
+        thisEnv.writingUninitZig = true;
+        try {
+          setValue.call(this, val, allocator);
+        } finally {
+          thisEnv.writingUninitZig = prevUninit;
+        }
+      } else {
+        setValue.call(this, val, allocator);
+      }
     };
     const clearPresentValue = function() {
       if (containsJsValue) {
-        if (this[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig) {
+        if (this[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig && isCurrentlyPresent.call(this)) {
           thisEnv.releaseZigJsValues(valueMember.structure, this[MEMORY], bitOffset >> 3);
         }
         if (this[SLOTS] && valueSlot !== undefined) {

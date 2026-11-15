@@ -50,7 +50,6 @@ pub var exported_pair: Pair = .{
 pub var uninit_ref: Ref(js.Any) = undefined;
 pub var uninit_pair: Pair = undefined;
 pub var uninit_tagged: TaggedValue = undefined;
-pub var collision_ref: Ref(js.Any) = undefined;
 
 var saved_ref: Ref(js.Object) = .@"null";
 
@@ -339,7 +338,29 @@ pub fn poisonUninitVarsWith0xAA() void {
     @memset(std.mem.asBytes(&uninit_tagged), 0xaa);
 }
 
-pub fn plantSavedHandleInCollisionVar() void {
-    @as(*u32, @ptrCast(&collision_ref)).* = saved_ref.handle;
+pub fn zigSetExportedRef(v: Ref(js.Any)) void {
+    if (!exported_ref.isReserved()) {
+        exported_ref.deinit();
+    }
+    exported_ref = v;
+}
+
+pub fn zigSetUninitTaggedJs(v: Ref(js.Any)) void {
+    uninit_tagged = .{ .js = v };
+}
+
+pub fn leaveStaleDeinitInUninitRefAndReuseSlot(
+    temp: Ref(js.Any),
+    keeper: Ref(js.Object),
+) void {
+    uninit_ref = temp;
+    uninit_ref.deinit(); // leaves stale `temp.handle` in `uninit_ref`!
+    if (!saved_ref.isNullOrUndefined()) {
+        saved_ref.deinit();
+    }
+    // `keeper` was allocated while `temp` was live; cloning `keeper` allocates into `temp`'s
+    // just-freed slot index with generation + 1!
+    saved_ref = keeper.clone();
+    keeper.deinit();
 }
 

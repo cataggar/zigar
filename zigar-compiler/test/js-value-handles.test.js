@@ -579,19 +579,52 @@ describe('JsValue Handle Registry & zigar.js.Ref(T) End-to-End Integration', fun
           expect(Number(mod.activeCount())).to.equal(0);
         }
 
-        // Verify uninitialized Zig memory whose raw bytes happen to collide with a live handle
-        // owned by Zig (`saved_ref`) never frees Zig's handle when JS assigns to `collision_ref`!
-        const zigOwned = new CustomWidget('zig-owned');
-        mod.storeGlobal(zigOwned);
+        // 1. Zig sets `exported_ref = objA`, then JS overwrites `mod.default.exported_ref = objB` -> 1 handle!
+        const objA = { fromZig: 'A' };
+        const objB = { fromJs: 'B' };
+        const objC = { fromJs: 'C' };
+        mod.zigSetExportedRef(objA);
         expect(Number(mod.activeCount())).to.equal(1);
-        mod.plantSavedHandleInCollisionVar();
+        expect(Object.is(mod.default.exported_ref, objA)).to.be.true;
+        mod.default.exported_ref = objB;
+        expect(Number(mod.activeCount())).to.equal(1);
+        expect(Object.is(mod.default.exported_ref, objB)).to.be.true;
+        mod.clearGlobal();
+        expect(Number(mod.activeCount())).to.equal(0);
 
-        mod.default.collision_ref = obj1;
+        // 2. JS sets `exported_ref = objA`, Zig deinits `objA` & sets `objB`, then JS sets `objC` -> 1 handle!
+        mod.default.exported_ref = objA;
+        expect(Number(mod.activeCount())).to.equal(1);
+        mod.zigSetExportedRef(objB);
+        expect(Number(mod.activeCount())).to.equal(1);
+        expect(Object.is(mod.default.exported_ref, objB)).to.be.true;
+        mod.default.exported_ref = objC;
+        expect(Number(mod.activeCount())).to.equal(1);
+        expect(Object.is(mod.default.exported_ref, objC)).to.be.true;
+        mod.clearGlobal();
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        // 3. Zig sets `uninit_tagged = .{ .js = objA }`, then JS switches `mod.default.uninit_tagged = { code: 1 }` -> 0 handles!
+        mod.poisonUninitVarsWith0xAA();
+        mod.zigSetUninitTaggedJs(objA);
+        expect(Number(mod.activeCount())).to.equal(1);
+        expect(Object.is(mod.default.uninit_tagged.js, objA)).to.be.true;
+        mod.default.uninit_tagged = { code: 1 };
+        expect(mod.default.uninit_tagged.code).to.equal(1);
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        // 4. ABA stale-slot safety: Zig deinits `uninit_ref` (leaving stale handle in memory),
+        // `saved_ref` reuses that exact slot index with generation + 1, then JS overwrites `uninit_ref` -> `saved_ref` stays intact!
+        const zigOwned = new CustomWidget('zig-owned-aba');
+        mod.leaveStaleDeinitInUninitRefAndReuseSlot({ doomed: true }, zigOwned);
+        expect(Number(mod.activeCount())).to.equal(1);
+
+        mod.default.uninit_ref = obj1;
         expect(Number(mod.activeCount())).to.equal(2);
         expect(Object.is(mod.loadGlobalClone(), zigOwned)).to.be.true;
-        expect(Object.is(mod.default.collision_ref, obj1)).to.be.true;
+        expect(Object.is(mod.default.uninit_ref, obj1)).to.be.true;
 
-        mod.default.collision_ref = undefined;
+        mod.default.uninit_ref = undefined;
         expect(Number(mod.activeCount())).to.equal(1);
         expect(Object.is(mod.loadGlobalClone(), zigOwned)).to.be.true;
         mod.clearGlobal();

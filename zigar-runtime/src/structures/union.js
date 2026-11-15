@@ -1,4 +1,4 @@
-import { StructureFlag, StructurePurpose, UnionFlag, VisitorFlag } from '../constants.js';
+import { MemberType, StructureFlag, StructurePurpose, UnionFlag, VisitorFlag } from '../constants.js';
 import { mixin } from '../environment.js';
 import {
   InaccessiblePointer, InactiveUnionProperty, InvalidInitializer, MissingUnionInitializer,
@@ -118,8 +118,17 @@ export default mixin({
       ? (containsJsValue
         ? function(value) {
             const inZig = Boolean(this[MEMORY]?.[ZIG]);
+            let prevName = name;
             if (inZig && !thisEnv.writingUninitZig) {
-              thisEnv.releaseZigJsValues(structure, this[MEMORY], 0);
+              prevName = undefined;
+              try {
+                prevName = getActiveField.call(this);
+              } catch {}
+              const prevMember = prevName !== undefined && valueMembers.find(m => m.name === prevName);
+              if (prevMember && prevName !== name && prevMember.type === MemberType.Object
+                && prevMember.bitOffset !== undefined && hasJsValue(prevMember.structure)) {
+                thisEnv.releaseZigJsValues(prevMember.structure, this[MEMORY], prevMember.bitOffset >> 3);
+              }
             }
             if (this[SLOTS]) {
               for (const m of valueMembers) {
@@ -130,7 +139,17 @@ export default mixin({
             }
             setActiveField.call(this, name);
             this[VISIT]?.('clear', VisitorFlag.IgnoreUncreated);
-            setValue.call(this, value);
+            if (inZig && !thisEnv.writingUninitZig && prevName !== name) {
+              const prevUninit = thisEnv.writingUninitZig;
+              thisEnv.writingUninitZig = true;
+              try {
+                setValue.call(this, value);
+              } finally {
+                thisEnv.writingUninitZig = prevUninit;
+              }
+            } else {
+              setValue.call(this, value);
+            }
           }
         : function(value) {
             setActiveField.call(this, name);

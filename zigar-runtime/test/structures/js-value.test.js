@@ -661,7 +661,7 @@ describe('Structure: js-value', function() {
     expect(env.getJsValueCount()).to.equal(0);
   });
 
-  it('should safely overwrite uninitialized 0xaaaaaaaa Zig globals and avoid handle-collision frees', function() {
+  it('should safely overwrite uninitialized 0xaaaaaaaa Zig globals, ABA stale slots, and Zig-written handles', function() {
     const env = new Env();
     const { u32, jsRef } = defineBasicTypes(env);
     const Ref = jsRef.constructor;
@@ -706,23 +706,39 @@ describe('Structure: js-value', function() {
     expect(uninitRef.$).to.be.undefined;
     expect(env.getJsValueCount()).to.equal(0);
 
-    // Uninitialized bytes colliding with an unrelated live handle must NEVER release that handle!
+    // Zig-written handle in Zig memory is cleanly released when JS overwrites it!
+    const zigWrittenDV = allocZigDV(0x3008, 4);
+    const zigHandle = env.allocJsValue(obj1);
+    zigWrittenDV.setUint32(0, zigHandle, env.littleEndian);
+    expect(env.getJsValueCount()).to.equal(1);
+    const zigWrittenRef = Ref(zigWrittenDV);
+    zigWrittenRef.$ = obj2;
+    expect(zigWrittenRef.$).to.equal(obj2);
+    expect(env.getJsValueCount()).to.equal(1);
+    zigWrittenRef.$ = undefined;
+    expect(env.getJsValueCount()).to.equal(0);
+
+    // ABA safety: stale handle left in Zig memory after Zig deinit (whose slot index was
+    // reused by another owner with generation + 1) must NOT release the new owner's handle!
+    const staleDV = allocZigDV(0x3010, 4);
+    const oldHandle = env.allocJsValue({ doomed: true });
+    staleDV.setUint32(0, oldHandle, env.littleEndian);
+    env.releaseJsValue(oldHandle);
     const innocentObj = { keepAlive: true };
-    const innocentHandle = env.allocJsValue(innocentObj);
-    expect(env.getJsValueCount()).to.equal(1);
+    const reusedSlotHandle = env.allocJsValue(innocentObj);
+    expect(reusedSlotHandle & 0xFFFFF).to.equal(oldHandle & 0xFFFFF);
+    expect(reusedSlotHandle).to.not.equal(oldHandle);
 
-    const collisionDV = allocZigDV(0x3010, 4);
-    collisionDV.setUint32(0, innocentHandle, env.littleEndian);
-    const collisionRef = Ref(collisionDV);
-    collisionRef.$ = obj1;
+    const staleRef = Ref(staleDV);
+    staleRef.$ = obj1;
     expect(env.getJsValueCount()).to.equal(2);
-    expect(env.getJsValue(innocentHandle)).to.equal(innocentObj);
-    expect(collisionRef.$).to.equal(obj1);
+    expect(env.getJsValue(reusedSlotHandle)).to.equal(innocentObj);
+    expect(staleRef.$).to.equal(obj1);
 
-    collisionRef.$ = undefined;
+    staleRef.$ = undefined;
     expect(env.getJsValueCount()).to.equal(1);
-    expect(env.getJsValue(innocentHandle)).to.equal(innocentObj);
-    env.releaseJsValue(innocentHandle);
+    expect(env.getJsValue(reusedSlotHandle)).to.equal(innocentObj);
+    env.releaseJsValue(reusedSlotHandle);
     expect(env.getJsValueCount()).to.equal(0);
 
     // Uninitialized `Pair` filled with 0xaa overwritten from JS

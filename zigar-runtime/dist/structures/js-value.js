@@ -33,13 +33,11 @@ var jsValue = mixin({
           delete this[TARGET];
         }
         if (inZigMemory && !thisEnv.writingUninitZig) {
-          thisEnv.releaseZigOwnedHandleAt(dv, 0);
+          const prevHandle = getHandle.call(this) >>> 0;
+          thisEnv.releaseJsValueIfValid(prevHandle);
         }
         const handle = thisEnv.allocJsValue(value);
         setHandle.call(this, handle);
-        if (inZigMemory && !thisEnv.writingUninitZig) {
-          thisEnv.recordZigOwnedHandleAt(dv, 0, handle);
-        }
       } else {
         this[TARGET] = value;
         setHandle.call(this, 0);

@@ -38,7 +38,6 @@ function initRegistryState(env) {
   env.jsValueActiveCount = 0;
   env.pendingJsHandles = null;
   env.writingUninitZig = false;
-  env.zigJsOwnedSlots = new Map();
 }
 
 var jsValueRegistry = mixin({
@@ -166,31 +165,9 @@ var jsValueRegistry = mixin({
     return (slot >= FIRST_DYNAMIC_SLOT && slot < this.jsValueNextSlot && gen !== 0
       && this.jsValueGenerations[slot] === (ACTIVE_BIT | gen));
   },
-  releaseZigOwnedHandleAt(dv, base = 0) {
-    const zig = dv?.[ZIG];
-    if (!zig || zig.address === undefined || this.zigJsOwnedSlots.size === 0) {
-      return;
-    }
-    const key = BigInt(zig.address) + BigInt(base);
-    const trackedHandle = this.zigJsOwnedSlots.get(key);
-    if (trackedHandle !== undefined) {
-      this.zigJsOwnedSlots.delete(key);
-      const memHandle = dv.getUint32(base, this.littleEndian) >>> 0;
-      if (memHandle === trackedHandle && this.isValidJsValueHandle(trackedHandle)) {
-        this.releaseJsValue(trackedHandle);
-      }
-    }
-  },
-  recordZigOwnedHandleAt(dv, base, handle) {
-    const zig = dv?.[ZIG];
-    if (!zig || zig.address === undefined) {
-      return;
-    }
-    const key = BigInt(zig.address) + BigInt(base);
-    if ((handle >>> 0) >= FIRST_DYNAMIC_SLOT) {
-      this.zigJsOwnedSlots.set(key, handle >>> 0);
-    } else {
-      this.zigJsOwnedSlots.delete(key);
+  releaseJsValueIfValid(handle) {
+    if (this.isValidJsValueHandle(handle)) {
+      this.releaseJsValue(handle >>> 0);
     }
   },
   consumeJsValueObject(refObj) {
@@ -268,27 +245,85 @@ var jsValueRegistry = mixin({
     }
   },
   releaseZigJsValues(structure, dv, offset = 0) {
-    if (!dv?.[ZIG] || this.writingUninitZig || this.zigJsOwnedSlots.size === 0 || !hasJsValue(structure)) {
+    if (!dv?.[ZIG] || this.writingUninitZig || this.jsValueActiveCount === 0 || !hasJsValue(structure)) {
       return;
     }
     if (this.restoreView) {
       dv = this.restoreView(dv);
     }
-    const byteSize = structure.byteSize ?? 0;
-    const startAddr = BigInt(dv[ZIG].address) + BigInt(offset);
-    const endAddr = startAddr + BigInt(byteSize);
-    for (const [ key, trackedHandle ] of this.zigJsOwnedSlots) {
-      if (key >= startAddr && key < endAddr) {
-        this.zigJsOwnedSlots.delete(key);
-        const relOffset = offset + Number(key - startAddr);
-        if (relOffset >= 0 && relOffset + 4 <= dv.byteLength) {
-          const memHandle = dv.getUint32(relOffset, this.littleEndian) >>> 0;
-          if (memHandle === trackedHandle && this.isValidJsValueHandle(trackedHandle)) {
-            this.releaseJsValue(trackedHandle);
+    const le = this.littleEndian;
+    const visit = (s, base) => {
+      if (s.purpose === StructurePurpose.JsValue) {
+        const handle = dv.getUint32(base, le) >>> 0;
+        this.releaseJsValueIfValid(handle);
+        return;
+      }
+      switch (s.type) {
+        case StructureType.Struct: {
+          for (const m of s.instance.members) {
+            if (m.type === MemberType.Object && m.bitOffset !== undefined && hasJsValue(m.structure)) {
+              visit(m.structure, base + (m.bitOffset >> 3));
+            }
           }
+          break;
+        }
+        case StructureType.Array: {
+          const [ elem ] = s.instance.members;
+          if (hasJsValue(elem.structure)) {
+            for (let i = 0; i < s.length; i++) {
+              visit(elem.structure, base + i * elem.byteSize);
+            }
+          }
+          break;
+        }
+        case StructureType.Optional: {
+          const [ valMember, presentMember ] = s.instance.members;
+          if (hasJsValue(valMember.structure)) {
+            const presentOffset = base + (presentMember.bitOffset >> 3);
+            const isPresent = (presentMember.bitSize === 1)
+              ? (dv.getUint8(presentOffset) === 1)
+              : isNonZeroBytes(dv, presentOffset, presentMember.byteSize);
+            if (isPresent) {
+              visit(valMember.structure, base + (valMember.bitOffset >> 3));
+            }
+          }
+          break;
+        }
+        case StructureType.ErrorUnion: {
+          const [ valMember, errMember ] = s.instance.members;
+          if (hasJsValue(valMember.structure)
+            && !isNonZeroBytes(dv, base + (errMember.bitOffset >> 3), errMember.byteSize)) {
+            visit(valMember.structure, base + (valMember.bitOffset >> 3));
+          }
+          break;
+        }
+        case StructureType.Union: {
+          if (s.flags & UnionFlag.HasSelector) {
+            const members = s.instance.members;
+            let activeMember;
+            if (s.flags & UnionFlag.HasTag) {
+              let activeName;
+              try {
+                const subDV = new DataView(dv.buffer, dv.byteOffset + base, s.byteSize);
+                const inst = s.constructor.call(ENVIRONMENT, subDV);
+                [ activeName ] = inst[PROPS];
+              } catch {}
+              activeMember = activeName && members.find(m => m.name === activeName);
+            } else {
+              const selMember = members[members.length - 1];
+              const idx = readUintBytes(dv, base + (selMember.bitOffset >> 3), selMember.byteSize, le);
+              activeMember = (idx < members.length - 1) ? members[idx] : undefined;
+            }
+            if (activeMember && activeMember.type === MemberType.Object
+              && activeMember.bitOffset !== undefined && hasJsValue(activeMember.structure)) {
+              visit(activeMember.structure, base + (activeMember.bitOffset >> 3));
+            }
+          }
+          break;
         }
       }
-    }
+    };
+    visit(structure, offset);
   },
   walkActiveJsValueLeaves(rootObj, structure, rootDV, callback) {
     const le = this.littleEndian;
