@@ -31,6 +31,7 @@ export const StructurePurpose = {
   GdImage: 11,
   JsValue: 12,
 };
+export const FIRST_DYNAMIC_JS_VALUE_SLOT = 8;
 export const structureNames = Object.keys(StructureType);
 export const StructureFlag = {
   HasValue: 1 << 0,

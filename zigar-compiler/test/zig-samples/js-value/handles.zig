@@ -25,6 +25,22 @@ pub const Error = error{
     Rejected,
 };
 
+pub const CallbackError = error{
+    Rejected,
+    Unexpected,
+};
+
+pub const RefWithUint = extern struct {
+    ref: Ref(js.Any),
+    num: u32,
+};
+
+pub var exported_ref: Ref(js.Any) = .@"null";
+pub var exported_pair: Pair = .{
+    .first = .@"null",
+    .second = .@"null",
+};
+
 var saved_ref: Ref(js.Object) = .@"null";
 
 pub fn activeCount() usize {
@@ -120,6 +136,17 @@ pub fn clearGlobal() void {
         saved_ref.deinit();
     }
     saved_ref = .@"null";
+    if (!exported_ref.isReserved()) {
+        exported_ref.deinit();
+    }
+    exported_ref = .@"null";
+    if (!exported_pair.first.isReserved()) {
+        exported_pair.first.deinit();
+    }
+    if (!exported_pair.second.isReserved()) {
+        exported_pair.second.deinit();
+    }
+    exported_pair = .{ .first = .@"null", .second = .@"null" };
 }
 
 pub fn swapPair(pair: Pair) Pair {
@@ -166,6 +193,46 @@ pub fn callWithBorrowedRef(
     // Verify `val` was only borrowed by `cb` and remains valid until `defer val.deinit()`!
     if (val.typeof() != .object) unreachable;
     return out;
+}
+
+pub fn callWithBorrowedComposites(
+    first: Ref(js.Any),
+    second: Ref(js.Any),
+    cb: *const fn (Pair, [2]Ref(js.Any), TaggedValue) void,
+) void {
+    defer first.deinit();
+    defer second.deinit();
+    const pair: Pair = .{ .first = first, .second = second };
+    const arr: [2]Ref(js.Any) = .{ first, second };
+    const tagged: TaggedValue = .{ .js = first };
+    cb(pair, arr, tagged);
+}
+
+pub fn callFallibleCallback(
+    val: Ref(js.Object),
+    cb: *const fn (Ref(js.Object)) CallbackError!Ref(js.Any),
+) CallbackError!Ref(js.Any) {
+    defer val.deinit();
+    return try cb(val);
+}
+
+pub fn callStrictFallibleCallback(
+    cb: *const fn () Error!Ref(js.Any),
+) anyerror!Ref(js.Any) {
+    return try cb();
+}
+
+pub fn callFallibleCompositeCallback(
+    val: Ref(js.Object),
+    cb: *const fn (Ref(js.Object)) CallbackError!RefWithUint,
+) CallbackError!RefWithUint {
+    defer val.deinit();
+    return try cb(val);
+}
+
+pub fn takeRefAndUint(val: Ref(js.Any), num: u32) u32 {
+    defer val.deinit();
+    return num;
 }
 
 pub fn inspectRawHandle(val: Ref(js.Any)) u32 {

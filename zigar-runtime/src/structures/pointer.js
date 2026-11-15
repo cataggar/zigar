@@ -11,7 +11,7 @@ import {
   TYPED_ARRAY, UPDATE, VISIT, ZIG
 } from '../symbols.js';
 import {
-  defineValue, findElements, getSelf, isCompatibleInstanceOf, isCompatibleType, isInvalidUsize
+  defineValue, findElements, getSelf, hasJsValue, isCompatibleInstanceOf, isCompatibleType, isInvalidUsize
 } from '../utils.js';
 
 export default mixin({
@@ -22,6 +22,7 @@ export default mixin({
       instance: { members },
     } = structure;
     const { structure: targetStructure } = members[0];
+    const targetContainsJsValue = hasJsValue(targetStructure);
     const {
       type: targetType,
       flags: targetFlags,
@@ -194,6 +195,12 @@ export default mixin({
         if (targetProxyType === ProxyType.ReadOnly || arg[READ_ONLY]) {
           if (!(flags & PointerFlag.IsConst)) {
             throw new ReadOnlyTarget(structure);
+          }
+        }
+        if (targetContainsJsValue && !arg[MEMORY]?.[ZIG] && thisEnv.pendingJsHandles !== null) {
+          const autoObj = arg = new Target(arg, { allocator });
+          if (targetFlags & StructureFlag.HasProxy) {
+            arg = getProxyTarget(autoObj).target;
           }
         }
       } else if (isCompatibleInstanceOf(arg, Target)) {

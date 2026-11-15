@@ -71,18 +71,36 @@ var argStruct = mixin({
     for (const member of members) {
       descriptors[member.name] = this.defineMember(member);
     }
+    const retvalMember = members[0];
+    const retvalHasJsValue = hasJsValue(retvalMember?.structure);
     const retvalSetter = descriptors.retval.set;
     descriptors.length = defineValue(argMembers.length);
     if (flags & StructureFlag.HasObject) {
       descriptors[VIVIFICATE] = this.defineVivificatorStruct(structure);
       if (descriptors[VIVIFICATE]?.value) {
-        const retvalMember = members[0];
         descriptors[VIVIFICATE].value.retvalMember = retvalMember;
-        descriptors[VIVIFICATE].value.retvalHasJsValue = hasJsValue(retvalMember?.structure);
+        descriptors[VIVIFICATE].value.retvalHasJsValue = retvalHasJsValue;
       }
     }
     descriptors[VISIT] = (flags & StructureFlag.HasPointer) && this.defineVisitorArgStruct(members);
-    descriptors[RETURN] = defineValue(function(value) {
+    descriptors[RETURN] = defineValue(retvalHasJsValue ? function(value) {
+      const prevPending = thisEnv.pendingJsHandles;
+      const prevUninit = thisEnv.writingUninitZig;
+      const allocatedHandles = [];
+      thisEnv.pendingJsHandles = allocatedHandles;
+      thisEnv.writingUninitZig = true;
+      try {
+        retvalSetter.call(this, value, this[ALLOCATOR]);
+      } catch (err) {
+        for (const handle of allocatedHandles) {
+          thisEnv.releaseJsValue(handle);
+        }
+        throw err;
+      } finally {
+        thisEnv.pendingJsHandles = prevPending;
+        thisEnv.writingUninitZig = prevUninit;
+      }
+    } : function(value) {
       // pass allocator associated with argument to setter
       retvalSetter.call(this, value, this[ALLOCATOR]);
     });

@@ -3,7 +3,7 @@ import { mixin } from '../environment.js';
 import { ArrayLengthMismatch, InvalidArrayInitializer } from '../errors.js';
 import { getProxy } from '../proxies.js';
 import {
-  ENTRIES, FINALIZE, INITIALIZE, MEMORY, PROXY, PROXY_TYPE, SENTINEL, VISIT, VIVIFICATE, ZIG
+  ENTRIES, FINALIZE, INITIALIZE, PROXY, PROXY_TYPE, SENTINEL, VISIT, VIVIFICATE
 } from '../symbols.js';
 import {
   copyObject, defineValue, hasJsValue, isCompatibleInstanceOf, transformIterable
@@ -32,7 +32,7 @@ export default mixin({
     const { set } = descriptor;
     const constructor = this.createConstructor(structure);
     const initializer = this.createInitializer(function(arg, allocator) {
-      if (isCompatibleInstanceOf(arg, constructor) && (!containsJsValue || arg[MEMORY]?.[ZIG])) {
+      if (isCompatibleInstanceOf(arg, constructor) && !containsJsValue) {
         copyObject(this, arg);
         if (flags & StructureFlag.HasPointer) {
           this[VISIT]('copy', VisitorFlag.Vivificate, arg);

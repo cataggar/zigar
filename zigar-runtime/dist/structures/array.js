@@ -2,7 +2,7 @@ import { ArrayFlag, StructureFlag, VisitorFlag, ProxyType } from '../constants.j
 import { mixin } from '../environment.js';
 import { ArrayLengthMismatch, InvalidArrayInitializer } from '../errors.js';
 import { getProxy } from '../proxies.js';
-import { SENTINEL, MEMORY, ZIG, VISIT, ENTRIES, INITIALIZE, FINALIZE, VIVIFICATE, PROXY, PROXY_TYPE } from '../symbols.js';
+import { SENTINEL, VISIT, ENTRIES, INITIALIZE, FINALIZE, VIVIFICATE, PROXY, PROXY_TYPE } from '../symbols.js';
 import { defineValue, hasJsValue, isCompatibleInstanceOf, copyObject, transformIterable } from '../utils.js';
 
 var array = mixin({
@@ -18,7 +18,7 @@ var array = mixin({
     const { set } = descriptor;
     const constructor = this.createConstructor(structure);
     const initializer = this.createInitializer(function(arg, allocator) {
-      if (isCompatibleInstanceOf(arg, constructor) && (!containsJsValue || arg[MEMORY]?.[ZIG])) {
+      if (isCompatibleInstanceOf(arg, constructor) && !containsJsValue) {
         copyObject(this, arg);
         if (flags & StructureFlag.HasPointer) {
           this[VISIT]('copy', VisitorFlag.Vivificate, arg);

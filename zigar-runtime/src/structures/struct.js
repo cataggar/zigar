@@ -1,7 +1,7 @@
 import { MemberFlag, StructFlag, StructureFlag, StructurePurpose } from '../constants.js';
 import { mixin } from '../environment.js';
 import { InvalidInitializer } from '../errors.js';
-import { ENTRIES, INITIALIZE, KEYS, MEMORY, PROPS, SETTERS, VISIT, VIVIFICATE, ZIG } from '../symbols.js';
+import { ENTRIES, INITIALIZE, KEYS, PROPS, SETTERS, VISIT, VIVIFICATE } from '../symbols.js';
 import { copyObject, defineValue, getSelf, hasJsValue, isCompatibleInstanceOf } from '../utils.js';
 
 export default mixin({
@@ -26,10 +26,17 @@ export default mixin({
       } else if (purpose == StructurePurpose.Directory) {
         arg = thisEnv.createDirectory(arg);
       }
-      if (isCompatibleInstanceOf(arg, constructor) && (!containsJsValue || arg[MEMORY]?.[ZIG])) {
+      if (isCompatibleInstanceOf(arg, constructor) && !containsJsValue) {
         copyObject(this, arg);
         if (flags & StructureFlag.HasPointer) {
           this[VISIT]('copy', 0, arg);
+        }
+      } else if (isCompatibleInstanceOf(arg, constructor)) {
+        for (const name of keys) {
+          const set = setters[name];
+          if (!set.special) {
+            set.call(this, arg[name], allocator);
+          }
         }
       } else if (arg && typeof(arg) === 'object') {
         propApplier.call(this, arg, allocator);

@@ -7,7 +7,7 @@ import {
   VIVIFICATE
 } from '../symbols.js';
 import {
-  copyObject, copyView, defineValue, isCompatibleInstanceOf, transformIterable
+  copyObject, copyView, defineValue, hasJsValue, isCompatibleInstanceOf, transformIterable
 } from '../utils.js';
 
 export default mixin({
@@ -19,6 +19,7 @@ export default mixin({
         members: [ member ],
       },
     } = structure;
+    const containsJsValue = hasJsValue(structure);
     /* c8 ignore start */
     if (process.env.DEV) {
       if (member.bitOffset !== undefined) {
@@ -49,7 +50,7 @@ export default mixin({
     // constructor or by a member setter (i.e. after object's shape has been established)
     const propApplier = this.createApplier(structure);
     const initializer = this.createInitializer(function(arg, allocator) {
-      if (isCompatibleInstanceOf(arg, constructor)) {
+      if (isCompatibleInstanceOf(arg, constructor) && !containsJsValue) {
         if (!this[MEMORY]) {
           shapeDefiner.call(this, null, arg.length, allocator);
         } else {

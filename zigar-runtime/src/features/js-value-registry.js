@@ -1,7 +1,7 @@
-import { MemberType, StructurePurpose, StructureType, UnionFlag } from '../constants.js';
+import { FIRST_DYNAMIC_JS_VALUE_SLOT, MemberType, StructurePurpose, StructureType, UnionFlag } from '../constants.js';
 import { mixin } from '../environment.js';
 import { InvalidJsValueHandle } from '../errors.js';
-import { MEMORY, PROPS, SLOTS, TARGET, VIVIFICATE } from '../symbols.js';
+import { ENVIRONMENT, MEMORY, PROPS, SLOTS, TARGET, VIVIFICATE, ZIG } from '../symbols.js';
 import { hasJsValue } from '../utils.js';
 
 export const RESERVED_UNDEFINED = 0;
@@ -9,7 +9,7 @@ export const RESERVED_NULL = 1;
 export const RESERVED_FALSE = 2;
 export const RESERVED_TRUE = 3;
 export const RESERVED_GLOBAL_THIS = 4;
-export const FIRST_DYNAMIC_SLOT = 8;
+export const FIRST_DYNAMIC_SLOT = FIRST_DYNAMIC_JS_VALUE_SLOT;
 
 const SLOT_MASK = 0x000FFFFF;
 const GEN_SHIFT = 20;
@@ -37,6 +37,7 @@ function initRegistryState(env) {
   env.jsValueNextSlot = FIRST_DYNAMIC_SLOT;
   env.jsValueActiveCount = 0;
   env.pendingJsHandles = null;
+  env.writingUninitZig = false;
 }
 
 export default mixin({
@@ -206,6 +207,14 @@ export default mixin({
           if (activeMember?.type === MemberType.Object) {
             this.consumeJsValueSlot(obj, activeMember.slot, activeMember.structure);
           }
+        } else if (structure.flags & UnionFlag.HasSelector) {
+          const members = structure.instance.members;
+          const selMember = members[members.length - 1];
+          const idx = readUintBytes(obj[MEMORY], selMember.bitOffset >> 3, selMember.byteSize, this.littleEndian);
+          const activeMember = members[idx];
+          if (activeMember?.type === MemberType.Object) {
+            this.consumeJsValueSlot(obj, activeMember.slot, activeMember.structure);
+          }
         }
         break;
       }
@@ -219,6 +228,77 @@ export default mixin({
         break;
       }
     }
+  },
+  releaseZigJsValues(structure, dv, offset = 0) {
+    if (!dv?.[ZIG] || this.writingUninitZig || !hasJsValue(structure)) {
+      return;
+    }
+    const le = this.littleEndian;
+    const visit = (s, base) => {
+      if (s.purpose === StructurePurpose.JsValue) {
+        const handle = dv.getUint32(base, le);
+        if (handle >= FIRST_DYNAMIC_SLOT) {
+          this.releaseJsValue(handle);
+        }
+        return;
+      }
+      switch (s.type) {
+        case StructureType.Struct: {
+          for (const m of s.instance.members) {
+            if (m.type === MemberType.Object && m.bitOffset !== undefined && hasJsValue(m.structure)) {
+              visit(m.structure, base + (m.bitOffset >> 3));
+            }
+          }
+          break;
+        }
+        case StructureType.Array: {
+          const [ elem ] = s.instance.members;
+          if (hasJsValue(elem.structure)) {
+            for (let i = 0; i < s.length; i++) {
+              visit(elem.structure, base + i * elem.byteSize);
+            }
+          }
+          break;
+        }
+        case StructureType.Optional: {
+          const [ valMember, presentMember ] = s.instance.members;
+          if (hasJsValue(valMember.structure)
+            && isNonZeroBytes(dv, base + (presentMember.bitOffset >> 3), presentMember.byteSize)) {
+            visit(valMember.structure, base + (valMember.bitOffset >> 3));
+          }
+          break;
+        }
+        case StructureType.ErrorUnion: {
+          const [ valMember, errMember ] = s.instance.members;
+          if (hasJsValue(valMember.structure)
+            && !isNonZeroBytes(dv, base + (errMember.bitOffset >> 3), errMember.byteSize)) {
+            visit(valMember.structure, base + (valMember.bitOffset >> 3));
+          }
+          break;
+        }
+        case StructureType.Union: {
+          if (s.flags & UnionFlag.HasSelector) {
+            const members = s.instance.members;
+            let activeMember;
+            if (s.flags & UnionFlag.HasTag) {
+              const subDV = new DataView(dv.buffer, dv.byteOffset + base, s.byteSize);
+              const inst = s.constructor.call(ENVIRONMENT, subDV);
+              const [ activeName ] = inst[PROPS];
+              activeMember = members.find(m => m.name === activeName);
+            } else {
+              const selMember = members[members.length - 1];
+              const idx = readUintBytes(dv, base + (selMember.bitOffset >> 3), selMember.byteSize, le);
+              activeMember = members[idx];
+            }
+            if (activeMember && activeMember.type === MemberType.Object && hasJsValue(activeMember.structure)) {
+              visit(activeMember.structure, base + (activeMember.bitOffset >> 3));
+            }
+          }
+          break;
+        }
+      }
+    };
+    visit(structure, offset);
   },
   consumeJsValueRetval(argStruct) {
     const retvalMember = argStruct?.[VIVIFICATE]?.retvalMember;
@@ -245,4 +325,14 @@ function isNonZeroBytes(dv, byteOffset, byteSize) {
     }
   }
   return false;
+}
+
+function readUintBytes(dv, byteOffset, byteSize, littleEndian) {
+  let value = 0;
+  for (let i = 0; i < byteSize; i++) {
+    const byte = dv.getUint8(byteOffset + i);
+    const shift = (littleEndian ? i : (byteSize - 1 - i)) * 8;
+    value |= byte << shift;
+  }
+  return value >>> 0;
 }

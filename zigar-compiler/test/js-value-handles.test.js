@@ -310,6 +310,160 @@ describe('JsValue Handle Registry & zigar.js.Ref(T) End-to-End Integration', fun
         mod.clearGlobal();
         expect(Number(mod.activeCount())).to.equal(0);
       });
+
+      it('should not leak handles for JS-memory instances, reassignments, or exported Zig variable mutations', function() {
+        const obj1 = { id: 'one' };
+        const obj2 = { id: 'two' };
+        const obj3 = new CustomWidget('three');
+
+        // Constructing and mutating standalone JS-memory instances allocates 0 dynamic slots
+        const jsPair = new mod.Pair({ first: obj1, second: obj2 });
+        expect(Number(mod.activeCount())).to.equal(0);
+        expect(Object.is(jsPair.first, obj1)).to.be.true;
+        expect(Object.is(jsPair.second, obj2)).to.be.true;
+
+        jsPair.first = obj3;
+        expect(Number(mod.activeCount())).to.equal(0);
+        expect(Object.is(jsPair.first, obj3)).to.be.true;
+
+        const swapped = mod.swapPair(jsPair);
+        expect(Object.is(swapped.first, obj2)).to.be.true;
+        expect(Object.is(swapped.second, obj3)).to.be.true;
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        const jsTagged = new mod.TaggedValue({ js: obj1 });
+        expect(Number(mod.activeCount())).to.equal(0);
+        expect(Object.is(jsTagged.js, obj1)).to.be.true;
+
+        // Mutating exported Zig `pub var` handles replaces & releases prior dynamic handles cleanly
+        mod.default.exported_ref = obj1;
+        expect(Number(mod.activeCount())).to.equal(1);
+        expect(Object.is(mod.default.exported_ref, obj1)).to.be.true;
+
+        mod.default.exported_ref = obj2;
+        expect(Number(mod.activeCount())).to.equal(1);
+        expect(Object.is(mod.default.exported_ref, obj2)).to.be.true;
+
+        mod.default.exported_ref = null;
+        expect(Number(mod.activeCount())).to.equal(0);
+        expect(mod.default.exported_ref).to.be.null;
+
+        mod.default.exported_pair = { first: obj1, second: obj2 };
+        expect(Number(mod.activeCount())).to.equal(2);
+        mod.default.exported_pair.first = obj3;
+        expect(Number(mod.activeCount())).to.equal(2);
+        expect(Object.is(mod.default.exported_pair.first, obj3)).to.be.true;
+        expect(Object.is(mod.default.exported_pair.second, obj2)).to.be.true;
+
+        mod.default.exported_pair = { first: null, second: undefined };
+        expect(Number(mod.activeCount())).to.equal(0);
+      });
+
+      it('should keep composite callback arguments valid after Zig deinit and slot generation wraparound', async function() {
+        const objA = new CustomWidget('retained-A');
+        const objB = { kind: 'retained-B' };
+        let savedPair;
+        let savedArr;
+        let savedTagged;
+
+        await mod.callWithBorrowedComposites(objA, objB, (pair, arr, tagged) => {
+          savedPair = pair;
+          savedArr = arr;
+          savedTagged = tagged;
+          expect(Number(mod.activeCount())).to.equal(2);
+        });
+
+        // Zig has already run `defer first.deinit(); defer second.deinit();`
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        // Churn >4,096 slot allocations/releases to wrap the 12-bit generation counter
+        for (let i = 0; i < 4100; i++) {
+          mod.inspectRawHandle({ churn: i });
+        }
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        // Saved JS-memory composites must still resolve the exact original JS objects!
+        expect(Object.is(savedPair.first, objA)).to.be.true;
+        expect(Object.is(savedPair.second, objB)).to.be.true;
+        expect(Object.is(savedArr[0], objA)).to.be.true;
+        expect(Object.is(savedArr[1], objB)).to.be.true;
+        expect(Object.is(savedTagged.js, objA)).to.be.true;
+        expect(Number(mod.activeCount())).to.equal(0);
+      });
+
+      it('should propagate JS callback exceptions on E!Ref(T) as Zig errors and clean up failed marshaling handles', async function() {
+        const inputObj = new CustomWidget('fallible-input');
+        const outputObj = { ok: true };
+
+        // Success path on E!Ref(T)
+        const ok = await mod.callFallibleCallback(inputObj, (arg) => {
+          expect(Object.is(arg, inputObj)).to.be.true;
+          return outputObj;
+        });
+        expect(Object.is(ok, outputObj)).to.be.true;
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        // Matching Zig error thrown from JS callback (`Error('Rejected')`) -> Zig error, NOT Ref(Error)!
+        let caughtRejected;
+        try {
+          await mod.callFallibleCallback(inputObj, () => {
+            throw new Error('Rejected');
+          });
+        } catch (err) {
+          caughtRejected = err;
+        }
+        expect(caughtRejected).to.be.an('error');
+        expect(caughtRejected.message).to.match(/Rejected/);
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        // Arbitrary JS TypeError thrown from callback -> maps to `Unexpected` on CallbackError!Ref(Any)
+        let caughtUnexpected;
+        try {
+          await mod.callFallibleCallback(inputObj, () => {
+            throw new TypeError('boom');
+          });
+        } catch (err) {
+          caughtUnexpected = err;
+        }
+        expect(caughtUnexpected).to.be.an('error');
+        expect(caughtUnexpected.message).to.match(/Unexpected/);
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        // Unmatched TypeError on strict Error!Ref(Any) (without Unexpected) fails thunk cleanly & leaks 0 handles
+        const origConsoleError = console.error;
+        console.error = () => {};
+        try {
+          let strictErr;
+          try {
+            await mod.callStrictFallibleCallback(() => {
+              throw new TypeError('strict-boom');
+            });
+          } catch (err) {
+            strictErr = err;
+          }
+          expect(strictErr).to.be.an('error');
+          expect(Number(mod.activeCount())).to.equal(0);
+
+          // Partial composite callback return (`ref` succeeds, `num` fails) rolls back `ref` handle!
+          let compositeRetErr;
+          try {
+            await mod.callFallibleCompositeCallback(inputObj, () => ({
+              ref: { shouldBeRolledBack: true },
+              num: 'invalid-uint',
+            }));
+          } catch (err) {
+            compositeRetErr = err;
+          }
+          expect(compositeRetErr).to.be.an('error');
+          expect(Number(mod.activeCount())).to.equal(0);
+        } finally {
+          console.error = origConsoleError;
+        }
+
+        // Failed multi-arg outbound call (`arg 0` allocates handle, `arg 1` fails u32 conversion) leaks 0 handles!
+        expect(() => mod.takeRefAndUint({ outboundRollback: true }, 'not-a-uint')).to.throw(Error);
+        expect(Number(mod.activeCount())).to.equal(0);
+      });
     });
   }
 

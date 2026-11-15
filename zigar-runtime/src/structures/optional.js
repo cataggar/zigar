@@ -1,6 +1,6 @@
 import { MemberType, OptionalFlag, StructureFlag, VisitorFlag } from '../constants.js';
 import { mixin } from '../environment.js';
-import { INITIALIZE, MEMORY, VISIT, VIVIFICATE, ZIG } from '../symbols.js';
+import { INITIALIZE, MEMORY, SLOTS, VISIT, VIVIFICATE, ZIG } from '../symbols.js';
 import { clearView, copyObject, defineValue, hasJsValue, isCompatibleInstanceOf } from '../utils.js';
 
 export default mixin({
@@ -10,6 +10,7 @@ export default mixin({
       flags,
     } = structure;
     const containsJsValue = hasJsValue(structure);
+    const thisEnv = this;
     const { get: getValue, set: setValue } = this.defineMember(valueMember);
     const { get: getPresent, set: setPresent } = this.defineMember(presentMember);
     const get = function() {
@@ -22,9 +23,36 @@ export default mixin({
       }
     };
     const isValueVoid = valueMember.type === MemberType.Void;
-    const { bitOffset, byteSize } = valueMember;
+    const { bitOffset, byteSize, slot: valueSlot } = valueMember;
+    const assignPresentValue = function(val, allocator) {
+      if (containsJsValue && this[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig && !getPresent.call(this)) {
+        const prevUninit = thisEnv.writingUninitZig;
+        thisEnv.writingUninitZig = true;
+        try {
+          setValue.call(this, val, allocator);
+        } finally {
+          thisEnv.writingUninitZig = prevUninit;
+        }
+      } else {
+        setValue.call(this, val, allocator);
+      }
+    };
+    const clearPresentValue = function() {
+      if (containsJsValue) {
+        if (this[MEMORY]?.[ZIG] && !thisEnv.writingUninitZig && getPresent.call(this)) {
+          thisEnv.releaseZigJsValues(valueMember.structure, this[MEMORY], bitOffset >> 3);
+        }
+        if (this[SLOTS] && valueSlot !== undefined) {
+          delete this[SLOTS][valueSlot];
+        }
+      }
+      setPresent.call(this, 0);
+      if (flags & OptionalFlag.HasSelector) {
+        clearView(this[MEMORY], bitOffset >> 3, byteSize);
+      }
+    };
     const initializer = this.createInitializer(function(arg, allocator) {
-      if (isCompatibleInstanceOf(arg, constructor) && (!containsJsValue || arg[MEMORY]?.[ZIG])) {
+      if (isCompatibleInstanceOf(arg, constructor) && !containsJsValue) {
         copyObject(this, arg);
         if (flags & StructureFlag.HasPointer) {
           // don't bother copying pointers when it's empty
@@ -34,26 +62,20 @@ export default mixin({
         }
       } else if (isCompatibleInstanceOf(arg, constructor)) {
         if (getPresent.call(arg)) {
-          setValue.call(this, getValue.call(arg), allocator);
+          assignPresentValue.call(this, getValue.call(arg), allocator);
           if (flags & OptionalFlag.HasSelector) {
             setPresent.call(this, 1);
           }
         } else {
-          setPresent.call(this, 0);
-          if (flags & OptionalFlag.HasSelector) {
-            clearView(this[MEMORY], bitOffset >> 3, byteSize);
-          }
+          clearPresentValue.call(this);
         }
       } else if (arg === null) {
-        setPresent.call(this, 0);
-        if (flags & OptionalFlag.HasSelector) {
-          clearView(this[MEMORY], bitOffset >> 3, byteSize);
-        }
+        clearPresentValue.call(this);
         // clear references so objects can be garbage-collected
         this[VISIT]?.('clear', VisitorFlag.IgnoreUncreated);
       } else if (arg !== undefined || isValueVoid) {
         // call setValue() first, in case it throws
-        setValue.call(this, arg, allocator);
+        assignPresentValue.call(this, arg, allocator);
         if (flags & OptionalFlag.HasSelector) {
           setPresent.call(this, 1);
         } else if (flags & StructureFlag.HasPointer) {

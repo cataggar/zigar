@@ -2,8 +2,8 @@ import { PointerFlag, StructureType, SliceFlag, StructureFlag, ProxyType } from 
 import { mixin } from '../environment.js';
 import { NoCastingToPointer, throwReadOnly, ConstantConstraint, ReadOnlyTarget, InvalidPointerTarget, PreviouslyFreed, NullPointer, InvalidSliceLength, ZigMemoryTargetRequired } from '../errors.js';
 import { getProxyType, getProxyTarget, getProxy } from '../proxies.js';
-import { CAST, ENVIRONMENT, PARENT, LAST_LENGTH, SLOTS, MEMORY, TYPE, TARGET, RESTORE, READ_ONLY, SETTERS, TYPED_ARRAY, ZIG, INITIALIZE, FINALIZE, PROXY, PROXY_TYPE, UPDATE, ADDRESS, LENGTH, VISIT, LAST_ADDRESS, MAX_LENGTH, SENTINEL, SIZE } from '../symbols.js';
-import { defineValue, isCompatibleInstanceOf, isInvalidUsize, getSelf, isCompatibleType, findElements } from '../utils.js';
+import { CAST, ENVIRONMENT, PARENT, LAST_LENGTH, SLOTS, MEMORY, TYPE, TARGET, RESTORE, READ_ONLY, ZIG, SETTERS, TYPED_ARRAY, INITIALIZE, FINALIZE, PROXY, PROXY_TYPE, UPDATE, ADDRESS, LENGTH, VISIT, LAST_ADDRESS, MAX_LENGTH, SENTINEL, SIZE } from '../symbols.js';
+import { defineValue, hasJsValue, isCompatibleInstanceOf, isInvalidUsize, getSelf, isCompatibleType, findElements } from '../utils.js';
 
 var pointer = mixin({
   definePointer(structure, descriptors) {
@@ -13,6 +13,7 @@ var pointer = mixin({
       instance: { members },
     } = structure;
     const { structure: targetStructure } = members[0];
+    const targetContainsJsValue = hasJsValue(targetStructure);
     const {
       type: targetType,
       flags: targetFlags,
@@ -185,6 +186,12 @@ var pointer = mixin({
         if (targetProxyType === ProxyType.ReadOnly || arg[READ_ONLY]) {
           if (!(flags & PointerFlag.IsConst)) {
             throw new ReadOnlyTarget(structure);
+          }
+        }
+        if (targetContainsJsValue && !arg[MEMORY]?.[ZIG] && thisEnv.pendingJsHandles !== null) {
+          const autoObj = arg = new Target(arg, { allocator });
+          if (targetFlags & StructureFlag.HasProxy) {
+            arg = getProxyTarget(autoObj).target;
           }
         }
       } else if (isCompatibleInstanceOf(arg, Target)) {

@@ -313,6 +313,7 @@ function hasJsValue(structure, seen = new Set()) {
     case StructureType.Optional:
     case StructureType.ErrorUnion:
     case StructureType.Array:
+    case StructureType.Slice:
       for (const member of structure.instance?.members ?? []) {
         if (member.type === MemberType.Object && hasJsValue(member.structure, seen)) {
           return true;
