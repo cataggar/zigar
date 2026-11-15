@@ -1299,4 +1299,121 @@ describe("Go Semantic Declaration-Graph Extractor (zigar:typescript/extractor@7.
       vfs.drop();
     }
   });
+
+  it("extracts named export default class/function/interface directly without bogus re-exports and handles dual default+named exports", () => {
+    const vfs = ts.createVfs(true);
+    try {
+      vfs.writeFile(
+        "/def-class.ts",
+        [
+          "export interface UsesK { k: K }",
+          "export default class K { x: number = 1 }",
+        ].join("\n"),
+      );
+      vfs.writeFile(
+        "/def-fn.ts",
+        "export default function f(): void {}\n",
+      );
+      vfs.writeFile(
+        "/def-iface.ts",
+        "export default interface I { y: string }\n",
+      );
+      vfs.writeFile(
+        "/def-both.ts",
+        [
+          "export default class Both { z: boolean = true }",
+          "export { Both };",
+        ].join("\n"),
+      );
+
+      const roots = ["/def-class.ts", "/def-fn.ts", "/def-iface.ts", "/def-both.ts"];
+      const progRes = ts.createProgram(vfs, roots, {
+        target: "es2024",
+        module: "esnext",
+        moduleResolution: "bundler",
+        strict: true,
+      });
+      assert.equal(progRes.ok, true);
+      const program = progRes.value;
+
+      try {
+        const res = ts.extractModuleGraph(program, {
+          rootFiles: roots,
+          followReExports: true,
+          expandUtilityTypes: false,
+          includeJsdoc: false,
+          includePrivateMembers: false,
+        });
+        assert.equal(res.ok, true);
+        const g = res.value;
+
+        const getMod = (fp) => {
+          const m = g.modules.find((mod) => g.str(mod.filePath) === fp);
+          assert.ok(m, `Expected module ${fp}`);
+          return m;
+        };
+
+        // 1. `export default class K` -> `defaultExport` points directly to `class-decl` (`name = "K"`, `exportName = "default"`), zero `re-export-decl`, `"K"` NOT in `exports`!
+        const clsMod = getMod("/def-class.ts");
+        assert.notEqual(clsMod.defaultExport, null);
+        const kDecl = g.decls[clsMod.defaultExport];
+        assert.equal(kDecl.kind.tag, "class-decl");
+        assert.equal(g.str(kDecl.name), "K");
+        assert.equal(g.str(kDecl.exportName), "default");
+        assert.deepEqual(
+          clsMod.exports.map((id) => g.str(g.decls[id].exportName)),
+          ["UsesK"],
+          "Must not leak 'K' into named exports or emit bogus re-export-decl",
+        );
+        assert.equal(
+          g.decls.filter((d) => d.module === clsMod.id && d.kind.tag === "re-export-decl").length,
+          0,
+        );
+
+        // 2. `export default function f` -> `defaultExport` points directly to `function-decl` (`name = "f"`, `exportName = "default"`)
+        const fnMod = getMod("/def-fn.ts");
+        assert.notEqual(fnMod.defaultExport, null);
+        const fDecl = g.decls[fnMod.defaultExport];
+        assert.equal(fDecl.kind.tag, "function-decl");
+        assert.equal(g.str(fDecl.name), "f");
+        assert.equal(g.str(fDecl.exportName), "default");
+        assert.equal(fnMod.exports.length, 0);
+        assert.equal(
+          g.decls.filter((d) => d.module === fnMod.id && d.kind.tag === "re-export-decl").length,
+          0,
+        );
+
+        // 3. `export default interface I` -> `defaultExport` points directly to `interface-decl` (`name = "I"`, `exportName = "default"`)
+        const ifMod = getMod("/def-iface.ts");
+        assert.notEqual(ifMod.defaultExport, null);
+        const iDecl = g.decls[ifMod.defaultExport];
+        assert.equal(iDecl.kind.tag, "interface-decl");
+        assert.equal(g.str(iDecl.name), "I");
+        assert.equal(g.str(iDecl.exportName), "default");
+        assert.equal(ifMod.exports.length, 0);
+        assert.equal(
+          g.decls.filter((d) => d.module === ifMod.id && d.kind.tag === "re-export-decl").length,
+          0,
+        );
+
+        // 4. `export default class Both {}; export { Both };` -> exports BOTH `default` (direct `class-decl`) and `"Both"` (in `exports` targeting `Both`)!
+        const bothMod = getMod("/def-both.ts");
+        assert.notEqual(bothMod.defaultExport, null);
+        const bothDefDecl = g.decls[bothMod.defaultExport];
+        assert.equal(bothDefDecl.kind.tag, "class-decl");
+        assert.equal(g.str(bothDefDecl.name), "Both");
+        assert.equal(g.str(bothDefDecl.exportName), "default");
+        assert.equal(bothMod.exports.length, 1);
+        const bothNamedDecl = g.decls[bothMod.exports[0]];
+        assert.equal(g.str(bothNamedDecl.exportName), "Both");
+        assert.equal(bothNamedDecl.kind.tag, "re-export-decl");
+        assert.equal(bothNamedDecl.kind.val.targetDecl, bothDefDecl.id);
+        assert.equal(g.str(bothNamedDecl.kind.val.sourceName), "Both");
+      } finally {
+        program.drop();
+      }
+    } finally {
+      vfs.drop();
+    }
+  });
 });

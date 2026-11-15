@@ -170,12 +170,31 @@ func buildExportSymbolMap(exports []*ast.Symbol) map[string]*ast.Symbol {
 	return out
 }
 
+func symbolOwnIdentifierName(sym *ast.Symbol) string {
+	if sym == nil {
+		return ""
+	}
+	for _, d := range sym.Declarations() {
+		if d != nil && d.Name() != nil && d.Name().Text() != "" {
+			return d.Name().Text()
+		}
+	}
+	if sym.Name() != "default" && sym.Name() != "export=" {
+		return sym.Name()
+	}
+	return ""
+}
+
 func (b *graphBuilder) isSymbolExportedUnderOwnName(target *ast.Symbol, exportByName map[string]*ast.Symbol) bool {
 	target = b.canonicalSymbol(target)
-	if target == nil || exportByName == nil || target.Name() == "" {
+	if target == nil || exportByName == nil {
 		return false
 	}
-	ownExp, ok := exportByName[target.Name()]
+	ownName := symbolOwnIdentifierName(target)
+	if ownName == "" || ownName == "default" || ownName == "export=" {
+		return false
+	}
+	ownExp, ok := exportByName[ownName]
 	if !ok || ownExp == nil {
 		return false
 	}
@@ -484,7 +503,7 @@ func (b *graphBuilder) extractExportedSymbolWithSet(
 		return nil
 	}
 
-	targetOwnName := target.Name()
+	targetOwnName := symbolOwnIdentifierName(target)
 	canonicalExportedAsOwnName := hasDirectNamedExportModifier(target.Declarations()) ||
 		b.isSymbolExportedUnderOwnName(target, exportByName) ||
 		(sf != nil && !b.isSymbolDeclaredInFile(target, sf))
@@ -665,7 +684,7 @@ func (b *graphBuilder) extractSymbolCategoriesInternal(
 				b.decls[existingID].Modifiers |= zigar_typescript_types.ModifierFlags_ExportDecl
 				if setOwnExportName && isNone(b.decls[existingID].ExportName) {
 					declNameStr := b.strings.strings[b.decls[existingID].Name]
-					if declNameStr != "" {
+					if declNameStr != "" && declNameStr != "default" {
 						b.decls[existingID].ExportName = witTypes.Some(b.decls[existingID].Name)
 					}
 				}
@@ -676,8 +695,11 @@ func (b *graphBuilder) extractSymbolCategoriesInternal(
 
 		ownerMod := b.symbolOwnerModule(g.nodes, fallbackMod)
 		declName := sym.Name()
-		if len(g.nodes) > 0 && g.nodes[0].Name() != nil && g.nodes[0].Name().Text() != "" {
-			declName = g.nodes[0].Name().Text()
+		for _, n := range g.nodes {
+			if n != nil && n.Name() != nil && n.Name().Text() != "" {
+				declName = n.Name().Text()
+				break
+			}
 		}
 		mods := b.combineNodesModifiers(g.nodes, forceExportFlag)
 		if g.cat == declCatVariable && len(g.nodes) > 0 && ast.IsVarConst(g.nodes[0]) {
@@ -688,7 +710,11 @@ func (b *graphBuilder) extractSymbolCategoriesInternal(
 		}
 
 		exportNameOpt := witTypes.None[uint32]()
-		if (hasDirectNamedExportModifier(g.nodes) || (forceExportFlag && setOwnExportName)) && declName != "" {
+		if hasDirectNamedExportModifier(g.nodes) && declName != "" {
+			exportNameOpt = witTypes.Some(b.intern(declName))
+		} else if mods&zigar_typescript_types.ModifierFlags_DefaultExport != 0 {
+			exportNameOpt = witTypes.Some(b.intern("default"))
+		} else if forceExportFlag && setOwnExportName && declName != "" {
 			exportNameOpt = witTypes.Some(b.intern(declName))
 		}
 
