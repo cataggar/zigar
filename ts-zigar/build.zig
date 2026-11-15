@@ -212,6 +212,7 @@ pub fn build(b: *std.Build) void {
         "node",
         "--test",
         "component/test/component.test.mjs",
+        "component/test/extractor.test.mjs",
     });
     run_node_comp_tests.setCwd(b.path(""));
     run_node_comp_tests.step.dependOn(&build_component_cmd.step);
