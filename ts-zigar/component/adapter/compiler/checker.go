@@ -56,11 +56,17 @@ func (self *Checker) TypeToString(fileName string, offset uint32) witTypes.Optio
 }
 
 func (self *Checker) InspectTypeAt(fileName string, offset uint32) witTypes.Option[zigar_typescript_compiler.TypeInfo] {
-	node, _, t := self.resolveAtOffset(fileName, offset)
+	node, sym, t := self.resolveAtOffset(fileName, offset)
 	if node == nil || t == nil {
 		return witTypes.None[zigar_typescript_compiler.TypeInfo]()
 	}
+	if t == self.tc.GetErrorType() && sym == nil {
+		return witTypes.None[zigar_typescript_compiler.TypeInfo]()
+	}
 	typeText := self.tc.TypeToStringEx(t, nil, defaultTypeFormatFlags, nil)
+	if typeText == "" {
+		return witTypes.None[zigar_typescript_compiler.TypeInfo]()
+	}
 	flags := uint32(t.Flags())
 	isUnion := t.IsUnion()
 	isIntersection := t.IsIntersection()
@@ -160,17 +166,27 @@ func (self *Checker) resolveAtOffset(fileName string, offset uint32) (*ast.Node,
 	if sf == nil {
 		return nil, nil, nil
 	}
-	if int(offset) > len(sf.Text()) {
+	text := sf.Text()
+	if int(offset) < 0 || int(offset) >= len(text) {
 		return nil, nil, nil
 	}
 
-	node := astnav.GetTouchingPropertyName(sf, int(offset))
-	if node == nil || ast.IsSourceFile(node) {
+	node := astnav.GetTouchingToken(sf, int(offset))
+	if node == nil ||
+		node.Kind == ast.KindEndOfFile ||
+		ast.IsSourceFile(node) ||
+		!ast.IsTokenKind(node.Kind) ||
+		node.Kind <= ast.KindLastTriviaToken ||
+		node.Kind == ast.KindJSDocCommentTextToken ||
+		ast.IsPunctuationKind(node.Kind) {
+		return nil, nil, nil
+	}
+	if ast.IsKeywordKind(node.Kind) && !ast.IsKeywordExpressionKind(node.Kind) && !ast.IsKeywordTypeKind(node.Kind) {
 		return nil, nil, nil
 	}
 
 	sym := self.tc.GetSymbolAtLocation(node)
-	if sym == nil && node.Parent != nil && ast.IsDeclaration(node.Parent) {
+	if sym == nil && node.Parent != nil && ast.IsDeclaration(node.Parent) && ast.GetNameOfDeclaration(node.Parent) == node {
 		sym = self.tc.GetSymbolOfDeclaration(node.Parent)
 	}
 
@@ -192,7 +208,11 @@ func (self *Checker) resolveAtOffset(fileName string, offset uint32) (*ast.Node,
 		}
 	}
 	if t == nil {
-		t = self.tc.GetTypeAtLocation(node)
+		typeNode := node
+		if node.Parent != nil && (node.Parent.Kind == ast.KindLiteralType || node.Parent.Kind == ast.KindThisType) {
+			typeNode = node.Parent
+		}
+		t = self.tc.GetTypeAtLocation(typeNode)
 	}
 	return node, sym, t
 }

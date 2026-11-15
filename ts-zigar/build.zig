@@ -183,6 +183,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_opt_comp_tests = b.addRunArtifact(opt_comp_tests);
     run_opt_comp_tests.setCwd(b.path(""));
+    run_opt_comp_tests.has_side_effects = true;
 
     // Dedicated strict component validation + Node.js 26 integration test step (`zig build test-component`)
     const req_comp_opts = b.addOptions();
@@ -204,6 +205,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_req_comp_tests = b.addRunArtifact(req_comp_tests);
     run_req_comp_tests.setCwd(b.path(""));
+    run_req_comp_tests.has_side_effects = true;
     run_req_comp_tests.step.dependOn(&build_component_cmd.step);
 
     const run_node_comp_tests = b.addSystemCommand(&.{

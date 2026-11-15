@@ -383,4 +383,93 @@ describe("TypeScript 7.1-next Go WASM Component (zigar:typescript@7.1.0)", () =>
       vfs.drop();
     }
   });
+
+  it("returns null on keywords, punctuation, trivia, and EOF while preserving literal types without leaking enclosing symbols", () => {
+    const vfs = ts.createVfs(true);
+    try {
+      const source = [
+        "// leading comment",
+        "export function greet(u: { name: string }) {",
+        '  return "hi " + u.name;',
+        "}",
+        "const z = 5;",
+      ].join("\n");
+
+      vfs.writeFile("/offsets.ts", source);
+      const progRes = ts.createProgram(vfs, ["/offsets.ts"], {
+        target: "es2024",
+        module: "esnext",
+        moduleResolution: "bundler",
+        strict: true,
+      });
+      assert.equal(progRes.ok, true);
+
+      const program = progRes.value;
+      try {
+        const checker = program.getChecker();
+        try {
+          const byteOffsetOf = (needle) => {
+            const idx = source.indexOf(needle);
+            assert.notEqual(idx, -1, `missing needle: ${needle}`);
+            return Buffer.byteLength(source.slice(0, idx), "utf8");
+          };
+
+          // Keywords, punctuation, trivia, EOF, and out-of-bounds must return null across all 3 methods
+          const nonSemanticPositions = [
+            ["comment trivia", byteOffsetOf("// leading")],
+            ["export keyword", byteOffsetOf("export function")],
+            ["space trivia", byteOffsetOf(" function greet")],
+            ["function keyword", byteOffsetOf("function greet")],
+            ["open paren right after greet", byteOffsetOf("(u:")],
+            ["function body open brace", byteOffsetOf("{\n  return")],
+            ["return keyword", byteOffsetOf("return ")],
+            ["EOF (offset == source.length)", Buffer.byteLength(source, "utf8")],
+            ["past EOF", Buffer.byteLength(source, "utf8") + 16],
+          ];
+
+          for (const [label, offset] of nonSemanticPositions) {
+            assert.equal(
+              checker.typeToString("/offsets.ts", offset),
+              null,
+              `typeToString should be null at ${label} (offset ${offset})`,
+            );
+            assert.equal(
+              checker.inspectTypeAt("/offsets.ts", offset),
+              null,
+              `inspectTypeAt should be null at ${label} (offset ${offset})`,
+            );
+            assert.equal(
+              checker.inspectSymbolAt("/offsets.ts", offset),
+              null,
+              `inspectSymbolAt should be null at ${label} (offset ${offset})`,
+            );
+          }
+
+          // Initializer literal `5` in `const z = 5;`:
+          // - `typeToString` and `inspectTypeAt` report literal/number type `5`
+          // - `inspectSymbolAt` returns `null` (must NOT leak enclosing declaration `z`)
+          const fiveOffset = byteOffsetOf("5;");
+          assert.equal(checker.typeToString("/offsets.ts", fiveOffset), "5");
+          const fiveType = checker.inspectTypeAt("/offsets.ts", fiveOffset);
+          assert.ok(fiveType, "inspectTypeAt on literal 5 should return type-info");
+          assert.equal(fiveType.typeText, "5");
+          assert.ok(fiveType.typeFlags > 0);
+          assert.equal(checker.inspectSymbolAt("/offsets.ts", fiveOffset), null);
+
+          // Declaration name `z` itself still resolves both symbol `z` and literal type `5`
+          const zOffset = byteOffsetOf("z = 5;");
+          assert.equal(checker.typeToString("/offsets.ts", zOffset), "5");
+          const zSym = checker.inspectSymbolAt("/offsets.ts", zOffset);
+          assert.ok(zSym, "inspectSymbolAt on declaration name z should return symbol-info");
+          assert.equal(zSym.name, "z");
+        } finally {
+          checker.drop();
+        }
+      } finally {
+        program.drop();
+      }
+    } finally {
+      vfs.drop();
+    }
+  });
 });
