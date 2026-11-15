@@ -417,6 +417,7 @@ func (b *graphBuilder) extractCheckerPropertySymbol(sym *ast.Symbol, containingT
 	var mods zigar_typescript_types.ModifierFlags
 	if firstDecl != nil {
 		mods = b.extractNodeModifiers(firstDecl, false)
+		mods &^= zigar_typescript_types.ModifierFlags_OptionalMod | zigar_typescript_types.ModifierFlags_ReadonlyMod
 	}
 	if sym.Flags()&ast.SymbolFlagsOptional != 0 {
 		mods |= zigar_typescript_types.ModifierFlags_OptionalMod

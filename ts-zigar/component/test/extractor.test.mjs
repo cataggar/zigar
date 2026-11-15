@@ -1118,4 +1118,185 @@ describe("Go Semantic Declaration-Graph Extractor (zigar:typescript/extractor@7.
       vfs.drop();
     }
   });
+
+  it("handles star re-exports of bare import re-exports, Required/Mutable mapped modifier removal, and export default of imported bindings with followReExports=false", () => {
+    const vfs = ts.createVfs(true);
+    try {
+      // 1. `/lib/c.ts` -> `/lib/b.ts` (`import { C } from './c'; export { C }`) -> `/a.ts` (`export * from './lib/b'`)
+      vfs.writeFile("/lib/c.ts", "export interface C { a: number }\n");
+      vfs.writeFile("/lib/b.ts", "import { C } from './c';\nexport { C };\n");
+      vfs.writeFile("/a.ts", "export * from './lib/b';\n");
+
+      // 2. `Required<S>` (`-?`) and `Mutable<S>` (`-readonly`) with `expandUtilityTypes: true`
+      vfs.writeFile(
+        "/mapped-mods.ts",
+        [
+          "export interface S { readonly ro?: string; readonly keepRo: number; opt?: boolean }",
+          "export type Req = Required<S>;",
+          "export type Mut = { -readonly [K in keyof S]: S[K] };",
+          "export type MutReq = { -readonly [K in keyof S]-?: S[K] };",
+        ].join("\n"),
+      );
+
+      // 3. `export default D` & `export default q` of imported bindings with `followReExports: false`
+      vfs.writeFile(
+        "/def-c.ts",
+        [
+          "export const q = 1;",
+          "export default class K { id = 0 }",
+        ].join("\n"),
+      );
+      vfs.writeFile(
+        "/def-a1.ts",
+        [
+          "import D from './def-c';",
+          "export default D;",
+        ].join("\n"),
+      );
+      vfs.writeFile(
+        "/def-a2.ts",
+        [
+          "import { q } from './def-c';",
+          "export default q;",
+        ].join("\n"),
+      );
+
+      const progRes = ts.createProgram(
+        vfs,
+        ["/a.ts", "/mapped-mods.ts", "/def-a1.ts", "/def-a2.ts"],
+        {
+          target: "es2024",
+          module: "esnext",
+          moduleResolution: "bundler",
+          strict: true,
+        },
+      );
+      assert.equal(progRes.ok, true);
+      const program = progRes.value;
+
+      try {
+        // Test 1 & 2 (`followReExports: true`, `expandUtilityTypes: true`)
+        const res = ts.extractModuleGraph(program, {
+          rootFiles: ["/a.ts", "/mapped-mods.ts"],
+          followReExports: true,
+          expandUtilityTypes: true,
+          includeJsdoc: false,
+          includePrivateMembers: false,
+        });
+        assert.equal(res.ok, true);
+        const g = res.value;
+
+        // Case 1: `/a.ts` must NOT emit a bogus `re-export-decl` with `moduleSpecifier: "./c"`!
+        const aMod = g.modules.find((m) => g.str(m.filePath) === "/a.ts");
+        assert.ok(aMod);
+        assert.equal(aMod.starReExports.length, 1);
+        for (const expId of aMod.exports) {
+          const d = g.decls[expId];
+          if (d.kind.tag === "re-export-decl") {
+            assert.notEqual(
+              g.str(d.kind.val.moduleSpecifier),
+              "./c",
+              "/a.ts must never inherit /lib/b.ts's relative './c' moduleSpecifier",
+            );
+          }
+        }
+        const cMod = g.modules.find((m) => g.str(m.filePath) === "/lib/c.ts");
+        assert.ok(cMod);
+        const cIface = findDecl(g, "C", "interface-decl", cMod.id);
+        assert.ok(cIface);
+        assert.ok(
+          aMod.exports.includes(cIface.id),
+          "Expected flattened star re-export in /a.ts to point directly to /lib/c.ts interface C",
+        );
+
+        const bMod = g.modules.find((m) => g.str(m.filePath) === "/lib/b.ts");
+        assert.ok(bMod);
+        const bExp = g.decls[bMod.exports[0]];
+        assert.equal(bExp.kind.tag, "re-export-decl");
+        assert.equal(g.str(bExp.kind.val.moduleSpecifier), "./c");
+        assert.equal(bExp.kind.val.targetDecl, cIface.id);
+
+        // Case 2: `Required<S>`, `Mutable<S>`, and `MutReq` clear `OptionalMod` / `ReadonlyMod`
+        const mappedMod = g.modules.find((m) => g.str(m.filePath) === "/mapped-mods.ts");
+        assert.ok(mappedMod);
+        const getResolvedProps = (aliasName) => {
+          const aliasDecl = findDecl(g, aliasName, "type-alias-decl", mappedMod.id);
+          assert.ok(aliasDecl);
+          const surfTy = g.types[aliasDecl.kind.val];
+          assert.notEqual(surfTy.resolvedType, null);
+          const resolvedTy = g.types[surfTy.resolvedType];
+          assert.equal(resolvedTy.kind.tag, "object-literal");
+          return new Map(
+            resolvedTy.kind.val.properties.map((pid) => [
+              g.str(g.properties[pid].name),
+              g.properties[pid],
+            ]),
+          );
+        };
+
+        const reqProps = getResolvedProps("Req");
+        assert.equal(reqProps.get("ro").modifiers & MODIFIER_FLAGS.optionalMod, 0, "Req.ro must clear OptionalMod");
+        assert.notEqual(reqProps.get("ro").modifiers & MODIFIER_FLAGS.readonlyMod, 0, "Req.ro must keep ReadonlyMod");
+        assert.equal(g.types[reqProps.get("ro").ty].kind.tag, "string-type");
+        assert.equal(reqProps.get("opt").modifiers & MODIFIER_FLAGS.optionalMod, 0, "Req.opt must clear OptionalMod");
+
+        const mutProps = getResolvedProps("Mut");
+        assert.equal(mutProps.get("ro").modifiers & MODIFIER_FLAGS.readonlyMod, 0, "Mut.ro must clear ReadonlyMod");
+        assert.notEqual(mutProps.get("ro").modifiers & MODIFIER_FLAGS.optionalMod, 0, "Mut.ro must keep OptionalMod");
+        assert.equal(mutProps.get("keepRo").modifiers & MODIFIER_FLAGS.readonlyMod, 0, "Mut.keepRo must clear ReadonlyMod");
+
+        const mutReqProps = getResolvedProps("MutReq");
+        assert.equal(mutReqProps.get("ro").modifiers & MODIFIER_FLAGS.readonlyMod, 0);
+        assert.equal(mutReqProps.get("ro").modifiers & MODIFIER_FLAGS.optionalMod, 0);
+
+        // Test 3: `export default D` and `export default q` with `followReExports: false`
+        const defRes = ts.extractModuleGraph(program, {
+          rootFiles: ["/def-a1.ts", "/def-a2.ts"],
+          followReExports: false,
+          expandUtilityTypes: false,
+          includeJsdoc: false,
+          includePrivateMembers: false,
+        });
+        assert.equal(defRes.ok, true);
+        const dg = defRes.value;
+
+        const a1Mod = dg.modules.find((m) => dg.str(m.filePath) === "/def-a1.ts");
+        assert.ok(a1Mod);
+        assert.notEqual(a1Mod.defaultExport, null);
+        const a1Def = dg.decls[a1Mod.defaultExport];
+        assert.equal(a1Def.module, a1Mod.id);
+        assert.equal(a1Def.kind.tag, "re-export-decl");
+        assert.equal(dg.str(a1Def.name), "default");
+        assert.equal(dg.str(a1Def.exportName), "default");
+        assert.equal(dg.str(a1Def.kind.val.moduleSpecifier), "./def-c");
+        assert.equal(dg.str(a1Def.kind.val.sourceName), "default");
+        assert.equal(a1Def.kind.val.targetDecl, null);
+
+        const a2Mod = dg.modules.find((m) => dg.str(m.filePath) === "/def-a2.ts");
+        assert.ok(a2Mod);
+        assert.notEqual(a2Mod.defaultExport, null);
+        const a2Def = dg.decls[a2Mod.defaultExport];
+        assert.equal(a2Def.module, a2Mod.id);
+        assert.equal(a2Def.kind.tag, "re-export-decl");
+        assert.equal(dg.str(a2Def.name), "default");
+        assert.equal(dg.str(a2Def.exportName), "default");
+        assert.equal(dg.str(a2Def.kind.val.moduleSpecifier), "./def-c");
+        assert.equal(dg.str(a2Def.kind.val.sourceName), "q");
+        assert.equal(dg.str(a2Def.kind.val.exportAlias), "default");
+        assert.equal(a2Def.kind.val.targetDecl, null);
+
+        const defCMod = dg.modules.find((m) => dg.str(m.filePath) === "/def-c.ts");
+        assert.ok(defCMod);
+        assert.equal(
+          defCMod.exports.length,
+          0,
+          "followReExports=false must not extract /def-c.ts exports",
+        );
+      } finally {
+        program.drop();
+      }
+    } finally {
+      vfs.drop();
+    }
+  });
 });

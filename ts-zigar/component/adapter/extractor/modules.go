@@ -442,8 +442,11 @@ func (b *graphBuilder) extractAmbientModuleDecls(sf *ast.SourceFile, modID uint3
 					}
 					if idOpt := b.extractExportAssignmentTarget(sf, modID, stmt, ea.Expression, label); isSome(idOpt) {
 						addDecl(idOpt.Some())
+						if label == "default" {
+							reExported["default"] = true
+						}
 						// Also surface any merged peers (e.g. `class EventEmitter` + `interface EventEmitter` + `namespace EventEmitter`).
-						if sym := b.resolveExpressionSymbol(ea.Expression); sym != nil {
+						if sym := b.resolveExpressionSymbol(ea.Expression); sym != nil && (b.cfg.FollowReExports || b.isSymbolDeclaredInFile(sym, sf)) {
 							for _, peerID := range b.extractSymbolAllCategories(sym, modID, true) {
 								addDecl(peerID)
 							}

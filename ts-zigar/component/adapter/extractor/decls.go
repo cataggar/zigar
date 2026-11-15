@@ -20,6 +20,17 @@ func (b *graphBuilder) extractExportAssignmentTarget(
 	if expr == nil {
 		return witTypes.None[uint32]()
 	}
+	if !b.cfg.FollowReExports {
+		rawSym := b.tc.GetSymbolAtLocation(expr)
+		if rawSym == nil {
+			rawSym = expr.Symbol()
+		}
+		if rawSym != nil && rawSym.Flags()&ast.SymbolFlagsAlias != 0 {
+			if reExpID, ok := b.extractAliasImportReExport(sf, modID, stmt, rawSym, fallbackName, rawSym); ok {
+				return witTypes.Some(reExpID)
+			}
+		}
+	}
 	if sym := b.resolveExpressionSymbol(expr); sym != nil {
 		setOwn := fallbackName != "default" || hasDirectNamedExportModifier(sym.Declarations())
 		if !setOwn && sf != nil {
@@ -233,8 +244,9 @@ func isAliasNodeTypeOnly(node *ast.Node) bool {
 }
 
 // tryExtractImportedReExport handles bare `export { X }` / `export { d as z }` / `export { ns }`
-// statements where the local binding was imported from another module (`import { X } from "./x"`,
+// statements in `sf` where the local binding was imported from another module (`import { X } from "./x"`,
 // `import * as ns from "./x"`, `import d from "./x"`, `import eq = require("./x")`).
+// It MUST NOT fire on star-re-exported symbols originating from another file (`exportSpecNode == nil`).
 func (b *graphBuilder) tryExtractImportedReExport(sf *ast.SourceFile, modID uint32, expSym *ast.Symbol) (uint32, bool) {
 	if expSym == nil || expSym.Flags()&ast.SymbolFlagsAlias == 0 {
 		return 0, false
@@ -243,17 +255,49 @@ func (b *graphBuilder) tryExtractImportedReExport(sf *ast.SourceFile, modID uint
 	var exportSpecNode *ast.Node
 	for _, d := range expSym.Declarations() {
 		if d != nil && d.Kind == ast.KindExportSpecifier && (sf == nil || ast.GetSourceFileOfNode(d) == sf) {
+			if ed := ast.FindAncestor(d, func(n *ast.Node) bool { return n.Kind == ast.KindExportDeclaration }); ed != nil {
+				if edNode := ed.AsExportDeclaration(); edNode != nil && edNode.ModuleSpecifier != nil {
+					continue
+				}
+			}
 			exportSpecNode = d
 			break
 		}
 	}
+	if exportSpecNode == nil {
+		return 0, false
+	}
 
-	cur := expSym
+	localSym := b.tc.GetImmediateAliasedSymbol(expSym)
+	if localSym == nil {
+		localSym = b.tc.GetExportSpecifierLocalTargetSymbol(exportSpecNode)
+	}
+	if localSym == nil || localSym == expSym {
+		return 0, false
+	}
+	return b.extractAliasImportReExport(sf, modID, exportSpecNode, localSym, expSym.Name(), expSym)
+}
+
+func (b *graphBuilder) extractAliasImportReExport(
+	sf *ast.SourceFile,
+	modID uint32,
+	exportNode *ast.Node,
+	startSym *ast.Symbol,
+	exportName string,
+	typeOnlySym *ast.Symbol,
+) (uint32, bool) {
+	cur := startSym
 	for hops := 0; hops < 16 && cur != nil && cur.Flags()&ast.SymbolFlagsAlias != 0; hops++ {
+		hasDeclInSF := false
 		for _, d := range cur.Declarations() {
 			if d == nil {
 				continue
 			}
+			if sf != nil && ast.GetSourceFileOfNode(d) != sf {
+				continue
+			}
+			hasDeclInSF = true
+
 			var specNode *ast.Node
 			var sourceName string
 			var isNamespace bool
@@ -286,11 +330,6 @@ func (b *graphBuilder) tryExtractImportedReExport(sf *ast.SourceFile, modID uint
 				}
 
 			case ast.KindImportEqualsDeclaration:
-				// Only treat non-directly-exported `import eq = require("...")` re-exported via `export { eq }` here;
-				// `export import eq = require("...")` is handled as `import-equals-decl` above.
-				if cur == expSym {
-					continue
-				}
 				ie := d.AsImportEqualsDeclaration()
 				if ie != nil && ie.ModuleReference != nil && ie.ModuleReference.Kind == ast.KindExternalModuleReference {
 					emr := ie.ModuleReference.AsExternalModuleReference()
@@ -315,25 +354,25 @@ func (b *graphBuilder) tryExtractImportedReExport(sf *ast.SourceFile, modID uint
 				}
 				targetDeclOpt := witTypes.None[uint32]()
 				if b.cfg.FollowReExports && !isNamespace {
-					resolved := b.canonicalSymbol(b.resolveAliasSymbol(expSym))
+					resolved := b.canonicalSymbol(b.resolveAliasSymbol(startSym))
 					if resolved != nil {
 						if ids := b.extractSymbolIfExtractable(resolved); len(ids) > 0 {
 							targetDeclOpt = witTypes.Some(ids[0])
 						}
 					}
 				}
-				isTypeOnly := b.tc.GetTypeOnlyAliasDeclaration(expSym) != nil ||
-					isAliasNodeTypeOnly(exportSpecNode) ||
+				isTypeOnly := (typeOnlySym != nil && b.tc.GetTypeOnlyAliasDeclaration(typeOnlySym) != nil) ||
+					isAliasNodeTypeOnly(exportNode) ||
 					isAliasNodeTypeOnly(d)
-				declID := b.makeReExportDecl(sf, modID, exportSpecNode, expSym.Name(), sourceName, specText, targetModOpt, targetDeclOpt, isTypeOnly)
+				declID := b.makeReExportDecl(sf, modID, exportNode, exportName, sourceName, specText, targetModOpt, targetDeclOpt, isTypeOnly)
 				return declID, true
 			}
 		}
 
-		next := b.tc.GetImmediateAliasedSymbol(cur)
-		if next == nil && exportSpecNode != nil && cur == expSym {
-			next = b.tc.GetExportSpecifierLocalTargetSymbol(exportSpecNode)
+		if !hasDeclInSF {
+			break
 		}
+		next := b.tc.GetImmediateAliasedSymbol(cur)
 		if next == nil || next == cur {
 			break
 		}
