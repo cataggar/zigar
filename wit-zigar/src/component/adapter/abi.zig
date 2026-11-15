@@ -311,10 +311,30 @@ fn resolveInstanceTypeExport(world_decls: []const ctypes.Decl, instance_idx: u32
 fn findInstanceBodyAtIdx(world_decls: []const ctypes.Decl, target: u32, depth: u32) ?[]const ctypes.Decl {
     var cursor: u32 = 0;
     for (world_decls) |d| switch (d) {
+        .alias => |al| switch (al) {
+            .outer => |o| if (o.sort == .instance) {
+                if (cursor == target) return null;
+                cursor += 1;
+            },
+            .instance_export => |ie| if (ie.sort == .instance) {
+                if (cursor == target) return null;
+                cursor += 1;
+            },
+        },
         .import => |im| {
             if (im.desc == .instance) {
                 if (cursor == target) {
                     const td = resolveOuterType(world_decls, im.desc.instance, depth + 1) orelse return null;
+                    if (td != .instance) return null;
+                    return td.instance.decls;
+                }
+                cursor += 1;
+            }
+        },
+        .@"export" => |ex| {
+            if (ex.desc == .instance) {
+                if (cursor == target) {
+                    const td = resolveOuterType(world_decls, ex.desc.instance, depth + 1) orelse return null;
                     if (td != .instance) return null;
                     return td.instance.decls;
                 }

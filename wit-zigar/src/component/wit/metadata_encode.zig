@@ -900,6 +900,15 @@ fn addImplicitImports(
     items.* = .empty;
 
     var seen = std.StringHashMapUnmanaged(void).empty;
+    var explicit_exports = std.StringHashMapUnmanaged(ast.WorldItem).empty;
+    for (original) |orig_it| {
+        if (orig_it == .@"export" and orig_it.@"export" == .interface_ref) {
+            const exp_qn = qualifiedName(ar, orig_it.@"export", ctx_pkg) catch return error.InvalidWit;
+            if (!explicit_exports.contains(exp_qn)) {
+                try explicit_exports.put(ar, exp_qn, orig_it);
+            }
+        }
+    }
 
     const Helper = struct {
         fn visit(
@@ -908,6 +917,7 @@ fn addImplicitImports(
             ctx: ast.PackageId,
             out: *std.ArrayList(ast.WorldItem),
             visited: *std.StringHashMapUnmanaged(void),
+            exp_map: *const std.StringHashMapUnmanaged(ast.WorldItem),
             item: ast.WorldItem,
             enc_gpa: Allocator,
             enc_diag: ?*EncodeDiagnostic,
@@ -949,6 +959,12 @@ fn addImplicitImports(
                     src_lookup.pkg.version,
                 );
                 if (visited.contains(src_qn)) continue;
+                if (item == .@"export") {
+                    if (exp_map.get(src_qn)) |sibling_exp| {
+                        try visit(arena, res, ctx, out, visited, exp_map, sibling_exp, enc_gpa, enc_diag, enc_world);
+                        continue;
+                    }
+                }
                 const synth: ast.WorldExtern = .{ .interface_ref = .{
                     .docs = "",
                     .ref = .{
@@ -960,7 +976,7 @@ fn addImplicitImports(
                         .name = u.from.name,
                     },
                 } };
-                try visit(arena, res, ctx, out, visited, .{ .import = synth }, enc_gpa, enc_diag, enc_world);
+                try visit(arena, res, ctx, out, visited, exp_map, .{ .import = synth }, enc_gpa, enc_diag, enc_world);
             }
             try out.append(arena, item);
         }
@@ -969,10 +985,10 @@ fn addImplicitImports(
     var non_exports = std.ArrayList(ast.WorldItem).empty;
     var exports_only = std.ArrayList(ast.WorldItem).empty;
     for (original) |it| {
-        if (it != .@"export") try Helper.visit(ar, resolver, ctx_pkg, &non_exports, &seen, it, gpa, diag, world_name);
+        if (it != .@"export") try Helper.visit(ar, resolver, ctx_pkg, &non_exports, &seen, &explicit_exports, it, gpa, diag, world_name);
     }
     for (original) |it| {
-        if (it == .@"export") try Helper.visit(ar, resolver, ctx_pkg, &exports_only, &seen, it, gpa, diag, world_name);
+        if (it == .@"export") try Helper.visit(ar, resolver, ctx_pkg, &exports_only, &seen, &explicit_exports, it, gpa, diag, world_name);
     }
     for (non_exports.items) |it| {
         if (it != .@"export") try items.append(ar, it);

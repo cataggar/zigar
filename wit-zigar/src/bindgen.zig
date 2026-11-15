@@ -463,6 +463,17 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\        handle: i32,
         \\        pub const Resource = R;
         \\        pub const wit_handle_kind = .own;
+        \\
+        \\        pub fn drop(self: @This()) void {
+        \\            R.drop(self);
+        \\        }
+        \\
+        \\        pub fn rep(self: @This()) i32 {
+        \\            if (!@hasDecl(R, "rep")) {
+        \\                @compileError("Own.rep() is only available on guest-exported resources");
+        \\            }
+        \\            return R.rep(self);
+        \\        }
         \\    };
         \\}
         \\
@@ -471,6 +482,13 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\        handle: i32,
         \\        pub const Resource = R;
         \\        pub const wit_handle_kind = .borrow;
+        \\
+        \\        pub fn borrowRep(self: @This()) i32 {
+        \\            if (!@hasDecl(R, "borrowRep")) {
+        \\                @compileError("Borrow.borrowRep() is only available on guest-exported resources");
+        \\            }
+        \\            return R.borrowRep(self);
+        \\        }
         \\    };
         \\}
         \\
@@ -894,7 +912,7 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\
         \\        pub fn wireLayoutOf(comptime T: type, comptime is_memory64: bool) Layout {
         \\            return comptime blk: {
-        \\                @setEvalBranchQuota(200_000);
+        \\                @setEvalBranchQuota(1_000_000);
         \\                const ptr_size: u32 = if (is_memory64) 8 else 4;
         \\                const is_le = @import("builtin").cpu.arch.endian() == .little;
         \\                if (T == void) break :blk .{ .size = 0, .alignment = 1, .is_blittable = true };
@@ -1038,7 +1056,7 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\
         \\        pub fn comptimeTypeAbiHash(comptime T: type, comptime is_memory64: bool) u64 {
         \\            return comptime blk: {
-        \\                @setEvalBranchQuota(200_000);
+        \\                @setEvalBranchQuota(1_000_000);
         \\                var h = Fnv1a64{};
         \\                hashTypeStructure(T, is_memory64, &h);
         \\                break :blk h.state;
@@ -1047,7 +1065,7 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\
         \\        pub fn comptimeAbiHash(comptime FnType: type, comptime is_memory64: bool) u64 {
         \\            return comptime blk: {
-        \\                @setEvalBranchQuota(200_000);
+        \\                @setEvalBranchQuota(1_000_000);
         \\                const f = @typeInfo(FnType).@"fn";
         \\                var h = Fnv1a64{};
         \\                h.update("zigar:fn:v1");
@@ -1196,7 +1214,7 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\
         \\        pub fn ArgStructLayout(comptime FnType: type, comptime is_memory64: bool) FrameLayout(FnType) {
         \\            return comptime blk: {
-        \\                @setEvalBranchQuota(200_000);
+        \\                @setEvalBranchQuota(1_000_000);
         \\                const f = @typeInfo(FnType).@"fn";
         \\                const RetT = f.return_type orelse void;
         \\                const ptr_size: u32 = @sizeOf(PtrInt(is_memory64));
@@ -2981,7 +2999,7 @@ fn emitInterfaceNamespace(
 
     // 2. Emit `pub const raw = struct { ... };` with core Wasm extern declarations.
     // For exported interfaces, omit raw `pub extern` declarations on exported functions
-    // (only `[resource-drop]` imports belong in `raw` on exports).
+    // (only resource intrinsics `[resource-drop]` / `[resource-new]` / `[resource-rep]` belong in `raw` on exports).
     try w.writeAll("    pub const raw = struct {\n");
     for (sorted_items) |item| {
         if (item == .type and item.type.kind == .resource) {
@@ -2993,6 +3011,16 @@ fn emitInterfaceNamespace(
                 "        pub extern \"{s}\" fn @\"[resource-drop]{s}\"(handle: i32) void;\n",
                 .{ drop_mod, item.type.name },
             );
+            if (ib.ext.is_export) {
+                try w.print(
+                    "        pub extern \"{s}\" fn @\"[resource-new]{s}\"(rep: i32) i32;\n",
+                    .{ drop_mod, item.type.name },
+                );
+                try w.print(
+                    "        pub extern \"{s}\" fn @\"[resource-rep]{s}\"(handle: i32) i32;\n",
+                    .{ drop_mod, item.type.name },
+                );
+            }
         }
     }
     if (!ib.ext.is_export) {
@@ -3264,6 +3292,8 @@ fn emitTypeDef(
             try w.print("{s}}};\n\n", .{indent});
         },
         .resource => |methods| {
+            const is_mem64_lit: []const u8 = if (opts.arch == .wasm64) "true" else "false";
+            const iface_lit: []const u8 = if (std.mem.eql(u8, canonical_module, "$root")) "" else canonical_module;
             try w.print("{s}pub const {s} = struct {{\n", .{ indent, pascal_name });
             try w.print("{s}    pub const OwnHandle = Own(@This());\n", .{indent});
             try w.print("{s}    pub const BorrowHandle = Borrow(@This());\n", .{indent});
@@ -3275,6 +3305,22 @@ fn emitTypeDef(
                 "{s}    pub fn drop(self: Own(@This())) void {{\n{s}        raw.@\"[resource-drop]{s}\"(self.handle);\n{s}    }}\n",
                 .{ indent, indent, td.name, indent },
             );
+            if (ext) |we_hdr| {
+                if (we_hdr.is_export) {
+                    try w.print(
+                        "\n{s}    pub fn new(rep_val: i32) Own(@This()) {{\n{s}        return .{{ .handle = raw.@\"[resource-new]{s}\"(rep_val) }};\n{s}    }}\n",
+                        .{ indent, indent, td.name, indent },
+                    );
+                    try w.print(
+                        "\n{s}    pub fn rep(self: Own(@This())) i32 {{\n{s}        return raw.@\"[resource-rep]{s}\"(self.handle);\n{s}    }}\n",
+                        .{ indent, indent, td.name, indent },
+                    );
+                    try w.print(
+                        "\n{s}    pub fn borrowRep(self: Borrow(@This())) i32 {{\n{s}        return self.handle;\n{s}    }}\n",
+                        .{ indent, indent, indent },
+                    );
+                }
+            }
 
             for (methods) |m| {
                 const ext_name = try formatResourceMemberName(ar, m.kind, td.name, m.name);
@@ -3313,21 +3359,41 @@ fn emitTypeDef(
                                 .world_decls = world_decls,
                             },
                         };
+                        const core_sig = if (we.is_export)
+                            try abi.liftCoreSigForArch(ar, ftr, opts.arch == .wasm64)
+                        else
+                            try abi.lowerCoreSigForArch(ar, ftr, opts.arch == .wasm64);
+                        try w.print("{s}    pub const {s}_CoreFn = fn (", .{ indent, m_raw });
+                        for (core_sig.params, 0..) |pt, idx| {
+                            if (idx > 0) try w.writeAll(", ");
+                            try w.writeAll(coreValTypeToZig(pt));
+                        }
+                        try w.writeAll(") callconv(.c) ");
+                        if (core_sig.results.len == 0) {
+                            try w.writeAll("void;\n");
+                        } else {
+                            try w.print("{s};\n", .{coreValTypeToZig(core_sig.results[0])});
+                        }
+
+                        const export_sym = if (iface_lit.len == 0)
+                            ext_name
+                        else
+                            try std.fmt.allocPrint(ar, "{s}#{s}", .{ iface_lit, ext_name });
+
                         const cls = abi.classifyFunc(ftr);
+                        const lift_opts = abi.classifyFuncLift(ftr);
                         try w.print(
                             \\{s}    pub const {s}_meta = .{{
                             \\{s}        .wit_name = "{s}",
                             \\{s}        .interface_name = "{s}",
+                            \\{s}        .export_name = "{s}",
                             \\{s}        .kind = .{s},
+                            \\{s}        .is_export = {},
                             \\{s}        .is_async = {},
                             \\{s}        .params_flat = @as(u32, {d}),
                             \\{s}        .results_flat = @as(u32, {d}),
                             \\{s}        .has_result = {},
                             \\{s}        .is_direct = {},
-                            \\{s}        .needs_memory = {},
-                            \\{s}        .needs_realloc = {},
-                            \\{s}        .string_encoding_utf8 = {},
-                            \\{s}    }};
                             \\
                         , .{
                             indent,
@@ -3337,7 +3403,11 @@ fn emitTypeDef(
                             indent,
                             canonical_module,
                             indent,
+                            export_sym,
+                            indent,
                             @tagName(m.kind),
+                            indent,
+                            we.is_export,
                             indent,
                             m.func.is_async,
                             indent,
@@ -3348,6 +3418,21 @@ fn emitTypeDef(
                             cls.has_result,
                             indent,
                             cls.class == .direct,
+                        });
+                        try w.print(
+                            \\{s}        .needs_memory = {},
+                            \\{s}        .needs_realloc = {},
+                            \\{s}        .string_encoding_utf8 = {},
+                            \\{s}        .lift_needs_memory = {},
+                            \\{s}        .lift_needs_realloc = {},
+                            \\{s}        .lift_needs_post_return = {},
+                            \\{s}    }};
+                            \\{s}    pub const {s}_fn_t = {s}_Fn;
+                            \\{s}    pub const {s}_sig = {s}_CoreFn;
+                            \\{s}    pub const {s}_canon_meta = {s}_meta;
+                            \\{s}    pub const {s}_zigar_abi_hash: u64 = canon.fast_abi.comptimeAbiHash({s}_fn_t, {s});
+                            \\
+                        , .{
                             indent,
                             cls.opts.memory,
                             indent,
@@ -3355,6 +3440,25 @@ fn emitTypeDef(
                             indent,
                             cls.opts.string_encoding,
                             indent,
+                            lift_opts.memory,
+                            indent,
+                            lift_opts.realloc,
+                            indent,
+                            lift_opts.needs_post_return,
+                            indent,
+                            indent,
+                            m_raw,
+                            m_raw,
+                            indent,
+                            m_raw,
+                            m_raw,
+                            indent,
+                            m_raw,
+                            m_raw,
+                            indent,
+                            m_raw,
+                            m_raw,
+                            is_mem64_lit,
                         });
                     }
                 }
@@ -3582,68 +3686,72 @@ fn emitExportBindingsHelper(
         );
     }
 
-    try w.print("{s}        pub const zigar_abi_entries = blk: {{\n", .{indent});
-    try w.print("{s}            var _entries: [{d}]canon.fast_abi.ZigarFuncEntry = undefined;\n", .{ indent, func_count });
-    try w.print("{s}            var _count: usize = 0;\n", .{indent});
-    for (items) |it| {
-        if (it != .func) continue;
-        if (findFuncRef(ext_funcs, it.func.name) == null) continue;
-        const raw_snake = try toRawSnakeCase(ar, it.func.name);
-        const collides = import_collisions.contains(it.func.name);
-        const decl_base = if (collides)
-            try std.fmt.allocPrint(ar, "export_{s}", .{raw_snake})
-        else
-            raw_snake;
-        const fast_export_sym = if (iface_lit.len == 0)
-            try std.fmt.allocPrint(ar, "__zigar_fast_{s}", .{decl_base})
-        else
-            try std.fmt.allocPrint(ar, "__zigar_fast_{s}#{s}", .{ iface_lit, decl_base });
+    if (func_count == 0) {
+        try w.print("{s}        pub const zigar_abi_entries: [0]canon.fast_abi.ZigarFuncEntry = .{{}};\n\n", .{indent});
+    } else {
+        try w.print("{s}        pub const zigar_abi_entries = blk: {{\n", .{indent});
+        try w.print("{s}            var _entries: [{d}]canon.fast_abi.ZigarFuncEntry = undefined;\n", .{ indent, func_count });
+        try w.print("{s}            var _count: usize = 0;\n", .{indent});
+        for (items) |it| {
+            if (it != .func) continue;
+            if (findFuncRef(ext_funcs, it.func.name) == null) continue;
+            const raw_snake = try toRawSnakeCase(ar, it.func.name);
+            const collides = import_collisions.contains(it.func.name);
+            const decl_base = if (collides)
+                try std.fmt.allocPrint(ar, "export_{s}", .{raw_snake})
+            else
+                raw_snake;
+            const fast_export_sym = if (iface_lit.len == 0)
+                try std.fmt.allocPrint(ar, "__zigar_fast_{s}", .{decl_base})
+            else
+                try std.fmt.allocPrint(ar, "__zigar_fast_{s}#{s}", .{ iface_lit, decl_base });
 
-        try w.print(
-            \\{s}            if (@hasDecl(Impl, "{s}") and @TypeOf(@field(Impl, "{s}")) == {s}_fn_t) {{
-            \\{s}                _entries[_count] = .{{
-            \\{s}                    .interface_name = "{s}",
-            \\{s}                    .func_name = "{s}",
-            \\{s}                    .fast_export_name = "{s}",
-            \\{s}                    .abi_hash = {s}_zigar_abi_hash,
-            \\{s}                    .arg_struct_size = @intCast(canon.fast_abi.ArgStructLayout({s}_fn_t, {s}).frame_size),
-            \\{s}                    .arg_struct_align = @intCast(canon.fast_abi.ArgStructLayout({s}_fn_t, {s}).frame_align),
-            \\{s}                    .flags = canon.fast_abi.ArgStructLayout({s}_fn_t, {s}).flags,
-            \\{s}                }};
-            \\{s}                _count += 1;
-            \\{s}            }}
-            \\
-        , .{
-            indent,
-            raw_snake,
-            raw_snake,
-            decl_base,
-            indent,
-            indent,
-            iface_lit,
-            indent,
-            it.func.name,
-            indent,
-            fast_export_sym,
-            indent,
-            decl_base,
-            indent,
-            decl_base,
-            is_mem64_lit,
-            indent,
-            decl_base,
-            is_mem64_lit,
-            indent,
-            decl_base,
-            is_mem64_lit,
-            indent,
-            indent,
-            indent,
-        });
+            try w.print(
+                \\{s}            if (@hasDecl(Impl, "{s}") and @TypeOf(@field(Impl, "{s}")) == {s}_fn_t) {{
+                \\{s}                _entries[_count] = .{{
+                \\{s}                    .interface_name = "{s}",
+                \\{s}                    .func_name = "{s}",
+                \\{s}                    .fast_export_name = "{s}",
+                \\{s}                    .abi_hash = {s}_zigar_abi_hash,
+                \\{s}                    .arg_struct_size = @intCast(canon.fast_abi.ArgStructLayout({s}_fn_t, {s}).frame_size),
+                \\{s}                    .arg_struct_align = @intCast(canon.fast_abi.ArgStructLayout({s}_fn_t, {s}).frame_align),
+                \\{s}                    .flags = canon.fast_abi.ArgStructLayout({s}_fn_t, {s}).flags,
+                \\{s}                }};
+                \\{s}                _count += 1;
+                \\{s}            }}
+                \\
+            , .{
+                indent,
+                raw_snake,
+                raw_snake,
+                decl_base,
+                indent,
+                indent,
+                iface_lit,
+                indent,
+                it.func.name,
+                indent,
+                fast_export_sym,
+                indent,
+                decl_base,
+                indent,
+                decl_base,
+                is_mem64_lit,
+                indent,
+                decl_base,
+                is_mem64_lit,
+                indent,
+                decl_base,
+                is_mem64_lit,
+                indent,
+                indent,
+                indent,
+            });
+        }
+        try w.print("{s}            const _final = _entries[0.._count].*;\n", .{indent});
+        try w.print("{s}            break :blk _final;\n", .{indent});
+        try w.print("{s}        }};\n\n", .{indent});
     }
-    try w.print("{s}            const _final = _entries[0.._count].*;\n", .{indent});
-    try w.print("{s}            break :blk _final;\n", .{indent});
-    try w.print("{s}        }};\n\n", .{indent});
 
     try w.print("{s}        pub fn registerCoreExports() void {{\n", .{indent});
     try w.print("{s}            canon.fast_abi.ensureScratchExported();\n", .{indent});
@@ -3683,8 +3791,15 @@ fn emitExportBindingsHelper(
         try w.print("{s}            if (@hasDecl(Impl, \"{s}\")) {{\n", .{ indent, raw_snake });
         try w.print("{s}                const _impl_fn = @field(Impl, \"{s}\");\n", .{ indent, raw_snake });
         try w.print("{s}                const _ImplT = @TypeOf(_impl_fn);\n", .{indent});
+        try w.print("{s}                const _has_impl_lift = comptime (@hasDecl(Impl, \"canon\") and @hasDecl(@field(Impl, \"canon\"), \"createLiftThunk\"));\n", .{indent});
+        try w.print("{s}                const _has_canon_lift = comptime @hasDecl(canon, \"createLiftThunk\");\n", .{indent});
         try w.print("{s}                if (_ImplT == {s}_CoreFn) {{\n", .{ indent, decl_base });
         try w.print("{s}                    @export(&_impl_fn, .{{ .name = \"{s}\" }});\n", .{ indent, export_sym });
+        try w.print("{s}                }} else if (_ImplT == {s}_Fn and !_has_impl_lift and !_has_canon_lift) {{\n", .{ indent, decl_base });
+        try w.print(
+            "{s}                    @compileError(\"registerCoreExports: high-level WIT function '{s}' requires `pub const canon = wit_zigar.canon;` on `Impl` (for `createLiftThunk`), or implement `{s}_CoreFn` directly\");\n",
+            .{ indent, raw_snake, decl_base },
+        );
         try w.print("{s}                }} else {{\n", .{indent});
         try w.print("{s}                    const _Wrapper = struct {{\n", .{indent});
         try w.print("{s}                        pub fn call(", .{indent});
@@ -3693,9 +3808,20 @@ fn emitExportBindingsHelper(
             try w.print("p{d}: {s}", .{ idx, coreValTypeToZig(pt) });
         }
         try w.print(") callconv(.c) {s} {{\n", .{core_ret});
-        try w.print("{s}                            if (comptime @hasDecl(Impl, \"canon\") and _ImplT == {s}_Fn) {{\n", .{ indent, decl_base });
+        try w.print("{s}                            if (comptime _has_impl_lift and _ImplT == {s}_Fn) {{\n", .{ indent, decl_base });
         try w.print(
-            "{s}                                const _thunk = Impl.canon.createLiftThunk({s}_Fn, .{{ .arch = if (is_wasm64) .wasm64 else .wasm32, .is_async = {s}_meta.is_async, .direction = .lift, .string_encoding_utf8 = {s}_meta.string_encoding_utf8 }}, &_impl_fn);\n",
+            "{s}                                const _thunk = @field(Impl, \"canon\").createLiftThunk({s}_Fn, .{{ .arch = if (is_wasm64) .wasm64 else .wasm32, .is_async = {s}_meta.is_async, .direction = .lift, .string_encoding_utf8 = {s}_meta.string_encoding_utf8 }}, &_impl_fn);\n",
+            .{ indent, decl_base, decl_base, decl_base },
+        );
+        try w.print("{s}                                return _thunk(", .{indent});
+        for (0..core_sig.params.len) |idx| {
+            if (idx > 0) try w.writeAll(", ");
+            try w.print("p{d}", .{idx});
+        }
+        try w.writeAll(");\n");
+        try w.print("{s}                            }} else if (comptime _has_canon_lift and _ImplT == {s}_Fn) {{\n", .{ indent, decl_base });
+        try w.print(
+            "{s}                                const _thunk = canon.createLiftThunk({s}_Fn, .{{ .arch = if (is_wasm64) .wasm64 else .wasm32, .is_async = {s}_meta.is_async, .direction = .lift, .string_encoding_utf8 = {s}_meta.string_encoding_utf8 }}, &_impl_fn);\n",
             .{ indent, decl_base, decl_base, decl_base },
         );
         try w.print("{s}                                return _thunk(", .{indent});
@@ -3717,8 +3843,103 @@ fn emitExportBindingsHelper(
         try w.print("{s}                    @export(&_Wrapper.call, .{{ .name = \"{s}\" }});\n", .{ indent, export_sym });
         try w.print("{s}                }}\n", .{indent});
         try w.print("{s}                if (_ImplT == {s}_fn_t) {{\n", .{ indent, decl_base });
-        try w.print("{s}                    @export(@field(@This(), \"fast_{s}\").thunk(), .{{ .name = \"{s}\" }});\n", .{ indent, decl_base, fast_export_sym });
+        try w.print("{s}                    @export(comptime @field(@This(), \"fast_{s}\").thunk(), .{{ .name = \"{s}\" }});\n", .{ indent, decl_base, fast_export_sym });
         try w.print("{s}                }}\n", .{indent});
+        try w.print("{s}            }}\n", .{indent});
+    }
+    for (items) |it| {
+        if (it != .type or it.type.kind != .resource) continue;
+        any_fn = true;
+        const res_pascal = try toPascalCase(ar, it.type.name);
+        const dtor_sym = if (iface_lit.len == 0)
+            try std.fmt.allocPrint(ar, "[dtor]{s}", .{it.type.name})
+        else
+            try std.fmt.allocPrint(ar, "{s}#[dtor]{s}", .{ iface_lit, it.type.name });
+        try w.print("{s}            if (@hasDecl(Impl, \"{s}\")) {{\n", .{ indent, res_pascal });
+        try w.print("{s}                const _ResImpl = @field(Impl, \"{s}\");\n", .{ indent, res_pascal });
+        try w.print("{s}                if (@hasDecl(_ResImpl, \"dtor\")) {{\n", .{indent});
+        try w.print("{s}                    const _dtor_fn = @field(_ResImpl, \"dtor\");\n", .{indent});
+        try w.print("{s}                    @export(&_dtor_fn, .{{ .name = \"{s}\" }});\n", .{ indent, dtor_sym });
+        try w.print("{s}                }}\n", .{indent});
+        for (it.type.kind.resource) |m| {
+            const ext_name = try formatResourceMemberName(ar, m.kind, it.type.name, m.name);
+            const fref = findFuncRef(ext_funcs, ext_name) orelse continue;
+            const m_raw = switch (m.kind) {
+                .constructor => try ar.dupe(u8, "constructor"),
+                .method, .static => try toRawSnakeCase(ar, m.name),
+            };
+            const export_sym = if (iface_lit.len == 0)
+                ext_name
+            else
+                try std.fmt.allocPrint(ar, "{s}#{s}", .{ iface_lit, ext_name });
+            const ftr = abi.FuncTypeRef{
+                .func = fref.sig,
+                .resolver = .{
+                    .inst_decls = inst_decls,
+                    .world_decls = world_decls,
+                },
+            };
+            const core_sig = try abi.liftCoreSigForArch(ar, ftr, opts.arch == .wasm64);
+            const core_ret = if (core_sig.results.len == 0)
+                "void"
+            else
+                coreValTypeToZig(core_sig.results[0]);
+            try w.print("{s}                if (@hasDecl(_ResImpl, \"{s}\")) {{\n", .{ indent, m_raw });
+            try w.print("{s}                    const _m_fn = @field(_ResImpl, \"{s}\");\n", .{ indent, m_raw });
+            try w.print("{s}                    const _MethodT = @TypeOf(_m_fn);\n", .{indent});
+            try w.print("{s}                    const _has_impl_lift = comptime (@hasDecl(Impl, \"canon\") and @hasDecl(@field(Impl, \"canon\"), \"createLiftThunk\"));\n", .{indent});
+            try w.print("{s}                    const _has_canon_lift = comptime @hasDecl(canon, \"createLiftThunk\");\n", .{indent});
+            try w.print("{s}                    if (_MethodT == {s}.{s}_CoreFn) {{\n", .{ indent, res_pascal, m_raw });
+            try w.print("{s}                        @export(&_m_fn, .{{ .name = \"{s}\" }});\n", .{ indent, export_sym });
+            try w.print("{s}                    }} else if (_MethodT == {s}.{s}_Fn and !_has_impl_lift and !_has_canon_lift) {{\n", .{ indent, res_pascal, m_raw });
+            try w.print(
+                "{s}                        @compileError(\"registerCoreExports: high-level WIT resource method '{s}.{s}' requires `pub const canon = wit_zigar.canon;` on `Impl` (for `createLiftThunk`), or implement `{s}.{s}_CoreFn` directly\");\n",
+                .{ indent, res_pascal, m_raw, res_pascal, m_raw },
+            );
+            try w.print("{s}                    }} else {{\n", .{indent});
+            try w.print("{s}                        const _MWrapper = struct {{\n", .{indent});
+            try w.print("{s}                            pub fn call(", .{indent});
+            for (core_sig.params, 0..) |pt, idx| {
+                if (idx > 0) try w.writeAll(", ");
+                try w.print("p{d}: {s}", .{ idx, coreValTypeToZig(pt) });
+            }
+            try w.print(") callconv(.c) {s} {{\n", .{core_ret});
+            try w.print("{s}                                if (comptime _has_impl_lift and _MethodT == {s}.{s}_Fn) {{\n", .{ indent, res_pascal, m_raw });
+            try w.print(
+                "{s}                                    const _thunk = @field(Impl, \"canon\").createLiftThunk({s}.{s}_Fn, .{{ .arch = if (is_wasm64) .wasm64 else .wasm32, .is_async = {s}.{s}_meta.is_async, .direction = .lift, .string_encoding_utf8 = {s}.{s}_meta.string_encoding_utf8 }}, &_m_fn);\n",
+                .{ indent, res_pascal, m_raw, res_pascal, m_raw, res_pascal, m_raw },
+            );
+            try w.print("{s}                                    return _thunk(", .{indent});
+            for (0..core_sig.params.len) |idx| {
+                if (idx > 0) try w.writeAll(", ");
+                try w.print("p{d}", .{idx});
+            }
+            try w.writeAll(");\n");
+            try w.print("{s}                                }} else if (comptime _has_canon_lift and _MethodT == {s}.{s}_Fn) {{\n", .{ indent, res_pascal, m_raw });
+            try w.print(
+                "{s}                                    const _thunk = canon.createLiftThunk({s}.{s}_Fn, .{{ .arch = if (is_wasm64) .wasm64 else .wasm32, .is_async = {s}.{s}_meta.is_async, .direction = .lift, .string_encoding_utf8 = {s}.{s}_meta.string_encoding_utf8 }}, &_m_fn);\n",
+                .{ indent, res_pascal, m_raw, res_pascal, m_raw, res_pascal, m_raw },
+            );
+            try w.print("{s}                                    return _thunk(", .{indent});
+            for (0..core_sig.params.len) |idx| {
+                if (idx > 0) try w.writeAll(", ");
+                try w.print("p{d}", .{idx});
+            }
+            try w.writeAll(");\n");
+            try w.print("{s}                                }} else {{\n", .{indent});
+            try w.print("{s}                                    return @call(.auto, _m_fn, .{{", .{indent});
+            for (0..core_sig.params.len) |idx| {
+                if (idx > 0) try w.writeAll(", ");
+                try w.print("p{d}", .{idx});
+            }
+            try w.writeAll("});\n");
+            try w.print("{s}                                }}\n", .{indent});
+            try w.print("{s}                            }}\n", .{indent});
+            try w.print("{s}                        }};\n", .{indent});
+            try w.print("{s}                        @export(&_MWrapper.call, .{{ .name = \"{s}\" }});\n", .{ indent, export_sym });
+            try w.print("{s}                    }}\n", .{indent});
+            try w.print("{s}                }}\n", .{indent});
+        }
         try w.print("{s}            }}\n", .{indent});
     }
     if (!any_fn) {
@@ -5022,5 +5243,106 @@ test "export liftCoreSig, no raw extern on exports, world import/export collisio
     try testing.expect(std.mem.indexOf(u8, zig_src, "pub const export_ping_Fn = fn (u32, u32) extern struct { @\"0\": u32, @\"1\": u32 };") != null);
     try testing.expect(std.mem.indexOf(u8, zig_src, "pub const export_ping_CoreFn = fn (i32, i32) callconv(.c) i32;") != null);
 }
+
+test "multi-export cross-interface use, reverse export order, type-only export, and exported resources" {
+    const alloc = testing.allocator;
+    const wit_src =
+        \\package my:hybrid@0.1.0;
+        \\
+        \\interface types {
+        \\    record span {
+        \\        file-name: string,
+        \\        start: u32,
+        \\        length: u32,
+        \\    }
+        \\    record diag {
+        \\        message: string,
+        \\        loc: option<span>,
+        \\    }
+        \\    record graph {
+        \\        strings: list<string>,
+        \\        diags: list<diag>,
+        \\    }
+        \\    record config {
+        \\        roots: list<string>,
+        \\        follow: bool,
+        \\    }
+        \\}
+        \\
+        \\interface compiler {
+        \\    use types.{diag, span};
+        \\    resource vfs {
+        \\        constructor(use-libs: bool);
+        \\        write-file: func(path: string, contents: string);
+        \\        read-file: func(path: string) -> option<string>;
+        \\    }
+        \\    resource program {
+        \\        get-diags: func() -> list<diag>;
+        \\        locate: func(pos: u32) -> option<span>;
+        \\    }
+        \\    create-program: func(fs: borrow<vfs>, roots: list<string>) -> result<program, list<diag>>;
+        \\}
+        \\
+        \\interface extractor {
+        \\    use types.{graph, config, diag};
+        \\    use compiler.{program};
+        \\    extract: func(prog: borrow<program>, cfg: config) -> result<graph, list<diag>>;
+        \\}
+        \\
+        \\world reverse-ordered-hybrid {
+        \\    export extractor;
+        \\    export compiler;
+        \\    export types;
+        \\}
+    ;
+
+    const zig32 = try generateFromWitSource(alloc, wit_src, .{
+        .world_name = "reverse-ordered-hybrid",
+        .arch = .wasm32,
+    });
+    defer alloc.free(zig32);
+    try assertValidZigAst(alloc, zig32);
+
+    // 1. All three interfaces remain exported even when declared in reverse dependency order.
+    try testing.expect(std.mem.indexOf(u8, zig32, "pub const types = struct {\n    pub const interface_name = \"my:hybrid/types@0.1.0\";\n    pub const is_export = true;") != null);
+    try testing.expect(std.mem.indexOf(u8, zig32, "pub const compiler = struct {\n    pub const interface_name = \"my:hybrid/compiler@0.1.0\";\n    pub const is_export = true;") != null);
+    try testing.expect(std.mem.indexOf(u8, zig32, "pub const extractor = struct {\n    pub const interface_name = \"my:hybrid/extractor@0.1.0\";\n    pub const is_export = true;") != null);
+
+    // 2. Type-only exported interface emits zero-length `zigar_abi_entries` without unmutated `var _count`.
+    try testing.expect(std.mem.indexOf(u8, zig32, "pub const zigar_abi_entries: [0]canon.fast_abi.ZigarFuncEntry = .{};") != null);
+
+    // 3. Cross-interface `use` targeting exported `types` and `compiler` resolves full Canonical ABI layout:
+    //    `extract(borrow<program>, config{roots: list<string>, follow: bool}) -> result<graph, list<diag>>`
+    //    params_flat = 1 + (2 + 1) = 4; results_flat = 1 + max(4, 2) = 5.
+    try testing.expect(std.mem.indexOf(u8, zig32, "pub const extract_CoreFn = fn (i32, i32, i32, i32) callconv(.c) i32;") != null);
+    try testing.expect(std.mem.indexOf(u8, zig32, ".params_flat = @as(u32, 4),") != null);
+    try testing.expect(std.mem.indexOf(u8, zig32, ".results_flat = @as(u32, 5),") != null);
+
+    // 4. Exported resources emit `[resource-drop]`, `[resource-new]`, `[resource-rep]`,
+    //    `Own.rep()` (on `Own(@This())`), `Borrow.borrowRep()` (direct `self.handle`), and full method `_CoreFn` + `_meta`.
+    try testing.expect(std.mem.indexOf(u8, zig32, "pub extern \"[export]my:hybrid/compiler@0.1.0\" fn @\"[resource-new]vfs\"(rep: i32) i32;") != null);
+    try testing.expect(std.mem.indexOf(u8, zig32, "pub extern \"[export]my:hybrid/compiler@0.1.0\" fn @\"[resource-rep]vfs\"(handle: i32) i32;") != null);
+    try testing.expect(std.mem.indexOf(u8, zig32, "pub fn rep(self: Own(@This())) i32 {\n            return raw.@\"[resource-rep]vfs\"(self.handle);\n        }") != null);
+    try testing.expect(std.mem.indexOf(u8, zig32, "pub fn borrowRep(self: Borrow(@This())) i32 {\n            return self.handle;\n        }") != null);
+    try testing.expect(std.mem.indexOf(u8, zig32, "pub fn rep(self: Borrow(@This()))") == null);
+    try testing.expect(std.mem.indexOf(u8, zig32, "pub const constructor_CoreFn = fn (i32) callconv(.c) i32;") != null);
+    try testing.expect(std.mem.indexOf(u8, zig32, "pub const locate_CoreFn = fn (i32, i32) callconv(.c) i32;") != null);
+
+    // 5. `registerCoreExports` emits explicit `@compileError` when high-level `X_Fn` is provided without `Impl.canon`
+    //    rather than silently skipping canonical exports.
+    try testing.expect(std.mem.indexOf(u8, zig32, "@compileError(\"registerCoreExports: high-level WIT function 'extract' requires `pub const canon = wit_zigar.canon;`") != null);
+    try testing.expect(std.mem.indexOf(u8, zig32, "@compileError(\"registerCoreExports: high-level WIT resource method 'Vfs.write_file' requires `pub const canon = wit_zigar.canon;`") != null);
+
+    // 6. wasm64 keeps resource handles `i32` while widening pointers/lengths to `i64`.
+    const zig64 = try generateFromWitSource(alloc, wit_src, .{
+        .world_name = "reverse-ordered-hybrid",
+        .arch = .wasm64,
+    });
+    defer alloc.free(zig64);
+    try assertValidZigAst(alloc, zig64);
+    try testing.expect(std.mem.indexOf(u8, zig64, "pub const extract_CoreFn = fn (i32, i64, i64, i32) callconv(.c) i64;") != null);
+    try testing.expect(std.mem.indexOf(u8, zig64, "pub const locate_CoreFn = fn (i32, i32) callconv(.c) i64;") != null);
+}
+
 
 
