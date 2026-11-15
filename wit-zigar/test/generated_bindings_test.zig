@@ -1133,5 +1133,58 @@ test "Phase 5 generated sample.wit async functions over AsyncScheduler and expor
     try shadow_task.complete();
 }
 
+test "exported resource Own.rep() invokes [resource-rep] while Borrow.borrowRep() returns raw rep directly" {
+    const MockExportedResource = struct {
+        var resource_rep_calls: usize = 0;
+        var drop_calls: usize = 0;
+
+        pub fn drop(self: canon.Own(@This())) void {
+            _ = self;
+            drop_calls += 1;
+        }
+
+        pub fn rep(self: canon.Own(@This())) i32 {
+            resource_rep_calls += 1;
+            return self.handle * 100;
+        }
+
+        pub fn borrowRep(self: canon.Borrow(@This())) i32 {
+            return self.handle;
+        }
+    };
+
+    MockExportedResource.resource_rep_calls = 0;
+    MockExportedResource.drop_calls = 0;
+
+    // `Own.rep()` looks up the representation via `[resource-rep]`
+    const own_h = canon.Own(MockExportedResource){ .handle = 7 };
+    try testing.expectEqual(@as(i32, 700), own_h.rep());
+    try testing.expectEqual(@as(usize, 1), MockExportedResource.resource_rep_calls);
+
+    // `Borrow.borrowRep()` returns the lowered guest `rep` directly without calling `[resource-rep]`
+    const bor_h = canon.Borrow(MockExportedResource){ .handle = 700 };
+    try testing.expectEqual(@as(i32, 700), bor_h.borrowRep());
+    try testing.expectEqual(@as(usize, 1), MockExportedResource.resource_rep_calls);
+
+    own_h.drop();
+    try testing.expectEqual(@as(usize, 1), MockExportedResource.drop_calls);
+
+    // Also verify generated `sample.Own` / `sample.Borrow` companion types expose `.rep` and `.borrowRep`
+    const GenExportedRes = struct {
+        pub fn drop(_: sample.Own(@This())) void {}
+        pub fn rep(self: sample.Own(@This())) i32 {
+            return self.handle + 1000;
+        }
+        pub fn borrowRep(self: sample.Borrow(@This())) i32 {
+            return self.handle;
+        }
+    };
+    const gen_own = sample.Own(GenExportedRes){ .handle = 42 };
+    const gen_bor = sample.Borrow(GenExportedRes){ .handle = 1042 };
+    try testing.expectEqual(@as(i32, 1042), gen_own.rep());
+    try testing.expectEqual(@as(i32, 1042), gen_bor.borrowRep());
+}
+
+
 
 

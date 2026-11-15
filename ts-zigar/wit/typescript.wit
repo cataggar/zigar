@@ -105,7 +105,13 @@ interface types {
         replace,
         search,
         split,
-        custom,
+    }
+
+    /// Computed symbol property/method key (`[Symbol.iterator]`, `[myUniqueSym]`, `[Symbol.for("x")]`).
+    variant symbol-key {
+        well-known(well-known-symbol),
+        unique(decl-id),
+        custom(string-id),
     }
 
     /// Single `${T}literal` segment in a template literal type.
@@ -165,12 +171,14 @@ interface types {
         index-ty: type-id,
     }
 
-    /// Conditional type `Check extends Extends ? TrueType : FalseType`.
+    /// Conditional type `Check extends Extends ? TrueType : FalseType`
+    /// (`infer-params` records `infer U` type parameters introduced in `extends-type`).
     record conditional-type-data {
         check-type: type-id,
         extends-type: type-id,
         true-type: type-id,
         false-type: type-id,
+        infer-params: list<type-param-id>,
     }
 
     /// Mapped type `readonly` / `?` modifier delta (`none`, `+`, `-`).
@@ -226,10 +234,12 @@ interface types {
         array(type-id),
         readonly-array(type-id),
         %tuple(list<tuple-element>),
+        readonly-tuple(list<tuple-element>),
         union-type(list<type-id>),
         intersection(list<type-id>),
         reference(type-ref-data),
         type-param(type-param-id),
+        infer-type(type-param-id),
         function-type(sig-id),
         constructor-type(sig-id),
         object-literal(object-type-data),
@@ -281,6 +291,7 @@ interface types {
         params: list<param-node>,
         return-type: type-id,
         type-predicate: option<type-predicate-data>,
+        is-abstract: bool,
         jsdoc: option<jsdoc-info>,
     }
 
@@ -288,7 +299,7 @@ interface types {
     record prop-node {
         id: prop-id,
         name: string-id,
-        computed-symbol: option<well-known-symbol>,
+        computed-symbol: option<symbol-key>,
         ty: type-id,
         setter-ty: option<type-id>,
         has-getter: bool,
@@ -300,7 +311,7 @@ interface types {
     /// Overloaded method member on an interface or class.
     record method-node {
         name: string-id,
-        computed-symbol: option<well-known-symbol>,
+        computed-symbol: option<symbol-key>,
         signatures: list<sig-id>,
         modifiers: modifier-flags,
         jsdoc: option<jsdoc-info>,
@@ -408,11 +419,13 @@ interface types {
         exports: list<decl-id>,
         default-export: option<decl-id>,
         export-equals: option<decl-id>,
+        umd-namespace: option<string-id>,
         star-re-exports: list<module-id>,
         ambient-modules: list<ambient-module-node>,
         global-augmentations: list<decl-id>,
         triple-slash-types: list<string-id>,
         triple-slash-paths: list<string-id>,
+        triple-slash-libs: list<string-id>,
     }
 
     /// Complete arena-indexed declaration and resolved-type graph returned across

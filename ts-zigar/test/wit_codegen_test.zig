@@ -10,6 +10,8 @@ const fast_abi = wit_zigar.fast_abi;
 const ts32 = @import("generated_ts_wasm32");
 const ts64 = @import("generated_ts_wasm64");
 const typescript_wit_source = @embedFile("typescript_wit");
+const wasm32_obj_bytes = @embedFile("wasm32_obj_bytes");
+const wasm64_obj_bytes = @embedFile("wasm64_obj_bytes");
 
 fn expectMetaMatchesCanon(
     comptime FnT: type,
@@ -123,9 +125,41 @@ test "types interface IR completeness: 14-flag u16 ModifierFlags, variants, and 
     try testing.expectEqual(@as(u32, 2), mod_layout.alignment);
     try testing.expectEqual(@as(u32, 1), mod_layout.flat_count);
 
-    // Verify `TypeKind` covers all 34 TypeScript 7.1 type constructs
+    // Verify `TypeKind` covers all 36 TypeScript 7.1 type constructs (including `readonly-tuple` and `infer-type`)
     const type_kind_info = @typeInfo(ts32.types.TypeKind).@"union";
-    try testing.expectEqual(@as(usize, 34), type_kind_info.field_names.len);
+    try testing.expectEqual(@as(usize, 36), type_kind_info.field_names.len);
+
+    // Verify the 5 `.d.ts` IR completeness constructs:
+    // 1. `infer-type` + `ConditionalTypeData.infer_params`
+    const cond_sample = ts32.types.TypeKind{
+        .conditional = .{
+            .check_type = 0,
+            .extends_type = 1,
+            .true_type = 2,
+            .false_type = 3,
+            .infer_params = &.{0},
+        },
+    };
+    try testing.expectEqual(@as(usize, 1), cond_sample.conditional.infer_params.len);
+    const infer_sample = ts32.types.TypeKind{ .infer_type = 0 };
+    try testing.expectEqual(@as(u32, 0), infer_sample.infer_type);
+
+    // 2. `readonly-tuple` distinct from `%tuple`
+    const ro_tuple = ts32.types.TypeKind{ .readonly_tuple = &.{} };
+    try testing.expectEqual(@as(usize, 0), ro_tuple.readonly_tuple.len);
+
+    // 3. `SignatureNode.is_abstract`
+    try testing.expect(@hasField(ts32.types.SignatureNode, "is_abstract"));
+
+    // 4. `SymbolKey` variant (`well-known`, `unique(decl-id)`, `custom(string-id)`) on `PropNode` & `MethodNode`
+    const sym_unique = ts32.types.SymbolKey{ .unique = 42 };
+    try testing.expectEqual(@as(u32, 42), sym_unique.unique);
+    const sym_wk = ts32.types.SymbolKey{ .well_known = .dispose };
+    try testing.expectEqual(ts32.types.WellKnownSymbol.dispose, sym_wk.well_known);
+
+    // 5. `ModuleNode.umd_namespace` and `ModuleNode.triple_slash_libs`
+    try testing.expect(@hasField(ts32.types.ModuleNode, "umd_namespace"));
+    try testing.expect(@hasField(ts32.types.ModuleNode, "triple_slash_libs"));
 
     // Verify `DeclKind` covers all 9 declaration forms
     const decl_kind_info = @typeInfo(ts32.types.DeclKind).@"union";
@@ -315,6 +349,7 @@ test "Canonical ABI linear-memory round-trip: create-program (20->1 spill) and e
                         .params = &params,
                         .return_type = 0,
                         .type_predicate = null,
+                        .is_abstract = false,
                         .jsdoc = null,
                     },
                 };
@@ -339,11 +374,13 @@ test "Canonical ABI linear-memory round-trip: create-program (20->1 spill) and e
                         .exports = &.{0},
                         .default_export = null,
                         .export_equals = null,
+                        .umd_namespace = null,
                         .star_re_exports = &.{},
                         .ambient_modules = &.{},
                         .global_augmentations = &.{},
                         .triple_slash_types = &.{},
                         .triple_slash_paths = &.{},
+                        .triple_slash_libs = &.{},
                     },
                 };
             };
@@ -401,3 +438,54 @@ test "Canonical ABI linear-memory round-trip: create-program (20->1 spill) and e
     defer decoded_meta.deinit(alloc);
     try testing.expectEqual(@as(usize, 4), decoded_meta.entries.len);
 }
+
+test "compiled wasm32 and wasm64 objects emit all 23 canonical core exports and fast ABI exports" {
+    const expected_exports = [_][]const u8{
+        // Top-level canonical exports
+        "zigar:typescript/compiler@7.1.0#compiler-version",
+        "zigar:typescript/compiler@7.1.0#transpile-module",
+        "zigar:typescript/compiler@7.1.0#create-program",
+        "zigar:typescript/extractor@7.1.0#extract-module-graph",
+        // `vfs` resource constructor, methods, and destructor
+        "zigar:typescript/compiler@7.1.0#[constructor]vfs",
+        "zigar:typescript/compiler@7.1.0#[method]vfs.write-file",
+        "zigar:typescript/compiler@7.1.0#[method]vfs.read-file",
+        "zigar:typescript/compiler@7.1.0#[method]vfs.file-exists",
+        "zigar:typescript/compiler@7.1.0#[method]vfs.delete-file",
+        "zigar:typescript/compiler@7.1.0#[method]vfs.list-files",
+        "zigar:typescript/compiler@7.1.0#[dtor]vfs",
+        // `program` resource methods and destructor
+        "zigar:typescript/compiler@7.1.0#[method]program.get-root-files",
+        "zigar:typescript/compiler@7.1.0#[method]program.get-syntactic-diagnostics",
+        "zigar:typescript/compiler@7.1.0#[method]program.get-semantic-diagnostics",
+        "zigar:typescript/compiler@7.1.0#[method]program.get-global-diagnostics",
+        "zigar:typescript/compiler@7.1.0#[method]program.emit-declarations",
+        "zigar:typescript/compiler@7.1.0#[method]program.get-checker",
+        "zigar:typescript/compiler@7.1.0#[dtor]program",
+        // `checker` resource methods and destructor
+        "zigar:typescript/compiler@7.1.0#[method]checker.type-to-string",
+        "zigar:typescript/compiler@7.1.0#[method]checker.inspect-type-at",
+        "zigar:typescript/compiler@7.1.0#[method]checker.inspect-symbol-at",
+        "zigar:typescript/compiler@7.1.0#[method]checker.resolve-module-exports",
+        "zigar:typescript/compiler@7.1.0#[dtor]checker",
+        // Fast ABI exports
+        "__zigar_fast_zigar:typescript/compiler@7.1.0#compiler_version",
+        "__zigar_fast_zigar:typescript/compiler@7.1.0#transpile_module",
+        "__zigar_fast_zigar:typescript/compiler@7.1.0#create_program",
+        "__zigar_fast_zigar:typescript/extractor@7.1.0#extract_module_graph",
+    };
+
+    for ([_][]const u8{ wasm32_obj_bytes, wasm64_obj_bytes }) |wasm_bytes| {
+        // Verify valid WebAssembly binary header (`\0asm` + version 1)
+        try testing.expect(wasm_bytes.len > 8);
+        try testing.expectEqualSlices(u8, "\x00asm\x01\x00\x00\x00", wasm_bytes[0..8]);
+
+        for (expected_exports) |sym| {
+            if (std.mem.indexOf(u8, wasm_bytes, sym) == null) {
+                std.debug.print("Missing expected Wasm export symbol: {s}\n", .{sym});
+                return error.MissingWasmExportSymbol;
+            }
+        }
+    }
+}
+

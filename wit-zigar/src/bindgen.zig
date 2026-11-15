@@ -463,6 +463,17 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\        handle: i32,
         \\        pub const Resource = R;
         \\        pub const wit_handle_kind = .own;
+        \\
+        \\        pub fn drop(self: @This()) void {
+        \\            R.drop(self);
+        \\        }
+        \\
+        \\        pub fn rep(self: @This()) i32 {
+        \\            if (!@hasDecl(R, "rep")) {
+        \\                @compileError("Own.rep() is only available on guest-exported resources");
+        \\            }
+        \\            return R.rep(self);
+        \\        }
         \\    };
         \\}
         \\
@@ -471,6 +482,13 @@ fn emitPreambleHelpers(w: BufWriter) !void {
         \\        handle: i32,
         \\        pub const Resource = R;
         \\        pub const wit_handle_kind = .borrow;
+        \\
+        \\        pub fn borrowRep(self: @This()) i32 {
+        \\            if (!@hasDecl(R, "borrowRep")) {
+        \\                @compileError("Borrow.borrowRep() is only available on guest-exported resources");
+        \\            }
+        \\            return R.borrowRep(self);
+        \\        }
         \\    };
         \\}
         \\
@@ -3294,8 +3312,12 @@ fn emitTypeDef(
                         .{ indent, indent, td.name, indent },
                     );
                     try w.print(
-                        "\n{s}    pub fn rep(self: Borrow(@This())) i32 {{\n{s}        return raw.@\"[resource-rep]{s}\"(self.handle);\n{s}    }}\n",
+                        "\n{s}    pub fn rep(self: Own(@This())) i32 {{\n{s}        return raw.@\"[resource-rep]{s}\"(self.handle);\n{s}    }}\n",
                         .{ indent, indent, td.name, indent },
+                    );
+                    try w.print(
+                        "\n{s}    pub fn borrowRep(self: Borrow(@This())) i32 {{\n{s}        return self.handle;\n{s}    }}\n",
+                        .{ indent, indent, indent },
                     );
                 }
             }
@@ -3773,7 +3795,12 @@ fn emitExportBindingsHelper(
         try w.print("{s}                const _has_canon_lift = comptime @hasDecl(canon, \"createLiftThunk\");\n", .{indent});
         try w.print("{s}                if (_ImplT == {s}_CoreFn) {{\n", .{ indent, decl_base });
         try w.print("{s}                    @export(&_impl_fn, .{{ .name = \"{s}\" }});\n", .{ indent, export_sym });
-        try w.print("{s}                }} else if (_ImplT != {s}_Fn or _has_impl_lift or _has_canon_lift) {{\n", .{ indent, decl_base });
+        try w.print("{s}                }} else if (_ImplT == {s}_Fn and !_has_impl_lift and !_has_canon_lift) {{\n", .{ indent, decl_base });
+        try w.print(
+            "{s}                    @compileError(\"registerCoreExports: high-level WIT function '{s}' requires `pub const canon = wit_zigar.canon;` on `Impl` (for `createLiftThunk`), or implement `{s}_CoreFn` directly\");\n",
+            .{ indent, raw_snake, decl_base },
+        );
+        try w.print("{s}                }} else {{\n", .{indent});
         try w.print("{s}                    const _Wrapper = struct {{\n", .{indent});
         try w.print("{s}                        pub fn call(", .{indent});
         for (core_sig.params, 0..) |pt, idx| {
@@ -3864,7 +3891,12 @@ fn emitExportBindingsHelper(
             try w.print("{s}                    const _has_canon_lift = comptime @hasDecl(canon, \"createLiftThunk\");\n", .{indent});
             try w.print("{s}                    if (_MethodT == {s}.{s}_CoreFn) {{\n", .{ indent, res_pascal, m_raw });
             try w.print("{s}                        @export(&_m_fn, .{{ .name = \"{s}\" }});\n", .{ indent, export_sym });
-            try w.print("{s}                    }} else if (_MethodT != {s}.{s}_Fn or _has_impl_lift or _has_canon_lift) {{\n", .{ indent, res_pascal, m_raw });
+            try w.print("{s}                    }} else if (_MethodT == {s}.{s}_Fn and !_has_impl_lift and !_has_canon_lift) {{\n", .{ indent, res_pascal, m_raw });
+            try w.print(
+                "{s}                        @compileError(\"registerCoreExports: high-level WIT resource method '{s}.{s}' requires `pub const canon = wit_zigar.canon;` on `Impl` (for `createLiftThunk`), or implement `{s}.{s}_CoreFn` directly\");\n",
+                .{ indent, res_pascal, m_raw, res_pascal, m_raw },
+            );
+            try w.print("{s}                    }} else {{\n", .{indent});
             try w.print("{s}                        const _MWrapper = struct {{\n", .{indent});
             try w.print("{s}                            pub fn call(", .{indent});
             for (core_sig.params, 0..) |pt, idx| {
@@ -5286,13 +5318,22 @@ test "multi-export cross-interface use, reverse export order, type-only export, 
     try testing.expect(std.mem.indexOf(u8, zig32, ".params_flat = @as(u32, 4),") != null);
     try testing.expect(std.mem.indexOf(u8, zig32, ".results_flat = @as(u32, 5),") != null);
 
-    // 4. Exported resources emit `[resource-drop]`, `[resource-new]`, `[resource-rep]`, and full method `_CoreFn` + `_meta`.
+    // 4. Exported resources emit `[resource-drop]`, `[resource-new]`, `[resource-rep]`,
+    //    `Own.rep()` (on `Own(@This())`), `Borrow.borrowRep()` (direct `self.handle`), and full method `_CoreFn` + `_meta`.
     try testing.expect(std.mem.indexOf(u8, zig32, "pub extern \"[export]my:hybrid/compiler@0.1.0\" fn @\"[resource-new]vfs\"(rep: i32) i32;") != null);
     try testing.expect(std.mem.indexOf(u8, zig32, "pub extern \"[export]my:hybrid/compiler@0.1.0\" fn @\"[resource-rep]vfs\"(handle: i32) i32;") != null);
+    try testing.expect(std.mem.indexOf(u8, zig32, "pub fn rep(self: Own(@This())) i32 {\n            return raw.@\"[resource-rep]vfs\"(self.handle);\n        }") != null);
+    try testing.expect(std.mem.indexOf(u8, zig32, "pub fn borrowRep(self: Borrow(@This())) i32 {\n            return self.handle;\n        }") != null);
+    try testing.expect(std.mem.indexOf(u8, zig32, "pub fn rep(self: Borrow(@This()))") == null);
     try testing.expect(std.mem.indexOf(u8, zig32, "pub const constructor_CoreFn = fn (i32) callconv(.c) i32;") != null);
     try testing.expect(std.mem.indexOf(u8, zig32, "pub const locate_CoreFn = fn (i32, i32) callconv(.c) i32;") != null);
 
-    // 5. wasm64 keeps resource handles `i32` while widening pointers/lengths to `i64`.
+    // 5. `registerCoreExports` emits explicit `@compileError` when high-level `X_Fn` is provided without `Impl.canon`
+    //    rather than silently skipping canonical exports.
+    try testing.expect(std.mem.indexOf(u8, zig32, "@compileError(\"registerCoreExports: high-level WIT function 'extract' requires `pub const canon = wit_zigar.canon;`") != null);
+    try testing.expect(std.mem.indexOf(u8, zig32, "@compileError(\"registerCoreExports: high-level WIT resource method 'Vfs.write_file' requires `pub const canon = wit_zigar.canon;`") != null);
+
+    // 6. wasm64 keeps resource handles `i32` while widening pointers/lengths to `i64`.
     const zig64 = try generateFromWitSource(alloc, wit_src, .{
         .world_name = "reverse-ordered-hybrid",
         .arch = .wasm64,

@@ -76,6 +76,9 @@ pub fn build(b: *std.Build) void {
     wasm32_free_mod.addAnonymousImport("generated_ts", .{
         .root_source_file = generated_ts_wasm32,
     });
+    wasm32_free_mod.addAnonymousImport("wit_zigar_canon", .{
+        .root_source_file = b.path("../wit-zigar/src/canon.zig"),
+    });
     const wasm32_free_obj = b.addObject(.{
         .name = "ts-wit-wasm32-freestanding",
         .root_module = wasm32_free_mod,
@@ -88,6 +91,9 @@ pub fn build(b: *std.Build) void {
     });
     wasm32_wasi_mod.addAnonymousImport("generated_ts", .{
         .root_source_file = generated_ts_wasm32,
+    });
+    wasm32_wasi_mod.addAnonymousImport("wit_zigar_canon", .{
+        .root_source_file = b.path("../wit-zigar/src/canon.zig"),
     });
     const wasm32_wasi_obj = b.addObject(.{
         .name = "ts-wit-wasm32-wasi",
@@ -102,6 +108,9 @@ pub fn build(b: *std.Build) void {
     wasm64_free_mod.addAnonymousImport("generated_ts", .{
         .root_source_file = generated_ts_wasm64,
     });
+    wasm64_free_mod.addAnonymousImport("wit_zigar_canon", .{
+        .root_source_file = b.path("../wit-zigar/src/canon.zig"),
+    });
     const wasm64_free_obj = b.addObject(.{
         .name = "ts-wit-wasm64-freestanding",
         .root_module = wasm64_free_mod,
@@ -112,7 +121,7 @@ pub fn build(b: *std.Build) void {
     _ = wasm_check_files.addCopyFile(wasm32_wasi_obj.getEmittedBin(), "ts-wit-wasm32-wasi.o");
     _ = wasm_check_files.addCopyFile(wasm64_free_obj.getEmittedBin(), "ts-wit-wasm64-freestanding.o");
 
-    // Native Canonical ABI + AST + round-trip tests
+    // Native Canonical ABI + AST + Wasm export symbol + round-trip tests
     const test_mod = b.createModule(.{
         .root_source_file = b.path("test/wit_codegen_test.zig"),
         .target = target,
@@ -128,6 +137,12 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addAnonymousImport("generated_ts_wasm64", .{
         .root_source_file = generated_ts_wasm64,
+    });
+    test_mod.addAnonymousImport("wasm32_obj_bytes", .{
+        .root_source_file = wasm32_free_obj.getEmittedBin(),
+    });
+    test_mod.addAnonymousImport("wasm64_obj_bytes", .{
+        .root_source_file = wasm64_free_obj.getEmittedBin(),
     });
 
     const unit_tests = b.addTest(.{

@@ -166,6 +166,17 @@ pub fn Own(comptime R: type) type {
         handle: i32,
         pub const Resource = R;
         pub const wit_handle_kind = HandleKind.own;
+
+        pub fn drop(self: @This()) void {
+            R.drop(self);
+        }
+
+        pub fn rep(self: @This()) i32 {
+            if (!@hasDecl(R, "rep")) {
+                @compileError("Own.rep() is only available on guest-exported resources");
+            }
+            return R.rep(self);
+        }
     };
 }
 
@@ -174,6 +185,13 @@ pub fn Borrow(comptime R: type) type {
         handle: i32,
         pub const Resource = R;
         pub const wit_handle_kind = HandleKind.borrow;
+
+        pub fn borrowRep(self: @This()) i32 {
+            if (!@hasDecl(R, "borrowRep")) {
+                @compileError("Borrow.borrowRep() is only available on guest-exported resources");
+            }
+            return R.borrowRep(self);
+        }
     };
 }
 
@@ -306,8 +324,17 @@ pub fn isBlittable(comptime T: type, comptime arch: Arch) bool {
     return (comptime layoutOf(T, arch)).is_blittable;
 }
 
+fn MemoizedLayout(comptime T: type, comptime arch: Arch) type {
+    return struct {
+        pub const value: TypeLayout = blk: {
+            @setEvalBranchQuota(1_000_000);
+            break :blk computeLayout(T, arch);
+        };
+    };
+}
+
 pub fn layoutOf(comptime T: type, comptime arch: Arch) TypeLayout {
-    return comptime computeLayout(T, arch);
+    return MemoizedLayout(T, arch).value;
 }
 
 fn computeLayout(comptime T: type, comptime arch: Arch) TypeLayout {
@@ -408,7 +435,7 @@ fn computeLayout(comptime T: type, comptime arch: Arch) TypeLayout {
         .pointer => |pt| switch (pt.size) {
             .slice => blk: {
                 const E = pt.child;
-                const elem_layout = computeLayout(E, arch);
+                const elem_layout = layoutOf(E, arch);
                 const addr_size: u32 = @sizeOf(AddrInt(arch));
                 const addr_ft = arch.flatAddrValType();
                 const flat_arr = [2]FlatValType{ addr_ft, addr_ft };
@@ -435,7 +462,7 @@ fn computeLayout(comptime T: type, comptime arch: Arch) TypeLayout {
                     .is_blittable = true,
                 };
             }
-            const elem_layout = computeLayout(ar.child, arch);
+            const elem_layout = layoutOf(ar.child, arch);
             const total_flat: u32 = @intCast(ar.len * elem_layout.flat_count);
             var flat_buf: [total_flat]FlatValType = undefined;
             for (0..ar.len) |i| {
@@ -467,7 +494,7 @@ fn computeLayout(comptime T: type, comptime arch: Arch) TypeLayout {
                 };
             }
             if (isStringWrapper(T)) {
-                const slice_layout = computeLayout([]const u8, arch);
+                const slice_layout = layoutOf([]const u8, arch);
                 break :blk .{
                     .size = slice_layout.size,
                     .alignment = slice_layout.alignment,
@@ -535,7 +562,7 @@ fn computeLayout(comptime T: type, comptime arch: Arch) TypeLayout {
 
             for (st.field_types, 0..) |FT, i| {
                 if (st.field_attrs[i].@"comptime") continue;
-                const fl = computeLayout(FT, arch);
+                const fl = layoutOf(FT, arch);
                 offset = alignForward(offset, fl.alignment);
                 if (all_fields_blittable) {
                     if (!fl.is_blittable or @offsetOf(T, st.field_names[i]) != offset or @sizeOf(FT) != fl.size) {
@@ -560,7 +587,7 @@ fn computeLayout(comptime T: type, comptime arch: Arch) TypeLayout {
             var cursor: usize = 0;
             for (st.field_types, 0..) |FT, i| {
                 if (st.field_attrs[i].@"comptime") continue;
-                const fl = computeLayout(FT, arch);
+                const fl = layoutOf(FT, arch);
                 for (fl.flat_types) |ft| {
                     flat_buf[cursor] = ft;
                     cursor += 1;
@@ -579,7 +606,7 @@ fn computeLayout(comptime T: type, comptime arch: Arch) TypeLayout {
             };
         },
         .optional => |op| blk: {
-            const payload = computeLayout(op.child, arch);
+            const payload = layoutOf(op.child, arch);
             const payload_offset = alignForward(1, payload.alignment);
             const alignment = @max(@as(u32, 1), payload.alignment);
             const size = alignForward(payload_offset + payload.size, alignment);
@@ -617,7 +644,7 @@ fn computeLayout(comptime T: type, comptime arch: Arch) TypeLayout {
             var contains_string = false;
 
             for (un.field_types) |CaseT| {
-                const cl = computeLayout(CaseT, arch);
+                const cl = layoutOf(CaseT, arch);
                 max_case_align = @max(max_case_align, cl.alignment);
                 max_case_size = @max(max_case_size, cl.size);
                 max_case_flat = @max(max_case_flat, cl.flat_count);
@@ -636,7 +663,7 @@ fn computeLayout(comptime T: type, comptime arch: Arch) TypeLayout {
             flat_buf[0] = .i32;
 
             for (un.field_types) |CaseT| {
-                const cl = computeLayout(CaseT, arch);
+                const cl = layoutOf(CaseT, arch);
                 for (cl.flat_types, 0..) |ft, j| {
                     if (!slot_initialized[j]) {
                         flat_buf[1 + j] = ft;
@@ -671,8 +698,8 @@ fn computeLayout(comptime T: type, comptime arch: Arch) TypeLayout {
             };
         },
         .error_union => |eu| blk: {
-            const ok_layout = computeLayout(eu.payload, arch);
-            const err_layout = computeLayout(eu.error_set, arch);
+            const ok_layout = layoutOf(eu.payload, arch);
+            const err_layout = layoutOf(eu.error_set, arch);
             const max_case_align = @max(ok_layout.alignment, err_layout.alignment);
             const max_case_size = @max(ok_layout.size, err_layout.size);
             const max_case_flat = @max(ok_layout.flat_count, err_layout.flat_count);
