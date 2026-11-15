@@ -234,9 +234,10 @@ pub const TypeScriptHost = struct {
     }
 
     /// Instantiate a `TypeScriptHost` inside a WASM-compiled Zig module running under
-    /// `zigar-compiler` / Node 26 V8 WebAssembly (`"zigar:component-host"` extern imports).
+    /// `zigar-compiler` / Node 26 V8 WebAssembly (`"zigar:component-host"` extern imports),
+    /// bound to the default-registered `instantiateComponentHost(...)` instance (`instanceId == 1`).
     pub fn initWasmExtern(allocator: std.mem.Allocator) !TypeScriptHost {
-        return initWasmExternId(allocator, 0);
+        return initWasmExternId(allocator, 1);
     }
 
     /// Like `initWasmExtern`, bound to a specific JS `instantiateComponentHost` `instanceId`.

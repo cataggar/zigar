@@ -30,6 +30,7 @@ const MODULE_OUT_DIR = join(TMP_ROOT, 'modules');
 
 const RUNTIME_SRC_DIR = join(REPO_ROOT, 'zigar-runtime/src');
 const WIT_ZIGAR_SRC_DIR = join(REPO_ROOT, 'wit-zigar/src');
+const TS_ZIGAR_SRC_DIR = join(REPO_ROOT, 'ts-zigar/src');
 const TS_WIT_PATH = join(REPO_ROOT, 'ts-zigar/wit/typescript.wit');
 const COMPONENT_WASM_PATH = process.env.TS_ZIGAR_COMPONENT_WASM
   ? resolve(process.env.TS_ZIGAR_COMPONENT_WASM)
@@ -401,6 +402,87 @@ describe('WebAssembly Component Host Runner (`component-host.js` + `wit-zigar` +
         expect(tsGuest.liveResourceCount()).to.equal(0);
       } finally {
         await zigHostMod.__zigar?.abandon();
+      }
+
+      // 5. Exercise `TypeScriptHost.initWasmExtern(allocator)` (without explicit `instanceId`)
+      //    directly from `ts-zigar/src/host.zig` against the default-registered `tsGuest` (`instanceId === 1`).
+      expect(tsGuest.instanceId).to.equal(1);
+      const tsHostPkgDir = join(TMP_ROOT, 'ts-host-pkg');
+      mkdirSync(tsHostPkgDir, { recursive: true });
+      const buildExtraZig = `const std = @import("std");
+pub fn getImports(b: *std.Build, args: anytype) []const std.Build.Module.Import {
+    const wit_zigar_mod = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = ${JSON.stringify(join(WIT_ZIGAR_SRC_DIR, 'root.zig'))} },
+        .target = args.target,
+        .optimize = args.optimize,
+    });
+    const gen_ts_mod = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = ${JSON.stringify(generatedTsPath)} },
+        .target = args.target,
+        .optimize = args.optimize,
+    });
+    const ts_zigar_mod = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = ${JSON.stringify(join(TS_ZIGAR_SRC_DIR, 'root.zig'))} },
+        .target = args.target,
+        .optimize = args.optimize,
+        .imports = &.{
+            .{ .name = "wit_zigar", .module = wit_zigar_mod },
+            .{ .name = "generated_ts_wasm32", .module = gen_ts_mod },
+            .{ .name = "generated_ts_wasm64", .module = gen_ts_mod },
+        },
+    });
+    return &.{
+        .{ .name = "ts_zigar", .module = ts_zigar_mod },
+    };
+}
+`;
+      const defaultHostZig = `const std = @import("std");
+const ts_zigar = @import("ts_zigar");
+
+pub fn checkDefaultInitWasmExtern(allocator: std.mem.Allocator) ![]const u8 {
+    var gpa_impl: std.heap.DebugAllocator(.{}) = .init;
+    defer {
+        if (gpa_impl.deinit() == .leak) @panic("Zig GPA leak in TypeScriptHost.initWasmExtern!");
+    }
+    const scratch = gpa_impl.allocator();
+
+    var ts_host = try ts_zigar.TypeScriptHost.initWasmExtern(scratch);
+    defer ts_host.deinit();
+
+    const ver = try ts_host.compilerVersion(scratch);
+    defer ts_zigar.TypeScriptHost.freeValue([]const u8, scratch, ver);
+    return try allocator.dupe(u8, ver);
+}
+`;
+      await writeFile(join(tsHostPkgDir, 'build.extra.zig'), buildExtraZig, 'utf8');
+      const defaultHostPath = join(tsHostPkgDir, 'default_wasm_host.zig');
+      await writeFile(defaultHostPath, defaultHostZig, 'utf8');
+
+      const { code: defaultHostCode } = await transpile(defaultHostPath, {
+        optimize: 'ReleaseSmall',
+        embedWASM: true,
+        stripWASM: true,
+        zigPath: 'zig',
+        buildDir: join(BUILD_DIR, 'default-wasm-host-mod'),
+      });
+      const resolvedDefaultCode = defaultHostCode
+        .replace(
+          /from\s+["']zigar-runtime["']/g,
+          `from ${JSON.stringify(pathToFileURL(join(RUNTIME_SRC_DIR, 'index.js')).href)}`,
+        )
+        .replace(
+          /import\s+["']zigar-runtime\/([^"']+)["']/g,
+          (_, subPath) => `import ${JSON.stringify(pathToFileURL(join(RUNTIME_SRC_DIR, subPath)).href)}`,
+        );
+      const defaultMjsPath = join(MODULE_OUT_DIR, `default-ts-host-${Date.now()}.mjs`);
+      await writeFile(defaultMjsPath, resolvedDefaultCode, 'utf8');
+      const defaultHostMod = await import(pathToFileURL(defaultMjsPath).href);
+      try {
+        const defaultVer = defaultHostMod.checkDefaultInitWasmExtern().string;
+        expect(defaultVer).to.match(/^7\.1\./);
+        expect(tsGuest.liveResourceCount()).to.equal(0);
+      } finally {
+        await defaultHostMod.__zigar?.abandon();
       }
     } finally {
       tsGuest.dispose();

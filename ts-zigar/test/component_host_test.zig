@@ -400,7 +400,7 @@ test "End-to-end native Zig TypeScriptHost executes typescript-compiler.componen
     try testing.expect(std.mem.indexOf(u8, transpiled.output_files[0].contents, "interface Pt") == null);
     try testing.expect(std.mem.indexOf(u8, transpiled.output_files[0].contents, "sumPt") != null);
 
-    // `extractModuleGraph`
+    // `extractModuleGraph` on `/index.ts`
     const graph_res = try ts_host.extractModuleGraph(
         alloc,
         program,
@@ -411,6 +411,157 @@ test "End-to-end native Zig TypeScriptHost executes typescript-compiler.componen
     try testing.expect(graph_res.ok.modules.len >= 1);
     try testing.expect(graph_res.ok.entry_modules.len >= 1);
     try testing.expect(containsStr(graph_res.ok.strings, "/index.ts"));
+
+    // Multi-declaration `.d.ts` `extractModuleGraph` check (Issue #42 semantic declaration-graph extractor)
+    try vfs.setFile(
+        alloc,
+        "/api/types.d.ts",
+        \\export interface UserRecord {
+        \\  readonly id: number;
+        \\  name: string;
+        \\  tags?: readonly string[];
+        \\}
+        \\
+        \\export enum AccountStatus {
+        \\  Active = "active",
+        \\  Suspended = "suspended",
+        \\}
+        \\
+        \\export type UserResult<T = UserRecord> =
+        \\  | { readonly ok: true; readonly value: T }
+        \\  | { readonly ok: false; readonly reason: string };
+        \\
+    );
+    try vfs.setFile(
+        alloc,
+        "/api/index.d.ts",
+        \\import type { UserRecord, UserResult } from "./types.js";
+        \\export { AccountStatus, type UserRecord } from "./types.js";
+        \\
+        \\export declare const API_VERSION = "7.1.0";
+        \\
+        \\export declare class Repository<T extends UserRecord> {
+        \\  readonly namespaceName: string;
+        \\  constructor(namespaceName: string);
+        \\  getById(id: number): UserResult<T>;
+        \\}
+        \\
+        \\/** Looks up a user record and narrows active accounts. */
+        \\export declare function isUserRecord(val: unknown): val is UserRecord;
+        \\
+        \\export declare namespace Diagnostics {
+        \\  export function formatCode(code: number): string;
+        \\}
+        \\
+    );
+
+    const dts_prog_outcome = try ts_host.createProgram(
+        alloc,
+        vfs,
+        &.{"/api/index.d.ts"},
+        opts,
+    );
+    defer dts_prog_outcome.deinitErr(alloc);
+    try testing.expect(dts_prog_outcome == .ok);
+    var dts_prog = dts_prog_outcome.ok;
+    defer dts_prog.deinit();
+
+    const dts_graph_res = try ts_host.extractModuleGraph(
+        alloc,
+        dts_prog,
+        ts_zigar.defaultExtractConfig(&.{"/api/index.d.ts"}),
+    );
+    defer TypeScriptHost.freeValue(@TypeOf(dts_graph_res), alloc, dts_graph_res);
+    try testing.expect(dts_graph_res == .ok);
+
+    const g = dts_graph_res.ok;
+    try testing.expect(g.modules.len >= 2);
+    try testing.expectEqual(@as(usize, 1), g.entry_modules.len);
+    try testing.expect(g.entry_modules[0] < g.modules.len);
+    try testing.expectEqualStrings("/api/index.d.ts", g.strings[g.modules[g.entry_modules[0]].file_path]);
+    try testing.expect(containsStr(g.strings, "/api/types.d.ts"));
+    try testing.expect(g.decls.len >= 7);
+    try testing.expect(g.types.len >= 6);
+    try testing.expect(g.signatures.len >= 3);
+    try testing.expect(g.type_params.len >= 2);
+    try testing.expect(g.properties.len >= 3);
+
+    var saw_interface = false;
+    var saw_enum = false;
+    var saw_type_alias = false;
+    var saw_const = false;
+    var saw_class = false;
+    var saw_fn = false;
+    var saw_namespace = false;
+    var saw_reexport = false;
+
+    for (g.decls) |decl| {
+        try testing.expect(decl.name < g.strings.len);
+        const dname = g.strings[decl.name];
+        switch (decl.kind) {
+            .interface_decl => |idata| {
+                if (std.mem.eql(u8, dname, "UserRecord")) {
+                    saw_interface = true;
+                    try testing.expectEqual(@as(usize, 3), idata.properties.len);
+                }
+            },
+            .enum_decl => |edata| {
+                if (std.mem.eql(u8, dname, "AccountStatus")) {
+                    saw_enum = true;
+                    try testing.expectEqual(@as(usize, 2), edata.members.len);
+                }
+            },
+            .type_alias_decl => |tid| {
+                if (std.mem.eql(u8, dname, "UserResult")) {
+                    saw_type_alias = true;
+                    try testing.expectEqual(@as(usize, 1), decl.type_params.len);
+                    try testing.expect(tid < g.types.len);
+                }
+            },
+            .variable_decl => |tid| {
+                if (std.mem.eql(u8, dname, "API_VERSION")) {
+                    saw_const = true;
+                    try testing.expect(tid < g.types.len);
+                }
+            },
+            .class_decl => |cdata| {
+                if (std.mem.eql(u8, dname, "Repository")) {
+                    saw_class = true;
+                    try testing.expectEqual(@as(usize, 1), decl.type_params.len);
+                    try testing.expectEqual(@as(usize, 1), cdata.constructors.len);
+                    try testing.expectEqual(@as(usize, 1), cdata.methods.len);
+                }
+            },
+            .function_decl => |sigs| {
+                if (std.mem.eql(u8, dname, "isUserRecord")) {
+                    saw_fn = true;
+                    try testing.expectEqual(@as(usize, 1), sigs.len);
+                    try testing.expect(decl.jsdoc != null or g.signatures[sigs[0]].jsdoc != null);
+                    try testing.expect(g.signatures[sigs[0]].type_predicate != null);
+                }
+            },
+            .namespace_decl => |ns_decls| {
+                if (std.mem.eql(u8, dname, "Diagnostics")) {
+                    saw_namespace = true;
+                    try testing.expectEqual(@as(usize, 1), ns_decls.len);
+                }
+            },
+            .re_export_decl => {
+                saw_reexport = true;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(saw_interface);
+    try testing.expect(saw_enum);
+    try testing.expect(saw_type_alias);
+    try testing.expect(saw_const);
+    try testing.expect(saw_class);
+    try testing.expect(saw_fn);
+    try testing.expect(saw_namespace);
+    try testing.expect(saw_reexport);
+
+    try dts_prog.drop();
 
     // Semantic error diagnostic check (`TS2322`)
     try vfs.setFile(alloc, "/broken.ts", "export const wrong: number = \"not-a-number\";\n");
@@ -437,3 +588,14 @@ test "End-to-end native Zig TypeScriptHost executes typescript-compiler.componen
     try vfs.drop();
     try testing.expectEqual(@as(u32, 0), ts_host.liveResourceCount());
 }
+
+test "TypeScriptHost.initWasmExtern binds default instance_id == 1 matching component-host registry" {
+    const alloc = testing.allocator;
+
+    var wasm_host = try TypeScriptHost.initWasmExtern(alloc);
+    defer wasm_host.deinit();
+
+    try testing.expect(wasm_host.owned_wasm_extern_state != null);
+    try testing.expectEqual(@as(u32, 1), wasm_host.owned_wasm_extern_state.?.instance_id);
+}
+

@@ -1761,69 +1761,80 @@ pub fn ComponentHostForArch(comptime arch: canon.Arch) type {
                 cls.core_result_type,
             );
 
-            // 3. Schedule `cabi_post_*` cleanup unconditionally after lifting!
-            var post_err: ?HostError = null;
-            {
-                var stack_post_buf: [256]u8 = undefined;
-                var heap_post_name: ?[]u8 = null;
-                defer if (heap_post_name) |h| allocator.free(h);
+            // 3. Resolve optional `cabi_post_*` cleanup export name
+            var stack_post_buf: [1024]u8 = undefined;
+            var heap_post_name: ?[]u8 = null;
+            defer if (heap_post_name) |h| allocator.free(h);
 
-                const maybe_post_name: ?[]const u8 = blk: {
-                    if (plan_exp) |pe| {
-                        break :blk if (pe.post_return_export) |pr| pr.export_name else null;
-                    }
-                    if (comptime cls.needs_post_return) {
-                        const needed = "cabi_post_".len + core_export_name.len;
-                        if (needed <= stack_post_buf.len) {
-                            break :blk std.fmt.bufPrint(&stack_post_buf, "cabi_post_{s}", .{core_export_name}) catch unreachable;
-                        }
-                        const s = try allocator.alloc(u8, needed);
-                        heap_post_name = s;
-                        @memcpy(s[0.."cabi_post_".len], "cabi_post_");
-                        @memcpy(s["cabi_post_".len..], core_export_name);
-                        break :blk s;
-                    }
-                    break :blk null;
-                };
-
-                defer if (maybe_post_name) |post_name| {
-                    self.backend.callPostReturn(post_name, raw_ret) catch |err| {
-                        if (post_err == null) post_err = err;
-                    };
-                };
-
-                // 4. Lift return value from guest flat register or indirect return pointer
-                if (comptime RetT == void or ret_layout.flat_count == 0) {
-                    if (post_err) |pe| return pe;
-                    return;
+            const maybe_post_name: ?[]const u8 = blk: {
+                if (plan_exp) |pe| {
+                    break :blk if (pe.post_return_export) |pr| pr.export_name else null;
                 }
-
-                if (comptime cls.results_indirect) {
-                    const ret_flat = try raw_ret.toZigFlat(arch.flatAddrValType());
-                    const ret_addr: AddrT = @bitCast(ret_flat);
-                    if ((ret_addr & (ret_layout.alignment - 1)) != 0) {
-                        return error.UnalignedPointer;
+                if (comptime cls.needs_post_return) {
+                    const needed = "cabi_post_".len + core_export_name.len;
+                    if (needed <= stack_post_buf.len) {
+                        break :blk std.fmt.bufPrint(&stack_post_buf, "cabi_post_{s}", .{core_export_name}) catch unreachable;
                     }
-                    const lifted = try loadFromGuest(RetT, op_ctx, ret_addr);
-                    errdefer switch (@typeInfo(RetT)) {
-                        .error_union => |eu| freeValue(eu.payload, allocator, lifted),
-                        .error_set => {},
-                        else => freeValue(RetT, allocator, lifted),
-                    };
-                    if (post_err) |pe| return pe;
-                    return lifted;
-                } else {
-                    var flat_ret: canon.FlatTuple(RetT, arch) = undefined;
-                    flat_ret[0] = try raw_ret.toZigFlat(ret_layout.flat_types[0]);
-                    const lifted = try liftFromFlatGuest(RetT, op_ctx, flat_ret);
-                    errdefer switch (@typeInfo(RetT)) {
-                        .error_union => |eu| freeValue(eu.payload, allocator, lifted),
-                        .error_set => {},
-                        else => freeValue(RetT, allocator, lifted),
-                    };
-                    if (post_err) |pe| return pe;
-                    return lifted;
+                    const s = try allocator.alloc(u8, needed);
+                    heap_post_name = s;
+                    @memcpy(s[0.."cabi_post_".len], "cabi_post_");
+                    @memcpy(s["cabi_post_".len..], core_export_name);
+                    break :blk s;
                 }
+                break :blk null;
+            };
+
+            // If lifting fails before we reach the explicit post-return call below,
+            // still invoke `cabi_post_*` best-effort so guest cleanup runs while
+            // returning the original lift error.
+            var post_called = false;
+            errdefer if (!post_called) {
+                if (maybe_post_name) |post_name| {
+                    self.backend.callPostReturn(post_name, raw_ret) catch {};
+                }
+            };
+
+            // 4. Lift return value from guest flat register or indirect return pointer,
+            //    then explicitly invoke `cabi_post_*` (freeing lifted host allocations on error).
+            if (comptime RetT == void or ret_layout.flat_count == 0) {
+                post_called = true;
+                if (maybe_post_name) |post_name| {
+                    try self.backend.callPostReturn(post_name, raw_ret);
+                }
+                return;
+            }
+
+            if (comptime cls.results_indirect) {
+                const ret_flat = try raw_ret.toZigFlat(arch.flatAddrValType());
+                const ret_addr: AddrT = @bitCast(ret_flat);
+                if ((ret_addr & (ret_layout.alignment - 1)) != 0) {
+                    return error.UnalignedPointer;
+                }
+                const lifted = try loadFromGuest(RetT, op_ctx, ret_addr);
+                errdefer switch (@typeInfo(RetT)) {
+                    .error_union => |eu| freeValue(eu.payload, allocator, lifted),
+                    .error_set => {},
+                    else => freeValue(RetT, allocator, lifted),
+                };
+                post_called = true;
+                if (maybe_post_name) |post_name| {
+                    try self.backend.callPostReturn(post_name, raw_ret);
+                }
+                return lifted;
+            } else {
+                var flat_ret: canon.FlatTuple(RetT, arch) = undefined;
+                flat_ret[0] = try raw_ret.toZigFlat(ret_layout.flat_types[0]);
+                const lifted = try liftFromFlatGuest(RetT, op_ctx, flat_ret);
+                errdefer switch (@typeInfo(RetT)) {
+                    .error_union => |eu| freeValue(eu.payload, allocator, lifted),
+                    .error_set => {},
+                    else => freeValue(RetT, allocator, lifted),
+                };
+                post_called = true;
+                if (maybe_post_name) |post_name| {
+                    try self.backend.callPostReturn(post_name, raw_ret);
+                }
+                return lifted;
             }
         }
 
@@ -3023,6 +3034,7 @@ pub const WasmExternBackend = struct {
     };
 
     fn vtableAlloc(ctx: *anyopaque, realloc_export: []const u8, alignment: u32, byte_len: u32) HostError!u64 {
+        if (comptime !builtin.cpu.arch.isWasm()) return error.BackendIoError;
         const self: *WasmExternBackend = @ptrCast(@alignCast(ctx));
         var out_addr: u32 = 0;
         const rc = raw.alloc(self.instance_id, realloc_export.ptr, realloc_export.len, alignment, byte_len, &out_addr);
@@ -3031,6 +3043,7 @@ pub const WasmExternBackend = struct {
     }
 
     fn vtableWrite(ctx: *anyopaque, guest_addr: u64, bytes: []const u8) HostError!void {
+        if (comptime !builtin.cpu.arch.isWasm()) return error.BackendIoError;
         const self: *WasmExternBackend = @ptrCast(@alignCast(ctx));
         const addr32 = std.math.cast(u32, guest_addr) orelse return error.OutOfBounds;
         if (raw.write(self.instance_id, addr32, bytes.ptr, bytes.len) != 0) {
@@ -3039,6 +3052,7 @@ pub const WasmExternBackend = struct {
     }
 
     fn vtableRead(ctx: *anyopaque, guest_addr: u64, out: []u8) HostError!void {
+        if (comptime !builtin.cpu.arch.isWasm()) return error.BackendIoError;
         const self: *WasmExternBackend = @ptrCast(@alignCast(ctx));
         const addr32 = std.math.cast(u32, guest_addr) orelse return error.OutOfBounds;
         if (raw.read(self.instance_id, addr32, out.ptr, out.len) != 0) {
@@ -3047,6 +3061,7 @@ pub const WasmExternBackend = struct {
     }
 
     fn vtableMemSize(ctx: *anyopaque) HostError!u64 {
+        if (comptime !builtin.cpu.arch.isWasm()) return error.BackendIoError;
         const self: *WasmExternBackend = @ptrCast(@alignCast(ctx));
         return raw.memory_size(self.instance_id);
     }
@@ -3057,6 +3072,7 @@ pub const WasmExternBackend = struct {
         params: []const CoreVal,
         expected_result: ?canon.FlatValType,
     ) HostError!CoreVal {
+        if (comptime !builtin.cpu.arch.isWasm()) return error.BackendIoError;
         const self: *WasmExternBackend = @ptrCast(@alignCast(ctx));
         var stack_params: [32]ExternCoreVal = undefined;
         if (params.len > stack_params.len) return error.BackendCallFailed;
@@ -3082,6 +3098,7 @@ pub const WasmExternBackend = struct {
     }
 
     fn vtablePostReturn(ctx: *anyopaque, post_export_name: []const u8, raw_result: CoreVal) HostError!void {
+        if (comptime !builtin.cpu.arch.isWasm()) return error.BackendIoError;
         const self: *WasmExternBackend = @ptrCast(@alignCast(ctx));
         const rc = raw.call_post_return(
             self.instance_id,
@@ -3094,6 +3111,7 @@ pub const WasmExternBackend = struct {
     }
 
     fn vtableResourceNew(ctx: *anyopaque, iface: []const u8, resource_name: []const u8, rep: i32) HostError!i32 {
+        if (comptime !builtin.cpu.arch.isWasm()) return error.BackendIoError;
         const self: *WasmExternBackend = @ptrCast(@alignCast(ctx));
         const h = raw.resource_new(self.instance_id, iface.ptr, iface.len, resource_name.ptr, resource_name.len, rep);
         if (h < 0) return error.InvalidResourceHandle;
@@ -3101,6 +3119,7 @@ pub const WasmExternBackend = struct {
     }
 
     fn vtableResourceRep(ctx: *anyopaque, iface: []const u8, resource_name: []const u8, handle: i32) HostError!i32 {
+        if (comptime !builtin.cpu.arch.isWasm()) return error.BackendIoError;
         const self: *WasmExternBackend = @ptrCast(@alignCast(ctx));
         var rep: i32 = 0;
         const rc = raw.resource_rep(self.instance_id, iface.ptr, iface.len, resource_name.ptr, resource_name.len, handle, &rep);
@@ -3109,12 +3128,14 @@ pub const WasmExternBackend = struct {
     }
 
     fn vtableResourceDrop(ctx: *anyopaque, iface: []const u8, resource_name: []const u8, handle: i32) HostError!void {
+        if (comptime !builtin.cpu.arch.isWasm()) return error.BackendIoError;
         const self: *WasmExternBackend = @ptrCast(@alignCast(ctx));
         const rc = raw.resource_drop(self.instance_id, iface.ptr, iface.len, resource_name.ptr, resource_name.len, handle);
         if (rc != 0) return error.DoubleDropResource;
     }
 
     fn vtableLiveResources(ctx: *anyopaque) u32 {
+        if (comptime !builtin.cpu.arch.isWasm()) return 0;
         const self: *WasmExternBackend = @ptrCast(@alignCast(ctx));
         return raw.live_resource_count(self.instance_id);
     }
@@ -4076,4 +4097,108 @@ test "ComponentPlan unpacks typescript-compiler.component.wasm when available" {
     try testing.expectEqualStrings("memory", extract_exp.memory_export.?.export_name);
     try testing.expectEqualStrings("cabi_realloc", extract_exp.realloc_export.?.export_name);
     try testing.expectEqualStrings("cabi_post_zigar:typescript/extractor@7.1.0#extract-module-graph", extract_exp.post_return_export.?.export_name);
+}
+
+test "ComponentHost propagates cabi_post_* errors and frees lifted host allocations without leaks" {
+    const alloc = testing.allocator;
+
+    const NestedOut = struct {
+        title: []const u8,
+        tags: []const []const u8,
+    };
+    const OutFn = fn ([]const u8) canon.Result(NestedOut, []const u8);
+
+    const State = struct {
+        fail_post: bool = true,
+        bad_utf8: bool = false,
+    };
+    var state = State{};
+
+    const Handler = struct {
+        var state_ptr: *State = undefined;
+
+        fn onCall(
+            m: *MockGuestBackend,
+            export_name: []const u8,
+            params: []const CoreVal,
+            _: ?canon.FlatValType,
+        ) HostError!CoreVal {
+            if (!std.mem.eql(u8, export_name, "produce-nested")) return error.CoreExportNotFound;
+            const in_ptr: u32 = @bitCast(params[0].i32);
+            const in_len: u32 = @bitCast(params[1].i32);
+            _ = try m.guestSlice(in_ptr, in_len);
+
+            // Build `Result(NestedOut, []const u8)` in guest memory:
+            // disc (1 byte, padded to 4) + payload (`title: (ptr, len)`, `tags: (ptr, len)` => 16 bytes) = 20 bytes
+            const title_bytes = if (state_ptr.bad_utf8) "\xff\xfe\xfd" else "allocated-on-host-heap";
+            const title_addr: u32 = @intCast(try m.guestAlloc(1, @intCast(title_bytes.len)));
+            @memcpy(try m.guestSlice(title_addr, title_bytes.len), title_bytes);
+
+            const tag0 = "alpha-heap-tag";
+            const tag1 = "beta-heap-tag";
+            const tag0_addr: u32 = @intCast(try m.guestAlloc(1, @intCast(tag0.len)));
+            @memcpy(try m.guestSlice(tag0_addr, tag0.len), tag0);
+            const tag1_addr: u32 = @intCast(try m.guestAlloc(1, @intCast(tag1.len)));
+            @memcpy(try m.guestSlice(tag1_addr, tag1.len), tag1);
+
+            const tags_arr_addr: u32 = @intCast(try m.guestAlloc(4, 16));
+            const elem_buf = try m.guestSlice(tags_arr_addr, 16);
+            std.mem.writeInt(u32, elem_buf[0..4], tag0_addr, .little);
+            std.mem.writeInt(u32, elem_buf[4..8], @intCast(tag0.len), .little);
+            std.mem.writeInt(u32, elem_buf[8..12], tag1_addr, .little);
+            std.mem.writeInt(u32, elem_buf[12..16], @intCast(tag1.len), .little);
+
+            const ret_addr: u32 = @intCast(try m.guestAlloc(4, 20));
+            const ret_buf = try m.guestSlice(ret_addr, 20);
+            @memset(ret_buf, 0);
+            ret_buf[0] = 0; // .ok
+            std.mem.writeInt(u32, ret_buf[4..8], title_addr, .little);
+            std.mem.writeInt(u32, ret_buf[8..12], @intCast(title_bytes.len), .little);
+            std.mem.writeInt(u32, ret_buf[12..16], tags_arr_addr, .little);
+            std.mem.writeInt(u32, ret_buf[16..20], 2, .little);
+
+            return .{ .i32 = @bitCast(ret_addr) };
+        }
+
+        fn onPost(_: *MockGuestBackend, post_name: []const u8, _: CoreVal) HostError!void {
+            if (!std.mem.eql(u8, post_name, "cabi_post_produce-nested")) {
+                return error.PostReturnNotFound;
+            }
+            if (state_ptr.fail_post) {
+                return error.BackendCallFailed;
+            }
+        }
+    };
+    Handler.state_ptr = &state;
+
+    var mock = try MockGuestBackend.init(alloc, .{});
+    defer mock.deinit();
+    mock.on_call_core = Handler.onCall;
+    mock.on_post_return = Handler.onPost;
+
+    const host = ComponentHost.init(mock.backend());
+
+    // 1. Lifting succeeds (allocating `title` + `tags[0]` + `tags[1]` + `tags` slice on `testing.allocator`),
+    //    then `cabi_post_produce-nested` returns `error.BackendCallFailed`:
+    //    `call` MUST free all lifted host allocations and return `error.BackendCallFailed` (called exactly once)!
+    try testing.expectError(error.BackendCallFailed, host.call(OutFn, .{}, alloc, "produce-nested", .{"req"}));
+    try testing.expectEqual(@as(usize, 1), mock.post_return_count);
+
+    // 2. When lifting itself fails (`error.InvalidUtf8`) AND `cabi_post_*` also errors,
+    //    `cabi_post_*` still runs best-effort once while preserving the original `error.InvalidUtf8`!
+    state.bad_utf8 = true;
+    try testing.expectError(error.InvalidUtf8, host.call(OutFn, .{}, alloc, "produce-nested", .{"req"}));
+    try testing.expectEqual(@as(usize, 2), mock.post_return_count);
+
+    // 3. When both lifting and `cabi_post_*` succeed, lifted nested allocations are returned intact.
+    state.bad_utf8 = false;
+    state.fail_post = false;
+    const ok_val = try host.call(OutFn, .{}, alloc, "produce-nested", .{"req"});
+    defer ComponentHost.free(@TypeOf(ok_val), alloc, ok_val);
+    try testing.expect(ok_val == .ok);
+    try testing.expectEqualStrings("allocated-on-host-heap", ok_val.ok.title);
+    try testing.expectEqual(@as(usize, 2), ok_val.ok.tags.len);
+    try testing.expectEqualStrings("alpha-heap-tag", ok_val.ok.tags[0]);
+    try testing.expectEqualStrings("beta-heap-tag", ok_val.ok.tags[1]);
+    try testing.expectEqual(@as(usize, 3), mock.post_return_count);
 }
