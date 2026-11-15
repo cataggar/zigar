@@ -478,7 +478,7 @@ pub fn wireLayoutOf(comptime T: type, comptime is_memory64: bool) Layout {
 /// wire representation for `is_memory64`.
 pub fn comptimeTypeAbiHash(comptime T: type, comptime is_memory64: bool) u64 {
     return comptime blk: {
-        @setEvalBranchQuota(200_000);
+        @setEvalBranchQuota(1_000_000);
         var h = Fnv1a64{};
         hashTypeStructure(T, is_memory64, &h);
         break :blk h.state;
@@ -489,7 +489,7 @@ pub fn comptimeTypeAbiHash(comptime T: type, comptime is_memory64: bool) u64 {
 /// `FnType` (parameter wire layouts + return wire layout + memory64 flag).
 pub fn comptimeAbiHash(comptime FnType: type, comptime is_memory64: bool) u64 {
     return comptime blk: {
-        @setEvalBranchQuota(200_000);
+        @setEvalBranchQuota(1_000_000);
         const f = @typeInfo(FnType).@"fn";
         var h = Fnv1a64{};
         h.update("zigar:fn:v1");
@@ -666,7 +666,7 @@ pub fn FrameLayout(comptime FnType: type) type {
 /// exports) append return slices after caller argument slices without collision.
 pub fn ArgStructLayout(comptime FnType: type, comptime is_memory64: bool) FrameLayout(FnType) {
     return comptime blk: {
-        @setEvalBranchQuota(200_000);
+        @setEvalBranchQuota(1_000_000);
         const f = @typeInfo(FnType).@"fn";
         const RetT = f.return_type orelse void;
         const ptr_size: u32 = @sizeOf(PtrInt(is_memory64));

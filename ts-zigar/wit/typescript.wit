@@ -1,0 +1,593 @@
+package zigar:typescript@7.1.0;
+
+/// Flat, arena-indexed intermediate representation (IR) for TypeScript 7.1
+/// declarations, types, signatures, and module graphs.
+///
+/// All graph edges use 0-based `u32` table indices (`string-id`, `module-id`,
+/// `decl-id`, `type-id`, `sig-id`, `type-param-id`, `prop-id`) into the owning
+/// `declaration-graph` tables so recursive TypeScript types (`type Json = ...`,
+/// generic constraints, mutually-referencing classes/interfaces) cross the
+/// WebAssembly Component Canonical ABI boundary in a single flat return value
+/// with zero recursive WIT types.
+interface types {
+    /// Index into `declaration-graph.strings` (interned UTF-8 string pool).
+    type string-id = u32;
+    /// Index into `declaration-graph.modules`.
+    type module-id = u32;
+    /// Index into `declaration-graph.decls`.
+    type decl-id = u32;
+    /// Index into `declaration-graph.types`.
+    type type-id = u32;
+    /// Index into `declaration-graph.signatures`.
+    type sig-id = u32;
+    /// Index into `declaration-graph.type-params`.
+    type type-param-id = u32;
+    /// Index into `declaration-graph.properties`.
+    type prop-id = u32;
+
+    /// Declaration and member modifier bitset.
+    flags modifier-flags {
+        export-decl,
+        default-export,
+        declare-ambient,
+        readonly-mod,
+        optional-mod,
+        static-mod,
+        abstract-mod,
+        private-mod,
+        protected-mod,
+        public-mod,
+        async-mod,
+        const-mod,
+        override-mod,
+        accessor-mod,
+    }
+
+    /// Severity category of a TypeScript compiler diagnostic.
+    enum diagnostic-category {
+        warning,
+        error,
+        suggestion,
+        message,
+    }
+
+    /// Byte and line/column span within a source or declaration file.
+    record source-span {
+        file-name: string,
+        start: u32,
+        length: u32,
+        line: u32,
+        column: u32,
+    }
+
+    /// Compiler or extractor diagnostic with optional source span.
+    record diagnostic {
+        code: u32,
+        category: diagnostic-category,
+        message: string,
+        span: option<source-span>,
+        related-spans: list<source-span>,
+    }
+
+    /// Individual `@tag` entry attached to a JSDoc comment block.
+    record jsdoc-tag {
+        name: string-id,
+        text: option<string-id>,
+    }
+
+    /// Structured JSDoc metadata attached to a declaration, signature, or member.
+    record jsdoc-info {
+        summary: option<string-id>,
+        tags: list<jsdoc-tag>,
+        is-deprecated: bool,
+        deprecation-message: option<string-id>,
+    }
+
+    /// TypeScript literal type payload (`"abc"`, `42`, `100n`, `true`).
+    variant literal-value {
+        str(string-id),
+        num(f64),
+        bigint-literal(string-id),
+        boolean(bool),
+    }
+
+    /// ECMAScript well-known `Symbol.*` keys for computed property/method names.
+    enum well-known-symbol {
+        iterator,
+        async-iterator,
+        dispose,
+        async-dispose,
+        has-instance,
+        to-string-tag,
+        to-primitive,
+        species,
+        match,
+        replace,
+        search,
+        split,
+        custom,
+    }
+
+    /// Single `${T}literal` segment in a template literal type.
+    record template-span {
+        ty: type-id,
+        literal: string-id,
+    }
+
+    /// Template literal type `` `head${T0}lit0...` ``.
+    record template-literal-data {
+        head: string-id,
+        spans: list<template-span>,
+    }
+
+    /// Element of a tuple type (`[label?: T, ...rest: U[]]`).
+    record tuple-element {
+        label: option<string-id>,
+        ty: type-id,
+        optional: bool,
+        variadic: bool,
+    }
+
+    /// Nominal or alias type reference (`Map<K, V>`, `ns.Foo<T>`).
+    record type-ref-data {
+        target-decl: option<decl-id>,
+        target-name: string-id,
+        module-specifier: option<string-id>,
+        type-args: list<type-id>,
+    }
+
+    /// Index signature (`readonly [key: string]: Value`).
+    record index-sig-node {
+        key-name: string-id,
+        key-type: type-id,
+        value-type: type-id,
+        is-readonly: bool,
+    }
+
+    /// Anonymous structural object / type-literal body (`{ a: number; (x: string): void }`).
+    record object-type-data {
+        properties: list<prop-id>,
+        call-signatures: list<sig-id>,
+        construct-signatures: list<sig-id>,
+        index-signatures: list<index-sig-node>,
+    }
+
+    /// `typeof expr.path<Args>` type query.
+    record typeof-query-data {
+        entity-path: list<string-id>,
+        target-decl: option<decl-id>,
+        type-args: list<type-id>,
+    }
+
+    /// Indexed access type `T[K]`.
+    record indexed-access-data {
+        object-ty: type-id,
+        index-ty: type-id,
+    }
+
+    /// Conditional type `Check extends Extends ? TrueType : FalseType`.
+    record conditional-type-data {
+        check-type: type-id,
+        extends-type: type-id,
+        true-type: type-id,
+        false-type: type-id,
+    }
+
+    /// Mapped type `readonly` / `?` modifier delta (`none`, `+`, `-`).
+    enum mapped-modifier {
+        none,
+        add,
+        remove,
+    }
+
+    /// Mapped type `{ [P in K as NameType]+?: ValueType }`.
+    record mapped-type-data {
+        type-param: type-param-id,
+        name-type: option<type-id>,
+        value-type: type-id,
+        readonly-modifier: mapped-modifier,
+        optional-modifier: mapped-modifier,
+    }
+
+    /// Type predicate return annotation (`x is T`, `asserts x is T`, `asserts cond`).
+    record type-predicate-data {
+        param-name: string-id,
+        param-index: option<u32>,
+        asserts: bool,
+        target-type: option<type-id>,
+    }
+
+    /// Inline `import("pkg").Qualifier<T>` or `typeof import("pkg")` type node.
+    record import-type-data {
+        module-specifier: string-id,
+        qualifier: list<string-id>,
+        type-args: list<type-id>,
+        is-type-of: bool,
+    }
+
+    /// Complete tagged union of TypeScript 7.1 syntactic and checker-resolved types.
+    variant type-kind {
+        any-type,
+        unknown-type,
+        void-type,
+        undefined-type,
+        null-type,
+        never-type,
+        boolean-type,
+        number-type,
+        bigint-type,
+        string-type,
+        symbol-type,
+        unique-symbol(string-id),
+        object-type,
+        this-type,
+        literal(literal-value),
+        template-literal(template-literal-data),
+        array(type-id),
+        readonly-array(type-id),
+        %tuple(list<tuple-element>),
+        union-type(list<type-id>),
+        intersection(list<type-id>),
+        reference(type-ref-data),
+        type-param(type-param-id),
+        function-type(sig-id),
+        constructor-type(sig-id),
+        object-literal(object-type-data),
+        keyof-type(type-id),
+        typeof-query(typeof-query-data),
+        indexed-access(indexed-access-data),
+        conditional(conditional-type-data),
+        mapped(mapped-type-data),
+        type-predicate(type-predicate-data),
+        import-type(import-type-data),
+        intrinsic(string-id),
+    }
+
+    /// Interned entry in `declaration-graph.types`.
+    ///
+    /// When `resolved-type` is `some(id)`, `kind` preserves the surface alias /
+    /// utility / mapped / conditional form while `resolved-type` points at the
+    /// TypeScript Checker's evaluated structural expansion.
+    record type-node {
+        id: type-id,
+        kind: type-kind,
+        resolved-type: option<type-id>,
+    }
+
+    /// Value parameter of a function, method, or constructor signature.
+    record param-node {
+        name: string-id,
+        ty: type-id,
+        optional: bool,
+        rest: bool,
+    }
+
+    /// Generic type parameter (`const in out T extends Constraint = Default`).
+    record type-param-node {
+        id: type-param-id,
+        name: string-id,
+        constraint: option<type-id>,
+        default-type: option<type-id>,
+        is-const: bool,
+        in-variance: bool,
+        out-variance: bool,
+    }
+
+    /// Call or construct signature in `declaration-graph.signatures`.
+    record signature-node {
+        id: sig-id,
+        type-params: list<type-param-id>,
+        this-param: option<type-id>,
+        params: list<param-node>,
+        return-type: type-id,
+        type-predicate: option<type-predicate-data>,
+        jsdoc: option<jsdoc-info>,
+    }
+
+    /// Object, interface, or class property/accessor/method member in `declaration-graph.properties`.
+    record prop-node {
+        id: prop-id,
+        name: string-id,
+        computed-symbol: option<well-known-symbol>,
+        ty: type-id,
+        setter-ty: option<type-id>,
+        has-getter: bool,
+        has-setter: bool,
+        modifiers: modifier-flags,
+        jsdoc: option<jsdoc-info>,
+    }
+
+    /// Overloaded method member on an interface or class.
+    record method-node {
+        name: string-id,
+        computed-symbol: option<well-known-symbol>,
+        signatures: list<sig-id>,
+        modifiers: modifier-flags,
+        jsdoc: option<jsdoc-info>,
+    }
+
+    /// `extends` or `implements` clause on an interface or class declaration.
+    record heritage-clause {
+        target-decl: option<decl-id>,
+        target-type: type-id,
+        type-args: list<type-id>,
+    }
+
+    /// Member of a TypeScript `enum` or `const enum` declaration.
+    record enum-member-node {
+        name: string-id,
+        value: option<literal-value>,
+        jsdoc: option<jsdoc-info>,
+    }
+
+    /// Body of an `interface` declaration.
+    record interface-data {
+        extends-clauses: list<heritage-clause>,
+        properties: list<prop-id>,
+        methods: list<method-node>,
+        call-signatures: list<sig-id>,
+        construct-signatures: list<sig-id>,
+        index-signatures: list<index-sig-node>,
+    }
+
+    /// Body of a `class` or `declare class` declaration.
+    record class-data {
+        extends-clause: option<heritage-clause>,
+        implements-clauses: list<heritage-clause>,
+        constructors: list<sig-id>,
+        properties: list<prop-id>,
+        methods: list<method-node>,
+        index-signatures: list<index-sig-node>,
+    }
+
+    /// Body of an `enum` or `const enum` declaration.
+    record enum-data {
+        is-const: bool,
+        members: list<enum-member-node>,
+    }
+
+    /// `import Alias = require("mod")` or `import Alias = ns.Target` declaration.
+    record import-equals-data {
+        module-specifier: option<string-id>,
+        entity-path: list<string-id>,
+        target-decl: option<decl-id>,
+        is-type-only: bool,
+    }
+
+    /// Named or namespace re-export (`export { Foo as Bar } from "./mod"`, `export * as ns from "./mod"`).
+    record re-export-data {
+        module-specifier: string-id,
+        source-name: string-id,
+        export-alias: option<string-id>,
+        target-decl: option<decl-id>,
+        target-module: option<module-id>,
+        is-namespace: bool,
+        is-type-only: bool,
+    }
+
+    /// Specific payload of a top-level or namespace-scoped TypeScript declaration.
+    variant decl-kind {
+        function-decl(list<sig-id>),
+        variable-decl(type-id),
+        interface-decl(interface-data),
+        class-decl(class-data),
+        type-alias-decl(type-id),
+        enum-decl(enum-data),
+        namespace-decl(list<decl-id>),
+        import-equals-decl(import-equals-data),
+        re-export-decl(re-export-data),
+    }
+
+    /// Declaration entry in `declaration-graph.decls`.
+    ///
+    /// Declaration merging (e.g. `interface` + `namespace`, `function` + `namespace`,
+    /// or multi-block `interface` augmentation) links peer declarations via `merged-with`.
+    record decl-node {
+        id: decl-id,
+        name: string-id,
+        export-name: option<string-id>,
+        module: module-id,
+        modifiers: modifier-flags,
+        type-params: list<type-param-id>,
+        kind: decl-kind,
+        merged-with: list<decl-id>,
+        jsdoc: option<jsdoc-info>,
+    }
+
+    /// Ambient module block (`declare module "pkg" { ... }`) declared within a file.
+    record ambient-module-node {
+        module-name: string-id,
+        decls: list<decl-id>,
+    }
+
+    /// Resolved TypeScript source or `.d.ts` module in `declaration-graph.modules`.
+    record module-node {
+        id: module-id,
+        specifier: string-id,
+        file-path: string-id,
+        exports: list<decl-id>,
+        default-export: option<decl-id>,
+        export-equals: option<decl-id>,
+        star-re-exports: list<module-id>,
+        ambient-modules: list<ambient-module-node>,
+        global-augmentations: list<decl-id>,
+        triple-slash-types: list<string-id>,
+        triple-slash-paths: list<string-id>,
+    }
+
+    /// Complete arena-indexed declaration and resolved-type graph returned across
+    /// the Component Model boundary in a single Canonical ABI lift/lower pass.
+    record declaration-graph {
+        strings: list<string>,
+        modules: list<module-node>,
+        entry-modules: list<module-id>,
+        decls: list<decl-node>,
+        types: list<type-node>,
+        signatures: list<signature-node>,
+        type-params: list<type-param-node>,
+        properties: list<prop-node>,
+        diagnostics: list<diagnostic>,
+    }
+
+    /// Configuration controlling batch module-graph extraction.
+    record extract-config {
+        root-files: list<string>,
+        module-specifiers: list<string>,
+        follow-re-exports: bool,
+        expand-utility-types: bool,
+        include-jsdoc: bool,
+        include-private-members: bool,
+    }
+}
+
+/// Stateful TypeScript 7.1 compiler interface exposing an in-memory virtual
+/// filesystem (`vfs`), compiled `program` handles, interactive `checker`
+/// queries, and standalone single-file transpilation.
+interface compiler {
+    use types.{diagnostic, source-span};
+
+    /// ECMAScript language target version.
+    enum script-target {
+        es2020,
+        es2022,
+        es2024,
+        esnext,
+    }
+
+    /// Module code-generation format.
+    enum module-kind {
+        commonjs,
+        es2020,
+        es2022,
+        esnext,
+        node16,
+        nodenext,
+        preserve,
+    }
+
+    /// Module resolution algorithm.
+    enum module-resolution-kind {
+        bundler,
+        node16,
+        nodenext,
+    }
+
+    /// Subset of `tsconfig.json` compiler options relevant to type-checking,
+    /// `.d.ts` declaration emit, and module resolution.
+    record compiler-options {
+        target: script-target,
+        module: module-kind,
+        module-resolution: module-resolution-kind,
+        strict: bool,
+        exact-optional-property-types: bool,
+        no-unchecked-indexed-access: bool,
+        declaration: bool,
+        emit-declaration-only: bool,
+        allow-js: bool,
+        skip-lib-check: bool,
+        base-url: option<string>,
+        type-roots: list<string>,
+        types: list<string>,
+    }
+
+    /// Single emitted artifact (`.js`, `.d.ts`, `.d.ts.map`, etc.).
+    record emit-file {
+        file-name: string,
+        contents: string,
+    }
+
+    /// Result of declaration emit or single-module transpilation.
+    record emit-output {
+        output-files: list<emit-file>,
+        diagnostics: list<diagnostic>,
+        emit-skipped: bool,
+    }
+
+    /// Resolved symbol summary returned by interactive `checker` inspection.
+    record symbol-info {
+        name: string,
+        qualified-name: string,
+        symbol-flags: u32,
+        type-text: string,
+        documentation: option<string>,
+        declaration-span: option<source-span>,
+    }
+
+    /// Resolved type summary returned by interactive `checker` inspection.
+    record type-info {
+        type-text: string,
+        type-flags: u32,
+        is-nullable: bool,
+        is-union: bool,
+        is-intersection: bool,
+        span: option<source-span>,
+    }
+
+    /// In-memory virtual filesystem populated by the host prior to compilation.
+    /// When `use-bundled-libs` is `true`, standard TypeScript `lib.*.d.ts`
+    /// definitions are pre-mounted automatically.
+    resource vfs {
+        constructor(use-bundled-libs: bool);
+        write-file: func(path: string, contents: string);
+        read-file: func(path: string) -> option<string>;
+        file-exists: func(path: string) -> bool;
+        delete-file: func(path: string) -> bool;
+        list-files: func(dir: string) -> list<string>;
+    }
+
+    /// TypeScript 7.1 type checker bound to a `program`.
+    resource checker {
+        type-to-string: func(file-name: string, offset: u32) -> option<string>;
+        inspect-type-at: func(file-name: string, offset: u32) -> option<type-info>;
+        inspect-symbol-at: func(file-name: string, offset: u32) -> option<symbol-info>;
+        resolve-module-exports: func(file-name: string) -> list<symbol-info>;
+    }
+
+    /// Compiled TypeScript 7.1 program owning parsed ASTs, bound symbols, and
+    /// lazy semantic type-checking state.
+    resource program {
+        get-root-files: func() -> list<string>;
+        get-syntactic-diagnostics: func(file-name: option<string>) -> list<diagnostic>;
+        get-semantic-diagnostics: func(file-name: option<string>) -> list<diagnostic>;
+        get-global-diagnostics: func() -> list<diagnostic>;
+        emit-declarations: func(file-name: option<string>) -> emit-output;
+        get-checker: func() -> checker;
+    }
+
+    /// Parse and bind `root-files` from `fs` under `options`, returning an owned
+    /// `program` resource or fatal configuration/file-not-found diagnostics.
+    create-program: func(
+        fs: borrow<vfs>,
+        root-files: list<string>,
+        options: compiler-options,
+    ) -> result<program, list<diagnostic>>;
+
+    /// Fast single-file TypeScript-to-JavaScript/declaration strip/transpile pass.
+    transpile-module: func(source: string, file-name: string) -> emit-output;
+
+    /// Return the upstream TypeScript compiler version (e.g. `"7.1.0"`).
+    compiler-version: func() -> string;
+}
+
+/// High-throughput batch `.d.ts` / resolved-type graph extractor consuming a
+/// compiled `compiler.program` and returning a flat `types.declaration-graph`.
+interface extractor {
+    use types.{declaration-graph, extract-config, diagnostic};
+    use compiler.{program};
+
+    /// Extract all exported declarations and checker-resolved types reachable
+    /// from `prog` according to `config` in a single Canonical ABI return.
+    extract-module-graph: func(
+        prog: borrow<program>,
+        config: extract-config,
+    ) -> result<declaration-graph, list<diagnostic>>;
+}
+
+/// Hybrid TypeScript 7.1 WebAssembly Component world combining stateful
+/// `compiler` resources (`vfs`, `program`, `checker`) with single-crossing
+/// arena-indexed `extractor` output (`declaration-graph`).
+world typescript-compiler {
+    export types;
+    export compiler;
+    export extractor;
+}

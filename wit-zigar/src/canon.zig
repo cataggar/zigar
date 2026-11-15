@@ -311,7 +311,7 @@ pub fn layoutOf(comptime T: type, comptime arch: Arch) TypeLayout {
 }
 
 fn computeLayout(comptime T: type, comptime arch: Arch) TypeLayout {
-    @setEvalBranchQuota(200_000);
+    @setEvalBranchQuota(1_000_000);
     const is_le = builtin.cpu.arch.endian() == .little;
 
     if (T == void) {
@@ -1995,7 +1995,7 @@ pub fn classifyZigFn(comptime FnType: type, comptime opts: CallOptions) FnClassi
 }
 
 fn computeFnClassification(comptime FnType: type, comptime opts: CallOptions) FnClassification {
-    @setEvalBranchQuota(200_000);
+    @setEvalBranchQuota(1_000_000);
     const f = @typeInfo(FnType).@"fn";
     const ArgsT = std.meta.ArgsTuple(FnType);
     const args_layout = layoutOf(ArgsT, opts.arch);

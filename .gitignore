@@ -84,6 +84,7 @@ jspm_packages/
 **/.zig-cache
 **/zig-out
 **/.zigar-cache
+**/.cache
 **/build/*
 *.so
 *.o
