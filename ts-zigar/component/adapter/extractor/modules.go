@@ -327,7 +327,9 @@ func (b *graphBuilder) extractModule(modID uint32) {
 			modSym = sf.AsNode().Symbol()
 		}
 		if modSym != nil {
-			for _, expSym := range b.tc.GetExportsOfModule(modSym) {
+			modExports := b.tc.GetExportsOfModule(modSym)
+			exportByName := buildExportSymbolMap(modExports)
+			for _, expSym := range modExports {
 				if expSym == nil {
 					continue
 				}
@@ -336,7 +338,7 @@ func (b *graphBuilder) extractModule(modID uint32) {
 					continue
 				case "default":
 					if isNone(b.modules[modID].DefaultExport) {
-						ids := b.extractExportedSymbol(sf, modID, expSym, true)
+						ids := b.extractExportedSymbolWithSet(sf, modID, expSym, true, exportByName)
 						if len(ids) > 0 {
 							b.modules[modID].DefaultExport = witTypes.Some(ids[0])
 						}
@@ -349,7 +351,7 @@ func (b *graphBuilder) extractModule(modID uint32) {
 					if !b.cfg.FollowReExports && !b.isSymbolDeclaredInFile(expSym, sf) {
 						continue
 					}
-					for _, id := range b.extractExportedSymbol(sf, modID, expSym, true) {
+					for _, id := range b.extractExportedSymbolWithSet(sf, modID, expSym, true, exportByName) {
 						appendExport(id)
 					}
 				}
@@ -512,11 +514,13 @@ func (b *graphBuilder) extractAmbientModuleDecls(sf *ast.SourceFile, modID uint3
 	}
 
 	if ambSym != nil {
-		for _, expSym := range b.tc.GetExportsOfModule(ambSym) {
+		ambExports := b.tc.GetExportsOfModule(ambSym)
+		exportByName := buildExportSymbolMap(ambExports)
+		for _, expSym := range ambExports {
 			if expSym == nil || expSym.Name() == "export=" || reExported[expSym.Name()] {
 				continue
 			}
-			for _, id := range b.extractExportedSymbol(sf, modID, expSym, true) {
+			for _, id := range b.extractExportedSymbolWithSet(sf, modID, expSym, true, exportByName) {
 				addDecl(id)
 			}
 		}

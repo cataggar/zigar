@@ -818,4 +818,304 @@ describe("Go Semantic Declaration-Graph Extractor (zigar:typescript/extractor@7.
       vfs.drop();
     }
   });
+
+  it("handles renamed local exports, multi-alias exports, export= namespace ExportName, followReExports=false bare re-exports, and instantiated signatures", () => {
+    const vfs = ts.createVfs(true);
+    try {
+      // 1. Single locally renamed export (`const hidden = 2; export { hidden as visible };`)
+      //    + multi-alias (`const base = 10; export { base as aliasA, base as aliasB };`)
+      vfs.writeFile(
+        "/renamed.ts",
+        [
+          "const hidden = 2;",
+          "export { hidden as visible };",
+          "const base = 10;",
+          "export { base as aliasA, base as aliasB };",
+        ].join("\n"),
+      );
+
+      // 2. Secondary export alias (`export const foo = 1; export { foo as foo2 };` and reverse order)
+      vfs.writeFile(
+        "/multi-alias.ts",
+        [
+          "export const foo = 1;",
+          "export { foo as foo2 };",
+          "export { rev as revAlias };",
+          "export const rev = 2;",
+        ].join("\n"),
+      );
+
+      // 3. Order-independence when local type is visited via reference before/after `export type { Hidden as Public }`
+      vfs.writeFile(
+        "/order-a.ts",
+        [
+          "interface Hidden { x: number }",
+          "export interface User { h: Hidden }",
+          "export type { Hidden as Public };",
+        ].join("\n"),
+      );
+      vfs.writeFile(
+        "/order-b.ts",
+        [
+          "export type { Hidden as Public };",
+          "interface Hidden { x: number }",
+          "export interface User { h: Hidden }",
+        ].join("\n"),
+      );
+
+      // 4. `export = Foo` with merged `declare function Foo` + `declare namespace Foo` (zero null exportName in exports)
+      vfs.writeFile(
+        "/export-eq-ns.d.ts",
+        [
+          "declare function Foo(): void;",
+          "declare namespace Foo {",
+          "  const version: string;",
+          "  interface Opts { debug?: boolean }",
+          "}",
+          "export = Foo;",
+        ].join("\n"),
+      );
+
+      // 5. Bare `import ...; export { ... }` with `followReExports: false`
+      vfs.writeFile(
+        "/x.d.ts",
+        [
+          "export interface X { a: number }",
+          "declare const defVal: string;",
+          "export default defVal;",
+        ].join("\n"),
+      );
+      vfs.writeFile(
+        "/cjs-dep.d.ts",
+        "declare const eqVal: boolean; export = eqVal;",
+      );
+      vfs.writeFile(
+        "/b.d.ts",
+        [
+          "import { X } from './x';",
+          "import * as ns from './x';",
+          "import d from './x';",
+          "import eq = require('./cjs-dep');",
+          "export { X, ns, d as z, eq };",
+          "export type Y = X;",
+        ].join("\n"),
+      );
+
+      // 6. Instantiated checker signatures (`const f = mk<string>()` and `Pick<Box<string>, 'get' | 'value'>`)
+      vfs.writeFile(
+        "/instantiated.ts",
+        [
+          "export declare function mk<T>(): (x: T, opt?: T, ...rest: T[]) => T;",
+          "export const f = mk<string>();",
+          "export declare function mkHigher<T>(): <U extends T = T>(u: U) => [T, U];",
+          "export const h = mkHigher<number>();",
+          "export interface Box<T> { get(): T; value: T }",
+          "export type P = Pick<Box<string>, 'get' | 'value'>;",
+        ].join("\n"),
+      );
+
+      const allRoots = [
+        "/renamed.ts",
+        "/multi-alias.ts",
+        "/order-a.ts",
+        "/order-b.ts",
+        "/export-eq-ns.d.ts",
+        "/b.d.ts",
+        "/instantiated.ts",
+      ];
+      const progRes = ts.createProgram(vfs, allRoots, {
+        target: "es2024",
+        module: "esnext",
+        moduleResolution: "bundler",
+        strict: true,
+      });
+      assert.equal(progRes.ok, true);
+      const program = progRes.value;
+
+      try {
+        // Test 1-4 & 6 with expandUtilityTypes: true
+        const res = ts.extractModuleGraph(program, {
+          rootFiles: [
+            "/renamed.ts",
+            "/multi-alias.ts",
+            "/order-a.ts",
+            "/order-b.ts",
+            "/export-eq-ns.d.ts",
+            "/instantiated.ts",
+          ],
+          followReExports: true,
+          expandUtilityTypes: true,
+          includeJsdoc: false,
+          includePrivateMembers: false,
+        });
+        assert.equal(res.ok, true);
+        const g = res.value;
+
+        const getMod = (fp) => {
+          const m = g.modules.find((mod) => g.str(mod.filePath) === fp);
+          assert.ok(m, `Expected module ${fp}`);
+          return m;
+        };
+        const getExportMap = (mod) => {
+          const map = new Map();
+          for (const id of mod.exports) {
+            const d = g.decls[id];
+            assert.notEqual(
+              d.exportName,
+              null,
+              `Exported decl '${g.str(d.name)}' in ${g.str(mod.filePath)} must not have null exportName`,
+            );
+            map.set(g.str(d.exportName), d);
+          }
+          return map;
+        };
+
+        // Case 1: `/renamed.ts` -> exported under `visible` (NOT `hidden`), plus BOTH `aliasA` and `aliasB`
+        const renamedExports = getExportMap(getMod("/renamed.ts"));
+        assert.ok(renamedExports.has("visible"), "Expected 'visible' export");
+        assert.ok(!renamedExports.has("hidden"), "Must NOT export 'hidden'");
+        assert.equal(g.str(renamedExports.get("visible").name), "hidden");
+        assert.ok(renamedExports.has("aliasA"), "Expected 'aliasA' export");
+        assert.ok(renamedExports.has("aliasB"), "Expected 'aliasB' export");
+        assert.ok(!renamedExports.has("base"), "Must NOT export 'base'");
+
+        // Case 2: `/multi-alias.ts` -> BOTH `foo` & `foo2`, and BOTH `rev` & `revAlias`
+        const multiExports = getExportMap(getMod("/multi-alias.ts"));
+        assert.ok(multiExports.has("foo"), "Expected 'foo' export");
+        assert.ok(multiExports.has("foo2"), "Expected 'foo2' export");
+        assert.equal(multiExports.get("foo").kind.tag, "variable-decl");
+        assert.equal(multiExports.get("foo2").kind.tag, "re-export-decl");
+        assert.equal(multiExports.get("foo2").kind.val.targetDecl, multiExports.get("foo").id);
+        assert.ok(multiExports.has("rev"), "Expected 'rev' export");
+        assert.ok(multiExports.has("revAlias"), "Expected 'revAlias' export");
+        assert.equal(multiExports.get("rev").kind.tag, "variable-decl");
+        assert.equal(multiExports.get("revAlias").kind.tag, "re-export-decl");
+        assert.equal(multiExports.get("revAlias").kind.val.targetDecl, multiExports.get("rev").id);
+
+        // Case 3: `/order-a.ts` & `/order-b.ts` -> `User` and `Public` in both statement orders
+        for (const fp of ["/order-a.ts", "/order-b.ts"]) {
+          const ordExports = getExportMap(getMod(fp));
+          assert.deepEqual(
+            [...ordExports.keys()].sort(),
+            ["Public", "User"],
+            `Expected ['Public', 'User'] exports in ${fp}`,
+          );
+          const pubDecl = ordExports.get("Public");
+          assert.equal(pubDecl.kind.tag, "interface-decl");
+          assert.equal(g.str(pubDecl.name), "Hidden");
+          const userDecl = ordExports.get("User");
+          const hProp = g.properties[userDecl.kind.val.properties[0]];
+          assert.equal(g.types[hProp.ty].kind.val.targetDecl, pubDecl.id);
+        }
+
+        // Case 4: `/export-eq-ns.d.ts` -> zero null `exportName` in module exports or namespace decls
+        const eqMod = getMod("/export-eq-ns.d.ts");
+        assert.notEqual(eqMod.exportEquals, null);
+        const eqExports = getExportMap(eqMod);
+        assert.ok(eqExports.has("version"), "Expected 'version' in export= namespace exports");
+        assert.ok(eqExports.has("Opts"), "Expected 'Opts' in export= namespace exports");
+        const fooNs = findDecl(g, "Foo", "namespace-decl", eqMod.id);
+        assert.ok(fooNs);
+        assert.equal(g.str(fooNs.exportName), "Foo");
+        for (const childId of fooNs.kind.val) {
+          assert.notEqual(g.decls[childId].exportName, null);
+        }
+
+        // Case 6: `/instantiated.ts` -> `f` is `(x: string, opt?: string, ...rest: string[]) => string`,
+        //         `h` has instantiated `<U extends number = number>`, and `P` expands to `{ get(): string; value: string }`
+        const instMod = getMod("/instantiated.ts");
+        const fDecl = findDecl(g, "f", "variable-decl", instMod.id);
+        assert.ok(fDecl);
+        const fType = g.types[fDecl.kind.val];
+        assert.equal(fType.kind.tag, "function-type");
+        const fSig = g.signatures[fType.kind.val];
+        assert.equal(fSig.typeParams.length, 0);
+        assert.equal(fSig.params.length, 3);
+        assert.equal(g.types[fSig.params[0].ty].kind.tag, "string-type");
+        assert.equal(fSig.params[0].optional, false);
+        assert.equal(g.types[fSig.params[1].ty].kind.tag, "string-type");
+        assert.equal(fSig.params[1].optional, true);
+        assert.equal(fSig.params[2].rest, true);
+        assert.equal(g.types[fSig.params[2].ty].kind.tag, "array");
+        assert.equal(g.types[g.types[fSig.params[2].ty].kind.val].kind.tag, "string-type");
+        assert.equal(g.types[fSig.returnType].kind.tag, "string-type");
+
+        const hDecl = findDecl(g, "h", "variable-decl", instMod.id);
+        const hSig = g.signatures[g.types[hDecl.kind.val].kind.val];
+        assert.equal(hSig.typeParams.length, 1);
+        const uTp = g.typeParams[hSig.typeParams[0]];
+        assert.equal(g.str(uTp.name), "U");
+        assert.equal(g.types[uTp.constraint].kind.tag, "number-type");
+        assert.equal(g.types[uTp.defaultType].kind.tag, "number-type");
+
+        const pDecl = findDecl(g, "P", "type-alias-decl", instMod.id);
+        assert.ok(pDecl);
+        const pSurfType = g.types[pDecl.kind.val];
+        assert.notEqual(pSurfType.resolvedType, null, "Expected Pick<Box<string>, ...> to expand");
+        const pResolved = g.types[pSurfType.resolvedType];
+        assert.equal(pResolved.kind.tag, "object-literal");
+        const pProps = new Map(
+          pResolved.kind.val.properties.map((pid) => [g.str(g.properties[pid].name), g.properties[pid]]),
+        );
+        assert.equal(g.types[pProps.get("value").ty].kind.tag, "string-type");
+        const getFnType = g.types[pProps.get("get").ty];
+        assert.equal(getFnType.kind.tag, "function-type");
+        const getFnSig = g.signatures[getFnType.kind.val];
+        assert.equal(g.types[getFnSig.returnType].kind.tag, "string-type");
+
+        // Test 5: `/b.d.ts` with `followReExports: false`
+        const noFollowRes = ts.extractModuleGraph(program, {
+          rootFiles: ["/b.d.ts"],
+          followReExports: false,
+          expandUtilityTypes: false,
+          includeJsdoc: false,
+          includePrivateMembers: false,
+        });
+        assert.equal(noFollowRes.ok, true);
+        const ng = noFollowRes.value;
+        const bMod = ng.modules.find((m) => ng.str(m.filePath) === "/b.d.ts");
+        assert.ok(bMod);
+        const bExports = new Map(
+          bMod.exports.map((id) => {
+            const d = ng.decls[id];
+            assert.notEqual(d.exportName, null);
+            return [ng.str(d.exportName), d];
+          }),
+        );
+        assert.deepEqual(
+          [...bExports.keys()].sort(),
+          ["X", "Y", "eq", "ns", "z"],
+          "Expected X, ns, z, eq, and Y all exported from /b.d.ts when followReExports=false",
+        );
+
+        const xReExp = bExports.get("X");
+        assert.equal(xReExp.kind.tag, "re-export-decl");
+        assert.equal(ng.str(xReExp.kind.val.moduleSpecifier), "./x");
+        assert.equal(ng.str(xReExp.kind.val.sourceName), "X");
+        assert.equal(xReExp.kind.val.targetDecl, null);
+        assert.notEqual(xReExp.kind.val.targetModule, null);
+
+        const nsReExp = bExports.get("ns");
+        assert.equal(nsReExp.kind.tag, "re-export-decl");
+        assert.equal(nsReExp.kind.val.isNamespace, true);
+        assert.equal(ng.str(nsReExp.kind.val.sourceName), "*");
+        assert.equal(nsReExp.kind.val.targetDecl, null);
+
+        const zReExp = bExports.get("z");
+        assert.equal(zReExp.kind.tag, "re-export-decl");
+        assert.equal(ng.str(zReExp.kind.val.sourceName), "default");
+        assert.equal(ng.str(zReExp.kind.val.exportAlias), "z");
+        assert.equal(zReExp.kind.val.targetDecl, null);
+
+        const eqReExp = bExports.get("eq");
+        assert.equal(eqReExp.kind.tag, "re-export-decl");
+        assert.equal(ng.str(eqReExp.kind.val.moduleSpecifier), "./cjs-dep");
+        assert.equal(eqReExp.kind.val.targetDecl, null);
+      } finally {
+        program.drop();
+      }
+    } finally {
+      vfs.drop();
+    }
+  });
 });

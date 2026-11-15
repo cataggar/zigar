@@ -429,6 +429,14 @@ func (b *graphBuilder) extractCheckerPropertySymbol(sym *ast.Symbol, containingT
 	if propTy == nil {
 		propTy = b.tc.GetTypeOfSymbol(sym)
 	}
+	if sym.Flags()&ast.SymbolFlagsOptional != 0 &&
+		propTy != nil &&
+		propTy.Flags()&checker.TypeFlagsUnion != 0 &&
+		(firstDecl == nil || !typeNodeHasExplicitUndefined(firstDecl.Type())) {
+		if stripped := b.tc.RemoveMissingOrUndefinedType(propTy); stripped != nil && stripped.Flags()&checker.TypeFlagsNever == 0 {
+			propTy = stripped
+		}
+	}
 	tyID := b.extractCheckerType(propTy)
 
 	hasGetter := sym.Flags()&ast.SymbolFlagsGetAccessor != 0 || getterDecl != nil
@@ -857,11 +865,34 @@ func (b *graphBuilder) extractSignatureFromDecl(decl *ast.Node) uint32 {
 	return sigID
 }
 
+func typeNodeHasExplicitUndefined(tn *ast.TypeNode) bool {
+	if tn == nil {
+		return false
+	}
+	switch tn.Kind {
+	case ast.KindUndefinedKeyword:
+		return true
+	case ast.KindParenthesizedType:
+		return typeNodeHasExplicitUndefined(tn.AsParenthesizedTypeNode().Type)
+	case ast.KindUnionType:
+		ut := tn.AsUnionTypeNode()
+		if ut != nil && ut.Types != nil {
+			for _, m := range ut.Types.Nodes {
+				if typeNodeHasExplicitUndefined(m) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func (b *graphBuilder) extractCheckerSignature(sig *checker.Signature, isAbstract bool) uint32 {
 	if sig == nil {
 		return b.allocSig()
 	}
-	if decl := sig.Declaration(); decl != nil {
+	decl := sig.Declaration()
+	if decl != nil && sig.Target() == nil && sig == b.tc.GetSignatureFromDeclaration(decl) {
 		return b.extractSignatureFromDecl(decl)
 	}
 	if existing, ok := b.sigByCheckerSig[sig]; ok {
@@ -889,11 +920,34 @@ func (b *graphBuilder) extractCheckerSignature(sig *checker.Signature, isAbstrac
 			continue
 		}
 		paramNames = append(paramNames, pSym.Name())
-		isOpt := pSym.Flags()&ast.SymbolFlagsOptional != 0
-		isRest := sig.HasRestParameter() && i == len(sigParams)-1
+		var paramDecl *ast.ParameterDeclaration
+		for _, d := range pSym.Declarations() {
+			if d != nil && d.Kind == ast.KindParameter {
+				paramDecl = d.AsParameterDeclaration()
+				break
+			}
+		}
+		isRest := (sig.HasRestParameter() && i == len(sigParams)-1) ||
+			pSym.CheckFlags()&ast.CheckFlagsRestParameter != 0 ||
+			(paramDecl != nil && paramDecl.DotDotDotToken != nil)
+		isOpt := !isRest && (pSym.Flags()&ast.SymbolFlagsOptional != 0 ||
+			pSym.CheckFlags()&ast.CheckFlagsOptionalParameter != 0 ||
+			(paramDecl != nil && (paramDecl.QuestionToken != nil || paramDecl.Initializer != nil)))
+		paramTy := b.tc.GetNonMissingTypeOfSymbol(pSym)
+		if paramTy == nil {
+			paramTy = b.tc.GetTypeOfSymbol(pSym)
+		}
+		if isOpt &&
+			paramTy != nil &&
+			paramTy.Flags()&checker.TypeFlagsUnion != 0 &&
+			(paramDecl == nil || !typeNodeHasExplicitUndefined(paramDecl.Type)) {
+			if stripped := b.tc.RemoveMissingOrUndefinedType(paramTy); stripped != nil && stripped.Flags()&checker.TypeFlagsNever == 0 {
+				paramTy = stripped
+			}
+		}
 		params = append(params, zigar_typescript_types.ParamNode{
 			Name:     b.intern(pSym.Name()),
-			Ty:       b.extractCheckerType(b.tc.GetTypeOfSymbol(pSym)),
+			Ty:       b.extractCheckerType(paramTy),
 			Optional: isOpt,
 			Rest:     isRest,
 		})
@@ -938,7 +992,7 @@ func (b *graphBuilder) extractCheckerSignature(sig *checker.Signature, isAbstrac
 		ReturnType:    retTyID,
 		TypePredicate: predOpt,
 		IsAbstract:    isAbstract || sig.Flags()&checker.SignatureFlagsAbstract != 0,
-		Jsdoc:         witTypes.None[zigar_typescript_types.JsdocInfo](),
+		Jsdoc:         b.extractJsdocForNode(decl),
 	}
 	return sigID
 }

@@ -154,6 +154,12 @@ type symCatKey struct {
 	cat declCategory
 }
 
+type localAliasKey struct {
+	modID      uint32
+	exportName string
+	targetDecl uint32
+}
+
 type graphBuilder struct {
 	prog   *export_zigar_typescript_compiler.Program
 	tsProg *compiler.Program
@@ -177,18 +183,20 @@ type graphBuilder struct {
 	extractedModules map[uint32]bool
 	moduleQueue      []uint32
 
-	declBySymCat    map[symCatKey]uint32
-	declByNode      map[*ast.Node]uint32
-	allDeclsForSym  map[*ast.Symbol][]uint32
-	extractedSymSet map[*ast.Symbol]bool
+	declBySymCat        map[symCatKey]uint32
+	declByNode          map[*ast.Node]uint32
+	localAliasReExports map[localAliasKey]uint32
+	allDeclsForSym      map[*ast.Symbol][]uint32
+	extractedSymSet     map[*ast.Symbol]bool
 
 	astTypeMemo      map[*ast.Node]uint32
 	checkerTypeMemo  map[*checker.Type]uint32
 	expandedTypeMemo map[*checker.Type]uint32
 	inInferExtends   map[*ast.Symbol]bool
 
-	tpByNode map[*ast.Node]uint32
-	tpBySym  map[*ast.Symbol]uint32
+	tpByNode        map[*ast.Node]uint32
+	tpBySym         map[*ast.Symbol]uint32
+	tpByCheckerType map[*checker.Type]uint32
 
 	sigByNode       map[*ast.Node]uint32
 	sigByCheckerSig map[*checker.Signature]uint32
@@ -212,35 +220,37 @@ func newGraphBuilder(
 	}
 
 	return &graphBuilder{
-		prog:              prog,
-		tsProg:            tsProg,
-		tc:                tc,
-		cfg:               cfg,
-		strings:           stringInterner{strings: []string{}, index: map[string]uint32{}},
-		modules:           []zigar_typescript_types.ModuleNode{},
-		entryModules:      []uint32{},
-		decls:             []zigar_typescript_types.DeclNode{},
-		types:             []zigar_typescript_types.TypeNode{},
-		signatures:        []zigar_typescript_types.SignatureNode{},
-		typeParams:        []zigar_typescript_types.TypeParamNode{},
-		properties:        []zigar_typescript_types.PropNode{},
-		explicitRootFiles: map[string]bool{},
-		modFilter:         modFilter,
-		moduleByFile:      map[string]uint32{},
-		sfByModule:        map[uint32]*ast.SourceFile{},
-		extractedModules:  map[uint32]bool{},
-		declBySymCat:      map[symCatKey]uint32{},
-		declByNode:        map[*ast.Node]uint32{},
-		allDeclsForSym:    map[*ast.Symbol][]uint32{},
-		extractedSymSet:   map[*ast.Symbol]bool{},
-		astTypeMemo:       map[*ast.Node]uint32{},
-		checkerTypeMemo:   map[*checker.Type]uint32{},
-		expandedTypeMemo:  map[*checker.Type]uint32{},
-		inInferExtends:    map[*ast.Symbol]bool{},
-		tpByNode:          map[*ast.Node]uint32{},
-		tpBySym:           map[*ast.Symbol]uint32{},
-		sigByNode:         map[*ast.Node]uint32{},
-		sigByCheckerSig:   map[*checker.Signature]uint32{},
+		prog:                prog,
+		tsProg:              tsProg,
+		tc:                  tc,
+		cfg:                 cfg,
+		strings:             stringInterner{strings: []string{}, index: map[string]uint32{}},
+		modules:             []zigar_typescript_types.ModuleNode{},
+		entryModules:        []uint32{},
+		decls:               []zigar_typescript_types.DeclNode{},
+		types:               []zigar_typescript_types.TypeNode{},
+		signatures:          []zigar_typescript_types.SignatureNode{},
+		typeParams:          []zigar_typescript_types.TypeParamNode{},
+		properties:          []zigar_typescript_types.PropNode{},
+		explicitRootFiles:   map[string]bool{},
+		modFilter:           modFilter,
+		moduleByFile:        map[string]uint32{},
+		sfByModule:          map[uint32]*ast.SourceFile{},
+		extractedModules:    map[uint32]bool{},
+		declBySymCat:        map[symCatKey]uint32{},
+		declByNode:          map[*ast.Node]uint32{},
+		localAliasReExports: map[localAliasKey]uint32{},
+		allDeclsForSym:      map[*ast.Symbol][]uint32{},
+		extractedSymSet:     map[*ast.Symbol]bool{},
+		astTypeMemo:         map[*ast.Node]uint32{},
+		checkerTypeMemo:     map[*checker.Type]uint32{},
+		expandedTypeMemo:    map[*checker.Type]uint32{},
+		inInferExtends:      map[*ast.Symbol]bool{},
+		tpByNode:            map[*ast.Node]uint32{},
+		tpBySym:             map[*ast.Symbol]uint32{},
+		tpByCheckerType:     map[*checker.Type]uint32{},
+		sigByNode:           map[*ast.Node]uint32{},
+		sigByCheckerSig:     map[*checker.Signature]uint32{},
 	}
 }
 

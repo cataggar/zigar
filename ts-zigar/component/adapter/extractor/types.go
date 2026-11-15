@@ -101,8 +101,13 @@ func (b *graphBuilder) populateTypeParamDecl(node *ast.Node) uint32 {
 }
 
 func (b *graphBuilder) ensureCheckerTypeParam(t *checker.Type) uint32 {
+	if existing, ok := b.tpByCheckerType[t]; ok {
+		return existing
+	}
+
+	isInstantiatedTP := t.Target() != nil || t.Mapper() != nil
 	sym := b.canonicalSymbol(t.Symbol())
-	if sym != nil {
+	if !isInstantiatedTP && sym != nil {
 		if existing, ok := b.tpBySym[sym]; ok {
 			return existing
 		}
@@ -112,16 +117,34 @@ func (b *graphBuilder) ensureCheckerTypeParam(t *checker.Type) uint32 {
 			}
 		}
 	}
+
 	name := "T"
 	if sym != nil && sym.Name() != "" {
 		name = sym.Name()
 	}
 	id := b.allocTypeParam(b.intern(name))
-	if sym != nil {
+	b.tpByCheckerType[t] = id
+	if !isInstantiatedTP && sym != nil {
 		b.tpBySym[sym] = id
 	}
+
+	if sym != nil {
+		for _, d := range sym.Declarations() {
+			if d != nil && d.Kind == ast.KindTypeParameter {
+				mods := ast.GetCombinedModifierFlags(d)
+				b.typeParams[id].IsConst = mods&ast.ModifierFlagsConst != 0
+				b.typeParams[id].InVariance = mods&ast.ModifierFlagsIn != 0
+				b.typeParams[id].OutVariance = mods&ast.ModifierFlagsOut != 0
+				break
+			}
+		}
+	}
+
 	if constraint := b.tc.GetBaseConstraintOfType(t); constraint != nil && constraint != t {
 		b.typeParams[id].Constraint = witTypes.Some(b.extractCheckerType(constraint))
+	}
+	if def := b.tc.GetDefaultFromTypeParameter(t); def != nil && def != t {
+		b.typeParams[id].DefaultType = witTypes.Some(b.extractCheckerType(def))
 	}
 	return id
 }
