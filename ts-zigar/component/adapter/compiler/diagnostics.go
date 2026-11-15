@@ -11,6 +11,11 @@ import (
 	witTypes "go.bytecodealliance.org/pkg/wit/types"
 )
 
+// ConvertDiagnostics converts TypeScript AST diagnostics into WIT Diagnostic records.
+func ConvertDiagnostics(diags []*ast.Diagnostic) []zigar_typescript_types.Diagnostic {
+	return convertDiagnostics(diags)
+}
+
 func convertDiagnostics(diags []*ast.Diagnostic) []zigar_typescript_types.Diagnostic {
 	if len(diags) == 0 {
 		return []zigar_typescript_types.Diagnostic{}

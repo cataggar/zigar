@@ -29,6 +29,56 @@ const MODULE_RESOLUTIONS = {
   nodenext: 2,
 };
 
+const WELL_KNOWN_SYMBOLS = [
+  "iterator",
+  "async-iterator",
+  "dispose",
+  "async-dispose",
+  "has-instance",
+  "to-string-tag",
+  "to-primitive",
+  "species",
+  "match",
+  "replace",
+  "search",
+  "split",
+];
+
+const MAPPED_MODIFIERS = ["none", "add", "remove"];
+
+const UNIT_TYPE_KINDS = {
+  0: "any-type",
+  1: "unknown-type",
+  2: "void-type",
+  3: "undefined-type",
+  4: "null-type",
+  5: "never-type",
+  6: "boolean-type",
+  7: "number-type",
+  8: "bigint-type",
+  9: "string-type",
+  10: "symbol-type",
+  12: "object-type",
+  13: "this-type",
+};
+
+export const MODIFIER_FLAGS = Object.freeze({
+  exportDecl: 1 << 0,
+  defaultExport: 1 << 1,
+  declareAmbient: 1 << 2,
+  readonlyMod: 1 << 3,
+  optionalMod: 1 << 4,
+  staticMod: 1 << 5,
+  abstractMod: 1 << 6,
+  privateMod: 1 << 7,
+  protectedMod: 1 << 8,
+  publicMod: 1 << 9,
+  asyncMod: 1 << 10,
+  constMod: 1 << 11,
+  overrideMod: 1 << 12,
+  accessorMod: 1 << 13,
+});
+
 /**
  * Convert a signed 32-bit Wasm linear-memory pointer/offset into an unsigned
  * 32-bit JS integer (`0 .. 0xffff_ffff`), avoiding negative-offset `RangeError`
@@ -294,6 +344,601 @@ export function instantiateTypeScriptComponent(wasmPath) {
       length: dv.getUint32(base + 12, true),
       line: dv.getUint32(base + 16, true),
       column: dv.getUint32(base + 20, true),
+    };
+  }
+
+  function liftU32List(dv, ptr, len) {
+    const p = toUnsignedPtr(ptr);
+    const n = toUnsignedPtr(len);
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      out[i] = dv.getUint32(p + i * 4, true);
+    }
+    return out;
+  }
+
+  function liftOptionU32(dv, tagOffset, valOffset = tagOffset + 4) {
+    return dv.getUint8(tagOffset) === 1 ? dv.getUint32(valOffset, true) : null;
+  }
+
+  function liftJsdocOption(dv, baseOffset) {
+    const b = toUnsignedPtr(baseOffset);
+    if (dv.getUint8(b) === 0) return null;
+    const summary = liftOptionU32(dv, b + 4, b + 8);
+    const tagsPtr = toUnsignedPtr(dv.getUint32(b + 12, true));
+    const tagsLen = toUnsignedPtr(dv.getUint32(b + 16, true));
+    const tags = new Array(tagsLen);
+    for (let i = 0; i < tagsLen; i++) {
+      const tb = tagsPtr + i * 12;
+      tags[i] = {
+        name: dv.getUint32(tb, true),
+        text: liftOptionU32(dv, tb + 4, tb + 8),
+      };
+    }
+    return {
+      summary,
+      tags,
+      isDeprecated: dv.getUint8(b + 20) !== 0,
+      deprecationMessage: liftOptionU32(dv, b + 24, b + 28),
+    };
+  }
+
+  function liftSymbolKeyOption(dv, baseOffset) {
+    const b = toUnsignedPtr(baseOffset);
+    if (dv.getUint8(b) === 0) return null;
+    const tag = dv.getUint8(b + 4);
+    if (tag === 0) {
+      const wkIdx = dv.getUint8(b + 8);
+      return { tag: "well-known", val: WELL_KNOWN_SYMBOLS[wkIdx] ?? `unknown(${wkIdx})` };
+    }
+    if (tag === 1) {
+      return { tag: "unique", val: dv.getUint32(b + 8, true) };
+    }
+    return { tag: "custom", val: dv.getUint32(b + 8, true) };
+  }
+
+  function liftLiteralValue(dv, baseOffset) {
+    const b = toUnsignedPtr(baseOffset);
+    const tag = dv.getUint8(b);
+    switch (tag) {
+      case 0:
+        return { tag: "str", val: dv.getUint32(b + 8, true) };
+      case 1:
+        return { tag: "num", val: dv.getFloat64(b + 8, true) };
+      case 2:
+        return { tag: "bigint-literal", val: dv.getUint32(b + 8, true) };
+      case 3:
+        return { tag: "boolean", val: dv.getUint8(b + 8) !== 0 };
+      default:
+        throw new Error(`Unknown literal-value tag: ${tag}`);
+    }
+  }
+
+  function liftHeritageClause(dv, baseOffset) {
+    const b = toUnsignedPtr(baseOffset);
+    return {
+      targetDecl: liftOptionU32(dv, b, b + 4),
+      targetType: dv.getUint32(b + 8, true),
+      typeArgs: liftU32List(dv, dv.getUint32(b + 12, true), dv.getUint32(b + 16, true)),
+    };
+  }
+
+  function liftHeritageClauseList(dv, ptr, len) {
+    const p = toUnsignedPtr(ptr);
+    const n = toUnsignedPtr(len);
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      out[i] = liftHeritageClause(dv, p + i * 20);
+    }
+    return out;
+  }
+
+  function liftMethodList(dv, ptr, len) {
+    const p = toUnsignedPtr(ptr);
+    const n = toUnsignedPtr(len);
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const b = p + i * 60;
+      out[i] = {
+        name: dv.getUint32(b, true),
+        computedSymbol: liftSymbolKeyOption(dv, b + 4),
+        signatures: liftU32List(dv, dv.getUint32(b + 16, true), dv.getUint32(b + 20, true)),
+        modifiers: dv.getUint16(b + 24, true),
+        jsdoc: liftJsdocOption(dv, b + 28),
+      };
+    }
+    return out;
+  }
+
+  function liftIndexSigList(dv, ptr, len) {
+    const p = toUnsignedPtr(ptr);
+    const n = toUnsignedPtr(len);
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const b = p + i * 16;
+      out[i] = {
+        keyName: dv.getUint32(b, true),
+        keyType: dv.getUint32(b + 4, true),
+        valueType: dv.getUint32(b + 8, true),
+        isReadonly: dv.getUint8(b + 12) !== 0,
+      };
+    }
+    return out;
+  }
+
+  function liftTypePredicateData(dv, baseOffset) {
+    const b = toUnsignedPtr(baseOffset);
+    return {
+      paramName: dv.getUint32(b, true),
+      paramIndex: liftOptionU32(dv, b + 4, b + 8),
+      asserts: dv.getUint8(b + 12) !== 0,
+      targetType: liftOptionU32(dv, b + 16, b + 20),
+    };
+  }
+
+  function liftTupleElementList(dv, ptr, len) {
+    const p = toUnsignedPtr(ptr);
+    const n = toUnsignedPtr(len);
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const b = p + i * 16;
+      out[i] = {
+        label: liftOptionU32(dv, b, b + 4),
+        ty: dv.getUint32(b + 8, true),
+        optional: dv.getUint8(b + 12) !== 0,
+        variadic: dv.getUint8(b + 13) !== 0,
+      };
+    }
+    return out;
+  }
+
+  function liftModuleList(dv, ptr, len) {
+    const p = toUnsignedPtr(ptr);
+    const n = toUnsignedPtr(len);
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const b = p + i * 92;
+      const ambPtr = toUnsignedPtr(dv.getUint32(b + 52, true));
+      const ambLen = toUnsignedPtr(dv.getUint32(b + 56, true));
+      const ambientModules = new Array(ambLen);
+      for (let j = 0; j < ambLen; j++) {
+        const ab = ambPtr + j * 12;
+        ambientModules[j] = {
+          moduleName: dv.getUint32(ab, true),
+          decls: liftU32List(dv, dv.getUint32(ab + 4, true), dv.getUint32(ab + 8, true)),
+        };
+      }
+      out[i] = {
+        id: dv.getUint32(b, true),
+        specifier: dv.getUint32(b + 4, true),
+        filePath: dv.getUint32(b + 8, true),
+        exports: liftU32List(dv, dv.getUint32(b + 12, true), dv.getUint32(b + 16, true)),
+        defaultExport: liftOptionU32(dv, b + 20, b + 24),
+        exportEquals: liftOptionU32(dv, b + 28, b + 32),
+        umdNamespace: liftOptionU32(dv, b + 36, b + 40),
+        starReExports: liftU32List(dv, dv.getUint32(b + 44, true), dv.getUint32(b + 48, true)),
+        ambientModules,
+        globalAugmentations: liftU32List(
+          dv,
+          dv.getUint32(b + 60, true),
+          dv.getUint32(b + 64, true),
+        ),
+        tripleSlashTypes: liftU32List(dv, dv.getUint32(b + 68, true), dv.getUint32(b + 72, true)),
+        tripleSlashPaths: liftU32List(dv, dv.getUint32(b + 76, true), dv.getUint32(b + 80, true)),
+        tripleSlashLibs: liftU32List(dv, dv.getUint32(b + 84, true), dv.getUint32(b + 88, true)),
+      };
+    }
+    return out;
+  }
+
+  function liftDeclKind(dv, baseOffset) {
+    const b = toUnsignedPtr(baseOffset);
+    const tag = dv.getUint8(b + 32);
+    switch (tag) {
+      case 0:
+        return {
+          tag: "function-decl",
+          val: liftU32List(dv, dv.getUint32(b + 36, true), dv.getUint32(b + 40, true)),
+        };
+      case 1:
+        return { tag: "variable-decl", val: dv.getUint32(b + 36, true) };
+      case 2:
+        return {
+          tag: "interface-decl",
+          val: {
+            extendsClauses: liftHeritageClauseList(
+              dv,
+              dv.getUint32(b + 36, true),
+              dv.getUint32(b + 40, true),
+            ),
+            properties: liftU32List(dv, dv.getUint32(b + 44, true), dv.getUint32(b + 48, true)),
+            methods: liftMethodList(dv, dv.getUint32(b + 52, true), dv.getUint32(b + 56, true)),
+            callSignatures: liftU32List(dv, dv.getUint32(b + 60, true), dv.getUint32(b + 64, true)),
+            constructSignatures: liftU32List(
+              dv,
+              dv.getUint32(b + 68, true),
+              dv.getUint32(b + 72, true),
+            ),
+            indexSignatures: liftIndexSigList(
+              dv,
+              dv.getUint32(b + 76, true),
+              dv.getUint32(b + 80, true),
+            ),
+          },
+        };
+      case 3:
+        return {
+          tag: "class-decl",
+          val: {
+            extendsClause:
+              dv.getUint8(b + 36) === 1 ? liftHeritageClause(dv, b + 40) : null,
+            implementsClauses: liftHeritageClauseList(
+              dv,
+              dv.getUint32(b + 60, true),
+              dv.getUint32(b + 64, true),
+            ),
+            constructors: liftU32List(dv, dv.getUint32(b + 68, true), dv.getUint32(b + 72, true)),
+            properties: liftU32List(dv, dv.getUint32(b + 76, true), dv.getUint32(b + 80, true)),
+            methods: liftMethodList(dv, dv.getUint32(b + 84, true), dv.getUint32(b + 88, true)),
+            indexSignatures: liftIndexSigList(
+              dv,
+              dv.getUint32(b + 92, true),
+              dv.getUint32(b + 96, true),
+            ),
+          },
+        };
+      case 4:
+        return { tag: "type-alias-decl", val: dv.getUint32(b + 36, true) };
+      case 5: {
+        const isConst = dv.getUint8(b + 36) !== 0;
+        const memPtr = toUnsignedPtr(dv.getUint32(b + 40, true));
+        const memLen = toUnsignedPtr(dv.getUint32(b + 44, true));
+        const members = new Array(memLen);
+        for (let i = 0; i < memLen; i++) {
+          const mb = memPtr + i * 64;
+          members[i] = {
+            name: dv.getUint32(mb, true),
+            value: dv.getUint8(mb + 8) === 1 ? liftLiteralValue(dv, mb + 16) : null,
+            jsdoc: liftJsdocOption(dv, mb + 32),
+          };
+        }
+        return { tag: "enum-decl", val: { isConst, members } };
+      }
+      case 6:
+        return {
+          tag: "namespace-decl",
+          val: liftU32List(dv, dv.getUint32(b + 36, true), dv.getUint32(b + 40, true)),
+        };
+      case 7:
+        return {
+          tag: "import-equals-decl",
+          val: {
+            moduleSpecifier: liftOptionU32(dv, b + 36, b + 40),
+            entityPath: liftU32List(dv, dv.getUint32(b + 44, true), dv.getUint32(b + 48, true)),
+            targetDecl: liftOptionU32(dv, b + 52, b + 56),
+            isTypeOnly: dv.getUint8(b + 60) !== 0,
+          },
+        };
+      case 8:
+        return {
+          tag: "re-export-decl",
+          val: {
+            moduleSpecifier: dv.getUint32(b + 36, true),
+            sourceName: dv.getUint32(b + 40, true),
+            exportAlias: liftOptionU32(dv, b + 44, b + 48),
+            targetDecl: liftOptionU32(dv, b + 52, b + 56),
+            targetModule: liftOptionU32(dv, b + 60, b + 64),
+            isNamespace: dv.getUint8(b + 68) !== 0,
+            isTypeOnly: dv.getUint8(b + 69) !== 0,
+          },
+        };
+      default:
+        throw new Error(`Unknown decl-kind tag: ${tag}`);
+    }
+  }
+
+  function liftDeclList(dv, ptr, len) {
+    const p = toUnsignedPtr(ptr);
+    const n = toUnsignedPtr(len);
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const b = p + i * 140;
+      out[i] = {
+        id: dv.getUint32(b, true),
+        name: dv.getUint32(b + 4, true),
+        exportName: liftOptionU32(dv, b + 8, b + 12),
+        module: dv.getUint32(b + 16, true),
+        modifiers: dv.getUint16(b + 20, true),
+        typeParams: liftU32List(dv, dv.getUint32(b + 24, true), dv.getUint32(b + 28, true)),
+        kind: liftDeclKind(dv, b),
+        mergedWith: liftU32List(dv, dv.getUint32(b + 100, true), dv.getUint32(b + 104, true)),
+        jsdoc: liftJsdocOption(dv, b + 108),
+      };
+    }
+    return out;
+  }
+
+  function liftTypeKind(dv, baseOffset) {
+    const b = toUnsignedPtr(baseOffset);
+    const tag = dv.getUint8(b + 8);
+    if (tag in UNIT_TYPE_KINDS) {
+      return { tag: UNIT_TYPE_KINDS[tag], val: null };
+    }
+    switch (tag) {
+      case 11:
+        return { tag: "unique-symbol", val: dv.getUint32(b + 16, true) };
+      case 14:
+        return { tag: "literal", val: liftLiteralValue(dv, b + 16) };
+      case 15: {
+        const head = dv.getUint32(b + 16, true);
+        const spPtr = toUnsignedPtr(dv.getUint32(b + 20, true));
+        const spLen = toUnsignedPtr(dv.getUint32(b + 24, true));
+        const spans = new Array(spLen);
+        for (let i = 0; i < spLen; i++) {
+          const sb = spPtr + i * 8;
+          spans[i] = {
+            ty: dv.getUint32(sb, true),
+            literal: dv.getUint32(sb + 4, true),
+          };
+        }
+        return { tag: "template-literal", val: { head, spans } };
+      }
+      case 16:
+        return { tag: "array", val: dv.getUint32(b + 16, true) };
+      case 17:
+        return { tag: "readonly-array", val: dv.getUint32(b + 16, true) };
+      case 18:
+        return {
+          tag: "tuple",
+          val: liftTupleElementList(dv, dv.getUint32(b + 16, true), dv.getUint32(b + 20, true)),
+        };
+      case 19:
+        return {
+          tag: "readonly-tuple",
+          val: liftTupleElementList(dv, dv.getUint32(b + 16, true), dv.getUint32(b + 20, true)),
+        };
+      case 20:
+        return {
+          tag: "union-type",
+          val: liftU32List(dv, dv.getUint32(b + 16, true), dv.getUint32(b + 20, true)),
+        };
+      case 21:
+        return {
+          tag: "intersection",
+          val: liftU32List(dv, dv.getUint32(b + 16, true), dv.getUint32(b + 20, true)),
+        };
+      case 22:
+        return {
+          tag: "reference",
+          val: {
+            targetDecl: liftOptionU32(dv, b + 16, b + 20),
+            targetName: dv.getUint32(b + 24, true),
+            moduleSpecifier: liftOptionU32(dv, b + 28, b + 32),
+            typeArgs: liftU32List(dv, dv.getUint32(b + 36, true), dv.getUint32(b + 40, true)),
+          },
+        };
+      case 23:
+        return { tag: "type-param", val: dv.getUint32(b + 16, true) };
+      case 24:
+        return { tag: "infer-type", val: dv.getUint32(b + 16, true) };
+      case 25:
+        return { tag: "function-type", val: dv.getUint32(b + 16, true) };
+      case 26:
+        return { tag: "constructor-type", val: dv.getUint32(b + 16, true) };
+      case 27:
+        return {
+          tag: "object-literal",
+          val: {
+            properties: liftU32List(dv, dv.getUint32(b + 16, true), dv.getUint32(b + 20, true)),
+            callSignatures: liftU32List(dv, dv.getUint32(b + 24, true), dv.getUint32(b + 28, true)),
+            constructSignatures: liftU32List(
+              dv,
+              dv.getUint32(b + 32, true),
+              dv.getUint32(b + 36, true),
+            ),
+            indexSignatures: liftIndexSigList(
+              dv,
+              dv.getUint32(b + 40, true),
+              dv.getUint32(b + 44, true),
+            ),
+          },
+        };
+      case 28:
+        return { tag: "keyof-type", val: dv.getUint32(b + 16, true) };
+      case 29:
+        return {
+          tag: "typeof-query",
+          val: {
+            entityPath: liftU32List(dv, dv.getUint32(b + 16, true), dv.getUint32(b + 20, true)),
+            targetDecl: liftOptionU32(dv, b + 24, b + 28),
+            typeArgs: liftU32List(dv, dv.getUint32(b + 32, true), dv.getUint32(b + 36, true)),
+          },
+        };
+      case 30:
+        return {
+          tag: "indexed-access",
+          val: {
+            objectTy: dv.getUint32(b + 16, true),
+            indexTy: dv.getUint32(b + 20, true),
+          },
+        };
+      case 31:
+        return {
+          tag: "conditional",
+          val: {
+            checkType: dv.getUint32(b + 16, true),
+            extendsType: dv.getUint32(b + 20, true),
+            trueType: dv.getUint32(b + 24, true),
+            falseType: dv.getUint32(b + 28, true),
+            inferParams: liftU32List(dv, dv.getUint32(b + 32, true), dv.getUint32(b + 36, true)),
+          },
+        };
+      case 32: {
+        const roMod = dv.getUint8(b + 32);
+        const optMod = dv.getUint8(b + 33);
+        return {
+          tag: "mapped",
+          val: {
+            typeParam: dv.getUint32(b + 16, true),
+            nameType: liftOptionU32(dv, b + 20, b + 24),
+            valueType: dv.getUint32(b + 28, true),
+            readonlyModifier: MAPPED_MODIFIERS[roMod] ?? `unknown(${roMod})`,
+            optionalModifier: MAPPED_MODIFIERS[optMod] ?? `unknown(${optMod})`,
+          },
+        };
+      }
+      case 33:
+        return { tag: "type-predicate", val: liftTypePredicateData(dv, b + 16) };
+      case 34:
+        return {
+          tag: "import-type",
+          val: {
+            moduleSpecifier: dv.getUint32(b + 16, true),
+            qualifier: liftU32List(dv, dv.getUint32(b + 20, true), dv.getUint32(b + 24, true)),
+            typeArgs: liftU32List(dv, dv.getUint32(b + 28, true), dv.getUint32(b + 32, true)),
+            isTypeOf: dv.getUint8(b + 36) !== 0,
+          },
+        };
+      case 35:
+        return { tag: "intrinsic", val: dv.getUint32(b + 16, true) };
+      default:
+        throw new Error(`Unknown type-kind tag: ${tag}`);
+    }
+  }
+
+  function liftTypeList(dv, ptr, len) {
+    const p = toUnsignedPtr(ptr);
+    const n = toUnsignedPtr(len);
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const b = p + i * 56;
+      out[i] = {
+        id: dv.getUint32(b, true),
+        kind: liftTypeKind(dv, b),
+        resolvedType: liftOptionU32(dv, b + 48, b + 52),
+      };
+    }
+    return out;
+  }
+
+  function liftSignatureList(dv, ptr, len) {
+    const p = toUnsignedPtr(ptr);
+    const n = toUnsignedPtr(len);
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const b = p + i * 96;
+      const parPtr = toUnsignedPtr(dv.getUint32(b + 20, true));
+      const parLen = toUnsignedPtr(dv.getUint32(b + 24, true));
+      const params = new Array(parLen);
+      for (let j = 0; j < parLen; j++) {
+        const pb = parPtr + j * 12;
+        params[j] = {
+          name: dv.getUint32(pb, true),
+          ty: dv.getUint32(pb + 4, true),
+          optional: dv.getUint8(pb + 8) !== 0,
+          rest: dv.getUint8(pb + 9) !== 0,
+        };
+      }
+      out[i] = {
+        id: dv.getUint32(b, true),
+        typeParams: liftU32List(dv, dv.getUint32(b + 4, true), dv.getUint32(b + 8, true)),
+        thisParam: liftOptionU32(dv, b + 12, b + 16),
+        params,
+        returnType: dv.getUint32(b + 28, true),
+        typePredicate: dv.getUint8(b + 32) === 1 ? liftTypePredicateData(dv, b + 36) : null,
+        isAbstract: dv.getUint8(b + 60) !== 0,
+        jsdoc: liftJsdocOption(dv, b + 64),
+      };
+    }
+    return out;
+  }
+
+  function liftTypeParamList(dv, ptr, len) {
+    const p = toUnsignedPtr(ptr);
+    const n = toUnsignedPtr(len);
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const b = p + i * 28;
+      out[i] = {
+        id: dv.getUint32(b, true),
+        name: dv.getUint32(b + 4, true),
+        constraint: liftOptionU32(dv, b + 8, b + 12),
+        defaultType: liftOptionU32(dv, b + 16, b + 20),
+        isConst: dv.getUint8(b + 24) !== 0,
+        inVariance: dv.getUint8(b + 25) !== 0,
+        outVariance: dv.getUint8(b + 26) !== 0,
+      };
+    }
+    return out;
+  }
+
+  function liftPropList(dv, ptr, len) {
+    const p = toUnsignedPtr(ptr);
+    const n = toUnsignedPtr(len);
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const b = p + i * 68;
+      out[i] = {
+        id: dv.getUint32(b, true),
+        name: dv.getUint32(b + 4, true),
+        computedSymbol: liftSymbolKeyOption(dv, b + 8),
+        ty: dv.getUint32(b + 20, true),
+        setterTy: liftOptionU32(dv, b + 24, b + 28),
+        hasGetter: dv.getUint8(b + 32) !== 0,
+        hasSetter: dv.getUint8(b + 33) !== 0,
+        modifiers: dv.getUint16(b + 34, true),
+        jsdoc: liftJsdocOption(dv, b + 36),
+      };
+    }
+    return out;
+  }
+
+  function liftDeclarationGraph(buffer, dv, retPtr) {
+    const strings = liftStringList(
+      buffer,
+      dv,
+      dv.getUint32(retPtr + 4, true),
+      dv.getUint32(retPtr + 8, true),
+    );
+    const modules = liftModuleList(dv, dv.getUint32(retPtr + 12, true), dv.getUint32(retPtr + 16, true));
+    const entryModules = liftU32List(dv, dv.getUint32(retPtr + 20, true), dv.getUint32(retPtr + 24, true));
+    const decls = liftDeclList(dv, dv.getUint32(retPtr + 28, true), dv.getUint32(retPtr + 32, true));
+    const types = liftTypeList(dv, dv.getUint32(retPtr + 36, true), dv.getUint32(retPtr + 40, true));
+    const signatures = liftSignatureList(
+      dv,
+      dv.getUint32(retPtr + 44, true),
+      dv.getUint32(retPtr + 48, true),
+    );
+    const typeParams = liftTypeParamList(
+      dv,
+      dv.getUint32(retPtr + 52, true),
+      dv.getUint32(retPtr + 56, true),
+    );
+    const properties = liftPropList(
+      dv,
+      dv.getUint32(retPtr + 60, true),
+      dv.getUint32(retPtr + 64, true),
+    );
+    const diagnostics = liftDiagnosticList(
+      buffer,
+      dv,
+      dv.getUint32(retPtr + 68, true),
+      dv.getUint32(retPtr + 72, true),
+    );
+    return {
+      strings,
+      modules,
+      modulesLen: modules.length,
+      entryModules,
+      decls,
+      types,
+      signatures,
+      typeParams,
+      properties,
+      diagnostics,
+      str(id) {
+        return id == null ? null : strings[id];
+      },
     };
   }
 
@@ -760,28 +1405,9 @@ export function instantiateTypeScriptComponent(wasmPath) {
       const tag = dv.getUint8(retPtr);
       let outcome;
       if (tag === 0) {
-        const strings = liftStringList(
-          buffer,
-          dv,
-          dv.getUint32(retPtr + 4, true),
-          dv.getUint32(retPtr + 8, true),
-        );
-        const modulesLen = dv.getUint32(retPtr + 16, true);
-        const entryPtr = toUnsignedPtr(dv.getUint32(retPtr + 20, true));
-        const entryLen = toUnsignedPtr(dv.getUint32(retPtr + 24, true));
-        const entryModules = [];
-        for (let i = 0; i < entryLen; i++) {
-          entryModules.push(dv.getUint32(entryPtr + i * 4, true));
-        }
-        const diagnostics = liftDiagnosticList(
-          buffer,
-          dv,
-          dv.getUint32(retPtr + 68, true),
-          dv.getUint32(retPtr + 72, true),
-        );
         outcome = {
           ok: true,
-          value: { strings, modulesLen, entryModules, diagnostics },
+          value: liftDeclarationGraph(buffer, dv, retPtr),
         };
       } else {
         const diagnostics = liftDiagnosticList(
