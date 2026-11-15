@@ -472,4 +472,84 @@ describe("TypeScript 7.1-next Go WASM Component (zigar:typescript@7.1.0)", () =>
       vfs.drop();
     }
   });
+
+  it("resolves `this` type annotations, instance/static `this` expressions, and `super` expressions accurately", () => {
+    const vfs = ts.createVfs(true);
+    try {
+      const source = [
+        "export class Foo {",
+        "  m(): this {",
+        "    return this;",
+        "  }",
+        "  static s() {",
+        "    return this;",
+        "  }",
+        "}",
+        "export class B extends Foo {",
+        "  q() {",
+        "    return super.m();",
+        "  }",
+        "}",
+        "",
+      ].join("\n");
+
+      vfs.writeFile("/this-super.ts", source);
+      const progRes = ts.createProgram(vfs, ["/this-super.ts"], {
+        target: "es2024",
+        module: "esnext",
+        moduleResolution: "bundler",
+        strict: true,
+      });
+      assert.equal(progRes.ok, true);
+
+      const program = progRes.value;
+      try {
+        assert.deepEqual(program.getSemanticDiagnostics(), []);
+
+        const checker = program.getChecker();
+        try {
+          const byteOffsetOf = (needle, tokenWithinNeedle = "") => {
+            const baseIdx = source.indexOf(needle);
+            assert.notEqual(baseIdx, -1, `missing needle: ${needle}`);
+            const subIdx = tokenWithinNeedle ? needle.indexOf(tokenWithinNeedle) : 0;
+            assert.notEqual(subIdx, -1, `missing token ${tokenWithinNeedle} in ${needle}`);
+            return Buffer.byteLength(source.slice(0, baseIdx + subIdx), "utf8");
+          };
+
+          // 1. `: this` return type annotation in `m(): this` -> `"this"` (NOT `"typeof Foo"`)
+          const thisTypeOffset = byteOffsetOf("m(): this", "this");
+          assert.equal(checker.typeToString("/this-super.ts", thisTypeOffset), "this");
+          assert.equal(checker.inspectTypeAt("/this-super.ts", thisTypeOffset)?.typeText, "this");
+          assert.equal(checker.inspectSymbolAt("/this-super.ts", thisTypeOffset)?.typeText, "this");
+
+          // 2. `return this;` in instance method `m()` -> `"this"`
+          const instThisOffset = byteOffsetOf("m(): this {\n    return this;", "return this;") + "return ".length;
+          assert.equal(checker.typeToString("/this-super.ts", instThisOffset), "this");
+          assert.equal(checker.inspectTypeAt("/this-super.ts", instThisOffset)?.typeText, "this");
+          assert.equal(checker.inspectSymbolAt("/this-super.ts", instThisOffset)?.typeText, "this");
+
+          // 3. `return this;` in static method `static s()` -> `"typeof Foo"`
+          const staticThisOffset = byteOffsetOf("static s() {\n    return this;", "return this;") + "return ".length;
+          assert.equal(checker.typeToString("/this-super.ts", staticThisOffset), "typeof Foo");
+          assert.equal(checker.inspectTypeAt("/this-super.ts", staticThisOffset)?.typeText, "typeof Foo");
+          assert.equal(checker.inspectSymbolAt("/this-super.ts", staticThisOffset)?.typeText, "typeof Foo");
+
+          // 4. `super` in derived instance method `q() { return super.m(); }` -> `"Foo"`
+          const superOffset = byteOffsetOf("super.m()", "super");
+          assert.equal(checker.typeToString("/this-super.ts", superOffset), "Foo");
+          assert.equal(checker.inspectTypeAt("/this-super.ts", superOffset)?.typeText, "Foo");
+          const superSym = checker.inspectSymbolAt("/this-super.ts", superOffset);
+          assert.ok(superSym);
+          assert.equal(superSym.name, "Foo");
+          assert.equal(superSym.typeText, "Foo");
+        } finally {
+          checker.drop();
+        }
+      } finally {
+        program.drop();
+      }
+    } finally {
+      vfs.drop();
+    }
+  });
 });
