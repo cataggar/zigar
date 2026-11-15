@@ -151,7 +151,75 @@ pub fn build(b: *std.Build) void {
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
-    const test_step = b.step("test", "Verify typescript.wit codegen, Canonical ABI, and wasm32/wasm64 cross-compilation");
+    // Reproducible TypeScript 7.1-next Go WASM Component build step (`zig build component`)
+    const component_wasm_rel = "component/dist/typescript-compiler.component.wasm";
+    const build_component_cmd = b.addSystemCommand(&.{
+        "node",
+        "component/build-component.mjs",
+        "-o",
+        component_wasm_rel,
+    });
+    build_component_cmd.setCwd(b.path(""));
+    const component_step = b.step("component", "Build TypeScript 7.1-next Go WASM Component via componentize-go");
+    component_step.dependOn(&build_component_cmd.step);
+
+    // Optional component loader check inside `zig build test` (validates `.component.wasm` whenever built)
+    const opt_comp_opts = b.addOptions();
+    opt_comp_opts.addOption([]const u8, "component_wasm_path", component_wasm_rel);
+    opt_comp_opts.addOption(bool, "require_component", false);
+
+    const opt_comp_test_mod = b.createModule(.{
+        .root_source_file = b.path("test/component_loader_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+    });
+    opt_comp_test_mod.addImport("wit_zigar", wit_zigar_mod);
+    opt_comp_test_mod.addOptions("build_options", opt_comp_opts);
+
+    const opt_comp_tests = b.addTest(.{
+        .root_module = opt_comp_test_mod,
+        .use_llvm = use_llvm,
+    });
+    const run_opt_comp_tests = b.addRunArtifact(opt_comp_tests);
+    run_opt_comp_tests.setCwd(b.path(""));
+
+    // Dedicated strict component validation + Node.js 26 integration test step (`zig build test-component`)
+    const req_comp_opts = b.addOptions();
+    req_comp_opts.addOption([]const u8, "component_wasm_path", component_wasm_rel);
+    req_comp_opts.addOption(bool, "require_component", true);
+
+    const req_comp_test_mod = b.createModule(.{
+        .root_source_file = b.path("test/component_loader_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+    });
+    req_comp_test_mod.addImport("wit_zigar", wit_zigar_mod);
+    req_comp_test_mod.addOptions("build_options", req_comp_opts);
+
+    const req_comp_tests = b.addTest(.{
+        .root_module = req_comp_test_mod,
+        .use_llvm = use_llvm,
+    });
+    const run_req_comp_tests = b.addRunArtifact(req_comp_tests);
+    run_req_comp_tests.setCwd(b.path(""));
+    run_req_comp_tests.step.dependOn(&build_component_cmd.step);
+
+    const run_node_comp_tests = b.addSystemCommand(&.{
+        "node",
+        "--test",
+        "component/test/component.test.mjs",
+    });
+    run_node_comp_tests.setCwd(b.path(""));
+    run_node_comp_tests.step.dependOn(&build_component_cmd.step);
+
+    const test_component_step = b.step("test-component", "Build and validate typescript-compiler.component.wasm with wit-zigar and Node.js 26");
+    test_component_step.dependOn(&run_req_comp_tests.step);
+    test_component_step.dependOn(&run_node_comp_tests.step);
+
+    const test_step = b.step("test", "Verify typescript.wit codegen, Canonical ABI, wasm32/wasm64 cross-compilation, and component loader");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&wasm_check_files.step);
+    test_step.dependOn(&run_opt_comp_tests.step);
 }

@@ -1,0 +1,386 @@
+import assert from "node:assert/strict";
+import path from "node:path";
+import { describe, it, before } from "node:test";
+import { fileURLToPath } from "node:url";
+import vm from "node:vm";
+
+import {
+  instantiateTypeScriptComponent,
+  sliceMemoryU8,
+  toUnsignedPtr,
+  wrapWasiImportsUnsigned,
+} from "./wasi-component-runner.mjs";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const defaultWasmPath = path.resolve(
+  __dirname,
+  "..",
+  "dist",
+  "typescript-compiler.component.wasm",
+);
+const wasmPath = process.env.TS_ZIGAR_COMPONENT_WASM
+  ? path.resolve(process.env.TS_ZIGAR_COMPONENT_WASM)
+  : defaultWasmPath;
+
+describe("WASI & Canonical ABI >= 2 GiB (0x8000_0000) unsigned pointer safety", () => {
+  it("converts negative signed i32 pointers (>= 2 GiB) via >>> 0 without RangeError", () => {
+    // 0x8000_0000 as signed i32 is -2147483648
+    const signedTwoGiB = 0x8000_0000 | 0;
+    assert.equal(signedTwoGiB, -2147483648);
+    assert.equal(toUnsignedPtr(signedTwoGiB), 0x8000_0000);
+    assert.equal(toUnsignedPtr(signedTwoGiB), 2147483648);
+
+    // 0xffff_fff0 as signed i32 is -16
+    const signedNearFourGiB = 0xffff_fff0 | 0;
+    assert.equal(signedNearFourGiB, -16);
+    assert.equal(toUnsignedPtr(signedNearFourGiB), 0xffff_fff0);
+    assert.equal(toUnsignedPtr(-1), 0xffff_ffff);
+  });
+
+  it("wraps WASI preview1 syscalls so >= 2 GiB pointer args arrive as unsigned u32", () => {
+    const capturedCalls = [];
+    const mockRawWasi = {
+      fd_write(fd, iovsPtr, iovsLen, nwrittenPtr) {
+        capturedCalls.push({ fn: "fd_write", fd, iovsPtr, iovsLen, nwrittenPtr });
+        assert.ok(iovsPtr >= 0, "iovsPtr must not be negative");
+        assert.ok(nwrittenPtr >= 0, "nwrittenPtr must not be negative");
+        return 0;
+      },
+      clock_time_get(clockId, precisionBigInt, timePtr) {
+        capturedCalls.push({ fn: "clock_time_get", clockId, precisionBigInt, timePtr });
+        assert.equal(typeof precisionBigInt, "bigint");
+        assert.ok(timePtr >= 0, "timePtr must not be negative");
+        return 0;
+      },
+    };
+
+    const wrapped = wrapWasiImportsUnsigned(mockRawWasi);
+    assert.equal(typeof wrapped["fd_write [v2]"], "function");
+    assert.equal(typeof wrapped.adapter_monotonic_clock_set_paused, "function");
+
+    // Simulate Wasm passing i32 pointers at 0x8000_0000 (-2147483648) and 0x8000_0030 (-2147483600)
+    wrapped.fd_write(1, 0x8000_0000 | 0, 2, 0x8000_0030 | 0);
+    wrapped["fd_write [v2]"](2, 0x9000_1000 | 0, 1, 0x9000_1010 | 0);
+    wrapped.clock_time_get(1, 1000n, 0xa000_0000 | 0);
+
+    assert.equal(capturedCalls.length, 3);
+    assert.deepEqual(capturedCalls[0], {
+      fn: "fd_write",
+      fd: 1,
+      iovsPtr: 0x8000_0000,
+      iovsLen: 2,
+      nwrittenPtr: 0x8000_0030,
+    });
+    assert.deepEqual(capturedCalls[1], {
+      fn: "fd_write",
+      fd: 2,
+      iovsPtr: 0x9000_1000,
+      iovsLen: 1,
+      nwrittenPtr: 0x9000_1010,
+    });
+    assert.deepEqual(capturedCalls[2], {
+      fn: "clock_time_get",
+      clockId: 1,
+      precisionBigInt: 1000n,
+      timePtr: 0xa000_0000,
+    });
+  });
+
+  it("slices a > 2 GiB WebAssembly.Memory at signed i32 offset -2147483648 (0x8000_0000)", () => {
+    // 32,769 pages * 64 KiB = 2 GiB + 64 KiB
+    const largeMem = new WebAssembly.Memory({ initial: 32769, maximum: 32770 });
+    const signedOffset = 0x8000_0000 | 0; // -2147483648 as signed i32
+    assert.equal(signedOffset, -2147483648);
+
+    // Direct `new Uint8Array(largeMem.buffer, signedOffset, 5)` throws RangeError in JS,
+    // whereas `sliceMemoryU8` converts via `>>> 0` and succeeds cleanly.
+    assert.throws(() => new Uint8Array(largeMem.buffer, signedOffset, 5), RangeError);
+
+    const payload = new TextEncoder().encode("zigar-2gib-ok");
+    const writeSlice = sliceMemoryU8(largeMem.buffer, signedOffset, payload.byteLength);
+    writeSlice.set(payload);
+
+    const readBack = new TextDecoder().decode(
+      sliceMemoryU8(largeMem.buffer, signedOffset, payload.byteLength),
+    );
+    assert.equal(readBack, "zigar-2gib-ok");
+  });
+});
+
+describe("TypeScript 7.1-next Go WASM Component (zigar:typescript@7.1.0)", () => {
+  let ts;
+
+  before(() => {
+    ts = instantiateTypeScriptComponent(wasmPath);
+  });
+
+  it("exposes expected component interfaces and reports TypeScript 7.1 compiler-version()", () => {
+    assert.ok(ts.componentExports.includes("zigar:typescript/types@7.1.0"));
+    assert.ok(ts.componentExports.includes("zigar:typescript/compiler@7.1.0"));
+    assert.ok(ts.componentExports.includes("zigar:typescript/extractor@7.1.0"));
+
+    const version = ts.compilerVersion();
+    assert.match(version, /^7\.1\./);
+  });
+
+  it("supports resource vfs CRUD operations and bundled lib.*.d.ts mounting", () => {
+    const vfsNoLibs = ts.createVfs(false);
+    try {
+      assert.equal(vfsNoLibs.fileExists("/index.ts"), false);
+      assert.equal(vfsNoLibs.readFile("/index.ts"), null);
+
+      vfsNoLibs.writeFile("/src/a.ts", "export const a = 1;\n");
+      vfsNoLibs.writeFile("/src/b.ts", "export const b = 2;\n");
+
+      assert.equal(vfsNoLibs.fileExists("/src/a.ts"), true);
+      assert.equal(vfsNoLibs.readFile("/src/a.ts"), "export const a = 1;\n");
+      assert.deepEqual(vfsNoLibs.listFiles("/src"), ["/src/a.ts", "/src/b.ts"]);
+
+      assert.equal(vfsNoLibs.deleteFile("/src/a.ts"), true);
+      assert.equal(vfsNoLibs.deleteFile("/src/a.ts"), false);
+      assert.equal(vfsNoLibs.fileExists("/src/a.ts"), false);
+      assert.deepEqual(vfsNoLibs.listFiles("/src"), ["/src/b.ts"]);
+    } finally {
+      vfsNoLibs.drop();
+    }
+  });
+
+  it("reports semantic diagnostics with accurate source spans using bundled libs", () => {
+    const vfs = ts.createVfs(true);
+    try {
+      const brokenSource = [
+        "export interface User { id: number; name: string; }",
+        'export function greet(u: User) { return "hi " + u.name; }',
+        'const bad: number = "oops";',
+        "",
+      ].join("\n");
+
+      vfs.writeFile("/index.ts", brokenSource);
+      const progRes = ts.createProgram(vfs, ["/index.ts"], {
+        target: "es2024",
+        module: "esnext",
+        moduleResolution: "bundler",
+        strict: true,
+      });
+      assert.equal(progRes.ok, true);
+
+      const program = progRes.value;
+      try {
+        assert.deepEqual(program.getRootFiles(), ["/index.ts"]);
+        assert.deepEqual(program.getSyntacticDiagnostics(), []);
+
+        const semDiags = program.getSemanticDiagnostics("/index.ts");
+        assert.equal(semDiags.length, 1);
+        const [diag] = semDiags;
+        assert.equal(diag.code, 2322);
+        assert.equal(diag.category, "error");
+        assert.match(diag.message, /Type 'string' is not assignable to type 'number'/);
+        assert.ok(diag.span);
+        assert.equal(diag.span.fileName, "/index.ts");
+        assert.equal(diag.span.line, 3);
+        assert.ok(diag.span.column >= 1);
+        assert.equal(
+          brokenSource.slice(diag.span.start, diag.span.start + diag.span.length),
+          "bad",
+        );
+      } finally {
+        program.drop();
+      }
+    } finally {
+      vfs.drop();
+    }
+  });
+
+  it("resolves types, symbols, module exports, and emits .d.ts declarations on a clean program", () => {
+    const vfs = ts.createVfs(true);
+    try {
+      const cleanSource = [
+        "export interface User {",
+        "  id: number;",
+        "  name: string;",
+        "}",
+        "",
+        "/** Greets a user by name. */",
+        "export function greet(u: User) {",
+        '  return "hi " + u.name;',
+        "}",
+        "",
+      ].join("\n");
+
+      vfs.writeFile("/index.ts", cleanSource);
+      const progRes = ts.createProgram(vfs, ["/index.ts"], {
+        target: "es2024",
+        module: "esnext",
+        moduleResolution: "bundler",
+        strict: true,
+        declaration: true,
+      });
+      assert.equal(progRes.ok, true);
+
+      const program = progRes.value;
+      try {
+        assert.deepEqual(program.getSyntacticDiagnostics(), []);
+        assert.deepEqual(program.getSemanticDiagnostics(), []);
+        assert.deepEqual(program.getGlobalDiagnostics(), []);
+
+        const greetOffset = Buffer.byteLength(
+          cleanSource.slice(0, cleanSource.indexOf("greet(")),
+          "utf8",
+        );
+
+        const checker = program.getChecker();
+        try {
+          const typeStr = checker.typeToString("/index.ts", greetOffset);
+          assert.equal(typeStr, "(u: User) => string");
+
+          const typeInfo = checker.inspectTypeAt("/index.ts", greetOffset);
+          assert.ok(typeInfo);
+          assert.equal(typeInfo.typeText, "(u: User) => string");
+          assert.ok(typeInfo.typeFlags > 0);
+          assert.equal(typeInfo.isUnion, false);
+
+          const symInfo = checker.inspectSymbolAt("/index.ts", greetOffset);
+          assert.ok(symInfo);
+          assert.equal(symInfo.name, "greet");
+          assert.equal(symInfo.typeText, "(u: User) => string");
+          assert.match(symInfo.documentation ?? "", /Greets a user by name/);
+          assert.ok(symInfo.declarationSpan);
+          assert.equal(symInfo.declarationSpan.fileName, "/index.ts");
+
+          const exportsList = checker.resolveModuleExports("/index.ts");
+          const exportNames = exportsList.map((s) => s.name).sort();
+          assert.deepEqual(exportNames, ["User", "greet"]);
+        } finally {
+          checker.drop();
+        }
+
+        // Verify .d.ts declaration emit in memory
+        const emitRes = program.emitDeclarations();
+        assert.equal(emitRes.emitSkipped, false);
+        assert.deepEqual(emitRes.diagnostics, []);
+        const dtsFile = emitRes.outputFiles.find((f) => f.fileName === "/index.d.ts");
+        assert.ok(dtsFile, "Expected /index.d.ts in emit output");
+        assert.match(dtsFile.contents, /export interface User/);
+        assert.match(dtsFile.contents, /export declare function greet\(u: User\): string;/);
+
+        // Verify modular extractor interface wiring
+        const graphRes = ts.extractModuleGraph(program, { rootFiles: ["/index.ts"] });
+        assert.equal(graphRes.ok, true);
+        assert.equal(graphRes.value.modulesLen, 1);
+        assert.equal(graphRes.value.entryModules.length, 1);
+        assert.ok(graphRes.value.strings.includes("/index.ts"));
+      } finally {
+        program.drop();
+      }
+    } finally {
+      vfs.drop();
+    }
+  });
+
+  it("transpiles single-file TypeScript modules to executable JavaScript via transpile-module", () => {
+    const tsCode = [
+      "interface Point { x: number; y: number }",
+      "export function normSq(p: Point): number {",
+      "  return p.x * p.x + p.y * p.y;",
+      "}",
+    ].join("\n");
+
+    const res = ts.transpileModule(tsCode, "/point.ts");
+    assert.equal(res.emitSkipped, false);
+    assert.deepEqual(res.diagnostics, []);
+    const jsFile = res.outputFiles.find((f) => f.fileName.endsWith(".js"));
+    assert.ok(jsFile, "Expected emitted .js file");
+    assert.ok(!jsFile.contents.includes("interface Point"));
+
+    // Strip `export ` to evaluate function body directly in Node VM
+    const runnable = `${jsFile.contents.replace(/^export\s+/gm, "")}\nnormSq({ x: 3, y: 4 });`;
+    const result = vm.runInNewContext(runnable);
+    assert.equal(result, 25);
+  });
+
+  it("supports multi-file imports, ES2024 bundled lib globals, and syntactic/error edge cases", () => {
+    const vfs = ts.createVfs(true);
+    try {
+      vfs.writeFile(
+        "/models.ts",
+        "export interface Item { readonly sku: string; price: number }\n",
+      );
+      const serviceSource = [
+        'import type { Item } from "./models";',
+        "export async function indexBySku(items: Item[]): Promise<Map<string, Item>> {",
+        "  return new Map(items.map((it) => [it.sku, it]));",
+        "}",
+        "",
+      ].join("\n");
+      vfs.writeFile("/service.ts", serviceSource);
+
+      const progRes = ts.createProgram(vfs, ["/service.ts"], {
+        target: "es2024",
+        module: "esnext",
+        moduleResolution: "bundler",
+        strict: true,
+        declaration: true,
+      });
+      assert.equal(progRes.ok, true);
+
+      const program = progRes.value;
+      try {
+        assert.deepEqual(program.getSemanticDiagnostics(), []);
+        assert.deepEqual(program.getGlobalDiagnostics(), []);
+
+        const checker = program.getChecker();
+        try {
+          const fnOffset = Buffer.byteLength(
+            serviceSource.slice(0, serviceSource.indexOf("indexBySku(")),
+            "utf8",
+          );
+          assert.equal(
+            checker.typeToString("/service.ts", fnOffset),
+            "(items: Item[]) => Promise<Map<string, Item>>",
+          );
+          // Relative specifier resolution via program resolved modules
+          const modelExports = checker.resolveModuleExports("./models");
+          assert.deepEqual(modelExports.map((e) => e.name), ["Item"]);
+        } finally {
+          checker.drop();
+        }
+
+        const singleEmit = program.emitDeclarations("/service.ts");
+        assert.equal(singleEmit.emitSkipped, false);
+        assert.equal(singleEmit.outputFiles.length, 1);
+        assert.equal(singleEmit.outputFiles[0].fileName, "/service.d.ts");
+        assert.match(
+          singleEmit.outputFiles[0].contents,
+          /export declare function indexBySku\(items: Item\[\]\): Promise<Map<string, Item>>;/,
+        );
+
+        // Missing entry module in extractor returns structured diagnostic error
+        const badGraph = ts.extractModuleGraph(program, { rootFiles: ["/does-not-exist.ts"] });
+        assert.equal(badGraph.ok, false);
+        assert.ok(badGraph.error.length >= 1);
+      } finally {
+        program.drop();
+      }
+
+      // Syntactic error reporting + empty root-files rejection
+      vfs.writeFile("/broken-syntax.ts", "export const x: = ;\n");
+      const synProgRes = ts.createProgram(vfs, ["/broken-syntax.ts"], { strict: true });
+      assert.equal(synProgRes.ok, true);
+      try {
+        const synDiags = synProgRes.value.getSyntacticDiagnostics("/broken-syntax.ts");
+        assert.ok(synDiags.length >= 1);
+        assert.equal(synDiags[0].category, "error");
+        assert.equal(synDiags[0].span?.fileName, "/broken-syntax.ts");
+      } finally {
+        synProgRes.value.drop();
+      }
+
+      const emptyRootsRes = ts.createProgram(vfs, [], { strict: true });
+      assert.equal(emptyRootsRes.ok, false);
+      assert.ok(emptyRootsRes.error.length >= 1);
+    } finally {
+      vfs.drop();
+    }
+  });
+});
