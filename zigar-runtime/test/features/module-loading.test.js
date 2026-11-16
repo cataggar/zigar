@@ -761,6 +761,97 @@ describe('Feature: module-loading', function() {
         env.suspendedContinuationCount = 1;
         expect(() => env.runWithContinuation(() => {})).to.throw('Concurrent JSPI calls require __stack_pointer export');
       })
+      it('should serialize same-microtask JSPI fiber resumptions so activeContinuation and __stack_pointer never cross', async function() {
+        const env = new Env();
+        let nextAddr = 0x10000;
+        env.memory = new WebAssembly.Memory({ initial: 8 });
+        env.allocateScratchMemory = (size) => {
+          const addr = nextAddr;
+          nextAddr += size;
+          return addr;
+        };
+        env.freeScratchMemory = () => {};
+        env.stackPointerGlobal = new WebAssembly.Global({ value: 'i32', mutable: true }, 0x8000);
+        env.initialStackPointer = 0x8000;
+
+        // Simulate wrapSuspending's core promise resumption behavior without WA.Suspending wrapper
+        // by exercising wrapSuspending directly when WA.Suspending is absent or mocking WA.Suspending
+        const origSuspending = WebAssembly.Suspending;
+        try {
+          // Temporarily stub WebAssembly.Suspending to pass through wrapper for deterministic unit simulation
+          Object.defineProperty(WebAssembly, 'Suspending', {
+            value: function(fn) { return fn; },
+            configurable: true,
+            writable: true,
+          });
+          const suspendingImport = env.wrapSuspending((p) => p);
+
+          const frameA = { id: 'A', hasPendingHostError: false, pendingHostError: undefined };
+          const frameB = { id: 'B', hasPendingHostError: false, pendingHostError: undefined };
+          const frameC = { id: 'C', hasPendingHostError: false, pendingHostError: undefined };
+
+          let resolveTick;
+          const sharedTick = new Promise((r) => { resolveTick = r; });
+
+          const startSimulatedFiber = (errorFrame, spOffset, onResume) => {
+            env.activeHostErrorFrame = errorFrame;
+            let capturedCont;
+            let resolveOuter, rejectOuter;
+            const outerPromise = new Promise((res, rej) => {
+              resolveOuter = res;
+              rejectOuter = rej;
+            });
+            const contPromise = env.runWithContinuation(() => {
+              capturedCont = env.activeContinuation;
+              env.stackPointerGlobal.value = capturedCont.sp - spOffset;
+              const expectedSp = env.stackPointerGlobal.value;
+              const resumePromise = suspendingImport(sharedTick);
+              resumePromise.then(() => {
+                // Inside "WASM resume": activeContinuation and __stack_pointer MUST belong to THIS fiber!
+                try {
+                  expect(env.activeContinuation).to.equal(capturedCont);
+                  expect(env.activeContinuation.hostErrorFrame).to.equal(errorFrame);
+                  expect(env.stackPointerGlobal.value).to.equal(expectedSp);
+                  resolveOuter(onResume());
+                } catch (err) {
+                  rejectOuter(err);
+                }
+              }, rejectOuter);
+              return outerPromise;
+            });
+            env.activeHostErrorFrame = null;
+            return { contPromise, getCont: () => capturedCont };
+          };
+
+          const fiberA = startSimulatedFiber(frameA, 64, () => {
+            env.recordPendingHostError(new Error('boom-from-A'));
+            return 'done-A';
+          });
+          const fiberB = startSimulatedFiber(frameB, 128, () => 'done-B');
+          const fiberC = startSimulatedFiber(frameC, 192, () => 'done-C');
+
+          // Abort fiberB before sharedTick resolves to verify finished waiters are cleanly skipped
+          const fiberAborted = startSimulatedFiber({ id: 'aborted' }, 256, () => 'unreachable');
+          fiberAborted.getCont().finish();
+
+          // Resolve all fibers in the exact same microtask tick!
+          resolveTick('go');
+          const results = await Promise.all([ fiberA.contPromise, fiberB.contPromise, fiberC.contPromise ]);
+          expect(results).to.deep.equal([ 'done-A', 'done-B', 'done-C' ]);
+          expect(frameA.hasPendingHostError).to.be.true;
+          expect(frameA.pendingHostError.message).to.equal('boom-from-A');
+          expect(frameB.hasPendingHostError).to.be.false;
+          expect(frameC.hasPendingHostError).to.be.false;
+          expect(env.resumingContinuation).to.be.null;
+          expect(env.stackPointerGlobal.value).to.equal(0x8000);
+        } finally {
+          Object.defineProperty(WebAssembly, 'Suspending', {
+            value: origSuspending,
+            configurable: true,
+            writable: true,
+          });
+        }
+      })
       it('should selectively wrap WASI imports based on jspiMode and customWASI', async function() {
         if (typeof WebAssembly.Suspending !== 'function' || typeof WebAssembly.promising !== 'function') {
           this.skip();

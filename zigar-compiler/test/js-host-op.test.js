@@ -93,6 +93,7 @@ describe('Table-Driven JS Host-Op Dispatcher & Dynamic Zig Callbacks (WASM32 / W
 
   const targets = [
     { label: 'wasm32 (useWazig=true)', memory64: false, useWazig: true, useJSPI: false },
+    { label: 'wasm32 (useWazig=true, JSPI)', memory64: false, useWazig: true, useJSPI: true },
     { label: 'wasm64 (useWazig=true, JSPI)', memory64: true, useWazig: true, useJSPI: true },
     { label: 'wasm32 (useWazig=false)', memory64: false, useWazig: false, useJSPI: false },
     { label: 'wasm64 (useWazig=false)', memory64: true, useWazig: false, useJSPI: false },
@@ -392,6 +393,105 @@ describe('Table-Driven JS Host-Op Dispatcher & Dynamic Zig Callbacks (WASM32 / W
         }
         expect(Number(mod.activeHandles())).to.equal(0);
       });
+
+      it('should release live Ref(T), composite struct/union Refs, and Callback Refs returned after an infallible throw', async function() {
+        for (let i = 0; i < 40; i++) {
+          let err1 = null;
+          try {
+            await mod.returnRefAfterThrow(() => {
+              throw new Error(`ref-boom-${i}`);
+            });
+          } catch (err) {
+            err1 = err;
+          }
+          expect(err1?.message).to.equal(`ref-boom-${i}`);
+
+          let err2 = null;
+          try {
+            await mod.returnStructRefAfterThrow(() => {
+              throw new Error(`struct-ref-boom-${i}`);
+            });
+          } catch (err) {
+            err2 = err;
+          }
+          expect(err2?.message).to.equal(`struct-ref-boom-${i}`);
+
+          let err3 = null;
+          try {
+            await mod.returnUnionRefAfterThrow(() => {
+              throw new Error(`union-ref-boom-${i}`);
+            });
+          } catch (err) {
+            err3 = err;
+          }
+          expect(err3?.message).to.equal(`union-ref-boom-${i}`);
+        }
+        expect(Number(mod.activeHandles())).to.equal(0);
+
+        const cbFn = await mod.createRefAfterThrowCallback();
+        for (let i = 0; i < 20; i++) {
+          expect(() => cbFn(() => {
+            throw new Error(`cb-ref-boom-${i}`);
+          })).to.throw(`cb-ref-boom-${i}`);
+        }
+        expect(cbFn(() => 1)).to.equal(Math);
+        await mod.deinitRefAfterThrowCallback();
+        expect(Number(mod.activeCallbacks())).to.equal(0);
+        expect(Number(mod.activeHandles())).to.equal(0);
+      });
+
+      if (target.useJSPI) {
+        it('should route pending host errors and __stack_pointer to the right JSPI fiber across 220+ same-microtask resumptions', async function() {
+          if (!debugEnv.useJSPI) {
+            this.skip();
+          }
+          const spBefore = debugEnv.stackPointerGlobal?.value;
+          const step1A = async () => 1;
+          const step1B = async () => 1;
+          const step1C = async () => 5;
+          const step2C = async () => 6;
+          const step1D = async () => 10;
+          const step2D = async () => 20;
+          for (let i = 0; i < 220; i++) {
+            const pA = mod.suspendThenCall(
+              step1A,
+              () => {
+                throw new Error(`fiber-A-${i}`);
+              },
+            );
+            const pB = mod.suspendThenCall(
+              step1B,
+              () => 2,
+            );
+            const pC = mod.doubleSuspendThenCall(
+              step1C,
+              step2C,
+              () => {
+                throw new Error(`fiber-C-${i}`);
+              },
+            );
+            const pD = mod.doubleSuspendThenCall(
+              step1D,
+              step2D,
+              () => 7,
+            );
+            const [ rA, rB, rC, rD ] = await Promise.allSettled([ pA, pB, pC, pD ]);
+            expect(rA.status).to.equal('rejected');
+            expect(rA.reason?.message).to.equal(`fiber-A-${i}`);
+            expect(rB.status).to.equal('fulfilled');
+            expect(rB.value).to.equal(3);
+            expect(rC.status).to.equal('rejected');
+            expect(rC.reason?.message).to.equal(`fiber-C-${i}`);
+            expect(rD.status).to.equal('fulfilled');
+            expect(rD.value).to.equal(37);
+          }
+          if (spBefore !== undefined) {
+            expect(debugEnv.stackPointerGlobal.value).to.equal(spBefore);
+          }
+          expect(debugEnv.resumingContinuation).to.be.null;
+          expect(Number(mod.activeHandles())).to.equal(0);
+        });
+      }
     });
   }
 });

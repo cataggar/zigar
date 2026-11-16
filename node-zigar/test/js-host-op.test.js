@@ -294,4 +294,30 @@ describe('Native JS Host-Op Dispatcher & Dynamic Zig Callbacks Integration', fun
     expect(tracker.deferRuns).to.equal(60);
     expect(Number(mod.activeHandles())).to.equal(0);
   });
+
+  it('should release live Ref(T), composite struct/union Refs, and Callback Refs returned after an infallible throw on native N-API', function() {
+    for (let i = 0; i < 40; i++) {
+      expect(() => mod.returnRefAfterThrow(() => {
+        throw new Error(`ref-boom-${i}`);
+      })).to.throw(`ref-boom-${i}`);
+      expect(() => mod.returnStructRefAfterThrow(() => {
+        throw new Error(`struct-ref-boom-${i}`);
+      })).to.throw(`struct-ref-boom-${i}`);
+      expect(() => mod.returnUnionRefAfterThrow(() => {
+        throw new Error(`union-ref-boom-${i}`);
+      })).to.throw(`union-ref-boom-${i}`);
+    }
+    expect(Number(mod.activeHandles())).to.equal(0);
+
+    const cbFn = mod.createRefAfterThrowCallback();
+    for (let i = 0; i < 20; i++) {
+      expect(() => cbFn(() => {
+        throw new Error(`cb-ref-boom-${i}`);
+      })).to.throw(`cb-ref-boom-${i}`);
+    }
+    expect(cbFn(() => 1)).to.equal(Math);
+    mod.deinitRefAfterThrowCallback();
+    expect(Number(mod.activeCallbacks())).to.equal(0);
+    expect(Number(mod.activeHandles())).to.equal(0);
+  });
 });

@@ -399,3 +399,84 @@ pub fn callMismatchedErrorSetWithDefer(f: Ref(js.Function), tracker: Ref(js.Obje
     return v + @as(i32, stack_buf[0] & 0);
 }
 
+pub fn suspendThenCall(
+    async_step: *const fn () i32,
+    post_fn: Ref(js.Function),
+) i32 {
+    defer post_fn.deinit();
+    var stack_canary: [256]u8 = undefined;
+    @memset(&stack_canary, 0x7E);
+    std.mem.doNotOptimizeAway(&stack_canary);
+    const step1 = async_step();
+    const step2 = js.callFn(fn () i32, post_fn, .{});
+    return step1 + step2 + @as(i32, stack_canary[0] ^ 0x7E);
+}
+
+pub fn doubleSuspendThenCall(
+    step1_fn: *const fn () i32,
+    step2_fn: *const fn () i32,
+    post_fn: Ref(js.Function),
+) i32 {
+    defer post_fn.deinit();
+    var stack_canary: [256]u8 = undefined;
+    @memset(&stack_canary, 0xA5);
+    std.mem.doNotOptimizeAway(&stack_canary);
+    const a = step1_fn();
+    const b = step2_fn();
+    const c = js.callFn(fn () i32, post_fn, .{});
+    return a + b + c + @as(i32, stack_canary[255] ^ 0xA5);
+}
+
+pub const RefPair = struct {
+    first: Ref(js.Object),
+    second: ?Ref(js.Object),
+};
+
+pub const RefChoice = union(enum) {
+    obj: Ref(js.Object),
+    num: i32,
+};
+
+pub fn returnRefAfterThrow(f: Ref(js.Function)) Ref(js.Object) {
+    defer f.deinit();
+    const obj = js.getGlobal(Ref(js.Object), "Math");
+    _ = js.callFn(fn () i32, f, .{});
+    return obj;
+}
+
+pub fn returnStructRefAfterThrow(f: Ref(js.Function)) RefPair {
+    defer f.deinit();
+    const first = js.getGlobal(Ref(js.Object), "Math");
+    const second = js.getGlobal(Ref(js.Object), "JSON");
+    _ = js.callFn(fn () i32, f, .{});
+    return .{ .first = first, .second = second };
+}
+
+pub fn returnUnionRefAfterThrow(f: Ref(js.Function)) RefChoice {
+    defer f.deinit();
+    const obj = js.getGlobal(Ref(js.Object), "Math");
+    _ = js.callFn(fn () i32, f, .{});
+    return .{ .obj = obj };
+}
+
+const RefAfterThrowCallback = js.Callback(fn (Ref(js.Function)) Ref(js.Object));
+var ref_after_throw_cb_state: u32 = 0;
+var ref_after_throw_cb: RefAfterThrowCallback = .{};
+
+fn onRefAfterThrowCallback(_: *u32, f: Ref(js.Function)) Ref(js.Object) {
+    defer f.deinit();
+    const obj = js.getGlobal(Ref(js.Object), "Math");
+    _ = js.callFn(fn () i32, f, .{});
+    return obj;
+}
+
+pub fn createRefAfterThrowCallback() !Ref(js.Function) {
+    ref_after_throw_cb = try RefAfterThrowCallback.tryInit(&ref_after_throw_cb_state, onRefAfterThrowCallback);
+    return ref_after_throw_cb.toRef().clone();
+}
+
+pub fn deinitRefAfterThrowCallback() void {
+    ref_after_throw_cb.deinit();
+}
+
+

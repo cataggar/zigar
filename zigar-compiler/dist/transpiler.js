@@ -6356,6 +6356,17 @@ var callMarshalingOutbound = mixin({
       errorFrame.pendingHostError = undefined;
       return { error };
     };
+    const discardPendingRetval = () => {
+      if (argStruct[VIVIFICATE]?.retvalHasJsValue) {
+        {
+          const shadowDV = this.findShadowView(argStruct[MEMORY]);
+          if (shadowDV) {
+            argStruct[UPDATE]?.(shadowDV);
+          }
+        }
+        this.discardJsValueRetval?.(argStruct);
+      }
+    };
     const prevErrorFrame = this.activeHostErrorFrame;
     this.activeHostErrorFrame = errorFrame;
     try {
@@ -6377,8 +6388,9 @@ var callMarshalingOutbound = mixin({
     } catch (err) {
       this.activeHostErrorFrame = prevErrorFrame;
       const pending = consumeErrorFrame();
+      const isCleanExit = !pending && (err instanceof Exit && err.code === 0);
       if (!finalized) {
-        finalize(!(err instanceof Exit && err.code === 0));
+        finalize(!isCleanExit);
       }
       if (pending) {
         throw pending.error;
@@ -6390,6 +6402,9 @@ var callMarshalingOutbound = mixin({
       const pending = consumeErrorFrame();
       if (pending) {
         if (!finalized) {
+          if (success) {
+            discardPendingRetval();
+          }
           finalize(true);
         }
         throw pending.error;
@@ -7781,11 +7796,17 @@ var jsValueRegistry = mixin({
     if (this.restoreView) {
       dv = this.restoreView(dv);
     }
+    this.releaseJsValuesInView(structure, dv, offset, false);
+  },
+  releaseJsValuesInView(structure, dv, offset = 0, clearHandles = false) {
     const le = this.littleEndian;
     const visit = (s, base) => {
       if (s.purpose === StructurePurpose.JsValue) {
         const handle = dv.getUint32(base, le) >>> 0;
         this.releaseJsValueIfValid(handle);
+        if (clearHandles) {
+          dv.setUint32(base, RESERVED_UNDEFINED, le);
+        }
         return;
       }
       switch (s.type) {
@@ -7838,6 +7859,19 @@ var jsValueRegistry = mixin({
       }
     };
     visit(structure, offset);
+  },
+  discardJsValueRetval(argStruct) {
+    const retvalMember = argStruct?.[VIVIFICATE]?.retvalMember;
+    if (!retvalMember || retvalMember.type !== MemberType.Object || this.jsValueActiveCount === 0) {
+      return;
+    }
+    const { structure, bitOffset, byteSize } = retvalMember;
+    if (!hasJsValue(structure)) {
+      return;
+    }
+    const offset = bitOffset >> 3;
+    const dv = argStruct[MEMORY];
+    this.releaseJsValuesInView(structure, dv, offset, true);
   },
   walkActiveJsValueLeaves(rootObj, structure, rootDV, callback) {
     const le = this.littleEndian;
@@ -8409,6 +8443,8 @@ var moduleLoading = mixin({
       this.continuationStackPool = [];
       this.activeContinuation = null;
       this.suspendedContinuationCount = 0;
+      this.resumingContinuation = null;
+      this.resumeWaiters = [];
       this.stackPointerGlobal = null;
       this.initialStackPointer = 0;
     }
@@ -8501,6 +8537,20 @@ var moduleLoading = mixin({
         : this.fromWebAssembly(returnType, retval);
       };
     },
+    releaseContinuationResume(cont) {
+      if (!cont || this.resumingContinuation !== cont) {
+        return;
+      }
+      this.resumingContinuation = null;
+      while (this.resumeWaiters.length > 0) {
+        const next = this.resumeWaiters.shift();
+        if (!next.cont.finished) {
+          this.resumingContinuation = next.cont;
+          next.wake();
+          return;
+        }
+      }
+    },
     wrapSuspending(fn) {
       const hasSuspending = typeof WA.Suspending === 'function';
       const wrapper = (...args) => {
@@ -8537,11 +8587,9 @@ var moduleLoading = mixin({
           if (cont) {
             cont.parentContinuation = null;
             cont.parentSp = defaultSp;
+            this.releaseContinuationResume(cont);
           }
           const resumeContinuation = () => {
-            if (this.activeContinuation && this.activeContinuation !== cont && !this.activeContinuation.suspended) {
-              this.activeContinuation.finish?.();
-            }
             if (cont) {
               if (cont.suspended) {
                 cont.suspended = false;
@@ -8555,12 +8603,50 @@ var moduleLoading = mixin({
             }
             this.activeContinuation = cont;
           };
+          const waitForResumeTurn = () => {
+            if (!cont || cont.finished) {
+              return null;
+            }
+            if (!this.resumingContinuation) {
+              this.resumingContinuation = cont;
+              return null;
+            }
+            return new Promise((wake) => {
+              this.resumeWaiters.push({ cont, wake });
+            });
+          };
           const promise = isPromise(res) ? res : Promise.resolve(res);
           return promise.then((val) => {
-            resumeContinuation();
+            const wait = waitForResumeTurn();
+            if (wait) {
+              return wait.then(() => {
+                if (cont.finished) {
+                  this.releaseContinuationResume(cont);
+                  return val;
+                }
+                resumeContinuation();
+                return val;
+              });
+            }
+            if (!cont?.finished) {
+              resumeContinuation();
+            }
             return val;
           }, (err) => {
-            resumeContinuation();
+            const wait = waitForResumeTurn();
+            if (wait) {
+              return wait.then(() => {
+                if (cont.finished) {
+                  this.releaseContinuationResume(cont);
+                  throw err;
+                }
+                resumeContinuation();
+                throw err;
+              });
+            }
+            if (!cont?.finished) {
+              resumeContinuation();
+            }
             throw err;
           });
         }
@@ -8625,11 +8711,13 @@ var moduleLoading = mixin({
         parentContinuation: prevCont,
         hostErrorFrame: this.activeHostErrorFrame,
         suspended: false,
+        finished: false,
         finish: null,
       };
       const finish = cont.finish = () => {
         if (finished) return;
         finished = true;
+        cont.finished = true;
         if (cont.suspended) {
           cont.suspended = false;
           this.suspendedContinuationCount--;
@@ -8648,6 +8736,7 @@ var moduleLoading = mixin({
             spGlobal.value = cont.parentSp;
           }
         }
+        this.releaseContinuationResume(cont);
         if (overflowError) {
           throw overflowError;
         }
@@ -8746,6 +8835,8 @@ var moduleLoading = mixin({
         this.continuationStackPool.length = 0;
         this.activeContinuation = null;
         this.suspendedContinuationCount = 0;
+        this.resumingContinuation = null;
+        this.resumeWaiters.length = 0;
       });
     },
     async instantiateWebAssembly(source, options = {}) {

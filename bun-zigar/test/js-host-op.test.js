@@ -222,6 +222,25 @@ describe('Bun Native JS Host-Op Dispatcher & Dynamic Zig Callbacks Integration',
       throw new RangeError('unlisted');
     }, tracker)).to.throw();
     expect(tracker.deferRuns).to.equal(1);
+
+    for (let i = 0; i < 20; i++) {
+      expect(() => mod.returnRefAfterThrow(() => {
+        throw new Error(`bun-ref-boom-${i}`);
+      })).to.throw(`bun-ref-boom-${i}`);
+      expect(() => mod.returnStructRefAfterThrow(() => {
+        throw new Error(`bun-struct-ref-boom-${i}`);
+      })).to.throw(`bun-struct-ref-boom-${i}`);
+      expect(() => mod.returnUnionRefAfterThrow(() => {
+        throw new Error(`bun-union-ref-boom-${i}`);
+      })).to.throw(`bun-union-ref-boom-${i}`);
+    }
+    const cbRefFn = mod.createRefAfterThrowCallback();
+    expect(() => cbRefFn(() => {
+      throw new Error('bun-cb-ref-boom');
+    })).to.throw('bun-cb-ref-boom');
+    expect(cbRefFn(() => 1)).to.equal(Math);
+    mod.deinitRefAfterThrowCallback();
+    expect(Number(mod.activeCallbacks())).to.equal(0);
     expect(Number(mod.activeHandles())).to.equal(0);
   });
 });

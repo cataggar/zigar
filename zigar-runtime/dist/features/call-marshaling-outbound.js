@@ -193,6 +193,17 @@ var callMarshalingOutbound = mixin({
       errorFrame.pendingHostError = undefined;
       return { error };
     };
+    const discardPendingRetval = () => {
+      if (argStruct[VIVIFICATE]?.retvalHasJsValue) {
+        {
+          const shadowDV = this.findShadowView(argStruct[MEMORY]);
+          if (shadowDV) {
+            argStruct[UPDATE]?.(shadowDV);
+          }
+        }
+        this.discardJsValueRetval?.(argStruct);
+      }
+    };
     const prevErrorFrame = this.activeHostErrorFrame;
     this.activeHostErrorFrame = errorFrame;
     try {
@@ -214,8 +225,9 @@ var callMarshalingOutbound = mixin({
     } catch (err) {
       this.activeHostErrorFrame = prevErrorFrame;
       const pending = consumeErrorFrame();
+      const isCleanExit = !pending && (err instanceof Exit && err.code === 0);
       if (!finalized) {
-        finalize(!(err instanceof Exit && err.code === 0));
+        finalize(!isCleanExit);
       }
       if (pending) {
         throw pending.error;
@@ -227,6 +239,9 @@ var callMarshalingOutbound = mixin({
       const pending = consumeErrorFrame();
       if (pending) {
         if (!finalized) {
+          if (success) {
+            discardPendingRetval();
+          }
           finalize(true);
         }
         throw pending.error;

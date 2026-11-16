@@ -723,4 +723,70 @@ describe('Feature: js-host-op', function() {
     env.releaseJsValue(objHandle);
     expect(env.getJsValueCount()).to.equal(0);
   });
+
+  it('should discard live JsValue handles written to retval when invokeThunk exits with a pending host error', function() {
+    const env = new Env();
+    env.littleEndian = true;
+    const harness = createMemoryHarness(env);
+    const s = defineHostOpStructures(env, harness.is64);
+
+    // ArgStruct for `fn () Ref(Object)` (retval is jsRef at offset 0)
+    const argsReturnRef = s.makeArgStruct(0x8801n, s.jsRef, []);
+    const ArgStructCtor = argsReturnRef.constructor;
+
+    const leakedCandidate = { role: 'returned-after-throw' };
+    let liveHandle = 0;
+    const expectedBoom = new Error('infallible-boom-before-return');
+
+    if (process.env.TARGET === 'wasm') {
+      let nextScratch = 0x9000;
+      env.allocateScratchMemory = (len) => {
+        const addr = nextScratch;
+        nextScratch += (len + 15) & ~15;
+        return addr;
+      };
+      env.freeScratchMemory = () => {};
+      env.runThunk = (_thunkAddr, _fnAddr, argAddr) => {
+        liveHandle = env.allocJsValue(leakedCandidate);
+        const dv = env.obtainZigView(argAddr, 4, false);
+        dv.setUint32(0, liveHandle, true);
+        env.recordPendingHostError(expectedBoom);
+        return true;
+      };
+    } else {
+      env.getBufferAddress = () => harness.addrOf(0x9000);
+      env.runThunk = () => {
+        liveHandle = env.allocJsValue(leakedCandidate);
+        // Write live handle directly into the outbound argStruct's buffer via active call interception
+        return true;
+      };
+    }
+
+    const thunkDV = new DataView(new ArrayBuffer(0));
+    thunkDV[ZIG] = { address: harness.addrOf(0x100), len: 0 };
+    const fnDV = new DataView(new ArrayBuffer(0));
+    fnDV[ZIG] = { address: harness.addrOf(0x200), len: 0 };
+    const thunk = { [MEMORY]: thunkDV };
+    const fnObj = Object.assign(() => {}, { [MEMORY]: fnDV });
+
+    if (process.env.TARGET === 'node') {
+      // Test discardJsValueRetval directly AND via invokeThunk with live handle in argStruct[MEMORY]
+      const argStruct = new ArgStructCtor([]);
+      liveHandle = env.allocJsValue(leakedCandidate);
+      argStruct[MEMORY].setUint32(0, liveHandle, env.littleEndian);
+      expect(env.getJsValueCount()).to.equal(1);
+      env.runThunk = () => {
+        env.recordPendingHostError(expectedBoom);
+        return true;
+      };
+      expect(() => env.invokeThunk(thunk, fnObj, argStruct)).to.throw(expectedBoom);
+      expect(env.getJsValueCount()).to.equal(0);
+    } else {
+      const caller = env.createOutboundCaller(thunk, ArgStructCtor);
+      caller[MEMORY] = fnDV;
+      expect(() => caller()).to.throw(expectedBoom);
+      expect(liveHandle).to.be.greaterThan(4);
+      expect(env.getJsValueCount()).to.equal(0);
+    }
+  });
 });

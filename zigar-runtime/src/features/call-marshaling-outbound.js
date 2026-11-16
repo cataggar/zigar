@@ -208,6 +208,17 @@ export default mixin({
       errorFrame.pendingHostError = undefined;
       return { error };
     };
+    const discardPendingRetval = () => {
+      if (argStruct[VIVIFICATE]?.retvalHasJsValue) {
+        if (process.env.TARGET === 'wasm') {
+          const shadowDV = this.findShadowView(argStruct[MEMORY]);
+          if (shadowDV) {
+            argStruct[UPDATE]?.(shadowDV);
+          }
+        }
+        this.discardJsValueRetval?.(argStruct);
+      }
+    };
     const prevErrorFrame = this.activeHostErrorFrame;
     this.activeHostErrorFrame = errorFrame;
     try {
@@ -229,8 +240,12 @@ export default mixin({
     } catch (err) {
       this.activeHostErrorFrame = prevErrorFrame;
       const pending = consumeErrorFrame();
+      const isCleanExit = !pending && (err instanceof Exit && err.code === 0);
       if (!finalized) {
-        finalize(!(err instanceof Exit && err.code === 0));
+        if (process.env.TARGET === 'node' && !isCleanExit) {
+          discardPendingRetval();
+        }
+        finalize(!isCleanExit);
       }
       if (pending) {
         throw pending.error;
@@ -242,6 +257,9 @@ export default mixin({
       const pending = consumeErrorFrame();
       if (pending) {
         if (!finalized) {
+          if (success) {
+            discardPendingRetval();
+          }
           finalize(true);
         }
         throw pending.error;

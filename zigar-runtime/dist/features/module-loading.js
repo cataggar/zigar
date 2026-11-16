@@ -72,6 +72,8 @@ var moduleLoading = mixin({
       this.continuationStackPool = [];
       this.activeContinuation = null;
       this.suspendedContinuationCount = 0;
+      this.resumingContinuation = null;
+      this.resumeWaiters = [];
       this.stackPointerGlobal = null;
       this.initialStackPointer = 0;
     }
@@ -164,6 +166,20 @@ var moduleLoading = mixin({
         : this.fromWebAssembly(returnType, retval);
       };
     },
+    releaseContinuationResume(cont) {
+      if (!cont || this.resumingContinuation !== cont) {
+        return;
+      }
+      this.resumingContinuation = null;
+      while (this.resumeWaiters.length > 0) {
+        const next = this.resumeWaiters.shift();
+        if (!next.cont.finished) {
+          this.resumingContinuation = next.cont;
+          next.wake();
+          return;
+        }
+      }
+    },
     wrapSuspending(fn) {
       const hasSuspending = typeof WA.Suspending === 'function';
       const wrapper = (...args) => {
@@ -200,11 +216,9 @@ var moduleLoading = mixin({
           if (cont) {
             cont.parentContinuation = null;
             cont.parentSp = defaultSp;
+            this.releaseContinuationResume(cont);
           }
           const resumeContinuation = () => {
-            if (this.activeContinuation && this.activeContinuation !== cont && !this.activeContinuation.suspended) {
-              this.activeContinuation.finish?.();
-            }
             if (cont) {
               if (cont.suspended) {
                 cont.suspended = false;
@@ -218,12 +232,50 @@ var moduleLoading = mixin({
             }
             this.activeContinuation = cont;
           };
+          const waitForResumeTurn = () => {
+            if (!cont || cont.finished) {
+              return null;
+            }
+            if (!this.resumingContinuation) {
+              this.resumingContinuation = cont;
+              return null;
+            }
+            return new Promise((wake) => {
+              this.resumeWaiters.push({ cont, wake });
+            });
+          };
           const promise = isPromise(res) ? res : Promise.resolve(res);
           return promise.then((val) => {
-            resumeContinuation();
+            const wait = waitForResumeTurn();
+            if (wait) {
+              return wait.then(() => {
+                if (cont.finished) {
+                  this.releaseContinuationResume(cont);
+                  return val;
+                }
+                resumeContinuation();
+                return val;
+              });
+            }
+            if (!cont?.finished) {
+              resumeContinuation();
+            }
             return val;
           }, (err) => {
-            resumeContinuation();
+            const wait = waitForResumeTurn();
+            if (wait) {
+              return wait.then(() => {
+                if (cont.finished) {
+                  this.releaseContinuationResume(cont);
+                  throw err;
+                }
+                resumeContinuation();
+                throw err;
+              });
+            }
+            if (!cont?.finished) {
+              resumeContinuation();
+            }
             throw err;
           });
         }
@@ -288,11 +340,13 @@ var moduleLoading = mixin({
         parentContinuation: prevCont,
         hostErrorFrame: this.activeHostErrorFrame,
         suspended: false,
+        finished: false,
         finish: null,
       };
       const finish = cont.finish = () => {
         if (finished) return;
         finished = true;
+        cont.finished = true;
         if (cont.suspended) {
           cont.suspended = false;
           this.suspendedContinuationCount--;
@@ -311,6 +365,7 @@ var moduleLoading = mixin({
             spGlobal.value = cont.parentSp;
           }
         }
+        this.releaseContinuationResume(cont);
         if (overflowError) {
           throw overflowError;
         }
@@ -409,6 +464,8 @@ var moduleLoading = mixin({
         this.continuationStackPool.length = 0;
         this.activeContinuation = null;
         this.suspendedContinuationCount = 0;
+        this.resumingContinuation = null;
+        this.resumeWaiters.length = 0;
       });
     },
     async instantiateWebAssembly(source, options = {}) {

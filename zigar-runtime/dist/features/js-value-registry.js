@@ -250,11 +250,17 @@ var jsValueRegistry = mixin({
     if (this.restoreView) {
       dv = this.restoreView(dv);
     }
+    this.releaseJsValuesInView(structure, dv, offset, false);
+  },
+  releaseJsValuesInView(structure, dv, offset = 0, clearHandles = false) {
     const le = this.littleEndian;
     const visit = (s, base) => {
       if (s.purpose === StructurePurpose.JsValue) {
         const handle = dv.getUint32(base, le) >>> 0;
         this.releaseJsValueIfValid(handle);
+        if (clearHandles) {
+          dv.setUint32(base, RESERVED_UNDEFINED, le);
+        }
         return;
       }
       switch (s.type) {
@@ -307,6 +313,19 @@ var jsValueRegistry = mixin({
       }
     };
     visit(structure, offset);
+  },
+  discardJsValueRetval(argStruct) {
+    const retvalMember = argStruct?.[VIVIFICATE]?.retvalMember;
+    if (!retvalMember || retvalMember.type !== MemberType.Object || this.jsValueActiveCount === 0) {
+      return;
+    }
+    const { structure, bitOffset, byteSize } = retvalMember;
+    if (!hasJsValue(structure)) {
+      return;
+    }
+    const offset = bitOffset >> 3;
+    const dv = argStruct[MEMORY];
+    this.releaseJsValuesInView(structure, dv, offset, true);
   },
   walkActiveJsValueLeaves(rootObj, structure, rootDV, callback) {
     const le = this.littleEndian;
