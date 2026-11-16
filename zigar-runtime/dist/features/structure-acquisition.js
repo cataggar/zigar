@@ -1,9 +1,10 @@
 import { SENTINEL, SLOTS, MEMORY, ZIG, PROPS, VISIT, ENVIRONMENT } from '../symbols.js';
-import { SliceFlag, StructureType, PointerFlag, ErrorSetFlag, StructurePurpose, StructFlag, MemberType, PrimitiveFlag, structureNames, ModuleAttribute, StructureFlag } from '../constants.js';
+import { SliceFlag, StructureType, PointerFlag, ErrorSetFlag, StructurePurpose, StructFlag, MemberType, PrimitiveFlag, structureNames, StructureFlag, ModuleAttribute } from '../constants.js';
 import { mixin } from '../environment.js';
 import './call-marshaling-inbound.js';
 import './call-marshaling-outbound.js';
 import './dir-conversion.js';
+import jsHostOp from './js-host-op.js';
 import './js-value-registry.js';
 import './module-loading.js';
 import './pointer-synchronization.js';
@@ -145,10 +146,34 @@ var structureAcquisition = mixin({
     const thunk = { [MEMORY]: this.obtainZigView(thunkAddress, 0) };
     this.comptime = true;
     this.mixinUsage = new Map();
+    if (this.instance?.exports) {
+      this.trackingMixins = true;
+      for (const [ name, fn ] of Object.entries(this.instance.exports)) {
+        if (name.startsWith('__zigar_js_reg_') && typeof(fn) === 'function') {
+          fn();
+        }
+      }
+    }
     this.invokeThunk(thunk, thunk, thunk);
     this.comptime = false;
+    this.resolveDeferredStructures(0);
+  },
+  registerTypeWithThunk(registerThunkAddress) {
+    const startIdx = this.structures.length;
+    const prevComptime = this.comptime;
+    this.comptime = true;
+    try {
+      const thunk = { [MEMORY]: this.obtainZigView(registerThunkAddress, 0) };
+      this.invokeThunk(thunk, thunk, thunk);
+    } finally {
+      this.comptime = prevComptime;
+    }
+    this.resolveDeferredStructures(startIdx);
+  },
+  resolveDeferredStructures(startIndex = 0) {
     // acquire pointer targets now that we have all constructors
-    for (const structure of this.structures) {
+    for (let i = startIndex; i < this.structures.length; i++) {
+      const structure = this.structures[i];
       if (this.hasDeferred) {
         const { static: { template } } = structure;
         const slots = template?.[SLOTS];
@@ -196,6 +221,9 @@ var structureAcquisition = mixin({
       if (this.table64) {
         settings.table64 = true;
       }
+    }
+    if (this.using?.(jsHostOp)) {
+      settings.hasJsHostOps = true;
     }
     return { structures, settings };
   },

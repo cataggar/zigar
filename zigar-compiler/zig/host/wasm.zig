@@ -250,6 +250,31 @@ pub fn getFactoryThunk(comptime module: type) usize {
     return @intFromPtr(exporter.getFactoryThunk(@This(), module));
 }
 
+pub fn getTypeFactoryThunk(comptime T: type) zig_fn.Thunk {
+    return exporter.getTypeFactoryThunk(@This(), T);
+}
+
+pub fn registerType(comptime T: type) void {
+    exporter.registerType(@This(), T);
+}
+
+pub fn invokeJsHostOp(descriptor_ptr: *const anyopaque, arg_ptr: *anyopaque, arg_size: usize) E {
+    if (!isJsThread()) return .PERM;
+    return _invokeJsHostOp(descriptor_ptr, arg_ptr, arg_size);
+}
+
+pub fn createZigCallback(descriptor_ptr: *const anyopaque, callback_id: u32) js.Error!u32 {
+    if (!isJsThread()) return error.OffJsThread;
+    const handle = _createZigCallback(descriptor_ptr, callback_id);
+    if (handle == 0) return error.JsException;
+    return handle;
+}
+
+pub fn releaseZigCallback(callback_id: u32) void {
+    if (!isJsThread()) @panic("JsValue operations require the JS thread");
+    _releaseZigCallback(callback_id);
+}
+
 pub fn isJsThread() bool {
     return builtin.single_threaded or in_main_thread;
 }
@@ -491,6 +516,9 @@ extern "env" fn _typeofJsValue(handle: u32) u32;
 extern "env" fn _instanceofJsValue(handle: u32, ctor_handle: u32) bool;
 extern "env" fn _equalJsValue(lhs_handle: u32, rhs_handle: u32) bool;
 extern "env" fn _getJsValueCount() u32;
+extern "env" fn _invokeJsHostOp(descriptor_ptr: *const anyopaque, arg_ptr: *anyopaque, arg_size: usize) E;
+extern "env" fn _createZigCallback(descriptor_ptr: *const anyopaque, callback_id: u32) u32;
+extern "env" fn _releaseZigCallback(callback_id: u32) void;
 extern "env" fn _displayPanic(bytes: [*]const u8, len: usize) void;
 
 comptime {

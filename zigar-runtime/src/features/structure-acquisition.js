@@ -7,6 +7,7 @@ import { mixin } from '../environment.js';
 import callMarshalingInbound from '../features/call-marshaling-inbound.js';
 import callMarshalingOutbound from '../features/call-marshaling-outbound.js';
 import dirConversion from '../features/dir-conversion.js';
+import jsHostOp from '../features/js-host-op.js';
 import jsValueRegistry from '../features/js-value-registry.js';
 import moduleLoading from '../features/module-loading.js';
 import pointerSynchronization from '../features/pointer-synchronization.js';
@@ -150,10 +151,34 @@ export default mixin({
     const thunk = { [MEMORY]: this.obtainZigView(thunkAddress, 0) };
     this.comptime = true;
     this.mixinUsage = new Map();
+    if (process.env.TARGET === 'wasm' && this.instance?.exports) {
+      this.trackingMixins = true;
+      for (const [ name, fn ] of Object.entries(this.instance.exports)) {
+        if (name.startsWith('__zigar_js_reg_') && typeof(fn) === 'function') {
+          fn();
+        }
+      }
+    }
     this.invokeThunk(thunk, thunk, thunk);
     this.comptime = false;
+    this.resolveDeferredStructures(0);
+  },
+  registerTypeWithThunk(registerThunkAddress) {
+    const startIdx = this.structures.length;
+    const prevComptime = this.comptime;
+    this.comptime = true;
+    try {
+      const thunk = { [MEMORY]: this.obtainZigView(registerThunkAddress, 0) };
+      this.invokeThunk(thunk, thunk, thunk);
+    } finally {
+      this.comptime = prevComptime;
+    }
+    this.resolveDeferredStructures(startIdx);
+  },
+  resolveDeferredStructures(startIndex = 0) {
     // acquire pointer targets now that we have all constructors
-    for (const structure of this.structures) {
+    for (let i = startIndex; i < this.structures.length; i++) {
+      const structure = this.structures[i];
       if (this.hasDeferred) {
         const { static: { template } } = structure;
         const slots = template?.[SLOTS];
@@ -202,6 +227,9 @@ export default mixin({
       if (this.table64) {
         settings.table64 = true;
       }
+    }
+    if (this.using?.(jsHostOp)) {
+      settings.hasJsHostOps = true;
     }
     return { structures, settings };
   },
@@ -261,6 +289,16 @@ export default mixin({
           case '_equalJsValue':
           case '_getJsValueCount':
             this.use(jsValueRegistry);
+            break;
+          case '_invokeJsHostOp':
+          case '_createZigCallback':
+          case '_releaseZigCallback':
+            this.use(jsHostOp);
+            this.use(jsValueRegistry);
+            this.use(jsValue);
+            this.use(callMarshalingInbound);
+            this.use(callMarshalingOutbound);
+            this.use(pointerSynchronization);
             break;
         }
       }

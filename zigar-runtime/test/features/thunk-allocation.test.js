@@ -220,6 +220,171 @@ if (process.env.TARGET === 'wasm') {
         expect(env.thunkSources).to.have.lengthOf(1);
       })
     })
+    describe('multi-source reuse across distinct signatures and custom import namespaces', function() {
+      it('should reuse spare thunkSources across multiple controllers (>16 thunks) and stub non-env imports', async function() {
+        const str = (s) => [ s.length, ...Buffer.from(s) ];
+        const uleb = (n) => {
+          const out = [];
+          do {
+            let b = n & 0x7f;
+            n >>>= 7;
+            if (n !== 0) b |= 0x80;
+            out.push(b);
+          } while (n !== 0);
+          return out;
+        };
+        const section = (id, payload) => [ id, ...uleb(payload.length), ...payload ];
+
+        // Build a WASM32 module with:
+        // - custom import namespace 'zigar:component-host'.'ping' () -> ()
+        // - two controllers (ctrlA = 0x100, ctrlB = 0x200), each with 2 slots per instance!
+        const types = [
+          0x03,
+          0x60, 0x00, 0x00,                   // 0: () -> ()
+          0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, // 1: (i32, i32) -> i32
+          0x60, 0x00, 0x01, 0x7f,             // 2: () -> i32
+        ];
+        const imports = [
+          0x03,
+          ...str('env'), ...str('memory'), 0x02, 0x00, 0x01,
+          ...str('env'), ...str('__indirect_function_table'), 0x01, 0x70, 0x00, 0x06,
+          ...str('zigar:component-host'), ...str('ping'), 0x00, 0x00,
+        ];
+        // Imported func 0 = ping
+        // Local funcs: 1=init, 2=createJsThunk, 3=destroyJsThunk, 4=identifyJsThunk, 5..8=thunks A0,A1,B0,B1
+        const funcs = [ 0x08, 0x00, 0x01, 0x01, 0x01, 0x02, 0x02, 0x02, 0x02 ];
+        const globals = [
+          0x04,
+          0x7f, 0x01, 0x41, 0x00, 0x0b, // global 0: A0
+          0x7f, 0x01, 0x41, 0x00, 0x0b, // global 1: A1
+          0x7f, 0x01, 0x41, 0x00, 0x0b, // global 2: B0
+          0x7f, 0x01, 0x41, 0x00, 0x0b, // global 3: B1
+        ];
+        const exports = [
+          0x04,
+          ...str('initialize'), 0x00, 0x01,
+          ...str('createJsThunk'), 0x00, 0x02,
+          ...str('destroyJsThunk'), 0x00, 0x03,
+          ...str('identifyJsThunk'), 0x00, 0x04,
+        ];
+        // Table slots 2, 3, 4, 5 -> funcs 5, 6, 7, 8
+        const elems = [
+          0x01,
+          0x00, 0x41, 0x02, 0x0b, 0x04, 0x05, 0x06, 0x07, 0x08,
+        ];
+        const bInit = [ 0x00, 0x0b ];
+        // createJsThunk(ctrl, fnId):
+        // if ctrl == 0x100 (256 -> 0x80, 0x02): check global 0 (-> slot 2), global 1 (-> slot 3)
+        // if ctrl == 0x200 (512 -> 0x80, 0x04): check global 2 (-> slot 4), global 3 (-> slot 5)
+        const allocSlot = (globalIdx, tableSlot) => [
+          0x23, globalIdx, 0x45, 0x04, 0x40,
+          0x20, 0x01, 0x24, globalIdx, 0x41, tableSlot, 0x0f,
+          0x0b,
+        ];
+        const bCreate = [
+          0x00,
+          0x20, 0x00, 0x41, 0x80, 0x02, 0x46, 0x04, 0x40,
+          ...allocSlot(0, 2),
+          ...allocSlot(1, 3),
+          0x41, 0x00, 0x0f,
+          0x0b,
+          0x20, 0x00, 0x41, 0x80, 0x04, 0x46, 0x04, 0x40,
+          ...allocSlot(2, 4),
+          ...allocSlot(3, 5),
+          0x41, 0x00, 0x0f,
+          0x0b,
+          0x41, 0x00, 0x0b,
+        ];
+        const freeSlot = (globalIdx, tableSlot) => [
+          0x20, 0x01, 0x41, tableSlot, 0x46, 0x04, 0x40,
+          0x23, globalIdx, 0x21, 0x02, 0x41, 0x00, 0x24, globalIdx, 0x20, 0x02, 0x0f,
+          0x0b,
+        ];
+        const bDestroy = [
+          0x01, 0x01, 0x7f,
+          ...freeSlot(0, 2),
+          ...freeSlot(1, 3),
+          ...freeSlot(2, 4),
+          ...freeSlot(3, 5),
+          0x41, 0x00, 0x0b,
+        ];
+        const identSlot = (globalIdx, tableSlot) => [
+          0x20, 0x01, 0x41, tableSlot, 0x46, 0x04, 0x40,
+          0x23, globalIdx, 0x0f,
+          0x0b,
+        ];
+        const bIdent = [
+          0x00,
+          ...identSlot(0, 2),
+          ...identSlot(1, 3),
+          ...identSlot(2, 4),
+          ...identSlot(3, 5),
+          0x41, 0x00, 0x0b,
+        ];
+        const bThunk0 = [ 0x00, 0x23, 0x00, 0x0b ];
+        const bThunk1 = [ 0x00, 0x23, 0x01, 0x0b ];
+        const bThunk2 = [ 0x00, 0x23, 0x02, 0x0b ];
+        const bThunk3 = [ 0x00, 0x23, 0x03, 0x0b ];
+        const bodies = [ bInit, bCreate, bDestroy, bIdent, bThunk0, bThunk1, bThunk2, bThunk3 ];
+        const codePayload = [ bodies.length ];
+        for (const b of bodies) {
+          codePayload.push(...uleb(b.length), ...b);
+        }
+        const wasmMulti = new Uint8Array([
+          0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+          ...section(1, types),
+          ...section(2, imports),
+          ...section(3, funcs),
+          ...section(6, globals),
+          ...section(7, exports),
+          ...section(9, elems),
+          ...section(10, codePayload),
+        ]);
+
+        const env = new Env();
+        await env.loadModule(wasmMulti, {
+          memoryInitial: 1,
+          tableInitial: 6,
+          multithreaded: false,
+          wasmImports: {
+            'zigar:component-host': { ping() {} },
+          },
+        });
+
+        const ctrlA = 0x100;
+        const ctrlB = 0x200;
+
+        // Allocate 20 thunks for ctrlA (spawns 10 thunkSources since 2 slots/source)
+        const addrsA = [];
+        for (let i = 1; i <= 20; i++) {
+          addrsA.push(env.allocateJsThunk(ctrlA, 1000 + i));
+        }
+        expect(env.thunkSources).to.have.lengthOf(10);
+
+        // Allocate 20 thunks for ctrlB — must reuse all 10 existing thunkSources without spawning an 11th!
+        const addrsB = [];
+        for (let i = 1; i <= 20; i++) {
+          addrsB.push(env.allocateJsThunk(ctrlB, 2000 + i));
+        }
+        expect(env.thunkSources).to.have.lengthOf(10);
+
+        for (let i = 0; i < 20; i++) {
+          expect(env.table.get(addrsA[i])()).to.equal(1001 + i);
+          expect(env.table.get(addrsB[i])()).to.equal(2001 + i);
+        }
+
+        // Identify first pair (findJsThunk clears table entry without freeing source slot)
+        expect(env.findJsThunk(ctrlA, addrsA[0])).to.equal(1001);
+        expect(env.findJsThunk(ctrlB, addrsB[0])).to.equal(2001);
+
+        // Free remaining 19 pairs -> 8 thunkSources drained completely, leaving only the 2 holding A[0] and B[0]
+        for (let i = 1; i < 20; i++) {
+          expect(env.freeJsThunk(ctrlA, addrsA[i])).to.equal(1001 + i);
+          expect(env.freeJsThunk(ctrlB, addrsB[i])).to.equal(2001 + i);
+        }
+        expect(env.thunkSources).to.have.lengthOf(2);
+      })
+    })
   })
 }
 

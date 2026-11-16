@@ -87,6 +87,8 @@ export default mixin({
       if (this.libc) {
         this.initializeLibc();
       }
+    } else if (name === 'modules' && typeof(this.registerJsModules) === 'function') {
+      this.registerJsModules(object);
     } else {
       throw new Error(`Unknown object: ${name}`);
     }

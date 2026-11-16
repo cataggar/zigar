@@ -390,11 +390,16 @@ function generateCode(definition, params) {
     add(`import { createEnvironment } from ${JSON.stringify(runtimeURL)};`);
   }
   const effectiveMixinPaths = [ ...mixinPaths ];
-  if (declareFeatures && !standaloneLoader && runtimeURL && structures.some(s => s.purpose === StructurePurpose.JsValue)) {
-    for (const reqPath of [ 'features/js-value-registry.js', 'structures/js-value.js' ]) {
-      if (!effectiveMixinPaths.includes(reqPath)) {
-        effectiveMixinPaths.push(reqPath);
+  if (declareFeatures && !standaloneLoader && runtimeURL) {
+    if (structures.some(s => s.purpose === StructurePurpose.JsValue) || definition.settings?.hasJsHostOps) {
+      for (const reqPath of [ 'features/js-value-registry.js', 'structures/js-value.js' ]) {
+        if (!effectiveMixinPaths.includes(reqPath)) {
+          effectiveMixinPaths.push(reqPath);
+        }
       }
+    }
+    if (definition.settings?.hasJsHostOps && !effectiveMixinPaths.includes('features/js-host-op.js')) {
+      effectiveMixinPaths.push('features/js-host-op.js');
     }
   }
   for (const mixinPath of effectiveMixinPaths) {

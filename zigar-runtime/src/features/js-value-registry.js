@@ -261,11 +261,17 @@ export default mixin({
     } else if (process.env.TARGET === 'node') {
       dv[FALLBACK]?.(false, offset, structure.byteSize);
     }
+    this.releaseJsValuesInView(structure, dv, offset, false);
+  },
+  releaseJsValuesInView(structure, dv, offset = 0, clearHandles = false) {
     const le = this.littleEndian;
     const visit = (s, base) => {
       if (s.purpose === StructurePurpose.JsValue) {
         const handle = dv.getUint32(base, le) >>> 0;
         this.releaseJsValueIfValid(handle);
+        if (clearHandles) {
+          dv.setUint32(base, RESERVED_UNDEFINED, le);
+        }
         return;
       }
       switch (s.type) {
@@ -318,6 +324,25 @@ export default mixin({
       }
     };
     visit(structure, offset);
+  },
+  discardJsValueRetval(argStruct) {
+    const retvalMember = argStruct?.[VIVIFICATE]?.retvalMember;
+    if (!retvalMember || retvalMember.type !== MemberType.Object || this.jsValueActiveCount === 0) {
+      return;
+    }
+    const { structure, bitOffset, byteSize } = retvalMember;
+    if (!hasJsValue(structure)) {
+      return;
+    }
+    const offset = bitOffset >> 3;
+    const dv = argStruct[MEMORY];
+    if (process.env.TARGET === 'node') {
+      dv[FALLBACK]?.(false, offset, byteSize);
+    }
+    this.releaseJsValuesInView(structure, dv, offset, true);
+    if (process.env.TARGET === 'node') {
+      dv[FALLBACK]?.(true, offset, byteSize);
+    }
   },
   walkActiveJsValueLeaves(rootObj, structure, rootDV, callback) {
     const le = this.littleEndian;

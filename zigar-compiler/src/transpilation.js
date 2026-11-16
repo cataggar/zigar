@@ -88,9 +88,12 @@ export async function transpile(srcPath, options) {
       usage[name] = true;
     }
   }
-  if (definition.structures.some(s => s.purpose === StructurePurpose.JsValue)) {
+  if (definition.structures.some(s => s.purpose === StructurePurpose.JsValue) || definition.settings?.hasJsHostOps) {
     usage.StructureJsValue = true;
     usage.FeatureJsValueRegistry = true;
+  }
+  if (definition.settings?.hasJsHostOps) {
+    usage.FeatureJsHostOp = true;
   }
   if (nodeCompat && usage.FeatureWorkerSupport) {
     usage.FeatureWorkerSupportCompat = true;

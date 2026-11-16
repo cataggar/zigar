@@ -171,7 +171,7 @@ var callMarshalingOutbound = mixin({
     const syncRunner = this[`${runnerName}Sync`] ;
     let useSyncRunner = false;
     if (syncRunner) {
-      if (this.comptime) {
+      if (this.comptime || fn.zigarSync || this.syncCallDepth > 0) {
         useSyncRunner = true;
       } else if (this.useJSPI && this.jspiMode !== 'all' && !this.customWASI) {
         const fnSlot = Number(fnAddress);
@@ -183,6 +183,29 @@ var callMarshalingOutbound = mixin({
       }
     }
     let success;
+    const errorFrame = { hasPendingHostError: false, pendingHostError: undefined };
+    const consumeErrorFrame = () => {
+      if (!errorFrame.hasPendingHostError) {
+        return undefined;
+      }
+      const error = errorFrame.pendingHostError;
+      errorFrame.hasPendingHostError = false;
+      errorFrame.pendingHostError = undefined;
+      return { error };
+    };
+    const discardPendingRetval = () => {
+      if (argStruct[VIVIFICATE]?.retvalHasJsValue) {
+        {
+          const shadowDV = this.findShadowView(argStruct[MEMORY]);
+          if (shadowDV) {
+            argStruct[UPDATE]?.(shadowDV);
+          }
+        }
+        this.discardJsValueRetval?.(argStruct);
+      }
+    };
+    const prevErrorFrame = this.activeHostErrorFrame;
+    this.activeHostErrorFrame = errorFrame;
     try {
       if (useSyncRunner) {
         const prevContinuation = this.activeContinuation;
@@ -200,12 +223,29 @@ var callMarshalingOutbound = mixin({
           : this.runThunk(thunkAddress, fnAddress, argAddress);
       }
     } catch (err) {
+      this.activeHostErrorFrame = prevErrorFrame;
+      const pending = consumeErrorFrame();
+      const isCleanExit = !pending && (err instanceof Exit && err.code === 0);
       if (!finalized) {
-        finalize(!(err instanceof Exit && err.code === 0));
+        finalize(!isCleanExit);
+      }
+      if (pending) {
+        throw pending.error;
       }
       throw err;
     }
+    this.activeHostErrorFrame = prevErrorFrame;
     const finishCall = (success) => {
+      const pending = consumeErrorFrame();
+      if (pending) {
+        if (!finalized) {
+          if (success) {
+            discardPendingRetval();
+          }
+          finalize(true);
+        }
+        throw pending.error;
+      }
       if (!success) {
         if (!finalized) {
           finalize(true);
@@ -259,9 +299,13 @@ var callMarshalingOutbound = mixin({
     };
     if (isPromise(success)) {
       const promise = success.then(finishCall, (err) => {
-        const isCleanExit = (err instanceof Exit && err.code === 0);
+        const pending = consumeErrorFrame();
+        const isCleanExit = !pending && (err instanceof Exit && err.code === 0);
         if (!finalized) {
           finalize(!isCleanExit);
+        }
+        if (pending) {
+          throw pending.error;
         }
         if (isCleanExit) {
           return;

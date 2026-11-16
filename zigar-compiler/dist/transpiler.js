@@ -285,6 +285,7 @@ const THROWING = symbol('throwing');
 const PROMISE = symbol('promise');
 const GENERATOR = symbol('generator');
 const ALLOCATOR = symbol('allocator');
+const FALLBACK = symbol('fallback');
 const SIGNATURE = symbol('signature');
 const CONTROLLER = symbol('controller');
 const PROXY_TYPE = symbol('proxy type');
@@ -1029,11 +1030,16 @@ function generateCode(definition, params) {
     add(`import { createEnvironment } from ${JSON.stringify(runtimeURL)};`);
   }
   const effectiveMixinPaths = [ ...mixinPaths ];
-  if (declareFeatures && !standaloneLoader && runtimeURL && structures.some(s => s.purpose === StructurePurpose.JsValue)) {
-    for (const reqPath of [ 'features/js-value-registry.js', 'structures/js-value.js' ]) {
-      if (!effectiveMixinPaths.includes(reqPath)) {
-        effectiveMixinPaths.push(reqPath);
+  if (declareFeatures && !standaloneLoader && runtimeURL) {
+    if (structures.some(s => s.purpose === StructurePurpose.JsValue) || definition.settings?.hasJsHostOps) {
+      for (const reqPath of [ 'features/js-value-registry.js', 'structures/js-value.js' ]) {
+        if (!effectiveMixinPaths.includes(reqPath)) {
+          effectiveMixinPaths.push(reqPath);
+        }
       }
+    }
+    if (definition.settings?.hasJsHostOps && !effectiveMixinPaths.includes('features/js-host-op.js')) {
+      effectiveMixinPaths.push('features/js-host-op.js');
     }
   }
   for (const mixinPath of effectiveMixinPaths) {
@@ -1481,6 +1487,8 @@ function stripUnused(binary, options = {}) {
     /^getFactoryThunk$/,
     /^getModuleAttributes$/,
     /^export(?:er)?\.getFactoryThunk/,
+    /^__zigar_js_reg_/,
+    /\.registerTypeExport$/,
   ];
 
   function getSection(type) {
@@ -1568,6 +1576,14 @@ function stripUnused(binary, options = {}) {
   }
 
   // mark blacklisted functions as unused
+  const exportSectionForBlacklist = getSection(SectionType.Export);
+  if (exportSectionForBlacklist) {
+    for (const object of exportSectionForBlacklist.exports) {
+      if (object.type === ObjectType.Function && blacklist.some(re => re.test(object.name))) {
+        functions[object.index].using = false;
+      }
+    }
+  }
   for (const fn of functions) {
     if (fn.name && blacklist.some(re => re.test(fn.name))) {
       fn.using = false;
@@ -5673,6 +5689,7 @@ function formatList(list, conj = 'or') {
 
 var allocatorMethods = mixin({
   defineAlloc() {
+    const thisEnv = this;
     return {
       value(len, align = 1) {
         const lz = Math.clz32(align);        
@@ -5685,11 +5702,22 @@ var allocatorMethods = mixin({
         if (!slicePtr) {
           throw new Error('Out of memory');
         }
-        // alloc returns a [*]u8, which has a initial length of 1
-        slicePtr.length = len;
-        const dv = slicePtr['*'][MEMORY];
-        // attach alignment so we can find it again
-        dv[ZIG].align = align;
+        let dv;
+        if (slicePtr instanceof DataView) {
+          dv = slicePtr;
+        } else {
+          // alloc returns a [*]u8, which has a initial length of 1
+          slicePtr.length = len;
+          dv = slicePtr['*'][MEMORY];
+        }
+        if (!dv[ZIG]) {
+          // Re-attach the one-shot JS-backed Zig tag consumed by vtable.alloc's return pointer
+          const address = thisEnv.getViewAddress(dv);
+          defineProperty(dv, ZIG, { value: { address, len, align, js: true }, writable: true, configurable: true, enumerable: false });
+        } else {
+          // attach alignment so we can find it again
+          dv[ZIG].align = align;
+        }
         return dv;
       }
     };
@@ -5838,6 +5866,8 @@ var baseline = mixin({
       if (this.libc) {
         this.initializeLibc();
       }
+    } else if (name === 'modules' && typeof(this.registerJsModules) === 'function') {
+      this.registerJsModules(object);
     } else {
       throw new Error(`Unknown object: ${name}`);
     }
@@ -6304,7 +6334,7 @@ var callMarshalingOutbound = mixin({
     const syncRunner = this[`${runnerName}Sync`] ;
     let useSyncRunner = false;
     if (syncRunner) {
-      if (this.comptime) {
+      if (this.comptime || fn.zigarSync || this.syncCallDepth > 0) {
         useSyncRunner = true;
       } else if (this.useJSPI && this.jspiMode !== 'all' && !this.customWASI) {
         const fnSlot = Number(fnAddress);
@@ -6316,6 +6346,29 @@ var callMarshalingOutbound = mixin({
       }
     }
     let success;
+    const errorFrame = { hasPendingHostError: false, pendingHostError: undefined };
+    const consumeErrorFrame = () => {
+      if (!errorFrame.hasPendingHostError) {
+        return undefined;
+      }
+      const error = errorFrame.pendingHostError;
+      errorFrame.hasPendingHostError = false;
+      errorFrame.pendingHostError = undefined;
+      return { error };
+    };
+    const discardPendingRetval = () => {
+      if (argStruct[VIVIFICATE]?.retvalHasJsValue) {
+        {
+          const shadowDV = this.findShadowView(argStruct[MEMORY]);
+          if (shadowDV) {
+            argStruct[UPDATE]?.(shadowDV);
+          }
+        }
+        this.discardJsValueRetval?.(argStruct);
+      }
+    };
+    const prevErrorFrame = this.activeHostErrorFrame;
+    this.activeHostErrorFrame = errorFrame;
     try {
       if (useSyncRunner) {
         const prevContinuation = this.activeContinuation;
@@ -6333,12 +6386,29 @@ var callMarshalingOutbound = mixin({
           : this.runThunk(thunkAddress, fnAddress, argAddress);
       }
     } catch (err) {
+      this.activeHostErrorFrame = prevErrorFrame;
+      const pending = consumeErrorFrame();
+      const isCleanExit = !pending && (err instanceof Exit && err.code === 0);
       if (!finalized) {
-        finalize(!(err instanceof Exit && err.code === 0));
+        finalize(!isCleanExit);
+      }
+      if (pending) {
+        throw pending.error;
       }
       throw err;
     }
+    this.activeHostErrorFrame = prevErrorFrame;
     const finishCall = (success) => {
+      const pending = consumeErrorFrame();
+      if (pending) {
+        if (!finalized) {
+          if (success) {
+            discardPendingRetval();
+          }
+          finalize(true);
+        }
+        throw pending.error;
+      }
       if (!success) {
         if (!finalized) {
           finalize(true);
@@ -6392,9 +6462,13 @@ var callMarshalingOutbound = mixin({
     };
     if (isPromise(success)) {
       const promise = success.then(finishCall, (err) => {
-        const isCleanExit = (err instanceof Exit && err.code === 0);
+        const pending = consumeErrorFrame();
+        const isCleanExit = !pending && (err instanceof Exit && err.code === 0);
         if (!finalized) {
           finalize(!isCleanExit);
+        }
+        if (pending) {
+          throw pending.error;
         }
         if (isCleanExit) {
           return;
@@ -6855,6 +6929,627 @@ var intConversion = mixin({
   },
 });
 
+const HostOpCode = {
+  ImportModule: 1,
+  GetGlobal: 2,
+  GetProp: 3,
+  SetProp: 4,
+  DeleteProp: 5,
+  HasProp: 6,
+  CallFn: 7,
+  CallMethod: 8,
+  Construct: 9,
+};
+
+const HostOpFlag = {
+  DynamicKey: 1 << 0,
+};
+
+var jsHostOp = mixin({
+  init() {
+    this.jsHostOpCache = new Map();
+    this.jsKeyCache = new Map();
+    this.jsKeyDecodeCount = 0;
+    this.jsModuleCache = new Map();
+    this.zigCallbackTemplateCache = new Map();
+    this.zigCallbackMap = new Map();
+    this.syncCallDepth = 0;
+    this.hasPendingHostError = false;
+    this.pendingHostError = undefined;
+    this.activeHostErrorFrame = null;
+  },
+  getHostErrorTarget() {
+    return this.activeContinuation?.hostErrorFrame ?? this.activeHostErrorFrame ?? this;
+  },
+  recordPendingHostError(err) {
+    const target = this.getHostErrorTarget();
+    if (!target.hasPendingHostError) {
+      target.hasPendingHostError = true;
+      target.pendingHostError = err;
+    }
+  },
+  savePendingHostError() {
+    const target = this.getHostErrorTarget();
+    if (!target.hasPendingHostError) {
+      return null;
+    }
+    const saved = { target, error: target.pendingHostError };
+    target.hasPendingHostError = false;
+    target.pendingHostError = undefined;
+    return saved;
+  },
+  restorePendingHostError(saved) {
+    if (saved) {
+      saved.target.hasPendingHostError = true;
+      saved.target.pendingHostError = saved.error;
+    }
+  },
+  consumePendingHostError(target = this.getHostErrorTarget()) {
+    if (!target?.hasPendingHostError) {
+      return undefined;
+    }
+    const error = target.pendingHostError;
+    target.hasPendingHostError = false;
+    target.pendingHostError = undefined;
+    return { error };
+  },
+  registerJsModule(specifier, moduleExports) {
+    this.jsModuleCache.set(String(specifier), moduleExports);
+  },
+  registerJsModules(modules) {
+    if (!modules || typeof(modules) !== 'object') {
+      return;
+    }
+    const entries = (modules instanceof Map) ? modules.entries() : Object.entries(modules);
+    for (const [ specifier, moduleExports ] of entries) {
+      this.jsModuleCache.set(String(specifier), moduleExports);
+    }
+  },
+  resolveJsModule(specifier) {
+    const spec = String(specifier);
+    if (this.jsModuleCache.has(spec)) {
+      return this.jsModuleCache.get(spec);
+    }
+    const proc = globalThis.process;
+    if (typeof(proc?.getBuiltinModule) === 'function') {
+      let mod = proc.getBuiltinModule(spec);
+      if (mod === undefined && !spec.includes(':') && !spec.startsWith('.') && !spec.startsWith('/')) {
+        mod = proc.getBuiltinModule(`node:${spec}`);
+      }
+      if (mod !== undefined) {
+        this.jsModuleCache.set(spec, mod);
+        return mod;
+      }
+      const nodeModule = proc.getBuiltinModule('node:module');
+      if (typeof(nodeModule?.createRequire) === 'function') {
+        const basePath = `${proc.cwd?.() ?? '/'}/_zigar_host_.js`;
+        const req = nodeModule.createRequire(basePath);
+        const loaded = req(spec);
+        this.jsModuleCache.set(spec, loaded);
+        return loaded;
+      }
+    }
+    const err = new Error(`Cannot find JS module '${spec}'`);
+    err.name = 'ModuleNotFound';
+    err.code = 'ModuleNotFound';
+    throw err;
+  },
+  internJsKey(keyAddr, keyLen) {
+    const len = Number(keyLen);
+    if (len === 0) {
+      return '';
+    }
+    const cacheKey = `${keyAddr}:${len}`;
+    const cached = this.jsKeyCache.get(cacheKey);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const dv = this.obtainZigView(keyAddr, len, false);
+    const bytes = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+    const decoded = decodeText(bytes);
+    this.jsKeyDecodeCount++;
+    this.jsKeyCache.set(cacheKey, decoded);
+    return decoded;
+  },
+  resolveArgStructBySignature(signature, registerThunk) {
+    let structure = this.argStructSignatureMap?.get(signature);
+    if (!structure && registerThunk) {
+      this.registerTypeWithThunk?.(registerThunk);
+      structure = this.argStructSignatureMap?.get(signature);
+    }
+    if (!structure) {
+      throw new Error(`Unregistered host-op ArgStruct signature: 0x${signature.toString(16)}`);
+    }
+    return structure;
+  },
+  getHostOpEntry(descriptorAddr) {
+    let entry = this.jsHostOpCache.get(descriptorAddr);
+    if (entry !== undefined) {
+      return entry;
+    }
+    const is64 = Boolean(this.memory64 || "32" == 64);
+    const ptrSize = is64 ? 8 : 4;
+    const descSize = 16 + 4 * ptrSize;
+    const dv = this.obtainZigView(descriptorAddr, descSize, false);
+    const le = this.littleEndian;
+    const signature = dv.getBigUint64(0, le);
+    const op = dv.getUint32(8, le);
+    const flags = dv.getUint32(12, le);
+    const keyAddr = readUsize(dv, 16, ptrSize, le, is64);
+    const keyLen = Number(readUsize(dv, 16 + ptrSize, ptrSize, le, false));
+    const registerThunk = readUsize(dv, 16 + 2 * ptrSize, ptrSize, le, is64);
+    const argByteSize = Number(readUsize(dv, 16 + 3 * ptrSize, ptrSize, le, false));
+
+    const argStructStructure = this.resolveArgStructBySignature(signature, registerThunk);
+    const dynamicKey = Boolean(flags & HostOpFlag.DynamicKey);
+    const usesStaticKey = !dynamicKey && (
+      op === HostOpCode.ImportModule
+      || op === HostOpCode.GetGlobal
+      || op === HostOpCode.GetProp
+      || op === HostOpCode.SetProp
+      || op === HostOpCode.DeleteProp
+      || op === HostOpCode.HasProp
+      || op === HostOpCode.CallMethod
+    );
+    const key = usesStaticKey ? this.internJsKey(keyAddr, keyLen) : null;
+    const marshaler = this.compileHostOpMarshaler(argStructStructure);
+
+    entry = {
+      op,
+      flags,
+      dynamicKey,
+      key,
+      argByteSize,
+      argStructStructure,
+      ArgStruct: argStructStructure.constructor,
+      ...marshaler,
+    };
+    this.jsHostOpCache.set(descriptorAddr, entry);
+    return entry;
+  },
+  compileHostOpMarshaler(argStructStructure) {
+    const thisEnv = this;
+    const members = argStructStructure.instance.members;
+    const retvalMember = members[0];
+    const argMembers = members.slice(1);
+    const extractors = [];
+
+    for (let i = 0; i < argMembers.length; i++) {
+      const member = argMembers[i];
+      const propIndex = i;
+      const { structure, type } = member;
+      if (structure?.type === StructureType.Struct && structure.purpose === StructurePurpose.Allocator) {
+        extractors.push({
+          isAllocator: true,
+          read(argStruct) {
+            argStruct[ALLOCATOR] = argStruct[propIndex];
+          },
+        });
+      } else if (isConstStringStructure(structure)) {
+        extractors.push({
+          isAllocator: false,
+          read(argStruct) {
+            const v = argStruct[propIndex];
+            if (v === null || v === undefined) return v;
+            if (typeof(v) === 'string') return v;
+            if (typeof(v.string) === 'string') return v.string;
+            const mem = v[MEMORY];
+            if (mem) {
+              return decodeText(new Uint8Array(mem.buffer, mem.byteOffset, mem.byteLength));
+            }
+            return v;
+          },
+        });
+      } else if (type === MemberType.Object && structure?.purpose !== StructurePurpose.JsValue) {
+        extractors.push({
+          isAllocator: false,
+          read(argStruct) {
+            const v = argStruct[propIndex];
+            if (v?.[MEMORY]?.[ZIG] && typeof(v.constructor) === 'function') {
+              return new v.constructor(v);
+            }
+            return v;
+          },
+        });
+      } else {
+        extractors.push({
+          isAllocator: false,
+          read(argStruct) {
+            return argStruct[propIndex];
+          },
+        });
+      }
+    }
+
+    let writeSuccess, writeError, isErrorUnionReturn = false;
+    if (retvalMember.structure?.type === StructureType.ErrorUnion) {
+      isErrorUnionReturn = true;
+      const euStructure = retvalMember.structure;
+      const [ valueMember, errorMember ] = euStructure.instance.members;
+      const ErrorSet = errorMember.structure.constructor;
+      const retvalSlot = retvalMember.slot;
+      const { set: setValue } = this.defineMember(valueMember);
+      const { set: setError } = this.defineMember(errorMember);
+      const { set: setErrorNumber } = this.defineMember(errorMember, false);
+      const valueIsVoid = (valueMember.type === MemberType.Void);
+      const valueIsOptional = (valueMember.structure?.type === StructureType.Optional);
+      const valueHasJs = hasJsValue(valueMember.structure);
+
+      writeError = (argStruct, err) => {
+        const euObj = argStruct[SLOTS][retvalSlot] ?? argStruct[VIVIFICATE](retvalSlot);
+        const matched = matchErrorToSet(ErrorSet, err);
+        if (!matched) {
+          throw new NotInErrorSet(errorMember.structure, err instanceof Error ? err : new Error(String(err)));
+        }
+        setError.call(euObj, matched);
+        const mem = (euObj[RESTORE]) ? euObj[RESTORE]() : euObj[MEMORY];
+        clearView(mem, valueMember.bitOffset >> 3, valueMember.byteSize);
+        euObj[VISIT]?.('clear', VisitorFlag.IgnoreUncreated);
+      };
+
+      writeSuccess = (argStruct, result) => {
+        const normalized = (valueIsOptional && result === undefined) ? null : result;
+        const euObj = argStruct[SLOTS][retvalSlot] ?? argStruct[VIVIFICATE](retvalSlot);
+        if (!valueIsVoid) {
+          if (valueHasJs) {
+            const prevPending = thisEnv.pendingJsHandles;
+            const prevUninit = thisEnv.writingUninitZig;
+            const allocatedHandles = [];
+            thisEnv.pendingJsHandles = allocatedHandles;
+            thisEnv.writingUninitZig = true;
+            try {
+              setValue.call(euObj, normalized, argStruct[ALLOCATOR]);
+            } catch (convErr) {
+              for (const handle of allocatedHandles) {
+                thisEnv.releaseJsValue(handle);
+              }
+              throw convErr;
+            } finally {
+              thisEnv.pendingJsHandles = prevPending;
+              thisEnv.writingUninitZig = prevUninit;
+            }
+          } else {
+            setValue.call(euObj, normalized, argStruct[ALLOCATOR]);
+          }
+        }
+        setErrorNumber.call(euObj, 0);
+      };
+    } else {
+      const retvalIsVoid = (retvalMember.type === MemberType.Void);
+      const retvalIsOptional = (retvalMember.structure?.type === StructureType.Optional);
+      const retvalHasJs = hasJsValue(retvalMember.structure);
+      writeSuccess = retvalIsVoid
+        ? () => {}
+        : retvalHasJs
+          ? (argStruct, result) => {
+              const normalized = (retvalIsOptional && result === undefined) ? null : result;
+              const prevPending = thisEnv.pendingJsHandles;
+              const prevUninit = thisEnv.writingUninitZig;
+              const allocatedHandles = [];
+              thisEnv.pendingJsHandles = allocatedHandles;
+              thisEnv.writingUninitZig = true;
+              try {
+                argStruct[RETURN](normalized);
+              } catch (convErr) {
+                for (const handle of allocatedHandles) {
+                  thisEnv.releaseJsValue(handle);
+                }
+                throw convErr;
+              } finally {
+                thisEnv.pendingJsHandles = prevPending;
+                thisEnv.writingUninitZig = prevUninit;
+              }
+            }
+          : (argStruct, result) => {
+              argStruct[RETURN]((retvalIsOptional && result === undefined) ? null : result);
+            };
+      writeError = null;
+    }
+
+    return {
+      extractors,
+      isErrorUnionReturn,
+      writeSuccess,
+      writeError,
+    };
+  },
+  invokeJsHostOp(descriptorAddr, argAddr, argSize) {
+    const savedPending = this.savePendingHostError();
+    let context = null;
+    this.syncCallDepth++;
+    try {
+      const entry = this.getHostOpEntry(descriptorAddr);
+      const byteLen = Number(argSize || entry.argByteSize);
+      const dv = this.obtainZigView(argAddr, byteLen, false);
+      const { ArgStruct, extractors, op, dynamicKey, key, isErrorUnionReturn, writeSuccess, writeError } = entry;
+      const argStruct = ArgStruct(dv);
+      if (VISIT in argStruct) {
+        argStruct[VISIT]('reset', VisitorFlag.IgnoreUncreated);
+        context = this.startContext();
+        this.updatePointerTargets(context, argStruct, true);
+        this.updateShadowTargets(context);
+      }
+      try {
+        const jsArgs = [];
+        for (const ext of extractors) {
+          if (ext.isAllocator) {
+            ext.read(argStruct);
+          } else {
+            jsArgs.push(ext.read(argStruct));
+          }
+        }
+        let result;
+        switch (op) {
+          case HostOpCode.ImportModule: {
+            const spec = dynamicKey ? jsArgs[0] : key;
+            result = this.resolveJsModule(spec);
+            break;
+          }
+          case HostOpCode.GetGlobal: {
+            const propKey = dynamicKey ? jsArgs[0] : key;
+            result = globalThis[propKey];
+            break;
+          }
+          case HostOpCode.GetProp: {
+            const target = jsArgs[0];
+            const propKey = dynamicKey ? jsArgs[1] : key;
+            result = target[propKey];
+            break;
+          }
+          case HostOpCode.SetProp: {
+            const target = jsArgs[0];
+            const propKey = dynamicKey ? jsArgs[1] : key;
+            const value = dynamicKey ? jsArgs[2] : jsArgs[1];
+            target[propKey] = value;
+            result = undefined;
+            break;
+          }
+          case HostOpCode.DeleteProp: {
+            const target = jsArgs[0];
+            const propKey = dynamicKey ? jsArgs[1] : key;
+            result = Reflect.deleteProperty(target, propKey);
+            break;
+          }
+          case HostOpCode.HasProp: {
+            const target = jsArgs[0];
+            const propKey = dynamicKey ? jsArgs[1] : key;
+            result = Reflect.has(target, propKey);
+            break;
+          }
+          case HostOpCode.CallFn: {
+            const callee = jsArgs[0];
+            if (typeof(callee) !== 'function') {
+              throw createNotCallableError('Target is not a function');
+            }
+            result = Reflect.apply(callee, undefined, jsArgs.slice(1));
+            break;
+          }
+          case HostOpCode.CallMethod: {
+            const receiver = jsArgs[0];
+            const methodKey = dynamicKey ? jsArgs[1] : key;
+            const callArgs = dynamicKey ? jsArgs.slice(2) : jsArgs.slice(1);
+            if (receiver === null || receiver === undefined) {
+              throw new TypeError(`Cannot read properties of ${receiver} (reading '${String(methodKey)}')`);
+            }
+            const method = receiver[methodKey];
+            if (typeof(method) !== 'function') {
+              throw createNotCallableError(`${String(methodKey)} is not a function`);
+            }
+            result = Reflect.apply(method, receiver, callArgs);
+            break;
+          }
+          case HostOpCode.Construct: {
+            const ctor = jsArgs[0];
+            if (typeof(ctor) !== 'function') {
+              throw createNotCallableError('Target is not a constructor');
+            }
+            result = Reflect.construct(ctor, jsArgs.slice(1));
+            break;
+          }
+          default:
+            throw new Error(`Unknown JS host operation: ${op}`);
+        }
+        writeSuccess(argStruct, result);
+        if ("wasm" === 'node') ;
+        return PosixError.NONE;
+      } catch (err) {
+        if (isErrorUnionReturn) {
+          writeError(argStruct, err);
+          if ("wasm" === 'node') ;
+          return PosixError.NONE;
+        }
+        if (ArgStruct[THROWING] && err instanceof Error) {
+          argStruct[RETURN](err);
+          if ("wasm" === 'node') ;
+          return PosixError.NONE;
+        }
+        throw err;
+      }
+    } catch (unhandledErr) {
+      this.recordPendingHostError(unhandledErr);
+      return PosixError.EFAULT;
+    } finally {
+      this.syncCallDepth--;
+      if (context) {
+        this.endContext();
+      }
+      if (savedPending) {
+        this.restorePendingHostError(savedPending);
+      }
+    }
+  },
+  getZigCallbackTemplate(descriptorAddr) {
+    let template = this.zigCallbackTemplateCache.get(descriptorAddr);
+    if (template !== undefined) {
+      return template;
+    }
+    const is64 = Boolean(this.memory64 || "32" == 64);
+    const ptrSize = is64 ? 8 : 4;
+    const descSize = 16 + 2 * ptrSize;
+    const dv = this.obtainZigView(descriptorAddr, descSize, false);
+    const le = this.littleEndian;
+    const signature = dv.getBigUint64(0, le);
+    const flags = dv.getUint32(8, le);
+    const trampolineThunk = readUsize(dv, 16, ptrSize, le, is64);
+    const registerThunk = readUsize(dv, 16 + ptrSize, ptrSize, le, is64);
+
+    const argStructStructure = this.resolveArgStructBySignature(signature, registerThunk);
+    const ArgStruct = argStructStructure.constructor;
+    const thunkDV = new DataView(new ArrayBuffer(0));
+    thunkDV[ZIG] = { address: trampolineThunk, len: 0 };
+    const thunkHolder = { [MEMORY]: thunkDV };
+    const retvalStructure = unwrapPayloadStructure(argStructStructure.instance.members[0]?.structure);
+    const unwrapString = isConstStringStructure(retvalStructure);
+
+    template = {
+      ArgStruct,
+      thunkHolder,
+      unwrapString,
+      is64,
+      sync: !(flags & 1),
+    };
+    this.zigCallbackTemplateCache.set(descriptorAddr, template);
+    return template;
+  },
+  createZigCallback(descriptorAddr, callbackId) {
+    const savedPending = this.savePendingHostError();
+    try {
+      const id = Number(callbackId) >>> 0;
+      const template = this.getZigCallbackTemplate(descriptorAddr);
+      const caller = this.createOutboundCaller(template.thunkHolder, template.ArgStruct);
+      caller.zigarSync = template.sync;
+      const slotDV = new DataView(new ArrayBuffer(0));
+      slotDV[ZIG] = { address: template.is64 ? BigInt(id) : id, len: 0 };
+      caller[MEMORY] = slotDV;
+      const state = { id, released: false, handle: 0 };
+      const unwrapString = template.unwrapString;
+      const wrapper = (...args) => {
+        if (state.released) {
+          throw new Error('Zig callback has already been released');
+        }
+        const res = caller(...args);
+        const pending = this.consumePendingHostError();
+        if (pending) {
+          throw pending.error;
+        }
+        if (unwrapString && res && typeof(res) === 'object' && MEMORY in res) {
+          if (typeof(res.string) === 'string') {
+            return res.string;
+          }
+          const mem = res[MEMORY];
+          if (mem) {
+            return decodeText(new Uint8Array(mem.buffer, mem.byteOffset, mem.byteLength));
+          }
+        }
+        return res;
+      };
+      const handle = this.allocJsValue(wrapper);
+      state.handle = handle;
+      this.zigCallbackMap.set(id, state);
+      return handle;
+    } catch (err) {
+      this.recordPendingHostError(err);
+      return 0;
+    } finally {
+      if (savedPending) {
+        this.restorePendingHostError(savedPending);
+      }
+    }
+  },
+  releaseZigCallback(callbackId) {
+    const id = Number(callbackId) >>> 0;
+    const state = this.zigCallbackMap.get(id);
+    if (state) {
+      state.released = true;
+      this.zigCallbackMap.delete(id);
+    }
+  },
+  getActiveZigCallbackCount() {
+    return this.zigCallbackMap.size;
+  },
+  ...({
+    exports: {
+      invokeJsHostOp: { argType: 'aaz', returnType: 'i' },
+      createZigCallback: { argType: 'ai', returnType: 'i' },
+      releaseZigCallback: { argType: 'i' },
+    },
+  } ),
+});
+
+function readUsize(dv, byteOffset, ptrSize, littleEndian, asBigInt) {
+  if (ptrSize === 8) {
+    const v = dv.getBigUint64(byteOffset, littleEndian);
+    return asBigInt ? v : Number(v);
+  }
+  const v = dv.getUint32(byteOffset, littleEndian);
+  return asBigInt ? BigInt(v) : v;
+}
+
+function unwrapPayloadStructure(structure) {
+  let s = structure;
+  while (s && (s.type === StructureType.ErrorUnion || s.type === StructureType.Optional)) {
+    s = s.instance?.members?.[0]?.structure;
+  }
+  return s;
+}
+
+function isConstStringStructure(structure) {
+  let s = structure;
+  if (s?.type === StructureType.Optional) {
+    s = s.instance?.members?.[0]?.structure;
+  }
+  if (!s || s.type !== StructureType.Pointer || !(s.flags & PointerFlag.IsConst)) {
+    return false;
+  }
+  const target = s.instance?.members?.[0]?.structure;
+  if (!target) {
+    return false;
+  }
+  if (target.type === StructureType.Slice && (target.flags & SliceFlag.IsString)) {
+    return true;
+  }
+  if (target.type === StructureType.Array && (target.flags & ArrayFlag.IsString)) {
+    return true;
+  }
+  return false;
+}
+
+function createNotCallableError(message) {
+  const err = new TypeError(message);
+  err.code = 'NotCallable';
+  return err;
+}
+
+function matchErrorToSet(ErrorSet, err) {
+  const ZigErrorCls = ErrorSet[CLASS];
+  if (ZigErrorCls && err instanceof ZigErrorCls) {
+    const m = ErrorSet(err);
+    if (m) return m;
+  }
+  if (typeof(err) === 'string') {
+    const m = ErrorSet(err) || (Object.hasOwn(ErrorSet, err) ? ErrorSet[err] : null);
+    if (m) return m;
+  } else if (err && typeof(err) === 'object') {
+    if (isErrorJSON(err)) {
+      const m = ErrorSet(err) || (Object.hasOwn(ErrorSet, err.error) ? ErrorSet[err.error] : null);
+      if (m) return m;
+    }
+    if (typeof(err.code) === 'string' && Object.hasOwn(ErrorSet, err.code)) {
+      return ErrorSet[err.code];
+    }
+    if (err instanceof Error) {
+      const m = ErrorSet(err)
+        || (err.name && Object.hasOwn(ErrorSet, err.name) ? ErrorSet[err.name] : null)
+        || (err.message && Object.hasOwn(ErrorSet, err.message) ? ErrorSet[err.message] : null);
+      if (m) return m;
+    } else if (typeof(err.name) === 'string' && Object.hasOwn(ErrorSet, err.name)) {
+      return ErrorSet[err.name];
+    }
+  }
+  return (Object.hasOwn(ErrorSet, 'JsException') ? ErrorSet.JsException : null)
+    ?? (Object.hasOwn(ErrorSet, 'Unexpected') ? ErrorSet.Unexpected : null);
+}
+
 const RESERVED_UNDEFINED = 0;
 const RESERVED_NULL = 1;
 const RESERVED_FALSE = 2;
@@ -7101,11 +7796,17 @@ var jsValueRegistry = mixin({
     if (this.restoreView) {
       dv = this.restoreView(dv);
     }
+    this.releaseJsValuesInView(structure, dv, offset, false);
+  },
+  releaseJsValuesInView(structure, dv, offset = 0, clearHandles = false) {
     const le = this.littleEndian;
     const visit = (s, base) => {
       if (s.purpose === StructurePurpose.JsValue) {
         const handle = dv.getUint32(base, le) >>> 0;
         this.releaseJsValueIfValid(handle);
+        if (clearHandles) {
+          dv.setUint32(base, RESERVED_UNDEFINED, le);
+        }
         return;
       }
       switch (s.type) {
@@ -7158,6 +7859,19 @@ var jsValueRegistry = mixin({
       }
     };
     visit(structure, offset);
+  },
+  discardJsValueRetval(argStruct) {
+    const retvalMember = argStruct?.[VIVIFICATE]?.retvalMember;
+    if (!retvalMember || retvalMember.type !== MemberType.Object || this.jsValueActiveCount === 0) {
+      return;
+    }
+    const { structure, bitOffset, byteSize } = retvalMember;
+    if (!hasJsValue(structure)) {
+      return;
+    }
+    const offset = bitOffset >> 3;
+    const dv = argStruct[MEMORY];
+    this.releaseJsValuesInView(structure, dv, offset, true);
   },
   walkActiveJsValueLeaves(rootObj, structure, rootDV, callback) {
     const le = this.littleEndian;
@@ -7729,6 +8443,8 @@ var moduleLoading = mixin({
       this.continuationStackPool = [];
       this.activeContinuation = null;
       this.suspendedContinuationCount = 0;
+      this.resumingContinuation = null;
+      this.resumeWaiters = [];
       this.stackPointerGlobal = null;
       this.initialStackPointer = 0;
     }
@@ -7821,6 +8537,20 @@ var moduleLoading = mixin({
         : this.fromWebAssembly(returnType, retval);
       };
     },
+    releaseContinuationResume(cont) {
+      if (!cont || this.resumingContinuation !== cont) {
+        return;
+      }
+      this.resumingContinuation = null;
+      while (this.resumeWaiters.length > 0) {
+        const next = this.resumeWaiters.shift();
+        if (!next.cont.finished) {
+          this.resumingContinuation = next.cont;
+          next.wake();
+          return;
+        }
+      }
+    },
     wrapSuspending(fn) {
       const hasSuspending = typeof WA.Suspending === 'function';
       const wrapper = (...args) => {
@@ -7857,11 +8587,9 @@ var moduleLoading = mixin({
           if (cont) {
             cont.parentContinuation = null;
             cont.parentSp = defaultSp;
+            this.releaseContinuationResume(cont);
           }
           const resumeContinuation = () => {
-            if (this.activeContinuation && this.activeContinuation !== cont && !this.activeContinuation.suspended) {
-              this.activeContinuation.finish?.();
-            }
             if (cont) {
               if (cont.suspended) {
                 cont.suspended = false;
@@ -7875,12 +8603,50 @@ var moduleLoading = mixin({
             }
             this.activeContinuation = cont;
           };
+          const waitForResumeTurn = () => {
+            if (!cont || cont.finished) {
+              return null;
+            }
+            if (!this.resumingContinuation) {
+              this.resumingContinuation = cont;
+              return null;
+            }
+            return new Promise((wake) => {
+              this.resumeWaiters.push({ cont, wake });
+            });
+          };
           const promise = isPromise(res) ? res : Promise.resolve(res);
           return promise.then((val) => {
-            resumeContinuation();
+            const wait = waitForResumeTurn();
+            if (wait) {
+              return wait.then(() => {
+                if (cont.finished) {
+                  this.releaseContinuationResume(cont);
+                  return val;
+                }
+                resumeContinuation();
+                return val;
+              });
+            }
+            if (!cont?.finished) {
+              resumeContinuation();
+            }
             return val;
           }, (err) => {
-            resumeContinuation();
+            const wait = waitForResumeTurn();
+            if (wait) {
+              return wait.then(() => {
+                if (cont.finished) {
+                  this.releaseContinuationResume(cont);
+                  throw err;
+                }
+                resumeContinuation();
+                throw err;
+              });
+            }
+            if (!cont?.finished) {
+              resumeContinuation();
+            }
             throw err;
           });
         }
@@ -7943,12 +8709,15 @@ var moduleLoading = mixin({
         sp: stackTop,
         parentSp: spGlobal ? spGlobal.value : (isSp64 ? 0n : 0),
         parentContinuation: prevCont,
+        hostErrorFrame: this.activeHostErrorFrame,
         suspended: false,
+        finished: false,
         finish: null,
       };
       const finish = cont.finish = () => {
         if (finished) return;
         finished = true;
+        cont.finished = true;
         if (cont.suspended) {
           cont.suspended = false;
           this.suspendedContinuationCount--;
@@ -7967,6 +8736,7 @@ var moduleLoading = mixin({
             spGlobal.value = cont.parentSp;
           }
         }
+        this.releaseContinuationResume(cont);
         if (overflowError) {
           throw overflowError;
         }
@@ -8065,6 +8835,8 @@ var moduleLoading = mixin({
         this.continuationStackPool.length = 0;
         this.activeContinuation = null;
         this.suspendedContinuationCount = 0;
+        this.resumingContinuation = null;
+        this.resumeWaiters.length = 0;
       });
     },
     async instantiateWebAssembly(source, options = {}) {
@@ -9035,11 +9807,7 @@ var thunkAllocation = mixin({
       const imports = { env, wasi, wasi_snapshot_preview1: wasiPreview };
       for (const { module, name, kind } of w.Module.imports(this.executable)) {
         if (kind === 'function') {
-          if (module === 'env') {
-            env[name] = empty;
-          } else if (module === 'wasi_snapshot_preview1') {
-            wasiPreview[name] = empty;
-          }
+          (imports[module] ??= {})[name] = empty;
         }
       }
       const initialPages = memoryInitial ?? (this.memory.buffer.byteLength / 65536);
@@ -9084,7 +9852,9 @@ var thunkAllocation = mixin({
       let source, sourceAddress = 0;
       for (source of this.thunkSources) {
         sourceAddress = source.createJsThunk(controllerAddress, funcId);
-        break;
+        if (sourceAddress) {
+          break;
+        }
       }
       if (!sourceAddress) {
         source = this.addJsThunkSource();
@@ -9277,7 +10047,7 @@ var allocator = mixin({
     }
   },
   freeHostMemory(ptr, buf, ptrAlign) {
-    const dv = buf['*'][MEMORY];
+    const dv = (buf instanceof DataView) ? buf : buf['*'][MEMORY];
     const address = this.getViewAddress(dv);
     const len = dv.byteLength;
     const entry = this.unregisterMemory(address, len);
@@ -10906,10 +11676,34 @@ var structureAcquisition = mixin({
     const thunk = { [MEMORY]: this.obtainZigView(thunkAddress, 0) };
     this.comptime = true;
     this.mixinUsage = new Map();
+    if (this.instance?.exports) {
+      this.trackingMixins = true;
+      for (const [ name, fn ] of Object.entries(this.instance.exports)) {
+        if (name.startsWith('__zigar_js_reg_') && typeof(fn) === 'function') {
+          fn();
+        }
+      }
+    }
     this.invokeThunk(thunk, thunk, thunk);
     this.comptime = false;
+    this.resolveDeferredStructures(0);
+  },
+  registerTypeWithThunk(registerThunkAddress) {
+    const startIdx = this.structures.length;
+    const prevComptime = this.comptime;
+    this.comptime = true;
+    try {
+      const thunk = { [MEMORY]: this.obtainZigView(registerThunkAddress, 0) };
+      this.invokeThunk(thunk, thunk, thunk);
+    } finally {
+      this.comptime = prevComptime;
+    }
+    this.resolveDeferredStructures(startIdx);
+  },
+  resolveDeferredStructures(startIndex = 0) {
     // acquire pointer targets now that we have all constructors
-    for (const structure of this.structures) {
+    for (let i = startIndex; i < this.structures.length; i++) {
+      const structure = this.structures[i];
       if (this.hasDeferred) {
         const { static: { template } } = structure;
         const slots = template?.[SLOTS];
@@ -10957,6 +11751,9 @@ var structureAcquisition = mixin({
       if (this.table64) {
         settings.table64 = true;
       }
+    }
+    if (this.using?.(jsHostOp)) {
+      settings.hasJsHostOps = true;
     }
     return { structures, settings };
   },
@@ -11015,6 +11812,16 @@ var structureAcquisition = mixin({
           case '_equalJsValue':
           case '_getJsValueCount':
             this.use(jsValueRegistry);
+            break;
+          case '_invokeJsHostOp':
+          case '_createZigCallback':
+          case '_releaseZigCallback':
+            this.use(jsHostOp);
+            this.use(jsValueRegistry);
+            this.use(jsValue);
+            this.use(callMarshalingInbound);
+            this.use(callMarshalingOutbound);
+            this.use(pointerSynchronization);
             break;
         }
       }
@@ -13107,8 +13914,15 @@ var argStruct = mixin({
     return constructor;
   },
   finalizeArgStruct(structure, staticDescriptors) {
-    const { flags } = structure;
+    const { flags, signature } = structure;
     staticDescriptors[THROWING] = defineValue(!!(flags & ArgStructFlag.IsThrowing));
+    if (signature !== undefined) {
+      let map = this.argStructSignatureMap;
+      if (!map) {
+        map = this.argStructSignatureMap = new Map();
+      }
+      map.set(signature, structure);
+    }
   },
   updateArgStructMembers(structure, memberFlags) {
     const {
@@ -15348,6 +16162,7 @@ var mixins = /*#__PURE__*/Object.freeze({
   FeatureCallMarshalingOutbound: callMarshalingOutbound,
   FeatureDirConversion: dirConversion,
   FeatureIntConversion: intConversion,
+  FeatureJsHostOp: jsHostOp,
   FeatureJsValueRegistry: jsValueRegistry,
   FeatureMemoryMapping: memoryMapping,
   FeatureModuleLoading: moduleLoading,
@@ -15545,9 +16360,12 @@ async function transpile(srcPath, options) {
       usage[name] = true;
     }
   }
-  if (definition.structures.some(s => s.purpose === StructurePurpose.JsValue)) {
+  if (definition.structures.some(s => s.purpose === StructurePurpose.JsValue) || definition.settings?.hasJsHostOps) {
     usage.StructureJsValue = true;
     usage.FeatureJsValueRegistry = true;
+  }
+  if (definition.settings?.hasJsHostOps) {
+    usage.FeatureJsHostOp = true;
   }
   if (nodeCompat && usage.FeatureWorkerSupport) {
     usage.FeatureWorkerSupportCompat = true;
