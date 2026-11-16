@@ -989,6 +989,7 @@ async function copyZonFile(srcPath, dstPath) {
 function generateCode(definition, params) {
   const { structures } = definition;
   const {
+    declareFeatures = false,
     runtimeURL,
     binarySource = null,
     topLevelAwait = true,
@@ -1028,7 +1029,7 @@ function generateCode(definition, params) {
     add(`import { createEnvironment } from ${JSON.stringify(runtimeURL)};`);
   }
   const effectiveMixinPaths = [ ...mixinPaths ];
-  if (!standaloneLoader && runtimeURL && structures.some(s => s.purpose === StructurePurpose.JsValue)) {
+  if (declareFeatures && !standaloneLoader && runtimeURL && structures.some(s => s.purpose === StructurePurpose.JsValue)) {
     for (const reqPath of [ 'features/js-value-registry.js', 'structures/js-value.js' ]) {
       if (!effectiveMixinPaths.includes(reqPath)) {
         effectiveMixinPaths.push(reqPath);
@@ -6861,11 +6862,13 @@ const RESERVED_TRUE = 3;
 const RESERVED_GLOBAL_THIS = 4;
 const FIRST_DYNAMIC_SLOT = FIRST_DYNAMIC_JS_VALUE_SLOT;
 
-const SLOT_MASK = 0x000FFFFF;
+const SLOT_INDEX_MASK = 0x00003FFF;
+const REALM_SHIFT = 14;
+const REALM_MASK = 0x3F;
 const GEN_SHIFT = 20;
 const GEN_MASK = 0x0FFF;
 const ACTIVE_BIT = 0x1000;
-const MAX_SLOTS = SLOT_MASK + 1;
+const MAX_SLOTS = SLOT_INDEX_MASK + 1;
 const INITIAL_CAPACITY = 64;
 
 const JS_TYPE_CODES = {
@@ -6892,8 +6895,12 @@ function initRegistryState(env) {
 
 var jsValueRegistry = mixin({
   init() {
+    this.jsValueRealmTag = 0;
     initRegistryState(this);
     this.destructors?.push(() => initRegistryState(this));
+  },
+  setJsValueRealmTag(tag) {
+    this.jsValueRealmTag = tag & REALM_MASK;
   },
   resetJsValueRegistry() {
     initRegistryState(this);
@@ -6934,7 +6941,7 @@ var jsValueRegistry = mixin({
     this.jsValueSlots[slot] = value;
     this.jsValueGenerations[slot] = ACTIVE_BIT | gen;
     this.jsValueActiveCount++;
-    const handle = ((gen << GEN_SHIFT) | slot) >>> 0;
+    const handle = ((gen << GEN_SHIFT) | (this.jsValueRealmTag << REALM_SHIFT) | slot) >>> 0;
     if (this.pendingJsHandles) {
       this.pendingJsHandles.push(handle);
     }
@@ -6952,10 +6959,11 @@ var jsValueRegistry = mixin({
     if (handle < FIRST_DYNAMIC_SLOT) {
       throw new InvalidJsValueHandle(handle);
     }
-    const slot = handle & SLOT_MASK;
+    const slot = handle & SLOT_INDEX_MASK;
+    const realm = (handle >>> REALM_SHIFT) & REALM_MASK;
     const gen = handle >>> GEN_SHIFT;
-    if (slot < FIRST_DYNAMIC_SLOT || slot >= this.jsValueNextSlot || gen === 0
-      || this.jsValueGenerations[slot] !== (ACTIVE_BIT | gen)) {
+    if (realm !== this.jsValueRealmTag || slot < FIRST_DYNAMIC_SLOT || slot >= this.jsValueNextSlot
+      || gen === 0 || this.jsValueGenerations[slot] !== (ACTIVE_BIT | gen)) {
       throw new InvalidJsValueHandle(handle);
     }
     return this.jsValueSlots[slot];
@@ -6976,10 +6984,11 @@ var jsValueRegistry = mixin({
     if (handle < FIRST_DYNAMIC_SLOT) {
       throw new InvalidJsValueHandle(handle);
     }
-    const slot = handle & SLOT_MASK;
+    const slot = handle & SLOT_INDEX_MASK;
+    const realm = (handle >>> REALM_SHIFT) & REALM_MASK;
     const gen = handle >>> GEN_SHIFT;
-    if (slot < FIRST_DYNAMIC_SLOT || slot >= this.jsValueNextSlot || gen === 0
-      || this.jsValueGenerations[slot] !== (ACTIVE_BIT | gen)) {
+    if (realm !== this.jsValueRealmTag || slot < FIRST_DYNAMIC_SLOT || slot >= this.jsValueNextSlot
+      || gen === 0 || this.jsValueGenerations[slot] !== (ACTIVE_BIT | gen)) {
       throw new InvalidJsValueHandle(handle);
     }
     this.jsValueGenerations[slot] = gen;
@@ -7010,9 +7019,11 @@ var jsValueRegistry = mixin({
     if (handle < FIRST_DYNAMIC_SLOT) {
       return false;
     }
-    const slot = handle & SLOT_MASK;
+    const slot = handle & SLOT_INDEX_MASK;
+    const realm = (handle >>> REALM_SHIFT) & REALM_MASK;
     const gen = handle >>> GEN_SHIFT;
-    return (slot >= FIRST_DYNAMIC_SLOT && slot < this.jsValueNextSlot && gen !== 0
+    return (realm === this.jsValueRealmTag && slot >= FIRST_DYNAMIC_SLOT
+      && slot < this.jsValueNextSlot && gen !== 0
       && this.jsValueGenerations[slot] === (ACTIVE_BIT | gen));
   },
   releaseJsValueIfValid(handle) {
@@ -8514,8 +8525,8 @@ var objectLinkage = mixin({
       // objects in WebAssembly have fixed addresses so the handle is the address
       // for native code module, locations of objects in memory can change depending on
       // where the shared library is loaded
-      const normalizedHandle = is64 ? BigInt(handle) : Number(handle);
-      const address = normalizedHandle ;
+      const address = (is64 ? BigInt(handle) : Number(handle))
+        ;
       let zigDV = object[MEMORY] = this.obtainZigView(address, jsDV.byteLength);
       if (writeBack) {
         copyView(zigDV, jsDV);
@@ -15572,6 +15583,7 @@ async function transpile(srcPath, options) {
     }
   }
   const { code, exports, structures } = generateCode(definition, {
+    declareFeatures: true,
     runtimeURL,
     binarySource,
     topLevelAwait,

@@ -41,7 +41,36 @@ pub fn WorkQueue(ns: type) type {
 
 var gpa = std.heap.DebugAllocator(.{}).init;
 const allocator = gpa.allocator();
-var imports: Module.Imports = undefined;
+var imports: Module.Imports = init: {
+    const fallback = struct {
+        fn cloneJsValue(_: *Module.Host, _: u32, _: *u32) callconv(.c) E {
+            return .NOSYS;
+        }
+        fn releaseJsValue(_: *Module.Host, _: u32) callconv(.c) E {
+            return .NOSYS;
+        }
+        fn typeofJsValue(_: *Module.Host, _: u32, _: *u8) callconv(.c) E {
+            return .NOSYS;
+        }
+        fn instanceofJsValue(_: *Module.Host, _: u32, _: u32, _: *bool) callconv(.c) E {
+            return .NOSYS;
+        }
+        fn equalJsValue(_: *Module.Host, _: u32, _: u32, _: *bool) callconv(.c) E {
+            return .NOSYS;
+        }
+        fn getJsValueCount(_: *Module.Host, _: *u32) callconv(.c) E {
+            return .NOSYS;
+        }
+    };
+    var imp: Module.Imports = undefined;
+    imp.clone_js_value = fallback.cloneJsValue;
+    imp.release_js_value = fallback.releaseJsValue;
+    imp.typeof_js_value = fallback.typeofJsValue;
+    imp.instanceof_js_value = fallback.instanceofJsValue;
+    imp.equal_js_value = fallback.equalJsValue;
+    imp.get_js_value_count = fallback.getJsValueCount;
+    break :init imp;
+};
 
 threadlocal var instance: *Module.Host = undefined;
 threadlocal var initialized: bool = false;
@@ -226,9 +255,12 @@ pub fn getInstance() *anyopaque {
     return instance;
 }
 
+var environ_fixed: bool = false;
+
 pub fn setHostInstance(ptr: *Module.Host) callconv(.c) E {
     if (builtin.link_libc and builtin.target.os.tag != .windows) {
-        if (@hasDecl(c, "RTLD_DEEPBIND")) {
+        if (!environ_fixed and @hasDecl(c, "RTLD_DEEPBIND")) {
+            environ_fixed = true;
             // fix missing environ due to RTLD_DEEPBIND option given to dlopen()
             if (std.c.dlopen(null, .{ .LAZY = true, .NOLOAD = true })) |handle| {
                 defer _ = std.c.dlclose(handle);
@@ -386,28 +418,107 @@ pub fn isRedirectingStderr() bool {
     return !redirection_suppressed;
 }
 
-pub fn cloneJsValue(_: u32) u32 {
-    @panic("JsValue native host bridge not supported yet");
+fn mapJsValueStatus(status: E) js.Error!void {
+    return switch (status) {
+        .SUCCESS => {},
+        .PERM => error.OffJsThread,
+        .NOSYS => error.HostUnavailable,
+        else => error.JsException,
+    };
 }
 
-pub fn releaseJsValue(_: u32) void {
-    @panic("JsValue native host bridge not supported yet");
+pub fn isJsThread() bool {
+    if (!initialized) return false;
+    var count: u32 = 0;
+    return imports.get_js_value_count(instance, &count) != .PERM;
 }
 
-pub fn typeofJsValue(_: u32) js.JsType {
-    @panic("JsValue native host bridge not supported yet");
+pub fn tryCloneJsValue(handle: u32) js.Error!u32 {
+    if (!initialized) return error.OffJsThread;
+    var cloned: u32 = js.reserved_undefined_handle;
+    try mapJsValueStatus(imports.clone_js_value(instance, handle, &cloned));
+    return cloned;
 }
 
-pub fn instanceofJsValue(_: u32, _: u32) bool {
-    @panic("JsValue native host bridge not supported yet");
+pub fn tryReleaseJsValue(handle: u32) js.Error!void {
+    if (!initialized) return error.OffJsThread;
+    try mapJsValueStatus(imports.release_js_value(instance, handle));
 }
 
-pub fn equalJsValue(_: u32, _: u32) bool {
-    @panic("JsValue native host bridge not supported yet");
+pub fn tryTypeofJsValue(handle: u32) js.Error!js.JsType {
+    if (!initialized) return error.OffJsThread;
+    var code: u8 = 0;
+    try mapJsValueStatus(imports.typeof_js_value(instance, handle, &code));
+    return @enumFromInt(code);
+}
+
+pub fn tryInstanceofJsValue(handle: u32, ctor_handle: u32) js.Error!bool {
+    if (!initialized) return error.OffJsThread;
+    var result: bool = false;
+    try mapJsValueStatus(imports.instanceof_js_value(instance, handle, ctor_handle, &result));
+    return result;
+}
+
+pub fn tryEqualJsValue(lhs_handle: u32, rhs_handle: u32) js.Error!bool {
+    if (!initialized) return error.OffJsThread;
+    var result: bool = false;
+    try mapJsValueStatus(imports.equal_js_value(instance, lhs_handle, rhs_handle, &result));
+    return result;
+}
+
+pub fn tryGetJsValueCount() js.Error!u32 {
+    if (!initialized) return error.OffJsThread;
+    var count: u32 = 0;
+    try mapJsValueStatus(imports.get_js_value_count(instance, &count));
+    return count;
+}
+
+pub fn cloneJsValue(handle: u32) u32 {
+    return tryCloneJsValue(handle) catch |err| switch (err) {
+        error.JsException => js.reserved_undefined_handle,
+        error.OffJsThread => @panic("JsValue operations require the JS thread"),
+        error.HostUnavailable => @panic("JsValue host imports unavailable"),
+    };
+}
+
+pub fn releaseJsValue(handle: u32) void {
+    tryReleaseJsValue(handle) catch |err| switch (err) {
+        error.JsException => {},
+        error.OffJsThread => @panic("JsValue operations require the JS thread"),
+        error.HostUnavailable => @panic("JsValue host imports unavailable"),
+    };
+}
+
+pub fn typeofJsValue(handle: u32) js.JsType {
+    return tryTypeofJsValue(handle) catch |err| switch (err) {
+        error.JsException => .@"undefined",
+        error.OffJsThread => @panic("JsValue operations require the JS thread"),
+        error.HostUnavailable => @panic("JsValue host imports unavailable"),
+    };
+}
+
+pub fn instanceofJsValue(handle: u32, ctor_handle: u32) bool {
+    return tryInstanceofJsValue(handle, ctor_handle) catch |err| switch (err) {
+        error.JsException => false,
+        error.OffJsThread => @panic("JsValue operations require the JS thread"),
+        error.HostUnavailable => @panic("JsValue host imports unavailable"),
+    };
+}
+
+pub fn equalJsValue(lhs_handle: u32, rhs_handle: u32) bool {
+    return tryEqualJsValue(lhs_handle, rhs_handle) catch |err| switch (err) {
+        error.JsException => false,
+        error.OffJsThread => @panic("JsValue operations require the JS thread"),
+        error.HostUnavailable => @panic("JsValue host imports unavailable"),
+    };
 }
 
 pub fn getJsValueCount() u32 {
-    return 0;
+    return tryGetJsValueCount() catch |err| switch (err) {
+        error.JsException => 0,
+        error.OffJsThread => @panic("JsValue operations require the JS thread"),
+        error.HostUnavailable => @panic("JsValue host imports unavailable"),
+    };
 }
 
 pub fn isRedirecting(comptime literal: @TypeOf(.enum_literal)) bool {
@@ -445,6 +556,7 @@ pub fn createModule(comptime module_ns: type) Module {
             .io_redirection = exporter.options.use_redirection,
             .debug = builtin.mode == .debug,
             .persistent = exporter.options.persistent,
+            .js_value = true,
         },
         .module_path = switch (builtin.mode) {
             .debug => exporter.options.module_path.ptr,

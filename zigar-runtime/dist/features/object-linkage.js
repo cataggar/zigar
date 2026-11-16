@@ -18,8 +18,8 @@ var objectLinkage = mixin({
       // objects in WebAssembly have fixed addresses so the handle is the address
       // for native code module, locations of objects in memory can change depending on
       // where the shared library is loaded
-      const normalizedHandle = is64 ? BigInt(handle) : Number(handle);
-      const address = normalizedHandle ;
+      const address = (is64 ? BigInt(handle) : Number(handle))
+        ;
       let zigDV = object[MEMORY] = this.obtainZigView(address, jsDV.byteLength);
       if (writeBack) {
         copyView(zigDV, jsDV);

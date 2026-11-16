@@ -5266,7 +5266,7 @@ pub fn Win32Substitute(comptime redirector: type) type {
                 .int => offset,
                 .pointer => |pt| switch (pt.child) {
                     c.union__LARGE_INTEGER => get: {
-                        const offset_ptr: *const c_longlong = @ptrCast(&offset);
+                        const offset_ptr: *const c_longlong = @ptrCast(@alignCast(&offset));
                         break :get offset_ptr.*;
                     },
                     else => offset.*,

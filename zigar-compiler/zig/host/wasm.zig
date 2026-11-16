@@ -250,28 +250,62 @@ pub fn getFactoryThunk(comptime module: type) usize {
     return @intFromPtr(exporter.getFactoryThunk(@This(), module));
 }
 
-pub fn cloneJsValue(handle: u32) u32 {
+pub fn isJsThread() bool {
+    return builtin.single_threaded or in_main_thread;
+}
+
+pub fn tryCloneJsValue(handle: u32) js.Error!u32 {
+    if (!isJsThread()) return error.OffJsThread;
     return _cloneJsValue(handle);
 }
 
-pub fn releaseJsValue(handle: u32) void {
+pub fn tryReleaseJsValue(handle: u32) js.Error!void {
+    if (!isJsThread()) return error.OffJsThread;
     _releaseJsValue(handle);
 }
 
-pub fn typeofJsValue(handle: u32) js.JsType {
+pub fn tryTypeofJsValue(handle: u32) js.Error!js.JsType {
+    if (!isJsThread()) return error.OffJsThread;
     return @enumFromInt(@as(u8, @intCast(_typeofJsValue(handle))));
 }
 
-pub fn instanceofJsValue(handle: u32, ctor_handle: u32) bool {
+pub fn tryInstanceofJsValue(handle: u32, ctor_handle: u32) js.Error!bool {
+    if (!isJsThread()) return error.OffJsThread;
     return _instanceofJsValue(handle, ctor_handle);
 }
 
-pub fn equalJsValue(lhs_handle: u32, rhs_handle: u32) bool {
+pub fn tryEqualJsValue(lhs_handle: u32, rhs_handle: u32) js.Error!bool {
+    if (!isJsThread()) return error.OffJsThread;
     return _equalJsValue(lhs_handle, rhs_handle);
 }
 
-pub fn getJsValueCount() u32 {
+pub fn tryGetJsValueCount() js.Error!u32 {
+    if (!isJsThread()) return error.OffJsThread;
     return _getJsValueCount();
+}
+
+pub fn cloneJsValue(handle: u32) u32 {
+    return tryCloneJsValue(handle) catch @panic("JsValue operations require the JS thread");
+}
+
+pub fn releaseJsValue(handle: u32) void {
+    tryReleaseJsValue(handle) catch @panic("JsValue operations require the JS thread");
+}
+
+pub fn typeofJsValue(handle: u32) js.JsType {
+    return tryTypeofJsValue(handle) catch @panic("JsValue operations require the JS thread");
+}
+
+pub fn instanceofJsValue(handle: u32, ctor_handle: u32) bool {
+    return tryInstanceofJsValue(handle, ctor_handle) catch @panic("JsValue operations require the JS thread");
+}
+
+pub fn equalJsValue(lhs_handle: u32, rhs_handle: u32) bool {
+    return tryEqualJsValue(lhs_handle, rhs_handle) catch @panic("JsValue operations require the JS thread");
+}
+
+pub fn getJsValueCount() u32 {
+    return tryGetJsValueCount() catch @panic("JsValue operations require the JS thread");
 }
 
 pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, _: ?usize) noreturn {

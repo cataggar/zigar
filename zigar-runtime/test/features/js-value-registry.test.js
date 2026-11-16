@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import { StructurePurpose, StructureType } from '../../src/constants.js';
 import { defineEnvironment } from '../../src/environment.js';
 import { InvalidJsValueHandle } from '../../src/errors.js';
 import {
@@ -9,6 +10,7 @@ import {
   RESERVED_TRUE,
   RESERVED_UNDEFINED,
 } from '../../src/features/js-value-registry.js';
+import { FALLBACK, MEMORY, TARGET, ZIG } from '../../src/symbols.js';
 import '../../src/mixins.js';
 
 const Env = defineEnvironment();
@@ -194,6 +196,108 @@ describe('Feature: js-value-registry', function() {
     expect(env.equalJsValue(RESERVED_NULL, RESERVED_UNDEFINED)).to.be.false;
 
     env.resetJsValueRegistry();
+    expect(env.getJsValueCount()).to.equal(0);
+  });
+
+  it('should isolate dynamic handles across realms via setJsValueRealmTag while preserving reserved constants', function() {
+    const primaryEnv = new Env();
+    const workerEnv = new Env();
+    primaryEnv.setJsValueRealmTag(0);
+    workerEnv.setJsValueRealmTag(32);
+
+    const primaryObj = { realm: 'primary' };
+    const workerObj = { realm: 'worker' };
+    const hPrimary = primaryEnv.allocJsValue(primaryObj);
+    const hWorker = workerEnv.allocJsValue(workerObj);
+
+    // Both allocate slot 8 generation 1, but realm bits (14..19) differ (0 vs 32)
+    expect(hPrimary & 0x3FFF).to.equal(FIRST_DYNAMIC_SLOT);
+    expect(hWorker & 0x3FFF).to.equal(FIRST_DYNAMIC_SLOT);
+    expect((hPrimary >>> 14) & 0x3F).to.equal(0);
+    expect((hWorker >>> 14) & 0x3F).to.equal(32);
+    expect(hPrimary).to.not.equal(hWorker);
+
+    // Cross-realm handle lookup/clone/release/typeof/equal must throw InvalidJsValueHandle
+    expect(() => workerEnv.getJsValue(hPrimary)).to.throw(InvalidJsValueHandle);
+    expect(() => workerEnv.cloneJsValue(hPrimary)).to.throw(InvalidJsValueHandle);
+    expect(() => workerEnv.releaseJsValue(hPrimary)).to.throw(InvalidJsValueHandle);
+    expect(() => workerEnv.typeofJsValue(hPrimary)).to.throw(InvalidJsValueHandle);
+    expect(() => workerEnv.equalJsValue(hPrimary, hWorker)).to.throw(InvalidJsValueHandle);
+
+    expect(() => primaryEnv.getJsValue(hWorker)).to.throw(InvalidJsValueHandle);
+    expect(() => primaryEnv.releaseJsValue(hWorker)).to.throw(InvalidJsValueHandle);
+
+    // Own handles and reserved constants remain completely intact
+    expect(primaryEnv.getJsValue(hPrimary)).to.equal(primaryObj);
+    expect(workerEnv.getJsValue(hWorker)).to.equal(workerObj);
+    expect(workerEnv.getJsValue(RESERVED_GLOBAL_THIS)).to.equal(globalThis);
+    expect(workerEnv.cloneJsValue(RESERVED_TRUE)).to.equal(RESERVED_TRUE);
+
+    primaryEnv.releaseJsValue(hPrimary);
+    workerEnv.releaseJsValue(hWorker);
+    expect(primaryEnv.getJsValueCount()).to.equal(0);
+    expect(workerEnv.getJsValueCount()).to.equal(0);
+
+    if (process.env.TARGET === 'node') {
+      const exports = primaryEnv.exportFunctions();
+      expect(exports.cloneJsValue).to.be.a('function');
+      expect(exports.releaseJsValue).to.be.a('function');
+      expect(exports.typeofJsValue).to.be.a('function');
+      expect(exports.instanceofJsValue).to.be.a('function');
+      expect(exports.equalJsValue).to.be.a('function');
+      expect(exports.getJsValueCount).to.be.a('function');
+      expect(exports.setJsValueRealmTag).to.be.a('function');
+    }
+  });
+
+  it('should synchronize [FALLBACK] buffers when consuming or releasing Zig-memory JsValue handles on Node', function() {
+    if (process.env.TARGET !== 'node') {
+      return;
+    }
+    const env = new Env();
+    env.littleEndian = true;
+    const target = { fallbackSynced: true };
+    const h1 = env.allocJsValue(target);
+    const h2 = env.allocJsValue({ second: true });
+
+    const externBuf = new ArrayBuffer(8);
+    const externView = new DataView(externBuf);
+    externView.setUint32(0, h1, true);
+    externView.setUint32(4, h2, true);
+
+    // Local shadow buffer starts zeroed until FALLBACK(false) pulls from externBuf
+    const shadowBuf = new ArrayBuffer(8);
+    const shadowView = new DataView(shadowBuf, 0, 4);
+    const syncCalls = [];
+    shadowView[FALLBACK] = (toExtern, offset = 0, len = shadowView.byteLength) => {
+      syncCalls.push(toExtern);
+      const src = toExtern ? new Uint8Array(shadowBuf, offset, len) : new Uint8Array(externBuf, offset, len);
+      const dst = toExtern ? new Uint8Array(externBuf, offset, len) : new Uint8Array(shadowBuf, offset, len);
+      dst.set(src);
+    };
+
+    const refObj = { [MEMORY]: shadowView };
+    env.consumeJsValueObject(refObj);
+    expect(refObj[TARGET]).to.equal(target);
+    expect(externView.getUint32(0, true)).to.equal(0);
+    expect(syncCalls).to.deep.equal([ false, true ]);
+    expect(env.getJsValueCount()).to.equal(1);
+
+    const jsValStruct = {
+      purpose: StructurePurpose.JsValue,
+      type: StructureType.Struct,
+      byteSize: 4,
+    };
+    const subView = new DataView(shadowBuf, 4, 4);
+    subView[ZIG] = { address: 0x1004, len: 4 };
+    subView[FALLBACK] = (toExtern) => {
+      syncCalls.push(toExtern);
+      const src = toExtern ? new Uint8Array(shadowBuf, 4, 4) : new Uint8Array(externBuf, 4, 4);
+      const dst = toExtern ? new Uint8Array(externBuf, 4, 4) : new Uint8Array(shadowBuf, 4, 4);
+      dst.set(src);
+    };
+    env.releaseZigJsValues(jsValStruct, subView, 0);
+    expect(syncCalls).to.deep.equal([ false, true, false ]);
     expect(env.getJsValueCount()).to.equal(0);
   });
 });

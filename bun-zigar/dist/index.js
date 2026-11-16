@@ -7,7 +7,10 @@ import {
   getPlatform, hideStatus, normalizePath, optionsForCompile, processConfig, showStatus,
 } from 'zigar-compiler';
 
-await plugin({
+const pluginRegistered = Symbol.for('bun-zigar.plugin');
+if (!globalThis[pluginRegistered]) {
+  globalThis[pluginRegistered] = true;
+  await plugin({
   name: "zigar",
   async setup(build) {
     build.onResolve({ filter: /\.(zig|zigar)($|\?)/ }, async ({ path, importer }) => {
@@ -86,4 +89,5 @@ await plugin({
       };
     });
   },
-});
+  });
+}

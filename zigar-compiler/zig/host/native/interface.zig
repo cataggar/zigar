@@ -29,7 +29,8 @@ pub fn Module(comptime Value: type) type {
             io_redirection: bool,
             debug: bool,
             persistent: bool,
-            _: u26 = 0,
+            js_value: bool = false,
+            _: u25 = 0,
         };
         pub const Imports = extern struct { // vtable that's filled by the addon
             create_bool: *const fn (*Host, bool, *Value) callconv(.c) E,
@@ -60,6 +61,12 @@ pub fn Module(comptime Value: type) type {
             initialize_thread: *const fn (*Host) callconv(.c) E,
             deinitialize_thread: *const fn (*Host) callconv(.c) E,
             redirect_syscalls: *const fn (*Host, *const anyopaque) callconv(.c) E,
+            clone_js_value: *const fn (*Host, u32, *u32) callconv(.c) E,
+            release_js_value: *const fn (*Host, u32) callconv(.c) E,
+            typeof_js_value: *const fn (*Host, u32, *u8) callconv(.c) E,
+            instanceof_js_value: *const fn (*Host, u32, u32, *bool) callconv(.c) E,
+            equal_js_value: *const fn (*Host, u32, u32, *bool) callconv(.c) E,
+            get_js_value_count: *const fn (*Host, *u32) callconv(.c) E,
         };
         pub const Exports = extern struct { // vtable that's used by the addon
             set_host_instance: *const fn (*Host) callconv(.c) E,

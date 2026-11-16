@@ -77,6 +77,7 @@ const ModuleHost = struct {
     };
 
     env: Env,
+    owner_thread_id: std.Thread.Id,
     ref_count: isize = 1,
     module: ?*Module = null,
     library: ?DynLib = null,
@@ -109,6 +110,13 @@ const ModuleHost = struct {
         enable_callback: ?Ref = null,
         handle_jscall: ?Ref = null,
         release_function: ?Ref = null,
+        clone_js_value: ?Ref = null,
+        release_js_value: ?Ref = null,
+        typeof_js_value: ?Ref = null,
+        instanceof_js_value: ?Ref = null,
+        equal_js_value: ?Ref = null,
+        get_js_value_count: ?Ref = null,
+        set_js_value_realm_tag: ?Ref = null,
 
         environ_get: ?Ref = null,
         environ_sizes_get: ?Ref = null,
@@ -161,6 +169,15 @@ const ModuleHost = struct {
     pub threadlocal var main_thread_syscall_trap_count: usize = 0;
     pub threadlocal var in_main_thread: bool = false;
 
+    const ActiveThunkFrame = struct {
+        host: *ModuleHost,
+        module: *Module,
+        prev: ?*const ActiveThunkFrame,
+    };
+    threadlocal var active_thunk_frame: ?*const ActiveThunkFrame = null;
+
+    var next_realm_tag: std.atomic.Value(u32) = .init(0);
+
     var host_list: std.ArrayList(*@This()) = .empty;
     var host_list_mutex: std.Io.Mutex = .init;
 
@@ -204,6 +221,7 @@ const ModuleHost = struct {
     fn createEnvironment(env: Env, disable_external_buffer: Value) !Value {
         // this function is only called from a main thread (where the event loop runs)
         in_main_thread = true;
+        const realm_tag: u32 = next_realm_tag.fetchAdd(1, .monotonic) & 0x3F;
         // compile embedded JavaScript
         const js_module = try compileJavaScript(env);
         // look for the Environment class
@@ -212,11 +230,21 @@ const ModuleHost = struct {
         const js_env = try env.callFunction(try env.getNull(), create_env, &.{});
         const self = try c_allocator.create(@This());
         system.init();
-        self.* = .{ .env = env };
+        self.* = .{
+            .env = env,
+            .owner_thread_id = std.Thread.getCurrentId(),
+        };
         defer self.release();
         try self.register();
         // import functions from the environment
         try self.importFunctionsFromJavaScript(js_env);
+        if (self.js.set_js_value_realm_tag) |ref| {
+            _ = try env.callFunction(
+                try env.getNull(),
+                try env.getReferenceValue(ref),
+                &.{try env.createUint32(realm_tag)},
+            );
+        }
         // export functions to it; exported functions will keep self alive until they're all
         // garbage collected
         try self.exportFunctionsToJavaScript(js_env);
@@ -381,7 +409,9 @@ const ModuleHost = struct {
                 },
             }
         };
-        _ = module.exports.set_host_instance(@ptrCast(self));
+        var load_frame: ActiveThunkFrame = undefined;
+        self.enterModuleHost(module, &load_frame);
+        defer restoreModuleHost(&load_frame);
         try self.exportFunctionsToModule();
         if (env.getValueBool(redirectingIO) catch true) {
             // hooks are installed even when io redirection is disabled, because they're needed for
@@ -573,6 +603,27 @@ const ModuleHost = struct {
         return try env.createUsize(thunk_address);
     }
 
+    fn enterModuleHost(self: *@This(), module: *Module, frame: *ActiveThunkFrame) void {
+        frame.* = .{
+            .host = self,
+            .module = module,
+            .prev = active_thunk_frame,
+        };
+        active_thunk_frame = frame;
+        _ = module.exports.set_host_instance(@ptrCast(self));
+    }
+
+    fn restoreModuleHost(frame: *const ActiveThunkFrame) void {
+        active_thunk_frame = frame.prev;
+        var it = frame.prev;
+        while (it) |enclosing| : (it = enclosing.prev) {
+            if (enclosing.module == frame.module) {
+                _ = frame.module.exports.set_host_instance(@ptrCast(enclosing.host));
+                break;
+            }
+        }
+    }
+
     fn runThunk(
         self: *@This(),
         thunk_address: Value,
@@ -581,6 +632,9 @@ const ModuleHost = struct {
     ) !Value {
         const env = self.env;
         const module = self.module orelse return error.NoLoadedModule;
+        var thunk_frame: ActiveThunkFrame = undefined;
+        self.enterModuleHost(module, &thunk_frame);
+        defer restoreModuleHost(&thunk_frame);
         const result = module.exports.run_thunk(
             try env.getValueUsize(thunk_address),
             try env.getValueUsize(fn_address),
@@ -599,6 +653,9 @@ const ModuleHost = struct {
     ) !Value {
         const env = self.env;
         const module = self.module orelse return error.NoLoadedModule;
+        var thunk_frame: ActiveThunkFrame = undefined;
+        self.enterModuleHost(module, &thunk_frame);
+        defer restoreModuleHost(&thunk_frame);
         const result = module.exports.run_variadic_thunk(
             try env.getValueUsize(thunk_address),
             try env.getValueUsize(fn_address),
@@ -613,6 +670,9 @@ const ModuleHost = struct {
         const env = self.env;
         var thunk_address: usize = 0;
         const module = self.module orelse return error.NoLoadedModule;
+        var thunk_frame: ActiveThunkFrame = undefined;
+        self.enterModuleHost(module, &thunk_frame);
+        defer restoreModuleHost(&thunk_frame);
         _ = module.exports.create_js_thunk(
             try env.getValueUsize(controller_address),
             try env.getValueUint32(fn_id),
@@ -625,6 +685,9 @@ const ModuleHost = struct {
         const env = self.env;
         var fn_id: usize = 0;
         const module = self.module orelse return error.NoLoadedModule;
+        var thunk_frame: ActiveThunkFrame = undefined;
+        self.enterModuleHost(module, &thunk_frame);
+        defer restoreModuleHost(&thunk_frame);
         _ = module.exports.destroy_js_thunk(
             try env.getValueUsize(controller_address),
             try env.getValueUsize(fn_address),
@@ -881,7 +944,11 @@ const ModuleHost = struct {
                 @compileLog(extra);
                 @compileError("Function declaration mismatch: " ++ field_name ++ "\n\nExpected: " ++ @typeName(T2) ++ "\n  Actual: " ++ @typeName(T1) ++ "\n");
             }
-            @field(module.imports, field_name) = transformed_func;
+            const is_js_value_import = comptime std.mem.endsWith(u8, field_name, "_js_value") or
+                std.mem.eql(u8, field_name, "get_js_value_count");
+            if (!is_js_value_import or module.attributes.js_value) {
+                @field(module.imports, field_name) = transformed_func;
+            }
         }
     }
 
@@ -1617,6 +1684,120 @@ const ModuleHost = struct {
         // a stat request can be handled by a 'stat' or an 'open' event handler
         if (mask.open) mask.stat = true;
         ptr.* = mask;
+    }
+
+    inline fn isOwnerJsThread(self: *const @This()) bool {
+        return in_main_thread and std.Thread.getCurrentId() == self.owner_thread_id;
+    }
+
+    fn cloneJsValue(self: *@This(), handle: u32, dest: *u32) !E {
+        if (!self.isOwnerJsThread()) return .PERM;
+        const env = self.env;
+        if (try env.isExceptionPending()) return .FAULT;
+        const scope = try env.openHandleScope();
+        defer env.closeHandleScope(scope) catch {};
+        const result = try env.callFunction(
+            try env.getNull(),
+            try env.getReferenceValue(self.js.clone_js_value orelse return error.Unexpected),
+            &.{
+                try env.createUint32(handle),
+            },
+        );
+        dest.* = try env.getValueUint32(result);
+        return .SUCCESS;
+    }
+
+    fn releaseJsValue(self: *@This(), handle: u32) !E {
+        if (!self.isOwnerJsThread()) return .PERM;
+        const env = self.env;
+        const saved_exc: ?Value = if (try env.isExceptionPending())
+            try env.getAndClearLastException()
+        else
+            null;
+        defer if (saved_exc) |exc| {
+            if (env.isExceptionPending() catch false) {
+                _ = env.getAndClearLastException() catch {};
+            }
+            env.throw(exc) catch {};
+        };
+        const scope = try env.openHandleScope();
+        defer env.closeHandleScope(scope) catch {};
+        _ = try env.callFunction(
+            try env.getNull(),
+            try env.getReferenceValue(self.js.release_js_value orelse return error.Unexpected),
+            &.{
+                try env.createUint32(handle),
+            },
+        );
+        return .SUCCESS;
+    }
+
+    fn typeofJsValue(self: *@This(), handle: u32, dest: *u8) !E {
+        if (!self.isOwnerJsThread()) return .PERM;
+        const env = self.env;
+        if (try env.isExceptionPending()) return .FAULT;
+        const scope = try env.openHandleScope();
+        defer env.closeHandleScope(scope) catch {};
+        const result = try env.callFunction(
+            try env.getNull(),
+            try env.getReferenceValue(self.js.typeof_js_value orelse return error.Unexpected),
+            &.{
+                try env.createUint32(handle),
+            },
+        );
+        dest.* = @truncate(try env.getValueUint32(result));
+        return .SUCCESS;
+    }
+
+    fn instanceofJsValue(self: *@This(), handle: u32, ctor_handle: u32, dest: *bool) !E {
+        if (!self.isOwnerJsThread()) return .PERM;
+        const env = self.env;
+        if (try env.isExceptionPending()) return .FAULT;
+        const scope = try env.openHandleScope();
+        defer env.closeHandleScope(scope) catch {};
+        const result = try env.callFunction(
+            try env.getNull(),
+            try env.getReferenceValue(self.js.instanceof_js_value orelse return error.Unexpected),
+            &.{
+                try env.createUint32(handle),
+                try env.createUint32(ctor_handle),
+            },
+        );
+        dest.* = try env.getValueBool(result);
+        return .SUCCESS;
+    }
+
+    fn equalJsValue(self: *@This(), lhs_handle: u32, rhs_handle: u32, dest: *bool) !E {
+        if (!self.isOwnerJsThread()) return .PERM;
+        const env = self.env;
+        if (try env.isExceptionPending()) return .FAULT;
+        const scope = try env.openHandleScope();
+        defer env.closeHandleScope(scope) catch {};
+        const result = try env.callFunction(
+            try env.getNull(),
+            try env.getReferenceValue(self.js.equal_js_value orelse return error.Unexpected),
+            &.{
+                try env.createUint32(lhs_handle),
+                try env.createUint32(rhs_handle),
+            },
+        );
+        dest.* = try env.getValueBool(result);
+        return .SUCCESS;
+    }
+
+    fn getJsValueCount(self: *@This(), dest: *u32) !E {
+        if (!self.isOwnerJsThread()) return .PERM;
+        const env = self.env;
+        if (try env.isExceptionPending()) return .FAULT;
+        const scope = try env.openHandleScope();
+        defer env.closeHandleScope(scope) catch {};
+        const result = try env.callFunction(
+            try env.getNull(),
+            try env.getReferenceValue(self.js.get_js_value_count orelse return error.Unexpected),
+            &.{},
+        );
+        dest.* = try env.getValueUint32(result);
+        return .SUCCESS;
     }
 
     fn releaseFunction(self: *@This(), fn_id: usize) !void {
