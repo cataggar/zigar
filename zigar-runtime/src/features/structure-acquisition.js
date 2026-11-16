@@ -306,6 +306,10 @@ export default mixin({
           case '_invokeJsHostOp':
           case '_createZigCallback':
           case '_releaseZigCallback':
+          case '_controlLastJsError':
+          case '_disposeJsValue':
+          case '_beginAsyncDisposeJsValue':
+          case '_awaitAsyncDisposeJsValue':
             this.use(jsHostOp);
             this.use(jsValueRegistry);
             this.use(jsValue);

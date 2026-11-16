@@ -153,7 +153,7 @@ export default mixin({
         ? retval.then(v => this.toWebAssembly(returnType, v))
         : this.toWebAssembly(returnType, retval);
       };
-      return (this.useJSPI && (name === 'handleJscall' || name === 'futexWaitAsync'))
+      return (this.useJSPI && (name === 'handleJscall' || name === 'futexWaitAsync' || name === 'awaitAsyncDisposeJsValue'))
         ? this.wrapSuspending(wrapper)
         : wrapper;
     },

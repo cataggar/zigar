@@ -183,8 +183,22 @@ var callMarshalingOutbound = mixin({
       }
     }
     let success;
-    const errorFrame = { hasPendingHostError: false, pendingHostError: undefined };
+    const errorFrame = {
+      hasPendingHostError: false,
+      pendingHostError: undefined,
+      hasCapturedError: false,
+      capturedError: undefined,
+    };
+    const clearCapturedErrorFrame = () => {
+      errorFrame.hasCapturedError = false;
+      errorFrame.capturedError = undefined;
+      if (prevErrorFrame === null) {
+        this.hasCapturedError = false;
+        this.capturedError = undefined;
+      }
+    };
     const consumeErrorFrame = () => {
+      clearCapturedErrorFrame();
       if (!errorFrame.hasPendingHostError) {
         return undefined;
       }

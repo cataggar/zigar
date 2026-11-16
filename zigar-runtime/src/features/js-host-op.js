@@ -7,7 +7,16 @@ import { isErrorJSON, NotInErrorSet } from '../errors.js';
 import {
   ALLOCATOR, CLASS, FALLBACK, MEMORY, RESTORE, RETURN, SLOTS, THROWING, VISIT, VIVIFICATE, ZIG,
 } from '../symbols.js';
-import { clearView, decodeText, hasJsValue } from '../utils.js';
+import { clearView, decodeText, hasJsValue, isPromise } from '../utils.js';
+
+export const NO_CAPTURED_ERROR_HANDLE = 7;
+
+export const LastErrorMode = {
+  Peek: 0,
+  Take: 1,
+  Has: 2,
+  Clear: 3,
+};
 
 export const HostOpCode = {
   ImportModule: 1,
@@ -42,17 +51,186 @@ export default mixin({
     this.syncCallDepth = 0;
     this.hasPendingHostError = false;
     this.pendingHostError = undefined;
+    this.hasCapturedError = false;
+    this.capturedError = undefined;
     this.activeHostErrorFrame = null;
+    this.pendingAsyncDisposals = new Map();
+    this.nextAsyncDisposalTicket = 1;
   },
   getHostErrorTarget() {
     return this.activeContinuation?.hostErrorFrame ?? this.activeHostErrorFrame ?? this;
   },
-  recordPendingHostError(err) {
-    const target = this.getHostErrorTarget();
-    if (!target.hasPendingHostError) {
+  recordPendingHostError(err, target = this.getHostErrorTarget()) {
+    if (target && !target.hasPendingHostError) {
       target.hasPendingHostError = true;
       target.pendingHostError = err;
     }
+  },
+  recordCapturedError(err, target = this.getHostErrorTarget()) {
+    if (target) {
+      target.hasCapturedError = true;
+      target.capturedError = err;
+    }
+  },
+  clearCapturedError(target = this.getHostErrorTarget()) {
+    if (target) {
+      target.hasCapturedError = false;
+      target.capturedError = undefined;
+    }
+  },
+  controlLastJsError(mode) {
+    const target = this.getHostErrorTarget();
+    switch (Number(mode) >>> 0) {
+      case LastErrorMode.Peek:
+        if (!target?.hasCapturedError) {
+          return NO_CAPTURED_ERROR_HANDLE;
+        }
+        return this.allocJsValue(target.capturedError);
+      case LastErrorMode.Take: {
+        if (!target?.hasCapturedError) {
+          return NO_CAPTURED_ERROR_HANDLE;
+        }
+        const err = target.capturedError;
+        target.hasCapturedError = false;
+        target.capturedError = undefined;
+        return this.allocJsValue(err);
+      }
+      case LastErrorMode.Has:
+        return target?.hasCapturedError ? 1 : 0;
+      case LastErrorMode.Clear:
+        this.clearCapturedError(target);
+        return 0;
+      default:
+        return NO_CAPTURED_ERROR_HANDLE;
+    }
+  },
+  disposeJsValue(handle, catchMode) {
+    const rawHandle = Number(handle) >>> 0;
+    const shouldCatch = Boolean(catchMode);
+    try {
+      const target = this.getJsValue(rawHandle);
+      if (target !== null && target !== undefined) {
+        const sym = getDisposeSymbol();
+        const method = sym !== undefined ? target[sym] : undefined;
+        if (method !== undefined && method !== null) {
+          if (typeof(method) !== 'function') {
+            throw createNotCallableError('[Symbol.dispose] is not a function');
+          }
+          Reflect.apply(method, target, []);
+        }
+      }
+      return 0;
+    } catch (err) {
+      if (shouldCatch) {
+        this.recordCapturedError(err);
+        return 1;
+      }
+      this.recordPendingHostError(err);
+      return 0;
+    } finally {
+      this.releaseJsValueIfValid(rawHandle);
+    }
+  },
+  beginAsyncDisposeJsValue(handle, catchMode, allowSuspend = true) {
+    const rawHandle = Number(handle) >>> 0;
+    const shouldCatch = Boolean(catchMode);
+    let deferredRelease = false;
+    try {
+      const target = this.getJsValue(rawHandle);
+      if (target === null || target === undefined) {
+        return 0;
+      }
+      const asyncSym = getAsyncDisposeSymbol();
+      let method = asyncSym !== undefined ? target[asyncSym] : undefined;
+      if (method === undefined || method === null) {
+        const syncSym = getDisposeSymbol();
+        method = syncSym !== undefined ? target[syncSym] : undefined;
+        if (method === undefined || method === null) {
+          return 0;
+        }
+        if (typeof(method) !== 'function') {
+          throw createNotCallableError('[Symbol.dispose] is not a function');
+        }
+      } else if (typeof(method) !== 'function') {
+        throw createNotCallableError('[Symbol.asyncDispose] is not a function');
+      }
+      const rawResult = Reflect.apply(method, target, []);
+      const then = (rawResult !== null && (typeof(rawResult) === 'object' || typeof(rawResult) === 'function'))
+        ? rawResult.then
+        : undefined;
+      if (typeof(then) !== 'function') {
+        return 0;
+      }
+      if (allowSuspend && this.useJSPI && this.activeContinuation) {
+        const state = { ok: false, err: undefined };
+        const promise = isPromise(rawResult)
+          ? rawResult
+          : new Promise((resolve, reject) => Reflect.apply(then, rawResult, [ resolve, reject ]));
+        const tracked = promise.then(
+          () => {
+            state.ok = true;
+          },
+          (err) => {
+            state.ok = false;
+            state.err = err;
+          },
+        );
+        const ticket = this.nextAsyncDisposalTicket;
+        this.nextAsyncDisposalTicket = (ticket >= 0x1FFFFFFF) ? 1 : ticket + 1;
+        this.pendingAsyncDisposals.set(ticket, {
+          tracked,
+          rawHandle,
+          shouldCatch,
+          errorTarget: this.getHostErrorTarget(),
+          state,
+        });
+        deferredRelease = true;
+        return ((ticket << 2) | 3) >>> 0;
+      }
+      if (isPromise(rawResult)) {
+        rawResult.then(undefined, noop);
+      } else {
+        new Promise((resolve, reject) => Reflect.apply(then, rawResult, [ resolve, reject ])).then(undefined, noop);
+      }
+      return 2;
+    } catch (err) {
+      if (shouldCatch) {
+        this.recordCapturedError(err);
+        return 1;
+      }
+      this.recordPendingHostError(err);
+      return 0;
+    } finally {
+      if (!deferredRelease) {
+        this.releaseJsValueIfValid(rawHandle);
+      }
+    }
+  },
+  async awaitAsyncDisposeJsValue(ticket) {
+    const id = Number(ticket) >>> 0;
+    const entry = this.pendingAsyncDisposals.get(id);
+    if (!entry) {
+      return 0;
+    }
+    this.pendingAsyncDisposals.delete(id);
+    const { tracked, rawHandle, shouldCatch, errorTarget, state } = entry;
+    try {
+      await tracked;
+      if (!state.ok) {
+        if (shouldCatch) {
+          this.recordCapturedError(state.err, errorTarget);
+          return 1;
+        }
+        this.recordPendingHostError(state.err, errorTarget);
+        return 0;
+      }
+      return 0;
+    } finally {
+      this.releaseJsValueIfValid(rawHandle);
+    }
+  },
+  asyncDisposeJsValue(handle, catchMode) {
+    return this.beginAsyncDisposeJsValue(handle, catchMode, false);
   },
   savePendingHostError() {
     const target = this.getHostErrorTarget();
@@ -441,6 +619,7 @@ export default mixin({
         if (!matched) {
           throw new NotInErrorSet(errorMember.structure, err instanceof Error ? err : new Error(String(err)));
         }
+        thisEnv.recordCapturedError(err);
         setError.call(euObj, matched);
         const mem = (process.env.TARGET === 'wasm' && euObj[RESTORE]) ? euObj[RESTORE]() : euObj[MEMORY];
         clearView(mem, valueMember.bitOffset >> 3, valueMember.byteSize);
@@ -733,13 +912,14 @@ export default mixin({
     }
     const is64 = Boolean(this.memory64 || process.env.BITS == 64);
     const ptrSize = is64 ? 8 : 4;
-    const descSize = 16 + 2 * ptrSize;
+    const descSize = 16 + 3 * ptrSize;
     const dv = this.obtainZigView(descriptorAddr, descSize, false);
     const le = this.littleEndian;
     const signature = dv.getBigUint64(0, le);
     const flags = dv.getUint32(8, le);
     const trampolineThunk = readUsize(dv, 16, ptrSize, le, is64);
     const registerThunk = readUsize(dv, 16 + ptrSize, ptrSize, le, is64);
+    const cancelThunk = readUsize(dv, 16 + 2 * ptrSize, ptrSize, le, is64);
 
     const argStructStructure = this.resolveArgStructBySignature(signature, registerThunk);
     const ArgStruct = argStructStructure.constructor;
@@ -752,12 +932,33 @@ export default mixin({
     template = {
       ArgStruct,
       thunkHolder,
+      cancelThunk,
       unwrapString,
       is64,
       sync: !(flags & 1),
+      once: Boolean(flags & 2),
     };
     this.zigCallbackTemplateCache.set(descriptorAddr, template);
     return template;
+  },
+  cancelZigCallbackSlot(cancelThunk, slotAddr, zeroAddr) {
+    if (!cancelThunk) {
+      return;
+    }
+    if (process.env.TARGET === 'wasm') {
+      const runner = this.runThunkSync ?? this.runThunk;
+      if (runner) {
+        const prevContinuation = this.activeContinuation;
+        this.activeContinuation = null;
+        try {
+          runner(cancelThunk, slotAddr, zeroAddr);
+        } finally {
+          this.activeContinuation = prevContinuation;
+        }
+      }
+    } else {
+      this.runThunk?.(cancelThunk, slotAddr, zeroAddr);
+    }
   },
   createZigCallback(descriptorAddr, callbackId) {
     const savedPending = this.savePendingHostError();
@@ -766,20 +967,15 @@ export default mixin({
       const template = this.getZigCallbackTemplate(descriptorAddr);
       const caller = this.createOutboundCaller(template.thunkHolder, template.ArgStruct);
       caller.zigarSync = template.sync;
+      const slotAddr = template.is64 ? BigInt(id) : id;
+      const zeroAddr = template.is64 ? 0n : 0;
       const slotDV = new DataView(new ArrayBuffer(0));
-      slotDV[ZIG] = { address: template.is64 ? BigInt(id) : id, len: 0 };
+      slotDV[ZIG] = { address: slotAddr, len: 0 };
       caller[MEMORY] = slotDV;
-      const state = { id, released: false, handle: 0 };
+      const state = { id, released: false, handle: 0, handleReleased: false };
       const unwrapString = template.unwrapString;
-      const wrapper = (...args) => {
-        if (state.released) {
-          throw new Error('Zig callback has already been released');
-        }
-        const res = caller(...args);
-        const pending = this.consumePendingHostError();
-        if (pending) {
-          throw pending.error;
-        }
+      const isOnce = template.once;
+      const unwrapResult = (res) => {
         if (unwrapString && res && typeof(res) === 'object' && MEMORY in res) {
           if (typeof(res.string) === 'string') {
             return res.string;
@@ -790,6 +986,43 @@ export default mixin({
           }
         }
         return res;
+      };
+      const finishOnceCleanup = () => {
+        if (this.zigCallbackMap.get(id) === state) {
+          this.cancelZigCallbackSlot(template.cancelThunk, slotAddr, zeroAddr);
+          this.releaseZigCallback(id);
+        }
+      };
+      const wrapper = (...args) => {
+        if (state.released) {
+          throw new Error('Zig callback has already been released');
+        }
+        if (isOnce) {
+          state.released = true;
+        }
+        let asyncResult = false;
+        try {
+          const res = caller(...args);
+          const pending = this.consumePendingHostError();
+          if (pending) {
+            throw pending.error;
+          }
+          if (isPromise(res)) {
+            asyncResult = true;
+            return res.then(
+              (resolved) => unwrapResult(resolved),
+            ).finally(() => {
+              if (isOnce) {
+                finishOnceCleanup();
+              }
+            });
+          }
+          return unwrapResult(res);
+        } finally {
+          if (isOnce && !asyncResult) {
+            finishOnceCleanup();
+          }
+        }
       };
       const handle = this.allocJsValue(wrapper);
       state.handle = handle;
@@ -810,6 +1043,10 @@ export default mixin({
     if (state) {
       state.released = true;
       this.zigCallbackMap.delete(id);
+      if (!state.handleReleased) {
+        state.handleReleased = true;
+        this.releaseJsValueIfValid(state.handle);
+      }
     }
   },
   getActiveZigCallbackCount() {
@@ -859,16 +1096,33 @@ export default mixin({
       invokeJsHostOp: { argType: 'aaz', returnType: 'i' },
       createZigCallback: { argType: 'ai', returnType: 'i' },
       releaseZigCallback: { argType: 'i' },
+      controlLastJsError: { argType: 'i', returnType: 'i' },
+      disposeJsValue: { argType: 'ib', returnType: 'i' },
+      beginAsyncDisposeJsValue: { argType: 'ib', returnType: 'i' },
+      awaitAsyncDisposeJsValue: { argType: 'i', returnType: 'i' },
     },
   } : process.env.TARGET === 'node' ? {
     exports: {
       invokeJsHostOp: {},
       createZigCallback: {},
       releaseZigCallback: {},
+      controlLastJsError: {},
+      disposeJsValue: {},
+      asyncDisposeJsValue: {},
     },
   /* c8 ignore next */
   } : undefined),
 });
+
+function getDisposeSymbol() {
+  return Symbol.dispose ?? Symbol.for('nodejs.dispose');
+}
+
+function getAsyncDisposeSymbol() {
+  return Symbol.asyncDispose ?? Symbol.for('nodejs.asyncDispose');
+}
+
+const noop = () => {};
 
 function hasDefaultFallbackTarget(val) {
   return val !== null && (typeof(val) === 'object' || typeof(val) === 'function');
