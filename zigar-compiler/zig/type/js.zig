@@ -2582,7 +2582,7 @@ test "HostOpDescriptor ABI layout, 9 host operations, Ref helpers, and 160 state
     try expectEqual(@as(usize, 16), @offsetOf(CallbackDescriptor, "trampoline_thunk"));
     try expectEqual(@as(usize, 16 + @sizeOf(usize)), @offsetOf(CallbackDescriptor, "register_thunk"));
     try expectEqual(@as(usize, 16 + 2 * @sizeOf(usize)), @offsetOf(CallbackDescriptor, "cancel_thunk"));
-    try expectEqual(@as(usize, 16 + 3 * @sizeOf(usize)), @sizeOf(CallbackDescriptor));
+    try expectEqual(std.mem.alignForward(usize, 16 + 3 * @sizeOf(usize), 8), @sizeOf(CallbackDescriptor));
 
     const DispatchMockHost = struct {
         var active_handles: u32 = 0;
