@@ -350,6 +350,7 @@ test "Canonical ABI linear-memory round-trip: create-program (20->1 spill) and e
                         .return_type = 0,
                         .type_predicate = null,
                         .is_abstract = false,
+                        .modifiers = .{},
                         .jsdoc = null,
                     },
                 };

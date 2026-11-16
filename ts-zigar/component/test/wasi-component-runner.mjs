@@ -502,10 +502,12 @@ export function instantiateTypeScriptComponent(wasmPath) {
       const ambLen = toUnsignedPtr(dv.getUint32(b + 56, true));
       const ambientModules = new Array(ambLen);
       for (let j = 0; j < ambLen; j++) {
-        const ab = ambPtr + j * 12;
+        const ab = ambPtr + j * 28;
         ambientModules[j] = {
           moduleName: dv.getUint32(ab, true),
           decls: liftU32List(dv, dv.getUint32(ab + 4, true), dv.getUint32(ab + 8, true)),
+          defaultExport: liftOptionU32(dv, ab + 12, ab + 16),
+          exportEquals: liftOptionU32(dv, ab + 20, ab + 24),
         };
       }
       out[i] = {
@@ -847,6 +849,7 @@ export function instantiateTypeScriptComponent(wasmPath) {
         returnType: dv.getUint32(b + 28, true),
         typePredicate: dv.getUint8(b + 32) === 1 ? liftTypePredicateData(dv, b + 36) : null,
         isAbstract: dv.getUint8(b + 60) !== 0,
+        modifiers: dv.getUint16(b + 62, true),
         jsdoc: liftJsdocOption(dv, b + 64),
       };
     }

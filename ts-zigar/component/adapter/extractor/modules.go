@@ -367,10 +367,12 @@ func (b *graphBuilder) extractModule(modID uint32) {
 	// 4. Extract deduplicated ambient module declarations (`declare module "node:fs"`, `declare module "fs"`, etc.).
 	for _, ambName := range ambientOrder {
 		blocks := ambientBlocks[ambName]
-		decls := b.extractAmbientModuleDecls(sf, modID, ambName, blocks)
+		decls, defaultExp, exportEq := b.extractAmbientModuleDecls(sf, modID, ambName, blocks)
 		b.modules[modID].AmbientModules = append(b.modules[modID].AmbientModules, zigar_typescript_types.AmbientModuleNode{
-			ModuleName: b.intern(ambName),
-			Decls:      decls,
+			ModuleName:    b.intern(ambName),
+			Decls:         decls,
+			DefaultExport: defaultExp,
+			ExportEquals:  exportEq,
 		})
 	}
 }
@@ -392,10 +394,17 @@ func (b *graphBuilder) extractNestedGlobalBlocks(sf *ast.SourceFile, modID uint3
 	}
 }
 
-func (b *graphBuilder) extractAmbientModuleDecls(sf *ast.SourceFile, modID uint32, ambName string, blocks []*ast.Node) []uint32 {
+func (b *graphBuilder) extractAmbientModuleDecls(
+	sf *ast.SourceFile,
+	modID uint32,
+	ambName string,
+	blocks []*ast.Node,
+) ([]uint32, witTypes.Option[uint32], witTypes.Option[uint32]) {
 	out := []uint32{}
 	seen := map[uint32]bool{}
 	reExported := map[string]bool{}
+	defaultExport := witTypes.None[uint32]()
+	exportEquals := witTypes.None[uint32]()
 	addDecl := func(id uint32) {
 		if !seen[id] {
 			seen[id] = true
@@ -442,13 +451,21 @@ func (b *graphBuilder) extractAmbientModuleDecls(sf *ast.SourceFile, modID uint3
 					}
 					if idOpt := b.extractExportAssignmentTarget(sf, modID, stmt, ea.Expression, label); isSome(idOpt) {
 						addDecl(idOpt.Some())
-						if label == "default" {
+						if ea.IsExportEquals {
+							exportEquals = idOpt
+						} else {
+							defaultExport = idOpt
 							reExported["default"] = true
 						}
 						// Also surface any merged peers (e.g. `class EventEmitter` + `interface EventEmitter` + `namespace EventEmitter`).
 						if sym := b.resolveExpressionSymbol(ea.Expression); sym != nil && (b.cfg.FollowReExports || b.isSymbolDeclaredInFile(sym, sf)) {
-							for _, peerID := range b.extractSymbolAllCategories(sym, modID, true) {
+							peers := b.extractSymbolAllCategories(sym, modID, true)
+							for _, peerID := range peers {
 								addDecl(peerID)
+								// Prefer non-namespace primary peer (class/function/variable/interface) for ExportEquals when merged.
+								if ea.IsExportEquals && isSome(exportEquals) && b.decls[exportEquals.Some()].Kind.Tag() == zigar_typescript_types.DeclKind_NamespaceDecl && b.decls[peerID].Kind.Tag() != zigar_typescript_types.DeclKind_NamespaceDecl {
+									exportEquals = witTypes.Some(peerID)
+								}
 							}
 						}
 					}
@@ -520,7 +537,22 @@ func (b *graphBuilder) extractAmbientModuleDecls(sf *ast.SourceFile, modID uint3
 		ambExports := b.tc.GetExportsOfModule(ambSym)
 		exportByName := buildExportSymbolMap(ambExports)
 		for _, expSym := range ambExports {
-			if expSym == nil || expSym.Name() == "export=" || reExported[expSym.Name()] {
+			if expSym == nil || expSym.Name() == "export=" {
+				continue
+			}
+			if expSym.Name() == "default" {
+				if !reExported["default"] {
+					ids := b.extractExportedSymbolWithSet(sf, modID, expSym, true, exportByName)
+					for _, id := range ids {
+						addDecl(id)
+					}
+					if isNone(defaultExport) && len(ids) > 0 {
+						defaultExport = witTypes.Some(ids[0])
+					}
+				}
+				continue
+			}
+			if reExported[expSym.Name()] {
 				continue
 			}
 			for _, id := range b.extractExportedSymbolWithSet(sf, modID, expSym, true, exportByName) {
@@ -529,7 +561,7 @@ func (b *graphBuilder) extractAmbientModuleDecls(sf *ast.SourceFile, modID uint3
 		}
 	}
 
-	return out
+	return out, defaultExport, exportEquals
 }
 
 func (b *graphBuilder) isSymbolDeclaredInFile(sym *ast.Symbol, sf *ast.SourceFile) bool {

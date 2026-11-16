@@ -374,11 +374,14 @@ const ModuleEmitCtx = struct {
     mod: *const ir.ModuleIr,
     out: std.ArrayList(u8) = .empty,
     nested_decl_scopes: std.ArrayList([]const []const u8) = .empty,
+    active_source_decls: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    emit_depth: usize = 0,
     used_self_mod_alias: bool = false,
 
     fn deinit(self: *ModuleEmitCtx) void {
         self.out.deinit(self.allocator);
         self.nested_decl_scopes.deinit(self.allocator);
+        self.active_source_decls.deinit(self.allocator);
     }
 
     fn lookupImportAlias(self: *const ModuleEmitCtx, target_mod_idx: u32) ?[]const u8 {
@@ -706,9 +709,16 @@ const ModuleEmitCtx = struct {
             }
             try self.out.appendSlice(self.allocator, " }");
         }
-        try self.out.print(self.allocator, ",\n.is_class = {s},\n.fields = .{{\n", .{
+        try self.out.print(self.allocator, ",\n.is_class = {s}", .{
             if (st.is_class) "true" else "false",
         });
+        if (st.has_private_constructor) {
+            try self.out.appendSlice(self.allocator, ",\n.has_private_constructor = true");
+        }
+        if (st.has_non_public_members) {
+            try self.out.appendSlice(self.allocator, ",\n.has_non_public_members = true");
+        }
+        try self.out.appendSlice(self.allocator, ",\n.fields = .{\n");
         for (st.fields) |f| {
             try self.out.appendSlice(self.allocator, ".{ .name = ");
             try self.emitStringLit(f.logical_name);
@@ -733,8 +743,65 @@ const ModuleEmitCtx = struct {
         self: *ModuleEmitCtx,
         wire_name: []const u8,
         is_const: bool,
+        has_unknown_values: bool,
         members: []const ir.EnumMemberIr,
     ) !void {
+        if (has_unknown_values) {
+            try self.out.appendSlice(self.allocator, "struct {\n__zigar_value: __zigar_js.JsValue = .{},\n");
+            for (members) |m| {
+                if (m.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
+                switch (m.value) {
+                    .unknown => {
+                        try self.out.print(self.allocator, "pub const {s}: __zigar_js.Global(@This()) = .{{ .js_name = ", .{m.zig_ident});
+                        try self.emitStringLit(m.wire_name);
+                        try self.out.appendSlice(self.allocator, " };\n");
+                    },
+                    .str => |s| {
+                        try self.out.print(self.allocator, "pub const {s}: []const u8 = ", .{m.zig_ident});
+                        try self.emitStringLit(s);
+                        try self.out.appendSlice(self.allocator, ";\n");
+                    },
+                    .num => |n| {
+                        if (std.math.isFinite(n)) {
+                            try self.out.print(self.allocator, "pub const {s}: f64 = {d};\n", .{ m.zig_ident, n });
+                        } else {
+                            try self.out.print(self.allocator, "pub const {s}: __zigar_js.Global(@This()) = .{{ .js_name = ", .{m.zig_ident});
+                            try self.emitStringLit(m.wire_name);
+                            try self.out.appendSlice(self.allocator, " };\n");
+                        }
+                    },
+                }
+            }
+            try self.out.appendSlice(self.allocator, "pub const zigar_js = .{\n.js_name = ");
+            try self.emitStringLit(wire_name);
+            try self.out.print(self.allocator, ",\n.is_enum = true,\n.is_const = {s},\n.has_unknown_values = true,\n.members = .{{\n", .{
+                if (is_const) "true" else "false",
+            });
+            for (members) |m| {
+                try self.out.appendSlice(self.allocator, ".{ .tag = ");
+                try self.emitStringLit(m.logical_name);
+                try self.out.appendSlice(self.allocator, ", .js_name = ");
+                try self.emitStringLit(m.wire_name);
+                switch (m.value) {
+                    .unknown => try self.out.appendSlice(self.allocator, ", .is_unknown = true"),
+                    .str => |s| {
+                        try self.out.appendSlice(self.allocator, ", .str_value = ");
+                        try self.emitStringLit(s);
+                    },
+                    .num => |n| {
+                        if (std.math.isFinite(n)) {
+                            try self.out.print(self.allocator, ", .num_value = @as(f64, {d})", .{n});
+                        } else {
+                            try self.out.appendSlice(self.allocator, ", .is_unknown = true");
+                        }
+                    },
+                }
+                try self.out.appendSlice(self.allocator, " },\n");
+            }
+            try self.out.appendSlice(self.allocator, "},\n};\n}");
+            return;
+        }
+
         try self.out.appendSlice(self.allocator, "enum {\n");
         for (members) |m| {
             if (m.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
@@ -751,7 +818,7 @@ const ModuleEmitCtx = struct {
             try self.out.appendSlice(self.allocator, ", .js_name = ");
             try self.emitStringLit(m.wire_name);
             switch (m.value) {
-                .auto => {},
+                .unknown => {},
                 .str => |s| {
                     try self.out.appendSlice(self.allocator, ", .str_value = ");
                     try self.emitStringLit(s);
@@ -768,6 +835,19 @@ const ModuleEmitCtx = struct {
     }
 
     fn emitDecl(self: *ModuleEmitCtx, d: ir.DeclIr) error{OutOfMemory}!void {
+        if (self.emit_depth >= 128) return;
+        const track_cycle = (d.kind == .namespace_decl or d.kind == .struct_decl) and d.source_decl_id != null;
+        if (track_cycle) {
+            const sid = d.source_decl_id.?;
+            if (self.active_source_decls.contains(sid)) return;
+            try self.active_source_decls.put(self.allocator, sid, {});
+        }
+        defer if (track_cycle) {
+            _ = self.active_source_decls.remove(d.source_decl_id.?);
+        };
+        self.emit_depth += 1;
+        defer self.emit_depth -= 1;
+
         if (d.jsdoc) |jd| {
             try appendJsDocComments(&self.out, self.allocator, jd);
         }
@@ -805,12 +885,12 @@ const ModuleEmitCtx = struct {
             },
             .enum_decl => |en| {
                 try self.out.print(self.allocator, "{s}const {s} = ", .{ pub_kw, d.zig_ident });
-                try self.emitEnumBody(d.wire_name, en.is_const, en.members);
+                try self.emitEnumBody(d.wire_name, en.is_const, en.has_unknown_values, en.members);
                 try self.out.appendSlice(self.allocator, ";\n");
             },
             .string_enum_decl => |members| {
                 try self.out.print(self.allocator, "{s}const {s} = ", .{ pub_kw, d.zig_ident });
-                try self.emitEnumBody(d.wire_name, false, members);
+                try self.emitEnumBody(d.wire_name, false, false, members);
                 try self.out.appendSlice(self.allocator, ";\n");
             },
             .union_decl => |un| {
@@ -993,6 +1073,10 @@ fn renderModuleRaw(
     try ctx.emitStringLit(mod.specifier);
     try ctx.out.appendSlice(allocator, ",\n.wire_specifier = ");
     try ctx.emitStringLit(mod.wire_specifier);
+    if (mod.export_equals_ident) |eq_ident| {
+        try ctx.out.appendSlice(allocator, ",\n.export_equals = ");
+        try ctx.emitStringLit(eq_ident);
+    }
     try ctx.out.appendSlice(allocator, ",\n.exports = .{\n");
     for (mod.decls) |d| {
         if (!d.is_exported or !d.is_js_exported) continue;

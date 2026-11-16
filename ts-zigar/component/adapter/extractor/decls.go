@@ -442,6 +442,183 @@ func (b *graphBuilder) makeLocalAliasReExportDecl(
 	return declID
 }
 
+func (b *graphBuilder) makeNamespaceAliasReExportDecl(
+	nsDeclID uint32,
+	modID uint32,
+	node *ast.Node,
+	exportName string,
+	sourceName string,
+	targetDeclID uint32,
+	isTypeOnly bool,
+) uint32 {
+	key := nsAliasKey{nsDeclID: nsDeclID, exportName: exportName, targetDecl: targetDeclID}
+	if existing, ok := b.nsAliasReExports[key]; ok {
+		return existing
+	}
+	targetMod := b.decls[targetDeclID].Module
+	aliasOpt := witTypes.None[uint32]()
+	if exportName != "" && exportName != sourceName {
+		aliasOpt = witTypes.Some(b.intern(exportName))
+	}
+	exportNameOpt := witTypes.None[uint32]()
+	if exportName != "" {
+		exportNameOpt = witTypes.Some(b.intern(exportName))
+	}
+	declID := b.allocDecl(zigar_typescript_types.DeclNode{
+		Name:       b.intern(exportName),
+		ExportName: exportNameOpt,
+		Module:     modID,
+		Modifiers:  zigar_typescript_types.ModifierFlags_ExportDecl,
+		Kind: zigar_typescript_types.MakeDeclKindReExportDecl(zigar_typescript_types.ReExportData{
+			ModuleSpecifier: b.intern(""),
+			SourceName:      b.intern(sourceName),
+			ExportAlias:     aliasOpt,
+			TargetDecl:      witTypes.Some(targetDeclID),
+			TargetModule:    witTypes.Some(targetMod),
+			IsNamespace:     false,
+			IsTypeOnly:      isTypeOnly,
+		}),
+		Jsdoc: b.extractJsdocForNode(node),
+	})
+	b.nsAliasReExports[key] = declID
+	return declID
+}
+
+func (b *graphBuilder) isActiveNamespaceSym(sym *ast.Symbol) bool {
+	sym = b.canonicalSymbol(sym)
+	if sym == nil {
+		return false
+	}
+	for _, active := range b.activeNsSyms {
+		if active == sym {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *graphBuilder) isActiveNamespaceDeclID(id uint32) bool {
+	for _, activeID := range b.activeNsDeclIDs {
+		if activeID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func isSymbolStrictlyInsideNodes(sym *ast.Symbol, containerNodes []*ast.Node) bool {
+	if sym == nil || len(containerNodes) == 0 {
+		return false
+	}
+	containerSet := make(map[*ast.Node]bool, len(containerNodes))
+	for _, cn := range containerNodes {
+		if cn != nil {
+			containerSet[cn] = true
+		}
+	}
+	for _, d := range sym.Declarations() {
+		if d == nil {
+			continue
+		}
+		for cur := d.Parent; cur != nil; cur = cur.Parent {
+			if containerSet[cur] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (b *graphBuilder) extractNamespaceExportedSymbol(
+	nsDeclID uint32,
+	nsNodes []*ast.Node,
+	nsSym *ast.Symbol,
+	sf *ast.SourceFile,
+	modID uint32,
+	expSym *ast.Symbol,
+	exportByName map[string]*ast.Symbol,
+) []uint32 {
+	if expSym == nil {
+		return nil
+	}
+	exportName := expSym.Name()
+	if exportName == "" || exportName == "export=" {
+		return nil
+	}
+
+	// 1. Check for `export import X = ...` directly declared inside this namespace.
+	for _, d := range expSym.Declarations() {
+		if d != nil && d.Kind == ast.KindImportEqualsDeclaration && isSymbolStrictlyInsideNodes(expSym, nsNodes) {
+			if idOpt := b.extractImportEqualsNode(sf, modID, d); isSome(idOpt) {
+				id := idOpt.Some()
+				b.decls[id].Modifiers |= zigar_typescript_types.ModifierFlags_ExportDecl
+				if isNone(b.decls[id].ExportName) {
+					b.decls[id].ExportName = witTypes.Some(b.intern(exportName))
+				}
+				return []uint32{id}
+			}
+		}
+	}
+
+	// 2. Check if `expSym` is a bare `export { ... }` of an external module import.
+	if reExpID, ok := b.tryExtractImportedReExport(sf, modID, expSym); ok {
+		return []uint32{reExpID}
+	}
+
+	var exportSpecNode *ast.Node
+	for _, d := range expSym.Declarations() {
+		if d != nil && d.Kind == ast.KindExportSpecifier {
+			exportSpecNode = d
+			break
+		}
+	}
+
+	target := expSym
+	if target.Flags()&ast.SymbolFlagsAlias != 0 {
+		if b.cfg.FollowReExports {
+			target = b.resolveAliasSymbol(target)
+		} else {
+			if resolved := b.resolveAliasSymbol(target); resolved != nil && b.isSymbolDeclaredInFile(resolved, sf) {
+				target = resolved
+			}
+		}
+	}
+	target = b.canonicalSymbol(target)
+	if target == nil {
+		return nil
+	}
+
+	// H1 fix: If `target` IS the enclosing namespace symbol (e.g. `namespace EventEmitter { export { EventEmitter } }`
+	// or `namespace path { export { path as posix } }`), an enclosing ancestor namespace symbol, OR a declaration
+	// defined OUTSIDE this namespace (`export { OuterType }`), emit a namespace-scoped `re-export-decl` WITHOUT
+	// inserting `nsDeclID`/merged-peer IDs into `children` and WITHOUT clobbering outer `ExportDecl`/`ExportName`!
+	if target == b.canonicalSymbol(nsSym) || b.isActiveNamespaceSym(target) || !isSymbolStrictlyInsideNodes(target, nsNodes) {
+		targetIDs := b.extractSymbolCategoriesInternal(target, modID, false, false)
+		if len(targetIDs) == 0 {
+			targetIDs = b.allDeclsForSym[target]
+		}
+		if len(targetIDs) == 0 {
+			return nil
+		}
+		primaryID := targetIDs[0]
+		for _, tid := range targetIDs {
+			if tid != nsDeclID && b.decls[tid].Kind.Tag() != zigar_typescript_types.DeclKind_NamespaceDecl {
+				primaryID = tid
+				break
+			}
+		}
+		srcName := symbolOwnIdentifierName(target)
+		if srcName == "" {
+			srcName = b.strings.strings[b.decls[primaryID].Name]
+		}
+		isTypeOnly := b.tc.GetTypeOnlyAliasDeclaration(expSym) != nil || isAliasNodeTypeOnly(exportSpecNode)
+		aliasID := b.makeNamespaceAliasReExportDecl(nsDeclID, modID, exportSpecNode, exportName, srcName, primaryID, isTypeOnly)
+		return []uint32{aliasID}
+	}
+
+	return b.extractExportedSymbolWithSet(sf, modID, expSym, true, exportByName)
+}
+
 func (b *graphBuilder) extractExportedSymbol(sf *ast.SourceFile, modID uint32, expSym *ast.Symbol, markExported bool) []uint32 {
 	return b.extractExportedSymbolWithSet(sf, modID, expSym, markExported, nil)
 }
@@ -835,7 +1012,12 @@ func (b *graphBuilder) populateDeclCategory(declID uint32, sym *ast.Symbol, cat 
 		b.decls[declID].Kind = zigar_typescript_types.MakeDeclKindEnumDecl(enumData)
 
 	case declCatNamespace:
-		nsDecls := b.extractMergedNamespaceDecls(nodes, sym, modID)
+		canonSym := b.canonicalSymbol(sym)
+		b.activeNsSyms = append(b.activeNsSyms, canonSym)
+		b.activeNsDeclIDs = append(b.activeNsDeclIDs, declID)
+		nsDecls := b.extractMergedNamespaceDecls(declID, nodes, sym, modID)
+		b.activeNsSyms = b.activeNsSyms[:len(b.activeNsSyms)-1]
+		b.activeNsDeclIDs = b.activeNsDeclIDs[:len(b.activeNsDeclIDs)-1]
 		b.decls[declID].Kind = zigar_typescript_types.MakeDeclKindNamespaceDecl(nsDecls)
 
 	case declCatImportEquals:
@@ -934,10 +1116,19 @@ func (b *graphBuilder) extractMergedEnumDecls(nodes []*ast.Node) zigar_typescrip
 	}
 }
 
-func (b *graphBuilder) extractMergedNamespaceDecls(nodes []*ast.Node, sym *ast.Symbol, modID uint32) []uint32 {
+func (b *graphBuilder) extractMergedNamespaceDecls(nsDeclID uint32, nodes []*ast.Node, sym *ast.Symbol, modID uint32) []uint32 {
 	out := []uint32{}
 	seen := map[uint32]bool{}
+	peerSet := map[uint32]bool{nsDeclID: true}
+	if canonSym := b.canonicalSymbol(sym); canonSym != nil {
+		for _, pid := range b.allDeclsForSym[canonSym] {
+			peerSet[pid] = true
+		}
+	}
 	add := func(id uint32) {
+		if id == nsDeclID || peerSet[id] || b.isActiveNamespaceDeclID(id) {
+			return
+		}
 		if !seen[id] {
 			seen[id] = true
 			out = append(out, id)
@@ -952,7 +1143,7 @@ func (b *graphBuilder) extractMergedNamespaceDecls(nodes []*ast.Node, sym *ast.S
 			if expSym == nil || expSym.Name() == "export=" {
 				continue
 			}
-			for _, id := range b.extractExportedSymbolWithSet(sf, modID, expSym, true, exportByName) {
+			for _, id := range b.extractNamespaceExportedSymbol(nsDeclID, nodes, sym, sf, modID, expSym, exportByName) {
 				add(id)
 			}
 		}

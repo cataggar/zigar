@@ -1416,4 +1416,175 @@ describe("Go Semantic Declaration-Graph Extractor (zigar:typescript/extractor@7.
       vfs.drop();
     }
   });
+
+  it("handles Issue #45 M2.2c adversarial cases: H1 merged namespace self-export, H4 ambient export=/default, and M2 private constructors & brand", () => {
+    const vfs = ts.createVfs(true);
+    try {
+      vfs.writeFile(
+        "/h1-merged.d.ts",
+        [
+          "interface OuterUnexported { hidden: number }",
+          "export declare class EventEmitter {",
+          "  emit(event: string): boolean;",
+          "}",
+          "export declare namespace EventEmitter {",
+          "  export { EventEmitter, EventEmitter as EEAlias, OuterUnexported as InnerExposed };",
+          "  export interface Abortable { signal?: boolean }",
+          "}",
+          "export declare namespace OuterNs {",
+          "  export const x: number;",
+          "  export namespace InnerNs {",
+          "    export { OuterNs };",
+          "  }",
+          "}",
+          "export {};",
+        ].join("\n"),
+      );
+      vfs.writeFile(
+        "/h4-ambient.d.ts",
+        [
+          'declare module "node:events" {',
+          "  class EventEmitter<T = any> { on(ev: string): this; }",
+          "  interface EventEmitter<T = any> { emit(ev: string): boolean; }",
+          "  namespace EventEmitter {",
+          "    export { EventEmitter };",
+          "    export function once(ee: EventEmitter): Promise<unknown[]>;",
+          "  }",
+          "  export = EventEmitter;",
+          "}",
+          'declare module "node:path" {',
+          "  namespace path {",
+          "    export function join(...p: string[]): string;",
+          "    export const sep: string;",
+          "  }",
+          "  export = path;",
+          "}",
+          'declare module "virtual:def" {',
+          "  export default class DefService { run(): void; }",
+          "}",
+        ].join("\n"),
+      );
+      vfs.writeFile(
+        "/m2-private.ts",
+        [
+          "interface SecretHelper { key: string }",
+          "export class Singleton {",
+          "  private secret?: SecretHelper;",
+          "  #brand: boolean = true;",
+          "  private constructor(token: string) {}",
+          '  static instance(): Singleton { return new Singleton("ok"); }',
+          "}",
+          "export class ProtectedBase {",
+          "  protected constructor(id: number) {}",
+          "}",
+        ].join("\n"),
+      );
+
+      const roots = ["/h1-merged.d.ts", "/h4-ambient.d.ts", "/m2-private.ts"];
+      const progRes = ts.createProgram(vfs, roots, {
+        target: "es2024",
+        module: "esnext",
+        moduleResolution: "bundler",
+        strict: true,
+      });
+      assert.equal(progRes.ok, true);
+      const program = progRes.value;
+
+      try {
+        const res = ts.extractModuleGraph(program, {
+          rootFiles: roots,
+          followReExports: true,
+          expandUtilityTypes: false,
+          includeJsdoc: false,
+          includePrivateMembers: false,
+        });
+        assert.equal(res.ok, true);
+        const g = res.value;
+
+        const getMod = (fp) => {
+          const m = g.modules.find((mod) => g.str(mod.filePath) === fp);
+          assert.ok(m, `Expected module ${fp}`);
+          return m;
+        };
+
+        // --- H1: Merged class+namespace re-exporting itself + outer unexported decl ---
+        const h1Mod = getMod("/h1-merged.d.ts");
+        const h1Decls = g.decls.filter((d) => d.module === h1Mod.id);
+        const eeCls = h1Decls.find((d) => g.str(d.name) === "EventEmitter" && d.kind.tag === "class-decl");
+        const eeNs = h1Decls.find((d) => g.str(d.name) === "EventEmitter" && d.kind.tag === "namespace-decl");
+        const outerHidden = h1Decls.find((d) => g.str(d.name) === "OuterUnexported" && d.kind.tag === "interface-decl");
+        assert.ok(eeCls && eeNs && outerHidden);
+
+        const nsChildren = eeNs.kind.val;
+        assert.ok(!nsChildren.includes(eeNs.id), "H1: namespace must never contain its own decl_id");
+        assert.ok(!nsChildren.includes(eeCls.id), "H1: namespace must not contain merged peer class decl_id directly");
+        assert.ok(!nsChildren.includes(outerHidden.id), "H1: namespace must not steal outer unexported decl_id directly");
+        assert.equal(outerHidden.exportName, null, "H1: outer unexported decl must keep exportName === null");
+        assert.equal(outerHidden.modifiers & MODIFIER_FLAGS.exportDecl, 0, "H1: outer unexported decl must not gain exportDecl");
+
+        const selfReExport = nsChildren
+          .map((id) => g.decls[id])
+          .find((d) => d.kind.tag === "re-export-decl" && g.str(d.name) === "EventEmitter");
+        assert.ok(selfReExport, "H1: expected namespace-scoped re-export-decl for EventEmitter");
+        assert.equal(selfReExport.kind.val.targetDecl, eeCls.id);
+
+        const outerNs = h1Decls.find((d) => g.str(d.name) === "OuterNs" && d.kind.tag === "namespace-decl");
+        const innerNs = outerNs.kind.val
+          .map((id) => g.decls[id])
+          .find((d) => g.str(d.name) === "InnerNs" && d.kind.tag === "namespace-decl");
+        assert.ok(outerNs && innerNs);
+        assert.ok(!innerNs.kind.val.includes(outerNs.id), "H1: nested namespace must not create ancestor cycle");
+        assert.ok(!innerNs.kind.val.includes(innerNs.id), "H1: nested namespace must not self-cycle");
+
+        // --- H4: ambient-module-node exportEquals & defaultExport ---
+        const h4Mod = getMod("/h4-ambient.d.ts");
+        const getAmb = (name) => {
+          const amb = h4Mod.ambientModules.find((a) => g.str(a.moduleName) === name);
+          assert.ok(amb, `Expected ambient module ${name}`);
+          return amb;
+        };
+
+        const ambEvents = getAmb("node:events");
+        assert.notEqual(ambEvents.exportEquals, null, "H4: node:events must populate exportEquals");
+        const ambEventsKinds = new Set(ambEvents.decls.map((id) => g.decls[id].kind.tag));
+        assert.ok(ambEventsKinds.has("class-decl"), "H4: node:events decls must include merged class EventEmitter");
+        assert.ok(ambEventsKinds.has("interface-decl"), "H4: node:events decls must include merged interface EventEmitter");
+        assert.ok(ambEventsKinds.has("namespace-decl"), "H4: node:events decls must include merged namespace EventEmitter");
+
+        const ambPath = getAmb("node:path");
+        assert.notEqual(ambPath.exportEquals, null, "H4: node:path must populate exportEquals");
+        assert.equal(g.decls[ambPath.exportEquals].kind.tag, "namespace-decl");
+
+        const ambDef = getAmb("virtual:def");
+        assert.notEqual(ambDef.defaultExport, null, "H4: virtual:def must populate defaultExport");
+        assert.equal(g.decls[ambDef.defaultExport].kind.tag, "class-decl");
+
+        // --- M2: private/protected constructors & #private brand marker ---
+        const m2Mod = getMod("/m2-private.ts");
+        const m2Decls = g.decls.filter((d) => d.module === m2Mod.id);
+        const singletonCls = m2Decls.find((d) => g.str(d.name) === "Singleton" && d.kind.tag === "class-decl");
+        const protectedCls = m2Decls.find((d) => g.str(d.name) === "ProtectedBase" && d.kind.tag === "class-decl");
+        assert.ok(singletonCls && protectedCls);
+
+        assert.equal(singletonCls.kind.val.constructors.length, 1, "M2: private constructor must be preserved");
+        const privCtorSig = g.signatures[singletonCls.kind.val.constructors[0]];
+        assert.notEqual(privCtorSig.modifiers & MODIFIER_FLAGS.privateMod, 0, "M2: privateMod must be set on private constructor");
+
+        assert.equal(protectedCls.kind.val.constructors.length, 1, "M2: protected constructor must be preserved");
+        const protCtorSig = g.signatures[protectedCls.kind.val.constructors[0]];
+        assert.notEqual(protCtorSig.modifiers & MODIFIER_FLAGS.protectedMod, 0, "M2: protectedMod must be set on protected constructor");
+
+        const brandProps = singletonCls.kind.val.properties
+          .map((pid) => g.properties[pid])
+          .filter((p) => (p.modifiers & MODIFIER_FLAGS.privateMod) !== 0);
+        assert.equal(brandProps.length, 1, "M2: expected lightweight #private brand marker when includePrivateMembers=false");
+        assert.equal(g.str(brandProps[0].name), "#private");
+        assert.equal(g.types[brandProps[0].ty].kind.tag, "any-type", "M2: brand marker must use any-type without pulling private helper types");
+      } finally {
+        program.drop();
+      }
+    } finally {
+      vfs.drop();
+    }
+  });
 });

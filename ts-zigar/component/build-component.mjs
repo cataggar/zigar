@@ -14,6 +14,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -221,7 +222,11 @@ export function buildComponent({ outputPath = defaultOutputWasm, forceRebuild = 
   const env = buildIsolatedEnv(cacheDir);
   const upstreamCheckoutDir = ensureUpstreamTypeScriptCheckout(cacheDir, env);
 
-  const stageRootDir = path.join(cacheDir, `stage-${TYPESCRIPT_PINNED_COMMIT.slice(0, 12)}`);
+  const worktreeHash = crypto.createHash("sha256").update(__dirname).digest("hex").slice(0, 10);
+  const stageRootDir = path.join(
+    cacheDir,
+    `stage-${TYPESCRIPT_PINNED_COMMIT.slice(0, 12)}-${worktreeHash}`,
+  );
   if (forceRebuild) {
     fs.rmSync(stageRootDir, { recursive: true, force: true });
   }

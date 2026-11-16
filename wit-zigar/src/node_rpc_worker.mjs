@@ -944,6 +944,8 @@ export function createComponentHostWasmImports(hostsById, getCallerMemory) {
 
 // ── Binary-Framed Stdio RPC Worker (`--rpc-stdio <component.wasm>`) ─────────
 
+const rpcSleepArr = new Int32Array(new SharedArrayBuffer(4));
+
 function readExactSync(fd, targetBuf, length) {
   let offset = 0;
   while (offset < length) {
@@ -951,8 +953,14 @@ function readExactSync(fd, targetBuf, length) {
     try {
       n = readSync(fd, targetBuf, offset, length - offset, null);
     } catch (err) {
-      if (err && (err.code === 'EAGAIN' || err.code === 'EINTR')) {
-        continue;
+      if (err) {
+        if (err.code === 'EAGAIN' || err.code === 'EWOULDBLOCK') {
+          Atomics.wait(rpcSleepArr, 0, 0, 1);
+          continue;
+        }
+        if (err.code === 'EINTR') {
+          continue;
+        }
       }
       throw err;
     }
@@ -973,8 +981,14 @@ function writeAllSync(fd, buf, offset, length) {
       const n = writeSync(fd, buf, pos, end - pos);
       pos += n;
     } catch (err) {
-      if (err && (err.code === 'EAGAIN' || err.code === 'EINTR')) {
-        continue;
+      if (err) {
+        if (err.code === 'EAGAIN' || err.code === 'EWOULDBLOCK') {
+          Atomics.wait(rpcSleepArr, 0, 0, 1);
+          continue;
+        }
+        if (err.code === 'EINTR') {
+          continue;
+        }
       }
       throw err;
     }
