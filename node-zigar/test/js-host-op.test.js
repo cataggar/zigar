@@ -320,4 +320,49 @@ describe('Native JS Host-Op Dispatcher & Dynamic Zig Callbacks Integration', fun
     expect(Number(mod.activeCallbacks())).to.equal(0);
     expect(Number(mod.activeHandles())).to.equal(0);
   });
+
+  it('should pass by-value extern struct Point4 and sret return across 24 callconv(.c) callbacks on native N-API', function() {
+    try {
+      for (let i = 0; i < 24; i++) {
+        const idx = i;
+        mod.registerPointCb(idx, (pt) => ({
+          x: pt.x + (idx + 1) * 100,
+          y: pt.y - (idx + 1) * 10,
+          z: pt.z + (idx + 1) * 1000,
+          w: pt.w ^ (idx + 1),
+        }));
+      }
+      for (let i = 0; i < 24; i++) {
+        const input = { x: i + 1, y: i + 2, z: i + 3, w: i + 4 };
+        const out = mod.callPointCb(i, input);
+        expect({ x: out.x, y: out.y, z: out.z, w: out.w }).to.deep.equal({
+          x: input.x + (i + 1) * 100,
+          y: input.y - (i + 1) * 10,
+          z: input.z + (i + 1) * 1000,
+          w: input.w ^ (i + 1),
+        });
+      }
+      mod.clearPointCbs();
+      for (let i = 0; i < 24; i++) {
+        const idx = i;
+        mod.registerPointCb(idx, (pt) => ({
+          x: pt.x + (idx + 50),
+          y: pt.y + (idx + 60),
+          z: pt.z + (idx + 70),
+          w: pt.w + (idx + 80),
+        }));
+      }
+      for (let i = 0; i < 24; i++) {
+        const out = mod.callPointCb(i, { x: 1, y: 2, z: 3, w: 4 });
+        expect({ x: out.x, y: out.y, z: out.z, w: out.w }).to.deep.equal({
+          x: 1 + i + 50,
+          y: 2 + i + 60,
+          z: 3 + i + 70,
+          w: 4 + i + 80,
+        });
+      }
+    } finally {
+      mod.clearPointCbs();
+    }
+  });
 });

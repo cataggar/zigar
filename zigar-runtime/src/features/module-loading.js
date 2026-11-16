@@ -54,6 +54,7 @@ export default mixin({
       this.valueMap = new Map();
       this.valueIndices = new Map();
       this.options = null;
+      this.wasmBinary = null;
       this.executable = null;
       this.instance = null;
       this.memory = null;
@@ -508,8 +509,24 @@ export default mixin({
         this.continuationStackSize = (continuationStackSize + 15) & ~15;
       }
       const res = await source;
+      let wasmInput = res;
+      if (res?.[Symbol.toStringTag] === 'Response') {
+        if (typeof res.arrayBuffer === 'function') {
+          const buf = await res.arrayBuffer();
+          this.wasmBinary = new Uint8Array(buf);
+          wasmInput = this.wasmBinary;
+        } else {
+          this.wasmBinary = null;
+        }
+      } else if (res instanceof ArrayBuffer) {
+        this.wasmBinary = new Uint8Array(res);
+      } else if (ArrayBuffer.isView(res)) {
+        this.wasmBinary = new Uint8Array(res.buffer, res.byteOffset, res.byteLength);
+      } else {
+        this.wasmBinary = null;
+      }
       if (memory64 === undefined) {
-        const detected = detectWasm64(res);
+        const detected = detectWasm64(wasmInput);
         if (detected) {
           if (detected.memory64) {
             this.memory64 = true;
@@ -519,9 +536,9 @@ export default mixin({
           }
         }
       }
-      const suffix = (res[Symbol.toStringTag] === 'Response') ? /* c8 ignore next */ 'Streaming' : '';
+      const suffix = (wasmInput?.[Symbol.toStringTag] === 'Response') ? /* c8 ignore next */ 'Streaming' : '';
       const f = WA['compile' + suffix];
-      const executable = this.executable = await f(res);
+      const executable = this.executable = await f(wasmInput);
       const functions = this.exportFunctions();
       const env = {}, wasi = {}, wasiPreview = {};
       const exports = this.exportedModules = { env, wasi, wasi_snapshot_preview1: wasiPreview };

@@ -13,6 +13,7 @@ pub const Action = enum(u32) {
     create,
     destroy,
     identify,
+    get_dynamic_thunk,
 };
 pub const Error = error{ UnableToCreateThunk, UnableToFindThunk };
 
@@ -63,6 +64,7 @@ pub fn createThunkController(comptime host: type, comptime BFT: type) ThunkContr
                             return Error.UnableToFindThunk;
                         }
                     },
+                    .get_dynamic_thunk => return Error.UnableToCreateThunk,
                 }
             }
         },
@@ -96,6 +98,28 @@ pub fn createThunkController(comptime host: type, comptime BFT: type) ThunkContr
                 }
                 break :init array;
             };
+            const dynamic_thunk: *const BFT = init: {
+                const CHT = CallHandler(BFT);
+                const ch = @typeInfo(CHT).@"fn";
+                const RT = ch.return_type.?;
+                const handler = getJscallHandler(host, BFT);
+                const ns = struct {
+                    inline fn call(bf_args: std.meta.ArgsTuple(BFT)) RT {
+                        const fn_id = if (@hasDecl(host, "consumePendingDynamicJsThunkId"))
+                            host.consumePendingDynamicJsThunkId()
+                        else
+                            0;
+                        var ch_args: std.meta.ArgsTuple(CHT) = undefined;
+                        inline for (bf_args, 0..) |arg, arg_index| {
+                            ch_args[arg_index] = arg;
+                        }
+                        ch_args[bf_args.len] = null;
+                        ch_args[bf_args.len + 1] = fn_id;
+                        return @call(.never_inline, handler, ch_args);
+                    }
+                };
+                break :init &fn_transform.spreadArgs(ns.call, ch.attrs.@"callconv");
+            };
 
             fn control(action: Action, arg: usize) !usize {
                 switch (action) {
@@ -125,6 +149,7 @@ pub fn createThunkController(comptime host: type, comptime BFT: type) ThunkContr
                             }
                         } else Error.UnableToFindThunk;
                     },
+                    .get_dynamic_thunk => return @intFromPtr(dynamic_thunk),
                 }
             }
         },
@@ -135,9 +160,22 @@ pub fn createThunkController(comptime host: type, comptime BFT: type) ThunkContr
 test "createThunkController" {
     const BFT = fn (i32, f64) usize;
     const host = struct {
+        var pending_id: usize = 0;
+
+        pub fn consumePendingDynamicJsThunkId() usize {
+            const id = pending_id;
+            pending_id = 0;
+            return id;
+        }
+
+        fn getLanguageName() []const u8 {
+            return "JavaScript";
+        }
+
         fn handleJscall(fn_id: usize, arg_ptr: *anyopaque, arg_size: usize) E {
             if (arg_size == @sizeOf(ArgStruct(BFT))) {
-                @as(*ArgStruct(BFT), @ptrCast(@alignCast(arg_ptr))).retval = fn_id;
+                const arg_s: *ArgStruct(BFT) = @ptrCast(@alignCast(arg_ptr));
+                arg_s.retval = fn_id + @as(usize, @intCast(arg_s.@"0"));
                 return .SUCCESS;
             } else {
                 return .FAULT;
@@ -148,7 +186,18 @@ test "createThunkController" {
     const thunk_address = try tc(.create, 1234);
     const thunk: *const BFT = @ptrFromInt(thunk_address);
     const result = thunk(777, 3.14);
-    try expectEqual(1234, result);
+    try expectEqual(1234 + 777, result);
+    if (builtin.target.cpu.arch.isWasm()) {
+        const dyn_address = try tc(.get_dynamic_thunk, 0);
+        try expect(dyn_address != 0 and dyn_address != thunk_address);
+        const dyn_thunk: *const BFT = @ptrFromInt(dyn_address);
+        host.pending_id = 5000;
+        try expectEqual(5777, dyn_thunk(777, 3.14));
+        try expectEqual(@as(usize, 0), host.pending_id);
+        try expectEqual(777, dyn_thunk(777, 3.14));
+    } else {
+        try expectError(Error.UnableToCreateThunk, tc(.get_dynamic_thunk, 0));
+    }
 }
 
 fn CallHandler(comptime BFT: type) type {
@@ -214,9 +263,13 @@ fn getJscallHandler(comptime host: type, comptime BFT: type) CallHandler(BFT) {
 test "getJscallHandler" {
     const BFT = fn (i32, f64) usize;
     const host = struct {
+        fn getLanguageName() []const u8 {
+            return "JavaScript";
+        }
+
         fn handleJscall(_: usize, arg_ptr: *anyopaque, arg_size: usize) E {
             if (arg_size == @sizeOf(ArgStruct(BFT))) {
-                @as(*ArgStruct, @ptrCast(@alignCast(arg_ptr))).retval = 1234;
+                @as(*ArgStruct(BFT), @ptrCast(@alignCast(arg_ptr))).retval = 1234;
                 return .SUCCESS;
             } else {
                 return .FAULT;
@@ -232,6 +285,10 @@ test "getJscallHandler (error handling)" {
     const host = struct {
         fn init(_: ?*const anyopaque) @This() {
             return .{};
+        }
+
+        fn getLanguageName() []const u8 {
+            return "JavaScript";
         }
 
         fn handleJscall(_: usize, _: *anyopaque, _: usize) E {
@@ -260,7 +317,7 @@ fn findError(comptime T: type, comptime errors: anytype) RT: {
     else
         ?anyerror;
 } {
-    return if (findErrorIndex(T, errors)) |index|
+    return if (comptime findErrorIndex(T, errors)) |index|
         errors[index]
     else
         null;
@@ -271,10 +328,10 @@ fn findErrorIndex(comptime T: type, comptime errors: anytype) ?usize {
         .error_union => |eu| inline for (errors, 0..) |err, i| {
             const name = @errorName(err);
             if (@typeInfo(eu.error_set).error_set.error_names) |error_names| {
-                break inline for (error_names) |error_name| {
-                    if (std.mem.eql(u8, error_name, name)) break i;
-                } else null;
-            } else break null;
+                if (inline for (error_names) |error_name| {
+                    if (std.mem.eql(u8, error_name, name)) break true;
+                } else false) break i;
+            } else break i;
         } else null,
         else => null,
     };

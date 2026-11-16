@@ -242,5 +242,29 @@ describe('Bun Native JS Host-Op Dispatcher & Dynamic Zig Callbacks Integration',
     mod.deinitRefAfterThrowCallback();
     expect(Number(mod.activeCallbacks())).to.equal(0);
     expect(Number(mod.activeHandles())).to.equal(0);
+
+    try {
+      for (let i = 0; i < 24; i++) {
+        const idx = i;
+        mod.registerPointCb(idx, (pt) => ({
+          x: pt.x + (idx + 1) * 100,
+          y: pt.y - (idx + 1) * 10,
+          z: pt.z + (idx + 1) * 1000,
+          w: pt.w ^ (idx + 1),
+        }));
+      }
+      for (let i = 0; i < 24; i++) {
+        const input = { x: i + 1, y: i + 2, z: i + 3, w: i + 4 };
+        const out = mod.callPointCb(i, input);
+        expect({ x: out.x, y: out.y, z: out.z, w: out.w }).to.deep.equal({
+          x: input.x + (i + 1) * 100,
+          y: input.y - (i + 1) * 10,
+          z: input.z + (i + 1) * 1000,
+          w: input.w ^ (i + 1),
+        });
+      }
+    } finally {
+      mod.clearPointCbs();
+    }
   });
 });

@@ -479,4 +479,78 @@ pub fn deinitRefAfterThrowCallback() void {
     ref_after_throw_cb.deinit();
 }
 
+pub const IntCb = *const fn (i32) i32;
+var reg_int_cbs: [40]?IntCb = @splat(null);
+
+pub fn registerIntCb(idx: u32, cb: IntCb) void {
+    if (reg_int_cbs[idx]) |prev| {
+        zigar.function.release(prev);
+    }
+    reg_int_cbs[idx] = cb;
+}
+
+pub fn clearIntCbs() void {
+    for (&reg_int_cbs) |*slot| {
+        if (slot.*) |cb| {
+            zigar.function.release(cb);
+            slot.* = null;
+        }
+    }
+}
+
+pub fn callIntCb(idx: u32, x: i32) i32 {
+    var stack_canary: [256]u8 = undefined;
+    const tag: u8 = @truncate(idx +% 0x5A);
+    @memset(&stack_canary, tag);
+    std.mem.doNotOptimizeAway(&stack_canary);
+    const res = reg_int_cbs[idx].?(x);
+    if (stack_canary[0] != tag or stack_canary[255] != tag) {
+        @panic("stack frame corrupted");
+    }
+    return res;
+}
+
+pub fn callTwo(i: u32, j: u32, a: i32) i32 {
+    var stack_canary: [256]u8 = undefined;
+    const tag: u8 = @truncate((i *% 7 +% j *% 13 +% @as(u32, @bitCast(a))) & 0xff);
+    @memset(&stack_canary, tag);
+    std.mem.doNotOptimizeAway(&stack_canary);
+    const first = reg_int_cbs[i].?(a);
+    const second = reg_int_cbs[j].?(a + 1);
+    if (stack_canary[0] != tag or stack_canary[255] != tag) {
+        @panic("stack frame corrupted across concurrent continuations");
+    }
+    return first * 10000 + second;
+}
+
+pub const Point4 = extern struct {
+    x: i32,
+    y: i32,
+    z: i32,
+    w: i32,
+};
+
+pub const PFn = *const fn (Point4) callconv(.c) Point4;
+var reg_point_cbs: [24]?PFn = @splat(null);
+
+pub fn registerPointCb(idx: u32, cb: PFn) void {
+    if (reg_point_cbs[idx]) |prev| {
+        zigar.function.release(prev);
+    }
+    reg_point_cbs[idx] = cb;
+}
+
+pub fn callPointCb(idx: u32, pt: Point4) Point4 {
+    return reg_point_cbs[idx].?(pt);
+}
+
+pub fn clearPointCbs() void {
+    for (&reg_point_cbs) |*slot| {
+        if (slot.*) |cb| {
+            zigar.function.release(cb);
+            slot.* = null;
+        }
+    }
+}
+
 

@@ -447,6 +447,224 @@ if (process.env.TARGET === 'wasm') {
         expect(env.thunkSources).to.have.lengthOf(0);
       })
     })
+    describe('primary-instance dynamic WASM trampolines', function() {
+      it('should synthesize, invoke, identify, and pool WASM32 dynamic trampolines without secondary instances', async function() {
+        const str = (s) => [ s.length, ...Buffer.from(s) ];
+        const section = (id, payload) => [ id, payload.length, ...payload ];
+        // Primary module:
+        // Types:
+        //   0: () -> ()
+        //   1: (i32) -> ()      [setPendingDynamicJsThunkId]
+        //   2: (i32) -> i32     [getDynamicJsThunk]
+        //   3: (i32, i32) -> i32 [ctrlA dynamic_thunk: (x, y) -> pending_id * 1000 + x * 10 + y]
+        //   4: (i32) -> i32     [ctrlB dynamic_thunk: (x) -> pending_id * 100 + x]
+        const types = [
+          0x05,
+          0x60, 0x00, 0x00,
+          0x60, 0x01, 0x7f, 0x00,
+          0x60, 0x01, 0x7f, 0x01, 0x7f,
+          0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f,
+          0x60, 0x01, 0x7f, 0x01, 0x7f,
+        ];
+        const imports = [
+          0x02,
+          ...str('env'), ...str('memory'), 0x02, 0x00, 0x01,
+          ...str('env'), ...str('__indirect_function_table'), 0x01, 0x70, 0x00, 0x10,
+        ];
+        // Funcs: 0=initialize, 1=setPendingDynamicJsThunkId, 2=getDynamicJsThunk, 3=dynThunkA, 4=dynThunkB
+        const funcs = [ 0x05, 0x00, 0x01, 0x02, 0x03, 0x04 ];
+        // Global 0: pending_dynamic_js_thunk_id (mut i32) = 0
+        const globals = [ 0x01, 0x7f, 0x01, 0x41, 0x00, 0x0b ];
+        const exports = [
+          0x03,
+          ...str('initialize'), 0x00, 0x00,
+          ...str('setPendingDynamicJsThunkId'), 0x00, 0x01,
+          ...str('getDynamicJsThunk'), 0x00, 0x02,
+        ];
+        // Place dynThunkA at table[11] (tests i32.const 11 = 0x41 0x0b 0x0b!) and dynThunkB at table[12]
+        const elems = [ 0x01, 0x00, 0x41, 0x0b, 0x0b, 0x02, 0x03, 0x04 ];
+        const bInit = [ 0x00, 0x0b ];
+        const bSetId = [ 0x00, 0x20, 0x00, 0x24, 0x00, 0x0b ];
+        // getDynamicJsThunk(ctrl): ctrl == 0x100 -> 11; ctrl == 0x200 -> 12; else 0
+        const bGetDyn = [
+          0x00,
+          0x20, 0x00, 0x41, 0x80, 0x02, 0x46, 0x04, 0x40, 0x41, 0x0b, 0x0f, 0x0b,
+          0x20, 0x00, 0x41, 0x80, 0x04, 0x46, 0x04, 0x40, 0x41, 0x0c, 0x0f, 0x0b,
+          0x41, 0x00, 0x0b,
+        ];
+        // dynThunkA(x, y): id = global0; global0 = 0; return id * 1000 + x * 10 + y
+        const bDynA = [
+          0x01, 0x01, 0x7f, // local 2 = id
+          0x23, 0x00, 0x21, 0x02,
+          0x41, 0x00, 0x24, 0x00,
+          0x20, 0x02, 0x41, 0xe8, 0x07, 0x6c,
+          0x20, 0x00, 0x41, 0x0a, 0x6c, 0x6a,
+          0x20, 0x01, 0x6a,
+          0x0b,
+        ];
+        // dynThunkB(x): id = global0; global0 = 0; return id * 100 + x
+        const bDynB = [
+          0x01, 0x01, 0x7f, // local 1 = id
+          0x23, 0x00, 0x21, 0x01,
+          0x41, 0x00, 0x24, 0x00,
+          0x20, 0x01, 0x41, 0xe4, 0x00, 0x6c,
+          0x20, 0x00, 0x6a,
+          0x0b,
+        ];
+        const bodies = [ bInit, bSetId, bGetDyn, bDynA, bDynB ];
+        const codePayload = [ bodies.length ];
+        for (const b of bodies) {
+          codePayload.push(b.length, ...b);
+        }
+        const wasmBytes = new Uint8Array([
+          0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+          ...section(1, types),
+          ...section(2, imports),
+          ...section(3, funcs),
+          ...section(6, globals),
+          ...section(7, exports),
+          ...section(9, elems),
+          ...section(10, codePayload),
+        ]);
+
+        // Load via Response to verify module-loading captures this.wasmBinary from Response too!
+        const response = new Response(wasmBytes, { headers: { 'content-type': 'application/wasm' } });
+        const env = new Env();
+        await env.loadModule(response, {
+          memoryInitial: 1,
+          tableInitial: 16,
+          multithreaded: false,
+        });
+
+        const ctrlA = 0x100;
+        const ctrlB = 0x200;
+        const slotsA = [];
+        const slotsB = [];
+        for (let i = 1; i <= 12; i++) {
+          slotsA.push(env.allocateJsThunk(ctrlA, 10 + i));
+          slotsB.push(env.allocateJsThunk(ctrlB, 50 + i));
+        }
+        // Zero secondary instances!
+        expect(env.thunkSources).to.have.lengthOf(0);
+
+        for (let i = 0; i < 12; i++) {
+          expect(env.table.get(slotsA[i])(3, 7)).to.equal((11 + i) * 1000 + 37);
+          expect(env.table.get(slotsB[i])(9)).to.equal((51 + i) * 100 + 9);
+        }
+
+        // Cross-controller isolation in findJsThunk / freeJsThunk
+        expect(env.findJsThunk(ctrlA, slotsA[0])).to.equal(11);
+        expect(env.findJsThunk(ctrlB, slotsA[0])).to.equal(0);
+        expect(env.freeJsThunk(ctrlB, slotsA[0])).to.equal(0);
+        expect(env.findJsThunk(ctrlA, 99999)).to.equal(0);
+        expect(env.freeJsThunk(ctrlA, 99999)).to.equal(0);
+
+        const tableLenBeforeReuse = env.table.length;
+        const firstTrampolineFn = env.table.get(slotsA[0]);
+
+        // Free all 24 dynamic thunks and reallocate 24 with new IDs — must reuse pooled trampolines & slots without growing table!
+        for (let i = 0; i < 12; i++) {
+          expect(env.freeJsThunk(ctrlA, slotsA[i])).to.equal(11 + i);
+          expect(env.freeJsThunk(ctrlB, slotsB[i])).to.equal(51 + i);
+          expect(env.table.get(slotsA[i])).to.be.null;
+          expect(env.table.get(slotsB[i])).to.be.null;
+        }
+        const reusedA = [];
+        const reusedB = [];
+        const seenReusedTrampolines = new Set();
+        for (let i = 0; i < 12; i++) {
+          const sa = env.allocateJsThunk(ctrlA, 80 + i);
+          const sb = env.allocateJsThunk(ctrlB, 90 + i);
+          reusedA.push(sa);
+          reusedB.push(sb);
+          seenReusedTrampolines.add(env.table.get(sa));
+        }
+        expect(env.table.length).to.equal(tableLenBeforeReuse);
+        expect(seenReusedTrampolines.has(firstTrampolineFn)).to.be.true;
+        for (let i = 0; i < 12; i++) {
+          expect(env.table.get(reusedA[i])(4, 2)).to.equal((80 + i) * 1000 + 42);
+          expect(env.table.get(reusedB[i])(6)).to.equal((90 + i) * 100 + 6);
+        }
+      })
+
+      it('should synthesize and invoke memory64 + table64 dynamic trampolines', async function() {
+        const str = (s) => [ s.length, ...Buffer.from(s) ];
+        const section = (id, payload) => [ id, payload.length, ...payload ];
+        const types = [
+          0x04,
+          0x60, 0x00, 0x00,
+          0x60, 0x01, 0x7e, 0x00,             // (i64) -> ()
+          0x60, 0x01, 0x7e, 0x01, 0x7e,       // (i64) -> i64
+          0x60, 0x02, 0x7e, 0x7e, 0x01, 0x7e, // (i64, i64) -> i64
+        ];
+        const imports = [
+          0x02,
+          ...str('env'), ...str('memory'), 0x02, 0x05, 0x01, 0x02,
+          ...str('env'), ...str('__indirect_function_table'), 0x01, 0x70, 0x04, 0x10,
+        ];
+        const funcs = [ 0x04, 0x00, 0x01, 0x02, 0x03 ];
+        const globals = [ 0x01, 0x7e, 0x01, 0x42, 0x00, 0x0b ];
+        const exports = [
+          0x03,
+          ...str('initialize'), 0x00, 0x00,
+          ...str('setPendingDynamicJsThunkId'), 0x00, 0x01,
+          ...str('getDynamicJsThunk'), 0x00, 0x02,
+        ];
+        // Active table64 element at offset 11 (i64.const 11 = 0x42 0x0b 0x0b)
+        const elems = [ 0x01, 0x00, 0x42, 0x0b, 0x0b, 0x01, 0x03 ];
+        const bInit = [ 0x00, 0x0b ];
+        const bSetId = [ 0x00, 0x20, 0x00, 0x24, 0x00, 0x0b ];
+        const bGetDyn = [ 0x00, 0x42, 0x0b, 0x0b ];
+        const bDyn = [
+          0x01, 0x01, 0x7e,
+          0x23, 0x00, 0x21, 0x02,
+          0x42, 0x00, 0x24, 0x00,
+          0x20, 0x02, 0x42, 0xe8, 0x07, 0x7e,
+          0x20, 0x00, 0x7c,
+          0x20, 0x01, 0x7c,
+          0x0b,
+        ];
+        const bodies = [ bInit, bSetId, bGetDyn, bDyn ];
+        const codePayload = [ bodies.length ];
+        for (const b of bodies) {
+          codePayload.push(b.length, ...b);
+        }
+        const wasm64Bytes = new Uint8Array([
+          0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+          ...section(1, types),
+          ...section(2, imports),
+          ...section(3, funcs),
+          ...section(6, globals),
+          ...section(7, exports),
+          ...section(9, elems),
+          ...section(10, codePayload),
+        ]);
+
+        const env = new Env();
+        await env.loadModule(wasm64Bytes, {
+          memoryInitial: 1,
+          memoryMax: 2,
+          tableInitial: 16,
+          multithreaded: false,
+        });
+        expect(env.memory64).to.be.true;
+        expect(env.table64).to.be.true;
+
+        const ctrl = 0x1_0000_0400n;
+        const slot1 = env.allocateJsThunk(ctrl, 301n);
+        const slot2 = env.allocateJsThunk(ctrl, 302n);
+        expect(slot1).to.be.a('bigint');
+        expect(slot2).to.be.a('bigint');
+        expect(env.thunkSources).to.have.lengthOf(0);
+        expect(env.table.get(slot1)(10n, 5n)).to.equal(301015n);
+        expect(env.table.get(slot2)(20n, 7n)).to.equal(302027n);
+        expect(env.findJsThunk(ctrl, slot1)).to.equal(301);
+        expect(env.freeJsThunk(ctrl, slot1)).to.equal(301);
+        const slot3 = env.allocateJsThunk(ctrl, 303n);
+        expect(slot3).to.equal(slot1);
+        expect(env.table.get(slot3)(30n, 9n)).to.equal(303039n);
+      })
+    })
   })
 }
 
