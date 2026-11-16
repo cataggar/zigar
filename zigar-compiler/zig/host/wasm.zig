@@ -267,6 +267,31 @@ pub fn invokeJsHostOp(descriptor_ptr: *const anyopaque, arg_ptr: *anyopaque, arg
     return _invokeJsHostOp(descriptor_ptr, arg_ptr, arg_size);
 }
 
+pub fn awaitJsPromise(
+    handle: u32,
+    mode: u32,
+    descriptor_ptr: *const anyopaque,
+    arg_ptr: *anyopaque,
+    arg_size: usize,
+    done_flag_addr: usize,
+) E {
+    if (!isJsThread()) return .PERM;
+    const code = _beginAwaitJsPromise(handle, mode);
+    return switch (code & 3) {
+        0 => .SUCCESS,
+        1 => .FAULT,
+        2 => .NOSYS,
+        3 => blk: {
+            const ticket = code >> 3;
+            if ((code & 4) != 0) {
+                if (_awaitJsPromise(ticket) != 0) break :blk .FAULT;
+            }
+            break :blk _finishAwaitJsPromise(ticket, descriptor_ptr, arg_ptr, arg_size, done_flag_addr);
+        },
+        else => unreachable,
+    };
+}
+
 pub fn createZigCallback(descriptor_ptr: *const anyopaque, callback_id: u32) js.Error!u32 {
     if (!isJsThread()) return error.OffJsThread;
     const handle = _createZigCallback(descriptor_ptr, callback_id);
@@ -574,6 +599,15 @@ extern "env" fn _controlLastJsError(mode: u32) u32;
 extern "env" fn _disposeJsValue(handle: u32, catch_mode: bool) u32;
 extern "env" fn _beginAsyncDisposeJsValue(handle: u32, catch_mode: bool) u32;
 extern "env" fn _awaitAsyncDisposeJsValue(ticket: u32) u32;
+extern "env" fn _beginAwaitJsPromise(handle: u32, mode: u32) u32;
+extern "env" fn _awaitJsPromise(ticket: u32) u32;
+extern "env" fn _finishAwaitJsPromise(
+    ticket: u32,
+    descriptor_ptr: *const anyopaque,
+    arg_ptr: *anyopaque,
+    arg_size: usize,
+    done_flag_addr: usize,
+) E;
 extern "env" fn _displayPanic(bytes: [*]const u8, len: usize) void;
 
 comptime {

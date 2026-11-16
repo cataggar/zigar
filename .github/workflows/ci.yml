@@ -84,6 +84,9 @@ jobs:
           cd wit-zigar
           zig build test
 
+      - name: Run zigar.js wasm32-wasi unit tests
+        run: zig test -target wasm32-wasi zigar-compiler/zig/type/js.zig --test-cmd wasmtime --test-cmd-bin
+
       - name: Run zigar-compiler tests (USE_WAZIG=1)
         env:
           USE_WAZIG: '1'
@@ -103,6 +106,7 @@ jobs:
             test/wit-zigar-bridge.test.js \
             test/js-value-handles.test.js \
             test/es-module-imports.test.js \
+            test/js-standard-wrappers.test.js \
             --grep "compile code for Windows$|should fail when directory is illegal$" \
             --invert
 
@@ -184,6 +188,7 @@ jobs:
             test/compilation.test.js \
             test/js-value-handles.test.js \
             test/es-module-imports.test.js \
+            test/js-standard-wrappers.test.js \
             --grep "compile code for Windows$|should fail when directory is illegal$" \
             --invert
 
@@ -259,14 +264,15 @@ jobs:
             test/index.test.js \
             test/worker.test.js \
             test/js-value-handles.test.js \
-            test/es-module-imports.test.js
+            test/es-module-imports.test.js \
+            test/js-standard-wrappers.test.js
 
       - name: Run bun-zigar native JsValue handle tests
         env:
           USE_WAZIG: '0'
         run: |
           cd bun-zigar
-          bun node_modules/mocha/bin/mocha.js --timeout 300000 -- test/js-value-handles.test.js test/es-module-imports.test.js
+          bun node_modules/mocha/bin/mocha.js --timeout 300000 -- test/js-value-handles.test.js test/es-module-imports.test.js test/js-standard-wrappers.test.js
 
   benchmarks:
     name: Wazig vs Zig Benchmarks

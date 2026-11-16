@@ -836,7 +836,7 @@ function isSuspendingImport(module, name) {
   if (module === 'wasi_snapshot_preview1' && (name === 'proc_exit' || PURE_SYNC_WASI_IMPORTS.has(name))) {
     return false;
   }
-  if (module === 'env' && name !== '_handleJscall' && name !== '_futexWaitAsync' && name !== '_awaitAsyncDisposeJsValue') {
+  if (module === 'env' && name !== '_handleJscall' && name !== '_futexWaitAsync' && name !== '_awaitAsyncDisposeJsValue' && name !== '_awaitJsPromise') {
     return false;
   }
   return true;

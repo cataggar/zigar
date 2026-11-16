@@ -37,6 +37,10 @@ pub const CallError = Error || error{
     Unexpected,
 };
 
+pub const OverflowError = Error || error{Overflow};
+
+pub const AllocError = Error || std.mem.Allocator.Error;
+
 pub const HostOp = enum(u32) {
     import_module = 1,
     get_global = 2,
@@ -47,6 +51,100 @@ pub const HostOp = enum(u32) {
     call_fn = 7,
     call_method = 8,
     construct = 9,
+    binary_create = 10,
+    binary_read = 11,
+    binary_write = 12,
+    binary_info = 13,
+    bigint_from_words = 14,
+    bigint_from_string = 15,
+    bigint_to_words = 16,
+    bigint_to_string = 17,
+    get_iterator = 18,
+    iterator_next = 19,
+    iterator_return = 20,
+    promise_settle = 21,
+    collection_op = 22,
+};
+
+pub const AwaitMode = enum(u32) {
+    promise = 0,
+    async_iterator_next = 1,
+    async_iterator_return = 2,
+};
+
+pub const BinaryKind = enum(u32) {
+    array_buffer = 0,
+    shared_array_buffer = 1,
+    data_view = 2,
+    buffer = 3,
+    uint8_array = 4,
+    int8_array = 5,
+    uint8_clamped_array = 6,
+    uint16_array = 7,
+    int16_array = 8,
+    uint32_array = 9,
+    int32_array = 10,
+    big_uint64_array = 11,
+    big_int64_array = 12,
+    float32_array = 13,
+    float64_array = 14,
+};
+
+pub const BinaryInfoKind = enum(u32) {
+    byte_length = 0,
+    byte_offset = 1,
+    element_length = 2,
+    is_buffer = 3,
+    is_array = 4,
+};
+
+pub const CollectionSubOp = enum(u32) {
+    array_init = 0,
+    array_with_capacity = 1,
+    array_len = 2,
+    array_get = 3,
+    array_set = 4,
+    array_push = 5,
+    array_pop = 6,
+    map_init = 7,
+    map_size = 8,
+    map_get = 9,
+    map_set = 10,
+    map_has = 11,
+    map_delete = 12,
+    map_clear = 13,
+    map_keys = 14,
+    map_values = 15,
+    map_entries = 16,
+    set_init = 17,
+    set_size = 18,
+    set_add = 19,
+    set_has = 20,
+    set_delete = 21,
+    set_clear = 22,
+    set_values = 23,
+    record_init = 24,
+    record_get = 25,
+    record_set = 26,
+    record_has = 27,
+    record_delete = 28,
+    record_keys = 29,
+    typed_array_get = 30,
+    typed_array_set = 31,
+    data_view_init = 32,
+    binary_slice = 33,
+    binary_get_buffer = 34,
+    buffer_from_string = 35,
+    buffer_to_string = 36,
+    date_now = 37,
+    date_from_ms = 38,
+    date_from_iso = 39,
+    date_get_ms = 40,
+    date_to_iso = 41,
+    regexp_init = 42,
+    regexp_test = 43,
+    regexp_source = 44,
+    regexp_flags = 45,
 };
 
 pub const HostOpFlags = packed struct(u32) {
@@ -335,8 +433,14 @@ pub fn Js(comptime host: type) type {
 
         pub const Error = module.Error;
         pub const CallError = module.CallError;
+        pub const OverflowError = module.OverflowError;
+        pub const AllocError = module.AllocError;
         pub const JsType = module.JsType;
         pub const HostOp = module.HostOp;
+        pub const AwaitMode = module.AwaitMode;
+        pub const BinaryKind = module.BinaryKind;
+        pub const BinaryInfoKind = module.BinaryInfoKind;
+        pub const CollectionSubOp = module.CollectionSubOp;
         pub const HostOpFlags = module.HostOpFlags;
         pub const JsModuleNode = module.JsModuleNode;
         pub const CallbackFlags = module.CallbackFlags;
@@ -507,9 +611,9 @@ pub fn Js(comptime host: type) type {
             }
         }
 
-        fn dispatchHostOp(
+        fn dispatchHostOpRawFlags(
             comptime op: module.HostOp,
-            comptime flags: module.HostOpFlags,
+            comptime raw_flags: u32,
             comptime key_name: []const u8,
             comptime HostFn: type,
             args_tuple: std.meta.ArgsTuple(HostFn),
@@ -518,7 +622,8 @@ pub fn Js(comptime host: type) type {
             const RT = FnReturnType(HostFn);
             const reg = TypeRegistration(Args);
             _ = reg;
-            if (comptime (op == .import_module and !flags.dynamic_key)) {
+            const flag_bits: module.HostOpFlags = @bitCast(raw_flags);
+            if (comptime (op == .import_module and !flag_bits.dynamic_key)) {
                 const mod_reg = ModuleRegistration(key_name.len, key_name[0..key_name.len].*);
                 _ = &mod_reg.key_arr;
             }
@@ -527,7 +632,7 @@ pub fn Js(comptime host: type) type {
                 var descriptor: module.HostOpDescriptor = .{
                     .signature = signature.get(Args),
                     .op = @intFromEnum(op),
-                    .flags = @bitCast(flags),
+                    .flags = raw_flags,
                     .key_ptr = if (key_name.len > 0) key_name.ptr else null,
                     .key_len = key_name.len,
                     .register_thunk = 0,
@@ -557,6 +662,140 @@ pub fn Js(comptime host: type) type {
                 return mapHostFailure(RT, status);
             }
             return frame.retval;
+        }
+
+        fn dispatchHostOp(
+            comptime op: module.HostOp,
+            comptime flags: module.HostOpFlags,
+            comptime key_name: []const u8,
+            comptime HostFn: type,
+            args_tuple: std.meta.ArgsTuple(HostFn),
+        ) FnReturnType(HostFn) {
+            return dispatchHostOpRawFlags(op, @bitCast(flags), key_name, HostFn, args_tuple);
+        }
+
+        fn dispatchHostOpOptionalFlag(
+            comptime op: module.HostOp,
+            comptime raw_flags: u32,
+            comptime PayloadT: type,
+            comptime ErrSet: type,
+            comptime ParamTypes: []const type,
+            args_tuple: std.meta.ArgsTuple(buildFnType(ParamTypes, ErrSet!PayloadT)),
+            missing_flag: *u8,
+        ) ErrSet!?PayloadT {
+            const HostFn = buildFnType(ParamTypes, ErrSet!PayloadT);
+            const Args = arg_struct.ArgStruct(HostFn);
+            const reg = TypeRegistration(Args);
+            _ = reg;
+
+            const Site = struct {
+                var descriptor: module.HostOpDescriptor = .{
+                    .signature = signature.get(Args),
+                    .op = @intFromEnum(op),
+                    .flags = raw_flags,
+                    .key_ptr = null,
+                    .key_len = 0,
+                    .register_thunk = 0,
+                    .arg_size = @sizeOf(Args),
+                };
+            };
+
+            if (!builtin.target.cpu.arch.isWasm() and @hasDecl(host, "getTypeFactoryThunk")) {
+                if (Site.descriptor.register_thunk == 0) {
+                    Site.descriptor.register_thunk = @intFromPtr(host.getTypeFactoryThunk(Args));
+                }
+            }
+
+            missing_flag.* = 0;
+            var frame: Args = undefined;
+            @memset(std.mem.asBytes(&frame), 0);
+            inline for (0..args_tuple.len) |i| {
+                const field_name = std.fmt.comptimePrint("{d}", .{i});
+                @field(frame, field_name) = args_tuple[i];
+            }
+
+            const status: E = if (@hasDecl(host, "invokeJsHostOp"))
+                host.invokeJsHostOp(&Site.descriptor, @ptrCast(&frame), @sizeOf(Args))
+            else
+                .NOSYS;
+
+            if (status != .SUCCESS) {
+                return mapHostFailure(ErrSet!?PayloadT, status);
+            }
+            if (missing_flag.* != 0) {
+                return null;
+            }
+            return try frame.retval;
+        }
+
+        fn dispatchAwaitOp(
+            comptime mode: module.AwaitMode,
+            comptime PayloadT: type,
+            comptime has_alloc: bool,
+            handle: u32,
+            allocator: if (has_alloc) std.mem.Allocator else void,
+            done_flag_ptr: ?*u8,
+        ) (if (has_alloc) module.AllocError else module.Error)!(if (mode == .async_iterator_next) ?PayloadT else PayloadT) {
+            const ErrSet = if (has_alloc) module.AllocError else module.Error;
+            const OutPayload = if (mode == .async_iterator_next) ?PayloadT else PayloadT;
+            const OutRT = ErrSet!OutPayload;
+
+            if (!isJsThread()) return error.OffJsThread;
+            if (!@hasDecl(host, "awaitJsPromise")) return error.HostUnavailable;
+
+            const HostFn = if (has_alloc)
+                buildFnType(&.{std.mem.Allocator}, ErrSet!PayloadT)
+            else
+                buildFnType(&.{}, ErrSet!PayloadT);
+            const Args = arg_struct.ArgStruct(HostFn);
+            const reg = TypeRegistration(Args);
+            _ = reg;
+
+            const Site = struct {
+                var descriptor: module.HostOpDescriptor = .{
+                    .signature = signature.get(Args),
+                    .op = 0,
+                    .flags = 0,
+                    .key_ptr = null,
+                    .key_len = 0,
+                    .register_thunk = 0,
+                    .arg_size = @sizeOf(Args),
+                };
+            };
+
+            if (!builtin.target.cpu.arch.isWasm() and @hasDecl(host, "getTypeFactoryThunk")) {
+                if (Site.descriptor.register_thunk == 0) {
+                    Site.descriptor.register_thunk = @intFromPtr(host.getTypeFactoryThunk(Args));
+                }
+            }
+
+            if (done_flag_ptr) |ptr| {
+                ptr.* = 0;
+            }
+            var frame: Args = undefined;
+            @memset(std.mem.asBytes(&frame), 0);
+            if (has_alloc) {
+                frame.@"0" = allocator;
+            }
+
+            const done_addr: usize = if (done_flag_ptr) |ptr| @intFromPtr(ptr) else 0;
+            const status = host.awaitJsPromise(
+                handle,
+                @intFromEnum(mode),
+                &Site.descriptor,
+                @ptrCast(&frame),
+                @sizeOf(Args),
+                done_addr,
+            );
+            if (status != .SUCCESS) {
+                return mapHostFailure(OutRT, status);
+            }
+            if (mode == .async_iterator_next) {
+                if (done_flag_ptr != null and done_flag_ptr.?.* != 0) {
+                    return null;
+                }
+            }
+            return try frame.retval;
         }
 
         fn dispatchWithPrependedArgs(
@@ -1384,6 +1623,7 @@ pub fn Js(comptime host: type) type {
                 const Self = @This();
                 pub const is_zig_callback = true;
                 pub const Signature = JsFnSig;
+                pub const ReturnType = RT;
 
                 id: u32 = 0,
                 func: Ref(module.Function) = Ref(module.Function).@"undefined",
@@ -1786,6 +2026,10 @@ pub fn Js(comptime host: type) type {
                 const Self = @This();
                 pub const is_zig_callback = true;
                 pub const Context = Ctx;
+                pub const ReturnType = blk: {
+                    const FnT = if (is_sig_type) unwrapFnType(FnOrSig) else unwrapFnType(@TypeOf(FnOrSig));
+                    break :blk @typeInfo(FnT).@"fn".return_type orelse void;
+                };
 
                 id: u32 = 0,
                 func: Ref(module.Function) = Ref(module.Function).@"undefined",
@@ -2438,6 +2682,1909 @@ pub fn Js(comptime host: type) type {
                 }
             };
         }
+
+        fn needsAllocatorForRead(comptime T: type) bool {
+            if (comptime util.getInternalType(T) == .js_value) return false;
+            return switch (@typeInfo(T)) {
+                .pointer => |pt| pt.size == .slice,
+                .optional => |opt| needsAllocatorForRead(opt.child),
+                .@"struct" => |st| blk: {
+                    for (st.field_types, 0..) |ft, i| {
+                        if (!st.field_attrs[i].@"comptime" and needsAllocatorForRead(ft)) break :blk true;
+                    }
+                    break :blk false;
+                },
+                else => false,
+            };
+        }
+
+        fn deinitOwnedElement(comptime ElemT: type, allocator: std.mem.Allocator, value: ElemT) void {
+            if (comptime util.getInternalType(ElemT) == .js_value) {
+                const r: Ref(module.Any) = .{ .handle = value.handle };
+                r.deinit();
+                return;
+            }
+            switch (@typeInfo(ElemT)) {
+                .pointer => |pt| if (pt.size == .slice) {
+                    for (value) |sub| {
+                        deinitOwnedElement(pt.child, allocator, sub);
+                    }
+                    allocator.free(value);
+                },
+                .optional => |opt| if (value) |inner| {
+                    deinitOwnedElement(opt.child, allocator, inner);
+                },
+                .@"struct" => |st| {
+                    inline for (st.field_names, 0..) |fname, i| {
+                        if (!st.field_attrs[i].@"comptime") {
+                            deinitOwnedElement(st.field_types[i], allocator, @field(value, fname));
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        fn unwrapPromiseOrErrorPayload(comptime RawT: type) type {
+            const NoErrT = switch (@typeInfo(RawT)) {
+                .error_union => |eu| eu.payload,
+                else => RawT,
+            };
+            return switch (@typeInfo(NoErrT)) {
+                .@"struct" => if (@hasDecl(NoErrT, "is_js_promise") and NoErrT.is_js_promise) NoErrT.Payload else NoErrT,
+                else => NoErrT,
+            };
+        }
+
+        fn extractHandlerPayloadType(comptime H: type) ?type {
+            const BaseT = switch (@typeInfo(H)) {
+                .pointer => |pt| if (pt.size == .one) pt.child else H,
+                else => H,
+            };
+            return switch (@typeInfo(BaseT)) {
+                .@"struct" => if (@hasDecl(BaseT, "is_zig_callback") and BaseT.is_zig_callback and @hasDecl(BaseT, "ReturnType"))
+                    unwrapPromiseOrErrorPayload(BaseT.ReturnType)
+                else
+                    null,
+                else => null,
+            };
+        }
+
+        fn coerceOptionalHandler(h: anytype) Ref(module.Any) {
+            const H = @TypeOf(h);
+            if (H == @TypeOf(null) or H == @TypeOf(undefined)) {
+                return Ref(module.Any).@"undefined";
+            }
+            return .{ .handle = extractHandle(h) };
+        }
+
+        fn binaryCreateCall(comptime OutT: type, comptime kind: module.BinaryKind, ptr_addr: usize, len_or_count: usize, copy_from_zig: bool) module.Error!OutT {
+            const HostFn = buildFnType(&.{ usize, usize, bool }, module.Error!OutT);
+            return dispatchHostOpRawFlags(.binary_create, @intFromEnum(kind), "", HostFn, .{ ptr_addr, len_or_count, copy_from_zig });
+        }
+
+        fn binaryReadCall(handle: u32, dest_bytes: []u8, src_byte_offset: usize) module.Error!usize {
+            const dest_addr: usize = if (dest_bytes.len > 0) @intFromPtr(dest_bytes.ptr) else 0;
+            const HostFn = buildFnType(&.{ Ref(module.Any), usize, usize, usize }, module.Error!usize);
+            return dispatchHostOpRawFlags(
+                .binary_read,
+                0,
+                "",
+                HostFn,
+                .{ .{ .handle = handle }, dest_addr, dest_bytes.len, src_byte_offset },
+            );
+        }
+
+        fn binaryWriteCall(handle: u32, src_bytes: []const u8, dst_byte_offset: usize) module.Error!void {
+            const src_addr: usize = if (src_bytes.len > 0) @intFromPtr(src_bytes.ptr) else 0;
+            const HostFn = buildFnType(&.{ Ref(module.Any), usize, usize, usize }, module.Error!void);
+            return dispatchHostOpRawFlags(
+                .binary_write,
+                0,
+                "",
+                HostFn,
+                .{ .{ .handle = handle }, src_addr, src_bytes.len, dst_byte_offset },
+            );
+        }
+
+        fn binarySizeInfoCall(comptime info_kind: module.BinaryInfoKind, handle: u32) module.Error!usize {
+            const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!usize);
+            return dispatchHostOpRawFlags(.binary_info, @intFromEnum(info_kind), "", HostFn, .{.{ .handle = handle }});
+        }
+
+        fn binaryBoolInfoCall(comptime info_kind: module.BinaryInfoKind, handle: u32) module.Error!bool {
+            const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!bool);
+            return dispatchHostOpRawFlags(.binary_info, @intFromEnum(info_kind), "", HostFn, .{.{ .handle = handle }});
+        }
+
+        /// Strongly typed wrapper for a JS `Promise<T>` (or thenable).
+        ///
+        /// Ownership: `.await()` and `.awaitAlloc()` borrow `self` without consuming its handle,
+        /// so `defer p.deinit()` works uniformly whether awaiting succeeds or fails, and the same
+        /// `Promise(T)` may be awaited multiple times (matching JS `await p; await p;`).
+        pub fn Promise(comptime T: type) type {
+            return extern struct {
+                const Self = @This();
+                pub const Payload = T;
+                pub const is_js_promise = true;
+                pub const internal_type: util.InternalType = .js_value;
+
+                handle: u32,
+
+                pub const @"undefined": Self = .{ .handle = module.reserved_undefined_handle };
+                pub const @"null": Self = .{ .handle = module.reserved_null_handle };
+
+                pub inline fn ref(self: Self) Ref(module.Object) {
+                    return .{ .handle = self.handle };
+                }
+
+                pub inline fn toRef(self: Self) Ref(module.Object) {
+                    return .{ .handle = self.handle };
+                }
+
+                pub inline fn fromRef(value: anytype) Self {
+                    return .{ .handle = extractHandle(value) };
+                }
+
+                pub inline fn isUndefined(self: Self) bool {
+                    return self.handle == module.reserved_undefined_handle;
+                }
+
+                pub inline fn isNull(self: Self) bool {
+                    return self.handle == module.reserved_null_handle;
+                }
+
+                pub inline fn isNullOrUndefined(self: Self) bool {
+                    return self.handle <= module.reserved_null_handle;
+                }
+
+                pub inline fn isReserved(self: Self) bool {
+                    return self.handle < module.first_dynamic_slot;
+                }
+
+                pub fn clone(self: Self) Self {
+                    return .{ .handle = self.ref().clone().handle };
+                }
+
+                pub fn tryClone(self: Self) module.Error!Self {
+                    return .{ .handle = (try self.ref().tryClone()).handle };
+                }
+
+                pub fn deinit(self: Self) void {
+                    self.ref().deinit();
+                }
+
+                pub fn tryDeinit(self: Self) module.Error!void {
+                    return self.ref().tryDeinit();
+                }
+
+                pub fn eql(self: Self, other: anytype) bool {
+                    return self.ref().eql(other);
+                }
+
+                pub fn tryEql(self: Self, other: anytype) module.Error!bool {
+                    return self.ref().tryEql(other);
+                }
+
+                pub fn @"await"(self: Self) module.Error!T {
+                    return dispatchAwaitOp(.promise, T, false, self.handle, {}, null);
+                }
+
+                pub const wait = @"await";
+
+                pub fn awaitAlloc(self: Self, allocator: std.mem.Allocator) module.AllocError!T {
+                    return dispatchAwaitOp(.promise, T, true, self.handle, allocator, null);
+                }
+
+                pub const waitAlloc = awaitAlloc;
+
+                pub fn resolve(value: anytype) module.Error!Self {
+                    if (@TypeOf(value) == void) {
+                        const HostFn = buildFnType(&.{}, module.Error!Self);
+                        return dispatchHostOpRawFlags(.promise_settle, 2, "", HostFn, .{});
+                    }
+                    const ValT = NormalizedValueType(@TypeOf(value));
+                    const HostFn = buildFnType(&.{ValT}, module.Error!Self);
+                    return dispatchHostOpRawFlags(.promise_settle, 0, "", HostFn, .{normalizeValue(value)});
+                }
+
+                pub fn resolveVoid() module.Error!Promise(void) {
+                    const HostFn = buildFnType(&.{}, module.Error!Promise(void));
+                    return dispatchHostOpRawFlags(.promise_settle, 2, "", HostFn, .{});
+                }
+
+                pub fn reject(reason: anytype) module.Error!Self {
+                    const ValT = NormalizedValueType(@TypeOf(reason));
+                    const HostFn = buildFnType(&.{ValT}, module.Error!Self);
+                    return dispatchHostOpRawFlags(.promise_settle, 1, "", HostFn, .{normalizeValue(reason)});
+                }
+
+                fn InferThenPayload(comptime FulfilledT: type, comptime RejectedT: type) type {
+                    if (FulfilledT == @TypeOf(null) or FulfilledT == @TypeOf(undefined)) {
+                        if (T == void) {
+                            if (extractHandlerPayloadType(RejectedT)) |rej_t| return rej_t;
+                        }
+                        return T;
+                    }
+                    if (extractHandlerPayloadType(FulfilledT)) |ful_t| {
+                        return ful_t;
+                    }
+                    return Ref(module.Any);
+                }
+
+                pub fn thenAs(self: Self, comptime R: type, on_fulfilled: anytype, on_rejected: anytype) module.Error!Promise(R) {
+                    const HostFn = buildFnType(&.{ Ref(module.Any), Ref(module.Any), Ref(module.Any) }, module.Error!Promise(R));
+                    return dispatchHostOp(
+                        .call_method,
+                        .{},
+                        "then",
+                        HostFn,
+                        .{
+                            .{ .handle = self.handle },
+                            coerceOptionalHandler(on_fulfilled),
+                            coerceOptionalHandler(on_rejected),
+                        },
+                    );
+                }
+
+                pub fn then(self: Self, on_fulfilled: anytype, on_rejected: anytype) module.Error!Promise(InferThenPayload(@TypeOf(on_fulfilled), @TypeOf(on_rejected))) {
+                    const R = InferThenPayload(@TypeOf(on_fulfilled), @TypeOf(on_rejected));
+                    return self.thenAs(R, on_fulfilled, on_rejected);
+                }
+
+                pub fn catchError(self: Self, on_rejected: anytype) module.Error!Promise(T) {
+                    return self.thenAs(T, null, on_rejected);
+                }
+            };
+        }
+
+        fn ByteBufferLike(comptime kind: module.BinaryKind) type {
+            return extern struct {
+                const Self = @This();
+                pub const internal_type: util.InternalType = .js_value;
+
+                handle: u32,
+
+                pub const @"undefined": Self = .{ .handle = module.reserved_undefined_handle };
+                pub const @"null": Self = .{ .handle = module.reserved_null_handle };
+
+                pub inline fn ref(self: Self) Ref(module.Object) {
+                    return .{ .handle = self.handle };
+                }
+
+                pub inline fn toRef(self: Self) Ref(module.Object) {
+                    return .{ .handle = self.handle };
+                }
+
+                pub inline fn fromRef(value: anytype) Self {
+                    return .{ .handle = extractHandle(value) };
+                }
+
+                pub inline fn isUndefined(self: Self) bool {
+                    return self.handle == module.reserved_undefined_handle;
+                }
+
+                pub inline fn isNull(self: Self) bool {
+                    return self.handle == module.reserved_null_handle;
+                }
+
+                pub inline fn isNullOrUndefined(self: Self) bool {
+                    return self.handle <= module.reserved_null_handle;
+                }
+
+                pub inline fn isReserved(self: Self) bool {
+                    return self.handle < module.first_dynamic_slot;
+                }
+
+                pub fn clone(self: Self) Self {
+                    return .{ .handle = self.ref().clone().handle };
+                }
+
+                pub fn tryClone(self: Self) module.Error!Self {
+                    return .{ .handle = (try self.ref().tryClone()).handle };
+                }
+
+                pub fn deinit(self: Self) void {
+                    self.ref().deinit();
+                }
+
+                pub fn tryDeinit(self: Self) module.Error!void {
+                    return self.ref().tryDeinit();
+                }
+
+                pub fn eql(self: Self, other: anytype) bool {
+                    return self.ref().eql(other);
+                }
+
+                pub fn tryEql(self: Self, other: anytype) module.Error!bool {
+                    return self.ref().tryEql(other);
+                }
+
+                pub fn init(byte_len: usize) module.Error!Self {
+                    return binaryCreateCall(Self, kind, 0, byte_len, false);
+                }
+
+                pub fn fromSlice(bytes: []const u8) module.Error!Self {
+                    const ptr_addr: usize = if (bytes.len > 0) @intFromPtr(bytes.ptr) else 0;
+                    return binaryCreateCall(Self, kind, ptr_addr, bytes.len, true);
+                }
+
+                pub fn byteLength(self: Self) module.Error!usize {
+                    return binarySizeInfoCall(.byte_length, self.handle);
+                }
+
+                pub const len = byteLength;
+
+                pub fn slice(self: Self, begin: isize, end: ?isize) module.Error!Self {
+                    const HostFn = buildFnType(&.{ Ref(module.Any), isize, bool, isize }, module.Error!Self);
+                    return dispatchHostOpRawFlags(
+                        .collection_op,
+                        @intFromEnum(module.CollectionSubOp.binary_slice),
+                        "",
+                        HostFn,
+                        .{ .{ .handle = self.handle }, begin, end != null, end orelse 0 },
+                    );
+                }
+
+                pub fn copyTo(self: Self, dest: []u8) module.Error!usize {
+                    return binaryReadCall(self.handle, dest, 0);
+                }
+
+                pub fn copyToOffset(self: Self, dest: []u8, src_byte_offset: usize) module.Error!usize {
+                    return binaryReadCall(self.handle, dest, src_byte_offset);
+                }
+
+                pub fn writeFrom(self: Self, src: []const u8) module.Error!void {
+                    return binaryWriteCall(self.handle, src, 0);
+                }
+
+                pub fn writeFromOffset(self: Self, src: []const u8, dst_byte_offset: usize) module.Error!void {
+                    return binaryWriteCall(self.handle, src, dst_byte_offset);
+                }
+
+                pub fn toOwnedSlice(self: Self, allocator: std.mem.Allocator) module.AllocError![]u8 {
+                    const total = try self.byteLength();
+                    const out = try allocator.alloc(u8, total);
+                    errdefer allocator.free(out);
+                    if (total > 0) {
+                        const n = try self.copyTo(out);
+                        if (n != total) return error.JsException;
+                    }
+                    return out;
+                }
+            };
+        }
+
+        pub const ArrayBuffer = ByteBufferLike(.array_buffer);
+        pub const SharedArrayBuffer = ByteBufferLike(.shared_array_buffer);
+
+        pub const DataView = extern struct {
+            const Self = @This();
+            pub const internal_type: util.InternalType = .js_value;
+
+            handle: u32,
+
+            pub const @"undefined": Self = .{ .handle = module.reserved_undefined_handle };
+            pub const @"null": Self = .{ .handle = module.reserved_null_handle };
+
+            pub inline fn ref(self: Self) Ref(module.Object) {
+                return .{ .handle = self.handle };
+            }
+
+            pub inline fn toRef(self: Self) Ref(module.Object) {
+                return .{ .handle = self.handle };
+            }
+
+            pub inline fn fromRef(value: anytype) Self {
+                return .{ .handle = extractHandle(value) };
+            }
+
+            pub inline fn isUndefined(self: Self) bool {
+                return self.handle == module.reserved_undefined_handle;
+            }
+
+            pub inline fn isNull(self: Self) bool {
+                return self.handle == module.reserved_null_handle;
+            }
+
+            pub inline fn isNullOrUndefined(self: Self) bool {
+                return self.handle <= module.reserved_null_handle;
+            }
+
+            pub inline fn isReserved(self: Self) bool {
+                return self.handle < module.first_dynamic_slot;
+            }
+
+            pub fn clone(self: Self) Self {
+                return .{ .handle = self.ref().clone().handle };
+            }
+
+            pub fn tryClone(self: Self) module.Error!Self {
+                return .{ .handle = (try self.ref().tryClone()).handle };
+            }
+
+            pub fn deinit(self: Self) void {
+                self.ref().deinit();
+            }
+
+            pub fn tryDeinit(self: Self) module.Error!void {
+                return self.ref().tryDeinit();
+            }
+
+            pub fn eql(self: Self, other: anytype) bool {
+                return self.ref().eql(other);
+            }
+
+            pub fn tryEql(self: Self, other: anytype) module.Error!bool {
+                return self.ref().tryEql(other);
+            }
+
+            pub fn init(ab: anytype, byte_offset: usize, maybe_byte_len: ?usize) module.Error!Self {
+                const HostFn = buildFnType(&.{ Ref(module.Any), usize, bool, usize }, module.Error!Self);
+                return dispatchHostOpRawFlags(
+                    .collection_op,
+                    @intFromEnum(module.CollectionSubOp.data_view_init),
+                    "",
+                    HostFn,
+                    .{ .{ .handle = extractHandle(ab) }, byte_offset, maybe_byte_len != null, maybe_byte_len orelse 0 },
+                );
+            }
+
+            pub fn fromSlice(bytes: []const u8) module.Error!Self {
+                const ptr_addr: usize = if (bytes.len > 0) @intFromPtr(bytes.ptr) else 0;
+                return binaryCreateCall(Self, .data_view, ptr_addr, bytes.len, true);
+            }
+
+            pub fn byteLength(self: Self) module.Error!usize {
+                return binarySizeInfoCall(.byte_length, self.handle);
+            }
+
+            pub fn byteOffset(self: Self) module.Error!usize {
+                return binarySizeInfoCall(.byte_offset, self.handle);
+            }
+
+            pub fn buffer(self: Self) module.Error!ArrayBuffer {
+                const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!ArrayBuffer);
+                return dispatchHostOpRawFlags(
+                    .collection_op,
+                    @intFromEnum(module.CollectionSubOp.binary_get_buffer),
+                    "",
+                    HostFn,
+                    .{.{ .handle = self.handle }},
+                );
+            }
+
+            pub fn getUint8(self: Self, offset: usize) module.Error!u8 {
+                return self.ref().tryCall(fn (usize) u8, "getUint8", .{offset});
+            }
+
+            pub fn setUint8(self: Self, offset: usize, value: u8) module.Error!void {
+                return self.ref().tryCall(fn (usize, u8) void, "setUint8", .{ offset, value });
+            }
+
+            pub fn getInt8(self: Self, offset: usize) module.Error!i8 {
+                return self.ref().tryCall(fn (usize) i8, "getInt8", .{offset});
+            }
+
+            pub fn setInt8(self: Self, offset: usize, value: i8) module.Error!void {
+                return self.ref().tryCall(fn (usize, i8) void, "setInt8", .{ offset, value });
+            }
+
+            pub fn getUint16(self: Self, offset: usize, little_endian: bool) module.Error!u16 {
+                return self.ref().tryCall(fn (usize, bool) u16, "getUint16", .{ offset, little_endian });
+            }
+
+            pub fn setUint16(self: Self, offset: usize, value: u16, little_endian: bool) module.Error!void {
+                return self.ref().tryCall(fn (usize, u16, bool) void, "setUint16", .{ offset, value, little_endian });
+            }
+
+            pub fn getInt16(self: Self, offset: usize, little_endian: bool) module.Error!i16 {
+                return self.ref().tryCall(fn (usize, bool) i16, "getInt16", .{ offset, little_endian });
+            }
+
+            pub fn setInt16(self: Self, offset: usize, value: i16, little_endian: bool) module.Error!void {
+                return self.ref().tryCall(fn (usize, i16, bool) void, "setInt16", .{ offset, value, little_endian });
+            }
+
+            pub fn getUint32(self: Self, offset: usize, little_endian: bool) module.Error!u32 {
+                return self.ref().tryCall(fn (usize, bool) u32, "getUint32", .{ offset, little_endian });
+            }
+
+            pub fn setUint32(self: Self, offset: usize, value: u32, little_endian: bool) module.Error!void {
+                return self.ref().tryCall(fn (usize, u32, bool) void, "setUint32", .{ offset, value, little_endian });
+            }
+
+            pub fn getInt32(self: Self, offset: usize, little_endian: bool) module.Error!i32 {
+                return self.ref().tryCall(fn (usize, bool) i32, "getInt32", .{ offset, little_endian });
+            }
+
+            pub fn setInt32(self: Self, offset: usize, value: i32, little_endian: bool) module.Error!void {
+                return self.ref().tryCall(fn (usize, i32, bool) void, "setInt32", .{ offset, value, little_endian });
+            }
+
+            pub fn getBigUint64(self: Self, offset: usize, little_endian: bool) module.Error!u64 {
+                return self.ref().tryCall(fn (usize, bool) u64, "getBigUint64", .{ offset, little_endian });
+            }
+
+            pub fn setBigUint64(self: Self, offset: usize, value: u64, little_endian: bool) module.Error!void {
+                return self.ref().tryCall(fn (usize, u64, bool) void, "setBigUint64", .{ offset, value, little_endian });
+            }
+
+            pub fn getBigInt64(self: Self, offset: usize, little_endian: bool) module.Error!i64 {
+                return self.ref().tryCall(fn (usize, bool) i64, "getBigInt64", .{ offset, little_endian });
+            }
+
+            pub fn setBigInt64(self: Self, offset: usize, value: i64, little_endian: bool) module.Error!void {
+                return self.ref().tryCall(fn (usize, i64, bool) void, "setBigInt64", .{ offset, value, little_endian });
+            }
+
+            pub fn getFloat32(self: Self, offset: usize, little_endian: bool) module.Error!f32 {
+                return self.ref().tryCall(fn (usize, bool) f32, "getFloat32", .{ offset, little_endian });
+            }
+
+            pub fn setFloat32(self: Self, offset: usize, value: f32, little_endian: bool) module.Error!void {
+                return self.ref().tryCall(fn (usize, f32, bool) void, "setFloat32", .{ offset, value, little_endian });
+            }
+
+            pub fn getFloat64(self: Self, offset: usize, little_endian: bool) module.Error!f64 {
+                return self.ref().tryCall(fn (usize, bool) f64, "getFloat64", .{ offset, little_endian });
+            }
+
+            pub fn setFloat64(self: Self, offset: usize, value: f64, little_endian: bool) module.Error!void {
+                return self.ref().tryCall(fn (usize, f64, bool) void, "setFloat64", .{ offset, value, little_endian });
+            }
+
+            pub fn copyTo(self: Self, dest: []u8) module.Error!usize {
+                return binaryReadCall(self.handle, dest, 0);
+            }
+
+            pub fn writeFrom(self: Self, src: []const u8) module.Error!void {
+                return binaryWriteCall(self.handle, src, 0);
+            }
+
+            pub fn toOwnedSlice(self: Self, allocator: std.mem.Allocator) module.AllocError![]u8 {
+                const total = try self.byteLength();
+                const out = try allocator.alloc(u8, total);
+                errdefer allocator.free(out);
+                if (total > 0) {
+                    const n = try self.copyTo(out);
+                    if (n != total) return error.JsException;
+                }
+                return out;
+            }
+        };
+
+        pub const Uint8Clamped = enum(u8) { _ };
+
+        fn typedArrayKindForElem(comptime Elem: type) module.BinaryKind {
+            return switch (Elem) {
+                u8 => .uint8_array,
+                i8 => .int8_array,
+                Uint8Clamped => .uint8_clamped_array,
+                u16 => .uint16_array,
+                i16 => .int16_array,
+                u32 => .uint32_array,
+                i32 => .int32_array,
+                u64 => .big_uint64_array,
+                i64 => .big_int64_array,
+                f32 => .float32_array,
+                f64 => .float64_array,
+                else => @compileError("Unsupported TypedArray element type: " ++ @typeName(Elem)),
+            };
+        }
+
+        pub fn TypedArrayKind(comptime Elem: type, comptime kind: module.BinaryKind) type {
+            return extern struct {
+                const Self = @This();
+                pub const Element = Elem;
+                pub const binary_kind = kind;
+                pub const internal_type: util.InternalType = .js_value;
+
+                handle: u32,
+
+                pub const @"undefined": Self = .{ .handle = module.reserved_undefined_handle };
+                pub const @"null": Self = .{ .handle = module.reserved_null_handle };
+
+                pub inline fn ref(self: Self) Ref(module.Object) {
+                    return .{ .handle = self.handle };
+                }
+
+                pub inline fn toRef(self: Self) Ref(module.Object) {
+                    return .{ .handle = self.handle };
+                }
+
+                pub inline fn fromRef(value: anytype) Self {
+                    return .{ .handle = extractHandle(value) };
+                }
+
+                pub inline fn isUndefined(self: Self) bool {
+                    return self.handle == module.reserved_undefined_handle;
+                }
+
+                pub inline fn isNull(self: Self) bool {
+                    return self.handle == module.reserved_null_handle;
+                }
+
+                pub inline fn isNullOrUndefined(self: Self) bool {
+                    return self.handle <= module.reserved_null_handle;
+                }
+
+                pub inline fn isReserved(self: Self) bool {
+                    return self.handle < module.first_dynamic_slot;
+                }
+
+                pub fn clone(self: Self) Self {
+                    return .{ .handle = self.ref().clone().handle };
+                }
+
+                pub fn tryClone(self: Self) module.Error!Self {
+                    return .{ .handle = (try self.ref().tryClone()).handle };
+                }
+
+                pub fn deinit(self: Self) void {
+                    self.ref().deinit();
+                }
+
+                pub fn tryDeinit(self: Self) module.Error!void {
+                    return self.ref().tryDeinit();
+                }
+
+                pub fn eql(self: Self, other: anytype) bool {
+                    return self.ref().eql(other);
+                }
+
+                pub fn tryEql(self: Self, other: anytype) module.Error!bool {
+                    return self.ref().tryEql(other);
+                }
+
+                pub fn init(length: usize) module.Error!Self {
+                    return binaryCreateCall(Self, kind, 0, length, false);
+                }
+
+                pub fn fromSlice(items: []const Elem) module.Error!Self {
+                    const ptr_addr: usize = if (items.len > 0) @intFromPtr(items.ptr) else 0;
+                    return binaryCreateCall(Self, kind, ptr_addr, items.len, true);
+                }
+
+                pub fn len(self: Self) module.Error!usize {
+                    return binarySizeInfoCall(.element_length, self.handle);
+                }
+
+                pub fn byteLength(self: Self) module.Error!usize {
+                    return binarySizeInfoCall(.byte_length, self.handle);
+                }
+
+                pub fn byteOffset(self: Self) module.Error!usize {
+                    return binarySizeInfoCall(.byte_offset, self.handle);
+                }
+
+                pub fn buffer(self: Self) module.Error!ArrayBuffer {
+                    const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!ArrayBuffer);
+                    return dispatchHostOpRawFlags(
+                        .collection_op,
+                        @intFromEnum(module.CollectionSubOp.binary_get_buffer),
+                        "",
+                        HostFn,
+                        .{.{ .handle = self.handle }},
+                    );
+                }
+
+                pub fn get(self: Self, index: usize) module.Error!Elem {
+                    const WireElem = if (Elem == Uint8Clamped) u8 else Elem;
+                    const HostFn = buildFnType(&.{ Ref(module.Any), usize }, module.Error!WireElem);
+                    const raw = try dispatchHostOpRawFlags(
+                        .collection_op,
+                        @intFromEnum(module.CollectionSubOp.typed_array_get),
+                        "",
+                        HostFn,
+                        .{ .{ .handle = self.handle }, index },
+                    );
+                    return if (Elem == Uint8Clamped) @enumFromInt(raw) else raw;
+                }
+
+                pub fn set(self: Self, index: usize, value: Elem) module.Error!void {
+                    const WireElem = if (Elem == Uint8Clamped) u8 else Elem;
+                    const wire_val: WireElem = if (Elem == Uint8Clamped) @intFromEnum(value) else value;
+                    const HostFn = buildFnType(&.{ Ref(module.Any), usize, WireElem }, module.Error!void);
+                    return dispatchHostOpRawFlags(
+                        .collection_op,
+                        @intFromEnum(module.CollectionSubOp.typed_array_set),
+                        "",
+                        HostFn,
+                        .{ .{ .handle = self.handle }, index, wire_val },
+                    );
+                }
+
+                pub fn copyTo(self: Self, dest: []Elem) module.Error!usize {
+                    _ = try self.len();
+                    const dest_bytes: []u8 = std.mem.sliceAsBytes(dest);
+                    const copied_bytes = try binaryReadCall(self.handle, dest_bytes, 0);
+                    return copied_bytes / @sizeOf(Elem);
+                }
+
+                pub fn writeFrom(self: Self, src: []const Elem) module.Error!void {
+                    _ = try self.len();
+                    const src_bytes: []const u8 = std.mem.sliceAsBytes(src);
+                    return binaryWriteCall(self.handle, src_bytes, 0);
+                }
+
+                pub fn toOwnedSlice(self: Self, allocator: std.mem.Allocator) module.AllocError![]Elem {
+                    const count = try self.len();
+                    const out = try allocator.alloc(Elem, count);
+                    errdefer allocator.free(out);
+                    if (count > 0) {
+                        const dest_bytes: []u8 = std.mem.sliceAsBytes(out);
+                        const copied_bytes = try binaryReadCall(self.handle, dest_bytes, 0);
+                        if (copied_bytes != count * @sizeOf(Elem)) return error.JsException;
+                    }
+                    return out;
+                }
+            };
+        }
+
+        pub fn TypedArray(comptime Elem: type) type {
+            const ActualElem = if (Elem == Uint8Clamped) u8 else Elem;
+            return TypedArrayKind(ActualElem, typedArrayKindForElem(Elem));
+        }
+
+        pub const Uint8Array = TypedArray(u8);
+        pub const Int8Array = TypedArray(i8);
+        pub const Uint8ClampedArray = TypedArrayKind(u8, .uint8_clamped_array);
+        pub const Uint16Array = TypedArray(u16);
+        pub const Int16Array = TypedArray(i16);
+        pub const Uint32Array = TypedArray(u32);
+        pub const Int32Array = TypedArray(i32);
+        pub const BigUint64Array = TypedArray(u64);
+        pub const BigInt64Array = TypedArray(i64);
+        pub const Float32Array = TypedArray(f32);
+        pub const Float64Array = TypedArray(f64);
+
+        pub const Buffer = extern struct {
+            const Self = @This();
+            pub const internal_type: util.InternalType = .js_value;
+
+            handle: u32,
+
+            pub const @"undefined": Self = .{ .handle = module.reserved_undefined_handle };
+            pub const @"null": Self = .{ .handle = module.reserved_null_handle };
+
+            pub inline fn ref(self: Self) Ref(module.Object) {
+                return .{ .handle = self.handle };
+            }
+
+            pub inline fn toRef(self: Self) Ref(module.Object) {
+                return .{ .handle = self.handle };
+            }
+
+            pub inline fn fromRef(value: anytype) Self {
+                return .{ .handle = extractHandle(value) };
+            }
+
+            pub inline fn isUndefined(self: Self) bool {
+                return self.handle == module.reserved_undefined_handle;
+            }
+
+            pub inline fn isNull(self: Self) bool {
+                return self.handle == module.reserved_null_handle;
+            }
+
+            pub inline fn isNullOrUndefined(self: Self) bool {
+                return self.handle <= module.reserved_null_handle;
+            }
+
+            pub inline fn isReserved(self: Self) bool {
+                return self.handle < module.first_dynamic_slot;
+            }
+
+            pub fn clone(self: Self) Self {
+                return .{ .handle = self.ref().clone().handle };
+            }
+
+            pub fn tryClone(self: Self) module.Error!Self {
+                return .{ .handle = (try self.ref().tryClone()).handle };
+            }
+
+            pub fn deinit(self: Self) void {
+                self.ref().deinit();
+            }
+
+            pub fn tryDeinit(self: Self) module.Error!void {
+                return self.ref().tryDeinit();
+            }
+
+            pub fn eql(self: Self, other: anytype) bool {
+                return self.ref().eql(other);
+            }
+
+            pub fn tryEql(self: Self, other: anytype) module.Error!bool {
+                return self.ref().tryEql(other);
+            }
+
+            pub fn alloc(size: usize) module.Error!Self {
+                return binaryCreateCall(Self, .buffer, 0, size, false);
+            }
+
+            pub fn fromSlice(bytes: []const u8) module.Error!Self {
+                const ptr_addr: usize = if (bytes.len > 0) @intFromPtr(bytes.ptr) else 0;
+                return binaryCreateCall(Self, .buffer, ptr_addr, bytes.len, true);
+            }
+
+            pub fn fromString(str: []const u8) module.Error!Self {
+                const HostFn = buildFnType(&.{[]const u8}, module.Error!Self);
+                return dispatchHostOpRawFlags(
+                    .collection_op,
+                    @intFromEnum(module.CollectionSubOp.buffer_from_string),
+                    "",
+                    HostFn,
+                    .{str},
+                );
+            }
+
+            pub fn byteLength(self: Self) module.Error!usize {
+                return binarySizeInfoCall(.byte_length, self.handle);
+            }
+
+            pub const len = byteLength;
+
+            pub fn copyTo(self: Self, dest: []u8) module.Error!usize {
+                return binaryReadCall(self.handle, dest, 0);
+            }
+
+            pub fn writeFrom(self: Self, src: []const u8) module.Error!void {
+                return binaryWriteCall(self.handle, src, 0);
+            }
+
+            pub fn toOwnedSlice(self: Self, allocator: std.mem.Allocator) module.AllocError![]u8 {
+                const total = try self.byteLength();
+                const out = try allocator.alloc(u8, total);
+                errdefer allocator.free(out);
+                if (total > 0) {
+                    const n = try self.copyTo(out);
+                    if (n != total) return error.JsException;
+                }
+                return out;
+            }
+
+            pub fn toStringAlloc(self: Self, allocator: std.mem.Allocator) module.AllocError![]u8 {
+                const HostFn = buildFnType(&.{ std.mem.Allocator, Ref(module.Any) }, module.AllocError![]u8);
+                return dispatchHostOpRawFlags(
+                    .collection_op,
+                    @intFromEnum(module.CollectionSubOp.buffer_to_string),
+                    "",
+                    HostFn,
+                    .{ allocator, .{ .handle = self.handle } },
+                );
+            }
+
+            pub fn isBuffer(value: anytype) module.Error!bool {
+                return binaryBoolInfoCall(.is_buffer, extractHandle(value));
+            }
+        };
+
+        pub fn Iterator(comptime T: type) type {
+            return extern struct {
+                const Self = @This();
+                pub const Element = T;
+                pub const internal_type: util.InternalType = .js_value;
+
+                handle: u32,
+
+                pub const @"undefined": Self = .{ .handle = module.reserved_undefined_handle };
+                pub const @"null": Self = .{ .handle = module.reserved_null_handle };
+
+                pub inline fn ref(self: Self) Ref(module.Object) {
+                    return .{ .handle = self.handle };
+                }
+
+                pub inline fn toRef(self: Self) Ref(module.Object) {
+                    return .{ .handle = self.handle };
+                }
+
+                pub inline fn fromRef(value: anytype) Self {
+                    return .{ .handle = extractHandle(value) };
+                }
+
+                pub inline fn isUndefined(self: Self) bool {
+                    return self.handle == module.reserved_undefined_handle;
+                }
+
+                pub inline fn isNull(self: Self) bool {
+                    return self.handle == module.reserved_null_handle;
+                }
+
+                pub inline fn isNullOrUndefined(self: Self) bool {
+                    return self.handle <= module.reserved_null_handle;
+                }
+
+                pub inline fn isReserved(self: Self) bool {
+                    return self.handle < module.first_dynamic_slot;
+                }
+
+                pub fn clone(self: Self) Self {
+                    return .{ .handle = self.ref().clone().handle };
+                }
+
+                pub fn tryClone(self: Self) module.Error!Self {
+                    return .{ .handle = (try self.ref().tryClone()).handle };
+                }
+
+                pub fn deinit(self: Self) void {
+                    self.ref().deinit();
+                }
+
+                pub fn tryDeinit(self: Self) module.Error!void {
+                    return self.ref().tryDeinit();
+                }
+
+                pub fn eql(self: Self, other: anytype) bool {
+                    return self.ref().eql(other);
+                }
+
+                pub fn tryEql(self: Self, other: anytype) module.Error!bool {
+                    return self.ref().tryEql(other);
+                }
+
+                pub fn from(iterable: anytype) module.Error!Self {
+                    const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!Self);
+                    return dispatchHostOpRawFlags(.get_iterator, 0, "", HostFn, .{.{ .handle = extractHandle(iterable) }});
+                }
+
+                pub fn next(self: Self) module.Error!?T {
+                    var done_flag: u8 = 0;
+                    return dispatchHostOpOptionalFlag(
+                        .iterator_next,
+                        0,
+                        T,
+                        module.Error,
+                        &.{ Ref(module.Any), usize },
+                        .{ .{ .handle = self.handle }, @intFromPtr(&done_flag) },
+                        &done_flag,
+                    );
+                }
+
+                pub fn nextAlloc(self: Self, allocator: std.mem.Allocator) module.AllocError!?T {
+                    var done_flag: u8 = 0;
+                    return dispatchHostOpOptionalFlag(
+                        .iterator_next,
+                        0,
+                        T,
+                        module.AllocError,
+                        &.{ std.mem.Allocator, Ref(module.Any), usize },
+                        .{ allocator, .{ .handle = self.handle }, @intFromPtr(&done_flag) },
+                        &done_flag,
+                    );
+                }
+
+                pub fn returnEarly(self: Self) module.Error!void {
+                    const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!void);
+                    return dispatchHostOpRawFlags(.iterator_return, 0, "", HostFn, .{.{ .handle = self.handle }});
+                }
+
+                pub const close = returnEarly;
+            };
+        }
+
+        pub fn AsyncIterator(comptime T: type) type {
+            return extern struct {
+                const Self = @This();
+                pub const Element = T;
+                pub const internal_type: util.InternalType = .js_value;
+
+                handle: u32,
+
+                pub const @"undefined": Self = .{ .handle = module.reserved_undefined_handle };
+                pub const @"null": Self = .{ .handle = module.reserved_null_handle };
+
+                pub inline fn ref(self: Self) Ref(module.Object) {
+                    return .{ .handle = self.handle };
+                }
+
+                pub inline fn toRef(self: Self) Ref(module.Object) {
+                    return .{ .handle = self.handle };
+                }
+
+                pub inline fn fromRef(value: anytype) Self {
+                    return .{ .handle = extractHandle(value) };
+                }
+
+                pub inline fn isUndefined(self: Self) bool {
+                    return self.handle == module.reserved_undefined_handle;
+                }
+
+                pub inline fn isNull(self: Self) bool {
+                    return self.handle == module.reserved_null_handle;
+                }
+
+                pub inline fn isNullOrUndefined(self: Self) bool {
+                    return self.handle <= module.reserved_null_handle;
+                }
+
+                pub inline fn isReserved(self: Self) bool {
+                    return self.handle < module.first_dynamic_slot;
+                }
+
+                pub fn clone(self: Self) Self {
+                    return .{ .handle = self.ref().clone().handle };
+                }
+
+                pub fn tryClone(self: Self) module.Error!Self {
+                    return .{ .handle = (try self.ref().tryClone()).handle };
+                }
+
+                pub fn deinit(self: Self) void {
+                    self.ref().deinit();
+                }
+
+                pub fn tryDeinit(self: Self) module.Error!void {
+                    return self.ref().tryDeinit();
+                }
+
+                pub fn eql(self: Self, other: anytype) bool {
+                    return self.ref().eql(other);
+                }
+
+                pub fn tryEql(self: Self, other: anytype) module.Error!bool {
+                    return self.ref().tryEql(other);
+                }
+
+                pub fn from(async_iterable: anytype) module.Error!Self {
+                    const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!Self);
+                    return dispatchHostOpRawFlags(.get_iterator, 1, "", HostFn, .{.{ .handle = extractHandle(async_iterable) }});
+                }
+
+                pub fn next(self: Self) module.Error!?T {
+                    var done_flag: u8 = 0;
+                    return dispatchAwaitOp(.async_iterator_next, T, false, self.handle, {}, &done_flag);
+                }
+
+                pub fn nextAlloc(self: Self, allocator: std.mem.Allocator) module.AllocError!?T {
+                    var done_flag: u8 = 0;
+                    return dispatchAwaitOp(.async_iterator_next, T, true, self.handle, allocator, &done_flag);
+                }
+
+                pub fn returnEarly(self: Self) module.Error!void {
+                    return dispatchAwaitOp(.async_iterator_return, void, false, self.handle, {}, null);
+                }
+
+                pub const close = returnEarly;
+            };
+        }
+
+        pub fn Array(comptime T: type) type {
+            return extern struct {
+                const Self = @This();
+                pub const Element = T;
+                pub const internal_type: util.InternalType = .js_value;
+
+                handle: u32,
+
+                pub const @"undefined": Self = .{ .handle = module.reserved_undefined_handle };
+                pub const @"null": Self = .{ .handle = module.reserved_null_handle };
+
+                pub inline fn ref(self: Self) Ref(module.Object) {
+                    return .{ .handle = self.handle };
+                }
+
+                pub inline fn toRef(self: Self) Ref(module.Object) {
+                    return .{ .handle = self.handle };
+                }
+
+                pub inline fn fromRef(value: anytype) Self {
+                    return .{ .handle = extractHandle(value) };
+                }
+
+                pub inline fn isUndefined(self: Self) bool {
+                    return self.handle == module.reserved_undefined_handle;
+                }
+
+                pub inline fn isNull(self: Self) bool {
+                    return self.handle == module.reserved_null_handle;
+                }
+
+                pub inline fn isNullOrUndefined(self: Self) bool {
+                    return self.handle <= module.reserved_null_handle;
+                }
+
+                pub inline fn isReserved(self: Self) bool {
+                    return self.handle < module.first_dynamic_slot;
+                }
+
+                pub fn clone(self: Self) Self {
+                    return .{ .handle = self.ref().clone().handle };
+                }
+
+                pub fn tryClone(self: Self) module.Error!Self {
+                    return .{ .handle = (try self.ref().tryClone()).handle };
+                }
+
+                pub fn deinit(self: Self) void {
+                    self.ref().deinit();
+                }
+
+                pub fn tryDeinit(self: Self) module.Error!void {
+                    return self.ref().tryDeinit();
+                }
+
+                pub fn eql(self: Self, other: anytype) bool {
+                    return self.ref().eql(other);
+                }
+
+                pub fn tryEql(self: Self, other: anytype) module.Error!bool {
+                    return self.ref().tryEql(other);
+                }
+
+                pub fn init() module.Error!Self {
+                    const HostFn = buildFnType(&.{}, module.Error!Self);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.array_init), "", HostFn, .{});
+                }
+
+                pub fn withCapacity(capacity: usize) module.Error!Self {
+                    const HostFn = buildFnType(&.{usize}, module.Error!Self);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.array_with_capacity), "", HostFn, .{capacity});
+                }
+
+                pub fn fromSlice(items: []const T) module.Error!Self {
+                    const arr = try Self.withCapacity(items.len);
+                    errdefer arr.deinit();
+                    for (items, 0..) |item, idx| {
+                        try arr.set(idx, item);
+                    }
+                    return arr;
+                }
+
+                pub fn isArray(value: anytype) module.Error!bool {
+                    return binaryBoolInfoCall(.is_array, extractHandle(value));
+                }
+
+                pub fn len(self: Self) module.Error!usize {
+                    const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!usize);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.array_len), "", HostFn, .{.{ .handle = self.handle }});
+                }
+
+                pub fn get(self: Self, index: usize) module.Error!T {
+                    const HostFn = buildFnType(&.{ Ref(module.Any), usize }, module.Error!T);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.array_get), "", HostFn, .{ .{ .handle = self.handle }, index });
+                }
+
+                pub fn getAlloc(self: Self, allocator: std.mem.Allocator, index: usize) module.AllocError!T {
+                    const HostFn = buildFnType(&.{ std.mem.Allocator, Ref(module.Any), usize }, module.AllocError!T);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.array_get), "", HostFn, .{ allocator, .{ .handle = self.handle }, index });
+                }
+
+                pub fn set(self: Self, index: usize, value: T) module.Error!void {
+                    const HostFn = buildFnType(&.{ Ref(module.Any), usize, T }, module.Error!void);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.array_set), "", HostFn, .{ .{ .handle = self.handle }, index, value });
+                }
+
+                pub fn push(self: Self, value: T) module.Error!usize {
+                    const HostFn = buildFnType(&.{ Ref(module.Any), T }, module.Error!usize);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.array_push), "", HostFn, .{ .{ .handle = self.handle }, value });
+                }
+
+                pub fn pop(self: Self) module.Error!?T {
+                    var empty_flag: u8 = 0;
+                    return dispatchHostOpOptionalFlag(
+                        .collection_op,
+                        @intFromEnum(module.CollectionSubOp.array_pop),
+                        T,
+                        module.Error,
+                        &.{ Ref(module.Any), usize },
+                        .{ .{ .handle = self.handle }, @intFromPtr(&empty_flag) },
+                        &empty_flag,
+                    );
+                }
+
+                pub fn popAlloc(self: Self, allocator: std.mem.Allocator) module.AllocError!?T {
+                    var empty_flag: u8 = 0;
+                    return dispatchHostOpOptionalFlag(
+                        .collection_op,
+                        @intFromEnum(module.CollectionSubOp.array_pop),
+                        T,
+                        module.AllocError,
+                        &.{ std.mem.Allocator, Ref(module.Any), usize },
+                        .{ allocator, .{ .handle = self.handle }, @intFromPtr(&empty_flag) },
+                        &empty_flag,
+                    );
+                }
+
+                pub fn toOwnedSlice(self: Self, allocator: std.mem.Allocator) module.AllocError![]T {
+                    const count = try self.len();
+                    const buf = try allocator.alloc(T, count);
+                    var initialized: usize = 0;
+                    errdefer {
+                        for (buf[0..initialized]) |elem| {
+                            deinitOwnedElement(T, allocator, elem);
+                        }
+                        allocator.free(buf);
+                    }
+                    while (initialized < count) : (initialized += 1) {
+                        buf[initialized] = if (comptime needsAllocatorForRead(T))
+                            try self.getAlloc(allocator, initialized)
+                        else
+                            try self.get(initialized);
+                    }
+                    return buf;
+                }
+
+                pub fn iterator(self: Self) module.Error!Iterator(T) {
+                    return Iterator(T).from(self);
+                }
+            };
+        }
+
+        pub fn Map(comptime K: type, comptime V: type) type {
+            return extern struct {
+                const Self = @This();
+                pub const Key = K;
+                pub const Value = V;
+                pub const Entry = struct { K, V };
+                pub const internal_type: util.InternalType = .js_value;
+
+                handle: u32,
+
+                pub const @"undefined": Self = .{ .handle = module.reserved_undefined_handle };
+                pub const @"null": Self = .{ .handle = module.reserved_null_handle };
+
+                pub inline fn ref(self: Self) Ref(module.Object) {
+                    return .{ .handle = self.handle };
+                }
+
+                pub inline fn toRef(self: Self) Ref(module.Object) {
+                    return .{ .handle = self.handle };
+                }
+
+                pub inline fn fromRef(value: anytype) Self {
+                    return .{ .handle = extractHandle(value) };
+                }
+
+                pub inline fn isUndefined(self: Self) bool {
+                    return self.handle == module.reserved_undefined_handle;
+                }
+
+                pub inline fn isNull(self: Self) bool {
+                    return self.handle == module.reserved_null_handle;
+                }
+
+                pub inline fn isNullOrUndefined(self: Self) bool {
+                    return self.handle <= module.reserved_null_handle;
+                }
+
+                pub inline fn isReserved(self: Self) bool {
+                    return self.handle < module.first_dynamic_slot;
+                }
+
+                pub fn clone(self: Self) Self {
+                    return .{ .handle = self.ref().clone().handle };
+                }
+
+                pub fn tryClone(self: Self) module.Error!Self {
+                    return .{ .handle = (try self.ref().tryClone()).handle };
+                }
+
+                pub fn deinit(self: Self) void {
+                    self.ref().deinit();
+                }
+
+                pub fn tryDeinit(self: Self) module.Error!void {
+                    return self.ref().tryDeinit();
+                }
+
+                pub fn eql(self: Self, other: anytype) bool {
+                    return self.ref().eql(other);
+                }
+
+                pub fn tryEql(self: Self, other: anytype) module.Error!bool {
+                    return self.ref().tryEql(other);
+                }
+
+                pub fn init() module.Error!Self {
+                    const HostFn = buildFnType(&.{}, module.Error!Self);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.map_init), "", HostFn, .{});
+                }
+
+                pub fn size(self: Self) module.Error!usize {
+                    const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!usize);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.map_size), "", HostFn, .{.{ .handle = self.handle }});
+                }
+
+                pub fn get(self: Self, key: K) module.Error!?V {
+                    var missing_flag: u8 = 0;
+                    return dispatchHostOpOptionalFlag(
+                        .collection_op,
+                        @intFromEnum(module.CollectionSubOp.map_get),
+                        V,
+                        module.Error,
+                        &.{ Ref(module.Any), K, usize },
+                        .{ .{ .handle = self.handle }, key, @intFromPtr(&missing_flag) },
+                        &missing_flag,
+                    );
+                }
+
+                pub fn getAlloc(self: Self, allocator: std.mem.Allocator, key: K) module.AllocError!?V {
+                    var missing_flag: u8 = 0;
+                    return dispatchHostOpOptionalFlag(
+                        .collection_op,
+                        @intFromEnum(module.CollectionSubOp.map_get),
+                        V,
+                        module.AllocError,
+                        &.{ std.mem.Allocator, Ref(module.Any), K, usize },
+                        .{ allocator, .{ .handle = self.handle }, key, @intFromPtr(&missing_flag) },
+                        &missing_flag,
+                    );
+                }
+
+                pub fn set(self: Self, key: K, value: V) module.Error!void {
+                    const HostFn = buildFnType(&.{ Ref(module.Any), K, V }, module.Error!void);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.map_set), "", HostFn, .{ .{ .handle = self.handle }, key, value });
+                }
+
+                pub fn has(self: Self, key: K) module.Error!bool {
+                    const HostFn = buildFnType(&.{ Ref(module.Any), K }, module.Error!bool);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.map_has), "", HostFn, .{ .{ .handle = self.handle }, key });
+                }
+
+                pub fn delete(self: Self, key: K) module.Error!bool {
+                    const HostFn = buildFnType(&.{ Ref(module.Any), K }, module.Error!bool);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.map_delete), "", HostFn, .{ .{ .handle = self.handle }, key });
+                }
+
+                pub fn clear(self: Self) module.Error!void {
+                    const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!void);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.map_clear), "", HostFn, .{.{ .handle = self.handle }});
+                }
+
+                pub fn keys(self: Self) module.Error!Iterator(K) {
+                    const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!Iterator(K));
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.map_keys), "", HostFn, .{.{ .handle = self.handle }});
+                }
+
+                pub fn values(self: Self) module.Error!Iterator(V) {
+                    const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!Iterator(V));
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.map_values), "", HostFn, .{.{ .handle = self.handle }});
+                }
+
+                pub fn entries(self: Self) module.Error!Iterator(Entry) {
+                    const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!Iterator(Entry));
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.map_entries), "", HostFn, .{.{ .handle = self.handle }});
+                }
+            };
+        }
+
+        pub fn Set(comptime T: type) type {
+            return extern struct {
+                const Self = @This();
+                pub const Element = T;
+                pub const internal_type: util.InternalType = .js_value;
+
+                handle: u32,
+
+                pub const @"undefined": Self = .{ .handle = module.reserved_undefined_handle };
+                pub const @"null": Self = .{ .handle = module.reserved_null_handle };
+
+                pub inline fn ref(self: Self) Ref(module.Object) {
+                    return .{ .handle = self.handle };
+                }
+
+                pub inline fn toRef(self: Self) Ref(module.Object) {
+                    return .{ .handle = self.handle };
+                }
+
+                pub inline fn fromRef(value: anytype) Self {
+                    return .{ .handle = extractHandle(value) };
+                }
+
+                pub inline fn isUndefined(self: Self) bool {
+                    return self.handle == module.reserved_undefined_handle;
+                }
+
+                pub inline fn isNull(self: Self) bool {
+                    return self.handle == module.reserved_null_handle;
+                }
+
+                pub inline fn isNullOrUndefined(self: Self) bool {
+                    return self.handle <= module.reserved_null_handle;
+                }
+
+                pub inline fn isReserved(self: Self) bool {
+                    return self.handle < module.first_dynamic_slot;
+                }
+
+                pub fn clone(self: Self) Self {
+                    return .{ .handle = self.ref().clone().handle };
+                }
+
+                pub fn tryClone(self: Self) module.Error!Self {
+                    return .{ .handle = (try self.ref().tryClone()).handle };
+                }
+
+                pub fn deinit(self: Self) void {
+                    self.ref().deinit();
+                }
+
+                pub fn tryDeinit(self: Self) module.Error!void {
+                    return self.ref().tryDeinit();
+                }
+
+                pub fn eql(self: Self, other: anytype) bool {
+                    return self.ref().eql(other);
+                }
+
+                pub fn tryEql(self: Self, other: anytype) module.Error!bool {
+                    return self.ref().tryEql(other);
+                }
+
+                pub fn init() module.Error!Self {
+                    const HostFn = buildFnType(&.{}, module.Error!Self);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.set_init), "", HostFn, .{});
+                }
+
+                pub fn size(self: Self) module.Error!usize {
+                    const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!usize);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.set_size), "", HostFn, .{.{ .handle = self.handle }});
+                }
+
+                pub fn add(self: Self, value: T) module.Error!void {
+                    const HostFn = buildFnType(&.{ Ref(module.Any), T }, module.Error!void);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.set_add), "", HostFn, .{ .{ .handle = self.handle }, value });
+                }
+
+                pub fn has(self: Self, value: T) module.Error!bool {
+                    const HostFn = buildFnType(&.{ Ref(module.Any), T }, module.Error!bool);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.set_has), "", HostFn, .{ .{ .handle = self.handle }, value });
+                }
+
+                pub fn delete(self: Self, value: T) module.Error!bool {
+                    const HostFn = buildFnType(&.{ Ref(module.Any), T }, module.Error!bool);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.set_delete), "", HostFn, .{ .{ .handle = self.handle }, value });
+                }
+
+                pub fn clear(self: Self) module.Error!void {
+                    const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!void);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.set_clear), "", HostFn, .{.{ .handle = self.handle }});
+                }
+
+                pub fn values(self: Self) module.Error!Iterator(T) {
+                    const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!Iterator(T));
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.set_values), "", HostFn, .{.{ .handle = self.handle }});
+                }
+
+                pub const iterator = values;
+            };
+        }
+
+        pub fn Record(comptime K: type, comptime V: type) type {
+            return extern struct {
+                const Self = @This();
+                pub const Key = K;
+                pub const Value = V;
+                pub const internal_type: util.InternalType = .js_value;
+
+                handle: u32,
+
+                pub const @"undefined": Self = .{ .handle = module.reserved_undefined_handle };
+                pub const @"null": Self = .{ .handle = module.reserved_null_handle };
+
+                pub inline fn ref(self: Self) Ref(module.Object) {
+                    return .{ .handle = self.handle };
+                }
+
+                pub inline fn toRef(self: Self) Ref(module.Object) {
+                    return .{ .handle = self.handle };
+                }
+
+                pub inline fn fromRef(value: anytype) Self {
+                    return .{ .handle = extractHandle(value) };
+                }
+
+                pub inline fn isUndefined(self: Self) bool {
+                    return self.handle == module.reserved_undefined_handle;
+                }
+
+                pub inline fn isNull(self: Self) bool {
+                    return self.handle == module.reserved_null_handle;
+                }
+
+                pub inline fn isNullOrUndefined(self: Self) bool {
+                    return self.handle <= module.reserved_null_handle;
+                }
+
+                pub inline fn isReserved(self: Self) bool {
+                    return self.handle < module.first_dynamic_slot;
+                }
+
+                pub fn clone(self: Self) Self {
+                    return .{ .handle = self.ref().clone().handle };
+                }
+
+                pub fn tryClone(self: Self) module.Error!Self {
+                    return .{ .handle = (try self.ref().tryClone()).handle };
+                }
+
+                pub fn deinit(self: Self) void {
+                    self.ref().deinit();
+                }
+
+                pub fn tryDeinit(self: Self) module.Error!void {
+                    return self.ref().tryDeinit();
+                }
+
+                pub fn eql(self: Self, other: anytype) bool {
+                    return self.ref().eql(other);
+                }
+
+                pub fn tryEql(self: Self, other: anytype) module.Error!bool {
+                    return self.ref().tryEql(other);
+                }
+
+                pub fn init() module.Error!Self {
+                    const HostFn = buildFnType(&.{}, module.Error!Self);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.record_init), "", HostFn, .{});
+                }
+
+                pub fn get(self: Self, key: K) module.Error!?V {
+                    var missing_flag: u8 = 0;
+                    return dispatchHostOpOptionalFlag(
+                        .collection_op,
+                        @intFromEnum(module.CollectionSubOp.record_get),
+                        V,
+                        module.Error,
+                        &.{ Ref(module.Any), K, usize },
+                        .{ .{ .handle = self.handle }, key, @intFromPtr(&missing_flag) },
+                        &missing_flag,
+                    );
+                }
+
+                pub fn getAlloc(self: Self, allocator: std.mem.Allocator, key: K) module.AllocError!?V {
+                    var missing_flag: u8 = 0;
+                    return dispatchHostOpOptionalFlag(
+                        .collection_op,
+                        @intFromEnum(module.CollectionSubOp.record_get),
+                        V,
+                        module.AllocError,
+                        &.{ std.mem.Allocator, Ref(module.Any), K, usize },
+                        .{ allocator, .{ .handle = self.handle }, key, @intFromPtr(&missing_flag) },
+                        &missing_flag,
+                    );
+                }
+
+                pub fn set(self: Self, key: K, value: V) module.Error!void {
+                    const HostFn = buildFnType(&.{ Ref(module.Any), K, V }, module.Error!void);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.record_set), "", HostFn, .{ .{ .handle = self.handle }, key, value });
+                }
+
+                pub fn has(self: Self, key: K) module.Error!bool {
+                    const HostFn = buildFnType(&.{ Ref(module.Any), K }, module.Error!bool);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.record_has), "", HostFn, .{ .{ .handle = self.handle }, key });
+                }
+
+                pub fn delete(self: Self, key: K) module.Error!bool {
+                    const HostFn = buildFnType(&.{ Ref(module.Any), K }, module.Error!bool);
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.record_delete), "", HostFn, .{ .{ .handle = self.handle }, key });
+                }
+
+                pub fn keys(self: Self) module.Error!Array([]const u8) {
+                    const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!Array([]const u8));
+                    return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.record_keys), "", HostFn, .{.{ .handle = self.handle }});
+                }
+
+                pub fn keysAlloc(self: Self, allocator: std.mem.Allocator) module.AllocError![][]u8 {
+                    const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!Array([]u8));
+                    const key_arr = try dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.record_keys), "", HostFn, .{.{ .handle = self.handle }});
+                    defer key_arr.deinit();
+                    return key_arr.toOwnedSlice(allocator);
+                }
+            };
+        }
+
+        pub const BigInt = extern struct {
+            const Self = @This();
+            pub const internal_type: util.InternalType = .js_value;
+
+            handle: u32,
+
+            pub const @"undefined": Self = .{ .handle = module.reserved_undefined_handle };
+            pub const @"null": Self = .{ .handle = module.reserved_null_handle };
+
+            pub inline fn ref(self: Self) Ref(module.Any) {
+                return .{ .handle = self.handle };
+            }
+
+            pub inline fn toRef(self: Self) Ref(module.Any) {
+                return .{ .handle = self.handle };
+            }
+
+            pub inline fn fromRef(value: anytype) Self {
+                return .{ .handle = extractHandle(value) };
+            }
+
+            pub inline fn isUndefined(self: Self) bool {
+                return self.handle == module.reserved_undefined_handle;
+            }
+
+            pub inline fn isNull(self: Self) bool {
+                return self.handle == module.reserved_null_handle;
+            }
+
+            pub inline fn isNullOrUndefined(self: Self) bool {
+                return self.handle <= module.reserved_null_handle;
+            }
+
+            pub inline fn isReserved(self: Self) bool {
+                return self.handle < module.first_dynamic_slot;
+            }
+
+            pub fn clone(self: Self) Self {
+                return .{ .handle = self.ref().clone().handle };
+            }
+
+            pub fn tryClone(self: Self) module.Error!Self {
+                return .{ .handle = (try self.ref().tryClone()).handle };
+            }
+
+            pub fn deinit(self: Self) void {
+                self.ref().deinit();
+            }
+
+            pub fn tryDeinit(self: Self) module.Error!void {
+                return self.ref().tryDeinit();
+            }
+
+            pub fn eql(self: Self, other: anytype) bool {
+                return self.ref().eql(other);
+            }
+
+            pub fn tryEql(self: Self, other: anytype) module.Error!bool {
+                return self.ref().tryEql(other);
+            }
+
+            pub fn fromU64(v: u64) module.Error!Self {
+                const HostFn = buildFnType(&.{ bool, u64, u64 }, module.Error!Self);
+                return dispatchHostOpRawFlags(.bigint_from_words, 0, "", HostFn, .{ false, v, 0 });
+            }
+
+            pub fn fromI64(v: i64) module.Error!Self {
+                const mag: u64 = @abs(v);
+                const HostFn = buildFnType(&.{ bool, u64, u64 }, module.Error!Self);
+                return dispatchHostOpRawFlags(.bigint_from_words, 0, "", HostFn, .{ v < 0, mag, 0 });
+            }
+
+            pub fn fromU128(v: u128) module.Error!Self {
+                const lo: u64 = @truncate(v);
+                const hi: u64 = @truncate(v >> 64);
+                const HostFn = buildFnType(&.{ bool, u64, u64 }, module.Error!Self);
+                return dispatchHostOpRawFlags(.bigint_from_words, 0, "", HostFn, .{ false, lo, hi });
+            }
+
+            pub fn fromI128(v: i128) module.Error!Self {
+                const mag: u128 = @abs(v);
+                const lo: u64 = @truncate(mag);
+                const hi: u64 = @truncate(mag >> 64);
+                const HostFn = buildFnType(&.{ bool, u64, u64 }, module.Error!Self);
+                return dispatchHostOpRawFlags(.bigint_from_words, 0, "", HostFn, .{ v < 0, lo, hi });
+            }
+
+            pub fn fromString(s: []const u8) module.Error!Self {
+                const HostFn = buildFnType(&.{[]const u8}, module.Error!Self);
+                return dispatchHostOpRawFlags(.bigint_from_string, 0, "", HostFn, .{s});
+            }
+
+            fn extractWords(self: Self, comptime bit_width: u32, comptime is_signed: bool) module.OverflowError![2]u64 {
+                var words: [2]u64 = .{ 0, 0 };
+                const HostFn = buildFnType(&.{ Ref(module.Any), u32, bool, usize }, module.Error!u32);
+                const status_code = try dispatchHostOpRawFlags(
+                    .bigint_to_words,
+                    0,
+                    "",
+                    HostFn,
+                    .{ .{ .handle = self.handle }, bit_width, is_signed, @intFromPtr(&words) },
+                );
+                if (status_code != 0) return error.Overflow;
+                return words;
+            }
+
+            pub fn toI64(self: Self) module.OverflowError!i64 {
+                const words = try self.extractWords(64, true);
+                return @bitCast(words[0]);
+            }
+
+            pub fn toU64(self: Self) module.OverflowError!u64 {
+                const words = try self.extractWords(64, false);
+                return words[0];
+            }
+
+            pub fn toI128(self: Self) module.OverflowError!i128 {
+                const words = try self.extractWords(128, true);
+                const combined: u128 = (@as(u128, words[1]) << 64) | @as(u128, words[0]);
+                return @bitCast(combined);
+            }
+
+            pub fn toU128(self: Self) module.OverflowError!u128 {
+                const words = try self.extractWords(128, false);
+                return (@as(u128, words[1]) << 64) | @as(u128, words[0]);
+            }
+
+            pub fn toStringAlloc(self: Self, allocator: std.mem.Allocator, radix: u8) module.AllocError![]u8 {
+                const HostFn = buildFnType(&.{ std.mem.Allocator, Ref(module.Any), u32 }, module.AllocError![]u8);
+                return dispatchHostOpRawFlags(
+                    .bigint_to_string,
+                    0,
+                    "",
+                    HostFn,
+                    .{ allocator, .{ .handle = self.handle }, @as(u32, radix) },
+                );
+            }
+        };
+
+        pub const Date = extern struct {
+            const Self = @This();
+            pub const internal_type: util.InternalType = .js_value;
+
+            handle: u32,
+
+            pub const @"undefined": Self = .{ .handle = module.reserved_undefined_handle };
+            pub const @"null": Self = .{ .handle = module.reserved_null_handle };
+
+            pub inline fn ref(self: Self) Ref(module.Object) {
+                return .{ .handle = self.handle };
+            }
+
+            pub inline fn toRef(self: Self) Ref(module.Object) {
+                return .{ .handle = self.handle };
+            }
+
+            pub inline fn fromRef(value: anytype) Self {
+                return .{ .handle = extractHandle(value) };
+            }
+
+            pub inline fn isUndefined(self: Self) bool {
+                return self.handle == module.reserved_undefined_handle;
+            }
+
+            pub inline fn isNull(self: Self) bool {
+                return self.handle == module.reserved_null_handle;
+            }
+
+            pub inline fn isNullOrUndefined(self: Self) bool {
+                return self.handle <= module.reserved_null_handle;
+            }
+
+            pub inline fn isReserved(self: Self) bool {
+                return self.handle < module.first_dynamic_slot;
+            }
+
+            pub fn clone(self: Self) Self {
+                return .{ .handle = self.ref().clone().handle };
+            }
+
+            pub fn tryClone(self: Self) module.Error!Self {
+                return .{ .handle = (try self.ref().tryClone()).handle };
+            }
+
+            pub fn deinit(self: Self) void {
+                self.ref().deinit();
+            }
+
+            pub fn tryDeinit(self: Self) module.Error!void {
+                return self.ref().tryDeinit();
+            }
+
+            pub fn eql(self: Self, other: anytype) bool {
+                return self.ref().eql(other);
+            }
+
+            pub fn tryEql(self: Self, other: anytype) module.Error!bool {
+                return self.ref().tryEql(other);
+            }
+
+            pub fn now() module.Error!f64 {
+                const HostFn = buildFnType(&.{}, module.Error!f64);
+                return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.date_now), "", HostFn, .{});
+            }
+
+            pub fn fromTimestampMs(ms: f64) module.Error!Self {
+                const HostFn = buildFnType(&.{f64}, module.Error!Self);
+                return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.date_from_ms), "", HostFn, .{ms});
+            }
+
+            pub fn fromIsoString(s: []const u8) module.Error!Self {
+                const HostFn = buildFnType(&.{[]const u8}, module.Error!Self);
+                return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.date_from_iso), "", HostFn, .{s});
+            }
+
+            pub fn timestampMs(self: Self) module.Error!f64 {
+                const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!f64);
+                return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.date_get_ms), "", HostFn, .{.{ .handle = self.handle }});
+            }
+
+            pub fn toIsoStringAlloc(self: Self, allocator: std.mem.Allocator) module.AllocError![]u8 {
+                const HostFn = buildFnType(&.{ std.mem.Allocator, Ref(module.Any) }, module.AllocError![]u8);
+                return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.date_to_iso), "", HostFn, .{ allocator, .{ .handle = self.handle } });
+            }
+        };
+
+        pub const RegExp = extern struct {
+            const Self = @This();
+            pub const internal_type: util.InternalType = .js_value;
+
+            handle: u32,
+
+            pub const @"undefined": Self = .{ .handle = module.reserved_undefined_handle };
+            pub const @"null": Self = .{ .handle = module.reserved_null_handle };
+
+            pub inline fn ref(self: Self) Ref(module.Object) {
+                return .{ .handle = self.handle };
+            }
+
+            pub inline fn toRef(self: Self) Ref(module.Object) {
+                return .{ .handle = self.handle };
+            }
+
+            pub inline fn fromRef(value: anytype) Self {
+                return .{ .handle = extractHandle(value) };
+            }
+
+            pub inline fn isUndefined(self: Self) bool {
+                return self.handle == module.reserved_undefined_handle;
+            }
+
+            pub inline fn isNull(self: Self) bool {
+                return self.handle == module.reserved_null_handle;
+            }
+
+            pub inline fn isNullOrUndefined(self: Self) bool {
+                return self.handle <= module.reserved_null_handle;
+            }
+
+            pub inline fn isReserved(self: Self) bool {
+                return self.handle < module.first_dynamic_slot;
+            }
+
+            pub fn clone(self: Self) Self {
+                return .{ .handle = self.ref().clone().handle };
+            }
+
+            pub fn tryClone(self: Self) module.Error!Self {
+                return .{ .handle = (try self.ref().tryClone()).handle };
+            }
+
+            pub fn deinit(self: Self) void {
+                self.ref().deinit();
+            }
+
+            pub fn tryDeinit(self: Self) module.Error!void {
+                return self.ref().tryDeinit();
+            }
+
+            pub fn eql(self: Self, other: anytype) bool {
+                return self.ref().eql(other);
+            }
+
+            pub fn tryEql(self: Self, other: anytype) module.Error!bool {
+                return self.ref().tryEql(other);
+            }
+
+            pub fn init(pattern: []const u8, flags: []const u8) module.Error!Self {
+                const HostFn = buildFnType(&.{ []const u8, []const u8 }, module.Error!Self);
+                return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.regexp_init), "", HostFn, .{ pattern, flags });
+            }
+
+            pub fn testMatch(self: Self, input: []const u8) module.Error!bool {
+                const HostFn = buildFnType(&.{ Ref(module.Any), []const u8 }, module.Error!bool);
+                return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.regexp_test), "", HostFn, .{ .{ .handle = self.handle }, input });
+            }
+
+            pub const @"test" = testMatch;
+
+            pub fn sourceAlloc(self: Self, allocator: std.mem.Allocator) module.AllocError![]u8 {
+                const HostFn = buildFnType(&.{ std.mem.Allocator, Ref(module.Any) }, module.AllocError![]u8);
+                return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.regexp_source), "", HostFn, .{ allocator, .{ .handle = self.handle } });
+            }
+
+            pub fn flagsAlloc(self: Self, allocator: std.mem.Allocator) module.AllocError![]u8 {
+                const HostFn = buildFnType(&.{ std.mem.Allocator, Ref(module.Any) }, module.AllocError![]u8);
+                return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.regexp_flags), "", HostFn, .{ allocator, .{ .handle = self.handle } });
+            }
+        };
     };
 }
 
@@ -2674,6 +4821,7 @@ test "HostOpDescriptor ABI layout, 9 host operations, Ref helpers, and 160 state
                     _ = f.@"1";
                     f.retval = .{ .handle = allocHandle() };
                 },
+                else => return .FAULT,
             }
             return .SUCCESS;
         }
@@ -3344,3 +5492,552 @@ test "JsException lazy capture, Module exact Error!T preservation, Ref dispose/a
         try expectEqual(@as(u32, 0), LifecycleMockHost.active_callbacks);
     }
 }
+
+test "Standard wrappers: ABI layout, Promise, binary views, collections, BigInt, Date, RegExp, and Iterators" {
+    const WrapperMockHost = struct {
+        const SelfHost = @This();
+        var active_handles: u32 = 0;
+        var next_slot: u32 = 16;
+        var active_callbacks: u32 = 0;
+        var await_unavailable: bool = false;
+        var storage_bytes: [64]u8 = @splat(0);
+        var storage_len: usize = 0;
+        var bigint_negative: bool = false;
+        var bigint_lo: u64 = 0;
+        var bigint_hi: u64 = 0;
+        var bigint_overflow_64: bool = false;
+        var iter_step: u32 = 0;
+        var iter_closed: bool = false;
+        var fail_array_index: ?usize = null;
+
+        fn allocSlot(tag: u32) u32 {
+            active_handles += 1;
+            const gen = next_slot;
+            next_slot += 1;
+            return (gen << 20) | tag;
+        }
+
+        pub fn cloneJsValue(handle: u32) u32 {
+            if (handle <= reserved_global_this_handle) return handle;
+            return allocSlot(handle & 0xFFFFF);
+        }
+
+        pub fn releaseJsValue(handle: u32) void {
+            if (handle >= first_dynamic_slot) {
+                std.debug.assert(active_handles > 0);
+                active_handles -= 1;
+            }
+        }
+
+        pub fn equalJsValue(a: u32, b: u32) bool {
+            return (a & 0xFFFFF) == (b & 0xFFFFF);
+        }
+
+        pub fn getJsValueCount() u32 {
+            return active_handles;
+        }
+
+        pub fn createZigCallback(_: *const anyopaque, _: u32) Error!u32 {
+            active_callbacks += 1;
+            return allocSlot(90);
+        }
+
+        pub fn releaseZigCallback(_: u32) void {
+            active_callbacks -= 1;
+            active_handles -= 1;
+        }
+
+        pub fn awaitJsPromise(
+            handle: u32,
+            mode_raw: u32,
+            _: *const anyopaque,
+            arg_ptr: *anyopaque,
+            _: usize,
+            done_flag_addr: usize,
+        ) E {
+            if (await_unavailable) return .NOSYS;
+            const mode: AwaitMode = @enumFromInt(mode_raw);
+            const tag = handle & 0xFFFFF;
+            switch (mode) {
+                .promise => {
+                    if (tag == 71) {
+                        const Frame = arg_struct.ArgStruct(fn () Error!i32);
+                        const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                        frame.retval = error.JsException;
+                        return .SUCCESS;
+                    }
+                    if (tag == 72) {
+                        const Frame = arg_struct.ArgStruct(fn (std.mem.Allocator) AllocError![]const u8);
+                        const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                        frame.retval = frame.@"0".dupe(u8, "async-text") catch return .FAULT;
+                        return .SUCCESS;
+                    }
+                    if (tag == 73) {
+                        const Frame = arg_struct.ArgStruct(fn () Error!void);
+                        const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                        frame.retval = {};
+                        return .SUCCESS;
+                    }
+                    const Frame = arg_struct.ArgStruct(fn () Error!i32);
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    frame.retval = 1234;
+                    return .SUCCESS;
+                },
+                .async_iterator_next => {
+                    const Frame = arg_struct.ArgStruct(fn () Error!?i32);
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    defer iter_step += 1;
+                    if (iter_step == 0) {
+                        frame.retval = @as(?i32, 77);
+                    } else if (iter_step == 1) {
+                        // Yielding explicit JS `null` while `done == false`!
+                        frame.retval = @as(?i32, null);
+                    } else {
+                        const done_ptr: *u8 = @ptrFromInt(done_flag_addr);
+                        done_ptr.* = 1;
+                    }
+                    return .SUCCESS;
+                },
+                .async_iterator_return => {
+                    iter_closed = true;
+                    const Frame = arg_struct.ArgStruct(fn () Error!void);
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    frame.retval = {};
+                    return .SUCCESS;
+                },
+            }
+        }
+
+        pub fn invokeJsHostOp(desc_ptr: *const anyopaque, arg_ptr: *anyopaque, _: usize) E {
+            const desc: *const HostOpDescriptor = @ptrCast(@alignCast(desc_ptr));
+            const op: HostOp = @enumFromInt(desc.op);
+            const J = Js(SelfHost);
+            switch (op) {
+                .promise_settle => {
+                    if (desc.flags == 2) {
+                        const Frame = arg_struct.ArgStruct(fn () Error!J.Promise(void));
+                        const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                        frame.retval = .{ .handle = allocSlot(73) };
+                    } else if (desc.flags == 1) {
+                        const Frame = arg_struct.ArgStruct(fn ([]const u8) Error!J.Promise(i32));
+                        const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                        frame.retval = .{ .handle = allocSlot(71) };
+                    } else {
+                        const Frame = arg_struct.ArgStruct(fn (i64) Error!J.Promise(i32));
+                        const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                        frame.retval = .{ .handle = allocSlot(70) };
+                    }
+                    return .SUCCESS;
+                },
+                .call_method => {
+                    const key = if (desc.key_ptr) |p| p[0..desc.key_len] else "";
+                    if (std.mem.eql(u8, key, "then")) {
+                        const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), J.Ref(Any), J.Ref(Any)) Error!J.Promise(i32));
+                        const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                        frame.retval = .{ .handle = allocSlot(70) };
+                        return .SUCCESS;
+                    }
+                    return .FAULT;
+                },
+                .binary_create => {
+                    const Frame = arg_struct.ArgStruct(fn (usize, usize, bool) Error!J.Ref(Object));
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    const kind: BinaryKind = @enumFromInt(desc.flags);
+                    const elem_size: usize = switch (kind) {
+                        .int32_array, .uint32_array, .float32_array => 4,
+                        .big_uint64_array, .big_int64_array, .float64_array => 8,
+                        .uint16_array, .int16_array => 2,
+                        else => 1,
+                    };
+                    const byte_len = frame.@"1" * elem_size;
+                    storage_len = byte_len;
+                    if (frame.@"2" and byte_len > 0) {
+                        const src: [*]const u8 = @ptrFromInt(frame.@"0");
+                        @memcpy(storage_bytes[0..byte_len], src[0..byte_len]);
+                    } else if (byte_len > 0) {
+                        @memset(storage_bytes[0..byte_len], 0);
+                    }
+                    frame.retval = .{ .handle = allocSlot(50 + desc.flags) };
+                    return .SUCCESS;
+                },
+                .binary_read => {
+                    const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), usize, usize, usize) Error!usize);
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    const offset = frame.@"3";
+                    const copy_len = @min(frame.@"2", storage_len - offset);
+                    if (copy_len > 0) {
+                        const dst: [*]u8 = @ptrFromInt(frame.@"1");
+                        @memcpy(dst[0..copy_len], storage_bytes[offset .. offset + copy_len]);
+                    }
+                    frame.retval = copy_len;
+                    return .SUCCESS;
+                },
+                .binary_write => {
+                    const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), usize, usize, usize) Error!void);
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    const copy_len = frame.@"2";
+                    const offset = frame.@"3";
+                    if (offset + copy_len > storage_len) {
+                        frame.retval = error.JsException;
+                        return .SUCCESS;
+                    }
+                    if (copy_len > 0) {
+                        const src: [*]const u8 = @ptrFromInt(frame.@"1");
+                        @memcpy(storage_bytes[offset .. offset + copy_len], src[0..copy_len]);
+                    }
+                    frame.retval = {};
+                    return .SUCCESS;
+                },
+                .binary_info => {
+                    const info_kind: BinaryInfoKind = @enumFromInt(desc.flags);
+                    switch (info_kind) {
+                        .byte_length => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!usize);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            frame.retval = storage_len;
+                        },
+                        .byte_offset => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!usize);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            frame.retval = 0;
+                        },
+                        .element_length => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!usize);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const tag = frame.@"0".handle & 0xFFFFF;
+                            const elem_size: usize = if (tag == 50 + @intFromEnum(BinaryKind.int32_array)) 4 else 1;
+                            frame.retval = storage_len / elem_size;
+                        },
+                        .is_buffer => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!bool);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            frame.retval = (frame.@"0".handle & 0xFFFFF) == 50 + @intFromEnum(BinaryKind.buffer);
+                        },
+                        .is_array => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!bool);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            frame.retval = (frame.@"0".handle & 0xFFFFF) == 80;
+                        },
+                    }
+                    return .SUCCESS;
+                },
+                .bigint_from_words => {
+                    const Frame = arg_struct.ArgStruct(fn (bool, u64, u64) Error!J.BigInt);
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    bigint_negative = frame.@"0";
+                    bigint_lo = frame.@"1";
+                    bigint_hi = frame.@"2";
+                    bigint_overflow_64 = (bigint_hi != 0);
+                    frame.retval = .{ .handle = allocSlot(65) };
+                    return .SUCCESS;
+                },
+                .bigint_from_string => {
+                    const Frame = arg_struct.ArgStruct(fn ([]const u8) Error!J.BigInt);
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    bigint_overflow_64 = frame.@"0".len > 20;
+                    frame.retval = .{ .handle = allocSlot(66) };
+                    return .SUCCESS;
+                },
+                .bigint_to_words => {
+                    const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), u32, bool, usize) Error!u32);
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    const width = frame.@"1";
+                    const is_signed = frame.@"2";
+                    if (width == 64 and (bigint_overflow_64 or (!is_signed and bigint_negative))) {
+                        frame.retval = 1;
+                        return .SUCCESS;
+                    }
+                    if (!is_signed and bigint_negative) {
+                        frame.retval = 1;
+                        return .SUCCESS;
+                    }
+                    const out_words: *[2]u64 = @ptrFromInt(frame.@"3");
+                    const mag: u128 = (@as(u128, bigint_hi) << 64) | @as(u128, bigint_lo);
+                    const twos: u128 = if (bigint_negative) (0 -% mag) else mag;
+                    out_words[0] = @truncate(twos);
+                    out_words[1] = @truncate(twos >> 64);
+                    frame.retval = 0;
+                    return .SUCCESS;
+                },
+                .bigint_to_string => {
+                    const Frame = arg_struct.ArgStruct(fn (std.mem.Allocator, J.Ref(Any), u32) AllocError![]u8);
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    frame.retval = frame.@"0".dupe(u8, "0xffffffffffffffffffffffffffffffff") catch return .FAULT;
+                    return .SUCCESS;
+                },
+                .get_iterator => {
+                    const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!J.Ref(Object));
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    iter_step = 0;
+                    iter_closed = false;
+                    frame.retval = .{ .handle = allocSlot(88) };
+                    return .SUCCESS;
+                },
+                .iterator_next => {
+                    const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), usize) Error!?i32);
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    defer iter_step += 1;
+                    if (iter_step == 0) {
+                        frame.retval = @as(?i32, 11);
+                    } else if (iter_step == 1) {
+                        frame.retval = @as(?i32, null);
+                    } else {
+                        const done_ptr: *u8 = @ptrFromInt(frame.@"1");
+                        done_ptr.* = 1;
+                    }
+                    return .SUCCESS;
+                },
+                .iterator_return => {
+                    const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!void);
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    iter_closed = true;
+                    frame.retval = {};
+                    return .SUCCESS;
+                },
+                .collection_op => {
+                    const sub: CollectionSubOp = @enumFromInt(desc.flags);
+                    switch (sub) {
+                        .array_init => {
+                            const Frame = arg_struct.ArgStruct(fn () Error!J.Ref(Object));
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            frame.retval = .{ .handle = allocSlot(80) };
+                        },
+                        .array_len => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!usize);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            frame.retval = 3;
+                        },
+                        .array_get => {
+                            const tag_check: *const J.Ref(Any) = @ptrCast(@alignCast(arg_ptr));
+                            _ = tag_check;
+                            // Distinguish Ref-element array vs string-element array via signature
+                            const RefGetFn = fn (J.Ref(Any), usize) Error!J.Ref(Object);
+                            const StrGetFn = fn (std.mem.Allocator, J.Ref(Any), usize) AllocError![]const u8;
+                            if (desc.signature == signature.get(arg_struct.ArgStruct(RefGetFn))) {
+                                const Frame = arg_struct.ArgStruct(RefGetFn);
+                                const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                                if (fail_array_index != null and frame.@"1" == fail_array_index.?) {
+                                    frame.retval = error.JsException;
+                                } else {
+                                    frame.retval = .{ .handle = allocSlot(81) };
+                                }
+                            } else if (desc.signature == signature.get(arg_struct.ArgStruct(StrGetFn))) {
+                                const Frame = arg_struct.ArgStruct(StrGetFn);
+                                const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                                if (fail_array_index != null and frame.@"2" == fail_array_index.?) {
+                                    frame.retval = error.JsException;
+                                } else {
+                                    frame.retval = frame.@"0".dupe(u8, "elem") catch return .FAULT;
+                                }
+                            } else {
+                                return .FAULT;
+                            }
+                        },
+                        .map_init => {
+                            const Frame = arg_struct.ArgStruct(fn () Error!J.Ref(Object));
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            frame.retval = .{ .handle = allocSlot(82) };
+                        },
+                        .map_get => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), []const u8, usize) Error!?i32);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            if (std.mem.eql(u8, frame.@"1", "present_val")) {
+                                frame.retval = @as(?i32, 42);
+                            } else if (std.mem.eql(u8, frame.@"1", "present_null")) {
+                                frame.retval = @as(?i32, null);
+                            } else {
+                                const miss_ptr: *u8 = @ptrFromInt(frame.@"2");
+                                miss_ptr.* = 1;
+                            }
+                        },
+                        .date_now => {
+                            const Frame = arg_struct.ArgStruct(fn () Error!f64);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            frame.retval = 1700000000000.0;
+                        },
+                        .regexp_init => {
+                            const Frame = arg_struct.ArgStruct(fn ([]const u8, []const u8) Error!J.RegExp);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            frame.retval = .{ .handle = allocSlot(85) };
+                        },
+                        .regexp_test => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), []const u8) Error!bool);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            frame.retval = std.mem.indexOf(u8, frame.@"1", "zig") != null;
+                        },
+                        else => return .FAULT,
+                    }
+                    return .SUCCESS;
+                },
+                else => return .FAULT,
+            }
+        }
+    };
+
+    const js = Js(WrapperMockHost);
+
+    // 1. Verify 4-byte handle layout and `.js_value` internal_type on both 32-bit wasm and 64-bit native
+    inline for (.{
+        js.Promise(i32),
+        js.Promise(void),
+        js.ArrayBuffer,
+        js.SharedArrayBuffer,
+        js.DataView,
+        js.Buffer,
+        js.Uint8Array,
+        js.Uint8ClampedArray,
+        js.Int32Array,
+        js.Float64Array,
+        js.BigUint64Array,
+        js.Array(i32),
+        js.Map([]const u8, i32),
+        js.Set(i32),
+        js.Record([]const u8, i32),
+        js.BigInt,
+        js.Date,
+        js.RegExp,
+        js.Iterator(i32),
+        js.AsyncIterator(i32),
+    }) |WrapperT| {
+        try expectEqual(@as(usize, 4), @sizeOf(WrapperT));
+        try expectEqual(@as(usize, 4), @alignOf(WrapperT));
+        try expectEqual(util.InternalType.js_value, util.getInternalType(WrapperT));
+    }
+
+    // 2. Promise(T): resolve, multiple borrows in `.await()`, `.then(closure, null)` type inference, reject, HostUnavailable
+    {
+        const p = try js.Promise(i32).resolve(1234);
+        defer p.deinit();
+        try expectEqual(@as(i32, 1234), try p.await());
+        try expectEqual(@as(i32, 1234), try p.wait());
+
+        const Adder = struct {
+            fn addOne(x: i32) i32 {
+                return x + 1;
+            }
+        };
+        const cl = try js.Closure(void, Adder.addOne).tryInit();
+        defer cl.deinit();
+        const p_chained = try p.then(cl, null);
+        defer p_chained.deinit();
+        try expectEqual(js.Promise(i32), @TypeOf(p_chained));
+
+        WrapperMockHost.await_unavailable = true;
+        try std.testing.expectError(error.HostUnavailable, p.await());
+        WrapperMockHost.await_unavailable = false;
+
+        const p_rej = try js.Promise(i32).reject("boom");
+        defer p_rej.deinit();
+        try std.testing.expectError(error.JsException, p_rej.await());
+
+        const p_void = try js.Promise(void).resolve({});
+        defer p_void.deinit();
+        try p_void.await();
+
+        const p_str: js.Promise([]const u8) = .{ .handle = WrapperMockHost.allocSlot(72) };
+        defer p_str.deinit();
+        const text = try p_str.awaitAlloc(std.testing.allocator);
+        defer std.testing.allocator.free(text);
+        try std.testing.expectEqualStrings("async-text", text);
+    }
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+    try expectEqual(@as(u32, 0), js.activeCallbackCount());
+
+    // 3. Binary views: 0-length & bulk roundtrips for Buffer, Int32Array, ArrayBuffer
+    {
+        const empty_buf = try js.Buffer.fromSlice(&.{});
+        defer empty_buf.deinit();
+        try expect(try js.Buffer.isBuffer(empty_buf));
+        try expectEqual(@as(usize, 0), try empty_buf.byteLength());
+        const empty_owned = try empty_buf.toOwnedSlice(std.testing.allocator);
+        defer std.testing.allocator.free(empty_owned);
+        try expectEqual(@as(usize, 0), empty_owned.len);
+
+        const src_ints = [_]i32{ -10, 20, -30, 4096 };
+        const i32_ta = try js.Int32Array.fromSlice(&src_ints);
+        defer i32_ta.deinit();
+        try expect(!try js.Buffer.isBuffer(i32_ta));
+        try expectEqual(@as(usize, 4), try i32_ta.len());
+        try expectEqual(@as(usize, 16), try i32_ta.byteLength());
+        const owned_ints = try i32_ta.toOwnedSlice(std.testing.allocator);
+        defer std.testing.allocator.free(owned_ints);
+        try std.testing.expectEqualSlices(i32, &src_ints, owned_ints);
+    }
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    // 4. Array.toOwnedSlice mid-array error cleanup (zero leaked handles AND zero leaked allocations!)
+    {
+        const ref_arr = try js.Array(js.Ref(js.Object)).init();
+        defer ref_arr.deinit();
+        try expect(try js.Array(i32).isArray(ref_arr));
+        WrapperMockHost.fail_array_index = 2;
+        try std.testing.expectError(error.JsException, ref_arr.toOwnedSlice(std.testing.allocator));
+        WrapperMockHost.fail_array_index = null;
+        // Elements 0 and 1 must have been `.deinit()`ed by `errdefer`; only `ref_arr` remains live!
+        try expectEqual(@as(u32, 1), js.activeHandleCount());
+
+        const str_arr: js.Array([]const u8) = .{ .handle = WrapperMockHost.allocSlot(80) };
+        defer str_arr.deinit();
+        WrapperMockHost.fail_array_index = 2;
+        try std.testing.expectError(error.JsException, str_arr.toOwnedSlice(std.testing.allocator));
+        WrapperMockHost.fail_array_index = null;
+    }
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    // 5. Map(?i32) missing vs explicit null value, BigInt bounds/overflow, Date, RegExp
+    {
+        const m = try js.Map([]const u8, ?i32).init();
+        defer m.deinit();
+        const v_present = try m.get("present_val");
+        try expectEqual(@as(??i32, @as(?i32, 42)), v_present);
+        const v_null = try m.get("present_null");
+        try expect(v_null != null and v_null.? == null);
+        const v_missing = try m.get("missing");
+        try expect(v_missing == null);
+
+        const bi_min = try js.BigInt.fromI128(std.math.minInt(i128));
+        defer bi_min.deinit();
+        try expectEqual(std.math.minInt(i128), try bi_min.toI128());
+        try std.testing.expectError(error.Overflow, bi_min.toI64());
+        try std.testing.expectError(error.Overflow, bi_min.toU128());
+
+        const bi_huge = try js.BigInt.fromString("0xffffffffffffffffffffffffffffffff");
+        defer bi_huge.deinit();
+        const hex = try bi_huge.toStringAlloc(std.testing.allocator, 16);
+        defer std.testing.allocator.free(hex);
+        try std.testing.expectEqualStrings("0xffffffffffffffffffffffffffffffff", hex);
+
+        try expectEqual(@as(f64, 1700000000000.0), try js.Date.now());
+        const re = try js.RegExp.init("zig", "i");
+        defer re.deinit();
+        try expect(try re.testMatch("hello zigar"));
+        try expect(!try re.@"test"("hello world"));
+    }
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    // 6. Iterator(?i32) and AsyncIterator(?i32) distinguishing `{ value: null, done: false }` from `{ done: true }`
+    {
+        const src: js.Ref(js.Object) = .{ .handle = WrapperMockHost.allocSlot(87) };
+        defer src.deinit();
+
+        const it = try js.Iterator(?i32).from(src);
+        defer it.deinit();
+        try expectEqual(@as(??i32, @as(?i32, 11)), try it.next());
+        const step_null = try it.next();
+        try expect(step_null != null and step_null.? == null);
+        try expect((try it.next()) == null);
+        try it.close();
+        try expect(WrapperMockHost.iter_closed);
+
+        const ait = try js.AsyncIterator(?i32).from(src);
+        defer ait.deinit();
+        try expectEqual(@as(??i32, @as(?i32, 77)), try ait.next());
+        const astep_null = try ait.next();
+        try expect(astep_null != null and astep_null.? == null);
+        try expect((try ait.next()) == null);
+        try ait.returnEarly();
+        try expect(WrapperMockHost.iter_closed);
+    }
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+}
+

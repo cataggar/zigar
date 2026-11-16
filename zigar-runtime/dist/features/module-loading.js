@@ -153,7 +153,7 @@ var moduleLoading = mixin({
         ? retval.then(v => this.toWebAssembly(returnType, v))
         : this.toWebAssembly(returnType, retval);
       };
-      return (this.useJSPI && (name === 'handleJscall' || name === 'futexWaitAsync' || name === 'awaitAsyncDisposeJsValue'))
+      return (this.useJSPI && (name === 'handleJscall' || name === 'futexWaitAsync' || name === 'awaitAsyncDisposeJsValue' || name === 'awaitJsPromise'))
         ? this.wrapSuspending(wrapper)
         : wrapper;
     },

@@ -310,6 +310,9 @@ export default mixin({
           case '_disposeJsValue':
           case '_beginAsyncDisposeJsValue':
           case '_awaitAsyncDisposeJsValue':
+          case '_beginAwaitJsPromise':
+          case '_awaitJsPromise':
+          case '_finishAwaitJsPromise':
             this.use(jsHostOp);
             this.use(jsValueRegistry);
             this.use(jsValue);
