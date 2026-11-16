@@ -373,7 +373,7 @@ pub const ScopeNamer = struct {
         return false;
     }
 
-    fn isTakenInAnyAncestor(self: *const ScopeNamer, logical: []const u8) bool {
+    pub fn isTakenInAnyAncestor(self: *const ScopeNamer, logical: []const u8) bool {
         var cur = self.parent;
         while (cur) |p| : (cur = p.parent) {
             if (p.used.contains(logical)) return true;

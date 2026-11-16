@@ -705,3 +705,363 @@ test "Regression Bug 3: export import Foo = Bar.Baz emits full multi-segment nes
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
 }
+
+test "Regression Round 2 Issue 1: Self declarations in enclosing containers or struct itself avoid ambiguous reference" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-r2-self", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const src_dir = try std.fmt.allocPrint(alloc, "{s}/src", .{sandbox});
+    defer alloc.free(src_dir);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+    try cwd.createDirPath(io, src_dir);
+
+    {
+        var sd = try cwd.openDir(io, src_dir, .{});
+        defer sd.close(io);
+        // Reproducer 1: `export declare class Self { m(): void }`
+        try sd.writeFile(io, .{
+            .sub_path = "case1.d.ts",
+            .data =
+            \\export declare class Self {
+            \\  tag: number;
+            \\  clone(): this;
+            \\  echo(other: Self): Self;
+            \\  m(): void;
+            \\}
+            ,
+        });
+        // Reproducer 2: `export type Self = { id: string }; export declare class Widget { constructor(); }`
+        try sd.writeFile(io, .{
+            .sub_path = "case2.d.ts",
+            .data =
+            \\export type Self = { id: string };
+            \\export declare class Widget {
+            \\  constructor();
+            \\  makeSelf(): Self;
+            \\}
+            ,
+        });
+        // Reproducer 3: `export interface Self { x: number } export interface A { m(): void }`
+        try sd.writeFile(io, .{
+            .sub_path = "case3.d.ts",
+            .data =
+            \\export interface Self {
+            \\  x: number;
+            \\}
+            \\export interface A {
+            \\  s: Self;
+            \\  m(): void;
+            \\}
+            ,
+        });
+        // Reproducer 4 + multi-level Self_2/Self_3:
+        // `export declare namespace NS { export interface Self { x: number } export class A { m(): void } }`
+        try sd.writeFile(io, .{
+            .sub_path = "case4.d.ts",
+            .data =
+            \\export declare namespace NS {
+            \\  export interface Self {
+            \\    x: number;
+            \\  }
+            \\  export class A {
+            \\    s: Self;
+            \\    m(): void;
+            \\  }
+            \\}
+            \\export declare namespace OuterNs {
+            \\  export interface Self {
+            \\    z: number;
+            \\  }
+            \\  export class B {
+            \\    s: Self;
+            \\    m(): void;
+            \\  }
+            \\}
+            \\export declare namespace Self {
+            \\  export class NestedInSelfNs {
+            \\    k: number;
+            \\    m(): void;
+            \\  }
+            \\}
+            \\export interface Self_2 {
+            \\  y: number;
+            \\}
+            \\export declare class Triple<Self_3> {
+            \\  a: Self_2;
+            \\  val: Self_3;
+            \\  m(): void;
+            \\}
+            ,
+        });
+    }
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const c1 = try std.fmt.allocPrint(alloc, "{s}/case1.d.ts", .{src_dir});
+    defer alloc.free(c1);
+    const c2 = try std.fmt.allocPrint(alloc, "{s}/case2.d.ts", .{src_dir});
+    defer alloc.free(c2);
+    const c3 = try std.fmt.allocPrint(alloc, "{s}/case3.d.ts", .{src_dir});
+    defer alloc.free(c3);
+    const c4 = try std.fmt.allocPrint(alloc, "{s}/case4.d.ts", .{src_dir});
+    defer alloc.free(c4);
+
+    const cli_args = [_][]const u8{
+        "-t", c1,
+        "-t", c2,
+        "-t", c3,
+        "-t", c4,
+        "-d", out_dir,
+    };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Round 2 Issue 1 pipeline error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+
+    const consumer_zig = try std.fmt.allocPrint(alloc, "{s}/consumer_r2_self.zig", .{sandbox});
+    defer alloc.free(consumer_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "consumer_r2_self.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r = @import("out/root.zig");
+            \\
+            \\test "all Self collision shapes compile and preserve outer Self nominal types" {
+            \\    const s1: r.case1.Self = .{ .tag = 7 };
+            \\    try std.testing.expectEqual(@as(f64, 7), s1.tag);
+            \\    const echo_fn: *const fn (*const r.case1.Self, r.case1.Self) r.case1.Self = &r.case1.Self.echo;
+            \\    _ = echo_fn;
+            \\
+            \\    const s2: r.case2.Self = .{ .id = "abc" };
+            \\    try std.testing.expectEqualStrings("abc", s2.id);
+            \\    const init_fn: *const fn () r.case2.Widget = &r.case2.Widget.init;
+            \\    _ = init_fn;
+            \\
+            \\    const s3: r.case3.Self = .{ .x = 3 };
+            \\    const a3: r.case3.A = .{ .s = s3 };
+            \\    try std.testing.expectEqual(@as(f64, 3), a3.s.x);
+            \\
+            \\    const ns_s: r.case4.Ns.Self = .{ .x = 9 };
+            \\    const ns_a: r.case4.Ns.A = .{ .s = ns_s };
+            \\    try std.testing.expectEqual(@as(f64, 9), ns_a.s.x);
+            \\    const ons_s: r.case4.OuterNs.Self = .{ .z = 15 };
+            \\    const ons_b: r.case4.OuterNs.B = .{ .s = ons_s };
+            \\    try std.testing.expectEqual(@as(f64, 15), ons_b.s.z);
+            \\    const nb: r.case4.Self.NestedInSelfNs = .{ .k = 11 };
+            \\    try std.testing.expectEqual(@as(f64, 11), nb.k);
+            \\    const t: r.case4.Triple(u32) = .{ .a = .{ .y = 12 }, .val = 99 };
+            \\    try std.testing.expectEqual(@as(f64, 12), t.a.y);
+            \\    try std.testing.expectEqual(@as(u32, 99), t.val);
+            \\}
+            ,
+        });
+    }
+
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
+}
+
+test "Regression Round 2 Issue 2: non-entry imported modules preserve namespaces and prune unreferenced files" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-r2-leafns", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const app_dir = try std.fmt.allocPrint(alloc, "{s}/app", .{sandbox});
+    defer alloc.free(app_dir);
+    const foo_types_dir = try std.fmt.allocPrint(alloc, "{s}/node_modules/@types/foo", .{sandbox});
+    defer alloc.free(foo_types_dir);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+
+    try cwd.createDirPath(io, app_dir);
+    try cwd.createDirPath(io, foo_types_dir);
+
+    {
+        var ad = try cwd.openDir(io, app_dir, .{});
+        defer ad.close(io);
+        try ad.writeFile(io, .{
+            .sub_path = "leaf.d.ts",
+            .data =
+            \\export declare class Inner {
+            \\  top: number;
+            \\}
+            \\export declare namespace LeafNs {
+            \\  class Inner {
+            \\    nested: string;
+            \\  }
+            \\}
+            ,
+        });
+        try ad.writeFile(io, .{
+            .sub_path = "unused_sibling.d.ts",
+            .data =
+            \\export interface UnusedSibling {
+            \\  shouldNotEmit: boolean;
+            \\}
+            ,
+        });
+        try ad.writeFile(io, .{
+            .sub_path = "index.d.ts",
+            .data =
+            \\/// <reference types="foo" />
+            \\import { Inner, LeafNs } from "./leaf.js";
+            \\import { UsedNs } from "foo/used";
+            \\export declare function f(a: Inner, b: LeafNs.Inner, c: UsedNs.Payload): void;
+            \\export import X = LeafNs.Inner;
+            \\export import Y = UsedNs.Payload;
+            ,
+        });
+    }
+
+    // Create 20 `.d.ts` files in `node_modules/@types/foo`, referencing all 20 from `@types/foo/index.d.ts`,
+    // while `app/index.d.ts` ONLY uses `foo/used.d.ts`!
+    {
+        var fd = try cwd.openDir(io, foo_types_dir, .{});
+        defer fd.close(io);
+        try fd.writeFile(io, .{
+            .sub_path = "package.json",
+            .data =
+            \\{
+            \\  "name": "@types/foo",
+            \\  "version": "1.0.0",
+            \\  "types": "./index.d.ts"
+            \\}
+            ,
+        });
+        try fd.writeFile(io, .{
+            .sub_path = "used.d.ts",
+            .data =
+            \\export declare namespace UsedNs {
+            \\  export interface Payload {
+            \\    ok: boolean;
+            \\  }
+            \\}
+            ,
+        });
+
+        var idx_buf: std.ArrayList(u8) = .empty;
+        defer idx_buf.deinit(alloc);
+        try idx_buf.appendSlice(alloc, "/// <reference path=\"./used.d.ts\" />\n");
+
+        for (1..20) |i| {
+            const fname = try std.fmt.allocPrint(alloc, "extra_{d:0>2}.d.ts", .{i});
+            defer alloc.free(fname);
+            const fbody = try std.fmt.allocPrint(
+                alloc,
+                "export interface ExtraType_{d} {{ v: number; }}\n",
+                .{i},
+            );
+            defer alloc.free(fbody);
+            try fd.writeFile(io, .{ .sub_path = fname, .data = fbody });
+            try idx_buf.print(alloc, "/// <reference path=\"./{s}\" />\n", .{fname});
+        }
+        try idx_buf.appendSlice(alloc, "export interface FooRootUnused { root_flag: boolean; }\n");
+        try fd.writeFile(io, .{ .sub_path = "index.d.ts", .data = idx_buf.items });
+    }
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    // Pass ONLY `-t app/index.d.ts` (NOT `leaf.d.ts`, NOT `unused_sibling.d.ts`, NOT `@types/foo`)!
+    const index_dts = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{app_dir});
+    defer alloc.free(index_dts);
+
+    const cli_args = [_][]const u8{ "-t", index_dts, "-d", out_dir };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Round 2 Issue 2 pipeline error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+
+    // Exactly 3 modules must be emitted: `index.zig`, `leaf.zig`, and `foo/used.zig`!
+    // Unreferenced `unused_sibling.d.ts`, `foo/index.d.ts`, and `foo/extra_01..19.d.ts` must NOT be emitted!
+    try std.testing.expectEqual(@as(usize, 3), res.ok.module_count);
+
+    var out_handle = try cwd.openDir(io, out_dir, .{});
+    defer out_handle.close(io);
+    try std.testing.expectError(error.FileNotFound, out_handle.statFile(io, "unused_sibling.zig", .{}));
+    try std.testing.expectError(error.FileNotFound, out_handle.statFile(io, "foo.zig", .{}));
+    try std.testing.expectError(error.FileNotFound, out_handle.statFile(io, "foo/extra_01.zig", .{}));
+
+    const index_zig = try std.fmt.allocPrint(alloc, "{s}/index.zig", .{out_dir});
+    defer alloc.free(index_zig);
+    const index_src = try cwd.readFileAlloc(io, index_zig, alloc, .limited(1024 * 1024));
+    defer alloc.free(index_src);
+    try std.testing.expect(std.mem.indexOf(u8, index_src, ".LeafNs.Inner") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_src, "Inner_2") == null);
+
+    const consumer_zig = try std.fmt.allocPrint(alloc, "{s}/consumer_r2_leafns.zig", .{sandbox});
+    defer alloc.free(consumer_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "consumer_r2_leafns.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r = @import("out/root.zig");
+            \\const leaf = @import("out/leaf.zig");
+            \\const foo_used = @import("out/foo/used.zig");
+            \\
+            \\test "non-entry LeafNs.Inner preserves namespace hierarchy and root.zig only exports primary" {
+            \\    try std.testing.expect(r.index == @import("out/index.zig"));
+            \\    try std.testing.expect(!@hasDecl(r, "leaf"));
+            \\    try std.testing.expect(!@hasDecl(r, "unused_sibling"));
+            \\    try std.testing.expect(!@hasDecl(r, "foo"));
+            \\
+            \\    try std.testing.expect(leaf.Inner != leaf.LeafNs.Inner);
+            \\    try std.testing.expect(r.X == leaf.LeafNs.Inner);
+            \\    try std.testing.expect(r.Y == foo_used.UsedNs.Payload);
+            \\
+            \\    const top_in: leaf.Inner = .{ .top = 1 };
+            \\    const nested_in: leaf.LeafNs.Inner = .{ .nested = "hello" };
+            \\    const payload: foo_used.UsedNs.Payload = .{ .ok = true };
+            \\    try std.testing.expectEqual(@as(f64, 1), top_in.top);
+            \\    try std.testing.expectEqualStrings("hello", nested_in.nested);
+            \\    try std.testing.expect(payload.ok);
+            \\
+            \\    const f_ptr: *const fn (leaf.Inner, leaf.LeafNs.Inner, foo_used.UsedNs.Payload) void = &r.f;
+            \\    _ = f_ptr;
+            \\}
+            ,
+        });
+    }
+
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
+}

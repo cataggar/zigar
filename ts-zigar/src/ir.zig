@@ -6,7 +6,11 @@ const naming = @import("naming.zig");
 pub const LowerOptions = struct {
     /// Optional VFS base directory stripped from file-module paths when deriving relative module names.
     base_dir: ?[]const u8 = null,
-    /// Optional `-m / --module` filters. Empty means emit all discovered modules as primary.
+    /// Optional explicit primary VFS entry paths (`-t / --types`). When non-empty and `modules` is
+    /// empty, only primary modules are re-exported by `root.zig`, and unreferenced non-primary
+    /// modules are pruned via reachability closure.
+    primary_vfs_paths: []const []const u8 = &.{},
+    /// Optional `-m / --module` filters. Empty means emit primary modules and their dependencies.
     modules: []const []const u8 = &.{},
     /// Optional `-s / --substitute <from=to>` rules.
     substitutions: []const cli.Substitution = &.{},
@@ -427,6 +431,7 @@ fn LowerCtx(comptime GraphType: type) type {
         source_mod_to_cand: std.AutoHashMapUnmanaged(u32, u32) = .empty,
         decl_locations: std.AutoHashMapUnmanaged(u32, DeclLocation) = .empty,
         merged_ns_consumed: std.AutoHashMapUnmanaged(u32, void) = .empty,
+        ns_child_ids: std.AutoHashMapUnmanaged(u32, void) = .empty,
         decl_to_cand: std.AutoHashMapUnmanaged(u32, u32) = .empty,
         cand_to_final_map: ?[]?u32 = null,
 
@@ -441,6 +446,7 @@ fn LowerCtx(comptime GraphType: type) type {
             self.source_mod_to_cand.deinit(self.scratch);
             self.decl_locations.deinit(self.scratch);
             self.merged_ns_consumed.deinit(self.scratch);
+            self.ns_child_ids.deinit(self.scratch);
             self.decl_to_cand.deinit(self.scratch);
         }
 
@@ -449,7 +455,30 @@ fn LowerCtx(comptime GraphType: type) type {
             return "";
         }
 
-        fn deriveFileLogicalSpecifier(self: *const Self, mod: anytype) ![]const u8 {
+        fn isPrimaryVfsPath(self: *const Self, fp: []const u8) bool {
+            if (fp.len == 0) return false;
+            for (self.options.primary_vfs_paths) |p| {
+                if (std.mem.eql(u8, p, fp)) return true;
+            }
+            return false;
+        }
+
+        fn normalizeExternalNodeModulesSubpath(self: *Self, nm_rel: []const u8) ![]const u8 {
+            const pkg_rel = if (std.mem.startsWith(u8, nm_rel, "@types/"))
+                nm_rel["@types/".len..]
+            else
+                nm_rel;
+            const stripped = naming.stripModuleExtension(pkg_rel);
+            const final_rel = if (std.mem.endsWith(u8, stripped, "/index") and stripped.len > "/index".len)
+                stripped[0 .. stripped.len - "/index".len]
+            else if (stripped.len == 0)
+                "index"
+            else
+                stripped;
+            return try self.alloc.dupe(u8, final_rel);
+        }
+
+        fn deriveFileLogicalSpecifier(self: *Self, mod: anytype) ![]const u8 {
             const raw_spec = self.str(mod.specifier);
             const file_path = self.str(mod.file_path);
 
@@ -467,11 +496,22 @@ fn LowerCtx(comptime GraphType: type) type {
                     if (after.len == 0) {
                         rel = "index";
                     } else if (after[0] == '/') {
-                        rel = after[1..];
+                        const sub = after[1..];
+                        if (std.mem.startsWith(u8, sub, "node_modules/")) {
+                            return self.normalizeExternalNodeModulesSubpath(sub["node_modules/".len..]);
+                        }
+                        if (std.mem.lastIndexOf(u8, sub, "/node_modules/")) |nm_idx| {
+                            return self.normalizeExternalNodeModulesSubpath(sub[nm_idx + "/node_modules/".len ..]);
+                        }
+                        rel = sub;
                     }
+                } else if (std.mem.lastIndexOf(u8, chosen, "/node_modules/")) |nm_idx| {
+                    return self.normalizeExternalNodeModulesSubpath(chosen[nm_idx + "/node_modules/".len ..]);
                 } else if (std.mem.lastIndexOfScalar(u8, chosen, '/')) |slash| {
                     rel = chosen[slash + 1 ..];
                 }
+            } else if (std.mem.lastIndexOf(u8, chosen, "/node_modules/")) |nm_idx| {
+                return self.normalizeExternalNodeModulesSubpath(chosen[nm_idx + "/node_modules/".len ..]);
             } else if (std.mem.startsWith(u8, chosen, "/")) {
                 rel = chosen[1..];
             }
@@ -611,12 +651,16 @@ fn LowerCtx(comptime GraphType: type) type {
 
         fn registerCanonicalDeclInCandidate(self: *Self, owner_cand: u32, did: u32) !void {
             if (did >= self.graph.decls.len) return;
-            try appendUniqueU32(&self.candidates.items[owner_cand].decl_ids, self.scratch, did);
+            if (!self.ns_child_ids.contains(did)) {
+                try appendUniqueU32(&self.candidates.items[owner_cand].decl_ids, self.scratch, did);
+            }
             try self.appendDeclRecursiveToCand(did, owner_cand);
             const d = self.graph.decls[did];
             for (d.merged_with) |mid| {
                 if (mid < self.graph.decls.len and self.graph.decls[mid].module == d.module) {
-                    try appendUniqueU32(&self.candidates.items[owner_cand].decl_ids, self.scratch, mid);
+                    if (!self.ns_child_ids.contains(mid)) {
+                        try appendUniqueU32(&self.candidates.items[owner_cand].decl_ids, self.scratch, mid);
+                    }
                     try self.appendDeclRecursiveToCand(mid, owner_cand);
                 }
             }
@@ -671,6 +715,16 @@ fn LowerCtx(comptime GraphType: type) type {
         }
 
         fn discoverCandidates(self: *Self) !void {
+            // Precompute all declarations owned as children of a `namespace_decl` so nested
+            // namespace members are never hoisted to top-level `cand.decl_ids`.
+            for (self.graph.decls) |d| {
+                if (d.kind == .namespace_decl) {
+                    for (d.kind.namespace_decl) |cid| {
+                        try self.ns_child_ids.put(self.scratch, cid, {});
+                    }
+                }
+            }
+
             // 1. Ambient modules (`declare module "node:http" { ... }`).
             for (self.graph.modules) |mod| {
                 if (self.isBundledLibModule(mod)) continue;
@@ -693,6 +747,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     mod.export_equals != null or
                     (mod.ambient_modules.len == 0 and mod.global_augmentations.len > 0) or
                     (mod.ambient_modules.len == 0 and self.graph.modules.len == 1) or
+                    (mod.ambient_modules.len == 0 and self.isPrimaryVfsPath(self.str(mod.file_path))) or
                     self.source_mod_to_cand.contains(mod.id);
 
                 if (has_file_content) {
@@ -725,42 +780,31 @@ fn LowerCtx(comptime GraphType: type) type {
 
             // 2b. Register declarations from transitively type-imported modules (`import type { X } from "./peer"`)
             // where the extractor recorded `d.module` without populating `mod.exports`.
-            {
-                var ns_child_ids: std.AutoHashMapUnmanaged(u32, void) = .empty;
-                defer ns_child_ids.deinit(self.scratch);
-                for (self.graph.decls) |d| {
-                    if (d.kind == .namespace_decl) {
-                        for (d.kind.namespace_decl) |cid| {
-                            try ns_child_ids.put(self.scratch, cid, {});
+            for (self.graph.decls) |d| {
+                if (self.decl_to_cand.contains(d.id)) continue;
+                if (self.ns_child_ids.contains(d.id)) continue;
+
+                var found_mod_idx: ?usize = null;
+                if (d.module < self.graph.modules.len and self.graph.modules[d.module].id == d.module) {
+                    found_mod_idx = d.module;
+                } else {
+                    for (self.graph.modules, 0..) |m, midx| {
+                        if (m.id == d.module) {
+                            found_mod_idx = midx;
+                            break;
                         }
                     }
                 }
-                for (self.graph.decls) |d| {
-                    if (self.decl_to_cand.contains(d.id)) continue;
-                    if (ns_child_ids.contains(d.id)) continue;
+                const mod_idx = found_mod_idx orelse continue;
+                const owner_mod = self.graph.modules[mod_idx];
+                if (self.isBundledLibModule(owner_mod)) continue;
 
-                    var found_mod_idx: ?usize = null;
-                    if (d.module < self.graph.modules.len and self.graph.modules[d.module].id == d.module) {
-                        found_mod_idx = d.module;
-                    } else {
-                        for (self.graph.modules, 0..) |m, midx| {
-                            if (m.id == d.module) {
-                                found_mod_idx = midx;
-                                break;
-                            }
-                        }
-                    }
-                    const mod_idx = found_mod_idx orelse continue;
-                    const owner_mod = self.graph.modules[mod_idx];
-                    if (self.isBundledLibModule(owner_mod)) continue;
-
-                    const c_idx = self.source_mod_to_cand.get(owner_mod.id) orelse blk: {
-                        const wire_spec = try self.deriveFileLogicalSpecifier(owner_mod);
-                        break :blk try self.getOrCreateCandidate(wire_spec, owner_mod.id);
-                    };
-                    try appendUniqueU32(&self.candidates.items[c_idx].decl_ids, self.scratch, d.id);
-                    try self.appendDeclRecursiveToCand(d.id, c_idx);
-                }
+                const c_idx = self.source_mod_to_cand.get(owner_mod.id) orelse blk: {
+                    const wire_spec = try self.deriveFileLogicalSpecifier(owner_mod);
+                    break :blk try self.getOrCreateCandidate(wire_spec, owner_mod.id);
+                };
+                try appendUniqueU32(&self.candidates.items[c_idx].decl_ids, self.scratch, d.id);
+                try self.appendDeclRecursiveToCand(d.id, c_idx);
             }
 
             // 3. Support dotted namespace `-m` filters such as `-m monaco.editor`.
@@ -805,6 +849,8 @@ fn LowerCtx(comptime GraphType: type) type {
                                 try queue.append(self.scratch, dep_cand);
                             }
                         }
+                    } else if (tn.resolved_type) |rt| {
+                        try self.collectReferencedCandsFromType(rt, visited_types, queue);
                     }
                     for (ref.type_args) |arg_ty| {
                         try self.collectReferencedCandsFromType(arg_ty, visited_types, queue);
@@ -953,13 +999,105 @@ fn LowerCtx(comptime GraphType: type) type {
             }
         }
 
-        fn filterAndCloseDependencies(self: *Self) LowerError![]u32 {
-            if (self.options.modules.len == 0) {
-                for (self.candidates.items) |*cand| {
-                    cand.is_primary = true;
-                    cand.included = true;
+        fn resolveRelativeVfsPath(allocator: std.mem.Allocator, from_file_path: []const u8, rel_path: []const u8) ![]u8 {
+            const dir_part = if (std.mem.lastIndexOfScalar(u8, from_file_path, '/')) |slash|
+                (if (slash == 0) "/" else from_file_path[0..slash])
+            else
+                "/";
+            const joined = if (rel_path.len > 0 and rel_path[0] == '/')
+                try allocator.dupe(u8, rel_path)
+            else if (std.mem.eql(u8, dir_part, "/"))
+                try std.fmt.allocPrint(allocator, "/{s}", .{rel_path})
+            else
+                try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_part, rel_path });
+            defer allocator.free(joined);
+
+            var parts: std.ArrayList([]const u8) = .empty;
+            defer parts.deinit(allocator);
+
+            var start: usize = 0;
+            var i: usize = 0;
+            while (i <= joined.len) : (i += 1) {
+                const is_sep = (i == joined.len) or (joined[i] == '/') or (joined[i] == '\\');
+                if (!is_sep) continue;
+                const seg = joined[start..i];
+                start = i + 1;
+                if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
+                if (std.mem.eql(u8, seg, "..")) {
+                    if (parts.items.len > 0) _ = parts.pop();
+                    continue;
                 }
-            } else {
+                try parts.append(allocator, seg);
+            }
+
+            if (parts.items.len == 0) return try allocator.dupe(u8, "/");
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(allocator);
+            for (parts.items) |seg| {
+                try out.append(allocator, '/');
+                try out.appendSlice(allocator, seg);
+            }
+            return try out.toOwnedSlice(allocator);
+        }
+
+        fn runReachabilityClosure(self: *Self, queue: *std.ArrayList(u32)) error{OutOfMemory}!void {
+            var visited_types: std.AutoHashMapUnmanaged(u32, void) = .empty;
+            defer visited_types.deinit(self.scratch);
+
+            var q_head: usize = 0;
+            while (q_head < queue.items.len) : (q_head += 1) {
+                const c_idx = queue.items[q_head];
+                const star_targets = try self.scratch.dupe(u32, self.candidates.items[c_idx].star_re_export_source_mods.items);
+                defer self.scratch.free(star_targets);
+                for (star_targets) |smid| {
+                    if (self.source_mod_to_cand.get(smid)) |dep_cand| {
+                        if (!self.candidates.items[dep_cand].included) {
+                            self.candidates.items[dep_cand].included = true;
+                            try queue.append(self.scratch, dep_cand);
+                        }
+                    }
+                }
+
+                const foreign_snapshot = try self.scratch.dupe(ForeignExportEntry, self.candidates.items[c_idx].foreign_exports.items);
+                defer self.scratch.free(foreign_snapshot);
+                for (foreign_snapshot) |fe| {
+                    if (self.decl_to_cand.get(fe.decl_id)) |dep_cand| {
+                        if (!self.candidates.items[dep_cand].included) {
+                            self.candidates.items[dep_cand].included = true;
+                            try queue.append(self.scratch, dep_cand);
+                        }
+                    }
+                }
+
+                const decl_snapshot = try self.scratch.dupe(u32, self.candidates.items[c_idx].decl_ids.items);
+                defer self.scratch.free(decl_snapshot);
+                for (decl_snapshot) |did| {
+                    try self.collectReferencedCandsFromDecl(did, &visited_types, queue);
+                }
+            }
+        }
+
+        fn findAmbientCandidateIdx(self: *Self, amb_name: []const u8) !?u32 {
+            const sub_spec = try applySubstitutions(self.scratch, amb_name, self.options.substitutions);
+            defer self.scratch.free(sub_spec);
+            const slash_spec = try self.scratch.dupe(u8, sub_spec);
+            defer self.scratch.free(slash_spec);
+            for (slash_spec) |*ch| {
+                if (ch.* == '.') ch.* = '/';
+            }
+            const rel_zig_path = try naming.sanitizeModuleRelPath(self.scratch, slash_spec);
+            defer self.scratch.free(rel_zig_path);
+
+            for (self.candidates.items, 0..) |cand, idx| {
+                if (std.mem.eql(u8, cand.rel_zig_path, rel_zig_path)) {
+                    return @intCast(idx);
+                }
+            }
+            return null;
+        }
+
+        fn filterAndCloseDependencies(self: *Self) LowerError![]u32 {
+            if (self.options.modules.len > 0) {
                 var queue: std.ArrayList(u32) = .empty;
                 defer queue.deinit(self.scratch);
 
@@ -978,39 +1116,112 @@ fn LowerCtx(comptime GraphType: type) type {
                     return error.NoMatchingModules;
                 }
 
-                var visited_types: std.AutoHashMapUnmanaged(u32, void) = .empty;
-                defer visited_types.deinit(self.scratch);
+                try self.runReachabilityClosure(&queue);
+            } else if (self.options.primary_vfs_paths.len > 0) {
+                var queue: std.ArrayList(u32) = .empty;
+                defer queue.deinit(self.scratch);
 
-                var q_head: usize = 0;
-                while (q_head < queue.items.len) : (q_head += 1) {
-                    const c_idx = queue.items[q_head];
-                    const star_targets = try self.scratch.dupe(u32, self.candidates.items[c_idx].star_re_export_source_mods.items);
-                    defer self.scratch.free(star_targets);
-                    for (star_targets) |smid| {
-                        if (self.source_mod_to_cand.get(smid)) |dep_cand| {
-                            if (!self.candidates.items[dep_cand].included) {
-                                self.candidates.items[dep_cand].included = true;
-                                try queue.append(self.scratch, dep_cand);
+                var primary_mod_ids: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                defer primary_mod_ids.deinit(self.scratch);
+
+                var ref_path_mod_ids: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                defer ref_path_mod_ids.deinit(self.scratch);
+
+                var mod_bfs: std.ArrayList(u32) = .empty;
+                defer mod_bfs.deinit(self.scratch);
+
+                for (self.graph.modules) |mod| {
+                    if (self.isPrimaryVfsPath(self.str(mod.file_path))) {
+                        try primary_mod_ids.put(self.scratch, mod.id, {});
+                        try ref_path_mod_ids.put(self.scratch, mod.id, {});
+                        try mod_bfs.append(self.scratch, mod.id);
+                    }
+                }
+
+                // Follow explicit `/// <reference path="..." />` directives (NOT `types="..."`!)
+                // from primary files so split ambient declarations in a package stay included.
+                var mb_head: usize = 0;
+                while (mb_head < mod_bfs.items.len) : (mb_head += 1) {
+                    const mid = mod_bfs.items[mb_head];
+                    const midx = self.findGraphModuleIndexById(mid) orelse continue;
+                    const cur_mod = self.graph.modules[midx];
+                    const cur_fp = self.str(cur_mod.file_path);
+                    for (cur_mod.triple_slash_paths) |ref_sid| {
+                        const ref_rel = self.str(ref_sid);
+                        if (ref_rel.len == 0) continue;
+                        const resolved_fp = try resolveRelativeVfsPath(self.scratch, cur_fp, ref_rel);
+                        defer self.scratch.free(resolved_fp);
+                        const resolved_dts = try std.fmt.allocPrint(self.scratch, "{s}.d.ts", .{resolved_fp});
+                        defer self.scratch.free(resolved_dts);
+
+                        for (self.graph.modules) |other| {
+                            const ofp = self.str(other.file_path);
+                            if (std.mem.eql(u8, ofp, resolved_fp) or std.mem.eql(u8, ofp, resolved_dts)) {
+                                if (!ref_path_mod_ids.contains(other.id)) {
+                                    try ref_path_mod_ids.put(self.scratch, other.id, {});
+                                    try mod_bfs.append(self.scratch, other.id);
+                                }
                             }
                         }
                     }
+                }
 
-                    const foreign_snapshot = try self.scratch.dupe(ForeignExportEntry, self.candidates.items[c_idx].foreign_exports.items);
-                    defer self.scratch.free(foreign_snapshot);
-                    for (foreign_snapshot) |fe| {
-                        if (self.decl_to_cand.get(fe.decl_id)) |dep_cand| {
-                            if (!self.candidates.items[dep_cand].included) {
-                                self.candidates.items[dep_cand].included = true;
-                                try queue.append(self.scratch, dep_cand);
+                var primary_seeded: usize = 0;
+                for (self.candidates.items, 0..) |*cand, idx| {
+                    for (cand.source_mod_ids.items) |smid| {
+                        if (primary_mod_ids.contains(smid)) {
+                            cand.is_primary = true;
+                            if (!cand.included) {
+                                cand.included = true;
+                                try queue.append(self.scratch, @intCast(idx));
+                            }
+                            primary_seeded += 1;
+                            break;
+                        }
+                    }
+                }
+
+                // Include ambient modules (and `/// <reference path="..." />` file modules) owned
+                // by primary files; if a primary `.d.ts` file is ambient-only, mark its ambient
+                // modules `is_primary = true` so `root.zig` re-exports them!
+                const make_ambient_primary = (primary_seeded == 0);
+                for (mod_bfs.items) |mid| {
+                    const midx = self.findGraphModuleIndexById(mid) orelse continue;
+                    const m = self.graph.modules[midx];
+                    if (!primary_mod_ids.contains(mid)) {
+                        if (self.source_mod_to_cand.get(mid)) |c_idx| {
+                            if (!self.candidates.items[c_idx].included) {
+                                self.candidates.items[c_idx].included = true;
+                                try queue.append(self.scratch, c_idx);
                             }
                         }
                     }
-
-                    const decl_snapshot = try self.scratch.dupe(u32, self.candidates.items[c_idx].decl_ids.items);
-                    defer self.scratch.free(decl_snapshot);
-                    for (decl_snapshot) |did| {
-                        try self.collectReferencedCandsFromDecl(did, &visited_types, &queue);
+                    for (m.ambient_modules) |amb| {
+                        if (try self.findAmbientCandidateIdx(self.str(amb.module_name))) |amb_cand_idx| {
+                            var ac = &self.candidates.items[amb_cand_idx];
+                            if (make_ambient_primary and primary_mod_ids.contains(mid)) {
+                                ac.is_primary = true;
+                            }
+                            if (!ac.included) {
+                                ac.included = true;
+                                try queue.append(self.scratch, amb_cand_idx);
+                            }
+                        }
                     }
+                }
+
+                if (queue.items.len == 0) {
+                    for (self.candidates.items) |*cand| {
+                        cand.is_primary = true;
+                        cand.included = true;
+                    }
+                } else {
+                    try self.runReachabilityClosure(&queue);
+                }
+            } else {
+                for (self.candidates.items) |*cand| {
+                    cand.is_primary = true;
+                    cand.included = true;
                 }
             }
 
@@ -2359,6 +2570,56 @@ fn LowerCtx(comptime GraphType: type) type {
             }
         }
 
+        fn chooseStructSelfIdent(
+            self: *Self,
+            raw_tps: []const u32,
+            merged_ids: []const u32,
+            parent_scope: *const naming.ScopeNamer,
+            prebound_names: *const std.AutoHashMapUnmanaged(u32, naming.BoundName),
+            prebound_overloads: *const std.AutoHashMapUnmanaged(u32, []naming.BoundName),
+        ) error{OutOfMemory}![]const u8 {
+            // Preview type-parameter bindings against `parent_scope` so `preview_tp.used` reflects
+            // this struct's comptime type parameters while `preview_tp.isTakenInAnyAncestor` checks
+            // EVERY enclosing scope (`parent_scope` — which already contains this struct's own outer
+            // declaration name AND all sibling declarations — plus all outer namespaces/structs/modules!).
+            var preview_tp = naming.ScopeNamer.initParam(self.scratch, parent_scope);
+            defer preview_tp.deinit();
+            for (raw_tps) |tp_id| {
+                const raw_tp = if (tp_id < self.graph.type_params.len) self.str(self.graph.type_params[tp_id].name) else "T";
+                const b = try preview_tp.bindWithFallbackSuffix(raw_tp, .pascal, "T");
+                b.deinit(self.scratch);
+            }
+
+            var merged_used: std.StringHashMapUnmanaged(void) = .empty;
+            defer merged_used.deinit(self.scratch);
+            for (merged_ids) |mid| {
+                if (self.merged_ns_consumed.contains(mid)) {
+                    for (self.graph.decls[mid].kind.namespace_decl) |cid| {
+                        if (prebound_names.get(cid)) |cb| try merged_used.put(self.scratch, cb.logical_name, {});
+                        if (prebound_overloads.get(cid)) |ovs| {
+                            for (ovs) |ov| try merged_used.put(self.scratch, ov.logical_name, {});
+                        }
+                    }
+                }
+            }
+
+            var suffix_n: usize = 1;
+            while (true) : (suffix_n += 1) {
+                const cand = if (suffix_n == 1)
+                    try self.scratch.dupe(u8, "Self")
+                else
+                    try std.fmt.allocPrint(self.scratch, "Self_{d}", .{suffix_n});
+                defer self.scratch.free(cand);
+
+                if (!preview_tp.used.contains(cand) and
+                    !preview_tp.isTakenInAnyAncestor(cand) and
+                    !merged_used.contains(cand))
+                {
+                    return try self.alloc.dupe(u8, cand);
+                }
+            }
+        }
+
         fn lowerStructDecl(
             self: *Self,
             final_mod_idx: u32,
@@ -2379,32 +2640,13 @@ fn LowerCtx(comptime GraphType: type) type {
             imports_used: *std.AutoHashMapUnmanaged(u32, void),
             needs_runtime: *bool,
         ) error{OutOfMemory}!StructDeclIr {
-            var self_taken_in_tp_or_merged = parent_scope.isTaken("Self") and parent_scope.is_param_scope;
-            if (!self_taken_in_tp_or_merged) {
-                var pcur = parent_scope.parent;
-                while (pcur) |pp| : (pcur = pp.parent) {
-                    if (pp.is_param_scope and pp.used.contains("Self")) {
-                        self_taken_in_tp_or_merged = true;
-                        break;
-                    }
-                }
-            }
-            for (raw_tps) |tp_id| {
-                const raw_tp = if (tp_id < self.graph.type_params.len) self.str(self.graph.type_params[tp_id].name) else "T";
-                const styled_tp = try naming.toPascalCase(self.scratch, raw_tp);
-                defer self.scratch.free(styled_tp);
-                if (std.mem.eql(u8, styled_tp, "Self")) self_taken_in_tp_or_merged = true;
-            }
-            for (merged_ids) |mid| {
-                if (self.merged_ns_consumed.contains(mid)) {
-                    for (self.graph.decls[mid].kind.namespace_decl) |cid| {
-                        if (prebound_names.get(cid)) |cb| {
-                            if (std.mem.eql(u8, cb.logical_name, "Self")) self_taken_in_tp_or_merged = true;
-                        }
-                    }
-                }
-            }
-            const provisional_self_ident: []const u8 = if (self_taken_in_tp_or_merged) "Self_2" else "Self";
+            const self_ident = try self.chooseStructSelfIdent(
+                raw_tps,
+                merged_ids,
+                parent_scope,
+                prebound_names,
+                prebound_overloads,
+            );
 
             var tp_scope = naming.ScopeNamer.initParam(self.scratch, parent_scope);
             defer tp_scope.deinit();
@@ -2413,7 +2655,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 raw_tps,
                 &tp_scope,
                 outer_active_tps,
-                provisional_self_ident,
+                self_ident,
                 imports_used,
                 needs_runtime,
             );
@@ -2421,6 +2663,7 @@ fn LowerCtx(comptime GraphType: type) type {
             var struct_scope = naming.ScopeNamer.initContainer(self.scratch, &tp_scope);
             defer struct_scope.deinit();
             try struct_scope.reserve("zigar_js");
+            try struct_scope.reserve(self_ident);
 
             // Reserve merged namespace child decl names (and overloads) in `struct_scope` first.
             for (merged_ids) |mid| {
@@ -2433,10 +2676,6 @@ fn LowerCtx(comptime GraphType: type) type {
                     }
                 }
             }
-
-            const self_bound = try struct_scope.bind("Self", .preserve);
-            const self_ident = try self.alloc.dupe(u8, self_bound.zig_ident);
-            self_bound.deinit(self.scratch);
 
             var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
             defer visited.deinit(self.scratch);
@@ -2824,10 +3063,27 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
             }
 
-            // Assign unique `root.zig` export identifiers for all emitted modules.
+            // Assign unique `root.zig` export identifiers for all emitted modules, binding
+            // `is_primary` modules first so non-primary transitive modules never shadow them!
             var root_scope = naming.ScopeNamer.initContainer(self.scratch, null);
             defer root_scope.deinit();
             try root_scope.reserve("zigar_js");
+
+            var root_export_idents = try self.scratch.alloc([]const u8, selected_cands.len);
+            defer self.scratch.free(root_export_idents);
+            var root_export_logicals = try self.scratch.alloc([]const u8, selected_cands.len);
+            defer self.scratch.free(root_export_logicals);
+
+            for ([_]bool{ true, false }) |primary_pass| {
+                for (selected_cands, 0..) |cand_idx, final_i| {
+                    const cand = &self.candidates.items[cand_idx];
+                    if (cand.is_primary != primary_pass) continue;
+                    const rb = try root_scope.bind(cand.substituted_specifier, .snake);
+                    root_export_idents[final_i] = try self.alloc.dupe(u8, rb.zig_ident);
+                    root_export_logicals[final_i] = try self.alloc.dupe(u8, rb.logical_name);
+                    rb.deinit(self.scratch);
+                }
+            }
 
             var modules = try self.alloc.alloc(ModuleIr, selected_cands.len);
 
@@ -2837,10 +3093,8 @@ fn LowerCtx(comptime GraphType: type) type {
                 const final_mod_idx: u32 = @intCast(final_i);
                 const ms = &mod_scopes[final_i];
 
-                const rb = try root_scope.bind(cand.substituted_specifier, .snake);
-                const root_export_ident = try self.alloc.dupe(u8, rb.zig_ident);
-                const root_export_logical = try self.alloc.dupe(u8, rb.logical_name);
-                rb.deinit(self.scratch);
+                const root_export_ident = root_export_idents[final_i];
+                const root_export_logical = root_export_logicals[final_i];
 
                 var imports_used: std.AutoHashMapUnmanaged(u32, void) = .empty;
                 defer imports_used.deinit(self.scratch);

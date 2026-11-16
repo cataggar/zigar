@@ -144,6 +144,7 @@ const SourceCollector = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     vfs_seen: std.StringHashMapUnmanaged(usize) = .empty,
+    probed_pkgs: std.StringHashMapUnmanaged(void) = .empty,
     files: std.ArrayList(VirtualFile) = .empty,
     root_vfs_paths: std.ArrayList([]const u8) = .empty,
     entry_base_dirs: std.ArrayList([]u8) = .empty,
@@ -151,6 +152,9 @@ const SourceCollector = struct {
 
     fn deinitScratch(self: *SourceCollector) void {
         self.vfs_seen.deinit(self.allocator);
+        var pkg_it = self.probed_pkgs.keyIterator();
+        while (pkg_it.next()) |k| self.allocator.free(k.*);
+        self.probed_pkgs.deinit(self.allocator);
         for (self.entry_base_dirs.items) |d| self.allocator.free(d);
         self.entry_base_dirs.deinit(self.allocator);
         for (self.scan_queue.items) |item| {
@@ -420,8 +424,8 @@ const SourceCollector = struct {
                     continue;
                 }
 
-                // 2. Relative ESM/CJS specifiers (`./...` or `../...`) on import/export lines.
-                try self.scanRelativeSpecifiersInLine(cur_disk_dir, line);
+                // 2. Relative (`./...`, `../...`) and bare package ESM/CJS specifiers on import/export lines.
+                try self.scanImportSpecifiersInLine(cur_disk_dir, line);
             }
         }
     }
@@ -429,13 +433,39 @@ const SourceCollector = struct {
     fn mountNodeModulesTypesPkg(self: *SourceCollector, start_disk_dir: []const u8, pkg_name: []const u8) !void {
         if (pkg_name.len == 0 or std.mem.indexOf(u8, pkg_name, "..") != null) return;
 
+        const cache_key = try std.fmt.allocPrint(self.allocator, "{s}\x00{s}", .{ start_disk_dir, pkg_name });
+        if (self.probed_pkgs.contains(cache_key)) {
+            self.allocator.free(cache_key);
+            return;
+        }
+        try self.probed_pkgs.put(self.allocator, cache_key, {});
+
+        // DefiniteTyped maps `@scope/pkg` -> `@types/scope__pkg`.
+        var dt_scoped_name: ?[]u8 = null;
+        defer if (dt_scoped_name) |s| self.allocator.free(s);
+        if (pkg_name[0] == '@') {
+            if (std.mem.indexOfScalar(u8, pkg_name[1..], '/')) |slash_rel| {
+                const scope_part = pkg_name[1 .. 1 + slash_rel];
+                const name_part = pkg_name[1 + slash_rel + 1 ..];
+                if (scope_part.len > 0 and name_part.len > 0) {
+                    dt_scoped_name = try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ scope_part, name_part });
+                }
+            }
+        }
+
         var cur_dir = try self.allocator.dupe(u8, start_disk_dir);
         defer self.allocator.free(cur_dir);
 
         for (0..6) |_| {
-            const at_types = try std.fmt.allocPrint(self.allocator, "{s}/node_modules/@types/{s}", .{ cur_dir, pkg_name });
-            defer self.allocator.free(at_types);
-            if (try self.loadPackageDirectory(at_types, false)) return;
+            if (dt_scoped_name) |dt_name| {
+                const at_types_scoped = try std.fmt.allocPrint(self.allocator, "{s}/node_modules/@types/{s}", .{ cur_dir, dt_name });
+                defer self.allocator.free(at_types_scoped);
+                if (try self.loadPackageDirectory(at_types_scoped, false)) return;
+            } else {
+                const at_types = try std.fmt.allocPrint(self.allocator, "{s}/node_modules/@types/{s}", .{ cur_dir, pkg_name });
+                defer self.allocator.free(at_types);
+                if (try self.loadPackageDirectory(at_types, false)) return;
+            }
 
             const direct_pkg = try std.fmt.allocPrint(self.allocator, "{s}/node_modules/{s}", .{ cur_dir, pkg_name });
             defer self.allocator.free(direct_pkg);
@@ -449,7 +479,40 @@ const SourceCollector = struct {
         }
     }
 
-    fn scanRelativeSpecifiersInLine(self: *SourceCollector, cur_disk_dir: []const u8, line: []const u8) !void {
+    fn extractBarePackageName(lit: []const u8) ?[]const u8 {
+        if (lit.len == 0) return null;
+        if (lit[0] == '.' or lit[0] == '/' or lit[0] == '#' or lit[0] == '\\') return null;
+        if (std.mem.startsWith(u8, lit, "node:")) return "node";
+        if (std.mem.indexOfScalar(u8, lit, ':') != null) return null;
+
+        if (lit[0] == '@') {
+            const first_slash = std.mem.indexOfScalar(u8, lit, '/') orelse return null;
+            if (first_slash <= 1 or first_slash + 1 >= lit.len) return null;
+            const rest = lit[first_slash + 1 ..];
+            if (std.mem.indexOfScalar(u8, rest, '/')) |second_slash| {
+                if (second_slash == 0) return null;
+                return lit[0 .. first_slash + 1 + second_slash];
+            }
+            return lit;
+        }
+
+        if (std.mem.indexOfScalar(u8, lit, '/')) |slash| {
+            return if (slash > 0) lit[0..slash] else null;
+        }
+        return lit;
+    }
+
+    fn lineHasModuleKeyword(line: []const u8) bool {
+        return std.mem.indexOf(u8, line, "import") != null or
+            std.mem.indexOf(u8, line, "export") != null or
+            std.mem.indexOf(u8, line, "from ") != null or
+            std.mem.indexOf(u8, line, "from\"") != null or
+            std.mem.indexOf(u8, line, "from'") != null or
+            std.mem.indexOf(u8, line, "require(") != null;
+    }
+
+    fn scanImportSpecifiersInLine(self: *SourceCollector, cur_disk_dir: []const u8, line: []const u8) !void {
+        const has_mod_kw = lineHasModuleKeyword(line);
         var i: usize = 0;
         while (i < line.len) : (i += 1) {
             const q = line[i];
@@ -458,6 +521,10 @@ const SourceCollector = struct {
             const lit = line[i + 1 .. i + 1 + end_rel];
             if (std.mem.startsWith(u8, lit, "./") or std.mem.startsWith(u8, lit, "../")) {
                 _ = try self.probeAndMountTypeTarget(cur_disk_dir, lit);
+            } else if (has_mod_kw) {
+                if (extractBarePackageName(lit)) |pkg_name| {
+                    try self.mountNodeModulesTypesPkg(cur_disk_dir, pkg_name);
+                }
             }
             i += end_rel + 1;
         }
@@ -627,6 +694,25 @@ pub fn loadTypesFromDisk(
     };
 }
 
+fn isBundledLibVfsPath(fp: []const u8) bool {
+    if (std.mem.startsWith(u8, fp, "/lib.") and std.mem.endsWith(u8, fp, ".d.ts")) return true;
+    if (std.mem.indexOf(u8, fp, "/typescript/lib/lib.") != null) return true;
+    return false;
+}
+
+fn isUnextractedStubModule(m: host_mod.types.ModuleNode) bool {
+    return m.exports.len == 0 and
+        m.default_export == null and
+        m.export_equals == null and
+        m.umd_namespace == null and
+        m.star_re_exports.len == 0 and
+        m.ambient_modules.len == 0 and
+        m.global_augmentations.len == 0 and
+        m.triple_slash_types.len == 0 and
+        m.triple_slash_paths.len == 0 and
+        m.triple_slash_libs.len == 0;
+}
+
 fn formatDiagnostics(
     allocator: std.mem.Allocator,
     heading: []const u8,
@@ -680,10 +766,35 @@ pub fn runPipelineWithHost(
     var compiler_opts = host_mod.defaultCompilerOptions();
     compiler_opts.skip_lib_check = true;
 
+    // When `-m` filters are passed, include mounted declaration files in `program_roots` so
+    // unimported subpath modules inside a package directory can be selected by `-m <subpath>`.
+    // Otherwise seed `createProgram` strictly from `loaded.root_vfs_paths` so unreferenced
+    // neighbor files are never even parsed by TypeScript!
+    var program_roots: std.ArrayList([]const u8) = .empty;
+    defer program_roots.deinit(allocator);
+    var program_roots_seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer program_roots_seen.deinit(allocator);
+
+    for (loaded.root_vfs_paths) |rp| {
+        if (!program_roots_seen.contains(rp)) {
+            try program_roots_seen.put(allocator, rp, {});
+            try program_roots.append(allocator, rp);
+        }
+    }
+    if (opts.modules.len > 0) {
+        for (loaded.files) |vf| {
+            if (!isTypeScriptDeclarationOrSource(vf.vfs_path)) continue;
+            if (!program_roots_seen.contains(vf.vfs_path)) {
+                try program_roots_seen.put(allocator, vf.vfs_path, {});
+                try program_roots.append(allocator, vf.vfs_path);
+            }
+        }
+    }
+
     const prog_outcome = ts_host.createProgram(
         allocator,
         vfs,
-        loaded.root_vfs_paths,
+        program_roots.items,
         compiler_opts,
     ) catch |err| {
         return .{ .err = try std.fmt.allocPrint(allocator, "Failed to invoke TypeScript compiler component: {s}", .{@errorName(err)}) };
@@ -698,11 +809,87 @@ pub fn runPipelineWithHost(
     };
     defer prog.deinit();
 
-    const extract_cfg = host_mod.defaultExtractConfig(&.{});
-    const graph_res = ts_host.extractModuleGraph(allocator, prog, extract_cfg) catch |err| {
+    // Seed `extract_roots` from `program_roots`, then expand to a fixed point if `extractModuleGraph`
+    // discovers any non-bundled imported `ModuleNode` stub (`ensureModule(sf, false)`) whose exports
+    // and nested `namespace_decl` hierarchy have not yet been extracted!
+    var extract_roots: std.ArrayList([]u8) = .empty;
+    defer {
+        for (extract_roots.items) |p| allocator.free(p);
+        extract_roots.deinit(allocator);
+    }
+    var extract_roots_set: std.StringHashMapUnmanaged(void) = .empty;
+    defer extract_roots_set.deinit(allocator);
+
+    for (program_roots.items) |rp| {
+        const owned = try allocator.dupe(u8, rp);
+        errdefer allocator.free(owned);
+        try extract_roots.append(allocator, owned);
+        try extract_roots_set.put(allocator, owned, {});
+    }
+
+    var extract_root_slices: std.ArrayList([]const u8) = .empty;
+    defer extract_root_slices.deinit(allocator);
+    for (extract_roots.items) |p| try extract_root_slices.append(allocator, p);
+
+    var graph_res = ts_host.extractModuleGraph(
+        allocator,
+        prog,
+        host_mod.defaultExtractConfig(extract_root_slices.items),
+    ) catch |err| {
         return .{ .err = try std.fmt.allocPrint(allocator, "Failed to extract TypeScript declaration graph: {s}", .{@errorName(err)}) };
     };
-    defer host_mod.TypeScriptHost.freeValue(@TypeOf(graph_res), allocator, graph_res);
+    var graph_res_active = true;
+    defer if (graph_res_active) host_mod.TypeScriptHost.freeValue(@TypeOf(graph_res), allocator, graph_res);
+
+    var iter: usize = 0;
+    while (iter < 8 and graph_res == .ok) : (iter += 1) {
+        const g = graph_res.ok;
+        var newly_discovered: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (newly_discovered.items) |p| allocator.free(p);
+            newly_discovered.deinit(allocator);
+        }
+
+        for (g.modules) |m| {
+            if (!isUnextractedStubModule(m)) continue;
+            const fp = if (m.file_path < g.strings.len) g.strings[m.file_path] else "";
+            if (fp.len == 0 or isBundledLibVfsPath(fp)) continue;
+            if (extract_roots_set.contains(fp)) continue;
+            var dup_in_batch = false;
+            for (newly_discovered.items) |np| {
+                if (std.mem.eql(u8, np, fp)) {
+                    dup_in_batch = true;
+                    break;
+                }
+            }
+            if (dup_in_batch) continue;
+            try newly_discovered.append(allocator, try allocator.dupe(u8, fp));
+        }
+
+        if (newly_discovered.items.len == 0) {
+            newly_discovered.deinit(allocator);
+            break;
+        }
+
+        host_mod.TypeScriptHost.freeValue(@TypeOf(graph_res), allocator, graph_res);
+        graph_res_active = false;
+
+        for (newly_discovered.items) |owned_fp| {
+            try extract_roots.append(allocator, owned_fp);
+            try extract_roots_set.put(allocator, owned_fp, {});
+            try extract_root_slices.append(allocator, owned_fp);
+        }
+        newly_discovered.deinit(allocator);
+
+        graph_res = ts_host.extractModuleGraph(
+            allocator,
+            prog,
+            host_mod.defaultExtractConfig(extract_root_slices.items),
+        ) catch |err| {
+            return .{ .err = try std.fmt.allocPrint(allocator, "Failed to extract TypeScript declaration graph: {s}", .{@errorName(err)}) };
+        };
+        graph_res_active = true;
+    }
 
     const graph_val = switch (graph_res) {
         .ok => |g| g,
@@ -713,6 +900,7 @@ pub fn runPipelineWithHost(
 
     var pkg_ir = ir.lowerGraph(allocator, graph_val, .{
         .base_dir = loaded.base_dir,
+        .primary_vfs_paths = loaded.root_vfs_paths,
         .modules = opts.modules,
         .substitutions = opts.substitutions,
     }) catch |err| switch (err) {
