@@ -385,6 +385,7 @@ fn LowerCtx(comptime GraphType: type) type {
             rel_zig_path: []const u8,
             source_mod_ids: std.ArrayList(u32) = .empty,
             decl_ids: std.ArrayList(u32) = .empty,
+            exported_decl_ids: std.ArrayList(u32) = .empty,
             foreign_exports: std.ArrayList(ForeignExportEntry) = .empty,
             star_re_export_source_mods: std.ArrayList(u32) = .empty,
             star_re_export_specs: std.ArrayList([]const u8) = .empty,
@@ -404,8 +405,8 @@ fn LowerCtx(comptime GraphType: type) type {
         };
 
         const StarExportItem = struct {
-            target_mod_idx: u32,
             decl_id: u32,
+            wire_name_override: ?[]const u8 = null,
         };
 
         const PlannedReExport = struct {
@@ -440,6 +441,7 @@ fn LowerCtx(comptime GraphType: type) type {
             for (self.candidates.items) |*c| {
                 c.source_mod_ids.deinit(self.scratch);
                 c.decl_ids.deinit(self.scratch);
+                c.exported_decl_ids.deinit(self.scratch);
                 c.foreign_exports.deinit(self.scratch);
                 c.star_re_export_source_mods.deinit(self.scratch);
                 c.star_re_export_specs.deinit(self.scratch);
@@ -668,6 +670,26 @@ fn LowerCtx(comptime GraphType: type) type {
             }
         }
 
+        fn resolveOrCreateOwnerCandForFileMod(self: *Self, owner_mod: anytype) !u32 {
+            if (self.source_mod_to_cand.get(owner_mod.id)) |existing| return existing;
+            // If `owner_mod` is an ambient-only `.d.ts` file (no ES exports / `export =` / globals),
+            // keep unexported helper declarations inside its ambient module candidate rather than
+            // synthesizing a bogus file-named `.zig` stub!
+            if (owner_mod.ambient_modules.len > 0 and
+                owner_mod.exports.len == 0 and
+                owner_mod.star_re_exports.len == 0 and
+                owner_mod.default_export == null and
+                owner_mod.export_equals == null and
+                owner_mod.global_augmentations.len == 0)
+            {
+                if (try self.findAmbientCandidateIdx(self.str(owner_mod.ambient_modules[0].module_name))) |amb_c| {
+                    return amb_c;
+                }
+            }
+            const ws = try self.deriveFileLogicalSpecifier(owner_mod);
+            return try self.getOrCreateCandidate(ws, owner_mod.id);
+        }
+
         fn registerCandidateDeclOrForeignExport(
             self: *Self,
             c_idx: u32,
@@ -681,7 +703,10 @@ fn LowerCtx(comptime GraphType: type) type {
 
             if (d.kind == .re_export_decl) {
                 const eff_name = if (d.export_name) |esid| self.str(esid) else self.str(d.name);
-                if (std.mem.eql(u8, eff_name, "*")) {
+                if (d.kind.re_export_decl.is_namespace and std.mem.eql(u8, eff_name, "*")) {
+                    if (!self.decl_to_cand.contains(did)) {
+                        try self.decl_to_cand.put(self.scratch, did, c_idx);
+                    }
                     if (d.kind.re_export_decl.target_module) |tmid| {
                         try appendUniqueU32(
                             &self.candidates.items[c_idx].star_re_export_source_mods,
@@ -705,11 +730,17 @@ fn LowerCtx(comptime GraphType: type) type {
                     return;
                 }
                 try appendUniqueU32(&self.candidates.items[c_idx].decl_ids, self.scratch, did);
+                if (!is_default_export and !d.modifiers.default_export) {
+                    try appendUniqueU32(&self.candidates.items[c_idx].exported_decl_ids, self.scratch, did);
+                }
                 try self.appendDeclRecursiveToCand(did, c_idx);
                 return;
             }
             if (d.kind == .import_equals_decl) {
                 try appendUniqueU32(&self.candidates.items[c_idx].decl_ids, self.scratch, did);
+                if (d.modifiers.export_decl and !is_default_export and !d.modifiers.default_export) {
+                    try appendUniqueU32(&self.candidates.items[c_idx].exported_decl_ids, self.scratch, did);
+                }
                 try self.appendDeclRecursiveToCand(did, c_idx);
                 return;
             }
@@ -721,11 +752,11 @@ fn LowerCtx(comptime GraphType: type) type {
                 } else if (self.findGraphModuleIndexById(d.module)) |om_idx| {
                     const owner_mod = self.graph.modules[om_idx];
                     if (!self.isBundledLibModule(owner_mod)) {
-                        owner_cand = self.source_mod_to_cand.get(owner_mod.id) orelse blk: {
-                            const ws = try self.deriveFileLogicalSpecifier(owner_mod);
-                            break :blk try self.getOrCreateCandidate(ws, owner_mod.id);
-                        };
+                        owner_cand = try self.resolveOrCreateOwnerCandForFileMod(owner_mod);
                         try self.registerCanonicalDeclInCandidate(owner_cand, did);
+                        if (!d.modifiers.default_export and !self.ns_child_ids.contains(did)) {
+                            try appendUniqueU32(&self.candidates.items[owner_cand].exported_decl_ids, self.scratch, did);
+                        }
                     } else {
                         owner_cand = c_idx;
                     }
@@ -736,6 +767,9 @@ fn LowerCtx(comptime GraphType: type) type {
 
             if (owner_cand == c_idx) {
                 try self.registerCanonicalDeclInCandidate(c_idx, did);
+                if (!is_default_export and !d.modifiers.default_export and !self.ns_child_ids.contains(did)) {
+                    try appendUniqueU32(&self.candidates.items[c_idx].exported_decl_ids, self.scratch, did);
+                }
             } else {
                 try appendUniqueForeignExport(&self.candidates.items[c_idx].foreign_exports, self.scratch, .{
                     .decl_id = did,
@@ -848,10 +882,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 const owner_mod = self.graph.modules[mod_idx];
                 if (self.isBundledLibModule(owner_mod)) continue;
 
-                const c_idx = self.source_mod_to_cand.get(owner_mod.id) orelse blk: {
-                    const wire_spec = try self.deriveFileLogicalSpecifier(owner_mod);
-                    break :blk try self.getOrCreateCandidate(wire_spec, owner_mod.id);
-                };
+                const c_idx = try self.resolveOrCreateOwnerCandForFileMod(owner_mod);
                 try appendUniqueU32(&self.candidates.items[c_idx].decl_ids, self.scratch, d.id);
                 try self.appendDeclRecursiveToCand(d.id, c_idx);
             }
@@ -1024,14 +1055,10 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                     } else if (re.target_module == null) {
                         const mspec = self.str(re.module_specifier);
-                        if (mspec.len > 0) {
-                            for (self.candidates.items, 0..) |*cand, idx| {
-                                if (moduleMatchesPattern(cand.wire_specifier, cand.substituted_specifier, mspec)) {
-                                    if (!cand.included) {
-                                        cand.included = true;
-                                        try queue.append(self.scratch, @intCast(idx));
-                                    }
-                                }
+                        if (try self.resolveSpecToCandidateIdx(mspec)) |dep_cand| {
+                            if (!self.candidates.items[dep_cand].included) {
+                                self.candidates.items[dep_cand].included = true;
+                                try queue.append(self.scratch, dep_cand);
                             }
                         }
                     }
@@ -1046,12 +1073,10 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                     } else if (ie.module_specifier) |msid| {
                         const mspec = self.str(msid);
-                        for (self.candidates.items, 0..) |*cand, idx| {
-                            if (moduleMatchesPattern(cand.wire_specifier, cand.substituted_specifier, mspec)) {
-                                if (!cand.included) {
-                                    cand.included = true;
-                                    try queue.append(self.scratch, @intCast(idx));
-                                }
+                        if (try self.resolveSpecToCandidateIdx(mspec)) |dep_cand| {
+                            if (!self.candidates.items[dep_cand].included) {
+                                self.candidates.items[dep_cand].included = true;
+                                try queue.append(self.scratch, dep_cand);
                             }
                         }
                     }
@@ -1122,12 +1147,10 @@ fn LowerCtx(comptime GraphType: type) type {
                 const star_specs = try self.scratch.dupe([]const u8, self.candidates.items[c_idx].star_re_export_specs.items);
                 defer self.scratch.free(star_specs);
                 for (star_specs) |mspec| {
-                    for (self.candidates.items, 0..) |*cand, idx| {
-                        if (moduleMatchesPattern(cand.wire_specifier, cand.substituted_specifier, mspec)) {
-                            if (!cand.included) {
-                                cand.included = true;
-                                try queue.append(self.scratch, @intCast(idx));
-                            }
+                    if (try self.resolveSpecToCandidateIdx(mspec)) |dep_cand| {
+                        if (!self.candidates.items[dep_cand].included) {
+                            self.candidates.items[dep_cand].included = true;
+                            try queue.append(self.scratch, dep_cand);
                         }
                     }
                 }
@@ -1167,6 +1190,31 @@ fn LowerCtx(comptime GraphType: type) type {
                     return @intCast(idx);
                 }
             }
+            return null;
+        }
+
+        fn resolveSpecToCandidateIdx(self: *Self, mspec: []const u8) error{OutOfMemory}!?u32 {
+            const trimmed = std.mem.trim(u8, mspec, " \t\r\n");
+            if (trimmed.len == 0) return null;
+
+            for (self.candidates.items, 0..) |cand, idx| {
+                if (std.mem.eql(u8, cand.wire_specifier, trimmed) or
+                    std.mem.eql(u8, cand.substituted_specifier, trimmed))
+                {
+                    return @intCast(idx);
+                }
+            }
+
+            if (try self.findAmbientCandidateIdx(trimmed)) |amb_idx| {
+                return amb_idx;
+            }
+
+            for (self.candidates.items, 0..) |cand, idx| {
+                if (moduleMatchesPattern(cand.wire_specifier, cand.substituted_specifier, trimmed)) {
+                    return @intCast(idx);
+                }
+            }
+
             return null;
         }
 
@@ -1403,7 +1451,9 @@ fn LowerCtx(comptime GraphType: type) type {
                 if (self.merged_ns_consumed.contains(did)) continue;
 
                 const d = self.graph.decls[did];
+                if (d.kind == .import_equals_decl and !d.modifiers.export_decl) continue;
                 const wire = if (d.export_name) |esid| self.str(esid) else self.str(d.name);
+                if (d.kind == .re_export_decl and d.kind.re_export_decl.is_namespace and std.mem.eql(u8, wire, "*")) continue;
                 const bound = try scope.bind(wire, self.declNameStyle(d));
 
                 // Duplicate into arena so `PackageIr` owns all strings.
@@ -2589,19 +2639,10 @@ fn LowerCtx(comptime GraphType: type) type {
                     });
                 },
                 .re_export_decl => |re| {
+                    const eff_name = if (d.export_name) |esid| self.str(esid) else self.str(d.name);
+                    if (re.is_namespace and std.mem.eql(u8, eff_name, "*")) return;
                     if (re.is_namespace) {
-                        const resolved_target_mod: ?u32 = if (re.target_module) |tmid|
-                            self.resolveFinalModFromSourceMod(tmid)
-                        else blk: {
-                            const mspec = self.str(re.module_specifier);
-                            if (mspec.len > 0) {
-                                if (try self.findAmbientCandidateIdx(mspec)) |amb_cand| {
-                                    break :blk self.candToFinalIndex(amb_cand);
-                                }
-                            }
-                            break :blk null;
-                        };
-                        if (resolved_target_mod) |t_mod_idx| {
+                        if (try self.resolveNamespaceReExportTargetMod(re)) |t_mod_idx| {
                             if (t_mod_idx != final_mod_idx) {
                                 try imports_used.put(self.scratch, t_mod_idx, {});
                                 try out_list.append(self.alloc, .{
@@ -2618,38 +2659,36 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                         return;
                     }
-                    if (re.target_decl) |tdid| {
-                        if (self.decl_locations.get(tdid)) |loc| {
-                            const is_self_noop = loc.module_index == final_mod_idx and
-                                loc.zig_path.len == 1 and
-                                std.mem.eql(u8, loc.zig_path[0], bound.zig_ident);
-                            if (!is_self_noop and loc.zig_path.len > 0) {
-                                if (loc.module_index != final_mod_idx) {
-                                    try imports_used.put(self.scratch, loc.module_index, {});
-                                }
-                                try out_list.append(self.alloc, .{
-                                    .source_decl_id = decl_id,
-                                    .zig_ident = bound.zig_ident,
-                                    .logical_name = bound.logical_name,
-                                    .wire_name = bound.wire_name,
-                                    .is_exported = true,
-                                    .is_default_export = is_default_export,
-                                    .jsdoc = top_jsdoc,
-                                    .kind = .{
-                                        .re_export_decl = .{
-                                            .target_module_index = loc.module_index,
-                                            .target_zig_path = loc.zig_path,
-                                        },
-                                    },
-                                });
+                    if (try self.resolveNamedReExportTargetLoc(d, re, 0)) |loc| {
+                        const is_self_noop = loc.module_index == final_mod_idx and
+                            loc.zig_path.len == 1 and
+                            std.mem.eql(u8, loc.zig_path[0], bound.zig_ident);
+                        if (!is_self_noop and loc.zig_path.len > 0) {
+                            if (loc.module_index != final_mod_idx) {
+                                try imports_used.put(self.scratch, loc.module_index, {});
                             }
+                            try out_list.append(self.alloc, .{
+                                .source_decl_id = decl_id,
+                                .zig_ident = bound.zig_ident,
+                                .logical_name = bound.logical_name,
+                                .wire_name = bound.wire_name,
+                                .is_exported = true,
+                                .is_default_export = is_default_export,
+                                .jsdoc = top_jsdoc,
+                                .kind = .{
+                                    .re_export_decl = .{
+                                        .target_module_index = loc.module_index,
+                                        .target_zig_path = loc.zig_path,
+                                    },
+                                },
+                            });
                         }
                     }
                 },
                 .import_equals_decl => |ie| {
                     if (!d.modifiers.export_decl) return;
                     if (ie.target_decl) |tdid| {
-                        if (self.decl_locations.get(tdid)) |loc| {
+                        if (try self.resolveEffectiveReExportTarget(tdid, 0)) |loc| {
                             const is_self_noop = loc.module_index == final_mod_idx and
                                 loc.zig_path.len == 1 and
                                 std.mem.eql(u8, loc.zig_path[0], bound.zig_ident);
@@ -2675,25 +2714,21 @@ fn LowerCtx(comptime GraphType: type) type {
                             }
                         }
                     } else if (ie.module_specifier) |msid| {
-                        const mspec = self.str(msid);
-                        for (self.candidates.items, 0..) |cand, c_idx| {
-                            if (moduleMatchesPattern(cand.wire_specifier, cand.substituted_specifier, mspec)) {
-                                if (self.candToFinalIndex(@intCast(c_idx))) |t_mod_idx| {
-                                    if (t_mod_idx != final_mod_idx) {
-                                        try imports_used.put(self.scratch, t_mod_idx, {});
-                                        try out_list.append(self.alloc, .{
-                                            .source_decl_id = decl_id,
-                                            .zig_ident = bound.zig_ident,
-                                            .logical_name = bound.logical_name,
-                                            .wire_name = bound.wire_name,
-                                            .is_exported = true,
-                                            .is_default_export = is_default_export,
-                                            .jsdoc = top_jsdoc,
-                                            .kind = .{ .namespace_re_export = .{ .target_module_index = t_mod_idx } },
-                                        });
-                                    }
+                        if (try self.resolveSpecToCandidateIdx(self.str(msid))) |c_idx| {
+                            if (self.candToFinalIndex(c_idx)) |t_mod_idx| {
+                                if (t_mod_idx != final_mod_idx) {
+                                    try imports_used.put(self.scratch, t_mod_idx, {});
+                                    try out_list.append(self.alloc, .{
+                                        .source_decl_id = decl_id,
+                                        .zig_ident = bound.zig_ident,
+                                        .logical_name = bound.logical_name,
+                                        .wire_name = bound.wire_name,
+                                        .is_exported = true,
+                                        .is_default_export = is_default_export,
+                                        .jsdoc = top_jsdoc,
+                                        .kind = .{ .namespace_re_export = .{ .target_module_index = t_mod_idx } },
+                                    });
                                 }
-                                break;
                             }
                         }
                     }
@@ -2988,27 +3023,181 @@ fn LowerCtx(comptime GraphType: type) type {
             return null;
         }
 
-        fn collectStarReExports(
-            self: *const Self,
+        fn resolveNamespaceReExportTargetMod(self: *Self, re: anytype) error{OutOfMemory}!?u32 {
+            if (re.target_module) |tmid| {
+                return self.resolveFinalModFromSourceMod(tmid);
+            }
+            const mspec = self.str(re.module_specifier);
+            if (try self.resolveSpecToCandidateIdx(mspec)) |amb_cand| {
+                return self.candToFinalIndex(amb_cand);
+            }
+            return null;
+        }
+
+        fn resolveNamedReExportTargetLoc(
+            self: *Self,
+            d: anytype,
+            re: anytype,
+            depth: usize,
+        ) error{OutOfMemory}!?DeclLocation {
+            if (depth > 64) return null;
+            if (re.target_decl) |tdid| {
+                return try self.resolveEffectiveReExportTarget(tdid, depth + 1);
+            }
+            const target_cand_opt: ?u32 = if (re.target_module) |tmid|
+                self.source_mod_to_cand.get(tmid)
+            else
+                try self.resolveSpecToCandidateIdx(self.str(re.module_specifier));
+
+            const target_cand_idx = target_cand_opt orelse return null;
+            const orig_name = self.str(d.name);
+            if (orig_name.len == 0) return null;
+
+            const tcand = &self.candidates.items[target_cand_idx];
+            for (tcand.exported_decl_ids.items) |edid| {
+                if (edid >= self.graph.decls.len) continue;
+                const ed = self.graph.decls[edid];
+                const ew = if (ed.export_name) |esid| self.str(esid) else self.str(ed.name);
+                if (std.mem.eql(u8, ew, orig_name)) {
+                    return try self.resolveEffectiveReExportTarget(edid, depth + 1);
+                }
+            }
+            for (tcand.foreign_exports.items) |fe| {
+                if (fe.is_default_export or fe.decl_id >= self.graph.decls.len) continue;
+                const fd = self.graph.decls[fe.decl_id];
+                const fw = fe.wire_name_override orelse (if (fd.export_name) |esid| self.str(esid) else self.str(fd.name));
+                if (std.mem.eql(u8, fw, orig_name)) {
+                    return try self.resolveEffectiveReExportTarget(fe.decl_id, depth + 1);
+                }
+            }
+            return null;
+        }
+
+        fn resolveEffectiveReExportTarget(self: *Self, did: u32, depth: usize) error{OutOfMemory}!?DeclLocation {
+            if (depth > 64 or did >= self.graph.decls.len) return null;
+            const d = self.graph.decls[did];
+            switch (d.kind) {
+                .re_export_decl => |re| {
+                    const eff_name = if (d.export_name) |esid| self.str(esid) else self.str(d.name);
+                    if (re.is_namespace and std.mem.eql(u8, eff_name, "*")) return null;
+                    if (re.is_namespace) {
+                        const owner_loc = self.decl_locations.get(did) orelse return null;
+                        if (try self.resolveNamespaceReExportTargetMod(re)) |t_mod_idx| {
+                            if (t_mod_idx != owner_loc.module_index) return owner_loc;
+                        }
+                        return null;
+                    }
+                    return try self.resolveNamedReExportTargetLoc(d, re, depth + 1);
+                },
+                .import_equals_decl => |ie| {
+                    if (!d.modifiers.export_decl) return null;
+                    if (ie.target_decl) |tdid| {
+                        return try self.resolveEffectiveReExportTarget(tdid, depth + 1);
+                    }
+                    if (ie.module_specifier) |msid| {
+                        const owner_loc = self.decl_locations.get(did) orelse return null;
+                        if (try self.resolveSpecToCandidateIdx(self.str(msid))) |c_idx| {
+                            if (self.candToFinalIndex(c_idx)) |t_mod_idx| {
+                                if (t_mod_idx != owner_loc.module_index) return owner_loc;
+                            }
+                        }
+                    }
+                    return null;
+                },
+                else => return self.decl_locations.get(did),
+            }
+        }
+
+        fn collectStarReExportsFromSourceMod(
+            self: *Self,
             source_mod_id: u32,
             self_final_mod_idx: u32,
             visited_source_mods: *std.AutoHashMapUnmanaged(u32, void),
+            visited_cands: *std.AutoHashMapUnmanaged(u32, void),
             out: *std.ArrayList(StarExportItem),
         ) error{OutOfMemory}!void {
-            if (source_mod_id >= self.graph.modules.len) return;
             if (visited_source_mods.contains(source_mod_id)) return;
             try visited_source_mods.put(self.scratch, source_mod_id, {});
 
-            const sm = self.graph.modules[source_mod_id];
-            if (self.resolveFinalModFromSourceMod(source_mod_id)) |t_final| {
+            if (self.findGraphModuleIndexById(source_mod_id)) |sm_idx| {
+                const sm = self.graph.modules[sm_idx];
+                if (self.resolveFinalModFromSourceMod(source_mod_id)) |t_final| {
+                    if (t_final != self_final_mod_idx) {
+                        for (sm.exports) |did| {
+                            try out.append(self.scratch, .{ .decl_id = did });
+                        }
+                    }
+                }
+                for (sm.star_re_exports) |next_sm| {
+                    try self.collectStarReExportsFromSourceMod(
+                        next_sm,
+                        self_final_mod_idx,
+                        visited_source_mods,
+                        visited_cands,
+                        out,
+                    );
+                }
+            }
+
+            if (self.source_mod_to_cand.get(source_mod_id)) |sc_idx| {
+                try self.collectStarReExportsFromCand(
+                    sc_idx,
+                    self_final_mod_idx,
+                    visited_source_mods,
+                    visited_cands,
+                    out,
+                );
+            }
+        }
+
+        fn collectStarReExportsFromCand(
+            self: *Self,
+            cand_idx: u32,
+            self_final_mod_idx: u32,
+            visited_source_mods: *std.AutoHashMapUnmanaged(u32, void),
+            visited_cands: *std.AutoHashMapUnmanaged(u32, void),
+            out: *std.ArrayList(StarExportItem),
+        ) error{OutOfMemory}!void {
+            if (cand_idx >= self.candidates.items.len) return;
+            if (visited_cands.contains(cand_idx)) return;
+            try visited_cands.put(self.scratch, cand_idx, {});
+
+            const cand = &self.candidates.items[cand_idx];
+            if (self.candToFinalIndex(cand_idx)) |t_final| {
                 if (t_final != self_final_mod_idx) {
-                    for (sm.exports) |did| {
-                        try out.append(self.scratch, .{ .target_mod_idx = t_final, .decl_id = did });
+                    for (cand.exported_decl_ids.items) |did| {
+                        try out.append(self.scratch, .{ .decl_id = did });
+                    }
+                    for (cand.foreign_exports.items) |fe| {
+                        if (!fe.is_default_export) {
+                            try out.append(self.scratch, .{
+                                .decl_id = fe.decl_id,
+                                .wire_name_override = fe.wire_name_override,
+                            });
+                        }
                     }
                 }
             }
-            for (sm.star_re_exports) |next_sm| {
-                try self.collectStarReExports(next_sm, self_final_mod_idx, visited_source_mods, out);
+
+            for (cand.star_re_export_source_mods.items) |smid| {
+                try self.collectStarReExportsFromSourceMod(
+                    smid,
+                    self_final_mod_idx,
+                    visited_source_mods,
+                    visited_cands,
+                    out,
+                );
+            }
+            for (cand.star_re_export_specs.items) |mspec| {
+                if (try self.resolveSpecToCandidateIdx(mspec)) |dep_cand| {
+                    try self.collectStarReExportsFromCand(
+                        dep_cand,
+                        self_final_mod_idx,
+                        visited_source_mods,
+                        visited_cands,
+                        out,
+                    );
+                }
             }
         }
 
@@ -3107,11 +3296,21 @@ fn LowerCtx(comptime GraphType: type) type {
                 var seen_non_default_decls: std.AutoHashMapUnmanaged(u32, void) = .empty;
                 defer seen_non_default_decls.deinit(self.scratch);
 
+                var seen_export_wires: std.StringHashMapUnmanaged(void) = .empty;
+                defer seen_export_wires.deinit(self.scratch);
+                for (cand.exported_decl_ids.items) |edid| {
+                    if (edid >= self.graph.decls.len) continue;
+                    const ed = self.graph.decls[edid];
+                    if (ed.modifiers.default_export) continue;
+                    const ew = if (ed.export_name) |esid| self.str(esid) else self.str(ed.name);
+                    if (ew.len > 0) try seen_export_wires.put(self.scratch, ew, {});
+                }
+
                 for (cand.foreign_exports.items) |fe| {
                     if (self.merged_ns_consumed.contains(fe.decl_id)) continue;
                     if (fe.decl_id >= self.graph.decls.len) continue;
                     const sd = self.graph.decls[fe.decl_id];
-                    const loc = self.decl_locations.get(fe.decl_id) orelse continue;
+                    const loc = (try self.resolveEffectiveReExportTarget(fe.decl_id, 0)) orelse continue;
                     if (loc.zig_path.len == 0 or loc.module_index == final_mod_idx) continue;
 
                     const export_wire = fe.wire_name_override orelse
@@ -3119,7 +3318,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     const style: naming.NameStyle = if (fe.wire_name_override != null) .preserve else self.declNameStyle(sd);
 
                     if (!fe.is_default_export) {
-                        if (seen_non_default_decls.contains(fe.decl_id)) continue;
+                        if (seen_non_default_decls.contains(fe.decl_id) or seen_export_wires.contains(export_wire)) continue;
                         const desired_styled = switch (style) {
                             .preserve => try self.scratch.dupe(u8, export_wire),
                             .camel => try naming.toCamelCase(self.scratch, export_wire),
@@ -3130,6 +3329,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         const base_check = if (desired_styled.len == 0) "_empty" else desired_styled;
                         if (ms.isTaken(base_check)) continue;
                         try seen_non_default_decls.put(self.scratch, fe.decl_id, {});
+                        if (export_wire.len > 0) try seen_export_wires.put(self.scratch, export_wire, {});
                     }
 
                     const sb = try ms.bind(export_wire, style);
@@ -3151,23 +3351,48 @@ fn LowerCtx(comptime GraphType: type) type {
                     try visited_star_smods.put(self.scratch, self_smid, {});
                 }
 
+                var visited_star_cands: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                defer visited_star_cands.deinit(self.scratch);
+                try visited_star_cands.put(self.scratch, cand_idx, {});
+
                 var star_items: std.ArrayList(StarExportItem) = .empty;
                 defer star_items.deinit(self.scratch);
                 for (cand.star_re_export_source_mods.items) |smid| {
-                    try self.collectStarReExports(smid, final_mod_idx, &visited_star_smods, &star_items);
+                    try self.collectStarReExportsFromSourceMod(
+                        smid,
+                        final_mod_idx,
+                        &visited_star_smods,
+                        &visited_star_cands,
+                        &star_items,
+                    );
+                }
+                for (cand.star_re_export_specs.items) |mspec| {
+                    if (try self.resolveSpecToCandidateIdx(mspec)) |dep_cand| {
+                        try self.collectStarReExportsFromCand(
+                            dep_cand,
+                            final_mod_idx,
+                            &visited_star_smods,
+                            &visited_star_cands,
+                            &star_items,
+                        );
+                    }
                 }
 
                 for (star_items.items) |item| {
-                    if (seen_non_default_decls.contains(item.decl_id)) continue;
                     if (self.merged_ns_consumed.contains(item.decl_id)) continue;
                     if (item.decl_id >= self.graph.decls.len) continue;
                     const sd = self.graph.decls[item.decl_id];
                     if (sd.modifiers.default_export) continue;
-                    const loc = self.decl_locations.get(item.decl_id) orelse continue;
+                    const loc = (try self.resolveEffectiveReExportTarget(item.decl_id, 0)) orelse continue;
                     if (loc.zig_path.len == 0 or loc.module_index == final_mod_idx) continue;
 
-                    const export_wire = if (sd.export_name) |esid| self.str(esid) else self.str(sd.name);
-                    const desired_styled = switch (self.declNameStyle(sd)) {
+                    const export_wire = item.wire_name_override orelse
+                        (if (sd.export_name) |esid| self.str(esid) else self.str(sd.name));
+                    if (seen_export_wires.contains(export_wire)) continue;
+                    if (item.wire_name_override == null and seen_non_default_decls.contains(item.decl_id)) continue;
+
+                    const style: naming.NameStyle = if (item.wire_name_override != null) .preserve else self.declNameStyle(sd);
+                    const desired_styled = switch (style) {
                         .preserve => try self.scratch.dupe(u8, export_wire),
                         .camel => try naming.toCamelCase(self.scratch, export_wire),
                         .pascal => try naming.toPascalCase(self.scratch, export_wire),
@@ -3178,9 +3403,14 @@ fn LowerCtx(comptime GraphType: type) type {
 
                     // `export *` in TypeScript does NOT override a direct export of the same name.
                     if (ms.isTaken(base_check)) continue;
-                    try seen_non_default_decls.put(self.scratch, item.decl_id, {});
+                    if (item.wire_name_override == null) {
+                        try seen_non_default_decls.put(self.scratch, item.decl_id, {});
+                    }
+                    if (export_wire.len > 0) {
+                        try seen_export_wires.put(self.scratch, export_wire, {});
+                    }
 
-                    const sb = try ms.bind(export_wire, self.declNameStyle(sd));
+                    const sb = try ms.bind(export_wire, style);
                     try planned_re_exports[final_i].append(self.scratch, .{
                         .source_decl_id = item.decl_id,
                         .zig_ident = try self.alloc.dupe(u8, sb.zig_ident),

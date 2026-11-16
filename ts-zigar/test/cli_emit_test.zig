@@ -1401,3 +1401,268 @@ test "Regression Round 3: @types/node reference-path ambient closure, mixed ES+a
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", r_empty_zig });
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
 }
+
+test "Regression Round 4: ambient export * from '...' inside declare module expands symbols without leaking @\"*\" or file stubs" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-r4-amb-star", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    // 1. Multi-`-t` (`-t globals.d.ts -t index.d.ts` where `globals.d.ts` has `declare module "x-core"`
+    //    and `declare module "x" { export * from "x-core"; export * as coreNs from "x-core"; }`).
+    const multi_dir = try std.fmt.allocPrint(alloc, "{s}/multi-star", .{sandbox});
+    defer alloc.free(multi_dir);
+    const out_multi = try std.fmt.allocPrint(alloc, "{s}/out-multi-star", .{sandbox});
+    defer alloc.free(out_multi);
+    try cwd.createDirPath(io, multi_dir);
+
+    {
+        var md = try cwd.openDir(io, multi_dir, .{});
+        defer md.close(io);
+        try md.writeFile(io, .{
+            .sub_path = "globals.d.ts",
+            .data =
+            \\declare module "x-core" {
+            \\  export interface XConfig {
+            \\    retries: number;
+            \\  }
+            \\  export function runCore(cfg: XConfig): boolean;
+            \\}
+            \\declare module "x" {
+            \\  export * from "x-core";
+            \\  export * as coreNs from "x-core";
+            \\}
+            ,
+        });
+        try md.writeFile(io, .{
+            .sub_path = "index.d.ts",
+            .data =
+            \\export interface EntryItem {
+            \\  title: string;
+            \\}
+            ,
+        });
+    }
+
+    {
+        const globals_dts = try std.fmt.allocPrint(alloc, "{s}/globals.d.ts", .{multi_dir});
+        defer alloc.free(globals_dts);
+        const index_dts = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{multi_dir});
+        defer alloc.free(index_dts);
+        const cli_args = [_][]const u8{ "-t", globals_dts, "-t", index_dts, "-d", out_multi };
+        var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+        defer parsed.deinit(alloc);
+        var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+        defer res.deinit(alloc);
+        if (res == .err) {
+            std.debug.print("Round 4 Subcase 1 error: {s}\n", .{res.err});
+        }
+        try std.testing.expect(res == .ok);
+
+        var out_h = try cwd.openDir(io, out_multi, .{});
+        defer out_h.close(io);
+        try std.testing.expectError(error.FileNotFound, out_h.statFile(io, "globals.zig", .{}));
+    }
+
+    // 2. Mixed `index.d.ts` with `export interface A`, `declare module "inline-core"`, and
+    //    `declare module "inline-mod" { export * from "inline-core"; }`.
+    const mixed_dir = try std.fmt.allocPrint(alloc, "{s}/mixed-star", .{sandbox});
+    defer alloc.free(mixed_dir);
+    const out_mixed = try std.fmt.allocPrint(alloc, "{s}/out-mixed-star", .{sandbox});
+    defer alloc.free(out_mixed);
+    try cwd.createDirPath(io, mixed_dir);
+
+    {
+        var mxd = try cwd.openDir(io, mixed_dir, .{});
+        defer mxd.close(io);
+        try mxd.writeFile(io, .{
+            .sub_path = "index.d.ts",
+            .data =
+            \\export interface A {
+            \\  id: number;
+            \\}
+            \\declare module "inline-core" {
+            \\  export function core(): number;
+            \\  export interface CoreItem {
+            \\    tag: string;
+            \\  }
+            \\}
+            \\declare module "inline-mod" {
+            \\  export * from "inline-core";
+            \\}
+            ,
+        });
+    }
+
+    {
+        const mixed_index = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{mixed_dir});
+        defer alloc.free(mixed_index);
+        const cli_args = [_][]const u8{ "-t", mixed_index, "-d", out_mixed };
+        var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+        defer parsed.deinit(alloc);
+        var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+        defer res.deinit(alloc);
+        if (res == .err) {
+            std.debug.print("Round 4 Subcase 2 error: {s}\n", .{res.err});
+        }
+        try std.testing.expect(res == .ok);
+    }
+
+    // 3. Reference-only `index.d.ts` -> `a.d.ts` (`declare module "liba"`) + `b.d.ts`
+    //    (`declare module "libb" { export * from "liba"; }` where filename `b.d.ts` != `"libb"`) +
+    //    `c.d.ts` (mutual `export *` cycle `mut-a <-> mut-b`).
+    const ref_dir = try std.fmt.allocPrint(alloc, "{s}/ref-star", .{sandbox});
+    defer alloc.free(ref_dir);
+    const out_ref = try std.fmt.allocPrint(alloc, "{s}/out-ref-star", .{sandbox});
+    defer alloc.free(out_ref);
+    try cwd.createDirPath(io, ref_dir);
+
+    {
+        var rd = try cwd.openDir(io, ref_dir, .{});
+        defer rd.close(io);
+        try rd.writeFile(io, .{
+            .sub_path = "index.d.ts",
+            .data =
+            \\/// <reference path="a.d.ts" />
+            \\/// <reference path="b.d.ts" />
+            \\/// <reference path="c.d.ts" />
+            ,
+        });
+        try rd.writeFile(io, .{
+            .sub_path = "a.d.ts",
+            .data =
+            \\declare module "liba" {
+            \\  interface InternalHelper {
+            \\    secret: number;
+            \\  }
+            \\  export interface LibItem {
+            \\    name: string;
+            \\    helper?: InternalHelper;
+            \\  }
+            \\  export function makeItem(name: string): LibItem;
+            \\  export {};
+            \\}
+            ,
+        });
+        try rd.writeFile(io, .{
+            .sub_path = "b.d.ts",
+            .data =
+            \\declare module "libb" {
+            \\  export * from "liba";
+            \\}
+            ,
+        });
+        try rd.writeFile(io, .{
+            .sub_path = "c.d.ts",
+            .data =
+            \\declare module "mut-a" {
+            \\  export interface MutA {
+            \\    a: number;
+            \\  }
+            \\  export * from "mut-b";
+            \\}
+            \\declare module "mut-b" {
+            \\  export interface MutB {
+            \\    b: string;
+            \\  }
+            \\  export * from "mut-a";
+            \\}
+            ,
+        });
+    }
+
+    {
+        const ref_index = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{ref_dir});
+        defer alloc.free(ref_index);
+        const cli_args = [_][]const u8{ "-t", ref_index, "-d", out_ref };
+        var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+        defer parsed.deinit(alloc);
+        var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+        defer res.deinit(alloc);
+        if (res == .err) {
+            std.debug.print("Round 4 Subcase 3 error: {s}\n", .{res.err});
+        }
+        try std.testing.expect(res == .ok);
+
+        var out_h = try cwd.openDir(io, out_ref, .{});
+        defer out_h.close(io);
+        // None of `index.zig`, `a.zig`, `b.zig`, or `c.zig` may be emitted as file stubs!
+        try std.testing.expectError(error.FileNotFound, out_h.statFile(io, "index.zig", .{}));
+        try std.testing.expectError(error.FileNotFound, out_h.statFile(io, "a.zig", .{}));
+        try std.testing.expectError(error.FileNotFound, out_h.statFile(io, "b.zig", .{}));
+        try std.testing.expectError(error.FileNotFound, out_h.statFile(io, "c.zig", .{}));
+    }
+
+    const consumer_zig = try std.fmt.allocPrint(alloc, "{s}/consumer_r4.zig", .{sandbox});
+    defer alloc.free(consumer_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "consumer_r4.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r_multi = @import("out-multi-star/root.zig");
+            \\const r_mixed = @import("out-mixed-star/root.zig");
+            \\const r_ref = @import("out-ref-star/root.zig");
+            \\
+            \\test "Round 4: ambient export * expands symbols and never leaks @\"*\" or file stubs" {
+            \\    // 1. Multi -t: no `globals` or `"*"`, `r_multi.x` re-exports `XConfig`, `runCore`, and `coreNs`!
+            \\    try std.testing.expect(!@hasDecl(r_multi, "globals"));
+            \\    try std.testing.expect(!@hasDecl(r_multi, "*"));
+            \\    try std.testing.expect(!@hasDecl(r_multi.x, "*"));
+            \\    try std.testing.expect(r_multi.x.XConfig == r_multi.x_core.XConfig);
+            \\    try std.testing.expect(&r_multi.x.runCore == &r_multi.x_core.runCore);
+            \\    try std.testing.expect(@hasDecl(r_multi.x, "coreNs"));
+            \\    try std.testing.expect(r_multi.x.coreNs.XConfig == r_multi.x_core.XConfig);
+            \\
+            \\    // 2. Mixed index.d.ts: no `"*"` anywhere, `r_mixed.inline_mod` re-exports `core` and `CoreItem`!
+            \\    try std.testing.expect(!@hasDecl(r_mixed, "*"));
+            \\    try std.testing.expect(!@hasDecl(r_mixed.index, "*"));
+            \\    try std.testing.expect(!@hasDecl(r_mixed.inline_mod, "*"));
+            \\    try std.testing.expect(r_mixed.A == r_mixed.index.A);
+            \\    try std.testing.expect(@hasDecl(r_mixed.inline_mod, "core"));
+            \\    try std.testing.expect(&r_mixed.inline_mod.core == &r_mixed.inline_core.core);
+            \\    try std.testing.expect(r_mixed.inline_mod.CoreItem == r_mixed.inline_core.CoreItem);
+            \\
+            \\    // 3. Reference-only index.d.ts -> a.d.ts + b.d.ts + c.d.ts:
+            \\    //    no file stubs, nominal type identity across `libb -> liba`, internal helper not re-exported,
+            \\    //    and cycle-safe mutual `export *` (`mut_a <-> mut_b`)!
+            \\    try std.testing.expect(!@hasDecl(r_ref, "*"));
+            \\    try std.testing.expect(!@hasDecl(r_ref, "index"));
+            \\    try std.testing.expect(!@hasDecl(r_ref, "a"));
+            \\    try std.testing.expect(!@hasDecl(r_ref, "b"));
+            \\    try std.testing.expect(!@hasDecl(r_ref, "c"));
+            \\    try std.testing.expect(r_ref.libb.LibItem == r_ref.liba.LibItem);
+            \\    try std.testing.expect(&r_ref.libb.makeItem == &r_ref.liba.makeItem);
+            \\    try std.testing.expect(!@hasDecl(r_ref.libb, "InternalHelper"));
+            \\    try std.testing.expect(r_ref.mut_a.MutB == r_ref.mut_b.MutB);
+            \\    try std.testing.expect(r_ref.mut_b.MutA == r_ref.mut_a.MutA);
+            \\}
+            ,
+        });
+    }
+
+    const r_multi_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_multi});
+    defer alloc.free(r_multi_zig);
+    const r_mixed_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_mixed});
+    defer alloc.free(r_mixed_zig);
+    const r_ref_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_ref});
+    defer alloc.free(r_ref_zig);
+
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", r_multi_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", r_mixed_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", r_ref_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
+}
