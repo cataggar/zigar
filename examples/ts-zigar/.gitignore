@@ -1,0 +1,9 @@
+*.wasm
+*.wasm.stamp
+.zig-cache/
+zig-cache/
+zig-out/
+.cache/
+.zigar-cache/
+node_modules/
+generated_ts.zig
