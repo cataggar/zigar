@@ -63,7 +63,15 @@ pub const JsModuleNode = struct {
 
 pub const CallbackFlags = packed struct(u32) {
     async_call: bool = false,
-    _: u31 = 0,
+    once: bool = false,
+    _: u30 = 0,
+};
+
+pub const LastErrorOp = enum(u32) {
+    peek = 0,
+    take = 1,
+    has = 2,
+    clear = 3,
 };
 
 pub const HostOpDescriptor = extern struct {
@@ -95,6 +103,7 @@ pub const reserved_null_handle: u32 = 1;
 pub const reserved_false_handle: u32 = 2;
 pub const reserved_true_handle: u32 = 3;
 pub const reserved_global_this_handle: u32 = 4;
+pub const no_captured_error_handle: u32 = 7;
 pub const first_dynamic_slot: u32 = 8;
 
 fn isCallbackWrapper(comptime T: type) bool {
@@ -111,7 +120,10 @@ fn extractHandle(value: anytype) u32 {
     if (V == @TypeOf(undefined)) return reserved_undefined_handle;
     if (V == bool) return if (value) reserved_true_handle else reserved_false_handle;
     if (comptime isCallbackWrapper(V)) {
-        return value.func.handle;
+        return switch (@typeInfo(V)) {
+            .pointer => value.*.func.handle,
+            else => value.func.handle,
+        };
     }
     if (comptime util.getInternalType(V) == .js_value) {
         return value.handle;
@@ -147,7 +159,7 @@ fn buildFnType(comptime params: []const type, comptime RT: type) type {
     return @Fn(&param_types, &param_attrs, RT, .{});
 }
 
-fn PrependParamsFn(comptime prefix: []const type, comptime FnSig: type) type {
+fn PrependParamsFn(comptime prefix: []const type, comptime FnSig: type, comptime CallbackRefT: type) type {
     const f = switch (@typeInfo(FnSig)) {
         .@"fn" => |fi| fi,
         else => @compileError("Expected a Zig function signature `fn (...) ...`, received " ++ @typeName(FnSig)),
@@ -176,7 +188,8 @@ fn PrependParamsFn(comptime prefix: []const type, comptime FnSig: type) type {
         out += 1;
     }
     for (f.param_types[extra_start..]) |maybe_pt| {
-        param_types[out] = maybe_pt.?;
+        const pt = maybe_pt.?;
+        param_types[out] = if (isCallbackWrapper(pt)) CallbackRefT else pt;
         param_attrs[out] = .{};
         out += 1;
     }
@@ -339,6 +352,7 @@ pub fn Js(comptime host: type) type {
         pub const reserved_false_handle = module.reserved_false_handle;
         pub const reserved_true_handle = module.reserved_true_handle;
         pub const reserved_global_this_handle = module.reserved_global_this_handle;
+        pub const no_captured_error_handle = module.no_captured_error_handle;
         pub const first_dynamic_slot = module.first_dynamic_slot;
 
         fn TypeRegistration(comptime T: type) type {
@@ -448,7 +462,10 @@ pub fn Js(comptime host: type) type {
             if (V == @TypeOf(null)) return Ref(module.Any).@"null";
             if (V == @TypeOf(undefined)) return Ref(module.Any).@"undefined";
             if (comptime isStringLiteralPtr(V)) return value[0..];
-            if (comptime isCallbackWrapper(V)) return value.func;
+            if (comptime isCallbackWrapper(V)) return switch (@typeInfo(V)) {
+                .pointer => value.*.func,
+                else => value.func,
+            };
             return value;
         }
 
@@ -554,7 +571,7 @@ pub fn Js(comptime host: type) type {
             inline for (prefix_info.field_types, 0..) |pt, i| {
                 prefix_types[i] = pt;
             }
-            const HostFn = PrependParamsFn(&prefix_types, FnSig);
+            const HostFn = PrependParamsFn(&prefix_types, FnSig, Ref(module.Function));
             const sig_info = @typeInfo(FnSig).@"fn";
             const user_info = switch (@typeInfo(@TypeOf(user_args))) {
                 .@"struct" => |si| si,
@@ -580,7 +597,9 @@ pub fn Js(comptime host: type) type {
                 out_idx += 1;
             }
             inline for (extra_start..sig_info.param_types.len) |ui| {
-                combined[out_idx] = coerceToParam(sig_info.param_types[ui].?, user_args[ui]);
+                const RawParamT = sig_info.param_types[ui].?;
+                const HostParamT = if (comptime isCallbackWrapper(RawParamT)) Ref(module.Function) else RawParamT;
+                combined[out_idx] = coerceToParam(HostParamT, user_args[ui]);
                 out_idx += 1;
             }
             return dispatchHostOp(op, flags, key_name, HostFn, combined);
@@ -600,6 +619,180 @@ pub fn Js(comptime host: type) type {
             }
             if (!isJsThread()) return error.OffJsThread;
             return host.getJsValueCount();
+        }
+
+        pub const JsException = struct {
+            const Self = @This();
+
+            raw: Ref(module.Any) = Ref(module.Any).@"undefined",
+
+            pub inline fn value(self: Self) Ref(module.Any) {
+                return self.raw;
+            }
+
+            pub inline fn intoValue(self: *Self) Ref(module.Any) {
+                const taken = self.raw;
+                self.raw = Ref(module.Any).@"undefined";
+                return taken;
+            }
+
+            pub fn deinit(self: anytype) void {
+                const T = @TypeOf(self);
+                switch (@typeInfo(T)) {
+                    .pointer => |pt| {
+                        if (pt.attrs.@"const") {
+                            self.raw.deinit();
+                        } else {
+                            const taken = self.raw;
+                            self.raw = Ref(module.Any).@"undefined";
+                            taken.deinit();
+                        }
+                    },
+                    else => self.raw.deinit(),
+                }
+            }
+
+            fn stringifyRefAlloc(allocator: std.mem.Allocator, val: Ref(module.Any)) module.Error![]const u8 {
+                return JsNs.callMethod(
+                    fn (std.mem.Allocator, Ref(module.Any)) module.Error![]const u8,
+                    Ref(module.Object).globalThis,
+                    "String",
+                    .{ allocator, val },
+                );
+            }
+
+            pub fn message(self: Self, allocator: std.mem.Allocator) module.Error!?[]const u8 {
+                if (!isJsThread()) return error.OffJsThread;
+                if (self.raw.isUndefined() or self.raw.isNull()) return null;
+                const ty = try self.raw.tryTypeof();
+                if (ty == .object or ty == .function) {
+                    const prop_ref = try JsNs.getProp(module.Error!Ref(module.Any), self.raw, "message");
+                    defer prop_ref.deinit();
+                    if (prop_ref.isUndefined() or prop_ref.isNull()) return null;
+                    return try stringifyRefAlloc(allocator, prop_ref);
+                }
+                return try stringifyRefAlloc(allocator, self.raw);
+            }
+
+            pub fn name(self: Self, allocator: std.mem.Allocator) module.Error!?[]const u8 {
+                if (!isJsThread()) return error.OffJsThread;
+                if (self.raw.isUndefined() or self.raw.isNull()) return null;
+                const ty = try self.raw.tryTypeof();
+                if (ty != .object and ty != .function) return null;
+                const prop_ref = try JsNs.getProp(module.Error!Ref(module.Any), self.raw, "name");
+                defer prop_ref.deinit();
+                if ((try prop_ref.tryTypeof()) != .string) return null;
+                return try stringifyRefAlloc(allocator, prop_ref);
+            }
+
+            pub fn code(self: Self, allocator: std.mem.Allocator) module.Error!?[]const u8 {
+                if (!isJsThread()) return error.OffJsThread;
+                if (self.raw.isUndefined() or self.raw.isNull()) return null;
+                const ty = try self.raw.tryTypeof();
+                if (ty != .object and ty != .function) return null;
+                const prop_ref = try JsNs.getProp(module.Error!Ref(module.Any), self.raw, "code");
+                defer prop_ref.deinit();
+                const prop_ty = try prop_ref.tryTypeof();
+                if (prop_ty != .string and prop_ty != .number and prop_ty != .bigint) return null;
+                return try stringifyRefAlloc(allocator, prop_ref);
+            }
+
+            pub fn stack(self: Self, allocator: std.mem.Allocator) module.Error!?[]const u8 {
+                if (!isJsThread()) return error.OffJsThread;
+                if (self.raw.isUndefined() or self.raw.isNull()) return null;
+                const ty = try self.raw.tryTypeof();
+                if (ty != .object and ty != .function) return null;
+                const prop_ref = try JsNs.getProp(module.Error!Ref(module.Any), self.raw, "stack");
+                defer prop_ref.deinit();
+                if ((try prop_ref.tryTypeof()) != .string) return null;
+                return try stringifyRefAlloc(allocator, prop_ref);
+            }
+        };
+
+        pub const CapturedError = JsException;
+
+        fn controlLastErrorImpl(op: module.LastErrorOp) module.Error!u32 {
+            if (@hasDecl(host, "tryControlLastJsError")) {
+                return host.tryControlLastJsError(@intFromEnum(op));
+            }
+            if (!isJsThread()) return error.OffJsThread;
+            if (@hasDecl(host, "controlLastJsError")) {
+                return host.controlLastJsError(@intFromEnum(op));
+            }
+            return error.HostUnavailable;
+        }
+
+        pub fn tryLastError() module.Error!?JsException {
+            const handle = try controlLastErrorImpl(.peek);
+            if (handle == module.no_captured_error_handle) return null;
+            return .{ .raw = .{ .handle = handle } };
+        }
+
+        pub fn lastError() ?JsException {
+            const handle = controlLastErrorImpl(.peek) catch |err| switch (err) {
+                error.OffJsThread => @panic("JsValue operations require the JS thread"),
+                else => return null,
+            };
+            if (handle == module.no_captured_error_handle) return null;
+            return .{ .raw = .{ .handle = handle } };
+        }
+
+        pub fn tryTakeLastError() module.Error!?JsException {
+            const handle = try controlLastErrorImpl(.take);
+            if (handle == module.no_captured_error_handle) return null;
+            return .{ .raw = .{ .handle = handle } };
+        }
+
+        pub fn takeLastError() ?JsException {
+            const handle = controlLastErrorImpl(.take) catch |err| switch (err) {
+                error.OffJsThread => @panic("JsValue operations require the JS thread"),
+                else => return null,
+            };
+            if (handle == module.no_captured_error_handle) return null;
+            return .{ .raw = .{ .handle = handle } };
+        }
+
+        pub fn tryHasLastError() module.Error!bool {
+            return (try controlLastErrorImpl(.has)) != 0;
+        }
+
+        pub fn hasLastError() bool {
+            const res = controlLastErrorImpl(.has) catch |err| switch (err) {
+                error.OffJsThread => @panic("JsValue operations require the JS thread"),
+                else => return false,
+            };
+            return res != 0;
+        }
+
+        pub fn tryClearLastError() module.Error!void {
+            _ = try controlLastErrorImpl(.clear);
+        }
+
+        pub fn clearLastError() void {
+            _ = controlLastErrorImpl(.clear) catch |err| switch (err) {
+                error.OffJsThread => @panic("JsValue operations require the JS thread"),
+                else => {},
+            };
+        }
+
+        pub fn dispose(resource: anytype) void {
+            const r: Ref(module.Any) = .{ .handle = extractHandle(resource) };
+            r.dispose();
+        }
+
+        pub fn tryDispose(resource: anytype) module.Error!void {
+            const r: Ref(module.Any) = .{ .handle = extractHandle(resource) };
+            return r.tryDispose();
+        }
+
+        pub fn asyncDispose(resource: anytype) void {
+            const r: Ref(module.Any) = .{ .handle = extractHandle(resource) };
+            r.asyncDispose();
+        }
+
+        pub fn tryAsyncDispose(resource: anytype) module.Error!void {
+            const r: Ref(module.Any) = .{ .handle = extractHandle(resource) };
+            return r.tryAsyncDispose();
         }
 
         pub inline fn global() Ref(module.Object) {
@@ -660,6 +853,10 @@ pub fn Js(comptime host: type) type {
                 pub const module_specifier = specifier;
                 pub const is_js_module_descriptor = true;
 
+                fn resolveAs(comptime ESet: type) ESet!Ref(module.Object) {
+                    return JsNs.importModuleAs(ESet!Ref(module.Object), specifier);
+                }
+
                 pub fn resolve() module.CallError!Ref(module.Object) {
                     return JsNs.importModule(specifier);
                 }
@@ -677,7 +874,8 @@ pub fn Js(comptime host: type) type {
                 }
 
                 pub fn callDefault(comptime FnSig: type, args: anytype) EnsureErrorReturn(FnReturnType(FnSig)) {
-                    const callee = try ModNs.default(Ref(module.Function));
+                    const ESet = ErrorSetOf(FnReturnType(FnSig));
+                    const callee = try JsNs.importModuleDefaultAs(ESet!Ref(module.Function), specifier);
                     defer callee.deinit();
                     return JsNs.callFn(WrapFnWithCallError(FnSig), callee, args);
                 }
@@ -687,7 +885,8 @@ pub fn Js(comptime host: type) type {
                 }
 
                 pub fn constructDefault(comptime CtorSig: type, args: anytype) EnsureErrorReturn(FnReturnType(CtorSig)) {
-                    const ctor = try ModNs.default(Ref(module.Function));
+                    const ESet = ErrorSetOf(FnReturnType(CtorSig));
+                    const ctor = try JsNs.importModuleDefaultAs(ESet!Ref(module.Function), specifier);
                     defer ctor.deinit();
                     return JsNs.construct(WrapFnWithCallError(CtorSig), ctor, args);
                 }
@@ -696,26 +895,22 @@ pub fn Js(comptime host: type) type {
                     return ModNs.constructDefault(CtorSig, args);
                 }
 
-                pub fn getProp(comptime RT: type, comptime name: []const u8) module.CallError!PayloadOf(RT) {
-                    const mod = try resolve();
+                pub fn getProp(comptime RT: type, comptime name: []const u8) EnsureErrorReturn(RT) {
+                    const ESet = ErrorSetOf(RT);
+                    const mod = try resolveAs(ESet);
                     defer mod.deinit();
-                    return switch (@typeInfo(RT)) {
-                        .error_union => try JsNs.getProp(RT, mod, name),
-                        else => try JsNs.getProp(module.CallError!RT, mod, name),
-                    };
+                    return JsNs.getProp(EnsureErrorReturn(RT), mod, name);
                 }
 
-                pub fn get(comptime RT: type, comptime name: []const u8) module.CallError!PayloadOf(RT) {
+                pub fn get(comptime RT: type, comptime name: []const u8) EnsureErrorReturn(RT) {
                     return ModNs.getProp(RT, name);
                 }
 
-                pub fn getAlloc(allocator: std.mem.Allocator, comptime RT: type, comptime name: []const u8) module.CallError!PayloadOf(RT) {
-                    const mod = try resolve();
+                pub fn getAlloc(allocator: std.mem.Allocator, comptime RT: type, comptime name: []const u8) EnsureErrorReturn(RT) {
+                    const ESet = ErrorSetOf(RT);
+                    const mod = try resolveAs(ESet);
                     defer mod.deinit();
-                    return switch (@typeInfo(RT)) {
-                        .error_union => try JsNs.getPropAlloc(allocator, RT, mod, name),
-                        else => try JsNs.getPropAlloc(allocator, module.CallError!RT, mod, name),
-                    };
+                    return JsNs.getPropAlloc(allocator, EnsureErrorReturn(RT), mod, name);
                 }
 
                 pub fn set(comptime name: []const u8, value: anytype) module.CallError!void {
@@ -737,50 +932,66 @@ pub fn Js(comptime host: type) type {
                 }
 
                 pub fn call(comptime FnSig: type, comptime name: []const u8, args: anytype) EnsureErrorReturn(FnReturnType(FnSig)) {
-                    const mod = try resolve();
+                    const ESet = ErrorSetOf(FnReturnType(FnSig));
+                    const mod = try resolveAs(ESet);
                     defer mod.deinit();
-                    const RawRT = FnReturnType(FnSig);
-                    return switch (@typeInfo(RawRT)) {
-                        .error_union => try JsNs.callMethod(FnSig, mod, name, args),
-                        else => try JsNs.callMethod(WrapFnWithCallError(FnSig), mod, name, args),
-                    };
+                    return JsNs.callMethod(WrapFnWithCallError(FnSig), mod, name, args);
                 }
 
                 pub fn construct(comptime CtorSig: type, comptime name: []const u8, args: anytype) EnsureErrorReturn(FnReturnType(CtorSig)) {
-                    const ctor = try ModNs.getProp(Ref(module.Function), name);
+                    const ESet = ErrorSetOf(FnReturnType(CtorSig));
+                    const ctor = try ModNs.getProp(ESet!Ref(module.Function), name);
                     defer ctor.deinit();
-                    const RawRT = FnReturnType(CtorSig);
-                    return switch (@typeInfo(RawRT)) {
-                        .error_union => try JsNs.construct(CtorSig, ctor, args),
-                        else => try JsNs.construct(WrapFnWithCallError(CtorSig), ctor, args),
-                    };
+                    return JsNs.construct(WrapFnWithCallError(CtorSig), ctor, args);
                 }
             };
         }
 
-        fn PayloadOf(comptime T: type) type {
+        fn ErrorSetOf(comptime T: type) type {
             return switch (@typeInfo(T)) {
-                .error_union => |eu| eu.payload,
-                else => T,
+                .error_union => |eu| eu.error_set,
+                else => module.CallError,
             };
         }
 
         fn EnsureErrorReturn(comptime RT: type) type {
             return switch (@typeInfo(RT)) {
-                .error_union => |eu| (module.CallError || eu.error_set)!eu.payload,
+                .error_union => RT,
                 else => module.CallError!RT,
             };
         }
 
-        fn WrapFnWithCallError(comptime FnSig: type) type {
+        fn EnsureJsErrorReturn(comptime RT: type) type {
+            return switch (@typeInfo(RT)) {
+                .error_union => RT,
+                else => module.Error!RT,
+            };
+        }
+
+        fn WrapFnWithJsError(comptime FnSig: type) type {
             const f = @typeInfo(FnSig).@"fn";
+            const rt = f.return_type orelse void;
+            if (@typeInfo(rt) == .error_union) return FnSig;
             var param_types: [f.param_types.len]type = undefined;
             var param_attrs: [f.param_types.len]std.lang.Type.Fn.ParamAttributes = undefined;
             for (f.param_types, 0..) |pt, i| {
                 param_types[i] = pt.?;
                 param_attrs[i] = .{};
             }
-            return @Fn(&param_types, &param_attrs, EnsureErrorReturn(f.return_type orelse void), .{});
+            return @Fn(&param_types, &param_attrs, module.Error!rt, .{});
+        }
+
+        fn WrapFnWithCallError(comptime FnSig: type) type {
+            const f = @typeInfo(FnSig).@"fn";
+            const rt = f.return_type orelse void;
+            if (@typeInfo(rt) == .error_union) return FnSig;
+            var param_types: [f.param_types.len]type = undefined;
+            var param_attrs: [f.param_types.len]std.lang.Type.Fn.ParamAttributes = undefined;
+            for (f.param_types, 0..) |pt, i| {
+                param_types[i] = pt.?;
+                param_attrs[i] = .{};
+            }
+            return @Fn(&param_types, &param_attrs, module.CallError!rt, .{});
         }
 
         pub fn getProp(comptime RT: type, target: anytype, comptime name: []const u8) RT {
@@ -978,8 +1189,10 @@ pub fn Js(comptime host: type) type {
                 ctx_ptr: *anyopaque = undefined,
                 invoker: ?InvokerFn = null,
                 deinit_ctx: ?DeinitCtxFn = null,
+                fn_handle: u32 = module.reserved_undefined_handle,
                 generation: u16 = 1,
                 active_calls: u32 = 0,
+                once: bool = false,
                 pending_release: bool = false,
                 next_free: u32 = null_index,
             };
@@ -1022,7 +1235,7 @@ pub fn Js(comptime host: type) type {
                 return null;
             }
 
-            fn allocate(ctx_ptr: *anyopaque, invoker: InvokerFn, deinit_ctx: ?DeinitCtxFn) !u32 {
+            fn allocate(ctx_ptr: *anyopaque, invoker: InvokerFn, deinit_ctx: ?DeinitCtxFn, is_once: bool) !u32 {
                 var slot_index: u32 = undefined;
                 var entry_ptr: *SlotEntry = undefined;
 
@@ -1051,13 +1264,25 @@ pub fn Js(comptime host: type) type {
                 entry_ptr.ctx_ptr = ctx_ptr;
                 entry_ptr.invoker = invoker;
                 entry_ptr.deinit_ctx = deinit_ctx;
+                entry_ptr.fn_handle = module.reserved_undefined_handle;
                 entry_ptr.active_calls = 0;
+                entry_ptr.once = is_once;
                 entry_ptr.pending_release = false;
                 entry_ptr.next_free = null_index;
                 active_count += 1;
 
                 const gen12: u32 = @as(u32, entry_ptr.generation & 0x0FFF);
                 return (gen12 << 20) | (slot_index + 1);
+            }
+
+            fn setHandle(callback_id: u32, handle: u32) void {
+                if (resolve(callback_id)) |resolved| {
+                    resolved.entry.fn_handle = handle;
+                }
+            }
+
+            fn isActive(callback_id: u32) bool {
+                return resolve(callback_id) != null;
             }
 
             const ResolvedSlot = struct {
@@ -1082,6 +1307,8 @@ pub fn Js(comptime host: type) type {
                 const ctx_ptr = entry.ctx_ptr;
                 entry.deinit_ctx = null;
                 entry.ctx_ptr = undefined;
+                entry.fn_handle = module.reserved_undefined_handle;
+                entry.once = false;
                 entry.pending_release = false;
                 entry.next_free = free_head;
                 free_head = slot_index;
@@ -1155,26 +1382,50 @@ pub fn Js(comptime host: type) type {
                     .flags = @bitCast(cb_flags),
                 };
 
+                var descriptor_once: module.CallbackDescriptor = .{
+                    .signature = signature.get(Args),
+                    .flags = @bitCast(module.CallbackFlags{
+                        .async_call = cb_flags.async_call,
+                        .once = true,
+                    }),
+                };
+
                 fn trampolineThunk(raw_id_ptr: *const anyopaque, arg_ptr: *anyopaque) anyerror!void {
                     const callback_id: u32 = @truncate(@intFromPtr(raw_id_ptr));
                     const resolved = CallbackRegistry.resolve(callback_id) orelse return error.InvalidCallback;
                     const entry = resolved.entry;
                     const invoker = entry.invoker orelse return error.InvalidCallback;
                     const ctx_ptr = entry.ctx_ptr;
+                    const is_once = entry.once;
+                    const once_handle = entry.fn_handle;
                     entry.active_calls += 1;
-                    defer CallbackRegistry.finishCall(resolved.slot_index, entry);
+                    const consumed_once = if (is_once) CallbackRegistry.release(callback_id) else false;
+                    if (consumed_once) {
+                        if (@hasDecl(host, "releaseZigCallback")) {
+                            host.releaseZigCallback(callback_id);
+                        }
+                    }
+                    defer {
+                        CallbackRegistry.finishCall(resolved.slot_index, entry);
+                        if (consumed_once) {
+                            if (once_handle > module.reserved_global_this_handle) {
+                                host.releaseJsValue(once_handle);
+                            }
+                        }
+                    }
                     return invoker(ctx_ptr, arg_ptr);
                 }
 
-                fn ensureDescriptor() *const module.CallbackDescriptor {
+                fn ensureDescriptor(is_once: bool) *const module.CallbackDescriptor {
                     _ = reg;
-                    if (descriptor.trampoline_thunk == 0) {
-                        descriptor.trampoline_thunk = @intFromPtr(&trampolineThunk);
+                    const target_desc = if (is_once or cb_flags.once) &descriptor_once else &descriptor;
+                    if (target_desc.trampoline_thunk == 0) {
+                        target_desc.trampoline_thunk = @intFromPtr(&trampolineThunk);
                         if (!builtin.target.cpu.arch.isWasm() and @hasDecl(host, "getTypeFactoryThunk")) {
-                            descriptor.register_thunk = @intFromPtr(host.getTypeFactoryThunk(Args));
+                            target_desc.register_thunk = @intFromPtr(host.getTypeFactoryThunk(Args));
                         }
                     }
-                    return &descriptor;
+                    return target_desc;
                 }
 
                 fn makeInvoker(comptime CtxPtrT: type, comptime handler: anytype) CallbackRegistry.InvokerFn {
@@ -1207,27 +1458,33 @@ pub fn Js(comptime host: type) type {
                     return &Wrapper.invoke;
                 }
 
-                fn registerSlot(ctx_ptr: *anyopaque, invoker: CallbackRegistry.InvokerFn, deinit_ctx: ?CallbackRegistry.DeinitCtxFn) module.CallError!Self {
+                fn registerSlot(ctx_ptr: *anyopaque, invoker: CallbackRegistry.InvokerFn, deinit_ctx: ?CallbackRegistry.DeinitCtxFn, is_once: bool) module.CallError!Self {
                     if (!isJsThread()) return error.OffJsThread;
                     if (!@hasDecl(host, "createZigCallback")) return error.HostUnavailable;
-                    const desc = ensureDescriptor();
-                    const slot_id = try CallbackRegistry.allocate(ctx_ptr, invoker, deinit_ctx);
+                    const effective_once = is_once or cb_flags.once;
+                    const desc = ensureDescriptor(effective_once);
+                    const slot_id = try CallbackRegistry.allocate(ctx_ptr, invoker, deinit_ctx, effective_once);
                     errdefer _ = CallbackRegistry.release(slot_id);
                     const handle = try host.createZigCallback(desc, slot_id);
+                    CallbackRegistry.setHandle(slot_id, handle);
                     return .{
                         .id = slot_id,
                         .func = .{ .handle = handle },
                     };
                 }
 
-                pub fn tryInit(ctx_ptr: anytype, comptime handler: anytype) module.CallError!Self {
+                fn tryInitMode(ctx_ptr: anytype, comptime handler: anytype, is_once: bool) module.CallError!Self {
                     const CtxPtrT = @TypeOf(ctx_ptr);
                     switch (@typeInfo(CtxPtrT)) {
                         .pointer => |pt| if (pt.size != .one) @compileError("Callback context must be a single-item pointer `*Ctx` or `*const Ctx`"),
                         else => @compileError("Callback context must be a pointer `*Ctx` or `*const Ctx`, received " ++ @typeName(CtxPtrT)),
                     }
                     const opaque_ctx: *anyopaque = @ptrCast(@constCast(ctx_ptr));
-                    return registerSlot(opaque_ctx, makeInvoker(CtxPtrT, handler), null);
+                    return registerSlot(opaque_ctx, makeInvoker(CtxPtrT, handler), null, is_once);
+                }
+
+                pub fn tryInit(ctx_ptr: anytype, comptime handler: anytype) module.CallError!Self {
+                    return tryInitMode(ctx_ptr, handler, false);
                 }
 
                 pub fn init(ctx_ptr: anytype, comptime handler: anytype) Self {
@@ -1238,7 +1495,19 @@ pub fn Js(comptime host: type) type {
                     };
                 }
 
-                pub fn tryInitOwned(allocator: std.mem.Allocator, ctx_value: anytype, comptime handler: anytype) module.CallError!Self {
+                pub fn tryOnce(ctx_ptr: anytype, comptime handler: anytype) module.CallError!Self {
+                    return tryInitMode(ctx_ptr, handler, true);
+                }
+
+                pub fn once(ctx_ptr: anytype, comptime handler: anytype) Self {
+                    return tryOnce(ctx_ptr, handler) catch |err| switch (err) {
+                        error.OffJsThread => @panic("JsValue operations require the JS thread"),
+                        error.HostUnavailable => @panic("JsValue host imports unavailable"),
+                        else => @panic("Failed to initialize one-shot Zig JS callback"),
+                    };
+                }
+
+                fn tryInitOwnedMode(allocator: std.mem.Allocator, ctx_value: anytype, comptime handler: anytype, is_once: bool) module.CallError!Self {
                     const Ctx = @TypeOf(ctx_value);
                     const HeapBox = struct {
                         alloc: std.mem.Allocator,
@@ -1252,12 +1521,23 @@ pub fn Js(comptime host: type) type {
                     };
                     const HandlerT = @TypeOf(handler);
                     const h_info = @typeInfo(HandlerT).@"fn";
+                    if (h_info.param_types.len != fn_info.param_types.len + 1) {
+                        @compileError(std.fmt.comptimePrint(
+                            "Callback handler expects {d} parameters (context + {d} JS args), received {d}",
+                            .{ fn_info.param_types.len + 1, fn_info.param_types.len, h_info.param_types.len },
+                        ));
+                    }
                     const BoxedInvoker = struct {
                         fn invoke(raw_ptr: *anyopaque, raw_arg: *anyopaque) anyerror!void {
                             const box: *HeapBox = @ptrCast(@alignCast(raw_ptr));
                             const frame: *Args = @ptrCast(@alignCast(raw_arg));
                             var call_args: std.meta.ArgsTuple(HandlerT) = undefined;
-                            call_args[0] = &box.ctx;
+                            const FirstParamT = h_info.param_types[0].?;
+                            if (comptime FirstParamT == Ctx) {
+                                call_args[0] = box.ctx;
+                            } else {
+                                call_args[0] = &box.ctx;
+                            }
                             inline for (0..fn_info.param_types.len) |i| {
                                 const field_name = std.fmt.comptimePrint("{d}", .{i});
                                 call_args[i + 1] = @field(frame, field_name);
@@ -1280,8 +1560,9 @@ pub fn Js(comptime host: type) type {
                         allocator.destroy(box);
                         return error.HostUnavailable;
                     }
-                    const desc = ensureDescriptor();
-                    const slot_id = CallbackRegistry.allocate(@ptrCast(box), &BoxedInvoker.invoke, &HeapBox.destroyBox) catch |err| {
+                    const effective_once = is_once or cb_flags.once;
+                    const desc = ensureDescriptor(effective_once);
+                    const slot_id = CallbackRegistry.allocate(@ptrCast(box), &BoxedInvoker.invoke, &HeapBox.destroyBox, effective_once) catch |err| {
                         allocator.destroy(box);
                         return err;
                     };
@@ -1289,10 +1570,15 @@ pub fn Js(comptime host: type) type {
                         _ = CallbackRegistry.release(slot_id);
                         return err;
                     };
+                    CallbackRegistry.setHandle(slot_id, handle);
                     return .{
                         .id = slot_id,
                         .func = .{ .handle = handle },
                     };
+                }
+
+                pub fn tryInitOwned(allocator: std.mem.Allocator, ctx_value: anytype, comptime handler: anytype) module.CallError!Self {
+                    return tryInitOwnedMode(allocator, ctx_value, handler, false);
                 }
 
                 pub fn initOwned(allocator: std.mem.Allocator, ctx_value: anytype, comptime handler: anytype) Self {
@@ -1303,7 +1589,19 @@ pub fn Js(comptime host: type) type {
                     };
                 }
 
-                pub fn tryInitFn(comptime plain_fn: anytype) module.CallError!Self {
+                pub fn tryOnceOwned(allocator: std.mem.Allocator, ctx_value: anytype, comptime handler: anytype) module.CallError!Self {
+                    return tryInitOwnedMode(allocator, ctx_value, handler, true);
+                }
+
+                pub fn onceOwned(allocator: std.mem.Allocator, ctx_value: anytype, comptime handler: anytype) Self {
+                    return tryOnceOwned(allocator, ctx_value, handler) catch |err| switch (err) {
+                        error.OffJsThread => @panic("JsValue operations require the JS thread"),
+                        error.HostUnavailable => @panic("JsValue host imports unavailable"),
+                        else => @panic("Failed to initialize owned one-shot Zig JS callback"),
+                    };
+                }
+
+                fn tryInitFnMode(comptime plain_fn: anytype, is_once: bool) module.CallError!Self {
                     const PlainFnT = @TypeOf(plain_fn);
                     const p_info = @typeInfo(PlainFnT).@"fn";
                     if (p_info.param_types.len != fn_info.param_types.len) {
@@ -1330,7 +1628,11 @@ pub fn Js(comptime host: type) type {
                             return forward(typed_ctx, frame);
                         }
                     };
-                    return registerSlot(@ptrCast(&Stateless.dummy), &Stateless.invoke, null);
+                    return registerSlot(@ptrCast(&Stateless.dummy), &Stateless.invoke, null, is_once);
+                }
+
+                pub fn tryInitFn(comptime plain_fn: anytype) module.CallError!Self {
+                    return tryInitFnMode(plain_fn, false);
                 }
 
                 pub fn initFn(comptime plain_fn: anytype) Self {
@@ -1338,6 +1640,18 @@ pub fn Js(comptime host: type) type {
                         error.OffJsThread => @panic("JsValue operations require the JS thread"),
                         error.HostUnavailable => @panic("JsValue host imports unavailable"),
                         else => @panic("Failed to initialize stateless Zig JS callback"),
+                    };
+                }
+
+                pub fn tryOnceFn(comptime plain_fn: anytype) module.CallError!Self {
+                    return tryInitFnMode(plain_fn, true);
+                }
+
+                pub fn onceFn(comptime plain_fn: anytype) Self {
+                    return tryOnceFn(plain_fn) catch |err| switch (err) {
+                        error.OffJsThread => @panic("JsValue operations require the JS thread"),
+                        error.HostUnavailable => @panic("JsValue host imports unavailable"),
+                        else => @panic("Failed to initialize stateless one-shot Zig JS callback"),
                     };
                 }
 
@@ -1349,6 +1663,10 @@ pub fn Js(comptime host: type) type {
                     return self.func;
                 }
 
+                pub inline fn value(self: Self) Ref(module.Function) {
+                    return self.func;
+                }
+
                 pub inline fn cloneRef(self: Self) Ref(module.Function) {
                     return self.func.clone();
                 }
@@ -1357,18 +1675,439 @@ pub fn Js(comptime host: type) type {
                     return self.id != 0 and !self.func.isUndefined();
                 }
 
-                pub fn deinit(self: *Self) void {
-                    if (self.id == 0) return;
-                    const slot_id = self.id;
-                    const fn_ref = self.func;
-                    self.id = 0;
-                    self.func = Ref(module.Function).@"undefined";
+                pub inline fn isActive(self: Self) bool {
+                    return self.id != 0 and CallbackRegistry.isActive(self.id);
+                }
+
+                pub fn deinit(self: anytype) void {
+                    const SelfArgT = @TypeOf(self);
+                    const slot_id, const fn_ref = switch (@typeInfo(SelfArgT)) {
+                        .pointer => |pt| blk: {
+                            const sid = self.id;
+                            const fref = self.func;
+                            if (!pt.attrs.@"const") {
+                                self.id = 0;
+                                self.func = Ref(module.Function).@"undefined";
+                            }
+                            break :blk .{ sid, fref };
+                        },
+                        else => .{ self.id, self.func },
+                    };
+                    if (slot_id == 0) return;
                     if (CallbackRegistry.release(slot_id)) {
                         if (@hasDecl(host, "releaseZigCallback")) {
                             host.releaseZigCallback(slot_id);
                         }
+                        fn_ref.deinit();
                     }
-                    fn_ref.deinit();
+                }
+            };
+        }
+
+        fn unwrapFnType(comptime T: type) type {
+            return switch (@typeInfo(T)) {
+                .@"fn" => T,
+                .pointer => |pt| if (pt.size == .one and @typeInfo(pt.child) == .@"fn")
+                    pt.child
+                else
+                    @compileError("Expected a Zig function or function signature, received " ++ @typeName(T)),
+                else => @compileError("Expected a Zig function or function signature, received " ++ @typeName(T)),
+            };
+        }
+
+        fn normalizeClosureReturn(comptime RT: type) type {
+            return switch (@typeInfo(RT)) {
+                .error_union => |eu| if (@typeInfo(eu.error_set).error_set.error_names == null) eu.payload else RT,
+                else => RT,
+            };
+        }
+
+        fn StripFirstFnParam(comptime FnT: type) type {
+            const f = @typeInfo(unwrapFnType(FnT)).@"fn";
+            if (f.param_types.len == 0) {
+                @compileError("Expected handler function with context parameter, received zero-parameter " ++ @typeName(FnT));
+            }
+            const rem = f.param_types.len - 1;
+            var param_types: [rem]type = undefined;
+            var param_attrs: [rem]std.lang.Type.Fn.ParamAttributes = undefined;
+            for (f.param_types[1..], 0..) |maybe_pt, i| {
+                param_types[i] = maybe_pt orelse @compileError("Closure JS parameter types cannot be `anytype`");
+                param_attrs[i] = .{};
+            }
+            return @Fn(&param_types, &param_attrs, normalizeClosureReturn(f.return_type orelse void), .{});
+        }
+
+        fn NormalizePlainFnSig(comptime FnT: type) type {
+            const f = @typeInfo(unwrapFnType(FnT)).@"fn";
+            var param_types: [f.param_types.len]type = undefined;
+            var param_attrs: [f.param_types.len]std.lang.Type.Fn.ParamAttributes = undefined;
+            for (f.param_types, 0..) |maybe_pt, i| {
+                param_types[i] = maybe_pt orelse @compileError("Closure JS parameter types cannot be `anytype`");
+                param_attrs[i] = .{};
+            }
+            return @Fn(&param_types, &param_attrs, normalizeClosureReturn(f.return_type orelse void), .{});
+        }
+
+        fn isSingleItemPointer(comptime T: type) bool {
+            return switch (@typeInfo(T)) {
+                .pointer => |pt| pt.size == .one,
+                else => false,
+            };
+        }
+
+        pub fn Closure(comptime Ctx: type, comptime FnOrSig: anytype) type {
+            return ClosureWithOptions(Ctx, FnOrSig, .{});
+        }
+
+        pub fn AsyncClosure(comptime Ctx: type, comptime FnOrSig: anytype) type {
+            return ClosureWithOptions(Ctx, FnOrSig, .{ .async_call = true });
+        }
+
+        pub fn ClosureWithOptions(comptime Ctx: type, comptime FnOrSig: anytype, comptime cb_flags: module.CallbackFlags) type {
+            const is_sig_type = (@TypeOf(FnOrSig) == type);
+            const is_ptr_ctx = isSingleItemPointer(Ctx);
+
+            return struct {
+                const Self = @This();
+                pub const is_zig_callback = true;
+                pub const Context = Ctx;
+
+                id: u32 = 0,
+                func: Ref(module.Function) = Ref(module.Function).@"undefined",
+
+                fn resolveJsSigForHandler(comptime HandlerValT: type) type {
+                    const HandlerFnT = unwrapFnType(HandlerValT);
+                    const h_info = @typeInfo(HandlerFnT).@"fn";
+                    if (!is_sig_type) {
+                        return if (Ctx == void) NormalizePlainFnSig(HandlerFnT) else StripFirstFnParam(HandlerFnT);
+                    }
+                    const SigFnT = unwrapFnType(FnOrSig);
+                    const s_info = @typeInfo(SigFnT).@"fn";
+                    if (Ctx == void) {
+                        return SigFnT;
+                    }
+                    if (h_info.param_types.len == s_info.param_types.len + 1) {
+                        return SigFnT;
+                    }
+                    if (h_info.param_types.len == s_info.param_types.len and s_info.param_types.len >= 1) {
+                        return StripFirstFnParam(SigFnT);
+                    }
+                    @compileError(std.fmt.comptimePrint(
+                        "Closure handler parameter count ({d}) does not match signature `{s}`",
+                        .{ h_info.param_types.len, @typeName(SigFnT) },
+                    ));
+                }
+
+                fn BackendFor(comptime handler: anytype) type {
+                    const JsSig = resolveJsSigForHandler(@TypeOf(handler));
+                    return CallbackWithOptions(JsSig, cb_flags);
+                }
+
+                fn fromBackend(cb: anytype) Self {
+                    return .{ .id = cb.id, .func = cb.func };
+                }
+
+                fn derefHandler(comptime h: anytype) switch (@typeInfo(@TypeOf(h))) {
+                    .pointer => |pt| pt.child,
+                    else => @TypeOf(h),
+                } {
+                    return switch (@typeInfo(@TypeOf(h))) {
+                        .pointer => h.*,
+                        else => h,
+                    };
+                }
+
+                fn tryCreatePtr(ctx_ptr: Ctx, comptime handler: anytype, is_once: bool) module.CallError!Self {
+                    const fn_val = comptime derefHandler(handler);
+                    const Backend = BackendFor(fn_val);
+                    const cb = if (is_once)
+                        try Backend.tryOnce(ctx_ptr, fn_val)
+                    else
+                        try Backend.tryInit(ctx_ptr, fn_val);
+                    return fromBackend(cb);
+                }
+
+                fn tryCreateOwned(allocator: std.mem.Allocator, ctx_value: Ctx, comptime handler: anytype, is_once: bool) module.CallError!Self {
+                    const fn_val = comptime derefHandler(handler);
+                    const Backend = BackendFor(fn_val);
+                    const cb = if (is_once)
+                        try Backend.tryOnceOwned(allocator, ctx_value, fn_val)
+                    else
+                        try Backend.tryInitOwned(allocator, ctx_value, fn_val);
+                    return fromBackend(cb);
+                }
+
+                fn tryCreateVoid(comptime plain_fn: anytype, is_once: bool) module.CallError!Self {
+                    const fn_val = comptime derefHandler(plain_fn);
+                    const Backend = BackendFor(fn_val);
+                    const cb = if (is_once)
+                        try Backend.tryOnceFn(fn_val)
+                    else
+                        try Backend.tryInitFn(fn_val);
+                    return fromBackend(cb);
+                }
+
+                fn unwrapOrPanic(res: module.CallError!Self) Self {
+                    return res catch |err| switch (err) {
+                        error.OffJsThread => @panic("JsValue operations require the JS thread"),
+                        error.HostUnavailable => @panic("JsValue host imports unavailable"),
+                        else => @panic("Failed to initialize Zig JS closure"),
+                    };
+                }
+
+                pub const tryInit = if (is_sig_type)
+                    (if (Ctx == void)
+                        struct {
+                            pub fn call(comptime plain_fn: anytype) module.CallError!Self {
+                                return tryCreateVoid(plain_fn, false);
+                            }
+                        }.call
+                    else if (is_ptr_ctx)
+                        struct {
+                            pub fn call(ctx_ptr: Ctx, comptime handler: anytype) module.CallError!Self {
+                                return tryCreatePtr(ctx_ptr, handler, false);
+                            }
+                        }.call
+                    else
+                        struct {
+                            pub fn call(allocator: std.mem.Allocator, ctx_value: Ctx, comptime handler: anytype) module.CallError!Self {
+                                return tryCreateOwned(allocator, ctx_value, handler, false);
+                            }
+                        }.call)
+                else
+                    (if (Ctx == void)
+                        struct {
+                            pub fn call() module.CallError!Self {
+                                return tryCreateVoid(FnOrSig, false);
+                            }
+                        }.call
+                    else if (is_ptr_ctx)
+                        struct {
+                            pub fn call(ctx_ptr: Ctx) module.CallError!Self {
+                                return tryCreatePtr(ctx_ptr, FnOrSig, false);
+                            }
+                        }.call
+                    else
+                        struct {
+                            pub fn call(allocator: std.mem.Allocator, ctx_value: Ctx) module.CallError!Self {
+                                return tryCreateOwned(allocator, ctx_value, FnOrSig, false);
+                            }
+                        }.call);
+
+                pub const init = if (is_sig_type)
+                    (if (Ctx == void)
+                        struct {
+                            pub fn call(comptime plain_fn: anytype) Self {
+                                return unwrapOrPanic(tryCreateVoid(plain_fn, false));
+                            }
+                        }.call
+                    else if (is_ptr_ctx)
+                        struct {
+                            pub fn call(ctx_ptr: Ctx, comptime handler: anytype) Self {
+                                return unwrapOrPanic(tryCreatePtr(ctx_ptr, handler, false));
+                            }
+                        }.call
+                    else
+                        struct {
+                            pub fn call(allocator: std.mem.Allocator, ctx_value: Ctx, comptime handler: anytype) Self {
+                                return unwrapOrPanic(tryCreateOwned(allocator, ctx_value, handler, false));
+                            }
+                        }.call)
+                else
+                    (if (Ctx == void)
+                        struct {
+                            pub fn call() Self {
+                                return unwrapOrPanic(tryCreateVoid(FnOrSig, false));
+                            }
+                        }.call
+                    else if (is_ptr_ctx)
+                        struct {
+                            pub fn call(ctx_ptr: Ctx) Self {
+                                return unwrapOrPanic(tryCreatePtr(ctx_ptr, FnOrSig, false));
+                            }
+                        }.call
+                    else
+                        struct {
+                            pub fn call(allocator: std.mem.Allocator, ctx_value: Ctx) Self {
+                                return unwrapOrPanic(tryCreateOwned(allocator, ctx_value, FnOrSig, false));
+                            }
+                        }.call);
+
+                pub const tryOnce = if (is_sig_type)
+                    (if (Ctx == void)
+                        struct {
+                            pub fn call(comptime plain_fn: anytype) module.CallError!Self {
+                                return tryCreateVoid(plain_fn, true);
+                            }
+                        }.call
+                    else if (is_ptr_ctx)
+                        struct {
+                            pub fn call(ctx_ptr: Ctx, comptime handler: anytype) module.CallError!Self {
+                                return tryCreatePtr(ctx_ptr, handler, true);
+                            }
+                        }.call
+                    else
+                        struct {
+                            pub fn call(allocator: std.mem.Allocator, ctx_value: Ctx, comptime handler: anytype) module.CallError!Self {
+                                return tryCreateOwned(allocator, ctx_value, handler, true);
+                            }
+                        }.call)
+                else
+                    (if (Ctx == void)
+                        struct {
+                            pub fn call() module.CallError!Self {
+                                return tryCreateVoid(FnOrSig, true);
+                            }
+                        }.call
+                    else if (is_ptr_ctx)
+                        struct {
+                            pub fn call(ctx_ptr: Ctx) module.CallError!Self {
+                                return tryCreatePtr(ctx_ptr, FnOrSig, true);
+                            }
+                        }.call
+                    else
+                        struct {
+                            pub fn call(allocator: std.mem.Allocator, ctx_value: Ctx) module.CallError!Self {
+                                return tryCreateOwned(allocator, ctx_value, FnOrSig, true);
+                            }
+                        }.call);
+
+                pub const once = if (is_sig_type)
+                    (if (Ctx == void)
+                        struct {
+                            pub fn call(comptime plain_fn: anytype) Self {
+                                return unwrapOrPanic(tryCreateVoid(plain_fn, true));
+                            }
+                        }.call
+                    else if (is_ptr_ctx)
+                        struct {
+                            pub fn call(ctx_ptr: Ctx, comptime handler: anytype) Self {
+                                return unwrapOrPanic(tryCreatePtr(ctx_ptr, handler, true));
+                            }
+                        }.call
+                    else
+                        struct {
+                            pub fn call(allocator: std.mem.Allocator, ctx_value: Ctx, comptime handler: anytype) Self {
+                                return unwrapOrPanic(tryCreateOwned(allocator, ctx_value, handler, true));
+                            }
+                        }.call)
+                else
+                    (if (Ctx == void)
+                        struct {
+                            pub fn call() Self {
+                                return unwrapOrPanic(tryCreateVoid(FnOrSig, true));
+                            }
+                        }.call
+                    else if (is_ptr_ctx)
+                        struct {
+                            pub fn call(ctx_ptr: Ctx) Self {
+                                return unwrapOrPanic(tryCreatePtr(ctx_ptr, FnOrSig, true));
+                            }
+                        }.call
+                    else
+                        struct {
+                            pub fn call(allocator: std.mem.Allocator, ctx_value: Ctx) Self {
+                                return unwrapOrPanic(tryCreateOwned(allocator, ctx_value, FnOrSig, true));
+                            }
+                        }.call);
+
+                pub const tryInitOwned = if (is_sig_type)
+                    struct {
+                        pub fn call(allocator: std.mem.Allocator, ctx_value: Ctx, comptime handler: anytype) module.CallError!Self {
+                            return tryCreateOwned(allocator, ctx_value, handler, false);
+                        }
+                    }.call
+                else
+                    struct {
+                        pub fn call(allocator: std.mem.Allocator, ctx_value: Ctx) module.CallError!Self {
+                            return tryCreateOwned(allocator, ctx_value, FnOrSig, false);
+                        }
+                    }.call;
+
+                pub const initOwned = if (is_sig_type)
+                    struct {
+                        pub fn call(allocator: std.mem.Allocator, ctx_value: Ctx, comptime handler: anytype) Self {
+                            return unwrapOrPanic(tryCreateOwned(allocator, ctx_value, handler, false));
+                        }
+                    }.call
+                else
+                    struct {
+                        pub fn call(allocator: std.mem.Allocator, ctx_value: Ctx) Self {
+                            return unwrapOrPanic(tryCreateOwned(allocator, ctx_value, FnOrSig, false));
+                        }
+                    }.call;
+
+                pub const tryOnceOwned = if (is_sig_type)
+                    struct {
+                        pub fn call(allocator: std.mem.Allocator, ctx_value: Ctx, comptime handler: anytype) module.CallError!Self {
+                            return tryCreateOwned(allocator, ctx_value, handler, true);
+                        }
+                    }.call
+                else
+                    struct {
+                        pub fn call(allocator: std.mem.Allocator, ctx_value: Ctx) module.CallError!Self {
+                            return tryCreateOwned(allocator, ctx_value, FnOrSig, true);
+                        }
+                    }.call;
+
+                pub const onceOwned = if (is_sig_type)
+                    struct {
+                        pub fn call(allocator: std.mem.Allocator, ctx_value: Ctx, comptime handler: anytype) Self {
+                            return unwrapOrPanic(tryCreateOwned(allocator, ctx_value, handler, true));
+                        }
+                    }.call
+                else
+                    struct {
+                        pub fn call(allocator: std.mem.Allocator, ctx_value: Ctx) Self {
+                            return unwrapOrPanic(tryCreateOwned(allocator, ctx_value, FnOrSig, true));
+                        }
+                    }.call;
+
+                pub inline fn ref(self: Self) Ref(module.Function) {
+                    return self.func;
+                }
+
+                pub inline fn toRef(self: Self) Ref(module.Function) {
+                    return self.func;
+                }
+
+                pub inline fn value(self: Self) Ref(module.Function) {
+                    return self.func;
+                }
+
+                pub inline fn cloneRef(self: Self) Ref(module.Function) {
+                    return self.func.clone();
+                }
+
+                pub inline fn isValid(self: Self) bool {
+                    return self.id != 0 and !self.func.isUndefined();
+                }
+
+                pub inline fn isActive(self: Self) bool {
+                    return self.id != 0 and CallbackRegistry.isActive(self.id);
+                }
+
+                pub fn deinit(self: anytype) void {
+                    const SelfArgT = @TypeOf(self);
+                    const slot_id, const fn_ref = switch (@typeInfo(SelfArgT)) {
+                        .pointer => |pt| blk: {
+                            const sid = self.id;
+                            const fref = self.func;
+                            if (!pt.attrs.@"const") {
+                                self.id = 0;
+                                self.func = Ref(module.Function).@"undefined";
+                            }
+                            break :blk .{ sid, fref };
+                        },
+                        else => .{ self.id, self.func },
+                    };
+                    if (slot_id == 0) return;
+                    if (CallbackRegistry.release(slot_id)) {
+                        if (@hasDecl(host, "releaseZigCallback")) {
+                            host.releaseZigCallback(slot_id);
+                        }
+                        fn_ref.deinit();
+                    }
                 }
             };
         }
@@ -1440,6 +2179,68 @@ pub fn Js(comptime host: type) type {
                     }
                     if (!isJsThread()) return error.OffJsThread;
                     host.releaseJsValue(self.handle);
+                }
+
+                pub fn tryDispose(self: Self) module.Error!void {
+                    if (self.isNullOrUndefined()) {
+                        if (!isJsThread()) return error.OffJsThread;
+                        return;
+                    }
+                    if (@hasDecl(host, "tryDisposeJsValue")) {
+                        return host.tryDisposeJsValue(self.handle);
+                    }
+                    if (!isJsThread()) return error.OffJsThread;
+                    if (@hasDecl(host, "disposeJsValue")) {
+                        host.disposeJsValue(self.handle);
+                        return;
+                    }
+                    self.deinit();
+                    return error.HostUnavailable;
+                }
+
+                pub fn dispose(self: Self) void {
+                    if (self.isNullOrUndefined()) {
+                        if (!isJsThread()) @panic("JsValue operations require the JS thread");
+                        return;
+                    }
+                    if (@hasDecl(host, "disposeJsValue")) {
+                        host.disposeJsValue(self.handle);
+                        return;
+                    }
+                    if (!isJsThread()) @panic("JsValue operations require the JS thread");
+                    self.deinit();
+                    @panic("JsValue host imports unavailable");
+                }
+
+                pub fn tryAsyncDispose(self: Self) module.Error!void {
+                    if (self.isNullOrUndefined()) {
+                        if (!isJsThread()) return error.OffJsThread;
+                        return;
+                    }
+                    if (@hasDecl(host, "tryAsyncDisposeJsValue")) {
+                        return host.tryAsyncDisposeJsValue(self.handle);
+                    }
+                    if (!isJsThread()) return error.OffJsThread;
+                    if (@hasDecl(host, "asyncDisposeJsValue")) {
+                        host.asyncDisposeJsValue(self.handle);
+                        return;
+                    }
+                    self.deinit();
+                    return error.HostUnavailable;
+                }
+
+                pub fn asyncDispose(self: Self) void {
+                    if (self.isNullOrUndefined()) {
+                        if (!isJsThread()) @panic("JsValue operations require the JS thread");
+                        return;
+                    }
+                    if (@hasDecl(host, "asyncDisposeJsValue")) {
+                        host.asyncDisposeJsValue(self.handle);
+                        return;
+                    }
+                    if (!isJsThread()) @panic("JsValue operations require the JS thread");
+                    self.deinit();
+                    @panic("JsValue host imports unavailable");
                 }
 
                 pub fn typeof(self: Self) module.JsType {
@@ -1568,24 +2369,48 @@ pub fn Js(comptime host: type) type {
                     return JsNs.callMethod(FnSig, self, name, args);
                 }
 
+                pub fn tryCall(self: Self, comptime FnSig: type, comptime name: []const u8, args: anytype) EnsureJsErrorReturn(FnReturnType(FnSig)) {
+                    return JsNs.callMethod(WrapFnWithJsError(FnSig), self, name, args);
+                }
+
                 pub fn callDynamic(self: Self, comptime FnSig: type, key: anytype, args: anytype) FnReturnType(FnSig) {
                     return JsNs.callMethodDynamic(FnSig, self, key, args);
+                }
+
+                pub fn tryCallDynamic(self: Self, comptime FnSig: type, key: anytype, args: anytype) EnsureJsErrorReturn(FnReturnType(FnSig)) {
+                    return JsNs.callMethodDynamic(WrapFnWithJsError(FnSig), self, key, args);
                 }
 
                 pub fn callSym(self: Self, comptime FnSig: type, sym: anytype, args: anytype) FnReturnType(FnSig) {
                     return JsNs.callMethodSym(FnSig, self, sym, args);
                 }
 
+                pub fn tryCallSym(self: Self, comptime FnSig: type, sym: anytype, args: anytype) EnsureJsErrorReturn(FnReturnType(FnSig)) {
+                    return JsNs.callMethodSym(WrapFnWithJsError(FnSig), self, sym, args);
+                }
+
                 pub fn invoke(self: Self, comptime FnSig: type, args: anytype) FnReturnType(FnSig) {
                     return JsNs.callFn(FnSig, self, args);
+                }
+
+                pub fn tryInvoke(self: Self, comptime FnSig: type, args: anytype) EnsureJsErrorReturn(FnReturnType(FnSig)) {
+                    return JsNs.callFn(WrapFnWithJsError(FnSig), self, args);
                 }
 
                 pub fn new(self: Self, comptime CtorSig: type, args: anytype) FnReturnType(CtorSig) {
                     return JsNs.construct(CtorSig, self, args);
                 }
 
+                pub fn tryNew(self: Self, comptime CtorSig: type, args: anytype) EnsureJsErrorReturn(FnReturnType(CtorSig)) {
+                    return JsNs.construct(WrapFnWithJsError(CtorSig), self, args);
+                }
+
                 pub fn construct(self: Self, comptime CtorSig: type, args: anytype) FnReturnType(CtorSig) {
                     return JsNs.construct(CtorSig, self, args);
+                }
+
+                pub fn tryConstruct(self: Self, comptime CtorSig: type, args: anytype) EnsureJsErrorReturn(FnReturnType(CtorSig)) {
+                    return JsNs.construct(WrapFnWithJsError(CtorSig), self, args);
                 }
             };
         }
@@ -2093,5 +2918,368 @@ test "Js.Module descriptor markers and default/export= interop flags" {
     try expectEqual(@as(u32, 0), js.activeHandleCount());
 }
 
+test "JsException lazy capture, Module exact Error!T preservation, Ref dispose/asyncDispose, and Closure/once" {
+    const LifecycleMockHost = struct {
+        var active_handles: u32 = 0;
+        var next_slot: u32 = 16;
+        var active_callbacks: u32 = 0;
+        var stored_trampoline: usize = 0;
+        var last_cb_flags: u32 = 0;
 
+        var has_captured_err: bool = false;
+        var captured_kind: enum { none, sys_err, plain_str, null_val, undef_val } = .none;
 
+        var dispose_calls: u32 = 0;
+        var async_dispose_calls: u32 = 0;
+        var fail_next_dispose: bool = false;
+
+        fn allocTagged(tag_slot: u32) u32 {
+            active_handles += 1;
+            const gen = next_slot;
+            next_slot += 1;
+            return (gen << 20) | tag_slot;
+        }
+
+        pub fn cloneJsValue(handle: u32) u32 {
+            if (handle <= reserved_global_this_handle) return handle;
+            return allocTagged(handle & 0xFFFFF);
+        }
+
+        pub fn releaseJsValue(handle: u32) void {
+            if (handle >= first_dynamic_slot) {
+                std.debug.assert(active_handles > 0);
+                active_handles -= 1;
+            }
+        }
+
+        pub fn typeofJsValue(handle: u32) JsType {
+            return switch (handle & 0xFFFFF) {
+                10 => .object, // Error object
+                11, 20, 21, 22, 23 => .string,
+                12 => .number,
+                else => .object,
+            };
+        }
+
+        pub fn getJsValueCount() u32 {
+            return active_handles;
+        }
+
+        pub fn tryControlLastJsError(mode: u32) Error!u32 {
+            const op: LastErrorOp = @enumFromInt(mode);
+            switch (op) {
+                .peek => {
+                    if (!has_captured_err) return no_captured_error_handle;
+                    return materializeCaptured();
+                },
+                .take => {
+                    if (!has_captured_err) return no_captured_error_handle;
+                    defer {
+                        has_captured_err = false;
+                        captured_kind = .none;
+                    }
+                    return materializeCaptured();
+                },
+                .has => return if (has_captured_err) 1 else 0,
+                .clear => {
+                    has_captured_err = false;
+                    captured_kind = .none;
+                    return 0;
+                },
+            }
+        }
+
+        fn materializeCaptured() u32 {
+            return switch (captured_kind) {
+                .none => no_captured_error_handle,
+                .sys_err => allocTagged(10),
+                .plain_str => allocTagged(11),
+                .null_val => reserved_null_handle,
+                .undef_val => reserved_undefined_handle,
+            };
+        }
+
+        pub fn tryDisposeJsValue(handle: u32) Error!void {
+            defer releaseJsValue(handle);
+            dispose_calls += 1;
+            if (fail_next_dispose) {
+                fail_next_dispose = false;
+                has_captured_err = true;
+                captured_kind = .sys_err;
+                return error.JsException;
+            }
+        }
+
+        pub fn disposeJsValue(handle: u32) void {
+            tryDisposeJsValue(handle) catch {};
+        }
+
+        pub fn tryAsyncDisposeJsValue(handle: u32) Error!void {
+            defer releaseJsValue(handle);
+            async_dispose_calls += 1;
+            if (fail_next_dispose) {
+                fail_next_dispose = false;
+                has_captured_err = true;
+                captured_kind = .sys_err;
+                return error.JsException;
+            }
+        }
+
+        pub fn asyncDisposeJsValue(handle: u32) void {
+            tryAsyncDisposeJsValue(handle) catch {};
+        }
+
+        pub fn invokeJsHostOp(desc_ptr: *const anyopaque, arg_ptr: *anyopaque, _: usize) E {
+            const desc: *const HostOpDescriptor = @ptrCast(@alignCast(desc_ptr));
+            const key = if (desc.key_ptr) |p| p[0..desc.key_len] else "";
+            const op: HostOp = @enumFromInt(desc.op);
+            switch (op) {
+                .import_module => {
+                    const out_bytes: [*]u8 = @ptrCast(arg_ptr);
+                    const handle_out: *u32 = @ptrCast(@alignCast(out_bytes));
+                    handle_out.* = allocTagged(30);
+                    out_bytes[4] = 0;
+                },
+                .get_prop => {
+                    const Frame = arg_struct.ArgStruct(fn (Js(@This()).Ref(Any)) Error!Js(@This()).Ref(Any));
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    if (std.mem.eql(u8, key, "message")) {
+                        frame.retval = .{ .handle = allocTagged(20) };
+                    } else if (std.mem.eql(u8, key, "name")) {
+                        frame.retval = .{ .handle = allocTagged(21) };
+                    } else if (std.mem.eql(u8, key, "code")) {
+                        frame.retval = .{ .handle = allocTagged(22) };
+                    } else if (std.mem.eql(u8, key, "stack")) {
+                        frame.retval = .{ .handle = allocTagged(23) };
+                    } else {
+                        frame.retval = .@"undefined";
+                    }
+                },
+                .call_method => {
+                    if (std.mem.eql(u8, key, "String")) {
+                        const Frame = arg_struct.ArgStruct(fn (std.mem.Allocator, Js(@This()).Ref(Any), Js(@This()).Ref(Any)) Error![]const u8);
+                        const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                        const text: []const u8 = switch (frame.@"2".handle & 0xFFFFF) {
+                            11 => "plain thrown string",
+                            20 => "ENOENT: no such file or directory",
+                            21 => "Error",
+                            22 => "ENOENT",
+                            23 => "Error: ENOENT\n    at readFileSync",
+                            else => "unknown",
+                        };
+                        frame.retval = frame.@"0".dupe(u8, text) catch return .FAULT;
+                        return .SUCCESS;
+                    }
+                    // Simulate `fs.readFileSync("/nonexistent")` throwing ENOENT -> lazy capture (0 handles!)
+                    has_captured_err = true;
+                    captured_kind = .sys_err;
+                    return .FAULT;
+                },
+                else => return .FAULT,
+            }
+            return .SUCCESS;
+        }
+
+        pub fn createZigCallback(desc_ptr: *const anyopaque, _: u32) Error!u32 {
+            const desc: *const CallbackDescriptor = @ptrCast(@alignCast(desc_ptr));
+            stored_trampoline = desc.trampoline_thunk;
+            last_cb_flags = desc.flags;
+            active_callbacks += 1;
+            return allocTagged(40);
+        }
+
+        pub fn releaseZigCallback(_: u32) void {
+            std.debug.assert(active_callbacks > 0);
+            active_callbacks -= 1;
+        }
+    };
+
+    const js = Js(LifecycleMockHost);
+    const Fs = js.Module("node:fs");
+
+    // 1. Module.call with explicit `js.Error!T` preserves exact error set (`js.Error!Ref(Any)`)
+    const CallRetT = @TypeOf(Fs.call(fn ([]const u8) js.Error!js.Ref(js.Any), "readFileSync", .{"/nonexistent"}));
+    try expectEqual(js.Error!js.Ref(js.Any), CallRetT);
+
+    // Catching `error.JsException` WITHOUT calling `takeLastError()` allocates ZERO handles!
+    try std.testing.expectError(
+        error.JsException,
+        Fs.call(fn ([]const u8) js.Error!js.Ref(js.Any), "readFileSync", .{"/nonexistent"}),
+    );
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+    try expect(js.hasLastError());
+
+    // `lastError()` peeks (allocates 1 handle) while keeping error pending; `takeLastError()` consumes it
+    {
+        const peeked = js.lastError().?;
+        defer peeked.deinit();
+        try expectEqual(@as(u32, 1), js.activeHandleCount());
+        try expect(js.hasLastError());
+    }
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    {
+        const err_info = js.takeLastError().?;
+        defer err_info.deinit();
+        try expect(!js.hasLastError());
+        try expect(js.takeLastError() == null);
+
+        const msg = (try err_info.message(std.testing.allocator)).?;
+        defer std.testing.allocator.free(msg);
+        try std.testing.expectEqualStrings("ENOENT: no such file or directory", msg);
+
+        const nm = (try err_info.name(std.testing.allocator)).?;
+        defer std.testing.allocator.free(nm);
+        try std.testing.expectEqualStrings("Error", nm);
+
+        const cd = (try err_info.code(std.testing.allocator)).?;
+        defer std.testing.allocator.free(cd);
+        try std.testing.expectEqualStrings("ENOENT", cd);
+
+        const st = (try err_info.stack(std.testing.allocator)).?;
+        defer std.testing.allocator.free(st);
+        try expect(std.mem.indexOf(u8, st, "readFileSync") != null);
+    }
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    // Primitive string, null, and undefined thrown values
+    LifecycleMockHost.has_captured_err = true;
+    LifecycleMockHost.captured_kind = .plain_str;
+    {
+        var prim_err = js.takeLastError().?;
+        defer prim_err.deinit();
+        const msg = (try prim_err.message(std.testing.allocator)).?;
+        defer std.testing.allocator.free(msg);
+        try std.testing.expectEqualStrings("plain thrown string", msg);
+        try expect((try prim_err.name(std.testing.allocator)) == null);
+        try expect((try prim_err.code(std.testing.allocator)) == null);
+    }
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    LifecycleMockHost.has_captured_err = true;
+    LifecycleMockHost.captured_kind = .null_val;
+    {
+        const null_err = js.takeLastError().?;
+        defer null_err.deinit();
+        try expect(null_err.value().isNull());
+        try expect((try null_err.message(std.testing.allocator)) == null);
+    }
+
+    LifecycleMockHost.has_captured_err = true;
+    LifecycleMockHost.captured_kind = .undef_val;
+    {
+        const undef_err = js.takeLastError().?;
+        defer undef_err.deinit();
+        try expect(undef_err.value().isUndefined());
+        try expect((try undef_err.message(std.testing.allocator)) == null);
+    }
+
+    // 2. Ref.dispose / tryDispose / asyncDispose / tryAsyncDispose
+    js.Ref(js.Object).@"null".dispose();
+    js.Ref(js.Object).@"undefined".asyncDispose();
+    try js.Ref(js.Object).@"null".tryDispose();
+    try js.Ref(js.Object).@"undefined".tryAsyncDispose();
+    try expectEqual(@as(u32, 0), LifecycleMockHost.dispose_calls);
+
+    {
+        const res: js.Ref(js.Object) = .{ .handle = LifecycleMockHost.allocTagged(50) };
+        res.dispose();
+        try expectEqual(@as(u32, 1), LifecycleMockHost.dispose_calls);
+        try expectEqual(@as(u32, 0), js.activeHandleCount());
+    }
+    {
+        const res: js.Ref(js.Object) = .{ .handle = LifecycleMockHost.allocTagged(51) };
+        LifecycleMockHost.fail_next_dispose = true;
+        try std.testing.expectError(error.JsException, res.tryDispose());
+        // Handle MUST still be released even when [Symbol.dispose]() threw!
+        try expectEqual(@as(u32, 0), js.activeHandleCount());
+        js.clearLastError();
+    }
+    {
+        const res: js.Ref(js.Object) = .{ .handle = LifecycleMockHost.allocTagged(52) };
+        try res.tryAsyncDispose();
+        try expectEqual(@as(u32, 1), LifecycleMockHost.async_dispose_calls);
+        try expectEqual(@as(u32, 0), js.activeHandleCount());
+    }
+
+    // 3. Closure (*Ctx, owned Ctx, void, type-sig & comptime-fn forms, .once(), ABA-safe defer deinit)
+    const Counter = struct {
+        total: i32 = 0,
+        fn add(self: *@This(), delta: i32) i32 {
+            self.total += delta;
+            return self.total;
+        }
+        fn double(x: i32) i32 {
+            return x * 2;
+        }
+    };
+
+    const TrampolineThunk = *const fn (*const anyopaque, *anyopaque) anyerror!void;
+    const CbArgs = arg_struct.ArgStruct(fn (i32) i32);
+
+    var ctr: Counter = .{ .total = 10 };
+    // Form A: `Closure(*Counter, fn (i32) i32).init(&ctr, Counter.add)`
+    var cl_sig = js.Closure(*Counter, fn (i32) i32).init(&ctr, Counter.add);
+    try expect(isCallbackWrapper(@TypeOf(cl_sig)));
+    try expect(cl_sig.isActive());
+    const thunk_a: TrampolineThunk = @ptrFromInt(LifecycleMockHost.stored_trampoline);
+    var frame_a: CbArgs = .{ .retval = 0, .@"0" = 5 };
+    try thunk_a(@ptrFromInt(cl_sig.id), @ptrCast(&frame_a));
+    try expectEqual(@as(i32, 15), frame_a.retval);
+    cl_sig.deinit();
+    try expect(!cl_sig.isActive());
+
+    // Form B: `Closure(*Counter, Counter.add).once(&ctr)` (one-shot auto-release + subsequent `defer deinit()`)
+    {
+        const cl_once = js.Closure(*Counter, Counter.add).once(&ctr);
+        defer cl_once.deinit();
+        try expectEqual(@as(u32, @bitCast(CallbackFlags{ .once = true })), LifecycleMockHost.last_cb_flags);
+        try expect(cl_once.isActive());
+
+        const thunk_b: TrampolineThunk = @ptrFromInt(LifecycleMockHost.stored_trampoline);
+        var frame_b: CbArgs = .{ .retval = 0, .@"0" = 7 };
+        try thunk_b(@ptrFromInt(cl_once.id), @ptrCast(&frame_b));
+        try expectEqual(@as(i32, 22), frame_b.retval);
+
+        // Immediately after `.once()` fires once, BOTH callback slot AND JS handle are already released!
+        try expect(!cl_once.isActive());
+        try expectEqual(@as(u32, 0), js.activeCallbackCount());
+        try expectEqual(@as(u32, 0), js.activeHandleCount());
+        try expectEqual(@as(u32, 0), LifecycleMockHost.active_callbacks);
+
+        // Second invocation must fail with `error.InvalidCallback`
+        try std.testing.expectError(error.InvalidCallback, thunk_b(@ptrFromInt(cl_once.id), @ptrCast(&frame_b)));
+
+        // Allocate another closure into the recycled slot BEFORE `defer cl_once.deinit()` runs to prove ABA safety!
+        var cl_newer = js.Closure(void, Counter.double).init();
+        defer cl_newer.deinit();
+        try expectEqual(@as(u32, 1), js.activeCallbackCount());
+        try expectEqual(@as(u32, 1), js.activeHandleCount());
+    }
+    try expectEqual(@as(u32, 0), js.activeCallbackCount());
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    // Form C: Owned value closure `Closure(Counter, Counter.add).once(allocator, val)` both fired and unfired
+    {
+        const cl_owned_fired = try js.Closure(Counter, Counter.add).tryOnce(std.testing.allocator, .{ .total = 100 });
+        defer cl_owned_fired.deinit();
+        const thunk_c: TrampolineThunk = @ptrFromInt(LifecycleMockHost.stored_trampoline);
+        var frame_c: CbArgs = .{ .retval = 0, .@"0" = 23 };
+        try thunk_c(@ptrFromInt(cl_owned_fired.id), @ptrCast(&frame_c));
+        try expectEqual(@as(i32, 123), frame_c.retval);
+        try expectEqual(@as(u32, 0), js.activeCallbackCount());
+        try expectEqual(@as(u32, 0), js.activeHandleCount());
+    }
+    {
+        var cl_owned_unfired = try js.Closure(Counter, fn (i32) i32).tryOnce(
+            std.testing.allocator,
+            .{ .total = 200 },
+            Counter.add,
+        );
+        try expectEqual(@as(u32, 1), js.activeCallbackCount());
+        try expectEqual(@as(u32, 1), js.activeHandleCount());
+        cl_owned_unfired.deinit();
+        try expectEqual(@as(u32, 0), js.activeCallbackCount());
+        try expectEqual(@as(u32, 0), js.activeHandleCount());
+    }
+}

@@ -31,7 +31,8 @@ pub fn Module(comptime Value: type) type {
             persistent: bool,
             js_value: bool = false,
             js_host_op: bool = false,
-            _: u24 = 0,
+            js_lifecycle: bool = false,
+            _: u23 = 0,
         };
         pub const Imports = extern struct { // vtable that's filled by the addon
             create_bool: *const fn (*Host, bool, *Value) callconv(.c) E,
@@ -71,6 +72,9 @@ pub fn Module(comptime Value: type) type {
             invoke_js_host_op: *const fn (*Host, usize, usize, usize) callconv(.c) E,
             create_zig_callback: *const fn (*Host, usize, u32, *u32) callconv(.c) E,
             release_zig_callback: *const fn (*Host, u32) callconv(.c) E,
+            control_last_js_error: *const fn (*Host, u32, *u32) callconv(.c) E,
+            dispose_js_value: *const fn (*Host, u32, bool) callconv(.c) E,
+            async_dispose_js_value: *const fn (*Host, u32, bool) callconv(.c) E,
         };
         pub const Exports = extern struct { // vtable that's used by the addon
             set_host_instance: *const fn (*Host) callconv(.c) E,

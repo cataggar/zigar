@@ -120,6 +120,9 @@ const ModuleHost = struct {
         invoke_js_host_op: ?Ref = null,
         create_zig_callback: ?Ref = null,
         release_zig_callback: ?Ref = null,
+        control_last_js_error: ?Ref = null,
+        dispose_js_value: ?Ref = null,
+        async_dispose_js_value: ?Ref = null,
 
         environ_get: ?Ref = null,
         environ_sizes_get: ?Ref = null,
@@ -947,13 +950,18 @@ const ModuleHost = struct {
                 @compileLog(extra);
                 @compileError("Function declaration mismatch: " ++ field_name ++ "\n\nExpected: " ++ @typeName(T2) ++ "\n  Actual: " ++ @typeName(T1) ++ "\n");
             }
-            const is_js_value_import = comptime std.mem.endsWith(u8, field_name, "_js_value") or
-                std.mem.eql(u8, field_name, "get_js_value_count");
+            const is_js_lifecycle_import = comptime std.mem.eql(u8, field_name, "control_last_js_error") or
+                std.mem.eql(u8, field_name, "dispose_js_value") or
+                std.mem.eql(u8, field_name, "async_dispose_js_value");
+            const is_js_value_import = comptime !is_js_lifecycle_import and
+                (std.mem.endsWith(u8, field_name, "_js_value") or
+                    std.mem.eql(u8, field_name, "get_js_value_count"));
             const is_js_host_op_import = comptime std.mem.eql(u8, field_name, "invoke_js_host_op") or
                 std.mem.eql(u8, field_name, "create_zig_callback") or
                 std.mem.eql(u8, field_name, "release_zig_callback");
             if ((!is_js_value_import or module.attributes.js_value) and
-                (!is_js_host_op_import or module.attributes.js_host_op))
+                (!is_js_host_op_import or module.attributes.js_host_op) and
+                (!is_js_lifecycle_import or module.attributes.js_lifecycle))
             {
                 @field(module.imports, field_name) = transformed_func;
             }
@@ -1886,6 +1894,94 @@ const ModuleHost = struct {
             },
         );
         return .SUCCESS;
+    }
+
+    fn controlLastJsError(self: *@This(), mode: u32, dest: *u32) !E {
+        if (!self.isOwnerJsThread()) return .PERM;
+        const env = self.env;
+        const saved_exc: ?Value = if (try env.isExceptionPending())
+            try env.getAndClearLastException()
+        else
+            null;
+        defer if (saved_exc) |exc| {
+            if (env.isExceptionPending() catch false) {
+                _ = env.getAndClearLastException() catch {};
+            }
+            env.throw(exc) catch {};
+        };
+        const scope = try env.openHandleScope();
+        defer env.closeHandleScope(scope) catch {};
+        const result = try env.callFunction(
+            try env.getNull(),
+            try env.getReferenceValue(self.js.control_last_js_error orelse return error.Unexpected),
+            &.{
+                try env.createUint32(mode),
+            },
+        );
+        dest.* = try env.getValueUint32(result);
+        return .SUCCESS;
+    }
+
+    fn disposeJsValue(self: *@This(), handle: u32, catch_mode: bool) !E {
+        if (!self.isOwnerJsThread()) return .PERM;
+        const env = self.env;
+        const saved_exc: ?Value = if (try env.isExceptionPending())
+            try env.getAndClearLastException()
+        else
+            null;
+        defer if (saved_exc) |exc| {
+            if (env.isExceptionPending() catch false) {
+                _ = env.getAndClearLastException() catch {};
+            }
+            env.throw(exc) catch {};
+        };
+        const scope = try env.openHandleScope();
+        defer env.closeHandleScope(scope) catch {};
+        const result = try env.callFunction(
+            try env.getNull(),
+            try env.getReferenceValue(self.js.dispose_js_value orelse return error.Unexpected),
+            &.{
+                try env.createUint32(handle),
+                try env.getBoolean(catch_mode),
+            },
+        );
+        return switch (try env.getValueUint32(result)) {
+            0 => .SUCCESS,
+            1 => .FAULT,
+            2 => .NOSYS,
+            else => .FAULT,
+        };
+    }
+
+    fn asyncDisposeJsValue(self: *@This(), handle: u32, catch_mode: bool) !E {
+        if (!self.isOwnerJsThread()) return .PERM;
+        const env = self.env;
+        const saved_exc: ?Value = if (try env.isExceptionPending())
+            try env.getAndClearLastException()
+        else
+            null;
+        defer if (saved_exc) |exc| {
+            if (env.isExceptionPending() catch false) {
+                _ = env.getAndClearLastException() catch {};
+            }
+            env.throw(exc) catch {};
+        };
+        const scope = try env.openHandleScope();
+        defer env.closeHandleScope(scope) catch {};
+        const result = try env.callFunction(
+            try env.getNull(),
+            try env.getReferenceValue(self.js.async_dispose_js_value orelse return error.Unexpected),
+            &.{
+                try env.createUint32(handle),
+                try env.getBoolean(catch_mode),
+            },
+        );
+        return switch (try env.getValueUint32(result)) {
+            0 => .SUCCESS,
+            1 => .FAULT,
+            2 => .NOSYS,
+            else => .FAULT,
+        };
     }
 
     fn releaseFunction(self: *@This(), fn_id: usize) !void {

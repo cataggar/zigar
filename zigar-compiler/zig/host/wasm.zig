@@ -279,6 +279,51 @@ pub fn releaseZigCallback(callback_id: u32) void {
     _releaseZigCallback(callback_id);
 }
 
+pub fn tryControlLastJsError(mode: u32) js.Error!u32 {
+    if (!isJsThread()) return error.OffJsThread;
+    return _controlLastJsError(mode);
+}
+
+pub fn controlLastJsError(mode: u32) u32 {
+    return tryControlLastJsError(mode) catch @panic("JsValue operations require the JS thread");
+}
+
+fn mapDisposeCode(code: u32) js.Error!void {
+    return switch (code & 3) {
+        0 => {},
+        1 => error.JsException,
+        2 => error.HostUnavailable,
+        else => error.JsException,
+    };
+}
+
+pub fn tryDisposeJsValue(handle: u32) js.Error!void {
+    if (!isJsThread()) return error.OffJsThread;
+    return mapDisposeCode(_disposeJsValue(handle, true));
+}
+
+pub fn disposeJsValue(handle: u32) void {
+    if (!isJsThread()) @panic("JsValue operations require the JS thread");
+    _ = _disposeJsValue(handle, false);
+}
+
+pub fn tryAsyncDisposeJsValue(handle: u32) js.Error!void {
+    if (!isJsThread()) return error.OffJsThread;
+    const code = _beginAsyncDisposeJsValue(handle, true);
+    if ((code & 3) == 3) {
+        return mapDisposeCode(_awaitAsyncDisposeJsValue(code >> 2));
+    }
+    return mapDisposeCode(code);
+}
+
+pub fn asyncDisposeJsValue(handle: u32) void {
+    if (!isJsThread()) @panic("JsValue operations require the JS thread");
+    const code = _beginAsyncDisposeJsValue(handle, false);
+    if ((code & 3) == 3) {
+        _ = _awaitAsyncDisposeJsValue(code >> 2);
+    }
+}
+
 pub fn isJsThread() bool {
     return builtin.single_threaded or in_main_thread;
 }
@@ -523,6 +568,10 @@ extern "env" fn _getJsValueCount() u32;
 extern "env" fn _invokeJsHostOp(descriptor_ptr: *const anyopaque, arg_ptr: *anyopaque, arg_size: usize) E;
 extern "env" fn _createZigCallback(descriptor_ptr: *const anyopaque, callback_id: u32) u32;
 extern "env" fn _releaseZigCallback(callback_id: u32) void;
+extern "env" fn _controlLastJsError(mode: u32) u32;
+extern "env" fn _disposeJsValue(handle: u32, catch_mode: bool) u32;
+extern "env" fn _beginAsyncDisposeJsValue(handle: u32, catch_mode: bool) u32;
+extern "env" fn _awaitAsyncDisposeJsValue(ticket: u32) u32;
 extern "env" fn _displayPanic(bytes: [*]const u8, len: usize) void;
 
 comptime {

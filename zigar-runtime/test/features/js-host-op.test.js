@@ -1514,4 +1514,237 @@ describe('Feature: js-host-op', function() {
 
     expect(env.getJsValueCount()).to.equal(0);
   });
+
+  it('should lazily capture JS exceptions on error-union host ops without allocating handles until inspected and isolate frames', function() {
+    const env = new Env();
+    env.littleEndian = true;
+    const harness = createMemoryHarness(env);
+    const s = defineHostOpStructures(env, harness.is64);
+
+    const argsFallibleCall = s.makeArgStruct(501n, s.errUnionI32, [ s.jsRef ]);
+    const dCall = writeDescriptor(harness, 0x300, {
+      signature: 501n,
+      op: HostOpCode.CallFn,
+      argSize: argsFallibleCall.byteSize,
+    });
+    const frameAddr = harness.addrOf(0x900);
+    const frameDV = harness.viewAt(0x900, 64);
+
+    let nextThrow = Object.assign(new TypeError('bad input'), { code: 'ERR_BAD_INPUT' });
+    const throwerHandle = env.allocJsValue(() => {
+      throw nextThrow;
+    });
+    const baselineHandles = env.getJsValueCount();
+    expect(baselineHandles).to.equal(1);
+
+    // 1. Before any error: Has=0, Peek=7 (NO_CAPTURED_ERROR_HANDLE), Take=7
+    expect(env.controlLastJsError(2)).to.equal(0);
+    expect(env.controlLastJsError(0)).to.equal(7);
+    expect(env.controlLastJsError(1)).to.equal(7);
+
+    // 2. Catching 50 errors without calling Peek/Take allocates ZERO JsValue handles
+    for (let i = 0; i < 50; i++) {
+      frameDV.setUint32(argsFallibleCall.instance.members[1].bitOffset / 8, throwerHandle, true);
+      expect(env.invokeJsHostOp(dCall, frameAddr)).to.equal(PosixError.NONE);
+      expect(env.getJsValueCount()).to.equal(baselineHandles);
+      expect(env.controlLastJsError(2)).to.equal(1);
+    }
+
+    // 3. Peek allocates a handle without consuming; Take allocates and clears
+    const peekHandle = env.controlLastJsError(0);
+    expect(peekHandle).to.be.greaterThan(7);
+    expect(env.controlLastJsError(2)).to.equal(1);
+    expect(env.getJsValue(peekHandle)).to.equal(nextThrow);
+    env.releaseJsValue(peekHandle);
+
+    const takeHandle = env.controlLastJsError(1);
+    expect(takeHandle).to.be.greaterThan(7);
+    expect(env.controlLastJsError(2)).to.equal(0);
+    expect(env.controlLastJsError(1)).to.equal(7);
+    expect(env.getJsValue(takeHandle).code).to.equal('ERR_BAD_INPUT');
+    env.releaseJsValue(takeHandle);
+
+    // 4. Throwing `undefined` and `null` returns reserved handles 0 and 1 (distinct from 7 = none)
+    for (const [ thrownVal, expectedReservedHandle ] of [
+      [ undefined, 0 ],
+      [ null, 1 ],
+    ]) {
+      nextThrow = thrownVal;
+      frameDV.setUint32(argsFallibleCall.instance.members[1].bitOffset / 8, throwerHandle, true);
+      expect(env.invokeJsHostOp(dCall, frameAddr)).to.equal(PosixError.NONE);
+      expect(env.controlLastJsError(2)).to.equal(1);
+      expect(env.controlLastJsError(1)).to.equal(expectedReservedHandle);
+      expect(env.controlLastJsError(2)).to.equal(0);
+    }
+
+    // 5. Concurrent JSPI continuation hostErrorFrames isolate captured errors
+    const frameA = { hasPendingHostError: false, pendingHostError: undefined, hasCapturedError: false, capturedError: undefined };
+    const frameB = { hasPendingHostError: false, pendingHostError: undefined, hasCapturedError: false, capturedError: undefined };
+    const errA = new Error('fiber-A');
+    const errB = new Error('fiber-B');
+
+    env.activeContinuation = { hostErrorFrame: frameA };
+    nextThrow = errA;
+    frameDV.setUint32(argsFallibleCall.instance.members[1].bitOffset / 8, throwerHandle, true);
+    expect(env.invokeJsHostOp(dCall, frameAddr)).to.equal(PosixError.NONE);
+
+    env.activeContinuation = { hostErrorFrame: frameB };
+    nextThrow = errB;
+    frameDV.setUint32(argsFallibleCall.instance.members[1].bitOffset / 8, throwerHandle, true);
+    expect(env.invokeJsHostOp(dCall, frameAddr)).to.equal(PosixError.NONE);
+
+    env.activeContinuation = { hostErrorFrame: frameA };
+    const hA = env.controlLastJsError(1);
+    expect(env.getJsValue(hA)).to.equal(errA);
+    env.releaseJsValue(hA);
+
+    env.activeContinuation = { hostErrorFrame: frameB };
+    const hB = env.controlLastJsError(1);
+    expect(env.getJsValue(hB)).to.equal(errB);
+    env.releaseJsValue(hB);
+    env.activeContinuation = null;
+
+    env.releaseJsValue(throwerHandle);
+    expect(env.getJsValueCount()).to.equal(0);
+  });
+
+  it('should support Symbol.dispose, Symbol.asyncDispose (sync fallback, microtask, and JSPI suspension), and one-shot callbacks', async function() {
+    const env = new Env();
+    env.littleEndian = true;
+    const harness = createMemoryHarness(env);
+    const s = defineHostOpStructures(env, harness.is64);
+
+    // 1. Sync Symbol.dispose success + throwing disposer always releases handle
+    const events = [];
+    const resOk = {
+      label: 'r1',
+      [Symbol.dispose]() {
+        events.push(`dispose:${this.label}`);
+      },
+    };
+    const hOk = env.allocJsValue(resOk);
+    expect(env.disposeJsValue(hOk, true)).to.equal(0);
+    expect(events).to.deep.equal([ 'dispose:r1' ]);
+    expect(env.getJsValueCount()).to.equal(0);
+
+    const disposeBoom = new Error('sync dispose failed');
+    const hThrowCatch = env.allocJsValue({
+      [Symbol.dispose]() {
+        throw disposeBoom;
+      },
+    });
+    expect(env.disposeJsValue(hThrowCatch, true)).to.equal(1);
+    expect(env.getJsValueCount()).to.equal(0);
+    const hCaught = env.controlLastJsError(1);
+    expect(env.getJsValue(hCaught)).to.equal(disposeBoom);
+    env.releaseJsValue(hCaught);
+
+    const hThrowPending = env.allocJsValue({
+      [Symbol.dispose]() {
+        throw disposeBoom;
+      },
+    });
+    expect(env.disposeJsValue(hThrowPending, false)).to.equal(0);
+    expect(env.getJsValueCount()).to.equal(0);
+    expect(env.consumePendingHostError()?.error).to.equal(disposeBoom);
+
+    // 2. Symbol.asyncDispose: fallback to Symbol.dispose, microtask async settlement, and JSPI timer ticket
+    const hFallback = env.allocJsValue({
+      [Symbol.dispose]() {
+        events.push('fallback-sync');
+      },
+    });
+    expect(env.beginAsyncDisposeJsValue(hFallback, true)).to.equal(0);
+    expect(events).to.include('fallback-sync');
+    expect(env.getJsValueCount()).to.equal(0);
+
+    const hMicrotask = env.allocJsValue({
+      async [Symbol.asyncDispose]() {
+        await Promise.resolve();
+        events.push('microtask-async');
+      },
+    });
+    expect(env.asyncDisposeJsValue(hMicrotask, true)).to.equal(0);
+    expect(events).to.include('microtask-async');
+    expect(env.getJsValueCount()).to.equal(0);
+
+    // Timer-backed asyncDispose without JSPI returns 2 (HostUnavailable) and releases handle immediately
+    const hTimerNoJspi = env.allocJsValue({
+      [Symbol.asyncDispose]() {
+        return new Promise((resolve) => setTimeout(resolve, 10));
+      },
+    });
+    expect(env.beginAsyncDisposeJsValue(hTimerNoJspi, true)).to.equal(2);
+    expect(env.getJsValueCount()).to.equal(0);
+
+    // Timer-backed asyncDispose WITH JSPI returns ticket ((ticket << 2) | 3) and resolves via awaitAsyncDisposeJsValue
+    const jspiFrame = { hasPendingHostError: false, pendingHostError: undefined, hasCapturedError: false, capturedError: undefined };
+    env.useJSPI = true;
+    env.activeContinuation = { hostErrorFrame: jspiFrame };
+    const hTimerJspi = env.allocJsValue({
+      [Symbol.asyncDispose]() {
+        return new Promise((resolve) => setTimeout(() => {
+          events.push('timer-jspi-done');
+          resolve();
+        }, 10));
+      },
+    });
+    const code = env.beginAsyncDisposeJsValue(hTimerJspi, true);
+    expect(code & 3).to.equal(3);
+    expect(env.getJsValueCount()).to.equal(1);
+    const awaitStatus = await env.awaitAsyncDisposeJsValue(code >>> 2);
+    expect(awaitStatus).to.equal(0);
+    expect(events).to.include('timer-jspi-done');
+    expect(env.getJsValueCount()).to.equal(0);
+
+    // Rejecting timer-backed asyncDispose WITH JSPI captures rejection on fiber's hostErrorFrame
+    const asyncRejectErr = Object.assign(new Error('timer close failed'), { code: 'ECONNRESET' });
+    const hTimerReject = env.allocJsValue({
+      [Symbol.asyncDispose]() {
+        return new Promise((_, reject) => setTimeout(() => reject(asyncRejectErr), 10));
+      },
+    });
+    const rejCode = env.beginAsyncDisposeJsValue(hTimerReject, true);
+    expect(rejCode & 3).to.equal(3);
+    expect(await env.awaitAsyncDisposeJsValue(rejCode >>> 2)).to.equal(1);
+    expect(env.getJsValueCount()).to.equal(0);
+    const hRej = env.controlLastJsError(1);
+    expect(env.getJsValue(hRej)).to.equal(asyncRejectErr);
+    env.releaseJsValue(hRej);
+    env.activeContinuation = null;
+    env.useJSPI = false;
+
+    // 3. One-shot callback (`flags = 2`) auto-revokes and auto-releases its JsValue handle after first call
+    const cbArgStruct = s.makeArgStruct(502n, s.i32, [ s.i32 ]);
+    const descOff = 0x500;
+    const ptrSize = harness.is64 ? 8 : 4;
+    const descDV = harness.viewAt(descOff, 16 + 2 * ptrSize);
+    descDV.setBigUint64(0, 502n, true);
+    descDV.setUint32(8, 2, true); // CallbackFlags.once = 1 << 1
+    descDV.setUint32(12, 0, true);
+    if (harness.is64) {
+      descDV.setBigUint64(16, 0x9000n, true);
+      descDV.setBigUint64(24, 0n, true);
+    } else {
+      descDV.setUint32(16, 0x9000, true);
+      descDV.setUint32(20, 0, true);
+    }
+    if (process.env.TARGET === 'wasm') {
+      env.createOutboundCaller = () => (x) => x * 3;
+    } else {
+      env.runThunk = () => true;
+      env.invokeThunk = (_thunk, _fn, argsHolder) => {
+        argsHolder.retval = argsHolder[0] * 3;
+        return argsHolder.retval;
+      };
+    }
+    const onceHandle = env.createZigCallback(harness.addrOf(descOff), 1);
+    const onceFn = env.getJsValue(onceHandle);
+    expect(env.getActiveZigCallbackCount()).to.equal(1);
+    expect(env.getJsValueCount()).to.equal(1);
+    expect(onceFn(14)).to.equal(42);
+    expect(env.getActiveZigCallbackCount()).to.equal(0);
+    expect(env.getJsValueCount()).to.equal(0);
+    expect(() => onceFn(1)).to.throw(/already been released/);
+  });
 });
