@@ -54,9 +54,11 @@ var moduleLoading = mixin({
       this.valueMap = new Map();
       this.valueIndices = new Map();
       this.options = null;
+      this.wasmBinary = null;
       this.executable = null;
       this.instance = null;
       this.memory = null;
+      this.initialMemoryPages = 0;
       this.table = null;
       this.initialTableLength = 0;
       this.exportedFunctions = null;
@@ -412,6 +414,7 @@ var moduleLoading = mixin({
     importFunctions(exports) {
       if (!this.memory && exports.memory) {
         this.memory = exports.memory;
+        this.initialMemoryPages = this.memory.buffer.byteLength / 65536;
         this.enableResizableMemory(this.memory);
       }
       if (!this.table && exports.__indirect_function_table) {
@@ -506,8 +509,24 @@ var moduleLoading = mixin({
         this.continuationStackSize = (continuationStackSize + 15) & -16;
       }
       const res = await source;
+      let wasmInput = res;
+      if (res?.[Symbol.toStringTag] === 'Response') {
+        if (typeof res.arrayBuffer === 'function') {
+          const buf = await res.arrayBuffer();
+          this.wasmBinary = new Uint8Array(buf);
+          wasmInput = this.wasmBinary;
+        } else {
+          this.wasmBinary = null;
+        }
+      } else if (res instanceof ArrayBuffer) {
+        this.wasmBinary = new Uint8Array(res);
+      } else if (ArrayBuffer.isView(res)) {
+        this.wasmBinary = new Uint8Array(res.buffer, res.byteOffset, res.byteLength);
+      } else {
+        this.wasmBinary = null;
+      }
       if (memory64 === undefined) {
-        const detected = detectWasm64(res);
+        const detected = detectWasm64(wasmInput);
         if (detected) {
           if (detected.memory64) {
             this.memory64 = true;
@@ -517,9 +536,9 @@ var moduleLoading = mixin({
           }
         }
       }
-      const suffix = (res[Symbol.toStringTag] === 'Response') ? 'Streaming' : '';
+      const suffix = (wasmInput?.[Symbol.toStringTag] === 'Response') ? 'Streaming' : '';
       const f = WA['compile' + suffix];
-      const executable = this.executable = await f(res);
+      const executable = this.executable = await f(wasmInput);
       const functions = this.exportFunctions();
       const env = {}, wasi = {}, wasiPreview = {};
       const exports = this.exportedModules = { env, wasi, wasi_snapshot_preview1: wasiPreview };
@@ -545,6 +564,7 @@ var moduleLoading = mixin({
       }
       debugger;
       if (memoryInitial) {
+        this.initialMemoryPages = memoryInitial;
         this.memory = env.memory = new WA.Memory(this.memory64 ? {
           initial: BigInt(memoryInitial),
           ...(memoryMax !== undefined ? { maximum: BigInt(memoryMax) } : undefined),

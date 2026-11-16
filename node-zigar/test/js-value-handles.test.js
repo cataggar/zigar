@@ -285,21 +285,24 @@ describe('Native JsValue Handle Registry & zigar.js.Ref(T) Integration', functio
 
   it('should reuse freed slots, trap on double-deinit or ABA stale handles, and still run defer cleanup while JS exceptions are pending', function() {
     const raw1 = mod.inspectRawHandle({ seq: 1 });
-    const raw2 = mod.inspectRawHandle({ seq: 2 });
-    const raw3 = mod.inspectRawHandle({ seq: 3 });
-
     const slot1 = raw1 & 0x3FFF;
-    const slot2 = raw2 & 0x3FFF;
-    const slot3 = raw3 & 0x3FFF;
     const gen1 = raw1 >>> 20;
-    const gen2 = raw2 >>> 20;
-    const gen3 = raw3 >>> 20;
-
     expect(slot1).to.be.at.least(8);
-    expect(slot2).to.equal(slot1);
-    expect(slot3).to.equal(slot1);
-    expect(gen2).to.equal(gen1 + 1);
-    expect(gen3).to.equal(gen2 + 1);
+
+    const seenBeforeRepeat = new Set([ slot1 ]);
+    let repeatedGen = 0;
+    for (let step = 0; step < 32; step++) {
+      const rawNext = mod.inspectRawHandle({ seq: step + 2 });
+      const nextSlot = rawNext & 0x3FFF;
+      const nextGen = rawNext >>> 20;
+      if (nextSlot === slot1) {
+        repeatedGen = nextGen;
+        break;
+      }
+      expect(seenBeforeRepeat.has(nextSlot)).to.be.false;
+      seenBeforeRepeat.add(nextSlot);
+    }
+    expect(repeatedGen).to.equal(gen1 + 1);
 
     expect(() => mod.triggerDoubleDeinit({ doomed: true })).to.throw(
       TypeError,
@@ -642,6 +645,63 @@ describe('Native JsValue Handle Registry & zigar.js.Ref(T) Integration', functio
     // Main thread's live handle in slot 8 remains completely uncorrupted
     expect(Object.is(mod.loadGlobalClone(), mainObj)).to.be.true;
     mod.clearGlobal();
+    expect(Number(mod.activeCount())).to.equal(0);
+  });
+
+  it('should support 24+ live *const fn (i32) i32 JS callbacks, reclaim released slots, and enforce M1/L1/L2 handle safety', function() {
+    for (let i = 0; i < 24; i++) {
+      expect(Number(mod.registerIntFn((x) => (i + 1) * 100 + x))).to.equal(i);
+    }
+    for (let i = 0; i < 24; i++) {
+      expect(mod.callRegisteredIntFn(i, 7)).to.equal((i + 1) * 100 + 7);
+    }
+    mod.releaseAllRegisteredIntFns();
+
+    for (let i = 0; i < 20; i++) {
+      expect(Number(mod.registerIntFn((x) => 8000 + i + x))).to.equal(i);
+    }
+    for (let i = 0; i < 20; i++) {
+      expect(mod.callRegisteredIntFn(i, 5)).to.equal(8005 + i);
+    }
+    mod.releaseAllRegisteredIntFns();
+
+    let staleIter1 = 0;
+    let staleIter4095 = 0;
+    for (let i = 1; i <= 10000 || staleIter4095 === 0; i++) {
+      const raw = mod.inspectRawHandle({ cycle: i });
+      const gen = raw >>> 20;
+      expect(gen).to.be.at.least(1);
+      expect(gen).to.be.at.most(4095);
+      if (i === 1) staleIter1 = raw;
+      if (gen === 4095 && staleIter4095 === 0) staleIter4095 = raw;
+      if (i > 30000) break;
+    }
+    const liveAfterChurn = { liveAfter10k: true };
+    mod.storeGlobal(liveAfterChurn);
+    expect(() => mod.inspectRawBitsTypeof(staleIter1)).to.throw(TypeError, /Invalid or released JS value handle/);
+    expect(() => mod.inspectRawBitsTypeof(staleIter4095)).to.throw(TypeError, /Invalid or released JS value handle/);
+    expect(Object.is(mod.loadGlobalClone(), liveAfterChurn)).to.be.true;
+    mod.clearGlobal();
+    expect(Number(mod.activeCount())).to.equal(0);
+
+    expect(() => mod.returnPairWithStaleFirst({ stale: 1 }, { validSibling: 2 })).to.throw(
+      TypeError,
+      /Invalid or released JS value handle/,
+    );
+    expect(Number(mod.activeCount())).to.equal(0);
+
+    mod.storeBorrowedSliceRefs({ a: 1 }, { b: 2 });
+    expect(Number(mod.activeCount())).to.equal(2);
+    expect(() => mod.returnBorrowedSliceOnHostError(() => {
+      throw new RangeError('pending-slice-host-err');
+    })).to.throw(RangeError, /pending-slice-host-err/);
+    expect(Number(mod.activeCount())).to.equal(2);
+    mod.clearBorrowedSliceRefs();
+    expect(Number(mod.activeCount())).to.equal(0);
+
+    expect(() => mod.returnByValueRefOnHostError(() => {
+      throw new RangeError('pending-byval-host-err');
+    }, { discardedByValue: true })).to.throw(RangeError, /pending-byval-host-err/);
     expect(Number(mod.activeCount())).to.equal(0);
   });
 });

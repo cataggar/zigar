@@ -403,9 +403,6 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
             if (@hasDecl(internal_ns, "onWorkerStart")) {
                 _ = @call(.auto, internal_ns.onWorkerStart, .{});
             }
-            defer if (@hasDecl(internal_ns, "onWorkerEnd")) {
-                _ = @call(.auto, internal_ns.onWorkerEnd, .{});
-            };
             var start_succeeded = true;
             if (@hasDecl(ns, "onThreadStart")) {
                 const result = @call(.auto, ns.onThreadStart, thread_start_params);
@@ -441,14 +438,14 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
             if (@hasDecl(ns, "onThreadEnd")) {
                 if (start_succeeded) _ = @call(.auto, ns.onThreadEnd, thread_end_params);
             }
+            if (@hasDecl(internal_ns, "onWorkerEnd")) {
+                _ = @call(.auto, internal_ns.onWorkerEnd, .{});
+            }
             if (@atomicRmw(usize, &self.thread_count, .Sub, 1, .acq_rel) == 1) {
                 self.queue.deinit();
                 const init_result = self.init_result;
                 const init_promise = self.init_promise;
                 const deinit_promise = self.deinit_promise;
-                if (@hasDecl(internal_ns, "onQueueDeinit")) {
-                    _ = @call(.auto, internal_ns.onQueueDeinit, .{});
-                }
                 const has_init_err = @typeInfo(WaitResult) == .error_union and std.meta.isError(init_result);
                 if (has_init_err) {
                     self.init_futex.store(1, .release);
@@ -459,6 +456,9 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
                     if (init_promise) |promise| promise.resolve(init_result);
                 }
                 if (deinit_promise) |promise| promise.resolve({});
+                if (@hasDecl(internal_ns, "onQueueDeinit")) {
+                    _ = @call(.auto, internal_ns.onQueueDeinit, .{});
+                }
             }
         }
 

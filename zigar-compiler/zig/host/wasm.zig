@@ -173,10 +173,27 @@ export fn runVariadicThunk(
     return true;
 }
 
+var pending_dynamic_js_thunk_id: usize = 0;
+
+pub fn consumePendingDynamicJsThunkId() usize {
+    const id = pending_dynamic_js_thunk_id;
+    pending_dynamic_js_thunk_id = 0;
+    return id;
+}
+
+export fn setPendingDynamicJsThunkId(fn_id: usize) void {
+    pending_dynamic_js_thunk_id = fn_id;
+}
+
+export fn getDynamicJsThunk(controller_address: usize) usize {
+    const controller: js_fn.ThunkController = @ptrFromInt(controller_address);
+    return controller(.get_dynamic_thunk, 0) catch 0;
+}
+
 export fn createJsThunk(controller_address: usize, fn_id: usize) usize {
     // try to use preallocated thunks within module first; if they've been used up,
-    // ask JavaScript to create a new instance of this module and get a new
-    // thunk from that
+    // ask JavaScript to synthesize a dynamic WASM trampoline forwarding into this
+    // module's dynamic_thunk
     const controller: js_fn.ThunkController = @ptrFromInt(controller_address);
     const can_allocate = builtin.single_threaded and in_main_thread;
     const thunk_address = controller(.create, fn_id) catch switch (can_allocate) {

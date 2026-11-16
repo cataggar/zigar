@@ -1,4 +1,9 @@
 import { expect } from 'chai';
+import { execFile } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 
 function delayedResolve(ms, value) {
   return new Promise((resolveFn) => setTimeout(() => resolveFn(value), ms));
@@ -285,5 +290,66 @@ describe('Native Standard zigar.js Wrappers & WorkQueue Async Promise/AsyncItera
 
     await mod.shutdown();
     queueStarted = false;
+  });
+
+  it('should wake queued threadsafe_callback items with FAULT when disableMultithread aborts with null env', async function() {
+    let jsCalledCount = 0;
+    mod.triggerAbortedQueuedJscall(() => {
+      jsCalledCount++;
+    });
+    let state = 0;
+    for (let attempt = 0; attempt < 40 && state === 0; attempt++) {
+      await new Promise((r) => setTimeout(r, 10));
+      state = mod.pollAndJoinAbortedQueuedJscall();
+    }
+    expect(state).to.equal(1);
+    expect(jsCalledCount).to.equal(0);
+  });
+
+  it('should cleanly tear down napi_threadsafe_function callbacks without crashing when a Worker terminates mid-flight', async function() {
+    const loaderPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+    const sampleFilePath = fileURLToPath(new URL('./zig-samples/js-value/standard-wrappers.zig', import.meta.url));
+    const script = `
+      import { Worker, isMainThread } from 'node:worker_threads';
+      import { pathToFileURL } from 'node:url';
+
+      if (isMainThread) {
+        const w = new Worker(new URL(import.meta.url), {
+          execArgv: [ ${JSON.stringify(`--loader=${loaderPath}`)}, '--no-warnings' ],
+        });
+        await new Promise((resolve, reject) => {
+          w.once('message', resolve);
+          w.once('error', reject);
+        });
+        await w.terminate();
+        console.log('TEARDOWN_OK');
+        process.exit(0);
+      } else {
+        const { parentPort } = await import('node:worker_threads');
+        const mod = await import(pathToFileURL(${JSON.stringify(sampleFilePath)}).href + '?optimize=ReleaseSafe&recompile=0&quiet=1');
+        await mod.startup(2);
+        const never = new Promise(() => {});
+        for (let i = 0; i < 16; i++) {
+          mod.pushDetachedWorkerAwaitNoPromise(never);
+        }
+        parentPort.postMessage('ready');
+      }
+    `;
+    const { mkdir, writeFile, rm } = await import('node:fs/promises');
+    const { dirname, join } = await import('node:path');
+    const scratchDir = process.env.TMPDIR || fileURLToPath(new URL('./.zigar-cache', import.meta.url));
+    const tmpScriptPath = join(scratchDir, 'm3-worker-teardown.mjs');
+    await mkdir(dirname(tmpScriptPath), { recursive: true });
+    await writeFile(tmpScriptPath, script, 'utf-8');
+    try {
+      const { stdout } = await execFileAsync(
+        process.execPath,
+        [ `--loader=${loaderPath}`, '--no-warnings', tmpScriptPath ],
+        { env: process.env },
+      );
+      expect(stdout).to.contain('TEARDOWN_OK');
+    } finally {
+      await rm(tmpScriptPath, { force: true });
+    }
   });
 });

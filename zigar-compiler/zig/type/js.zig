@@ -1420,8 +1420,10 @@ pub fn Js(comptime host: type) type {
 
         const CallbackRegistry = struct {
             const slab_capacity: usize = 64;
+            const initial_table_capacity: usize = 16;
             const null_index: u32 = std.math.maxInt(u32);
             const max_slot_index: u32 = (1 << 20) - 2;
+            const max_generation: u16 = 0x0FFF;
             const InvokerFn = *const fn (*anyopaque, *anyopaque) anyerror!void;
             const DeinitCtxFn = *const fn (*anyopaque) void;
 
@@ -1429,6 +1431,7 @@ pub fn Js(comptime host: type) type {
                 ctx_ptr: *anyopaque = undefined,
                 invoker: ?InvokerFn = null,
                 deinit_ctx: ?DeinitCtxFn = null,
+                sig_hash: u64 = 0,
                 fn_handle: u32 = module.reserved_undefined_handle,
                 generation: u16 = 1,
                 active_calls: u32 = 0,
@@ -1437,16 +1440,22 @@ pub fn Js(comptime host: type) type {
                 next_free: u32 = null_index,
             };
 
-            const SlabNode = struct {
+            const Slab = struct {
                 entries: [slab_capacity]SlotEntry = @splat(.{}),
-                next: ?*SlabNode = null,
             };
 
-            var inline_slab: SlabNode = .{};
-            var slab_count: u32 = 1;
+            var inline_slab: Slab = .{};
+            var inline_slab_table: [initial_table_capacity]*Slab = init: {
+                var table: [initial_table_capacity]*Slab = undefined;
+                table[0] = &inline_slab;
+                break :init table;
+            };
+            var slabs: []*Slab = inline_slab_table[0..];
+            var slabs_heap_allocated: bool = false;
+            var slab_count: usize = 1;
             var high_water_in_tail: usize = 0;
-            var tail_slab: *SlabNode = &inline_slab;
             var free_head: u32 = null_index;
+            var free_tail: u32 = null_index;
             var active_count: u32 = 0;
 
             fn backingAllocator() std.mem.Allocator {
@@ -1461,21 +1470,12 @@ pub fn Js(comptime host: type) type {
 
             fn entryAt(slot_index: u32) ?*SlotEntry {
                 const slab_idx: usize = @intCast(slot_index / slab_capacity);
+                if (slab_idx >= slab_count) return null;
                 const offset: usize = @intCast(slot_index % slab_capacity);
-                var current: ?*SlabNode = &inline_slab;
-                var idx: usize = 0;
-                while (current) |node| : ({
-                    current = node.next;
-                    idx += 1;
-                }) {
-                    if (idx == slab_idx) {
-                        return &node.entries[offset];
-                    }
-                }
-                return null;
+                return &slabs[slab_idx].entries[offset];
             }
 
-            fn allocate(ctx_ptr: *anyopaque, invoker: InvokerFn, deinit_ctx: ?DeinitCtxFn, is_once: bool) !u32 {
+            fn allocate(ctx_ptr: *anyopaque, invoker: InvokerFn, deinit_ctx: ?DeinitCtxFn, is_once: bool, sig_hash: u64) !u32 {
                 var slot_index: u32 = undefined;
                 var entry_ptr: *SlotEntry = undefined;
 
@@ -1483,27 +1483,43 @@ pub fn Js(comptime host: type) type {
                     slot_index = free_head;
                     entry_ptr = entryAt(slot_index) orelse return error.Unexpected;
                     free_head = entry_ptr.next_free;
+                    if (free_head == null_index) {
+                        free_tail = null_index;
+                    }
+                    entry_ptr.next_free = null_index;
                 } else {
                     if (high_water_in_tail >= slab_capacity) {
-                        const next_global: u32 = slab_count * @as(u32, slab_capacity);
-                        if (next_global > max_slot_index) return error.OutOfMemory;
-                        const new_slab = try backingAllocator().create(SlabNode);
+                        const next_global_usize: usize = slab_count * slab_capacity;
+                        if (next_global_usize > max_slot_index) return error.OutOfMemory;
+                        const alloc = backingAllocator();
+                        if (slab_count >= slabs.len) {
+                            const max_slabs: usize = @intCast((max_slot_index / slab_capacity) + 1);
+                            const new_cap = @min(slabs.len * 2, max_slabs);
+                            if (new_cap <= slab_count) return error.OutOfMemory;
+                            const new_table = try alloc.alloc(*Slab, new_cap);
+                            @memcpy(new_table[0..slab_count], slabs[0..slab_count]);
+                            if (slabs_heap_allocated) {
+                                alloc.free(slabs);
+                            }
+                            slabs = new_table;
+                            slabs_heap_allocated = true;
+                        }
+                        const new_slab = try alloc.create(Slab);
                         new_slab.* = .{};
-                        tail_slab.next = new_slab;
-                        tail_slab = new_slab;
+                        slabs[slab_count] = new_slab;
                         slab_count += 1;
                         high_water_in_tail = 0;
                     }
-                    slot_index = (slab_count - 1) * @as(u32, slab_capacity) + @as(u32, @intCast(high_water_in_tail));
+                    slot_index = @as(u32, @intCast((slab_count - 1) * slab_capacity + high_water_in_tail));
                     if (slot_index > max_slot_index) return error.OutOfMemory;
-                    entry_ptr = &tail_slab.entries[high_water_in_tail];
+                    entry_ptr = &slabs[slab_count - 1].entries[high_water_in_tail];
                     high_water_in_tail += 1;
                 }
 
-                if (entry_ptr.generation == 0) entry_ptr.generation = 1;
                 entry_ptr.ctx_ptr = ctx_ptr;
                 entry_ptr.invoker = invoker;
                 entry_ptr.deinit_ctx = deinit_ctx;
+                entry_ptr.sig_hash = sig_hash;
                 entry_ptr.fn_handle = module.reserved_undefined_handle;
                 entry_ptr.active_calls = 0;
                 entry_ptr.once = is_once;
@@ -1537,7 +1553,7 @@ pub fn Js(comptime host: type) type {
                 const gen12: u16 = @intCast((callback_id >> 20) & 0x0FFF);
                 if (gen12 == 0) return null;
                 const entry = entryAt(slot_index) orelse return null;
-                if (entry.invoker == null or entry.pending_release) return null;
+                if (entry.generation == 0 or entry.invoker == null or entry.pending_release) return null;
                 if ((entry.generation & 0x0FFF) != gen12) return null;
                 return .{ .slot_index = slot_index, .entry = entry };
             }
@@ -1547,11 +1563,22 @@ pub fn Js(comptime host: type) type {
                 const ctx_ptr = entry.ctx_ptr;
                 entry.deinit_ctx = null;
                 entry.ctx_ptr = undefined;
+                entry.sig_hash = 0;
                 entry.fn_handle = module.reserved_undefined_handle;
                 entry.once = false;
                 entry.pending_release = false;
-                entry.next_free = free_head;
-                free_head = slot_index;
+                entry.next_free = null_index;
+                if (entry.generation != 0) {
+                    if (free_tail != null_index) {
+                        if (entryAt(free_tail)) |tail_entry| {
+                            tail_entry.next_free = slot_index;
+                        }
+                        free_tail = slot_index;
+                    } else {
+                        free_head = slot_index;
+                        free_tail = slot_index;
+                    }
+                }
                 if (deinit_ctx) |cleanup| {
                     cleanup(ctx_ptr);
                 }
@@ -1571,11 +1598,13 @@ pub fn Js(comptime host: type) type {
                 const gen12: u16 = @intCast((callback_id >> 20) & 0x0FFF);
                 if (gen12 == 0) return false;
                 const entry = entryAt(slot_index) orelse return false;
-                if (entry.invoker == null or entry.pending_release or (entry.generation & 0x0FFF) != gen12) return false;
+                if (entry.generation == 0 or entry.invoker == null or entry.pending_release or (entry.generation & 0x0FFF) != gen12) return false;
 
                 entry.invoker = null;
-                const next_gen: u16 = (entry.generation + 1) & 0x0FFF;
-                entry.generation = if (next_gen == 0) 1 else next_gen;
+                entry.sig_hash = 0;
+                // Permanently retire slots once their 12-bit generation reaches 0x0FFF (4095)
+                // so a (gen, slot) CallbackId can never wrap around and alias a future callback.
+                entry.generation = if (entry.generation >= max_generation) 0 else (entry.generation + 1);
                 active_count -= 1;
 
                 if (entry.active_calls > 0) {
@@ -1647,6 +1676,7 @@ pub fn Js(comptime host: type) type {
                     const callback_id: u32 = @truncate(@intFromPtr(raw_id_ptr));
                     const resolved = CallbackRegistry.resolve(callback_id) orelse return error.InvalidCallback;
                     const entry = resolved.entry;
+                    if (entry.sig_hash != descriptor.signature) return error.SignatureMismatch;
                     const invoker = entry.invoker orelse return error.InvalidCallback;
                     const ctx_ptr = entry.ctx_ptr;
                     const is_once = entry.once;
@@ -1717,7 +1747,7 @@ pub fn Js(comptime host: type) type {
                     if (!@hasDecl(host, "createZigCallback")) return error.HostUnavailable;
                     const effective_once = is_once or cb_flags.once;
                     const desc = ensureDescriptor(effective_once);
-                    const slot_id = try CallbackRegistry.allocate(ctx_ptr, invoker, deinit_ctx, effective_once);
+                    const slot_id = try CallbackRegistry.allocate(ctx_ptr, invoker, deinit_ctx, effective_once, desc.signature);
                     errdefer _ = CallbackRegistry.release(slot_id);
                     const handle = try host.createZigCallback(desc, slot_id);
                     CallbackRegistry.setHandle(slot_id, handle);
@@ -1816,7 +1846,7 @@ pub fn Js(comptime host: type) type {
                     }
                     const effective_once = is_once or cb_flags.once;
                     const desc = ensureDescriptor(effective_once);
-                    const slot_id = CallbackRegistry.allocate(@ptrCast(box), &BoxedInvoker.invoke, &HeapBox.destroyBox, effective_once) catch |err| {
+                    const slot_id = CallbackRegistry.allocate(@ptrCast(box), &BoxedInvoker.invoke, &HeapBox.destroyBox, effective_once, desc.signature) catch |err| {
                         allocator.destroy(box);
                         return err;
                     };
@@ -6040,4 +6070,175 @@ test "Standard wrappers: ABI layout, Promise, binary views, collections, BigInt,
     }
     try expectEqual(@as(u32, 0), js.activeHandleCount());
 }
+
+test "CallbackRegistry: FIFO reuse, permanent retirement at 0xFFF, multi-slab O(1) lookup, and signature check" {
+    const RegistryAuditMockHost = struct {
+        var active_handles: u32 = 0;
+        var active_callbacks: u32 = 0;
+        var stored_trampoline: usize = 0;
+        var next_handle_id: u32 = first_dynamic_slot;
+
+        pub fn cloneJsValue(handle: u32) u32 {
+            if (handle <= reserved_global_this_handle) return handle;
+            active_handles += 1;
+            const out = next_handle_id;
+            next_handle_id += 1;
+            return out;
+        }
+
+        pub fn releaseJsValue(handle: u32) void {
+            if (handle >= first_dynamic_slot) {
+                std.debug.assert(active_handles > 0);
+                active_handles -= 1;
+            }
+        }
+
+        pub fn equalJsValue(a: u32, b: u32) bool {
+            return a == b;
+        }
+
+        pub fn getJsValueCount() u32 {
+            return active_handles;
+        }
+
+        pub fn createZigCallback(desc_ptr: *const anyopaque, _: u32) Error!u32 {
+            const desc: *const CallbackDescriptor = @ptrCast(@alignCast(desc_ptr));
+            stored_trampoline = desc.trampoline_thunk;
+            active_callbacks += 1;
+            active_handles += 1;
+            const out = next_handle_id;
+            next_handle_id += 1;
+            return out;
+        }
+
+        pub fn releaseZigCallback(_: u32) void {
+            std.debug.assert(active_callbacks > 0);
+            std.debug.assert(active_handles > 0);
+            active_callbacks -= 1;
+            active_handles -= 1;
+        }
+    };
+
+    const js = Js(RegistryAuditMockHost);
+    const TrampolineThunk = *const fn (*const anyopaque, *anyopaque) anyerror!void;
+
+    const Fns = struct {
+        fn addOne(x: i32) i32 {
+            return x + 1;
+        }
+        fn addTwoU32(x: u32) u32 {
+            return x + 2;
+        }
+    };
+
+    // 1. Verify FIFO free-queue ordering across freed callback slots
+    {
+        var c1 = js.Closure(void, Fns.addOne).init();
+        var c2 = js.Closure(void, Fns.addOne).init();
+        var c3 = js.Closure(void, Fns.addOne).init();
+        try expectEqual(@as(u32, 1), c1.id & 0x000F_FFFF);
+        try expectEqual(@as(u32, 2), c2.id & 0x000F_FFFF);
+        try expectEqual(@as(u32, 3), c3.id & 0x000F_FFFF);
+        c1.deinit();
+        c2.deinit();
+        c3.deinit();
+
+        var r1 = js.Closure(void, Fns.addOne).init();
+        var r2 = js.Closure(void, Fns.addOne).init();
+        var r3 = js.Closure(void, Fns.addOne).init();
+        try expectEqual(@as(u32, 1), r1.id & 0x000F_FFFF);
+        try expectEqual(@as(u32, 2), r2.id & 0x000F_FFFF);
+        try expectEqual(@as(u32, 3), r3.id & 0x000F_FFFF);
+        try expectEqual(@as(u32, 2), r1.id >> 20);
+        try expectEqual(@as(u32, 2), r2.id >> 20);
+        try expectEqual(@as(u32, 2), r3.id >> 20);
+        r1.deinit();
+        r2.deinit();
+        r3.deinit();
+    }
+
+    // 2. Run 13,000 Closure alloc/deinit cycles across the 3 FIFO-queued slots:
+    // verify fair FIFO rotation across slots 1..3, permanent retirement of all 3 slots at 0xFFF (4095),
+    // automatic advancement to slot 4, and zero wraparound / zero ABA reuse!
+    var seen_ids = std.AutoHashMap(u32, void).init(std.testing.allocator);
+    defer seen_ids.deinit();
+    var stale_first_id: u32 = 0;
+    var stale_max_gen_id: u32 = 0;
+    var retired_count: u32 = 0;
+    const i32_thunk_capture = blk: {
+        var tmp = js.Closure(void, Fns.addOne).init();
+        stale_first_id = tmp.id;
+        const thunk_ptr = RegistryAuditMockHost.stored_trampoline;
+        try seen_ids.putNoClobber(tmp.id, {});
+        tmp.deinit();
+        break :blk @as(TrampolineThunk, @ptrFromInt(thunk_ptr));
+    };
+
+    const I32Args = arg_struct.ArgStruct(fn (i32) i32);
+    var cycle: usize = 0;
+    while (cycle < 13000) : (cycle += 1) {
+        var cl = js.Closure(void, Fns.addOne).init();
+        const gen = cl.id >> 20;
+        try expect(gen >= 1 and gen <= 0x0FFF);
+        // Every issued CallbackId across all 6,000 cycles MUST be globally unique!
+        try seen_ids.putNoClobber(cl.id, {});
+        if (gen == 0x0FFF) {
+            retired_count += 1;
+            if (stale_max_gen_id == 0) stale_max_gen_id = cl.id;
+        }
+        var call_frame: I32Args = .{ .retval = 0, .@"0" = @intCast(cycle) };
+        try i32_thunk_capture(@ptrFromInt(cl.id), @ptrCast(&call_frame));
+        try expectEqual(@as(i32, @intCast(cycle + 1)), call_frame.retval);
+
+        // Stale IDs must NEVER resolve to a live callback!
+        try std.testing.expectError(error.InvalidCallback, i32_thunk_capture(@ptrFromInt(stale_first_id), @ptrCast(&call_frame)));
+        if (stale_max_gen_id != 0 and stale_max_gen_id != cl.id) {
+            try std.testing.expectError(error.InvalidCallback, i32_thunk_capture(@ptrFromInt(stale_max_gen_id), @ptrCast(&call_frame)));
+        }
+        cl.deinit();
+    }
+    try expect(retired_count >= 1);
+    try expectEqual(@as(u32, 0), js.activeCallbackCount());
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    // 3. Multi-slab O(1) lookup across >200 simultaneous live callbacks (4+ slabs of 64 entries)
+    {
+        var live: [220]js.Closure(void, Fns.addOne) = undefined;
+        for (&live, 0..) |*slot, idx| {
+            slot.* = js.Closure(void, Fns.addOne).init();
+            var frame: I32Args = .{ .retval = 0, .@"0" = @intCast(idx * 3) };
+            try i32_thunk_capture(@ptrFromInt(slot.id), @ptrCast(&frame));
+            try expectEqual(@as(i32, @intCast(idx * 3 + 1)), frame.retval);
+        }
+        try expectEqual(@as(u32, 220), js.activeCallbackCount());
+        for (&live, 0..) |*slot, idx| {
+            var frame: I32Args = .{ .retval = 0, .@"0" = @intCast(idx + 10) };
+            try i32_thunk_capture(@ptrFromInt(slot.id), @ptrCast(&frame));
+            try expectEqual(@as(i32, @intCast(idx + 11)), frame.retval);
+            slot.deinit();
+        }
+        try expectEqual(@as(u32, 0), js.activeCallbackCount());
+    }
+
+    // 4. Signature hash verification in trampolineThunk rejects mismatched callback signatures
+    {
+        var i32_cb = js.Closure(void, Fns.addOne).init();
+        defer i32_cb.deinit();
+        var u32_cb = js.Closure(void, Fns.addTwoU32).init();
+        defer u32_cb.deinit();
+        const u32_thunk: TrampolineThunk = @ptrFromInt(RegistryAuditMockHost.stored_trampoline);
+        const U32Args = arg_struct.ArgStruct(fn (u32) u32);
+        var u32_frame: U32Args = .{ .retval = 0, .@"0" = 40 };
+
+        // Valid signature succeeds
+        try u32_thunk(@ptrFromInt(u32_cb.id), @ptrCast(&u32_frame));
+        try expectEqual(@as(u32, 42), u32_frame.retval);
+
+        // Dispatching `i32_cb.id` (`fn (i32) i32`) through `u32_thunk` (`fn (u32) u32`) MUST fail with `error.SignatureMismatch`!
+        try std.testing.expectError(error.SignatureMismatch, u32_thunk(@ptrFromInt(i32_cb.id), @ptrCast(&u32_frame)));
+    }
+    try expectEqual(@as(u32, 0), js.activeCallbackCount());
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+}
+
 

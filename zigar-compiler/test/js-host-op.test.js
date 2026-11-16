@@ -89,6 +89,7 @@ describe('Table-Driven JS Host-Op Dispatcher & Dynamic Zig Callbacks (WASM32 / W
     });
     expect(plain.code).to.not.include('features/js-host-op.js');
     expect(plain.code).to.not.include('features/js-value-registry.js');
+    expect(plain.code).to.not.include('features/thunk-allocation.js');
   });
 
   const targets = [
@@ -96,6 +97,7 @@ describe('Table-Driven JS Host-Op Dispatcher & Dynamic Zig Callbacks (WASM32 / W
     { label: 'wasm32 (useWazig=true, JSPI)', memory64: false, useWazig: true, useJSPI: true },
     { label: 'wasm64 (useWazig=true, JSPI)', memory64: true, useWazig: true, useJSPI: true },
     { label: 'wasm32 (useWazig=false)', memory64: false, useWazig: false, useJSPI: false },
+    { label: 'wasm32 (useWazig=false, JSPI)', memory64: false, useWazig: false, useJSPI: true },
     { label: 'wasm64 (useWazig=false)', memory64: true, useWazig: false, useJSPI: false },
   ];
 
@@ -129,6 +131,8 @@ describe('Table-Driven JS Host-Op Dispatcher & Dynamic Zig Callbacks (WASM32 / W
       it('should emit js-host-op.js mixin and strip __zigar_js_reg_* exports from stripped WASM', function() {
         expect(transpiled.code).to.include('zigar-runtime/features/js-host-op.js');
         expect(transpiled.code).to.not.include('__zigar_js_reg_');
+        expect(debugEnv.instance.exports.getDynamicJsThunk).to.be.a('function');
+        expect(debugEnv.instance.exports.setPendingDynamicJsThunkId).to.be.a('function');
       });
 
       it('should execute all 9 host operations, bind `this`, intern UTF-8 keys once, and support Symbol keys', async function() {
@@ -440,7 +444,171 @@ describe('Table-Driven JS Host-Op Dispatcher & Dynamic Zig Callbacks (WASM32 / W
         expect(Number(mod.activeHandles())).to.equal(0);
       });
 
+      it('should pass by-value extern struct Point4 and sret return across 24 callconv(.c) callbacks via primary-instance dynamic trampolines', async function() {
+        try {
+          for (let i = 0; i < 24; i++) {
+            const idx = i;
+            await mod.registerPointCb(idx, (pt) => ({
+              x: pt.x + (idx + 1) * 100,
+              y: pt.y - (idx + 1) * 10,
+              z: pt.z + (idx + 1) * 1000,
+              w: pt.w ^ (idx + 1),
+            }));
+          }
+          expect(debugEnv.thunkSources.length).to.equal(0);
+
+          for (let i = 0; i < 24; i++) {
+            const input = { x: i + 1, y: i + 2, z: i + 3, w: i + 4 };
+            const out = await mod.callPointCb(i, input);
+            expect({ x: out.x, y: out.y, z: out.z, w: out.w }).to.deep.equal({
+              x: input.x + (i + 1) * 100,
+              y: input.y - (i + 1) * 10,
+              z: input.z + (i + 1) * 1000,
+              w: input.w ^ (i + 1),
+            });
+          }
+
+          await mod.clearPointCbs();
+          const tableLenAfterFirstWave = Number(debugEnv.table.length);
+
+          // Second wave verifies pooled trampoline + slot reuse without table growth
+          for (let i = 0; i < 24; i++) {
+            const idx = i;
+            await mod.registerPointCb(idx, (pt) => ({
+              x: pt.x + (idx + 50),
+              y: pt.y + (idx + 60),
+              z: pt.z + (idx + 70),
+              w: pt.w + (idx + 80),
+            }));
+          }
+          expect(Number(debugEnv.table.length)).to.equal(tableLenAfterFirstWave);
+          expect(debugEnv.thunkSources.length).to.equal(0);
+
+          for (let i = 0; i < 24; i++) {
+            const out = await mod.callPointCb(i, { x: 1, y: 2, z: 3, w: 4 });
+            expect({ x: out.x, y: out.y, z: out.z, w: out.w }).to.deep.equal({
+              x: 1 + i + 50,
+              y: 2 + i + 60,
+              z: 3 + i + 70,
+              w: 4 + i + 80,
+            });
+          }
+        } finally {
+          await mod.clearPointCbs();
+        }
+      });
+
       if (target.useJSPI) {
+        it('should preserve exact return values across concurrent sync + async JSPI calls on 40 callbacks (indices 0..39)', async function() {
+          if (!debugEnv.useJSPI) {
+            this.skip();
+          }
+          const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          try {
+            for (let i = 0; i < 40; i++) {
+              const idx = i;
+              const cb = (idx % 2 === 1)
+                ? async (x) => {
+                    await delay(idx % 7);
+                    return idx * 10 + x;
+                  }
+                : (x) => idx * 10 + x;
+              await mod.registerIntCb(idx, cb);
+            }
+            expect(debugEnv.thunkSources.length).to.equal(0);
+
+            const pairs = [
+              [ 16, 33, 1 ],
+              [ 34, 34, 2 ],
+              [ 20, 22, 3 ],
+              [ 37, 20, 4 ],
+              [ 36, 20, 5 ],
+              [ 26, 30, 6 ],
+            ];
+            let seed = 0x12345678;
+            const nextRand = () => {
+              seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+              return seed;
+            };
+            for (let k = 0; k < 50; k++) {
+              const i = nextRand() % 40;
+              const j = nextRand() % 40;
+              const a = (k % 9) + 1;
+              pairs.push([ i, j, a ]);
+            }
+
+            const actuals = await Promise.all(pairs.map(([ i, j, a ]) => mod.callTwo(i, j, a)));
+            for (let idx = 0; idx < pairs.length; idx++) {
+              const [ i, j, a ] = pairs[idx];
+              const expected = (i * 10 + a) * 10000 + (j * 10 + a + 1);
+              expect(actuals[idx], `pair #${idx} (${i}, ${j}, ${a})`).to.equal(expected);
+            }
+          } finally {
+            await mod.clearIntCbs();
+          }
+        });
+
+        it('should survive 2,000 iterations of sync-throwing and async-rejecting JSPI callbacks on 17th+ slots without stack exhaustion', async function() {
+          if (!debugEnv.useJSPI) {
+            this.skip();
+          }
+          const spBefore = debugEnv.stackPointerGlobal?.value;
+          const origConsoleError = console.error;
+          let loggedErrorCount = 0;
+          console.error = () => {
+            loggedErrorCount++;
+          };
+          try {
+            for (let i = 0; i < 20; i++) {
+              const idx = i;
+              if (idx === 17) {
+                await mod.registerIntCb(idx, () => {
+                  throw new Error('boom');
+                });
+              } else if (idx === 18) {
+                await mod.registerIntCb(idx, async () => {
+                  await Promise.resolve();
+                  throw new Error('async-boom');
+                });
+              } else if (idx === 19) {
+                await mod.registerIntCb(idx, (x) => x + 40);
+              } else {
+                await mod.registerIntCb(idx, (x) => x + idx);
+              }
+            }
+            expect(debugEnv.thunkSources.length).to.equal(0);
+
+            for (let iter = 1; iter <= 2000; iter++) {
+              let syncErr = null;
+              try {
+                await mod.callIntCb(17, iter);
+              } catch (err) {
+                syncErr = err;
+              }
+              expect(syncErr).to.be.an('error');
+              expect(syncErr.message).to.not.include('out of bounds');
+
+              let asyncErr = null;
+              try {
+                await mod.callIntCb(18, iter);
+              } catch (err) {
+                asyncErr = err;
+              }
+              expect(asyncErr).to.be.an('error');
+              expect(asyncErr.message).to.not.include('out of bounds');
+
+              const okVal = await mod.callIntCb(19, 1);
+              expect(okVal).to.equal(41);
+            }
+            expect(loggedErrorCount).to.be.at.least(4000);
+            if (spBefore !== undefined) {
+              expect(debugEnv.stackPointerGlobal.value).to.equal(spBefore);
+            }
+          } finally {
+            console.error = origConsoleError;
+            await mod.clearIntCbs();
+          }
+        });
         it('should route pending host errors and __stack_pointer to the right JSPI fiber across 220+ same-microtask resumptions', async function() {
           if (!debugEnv.useJSPI) {
             this.skip();

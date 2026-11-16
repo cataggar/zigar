@@ -456,4 +456,34 @@ pub fn deinitRefAfterThrowCallback() void {
     ref_after_throw_cb.deinit();
 }
 
+pub const Point4 = extern struct {
+    x: i32,
+    y: i32,
+    z: i32,
+    w: i32,
+};
+
+pub const PFn = *const fn (Point4) callconv(.c) Point4;
+var reg_point_cbs: [24]?PFn = @splat(null);
+
+pub fn registerPointCb(idx: u32, cb: PFn) void {
+    if (reg_point_cbs[idx]) |prev| {
+        zigar.function.release(prev);
+    }
+    reg_point_cbs[idx] = cb;
+}
+
+pub fn callPointCb(idx: u32, pt: Point4) Point4 {
+    return reg_point_cbs[idx].?(pt);
+}
+
+pub fn clearPointCbs() void {
+    for (&reg_point_cbs) |*slot| {
+        if (slot.*) |cb| {
+            zigar.function.release(cb);
+            slot.* = null;
+        }
+    }
+}
+
 
