@@ -30,6 +30,13 @@ describe('Native ES Module Imports, Tree-Shaking & CJS/ESM Interop (node-zigar)'
   });
 
   it('should interoperate across node:path, node:url, local .mjs ESM, and local .cjs export = callable/class via ESM import()', async function() {
+    // Import and mutate `named.cjs` BEFORE importing the Zig module so Node's load-time ESM snapshot
+    // (`namedNs.counter === 1`) diverges from live `module.exports.counter === 2` prior to registration.
+    const namedNs = await import('./zig-samples/js-value/module-imports/named.cjs');
+    expect(namedNs.counter).to.equal(1);
+    expect(namedNs.default.bump()).to.equal(2);
+    expect(namedNs.counter).to.equal(1);
+
     const mod = await import(parityURL.href);
     expect(mod.exerciseNodeBuiltins().string).to.equal(
       'item.zig|p/item.zig|https://example.org/docs/spec?v=2|file:',
@@ -42,6 +49,9 @@ describe('Native ES Module Imports, Tree-Shaking & CJS/ESM Interop (node-zigar)'
     );
     expect(mod.exerciseNamespaceShadowMutation().string).to.equal(
       '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
+    );
+    expect(mod.exerciseNamedCjs().string).to.equal(
+      '2|3=3|42->43|del=true:has=false:def_has=false|restored=1',
     );
     expect(mod.exerciseNamedCjs().string).to.equal(
       '1|2=2|42->43|del=true:has=false:def_has=false|restored=1',
@@ -72,6 +82,8 @@ describe('Native ES Module Imports, Tree-Shaking & CJS/ESM Interop (node-zigar)'
 
   it('should interoperate identically when loaded via CommonJS require() (node-zigar/cjs)', function() {
     const require = createRequire(import.meta.url);
+    const namedCjs = require('./zig-samples/js-value/module-imports/named.cjs');
+    expect(namedCjs.bump()).to.equal(2);
     const mod = require('./zig-samples/js-value/module-imports/module-parity.zig?optimize=ReleaseSafe&quiet=1');
     expect(mod.exerciseNodeBuiltins().string).to.equal(
       'item.zig|p/item.zig|https://example.org/docs/spec?v=2|file:',
@@ -84,6 +96,9 @@ describe('Native ES Module Imports, Tree-Shaking & CJS/ESM Interop (node-zigar)'
     );
     expect(mod.exerciseNamespaceShadowMutation().string).to.equal(
       '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
+    );
+    expect(mod.exerciseNamedCjs().string).to.equal(
+      '2|3=3|42->43|del=true:has=false:def_has=false|restored=1',
     );
     expect(mod.exerciseNamedCjs().string).to.equal(
       '1|2=2|42->43|del=true:has=false:def_has=false|restored=1',

@@ -16,6 +16,8 @@ describe('Bun Native ES Module Imports, Tree-Shaking & CJS/ESM Interop (bun-ziga
 
   it('should interoperate across node:path, node:url, local .mjs ESM, and local .cjs export = callable/class on Bun N-API', async function() {
     global.__test_options = { optimize: 'ReleaseSafe', quiet: true };
+    const namedNs = await import('../../node-zigar/test/zig-samples/js-value/module-imports/named.cjs');
+    expect(namedNs.default.bump()).to.equal(2);
     const mod = await import(parityURL);
     expect(mod.exerciseNodeBuiltins().string).to.equal(
       'item.zig|p/item.zig|https://example.org/docs/spec?v=2|file:',
@@ -28,6 +30,9 @@ describe('Bun Native ES Module Imports, Tree-Shaking & CJS/ESM Interop (bun-ziga
     );
     expect(mod.exerciseNamespaceShadowMutation().string).to.equal(
       '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
+    );
+    expect(mod.exerciseNamedCjs().string).to.equal(
+      '2|3=3|42->43|del=true:has=false:def_has=false|restored=1',
     );
     expect(mod.exerciseNamedCjs().string).to.equal(
       '1|2=2|42->43|del=true:has=false:def_has=false|restored=1',

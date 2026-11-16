@@ -1438,6 +1438,80 @@ describe('Feature: js-host-op', function() {
       env.releaseJsValue(hTs);
     }
 
+    // D. Verify CJS namespaces mutated (or having properties deleted) BEFORE module registration still unwrap to live exports
+    const preMutatedBareExports = {
+      counter: 1,
+      bump() {
+        preMutatedBareExports.counter += 1;
+        return preMutatedBareExports.counter;
+      },
+    };
+    const preMutatedBareNs = Object.create(null);
+    Object.defineProperties(preMutatedBareNs, {
+      [Symbol.toStringTag]: { value: 'Module' },
+      counter: { value: 1, writable: false, enumerable: true, configurable: false },
+      bump: { value: preMutatedBareExports.bump, writable: false, enumerable: true, configurable: false },
+      default: { value: preMutatedBareExports, writable: false, enumerable: true, configurable: false },
+      'module.exports': { value: preMutatedBareExports, writable: false, enumerable: true, configurable: false },
+    });
+    Object.freeze(preMutatedBareNs);
+    // Mutate live CJS exports BEFORE registering with Zigar (`counter` is 2 while snapshot `ns.counter` is still 1)
+    expect(preMutatedBareExports.bump()).to.equal(2);
+    expect(preMutatedBareNs.counter).to.equal(1);
+
+    const preMutatedExplicitCjsExports = {
+      counter: 1,
+      removedBeforeLoad: 99,
+      bump() {
+        preMutatedExplicitCjsExports.counter += 1;
+        return preMutatedExplicitCjsExports.counter;
+      },
+    };
+    const preMutatedExplicitCjsNs = Object.create(null);
+    Object.defineProperties(preMutatedExplicitCjsNs, {
+      [Symbol.toStringTag]: { value: 'Module' },
+      counter: { value: 1, writable: false, enumerable: true, configurable: false },
+      removedBeforeLoad: { value: 99, writable: false, enumerable: true, configurable: false },
+      bump: { value: preMutatedExplicitCjsExports.bump, writable: false, enumerable: true, configurable: false },
+      default: { value: preMutatedExplicitCjsExports, writable: false, enumerable: true, configurable: false },
+      'module.exports': { value: preMutatedExplicitCjsExports, writable: false, enumerable: true, configurable: false },
+    });
+    Object.freeze(preMutatedExplicitCjsNs);
+    // Both mutate `counter` AND delete `removedBeforeLoad` before registering `.cjs`
+    expect(preMutatedExplicitCjsExports.bump()).to.equal(2);
+    delete preMutatedExplicitCjsExports.removedBeforeLoad;
+
+    env.registerJsModules({
+      'pkg-pre-mutated-cjs': preMutatedBareNs,
+      './pre-mutated-named.cjs': preMutatedExplicitCjsNs,
+    });
+
+    for (const [ ns, backingExports ] of [
+      [ preMutatedBareNs, preMutatedBareExports ],
+      [ preMutatedExplicitCjsNs, preMutatedExplicitCjsExports ],
+    ]) {
+      const hPre = env.allocJsValue(ns);
+
+      // GetProp('counter') reads live 2, NOT stale snapshot 1
+      frameDV.setUint32(argsGetI32.instance.members[1].bitOffset / 8, hPre, true);
+      expect(env.invokeJsHostOp(dGetCounter, frameAddr)).to.equal(PosixError.NONE);
+      expect(frameDV.getInt32(0, true)).to.equal(2);
+
+      // SetProp('counter', 42) mutates live exports without throwing TypeError on frozen namespace
+      frameDV.setUint16(0, 0xffff, true);
+      frameDV.setUint32(argsSetFallible.instance.members[1].bitOffset / 8, hPre, true);
+      frameDV.setInt32(argsSetFallible.instance.members[2].bitOffset / 8, 42, true);
+      expect(env.invokeJsHostOp(dSetCounter, frameAddr)).to.equal(PosixError.NONE);
+      expect(frameDV.getUint16(0, true)).to.equal(0);
+      expect(backingExports.counter).to.equal(42);
+
+      frameDV.setUint32(argsGetI32.instance.members[1].bitOffset / 8, hPre, true);
+      expect(env.invokeJsHostOp(dGetCounter, frameAddr)).to.equal(PosixError.NONE);
+      expect(frameDV.getInt32(0, true)).to.equal(42);
+
+      env.releaseJsValue(hPre);
+    }
+
     expect(env.getJsValueCount()).to.equal(0);
   });
 });

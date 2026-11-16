@@ -8316,7 +8316,7 @@ var jsHostOp = mixin({
   trackJsModuleNamespace(moduleExports, specifier) {
     if (moduleExports !== null && (typeof(moduleExports) === 'object' || typeof(moduleExports) === 'function')) {
       this.jsModuleNamespaces.add(moduleExports);
-      if (typeof(specifier) === 'string' && /\.m[jt]s(?:$|[?#])/i.test(specifier)) {
+      if (isEsmExtension(specifier)) {
         this.jsEsmNamespaces.add(moduleExports);
         return;
       }
@@ -8391,7 +8391,7 @@ var jsHostOp = mixin({
       || isEsModuleNamespaceObject(moduleExports)
       || isFrozenNullProtoNamespace(moduleExports)
       || spec.startsWith('node:')
-      || /\.c[jt]s(?:$|[?#])/i.test(spec)
+      || isCjsExtension(spec)
     ) {
       return moduleExports;
     }
@@ -9106,32 +9106,21 @@ function isFrozenNullProtoNamespace(mod) {
     && Object.isFrozen(mod);
 }
 
-function findPropertyDescriptor(obj, key) {
-  let cur = Object(obj);
-  while (cur !== null) {
-    const desc = Object.getOwnPropertyDescriptor(cur, key);
-    if (desc) {
-      return desc;
-    }
-    cur = Object.getPrototypeOf(cur);
-  }
-  return undefined;
+function isEsmExtension(specifier) {
+  return typeof(specifier) === 'string' && /\.m[jt]s(?:$|[?#])/i.test(specifier);
 }
 
-function hasOnlyCjsMirroredExports(mod) {
-  const cjsExports = Object(mod.default);
+function isCjsExtension(specifier) {
+  return typeof(specifier) === 'string' && /\.c[jt]s(?:$|[?#])/i.test(specifier);
+}
+
+function hasOnlyCjsMirroredExports(mod, cjsExports = mod.default) {
+  const target = Object(cjsExports);
   for (const key of Reflect.ownKeys(mod)) {
     if (typeof(key) !== 'string' || key === 'default' || key === 'module.exports') {
       continue;
     }
-    const cjsDesc = findPropertyDescriptor(cjsExports, key);
-    if (!cjsDesc) {
-      if (mod[key] !== undefined) {
-        return false;
-      }
-      continue;
-    }
-    if (!cjsDesc.get && !Object.is(mod[key], cjsDesc.value)) {
+    if (!(key in target) && mod[key] !== undefined) {
       return false;
     }
   }
@@ -9168,16 +9157,14 @@ function isRollupMergedCjsNamespace(mod) {
 }
 
 function isSyntheticCjsNamespace(mod, specifier) {
-  if (isCjsWrappedNamespace(mod)) {
+  if (
+    isCjsExtension(specifier)
+    && isEsModuleNamespaceObject(mod)
+    && hasDefaultFallbackTarget(mod.default)
+  ) {
     return true;
   }
-  if (
-    (isEsModuleNamespaceObject(mod) || isFrozenNullProtoNamespace(mod))
-    && hasDefaultFallbackTarget(mod.default)
-    && hasOnlyCjsMirroredExports(mod)
-    && typeof(specifier) === 'string'
-    && /\.c[jt]s(?:$|[?#])/i.test(specifier)
-  ) {
+  if (isCjsWrappedNamespace(mod)) {
     return true;
   }
   return isRollupMergedCjsNamespace(mod);
