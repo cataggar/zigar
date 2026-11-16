@@ -147,6 +147,15 @@ export const optionsForTranspile = {
     type: 'boolean',
     title: 'Use resizable ArrayBuffer for WebAssembly memory',
   },
+  moduleFormat: {
+    type: 'string',
+    enum: [ 'esm', 'cjs' ],
+    title: 'Output JavaScript module format',
+  },
+  dynamicJsImports: {
+    type: 'boolean',
+    title: 'Load referenced JS modules dynamically instead of emitting static imports',
+  },
 };
 
 const allOptions = {

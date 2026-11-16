@@ -698,7 +698,13 @@ var moduleLoading = mixin({
       };
     },
     loadModule(source, options) {
+      if (options?.moduleBaseURL && !this.moduleBaseURL) {
+        this.moduleBaseURL = options.moduleBaseURL;
+      }
       return this.initPromise = (async () => {
+        if (options?.preloadJsModules) {
+          await this.preloadJsModules?.(options.preloadJsModules, options.moduleBaseURL ?? this.moduleBaseURL);
+        }
         const instance = this.instance = await this.instantiateWebAssembly(source, options);
         this.importFunctions(instance.exports);
         this.initializeCustomWASI();

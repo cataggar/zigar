@@ -789,4 +789,102 @@ describe('Feature: js-host-op', function() {
       expect(env.getJsValueCount()).to.equal(0);
     }
   });
+
+  it('should handle ModuleDefault flag and ESM namespace .default fallback for CJS export = callable/class', function() {
+    const env = new Env();
+    env.littleEndian = true;
+    const harness = createMemoryHarness(env);
+    const s = defineHostOpStructures(env, harness.is64);
+
+    // Simulate ESM `import * as cjsMod` wrapping a CJS `module.exports = Object.assign(fn, { extra, method })`
+    const cjsFn = Object.assign(
+      function(a, b) {
+        return a * 10 + b;
+      },
+      {
+        extra: 77,
+        readExtra() {
+          if (this !== cjsFn) {
+            throw new TypeError('lost default this binding');
+          }
+          return this.extra;
+        },
+      },
+    );
+    const esmWrappedCjs = Object.defineProperty({ default: cjsFn }, Symbol.toStringTag, { value: 'Module' });
+    env.registerJsModules({
+      'esm-wrapped-cjs': esmWrappedCjs,
+      'raw-cjs-fn': cjsFn,
+    });
+
+    const argsImport = s.makeArgStruct(401n, s.jsRef, []);
+    const argsHas = s.makeArgStruct(402n, s.boolStruct, [ s.jsRef ]);
+    const argsGetI32 = s.makeArgStruct(403n, s.i32, [ s.jsRef ]);
+    const argsCallMethod = s.makeArgStruct(404n, s.i32, [ s.jsRef ]);
+    const argsCallFn = s.makeArgStruct(405n, s.i32, [ s.jsRef, s.i32, s.i32 ]);
+
+    const enc = new TextEncoder();
+    let strOff = 0x100;
+    const putKey = (text) => {
+      const bytes = enc.encode(text);
+      const view = harness.viewAt(strOff, bytes.length);
+      new Uint8Array(view.buffer, view.byteOffset, bytes.length).set(bytes);
+      const out = { keyAddr: harness.addrOf(strOff), keyLen: harness.is64 ? BigInt(bytes.length) : bytes.length };
+      strOff += (bytes.length + 7) & ~7;
+      return out;
+    };
+
+    const kWrapped = putKey('esm-wrapped-cjs');
+    const kRaw = putKey('raw-cjs-fn');
+    const kExtra = putKey('extra');
+    const kReadExtra = putKey('readExtra');
+
+    const dImportNs = writeDescriptor(harness, 0x300, { signature: 401n, op: HostOpCode.ImportModule, ...kWrapped, argSize: argsImport.byteSize });
+    const dImportDefWrapped = writeDescriptor(harness, 0x340, { signature: 401n, op: HostOpCode.ImportModule, flags: HostOpFlag.ModuleDefault, ...kWrapped, argSize: argsImport.byteSize });
+    const dImportDefRaw = writeDescriptor(harness, 0x380, { signature: 401n, op: HostOpCode.ImportModule, flags: HostOpFlag.ModuleDefault, ...kRaw, argSize: argsImport.byteSize });
+    const dHasExtra = writeDescriptor(harness, 0x3c0, { signature: 402n, op: HostOpCode.HasProp, ...kExtra, argSize: argsHas.byteSize });
+    const dGetExtra = writeDescriptor(harness, 0x400, { signature: 403n, op: HostOpCode.GetProp, ...kExtra, argSize: argsGetI32.byteSize });
+    const dCallReadExtra = writeDescriptor(harness, 0x440, { signature: 404n, op: HostOpCode.CallMethod, ...kReadExtra, argSize: argsCallMethod.byteSize });
+    const dCallFn = writeDescriptor(harness, 0x480, { signature: 405n, op: HostOpCode.CallFn, argSize: argsCallFn.byteSize });
+
+    const frameAddr = harness.addrOf(0x900);
+    const frameDV = harness.viewAt(0x900, 64);
+
+    // 1. ImportModule with ModuleDefault unwraps ESM namespace `.default` AND returns raw CJS export directly
+    expect(env.invokeJsHostOp(dImportDefWrapped, frameAddr)).to.equal(PosixError.NONE);
+    const hDefWrapped = frameDV.getUint32(0, true);
+    expect(env.getJsValue(hDefWrapped)).to.equal(cjsFn);
+
+    expect(env.invokeJsHostOp(dImportDefRaw, frameAddr)).to.equal(PosixError.NONE);
+    const hDefRaw = frameDV.getUint32(0, true);
+    expect(env.getJsValue(hDefRaw)).to.equal(cjsFn);
+
+    // 2. ImportModule namespace falls back to `.default` for non-hoisted CJS properties/methods & CallFn
+    expect(env.invokeJsHostOp(dImportNs, frameAddr)).to.equal(PosixError.NONE);
+    const hNs = frameDV.getUint32(0, true);
+    expect(env.getJsValue(hNs)).to.equal(esmWrappedCjs);
+
+    frameDV.setUint32(argsHas.instance.members[1].bitOffset / 8, hNs, true);
+    expect(env.invokeJsHostOp(dHasExtra, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint8(0)).to.equal(1);
+
+    frameDV.setUint32(argsGetI32.instance.members[1].bitOffset / 8, hNs, true);
+    expect(env.invokeJsHostOp(dGetExtra, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getInt32(0, true)).to.equal(77);
+
+    frameDV.setUint32(argsCallMethod.instance.members[1].bitOffset / 8, hNs, true);
+    expect(env.invokeJsHostOp(dCallReadExtra, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getInt32(0, true)).to.equal(77);
+
+    frameDV.setUint32(argsCallFn.instance.members[1].bitOffset / 8, hNs, true);
+    frameDV.setInt32(argsCallFn.instance.members[2].bitOffset / 8, 4, true);
+    frameDV.setInt32(argsCallFn.instance.members[3].bitOffset / 8, 9, true);
+    expect(env.invokeJsHostOp(dCallFn, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getInt32(0, true)).to.equal(49);
+
+    env.releaseJsValue(hDefWrapped);
+    env.releaseJsValue(hDefRaw);
+    env.releaseJsValue(hNs);
+    expect(env.getJsValueCount()).to.equal(0);
+  });
 });

@@ -23,6 +23,7 @@ export const HostOpCode = {
 
 export const HostOpFlag = {
   DynamicKey: 1 << 0,
+  ModuleDefault: 1 << 1,
 };
 
 export default mixin({
@@ -31,6 +32,8 @@ export default mixin({
     this.jsKeyCache = new Map();
     this.jsKeyDecodeCount = 0;
     this.jsModuleCache = new Map();
+    this.jsModuleNamespaces = new WeakSet();
+    this.moduleBaseURL = null;
     this.zigCallbackTemplateCache = new Map();
     this.zigCallbackMap = new Map();
     this.syncCallDepth = 0;
@@ -73,8 +76,14 @@ export default mixin({
     target.pendingHostError = undefined;
     return { error };
   },
+  trackJsModuleNamespace(moduleExports) {
+    if (moduleExports !== null && (typeof(moduleExports) === 'object' || typeof(moduleExports) === 'function')) {
+      this.jsModuleNamespaces.add(moduleExports);
+    }
+  },
   registerJsModule(specifier, moduleExports) {
     this.jsModuleCache.set(String(specifier), moduleExports);
+    this.trackJsModuleNamespace(moduleExports);
   },
   registerJsModules(modules) {
     if (!modules || typeof(modules) !== 'object') {
@@ -82,7 +91,7 @@ export default mixin({
     }
     const entries = (modules instanceof Map) ? modules.entries() : Object.entries(modules);
     for (const [ specifier, moduleExports ] of entries) {
-      this.jsModuleCache.set(String(specifier), moduleExports);
+      this.registerJsModule(specifier, moduleExports);
     }
   },
   resolveJsModule(specifier) {
@@ -92,21 +101,38 @@ export default mixin({
     }
     const proc = globalThis.process;
     if (typeof(proc?.getBuiltinModule) === 'function') {
-      let mod = proc.getBuiltinModule(spec);
-      if (mod === undefined && !spec.includes(':') && !spec.startsWith('.') && !spec.startsWith('/')) {
-        mod = proc.getBuiltinModule(`node:${spec}`);
-      }
-      if (mod !== undefined) {
-        this.jsModuleCache.set(spec, mod);
-        return mod;
+      if (spec.startsWith('node:')) {
+        const builtin = proc.getBuiltinModule(spec);
+        if (builtin !== undefined) {
+          this.registerJsModule(spec, builtin);
+          return builtin;
+        }
       }
       const nodeModule = proc.getBuiltinModule('node:module');
       if (typeof(nodeModule?.createRequire) === 'function') {
-        const basePath = `${proc.cwd?.() ?? '/'}/_zigar_host_.js`;
-        const req = nodeModule.createRequire(basePath);
-        const loaded = req(spec);
-        this.jsModuleCache.set(spec, loaded);
-        return loaded;
+        const rawBase = (this.moduleBaseURL || `${proc.cwd?.() ?? '/'}/_zigar_host_.js`).split(/[?#]/)[0];
+        const basePath = rawBase.endsWith('/') ? `${rawBase}_zigar_host_.js` : rawBase;
+        try {
+          const req = nodeModule.createRequire(basePath);
+          const loaded = req(spec);
+          this.registerJsModule(spec, loaded);
+          return loaded;
+        } catch (reqErr) {
+          if (!spec.includes(':') && !spec.startsWith('.') && !spec.startsWith('/')) {
+            const builtin = proc.getBuiltinModule(spec) ?? proc.getBuiltinModule(`node:${spec}`);
+            if (builtin !== undefined) {
+              this.registerJsModule(spec, builtin);
+              return builtin;
+            }
+          }
+          throw reqErr;
+        }
+      } else if (!spec.includes(':') && !spec.startsWith('.') && !spec.startsWith('/')) {
+        const builtin = proc.getBuiltinModule(spec) ?? proc.getBuiltinModule(`node:${spec}`);
+        if (builtin !== undefined) {
+          this.registerJsModule(spec, builtin);
+          return builtin;
+        }
       }
     }
     const err = new Error(`Cannot find JS module '${spec}'`);
@@ -341,7 +367,7 @@ export default mixin({
       const entry = this.getHostOpEntry(descriptorAddr);
       const byteLen = Number(argSize || entry.argByteSize);
       const dv = this.obtainZigView(argAddr, byteLen, false);
-      const { ArgStruct, extractors, op, dynamicKey, key, isErrorUnionReturn, writeSuccess, writeError } = entry;
+      const { ArgStruct, extractors, op, flags, dynamicKey, key, isErrorUnionReturn, writeSuccess, writeError } = entry;
       const argStruct = ArgStruct(dv);
       if (VISIT in argStruct) {
         argStruct[VISIT]('reset', VisitorFlag.IgnoreUncreated);
@@ -362,7 +388,8 @@ export default mixin({
         switch (op) {
           case HostOpCode.ImportModule: {
             const spec = dynamicKey ? jsArgs[0] : key;
-            result = this.resolveJsModule(spec);
+            const mod = this.resolveJsModule(spec);
+            result = (flags & HostOpFlag.ModuleDefault) ? unwrapModuleDefault(mod) : mod;
             break;
           }
           case HostOpCode.GetGlobal: {
@@ -373,31 +400,78 @@ export default mixin({
           case HostOpCode.GetProp: {
             const target = jsArgs[0];
             const propKey = dynamicKey ? jsArgs[1] : key;
-            result = target[propKey];
+            if (
+              target !== null
+              && target !== undefined
+              && !(propKey in Object(target))
+              && this.jsModuleNamespaces.has(target)
+              && hasDefaultFallbackTarget(target.default)
+            ) {
+              result = target.default[propKey];
+            } else {
+              result = target[propKey];
+            }
             break;
           }
           case HostOpCode.SetProp: {
             const target = jsArgs[0];
             const propKey = dynamicKey ? jsArgs[1] : key;
             const value = dynamicKey ? jsArgs[2] : jsArgs[1];
-            target[propKey] = value;
+            if (
+              target !== null
+              && target !== undefined
+              && this.jsModuleNamespaces.has(target)
+              && isModuleNamespaceLike(target)
+              && hasDefaultFallbackTarget(target.default)
+            ) {
+              target.default[propKey] = value;
+            } else {
+              target[propKey] = value;
+            }
             result = undefined;
             break;
           }
           case HostOpCode.DeleteProp: {
             const target = jsArgs[0];
             const propKey = dynamicKey ? jsArgs[1] : key;
-            result = Reflect.deleteProperty(target, propKey);
+            if (
+              target !== null
+              && target !== undefined
+              && this.jsModuleNamespaces.has(target)
+              && isModuleNamespaceLike(target)
+              && hasDefaultFallbackTarget(target.default)
+            ) {
+              result = Reflect.deleteProperty(Object(target.default), propKey);
+            } else {
+              result = Reflect.deleteProperty(target, propKey);
+            }
             break;
           }
           case HostOpCode.HasProp: {
             const target = jsArgs[0];
             const propKey = dynamicKey ? jsArgs[1] : key;
-            result = Reflect.has(target, propKey);
+            let present = Reflect.has(target, propKey);
+            if (
+              !present
+              && this.jsModuleNamespaces.has(target)
+              && hasDefaultFallbackTarget(target.default)
+            ) {
+              present = Reflect.has(Object(target.default), propKey);
+            }
+            result = present;
             break;
           }
           case HostOpCode.CallFn: {
-            const callee = jsArgs[0];
+            let callee = jsArgs[0];
+            if (
+              typeof(callee) !== 'function'
+              && callee !== null
+              && callee !== undefined
+              && this.jsModuleNamespaces.has(callee)
+              && typeof(callee.default) === 'function'
+            ) {
+              callee = callee.default;
+            }
             if (typeof(callee) !== 'function') {
               throw createNotCallableError('Target is not a function');
             }
@@ -405,13 +479,22 @@ export default mixin({
             break;
           }
           case HostOpCode.CallMethod: {
-            const receiver = jsArgs[0];
+            const target = jsArgs[0];
             const methodKey = dynamicKey ? jsArgs[1] : key;
             const callArgs = dynamicKey ? jsArgs.slice(2) : jsArgs.slice(1);
-            if (receiver === null || receiver === undefined) {
-              throw new TypeError(`Cannot read properties of ${receiver} (reading '${String(methodKey)}')`);
+            if (target === null || target === undefined) {
+              throw new TypeError(`Cannot read properties of ${target} (reading '${String(methodKey)}')`);
             }
-            const method = receiver[methodKey];
+            let receiver = target;
+            let method = target[methodKey];
+            if (this.jsModuleNamespaces.has(target) && hasDefaultFallbackTarget(target.default)) {
+              if (!(methodKey in Object(target))) {
+                receiver = target.default;
+                method = receiver[methodKey];
+              } else if (target.default[methodKey] === method) {
+                receiver = target.default;
+              }
+            }
             if (typeof(method) !== 'function') {
               throw createNotCallableError(`${String(methodKey)} is not a function`);
             }
@@ -419,7 +502,16 @@ export default mixin({
             break;
           }
           case HostOpCode.Construct: {
-            const ctor = jsArgs[0];
+            let ctor = jsArgs[0];
+            if (
+              typeof(ctor) !== 'function'
+              && ctor !== null
+              && ctor !== undefined
+              && this.jsModuleNamespaces.has(ctor)
+              && typeof(ctor.default) === 'function'
+            ) {
+              ctor = ctor.default;
+            }
             if (typeof(ctor) !== 'function') {
               throw createNotCallableError('Target is not a constructor');
             }
@@ -554,6 +646,38 @@ export default mixin({
     return this.zigCallbackMap.size;
   },
   ...(process.env.TARGET === 'wasm' ? {
+    async preloadJsModules(specifiers = this.jsModules, baseURL = this.moduleBaseURL) {
+      if (!Array.isArray(specifiers) || specifiers.length === 0) {
+        return;
+      }
+      for (const rawSpec of specifiers) {
+        const spec = String(rawSpec);
+        if (!spec || this.jsModuleCache.has(spec) || spec.startsWith('virtual:') || spec.startsWith('\0')) {
+          continue;
+        }
+        let importTarget = spec;
+        if ((spec.startsWith('./') || spec.startsWith('../')) && baseURL) {
+          const cleanBase = String(baseURL).split(/[?#]/)[0];
+          const baseHref = cleanBase.includes('://')
+            ? cleanBase
+            : `file://${cleanBase.startsWith('/') ? '' : '/'}${cleanBase}`;
+          importTarget = new URL(spec, baseHref).href;
+        }
+        try {
+          const loaded = await import(importTarget);
+          this.registerJsModule(spec, loaded);
+        } catch (importErr) {
+          if (baseURL && !this.moduleBaseURL) {
+            this.moduleBaseURL = baseURL;
+          }
+          try {
+            this.resolveJsModule(spec);
+          } catch {
+            throw importErr;
+          }
+        }
+      }
+    },
     exports: {
       invokeJsHostOp: { argType: 'aaz', returnType: 'i' },
       createZigCallback: { argType: 'ai', returnType: 'i' },
@@ -568,6 +692,29 @@ export default mixin({
   /* c8 ignore next */
   } : undefined),
 });
+
+function hasDefaultFallbackTarget(val) {
+  return val !== null && (typeof(val) === 'object' || typeof(val) === 'function');
+}
+
+function isModuleNamespaceLike(mod) {
+  if (mod === null || typeof(mod) !== 'object') {
+    return false;
+  }
+  return mod[Symbol.toStringTag] === 'Module'
+    || mod.__esModule === true
+    || Object.getPrototypeOf(mod) === null;
+}
+
+function unwrapModuleDefault(mod) {
+  if (isModuleNamespaceLike(mod)) {
+    return mod.default;
+  }
+  if (mod !== null && (typeof(mod) === 'object' || typeof(mod) === 'function') && ('default' in mod)) {
+    return mod.default;
+  }
+  return mod;
+}
 
 function readUsize(dv, byteOffset, ptrSize, littleEndian, asBigInt) {
   if (ptrSize === 8) {

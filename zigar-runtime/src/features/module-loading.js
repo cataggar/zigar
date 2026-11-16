@@ -698,7 +698,13 @@ export default mixin({
       };
     },
     loadModule(source, options) {
+      if (options?.moduleBaseURL && !this.moduleBaseURL) {
+        this.moduleBaseURL = options.moduleBaseURL;
+      }
       return this.initPromise = (async () => {
+        if (options?.preloadJsModules) {
+          await this.preloadJsModules?.(options.preloadJsModules, options.moduleBaseURL ?? this.moduleBaseURL);
+        }
         const instance = this.instance = await this.instantiateWebAssembly(source, options);
         this.importFunctions(instance.exports);
         this.initializeCustomWASI();
@@ -837,8 +843,17 @@ export default mixin({
     },
     importFunctions(exports) {
       for (const [ name ] of Object.entries(this.imports)) {
-        const fn = exports[name];
+        let fn = exports[name];
         if (fn) {
+          if (name === 'loadModule') {
+            const rawLoadModule = fn;
+            fn = (path) => {
+              if (!this.moduleBaseURL && typeof(path) === 'string') {
+                this.moduleBaseURL = path;
+              }
+              return rawLoadModule(path);
+            };
+          }
           defineProperty(this, name, defineValue(fn));
           this.destructors.push(() => this[name] = throwError);
         }

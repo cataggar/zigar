@@ -5,7 +5,7 @@ import './call-marshaling-inbound.js';
 import './call-marshaling-outbound.js';
 import './dir-conversion.js';
 import jsHostOp from './js-host-op.js';
-import './js-value-registry.js';
+import jsValueRegistry from './js-value-registry.js';
 import './module-loading.js';
 import './pointer-synchronization.js';
 import './reader-conversion.js';
@@ -16,7 +16,7 @@ import '../structures/allocator.js';
 import '../structures/dir.js';
 import '../structures/file.js';
 import '../structures/generator.js';
-import '../structures/js-value.js';
+import jsValue from '../structures/js-value.js';
 import '../structures/promise.js';
 import '../syscalls/clock-res-get.js';
 import '../syscalls/clock-time-get.js';
@@ -78,6 +78,8 @@ var structureAcquisition = mixin({
     this.ioRedirection = true;
     this.libc = false;
     this.hasDeferred = false;
+    this.jsModules = [];
+    this.jsModuleSet = new Set();
   },
   createView(address, len, copy, handle) {
     len = Number(len);
@@ -119,6 +121,17 @@ var structureAcquisition = mixin({
     return this.structureMap.get(name);
   },
   setStructure(name, value) {
+    if (typeof(name) === 'string' && name.startsWith('__zigar_js_mod:')) {
+      const specifier = name.slice('__zigar_js_mod:'.length);
+      if (specifier && !this.jsModuleSet.has(specifier)) {
+        this.jsModuleSet.add(specifier);
+        this.jsModules.push(specifier);
+      }
+      this.use?.(jsHostOp);
+      this.use?.(jsValueRegistry);
+      this.use?.(jsValue);
+      return;
+    }
     this.structureMap.set(name, value);
   },
   beginStructure(structure) {
@@ -149,7 +162,7 @@ var structureAcquisition = mixin({
     if (this.instance?.exports) {
       this.trackingMixins = true;
       for (const [ name, fn ] of Object.entries(this.instance.exports)) {
-        if (name.startsWith('__zigar_js_reg_') && typeof(fn) === 'function') {
+        if ((name.startsWith('__zigar_js_reg_') || name.startsWith('__zigar_js_mod_')) && typeof(fn) === 'function') {
           fn();
         }
       }
@@ -222,10 +235,10 @@ var structureAcquisition = mixin({
         settings.table64 = true;
       }
     }
-    if (this.using?.(jsHostOp)) {
+    if (this.using?.(jsHostOp) || this.jsModules.length > 0) {
       settings.hasJsHostOps = true;
     }
-    return { structures, settings };
+    return { structures, settings, jsModules: [ ...this.jsModules ] };
   },
   prepareObjectsForExport() {
     const list = [];

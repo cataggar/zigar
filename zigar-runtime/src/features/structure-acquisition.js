@@ -81,6 +81,8 @@ export default mixin({
     this.ioRedirection = true;
     this.libc = false;
     this.hasDeferred = false;
+    this.jsModules = [];
+    this.jsModuleSet = new Set();
   },
   createView(address, len, copy, handle) {
     len = Number(len);
@@ -124,6 +126,17 @@ export default mixin({
     return this.structureMap.get(name);
   },
   setStructure(name, value) {
+    if (typeof(name) === 'string' && name.startsWith('__zigar_js_mod:')) {
+      const specifier = name.slice('__zigar_js_mod:'.length);
+      if (specifier && !this.jsModuleSet.has(specifier)) {
+        this.jsModuleSet.add(specifier);
+        this.jsModules.push(specifier);
+      }
+      this.use?.(jsHostOp);
+      this.use?.(jsValueRegistry);
+      this.use?.(jsValue);
+      return;
+    }
     this.structureMap.set(name, value);
   },
   beginStructure(structure) {
@@ -154,7 +167,7 @@ export default mixin({
     if (process.env.TARGET === 'wasm' && this.instance?.exports) {
       this.trackingMixins = true;
       for (const [ name, fn ] of Object.entries(this.instance.exports)) {
-        if (name.startsWith('__zigar_js_reg_') && typeof(fn) === 'function') {
+        if ((name.startsWith('__zigar_js_reg_') || name.startsWith('__zigar_js_mod_')) && typeof(fn) === 'function') {
           fn();
         }
       }
@@ -228,10 +241,10 @@ export default mixin({
         settings.table64 = true;
       }
     }
-    if (this.using?.(jsHostOp)) {
+    if (this.using?.(jsHostOp) || this.jsModules.length > 0) {
       settings.hasJsHostOps = true;
     }
-    return { structures, settings };
+    return { structures, settings, jsModules: [ ...this.jsModules ] };
   },
   prepareObjectsForExport() {
     const list = [];

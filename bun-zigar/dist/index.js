@@ -82,7 +82,29 @@ if (!globalThis[pluginRegistered]) {
       const runtimeURL = pathToFileURL(getLibraryPath()).href;
       const binarySource = env.hasMethods() ? JSON.stringify(outputPath) : undefined;
       const envVariables = { ADDON_PATH: addonPath };
-      const { code } = generateCode(definition, { runtimeURL, binarySource, envVariables });
+      const resolveDir = dirname(srcPath ?? path);
+      const fileBaseURL = pathToFileURL(srcPath ?? path).href;
+      const jsModuleResolver = (spec) => {
+        if (spec.startsWith('virtual:') || spec.startsWith('\0')) {
+          return null;
+        }
+        if (spec.startsWith('node:') || spec.startsWith('bun:')) {
+          return spec;
+        }
+        try {
+          const resolved = Bun.resolveSync(spec, resolveDir);
+          if (resolved.startsWith('/') || /^[A-Za-z]:[\\/]/.test(resolved)) {
+            return pathToFileURL(resolved).href;
+          }
+          return resolved;
+        } catch {
+          if (spec.startsWith('./') || spec.startsWith('../')) {
+            return new URL(spec, fileBaseURL).href;
+          }
+          return spec;
+        }
+      };
+      const { code } = generateCode(definition, { runtimeURL, binarySource, envVariables, jsModuleResolver });
       return {
         contents: code,
         loader: 'js',

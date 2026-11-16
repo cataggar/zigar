@@ -224,6 +224,14 @@ describe('Structure: js-allocator', function() {
       if (process.env.TARGET === 'wasm') {
         expect(scratchAllocations).to.equal(1);
         expect(scratchDeallocations).to.equal(1);
+        // Also test inbound WASM vtable.free path where findMemory returns targetDV (without [ZIG])
+        env.allocateHostMemory(ptr, 40, 2);
+        expect(env.memoryList).to.have.lengthOf(1);
+        const { targetDV } = env.memoryList[0];
+        env.freeHostMemory(ptr, { '*': { [MEMORY]: targetDV } }, 2);
+        expect(env.memoryList).to.have.lengthOf(0);
+        expect(scratchAllocations).to.equal(2);
+        expect(scratchDeallocations).to.equal(2);
       }
     })
   })

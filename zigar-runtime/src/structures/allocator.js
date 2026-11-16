@@ -91,7 +91,10 @@ export default mixin({
     }
   },
   freeHostMemory(ptr, buf, ptrAlign) {
-    const dv = (buf instanceof DataView) ? buf : buf['*'][MEMORY];
+    let dv = (buf instanceof DataView) ? buf : buf['*'][MEMORY];
+    if (process.env.TARGET === 'wasm' && !dv[ZIG]) {
+      dv = this.findShadowView(dv) ?? dv;
+    }
     const address = this.getViewAddress(dv);
     const len = dv.byteLength;
     if (process.env.DEV) {
