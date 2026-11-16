@@ -3,7 +3,7 @@
 import { copyFile } from 'fs/promises';
 import { join, resolve } from 'path';
 import { fileURLToPath } from 'url';
-import { runWit, test } from '../dist/index.js';
+import { runTs, runWit, test } from '../dist/index.js';
 
 async function copyBuildFile() {
   const modPath = findZigarCompiler();
@@ -45,6 +45,13 @@ async function runWitCommand(args) {
   }
 }
 
+async function runTsCommand(args) {
+  const { code } = await runTs(args);
+  if (code) {
+    process.exit(code);
+  }
+}
+
 function printHelp() {
   const lines = [
     'Usage: npx zigar [command]',
@@ -55,6 +62,7 @@ function printHelp() {
     '  extra         Create a barebone build.extra.zig in the current folder',
     '  test <path>   Run a Zig module\'s unit tests',
     '  wit [args]    Generate Zig bindings from WIT or inspect zigar:abi sections',
+    '  ts [args]     Generate Zig bindings from TypeScript declarations',
     '',
     '  help          Show this message',
     '',
@@ -78,6 +86,9 @@ try {
       break;
     case 'wit':
       await runWitCommand(process.argv.slice(3));
+      break;
+    case 'ts':
+      await runTsCommand(process.argv.slice(3));
       break;
     case 'help':
     case undefined:

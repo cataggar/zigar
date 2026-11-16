@@ -5,6 +5,11 @@ pub const wit_zigar = @import("wit_zigar");
 pub const typescript = @import("generated_ts_wasm32");
 pub const typescript_wasm64 = @import("generated_ts_wasm64");
 pub const host = @import("host.zig");
+pub const cli = @import("cli.zig");
+pub const naming = @import("naming.zig");
+pub const ir = @import("ir.zig");
+pub const emit = @import("emit.zig");
+pub const driver = @import("driver.zig");
 
 pub const types = typescript.types;
 pub const compiler = typescript.compiler;
@@ -15,3 +20,11 @@ pub const ComponentPlan = host.ComponentPlan;
 pub const defaultCompilerOptions = host.defaultCompilerOptions;
 pub const defaultExtractConfig = host.defaultExtractConfig;
 
+test {
+    _ = host;
+    _ = cli;
+    _ = naming;
+    _ = ir;
+    _ = emit;
+    _ = driver;
+}

@@ -151,8 +151,39 @@ pub fn build(b: *std.Build) void {
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
-    // Reproducible TypeScript 7.1-next Go WASM Component build step (`zig build component`)
+    // Reproducible TypeScript 7.1-next Go WASM Component build step (`zig build component` / `zig build build-component`)
     const component_wasm_rel = "component/dist/typescript-compiler.component.wasm";
+    const component_wasm_abs = b.root.joinString(b.allocator, component_wasm_rel) catch @panic("OOM");
+    const build_component_script_abs = b.root.joinString(b.allocator, "component/build-component.mjs") catch @panic("OOM");
+
+    // Installable `ts-zigar` CLI executable (`zig build` -> `zig-out/bin/ts-zigar`, `zig build run -- <args>`)
+    const cli_build_opts = b.addOptions();
+    cli_build_opts.addOption([]const u8, "default_component_path", component_wasm_abs);
+    cli_build_opts.addOption([]const u8, "build_component_script_path", build_component_script_abs);
+    cli_build_opts.addOption([]const u8, "default_node_exe", "node");
+
+    const cli_exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+    });
+    cli_exe_mod.addImport("ts_zigar", ts_zigar_mod);
+    cli_exe_mod.addOptions("build_options", cli_build_opts);
+
+    const cli_exe = b.addExecutable(.{
+        .name = "ts-zigar",
+        .root_module = cli_exe_mod,
+        .use_llvm = use_llvm,
+    });
+    b.installArtifact(cli_exe);
+
+    const run_cli = b.addRunArtifact(cli_exe);
+    run_cli.step.dependOn(b.getInstallStep());
+    run_cli.addPassthruArgs();
+    const run_step = b.step("run", "Run the ts-zigar CLI");
+    run_step.dependOn(&run_cli.step);
+
     const build_component_cmd = b.addSystemCommand(&.{
         "node",
         "component/build-component.mjs",
@@ -162,6 +193,8 @@ pub fn build(b: *std.Build) void {
     build_component_cmd.setCwd(b.path(""));
     const component_step = b.step("component", "Build TypeScript 7.1-next Go WASM Component via componentize-go");
     component_step.dependOn(&build_component_cmd.step);
+    const build_component_step = b.step("build-component", "Build TypeScript 7.1-next Go WASM Component via componentize-go");
+    build_component_step.dependOn(&build_component_cmd.step);
 
     // Optional component loader check inside `zig build test` (validates `.component.wasm` whenever built)
     const opt_comp_opts = b.addOptions();
@@ -257,9 +290,38 @@ pub fn build(b: *std.Build) void {
     test_component_step.dependOn(&run_req_host_tests.step);
     test_component_step.dependOn(&run_node_comp_tests.step);
 
-    const test_step = b.step("test", "Verify typescript.wit codegen, Canonical ABI, wasm32/wasm64 cross-compilation, and component loader");
+    const root_unit_tests = b.addTest(.{
+        .root_module = ts_zigar_mod,
+        .use_llvm = use_llvm,
+    });
+    const run_root_unit_tests = b.addRunArtifact(root_unit_tests);
+
+    const cli_emit_opts = b.addOptions();
+    cli_emit_opts.addOption([]const u8, "zig_exe", b.graph.zig_exe);
+
+    const cli_emit_test_mod = b.createModule(.{
+        .root_source_file = b.path("test/cli_emit_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+    });
+    cli_emit_test_mod.addImport("ts_zigar", ts_zigar_mod);
+    cli_emit_test_mod.addOptions("test_options", cli_emit_opts);
+
+    const cli_emit_tests = b.addTest(.{
+        .root_module = cli_emit_test_mod,
+        .use_llvm = use_llvm,
+    });
+    const run_cli_emit_tests = b.addRunArtifact(cli_emit_tests);
+    run_cli_emit_tests.setCwd(b.path(""));
+    run_cli_emit_tests.has_side_effects = true;
+    run_cli_emit_tests.step.dependOn(b.getInstallStep());
+
+    const test_step = b.step("test", "Verify typescript.wit codegen, CLI, IR, Zig 0.17 emitter, and component host");
     test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_root_unit_tests.step);
     test_step.dependOn(&wasm_check_files.step);
     test_step.dependOn(&run_opt_comp_tests.step);
     test_step.dependOn(&run_opt_host_tests.step);
+    test_step.dependOn(&run_cli_emit_tests.step);
 }
