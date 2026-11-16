@@ -15,6 +15,9 @@ const LocalCjsClass = js.Module("./cjs-class.cjs");
 const SingletonEsm = js.Module("./singleton-esm.mjs");
 const NamedCjs = js.Module("./named.cjs");
 const FalsyEsm = js.Module("./falsy.mjs");
+const FacadeEsm = js.Module("./facade.mjs");
+const FnCjs = js.Module("./fn.cjs");
+const TsCjs = js.Module("./ts.cjs");
 
 pub const unused_mod_desc = js.Module("unused-parity-mod");
 
@@ -259,5 +262,109 @@ pub fn exerciseRuntimeRelativeImport(spec: []const u8, a: i32, b: i32) !i32 {
     const dyn_mod = try js.importModuleDynamicAs(HostError!Ref(js.Function), spec);
     defer dyn_mod.deinit();
     return dyn_mod.invoke(fn (i32, i32) HostError!i32, .{ a, b });
+}
+
+pub fn exerciseEsmFacade(alloc: std.mem.Allocator) ![]const u8 {
+    const has_ver = try FacadeEsm.has("version");
+    const ver = try FacadeEsm.get(i32, "version");
+
+    var set_failed = false;
+    if (FacadeEsm.set("version", @as(i32, 9))) |_| {
+        return error.UnexpectedMutationSuccess;
+    } else |err| {
+        if (err != error.TypeError and err != error.JsException) return err;
+        set_failed = true;
+    }
+    const named_has_ver = try NamedCjs.has("version");
+    const del_ver = try FacadeEsm.delete("version");
+    const ver_after = try FacadeEsm.get(i32, "version");
+
+    try FacadeEsm.set("facadeExtra", @as(i32, 33));
+    const via_facade = try FacadeEsm.get(i32, "facadeExtra");
+    const via_named = try NamedCjs.get(i32, "facadeExtra");
+    const del_extra = try FacadeEsm.delete("facadeExtra");
+    const has_extra_after = try FacadeEsm.has("facadeExtra");
+
+    return std.fmt.allocPrint(
+        alloc,
+        "has={any}:v={d}|set_err={any}:named_has={any}:del={any}:after={d}|extra={d}={d}:del={any}:has={any}",
+        .{
+            has_ver,
+            ver,
+            set_failed,
+            named_has_ver,
+            del_ver,
+            ver_after,
+            via_facade,
+            via_named,
+            del_extra,
+            has_extra_after,
+        },
+    );
+}
+
+pub fn exerciseFnCjs(alloc: std.mem.Allocator) ![]const u8 {
+    const c1 = try FnCjs.callExportEquals(fn (i32) HostError!i32, .{10});
+    const extra0 = try FnCjs.get(i32, "extra");
+
+    try FnCjs.set("extra", @as(i32, 20));
+    const extra1 = try FnCjs.get(i32, "extra");
+    const c2 = try FnCjs.callExportEquals(fn (i32) HostError!i32, .{10});
+
+    const deleted = try FnCjs.delete("extra");
+    const has_after_del = try FnCjs.has("extra");
+
+    try FnCjs.set("extra", @as(i32, 1));
+    const c3 = try FnCjs.callExportEquals(fn (i32) HostError!i32, .{10});
+
+    return std.fmt.allocPrint(
+        alloc,
+        "{d}:{d}|{d}->{d}|del={any}:has={any}|restored={d}",
+        .{
+            c1,
+            extra0,
+            extra1,
+            c2,
+            deleted,
+            has_after_del,
+            c3,
+        },
+    );
+}
+
+pub fn exerciseTsEsModuleCjs(alloc: std.mem.Allocator) ![]const u8 {
+    const has_named = try TsCjs.has("named");
+    const named = try TsCjs.get(i32, "named");
+    const has_inner = try TsCjs.has("inner");
+    const inner = try TsCjs.get(i32, "inner");
+
+    const def_obj = try TsCjs.default(Ref(js.Object));
+    defer def_obj.deinit();
+    const def_inner = def_obj.get(i32, "inner");
+
+    try TsCjs.set("added", @as(i32, 1));
+    const has_added = try TsCjs.has("added");
+    const added_via_mod = try TsCjs.get(i32, "added");
+    const added_via_def = def_obj.get(i32, "added");
+
+    const del_added = try TsCjs.delete("added");
+    const has_added_after = try TsCjs.has("added");
+
+    return std.fmt.allocPrint(
+        alloc,
+        "named={any}:{d}|inner={any}:{d}={d}|added={any}:{d}={d}|del={any}:has={any}",
+        .{
+            has_named,
+            named,
+            has_inner,
+            inner,
+            def_inner,
+            has_added,
+            added_via_mod,
+            added_via_def,
+            del_added,
+            has_added_after,
+        },
+    );
 }
 

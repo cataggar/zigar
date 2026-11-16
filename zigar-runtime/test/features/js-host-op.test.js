@@ -1183,4 +1183,261 @@ describe('Feature: js-host-op', function() {
     env.releaseJsValue(hGetModExp);
     expect(env.getJsValueCount()).to.equal(0);
   });
+
+  it('should preserve ESM facade own exports over CJS star-reexports, support Rollup _mergeNamespaces CJS, and keep __esModule CJS default parity', function() {
+    const env = new Env();
+    env.littleEndian = true;
+    const harness = createMemoryHarness(env);
+    const s = defineHostOpStructures(env, harness.is64);
+
+    const errUnionVoid = {
+      type: StructureType.ErrorUnion,
+      name: 'HostError!void',
+      byteSize: 2,
+      align: 2,
+      flags: StructureFlag.HasValue,
+      signature: 470n,
+      instance: {
+        members: [
+          { type: MemberType.Void, bitSize: 0, bitOffset: 0, byteSize: 0, structure: s.voidStruct },
+          { type: MemberType.Uint, flags: MemberFlag.IsSelector, bitSize: 16, bitOffset: 0, byteSize: 2, structure: s.errSet },
+        ],
+      },
+      static: {},
+    };
+    env.beginStructure(errUnionVoid);
+    env.finishStructure(errUnionVoid);
+
+    // 1. ESM facade (`export * from './named.cjs'; export { default } from './named.cjs'; export const version = 2;`)
+    // even when registered without `.mjs` extension (`./facade.js`)
+    const namedExports = {
+      counter: 1,
+      bump() {
+        namedExports.counter += 1;
+        return namedExports.counter;
+      },
+    };
+    const facadeNs = Object.create(null);
+    Object.defineProperties(facadeNs, {
+      [Symbol.toStringTag]: { value: 'Module' },
+      counter: { value: 1, writable: false, enumerable: true, configurable: false },
+      bump: { value: namedExports.bump, writable: false, enumerable: true, configurable: false },
+      default: { value: namedExports, writable: false, enumerable: true, configurable: false },
+      'module.exports': { value: namedExports, writable: false, enumerable: true, configurable: false },
+      version: { value: 2, writable: false, enumerable: true, configurable: false },
+    });
+    Object.freeze(facadeNs);
+
+    // 2. Rollup @rollup/plugin-commonjs `_mergeNamespaces` helper (exact output of v29)
+    function mergeNamespaces(n, m) {
+      m.forEach((e) => {
+        if (e && typeof(e) !== 'string' && !Array.isArray(e)) {
+          Object.keys(e).forEach((k) => {
+            if (k !== 'default' && !(k in n)) {
+              const d = Object.getOwnPropertyDescriptor(e, k);
+              Object.defineProperty(n, k, d.get ? d : {
+                enumerable: true,
+                get: () => e[k],
+              });
+            }
+          });
+        }
+      });
+      return Object.freeze(n);
+    }
+
+    const rollupNamedExports = {
+      counter: 1,
+      bump() {
+        rollupNamedExports.counter += 1;
+        return rollupNamedExports.counter;
+      },
+    };
+    const rollupNamedNs = mergeNamespaces({ __proto__: null, default: rollupNamedExports }, [ rollupNamedExports ]);
+
+    const rollupFn = function(x) {
+      return x + rollupFn.extra;
+    };
+    rollupFn.extra = 1;
+    const rollupFnNs = mergeNamespaces({ __proto__: null, default: rollupFn }, [ rollupFn ]);
+
+    // 3. TypeScript/Babel `__esModule: true` CJS (`ts.cjs`) under Node ESM AND Rollup `_mergeNamespaces`
+    const nodeTsExports = {};
+    Object.defineProperty(nodeTsExports, '__esModule', { value: true });
+    nodeTsExports.named = 5;
+    nodeTsExports.default = { inner: 9 };
+    const nodeTsNs = Object.create(null);
+    Object.defineProperties(nodeTsNs, {
+      [Symbol.toStringTag]: { value: 'Module' },
+      __esModule: { value: true, enumerable: true },
+      named: { value: 5, enumerable: true },
+      default: { value: nodeTsExports, enumerable: true },
+      'module.exports': { value: nodeTsExports, enumerable: true },
+    });
+    Object.freeze(nodeTsNs);
+
+    const rollupTsExports = {};
+    Object.defineProperty(rollupTsExports, '__esModule', { value: true });
+    rollupTsExports.named = 5;
+    rollupTsExports.default = { inner: 9 };
+    const rollupTsNs = mergeNamespaces({ __proto__: null, default: rollupTsExports.default }, [ rollupTsExports ]);
+
+    env.registerJsModules({
+      './facade.js': facadeNs,
+      'rollup-named-no-ext': rollupNamedNs,
+      'rollup-fn-no-ext': rollupFnNs,
+      './ts-node.cjs': nodeTsNs,
+      './ts-rollup.cjs': rollupTsNs,
+    });
+
+    const argsGetI32 = s.makeArgStruct(471n, s.i32, [ s.jsRef ]);
+    const argsSetFallible = s.makeArgStruct(472n, errUnionVoid, [ s.jsRef, s.i32 ]);
+    const argsDelete = s.makeArgStruct(473n, s.boolStruct, [ s.jsRef ]);
+    const argsHas = s.makeArgStruct(474n, s.boolStruct, [ s.jsRef ]);
+    const argsCallFn = s.makeArgStruct(475n, s.i32, [ s.jsRef, s.i32 ]);
+
+    const enc = new TextEncoder();
+    let strOff = 0x100;
+    const putKey = (text) => {
+      const bytes = enc.encode(text);
+      const view = harness.viewAt(strOff, bytes.length);
+      new Uint8Array(view.buffer, view.byteOffset, bytes.length).set(bytes);
+      const out = { keyAddr: harness.addrOf(strOff), keyLen: harness.is64 ? BigInt(bytes.length) : bytes.length };
+      strOff += (bytes.length + 7) & ~7;
+      return out;
+    };
+
+    const kVersion = putKey('version');
+    const kCounter = putKey('counter');
+    const kExtra = putKey('extra');
+    const kNamed = putKey('named');
+    const kInner = putKey('inner');
+    const kAdded = putKey('added');
+
+    const dHasVer = writeDescriptor(harness, 0x300, { signature: 474n, op: HostOpCode.HasProp, ...kVersion, argSize: argsHas.byteSize });
+    const dGetVer = writeDescriptor(harness, 0x340, { signature: 471n, op: HostOpCode.GetProp, ...kVersion, argSize: argsGetI32.byteSize });
+    const dSetVer = writeDescriptor(harness, 0x380, { signature: 472n, op: HostOpCode.SetProp, ...kVersion, argSize: argsSetFallible.byteSize });
+    const dDelVer = writeDescriptor(harness, 0x3c0, { signature: 473n, op: HostOpCode.DeleteProp, ...kVersion, argSize: argsDelete.byteSize });
+
+    const dSetCounter = writeDescriptor(harness, 0x400, { signature: 472n, op: HostOpCode.SetProp, ...kCounter, argSize: argsSetFallible.byteSize });
+    const dGetCounter = writeDescriptor(harness, 0x440, { signature: 471n, op: HostOpCode.GetProp, ...kCounter, argSize: argsGetI32.byteSize });
+    const dDelCounter = writeDescriptor(harness, 0x480, { signature: 473n, op: HostOpCode.DeleteProp, ...kCounter, argSize: argsDelete.byteSize });
+    const dHasCounter = writeDescriptor(harness, 0x4c0, { signature: 474n, op: HostOpCode.HasProp, ...kCounter, argSize: argsHas.byteSize });
+
+    const dSetExtra = writeDescriptor(harness, 0x500, { signature: 472n, op: HostOpCode.SetProp, ...kExtra, argSize: argsSetFallible.byteSize });
+    const dDelExtra = writeDescriptor(harness, 0x540, { signature: 473n, op: HostOpCode.DeleteProp, ...kExtra, argSize: argsDelete.byteSize });
+    const dCallFn = writeDescriptor(harness, 0x580, { signature: 475n, op: HostOpCode.CallFn, argSize: argsCallFn.byteSize });
+
+    const dGetNamed = writeDescriptor(harness, 0x5c0, { signature: 471n, op: HostOpCode.GetProp, ...kNamed, argSize: argsGetI32.byteSize });
+    const dHasInner = writeDescriptor(harness, 0x600, { signature: 474n, op: HostOpCode.HasProp, ...kInner, argSize: argsHas.byteSize });
+    const dGetInner = writeDescriptor(harness, 0x640, { signature: 471n, op: HostOpCode.GetProp, ...kInner, argSize: argsGetI32.byteSize });
+    const dSetAdded = writeDescriptor(harness, 0x680, { signature: 472n, op: HostOpCode.SetProp, ...kAdded, argSize: argsSetFallible.byteSize });
+    const dGetAdded = writeDescriptor(harness, 0x6c0, { signature: 471n, op: HostOpCode.GetProp, ...kAdded, argSize: argsGetI32.byteSize });
+    const dDelAdded = writeDescriptor(harness, 0x700, { signature: 473n, op: HostOpCode.DeleteProp, ...kAdded, argSize: argsDelete.byteSize });
+
+    const frameAddr = harness.addrOf(0x900);
+    const frameDV = harness.viewAt(0x900, 64);
+
+    // A. Verify ESM facade preserves `version` = 2 and rejects SetProp('version', 9) without mutating namedExports
+    const hFacade = env.allocJsValue(facadeNs);
+    frameDV.setUint32(argsHas.instance.members[1].bitOffset / 8, hFacade, true);
+    expect(env.invokeJsHostOp(dHasVer, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint8(0)).to.equal(1);
+
+    frameDV.setUint32(argsGetI32.instance.members[1].bitOffset / 8, hFacade, true);
+    expect(env.invokeJsHostOp(dGetVer, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getInt32(0, true)).to.equal(2);
+
+    frameDV.setUint16(0, 0, true);
+    frameDV.setUint32(argsSetFallible.instance.members[1].bitOffset / 8, hFacade, true);
+    frameDV.setInt32(argsSetFallible.instance.members[2].bitOffset / 8, 9, true);
+    expect(env.invokeJsHostOp(dSetVer, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint16(0, true)).to.equal(1);
+    expect('version' in namedExports).to.be.false;
+
+    frameDV.setUint32(argsDelete.instance.members[1].bitOffset / 8, hFacade, true);
+    expect(env.invokeJsHostOp(dDelVer, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint8(0)).to.equal(0);
+    env.releaseJsValue(hFacade);
+
+    // B. Verify Rollup `_mergeNamespaces` CJS unwrapping on `rollupNamedNs` and `rollupFnNs`
+    const hRollupNamed = env.allocJsValue(rollupNamedNs);
+    frameDV.setUint16(0, 0xffff, true);
+    frameDV.setUint32(argsSetFallible.instance.members[1].bitOffset / 8, hRollupNamed, true);
+    frameDV.setInt32(argsSetFallible.instance.members[2].bitOffset / 8, 42, true);
+    expect(env.invokeJsHostOp(dSetCounter, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint16(0, true)).to.equal(0);
+    expect(rollupNamedExports.counter).to.equal(42);
+
+    frameDV.setUint32(argsGetI32.instance.members[1].bitOffset / 8, hRollupNamed, true);
+    expect(env.invokeJsHostOp(dGetCounter, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getInt32(0, true)).to.equal(42);
+
+    frameDV.setUint32(argsDelete.instance.members[1].bitOffset / 8, hRollupNamed, true);
+    expect(env.invokeJsHostOp(dDelCounter, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint8(0)).to.equal(1);
+
+    frameDV.setUint32(argsHas.instance.members[1].bitOffset / 8, hRollupNamed, true);
+    expect(env.invokeJsHostOp(dHasCounter, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint8(0)).to.equal(0);
+    env.releaseJsValue(hRollupNamed);
+
+    const hRollupFn = env.allocJsValue(rollupFnNs);
+    frameDV.setUint16(0, 0xffff, true);
+    frameDV.setUint32(argsSetFallible.instance.members[1].bitOffset / 8, hRollupFn, true);
+    frameDV.setInt32(argsSetFallible.instance.members[2].bitOffset / 8, 20, true);
+    expect(env.invokeJsHostOp(dSetExtra, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint16(0, true)).to.equal(0);
+
+    frameDV.setUint32(argsCallFn.instance.members[1].bitOffset / 8, hRollupFn, true);
+    frameDV.setInt32(argsCallFn.instance.members[2].bitOffset / 8, 10, true);
+    expect(env.invokeJsHostOp(dCallFn, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getInt32(0, true)).to.equal(30);
+
+    frameDV.setUint32(argsDelete.instance.members[1].bitOffset / 8, hRollupFn, true);
+    expect(env.invokeJsHostOp(dDelExtra, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint8(0)).to.equal(1);
+    expect('extra' in rollupFn).to.be.false;
+    env.releaseJsValue(hRollupFn);
+
+    // C. Verify `__esModule: true` CJS parity across BOTH Node ESM (`nodeTsNs`) and Rollup (`rollupTsNs`)
+    for (const [ ns, backingDefault ] of [
+      [ nodeTsNs, nodeTsExports.default ],
+      [ rollupTsNs, rollupTsExports.default ],
+    ]) {
+      const hTs = env.allocJsValue(ns);
+
+      frameDV.setUint32(argsGetI32.instance.members[1].bitOffset / 8, hTs, true);
+      expect(env.invokeJsHostOp(dGetNamed, frameAddr)).to.equal(PosixError.NONE);
+      expect(frameDV.getInt32(0, true)).to.equal(5);
+
+      frameDV.setUint32(argsHas.instance.members[1].bitOffset / 8, hTs, true);
+      expect(env.invokeJsHostOp(dHasInner, frameAddr)).to.equal(PosixError.NONE);
+      expect(frameDV.getUint8(0)).to.equal(1);
+
+      frameDV.setUint32(argsGetI32.instance.members[1].bitOffset / 8, hTs, true);
+      expect(env.invokeJsHostOp(dGetInner, frameAddr)).to.equal(PosixError.NONE);
+      expect(frameDV.getInt32(0, true)).to.equal(9);
+
+      frameDV.setUint16(0, 0xffff, true);
+      frameDV.setUint32(argsSetFallible.instance.members[1].bitOffset / 8, hTs, true);
+      frameDV.setInt32(argsSetFallible.instance.members[2].bitOffset / 8, 1, true);
+      expect(env.invokeJsHostOp(dSetAdded, frameAddr)).to.equal(PosixError.NONE);
+      expect(frameDV.getUint16(0, true)).to.equal(0);
+      expect(backingDefault.added).to.equal(1);
+
+      frameDV.setUint32(argsGetI32.instance.members[1].bitOffset / 8, hTs, true);
+      expect(env.invokeJsHostOp(dGetAdded, frameAddr)).to.equal(PosixError.NONE);
+      expect(frameDV.getInt32(0, true)).to.equal(1);
+
+      frameDV.setUint32(argsDelete.instance.members[1].bitOffset / 8, hTs, true);
+      expect(env.invokeJsHostOp(dDelAdded, frameAddr)).to.equal(PosixError.NONE);
+      expect(frameDV.getUint8(0)).to.equal(1);
+      expect('added' in backingDefault).to.be.false;
+
+      env.releaseJsValue(hTs);
+    }
+
+    expect(env.getJsValueCount()).to.equal(0);
+  });
 });

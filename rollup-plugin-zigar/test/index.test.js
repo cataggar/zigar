@@ -1,3 +1,4 @@
+import CommonJS from '@rollup/plugin-commonjs';
 import NodeResolve from '@rollup/plugin-node-resolve';
 import { expect } from 'chai';
 import { readFile } from 'fs/promises';
@@ -192,6 +193,15 @@ describe('Loader', function() {
       expect(mod.exerciseFalsyEsm().string).to.equal(
         'z=0|b=false|null=true|undef=true|set_err=true:def=100:del=false',
       );
+      expect(mod.exerciseEsmFacade().string).to.equal(
+        'has=true:v=2|set_err=true:named_has=false:del=false:after=2|extra=33=33:del=true:has=false',
+      );
+      expect(mod.exerciseFnCjs().string).to.equal(
+        '11:1|20->30|del=true:has=false|restored=11',
+      );
+      expect(mod.exerciseTsEsModuleCjs().string).to.equal(
+        'named=true:5|inner=true:9=9|added=true:1=1|del=true:has=false',
+      );
       expect(Number(mod.activeHandles())).to.equal(0);
 
       // Also verify Rollup multi-chunk code splitting with dynamicJsImports: true!
@@ -236,7 +246,73 @@ describe('Loader', function() {
       expect(dynEntryMod.exerciseFalsyEsm().string).to.equal(
         'z=0|b=false|null=true|undef=true|set_err=true:def=100:del=false',
       );
+      expect(dynEntryMod.exerciseEsmFacade().string).to.equal(
+        'has=true:v=2|set_err=true:named_has=false:del=false:after=2|extra=33=33:del=true:has=false',
+      );
+      expect(dynEntryMod.exerciseFnCjs().string).to.equal(
+        '11:1|20->30|del=true:has=false|restored=11',
+      );
+      expect(dynEntryMod.exerciseTsEsModuleCjs().string).to.equal(
+        'named=true:5|inner=true:9=9|added=true:1=1|del=true:has=false',
+      );
       expect(Number(dynEntryMod.activeHandles())).to.equal(0);
+    })
+
+    it('should bundle named.cjs, fn.cjs, ts.cjs, and facade.mjs in-bundle with @rollup/plugin-commonjs without marking .cjs external', async function() {
+      const outDir = join(tmpdir(), 'rollup-commonjs-inbundle');
+      const jsPath = join(outDir, 'parity-cjs-inbundle.mjs');
+      const bundle = await rollup({
+        input: parityZig,
+        external: (id) => id.startsWith('node:'),
+        plugins: [
+          Zigar({ embedWASM: true, optimize: 'ReleaseSmall' }),
+          CommonJS(),
+          NodeResolve({
+            modulePaths: [ absolute(`../node_modules`) ],
+          }),
+        ],
+      });
+      try {
+        await bundle.write({
+          file: jsPath,
+          format: 'esm',
+        });
+      } finally {
+        await bundle.close();
+      }
+      const code = await readFile(jsPath, 'utf-8');
+      expect(code).to.include('_mergeNamespaces');
+      expect(code).to.not.match(/from\s+['"][^'"]*\.cjs['"]/);
+
+      const mod = await import(pathToFileURL(jsPath).href);
+      expect(mod.exerciseNodeBuiltins().string).to.equal(
+        'item.zig|p/item.zig|https://example.org/docs/spec?v=2|file:',
+      );
+      expect(mod.exerciseLocalEsm('rollup-cjs').string).to.equal(
+        'v17=v17|zig<->esm|esm-default:rollup-cjs|esm-default:handle',
+      );
+      expect(mod.exerciseLocalCjsExportEquals(4, 23).string).to.equal(
+        '423|cjs-static-extra|cjs-static-extra:ok|708|cjs-ctor-tag|155',
+      );
+      expect(mod.exerciseNamespaceShadowMutation().string).to.equal(
+        '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
+      );
+      expect(mod.exerciseNamedCjs().string).to.equal(
+        '1|2=2|42->43|del=true:has=false:def_has=false|restored=1',
+      );
+      expect(mod.exerciseFalsyEsm().string).to.equal(
+        'z=0|b=false|null=true|undef=true|set_err=true:def=100:del=false',
+      );
+      expect(mod.exerciseEsmFacade().string).to.equal(
+        'has=true:v=2|set_err=true:named_has=false:del=false:after=2|extra=33=33:del=true:has=false',
+      );
+      expect(mod.exerciseFnCjs().string).to.equal(
+        '11:1|20->30|del=true:has=false|restored=11',
+      );
+      expect(mod.exerciseTsEsModuleCjs().string).to.equal(
+        'named=true:5|inner=true:9=9|added=true:1=1|del=true:has=false',
+      );
+      expect(Number(mod.activeHandles())).to.equal(0);
     })
   })
 })

@@ -49,6 +49,15 @@ describe('Native ES Module Imports, Tree-Shaking & CJS/ESM Interop (node-zigar)'
     expect(mod.exerciseFalsyEsm().string).to.equal(
       'z=0|b=false|null=true|undef=true|set_err=true:def=100:del=false',
     );
+    expect(mod.exerciseEsmFacade().string).to.equal(
+      'has=true:v=2|set_err=true:named_has=false:del=false:after=2|extra=33=33:del=true:has=false',
+    );
+    expect(mod.exerciseFnCjs().string).to.equal(
+      '11:1|20->30|del=true:has=false|restored=11',
+    );
+    expect(mod.exerciseTsEsModuleCjs().string).to.equal(
+      'named=true:5|inner=true:9=9|added=true:1=1|del=true:has=false',
+    );
     const unrelatedCwd = join(process.env.TMPDIR || os.tmpdir(), 'node-zigar-unrelated-cwd');
     await mkdir(unrelatedCwd, { recursive: true });
     const prevCwd = process.cwd();
@@ -81,6 +90,15 @@ describe('Native ES Module Imports, Tree-Shaking & CJS/ESM Interop (node-zigar)'
     );
     expect(mod.exerciseFalsyEsm().string).to.equal(
       'z=0|b=false|null=true|undef=true|set_err=true:def=100:del=false',
+    );
+    expect(mod.exerciseEsmFacade().string).to.equal(
+      'has=true:v=2|set_err=true:named_has=false:del=false:after=2|extra=33=33:del=true:has=false',
+    );
+    expect(mod.exerciseFnCjs().string).to.equal(
+      '11:1|20->30|del=true:has=false|restored=11',
+    );
+    expect(mod.exerciseTsEsModuleCjs().string).to.equal(
+      'named=true:5|inner=true:9=9|added=true:1=1|del=true:has=false',
     );
     expect(mod.exerciseRuntimeRelativeImport('./cjs-export-equals.cjs', 3, 19)).to.equal(319);
     expect(Number(mod.activeHandles())).to.equal(0);

@@ -97,8 +97,11 @@ describe('Tree-Shaken ES Module Imports & CJS/ESM Interop (zigar-compiler WASM)'
         './singleton-esm.mjs',
         './named.cjs',
         './falsy.mjs',
+        './facade.mjs',
+        './fn.cjs',
+        './ts.cjs',
       ]);
-      expect(result.jsModules).to.have.lengthOf(8);
+      expect(result.jsModules).to.have.lengthOf(11);
 
       const tmpBase = process.env.TMPDIR || os.tmpdir();
       const outDir = join(tmpBase, 'zigar-esmod-wasm');
@@ -124,6 +127,15 @@ describe('Tree-Shaken ES Module Imports & CJS/ESM Interop (zigar-compiler WASM)'
       );
       expect(mod.exerciseFalsyEsm().string).to.equal(
         'z=0|b=false|null=true|undef=true|set_err=true:def=100:del=false',
+      );
+      expect(mod.exerciseEsmFacade().string).to.equal(
+        'has=true:v=2|set_err=true:named_has=false:del=false:after=2|extra=33=33:del=true:has=false',
+      );
+      expect(mod.exerciseFnCjs().string).to.equal(
+        '11:1|20->30|del=true:has=false|restored=11',
+      );
+      expect(mod.exerciseTsEsModuleCjs().string).to.equal(
+        'named=true:5|inner=true:9=9|added=true:1=1|del=true:has=false',
       );
       expect(Number(mod.activeHandles())).to.equal(0);
     });
@@ -171,6 +183,15 @@ describe('Tree-Shaken ES Module Imports & CJS/ESM Interop (zigar-compiler WASM)'
     expect(cjsMod.exerciseFalsyEsm().string).to.equal(
       'z=0|b=false|null=true|undef=true|set_err=true:def=100:del=false',
     );
+    expect(cjsMod.exerciseEsmFacade().string).to.equal(
+      'has=true:v=2|set_err=true:named_has=false:del=false:after=2|extra=33=33:del=true:has=false',
+    );
+    expect(cjsMod.exerciseFnCjs().string).to.equal(
+      '11:1|20->30|del=true:has=false|restored=11',
+    );
+    expect(cjsMod.exerciseTsEsModuleCjs().string).to.equal(
+      'named=true:5|inner=true:9=9|added=true:1=1|del=true:has=false',
+    );
     expect(Number(cjsMod.activeHandles())).to.equal(0);
 
     // dynamicJsImports: true mode — write generated ESM alongside local helper modules and import from an unrelated cwd!
@@ -193,7 +214,17 @@ describe('Tree-Shaken ES Module Imports & CJS/ESM Interop (zigar-compiler WASM)'
     const unrelatedCwd = join(tmpBase, `zigar-unrelated-cwd-${runId}`);
     await mkdir(dynOutDir, { recursive: true });
     await mkdir(unrelatedCwd, { recursive: true });
-    for (const helperFile of [ 'esm-helper.mjs', 'cjs-export-equals.cjs', 'cjs-class.cjs', 'singleton-esm.mjs', 'named.cjs', 'falsy.mjs' ]) {
+    for (const helperFile of [
+      'esm-helper.mjs',
+      'cjs-export-equals.cjs',
+      'cjs-class.cjs',
+      'singleton-esm.mjs',
+      'named.cjs',
+      'falsy.mjs',
+      'facade.mjs',
+      'fn.cjs',
+      'ts.cjs',
+    ]) {
       await copyFile(join(sampleDir, helperFile), join(dynOutDir, helperFile));
     }
     const dynPath = join(dynOutDir, 'parity-dyn.mjs');
@@ -221,6 +252,15 @@ describe('Tree-Shaken ES Module Imports & CJS/ESM Interop (zigar-compiler WASM)'
       );
       expect(dynMod.exerciseFalsyEsm().string).to.equal(
         'z=0|b=false|null=true|undef=true|set_err=true:def=100:del=false',
+      );
+      expect(dynMod.exerciseEsmFacade().string).to.equal(
+        'has=true:v=2|set_err=true:named_has=false:del=false:after=2|extra=33=33:del=true:has=false',
+      );
+      expect(dynMod.exerciseFnCjs().string).to.equal(
+        '11:1|20->30|del=true:has=false|restored=11',
+      );
+      expect(dynMod.exerciseTsEsModuleCjs().string).to.equal(
+        'named=true:5|inner=true:9=9|added=true:1=1|del=true:has=false',
       );
       expect(dynMod.bumpSingletonVisits(9)).to.equal(9);
       expect(singletonFromJs.visits).to.equal(9);
@@ -272,6 +312,15 @@ describe('Tree-Shaken ES Module Imports & CJS/ESM Interop (zigar-compiler WASM)'
     );
     expect(mod.exerciseFalsyEsm().string).to.equal(
       'z=0|b=false|null=true|undef=true|set_err=true:def=100:del=false',
+    );
+    expect(mod.exerciseEsmFacade().string).to.equal(
+      'has=true:v=2|set_err=true:named_has=false:del=false:after=2|extra=33=33:del=true:has=false',
+    );
+    expect(mod.exerciseFnCjs().string).to.equal(
+      '11:1|20->30|del=true:has=false|restored=11',
+    );
+    expect(mod.exerciseTsEsModuleCjs().string).to.equal(
+      'named=true:5|inner=true:9=9|added=true:1=1|del=true:has=false',
     );
     expect(Number(mod.activeHandles())).to.equal(0);
   });
