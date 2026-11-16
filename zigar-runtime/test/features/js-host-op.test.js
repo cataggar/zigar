@@ -556,13 +556,14 @@ describe('Feature: js-host-op', function() {
 
     const cbArgStruct = types.makeArgStruct(201n, types.i32, [ types.i32 ]);
     const trampAddr = harness.is64 ? 0x9999n : 0x9999;
-    const descSize = 16 + 2 * harness.ptrSize;
+    const descSize = 16 + 3 * harness.ptrSize;
     const descDV = harness.viewAt(0x800, descSize);
     descDV.setBigUint64(0, 201n, true);
     descDV.setUint32(8, 0, true);
     descDV.setUint32(12, 0, true);
     writePtr(descDV, 16, trampAddr, harness.is64);
     writePtr(descDV, 16 + harness.ptrSize, 0, harness.is64);
+    writePtr(descDV, 16 + 2 * harness.ptrSize, 0, harness.is64);
     const descAddr = harness.addrOf(0x800);
 
     // Intercept invokeThunk to simulate the shared Zig trampoline reading callbackId from fnHolder[MEMORY][ZIG].address
@@ -594,10 +595,9 @@ describe('Feature: js-host-op', function() {
     }
 
     for (const { h, slotId } of handles) {
-      env.releaseZigCallback(slotId);
       const releasedFn = env.getJsValue(h);
+      env.releaseZigCallback(slotId);
       expect(() => releasedFn(1)).to.throw(/already been released/);
-      env.releaseJsValue(h);
     }
     expect(env.getActiveZigCallbackCount()).to.equal(0);
     expect(env.getJsValueCount()).to.equal(0);
@@ -1608,7 +1608,7 @@ describe('Feature: js-host-op', function() {
     expect(env.getJsValueCount()).to.equal(0);
   });
 
-  it('should support Symbol.dispose, Symbol.asyncDispose (sync fallback, microtask, and JSPI suspension), and one-shot callbacks', async function() {
+  it('should support Symbol.dispose, Symbol.asyncDispose (sync return, sync fallback, JSPI suspension, and sync NOSYS), and one-shot callbacks', async function() {
     const env = new Env();
     env.littleEndian = true;
     const harness = createMemoryHarness(env);
@@ -1648,7 +1648,8 @@ describe('Feature: js-host-op', function() {
     expect(env.getJsValueCount()).to.equal(0);
     expect(env.consumePendingHostError()?.error).to.equal(disposeBoom);
 
-    // 2. Symbol.asyncDispose: fallback to Symbol.dispose, microtask async settlement, and JSPI timer ticket
+    // 2. Symbol.asyncDispose: fallback to Symbol.dispose, synchronous non-Promise asyncDispose,
+    //    no microtask draining on sync stacks (returns 2 without UnhandledPromiseRejection), and JSPI ticket
     const hFallback = env.allocJsValue({
       [Symbol.dispose]() {
         events.push('fallback-sync');
@@ -1658,15 +1659,45 @@ describe('Feature: js-host-op', function() {
     expect(events).to.include('fallback-sync');
     expect(env.getJsValueCount()).to.equal(0);
 
-    const hMicrotask = env.allocJsValue({
-      async [Symbol.asyncDispose]() {
-        await Promise.resolve();
-        events.push('microtask-async');
+    const hSyncAsyncDispose = env.allocJsValue({
+      [Symbol.asyncDispose]() {
+        events.push('sync-async-dispose');
       },
     });
-    expect(env.asyncDisposeJsValue(hMicrotask, true)).to.equal(0);
-    expect(events).to.include('microtask-async');
+    expect(env.asyncDisposeJsValue(hSyncAsyncDispose, true)).to.equal(0);
+    expect(events).to.include('sync-async-dispose');
     expect(env.getJsValueCount()).to.equal(0);
+
+    // Promise-returning [Symbol.asyncDispose] without JSPI NEVER drains nextTick/microtasks,
+    // attaches a rejection handler immediately, releases handle, and returns 2 (HostUnavailable)
+    const tickOrder = [];
+    process.nextTick(() => tickOrder.push('nextTick'));
+    tickOrder.push('before');
+    const hPromiseNoJspi = env.allocJsValue({
+      async [Symbol.asyncDispose]() {
+        await Promise.resolve();
+        events.push('microtask-async-settled-later');
+      },
+    });
+    expect(env.asyncDisposeJsValue(hPromiseNoJspi, true)).to.equal(2);
+    expect(env.getJsValueCount()).to.equal(0);
+    tickOrder.push('after');
+    expect(tickOrder).to.deep.equal([ 'before', 'after' ]);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(tickOrder).to.deep.equal([ 'before', 'after', 'nextTick' ]);
+
+    // Rejecting Promise on non-JSPI stack attaches handler immediately so Node never sees UnhandledPromiseRejection,
+    // and unrelated Promise.reject handled later in the same tick does NOT crash the process
+    const unrelatedPending = Promise.reject(new Error('handled later in same tick'));
+    const hRejNoJspi = env.allocJsValue({
+      [Symbol.asyncDispose]() {
+        return Promise.reject(new Error('sync-stack async rejection'));
+      },
+    });
+    expect(env.beginAsyncDisposeJsValue(hRejNoJspi, true)).to.equal(2);
+    expect(env.getJsValueCount()).to.equal(0);
+    unrelatedPending.catch(() => {});
+    await new Promise((resolve) => setImmediate(resolve));
 
     // Timer-backed asyncDispose without JSPI returns 2 (HostUnavailable) and releases handle immediately
     const hTimerNoJspi = env.allocJsValue({
@@ -1714,26 +1745,54 @@ describe('Feature: js-host-op', function() {
     env.activeContinuation = null;
     env.useJSPI = false;
 
-    // 3. One-shot callback (`flags = 2`) auto-revokes and auto-releases its JsValue handle after first call
+    // 3. One-shot callback (`flags = 2`) auto-revokes and auto-releases its JsValue handle after first call,
+    //    AND invokes `cancelThunk` when JS argument conversion throws before reaching Zig trampoline
     const cbArgStruct = s.makeArgStruct(502n, s.i32, [ s.i32 ]);
     const descOff = 0x500;
     const ptrSize = harness.is64 ? 8 : 4;
-    const descDV = harness.viewAt(descOff, 16 + 2 * ptrSize);
+    const cancelAddr = harness.is64 ? 0x9100n : 0x9100;
+    const descDV = harness.viewAt(descOff, 16 + 3 * ptrSize);
     descDV.setBigUint64(0, 502n, true);
     descDV.setUint32(8, 2, true); // CallbackFlags.once = 1 << 1
     descDV.setUint32(12, 0, true);
     if (harness.is64) {
       descDV.setBigUint64(16, 0x9000n, true);
       descDV.setBigUint64(24, 0n, true);
+      descDV.setBigUint64(32, cancelAddr, true);
     } else {
       descDV.setUint32(16, 0x9000, true);
       descDV.setUint32(20, 0, true);
+      descDV.setUint32(24, cancelAddr, true);
     }
+    const cancelledSlots = [];
     if (process.env.TARGET === 'wasm') {
-      env.createOutboundCaller = () => (x) => x * 3;
+      env.runThunk = (thunk, fnAddr) => {
+        if (thunk === cancelAddr) {
+          const cid = Number(fnAddr) >>> 0;
+          cancelledSlots.push(cid);
+          env.releaseZigCallback(cid);
+        }
+        return true;
+      };
+      env.createOutboundCaller = () => (x) => {
+        if (typeof(x) !== 'number') {
+          throw new TypeError('Expected number');
+        }
+        env.releaseZigCallback(1);
+        return x * 3;
+      };
     } else {
-      env.runThunk = () => true;
-      env.invokeThunk = (_thunk, _fn, argsHolder) => {
+      env.runThunk = (thunk, fnAddr) => {
+        if (thunk === cancelAddr) {
+          const cid = Number(fnAddr) >>> 0;
+          cancelledSlots.push(cid);
+          env.releaseZigCallback(cid);
+        }
+        return true;
+      };
+      env.invokeThunk = (_thunk, fnHolder, argsHolder) => {
+        const cid = Number(fnHolder[MEMORY][ZIG].address) >>> 0;
+        env.releaseZigCallback(cid);
         argsHolder.retval = argsHolder[0] * 3;
         return argsHolder.retval;
       };
@@ -1743,8 +1802,22 @@ describe('Feature: js-host-op', function() {
     expect(env.getActiveZigCallbackCount()).to.equal(1);
     expect(env.getJsValueCount()).to.equal(1);
     expect(onceFn(14)).to.equal(42);
+    expect(cancelledSlots).to.deep.equal([]);
     expect(env.getActiveZigCallbackCount()).to.equal(0);
     expect(env.getJsValueCount()).to.equal(0);
     expect(() => onceFn(1)).to.throw(/already been released/);
+
+    // Pre-trampoline JS arg conversion TypeError cancels Zig slot via cancelThunk and single-releases handle
+    const badOnceHandle = env.createZigCallback(harness.addrOf(descOff), 2);
+    const badOnceFn = env.getJsValue(badOnceHandle);
+    expect(env.getActiveZigCallbackCount()).to.equal(1);
+    expect(env.getJsValueCount()).to.equal(1);
+    expect(() => badOnceFn('not a number')).to.throw(Error);
+    expect(cancelledSlots).to.deep.equal([ 2 ]);
+    expect(env.getActiveZigCallbackCount()).to.equal(0);
+    expect(env.getJsValueCount()).to.equal(0);
+    // Subsequent releaseZigCallback(2) (e.g. if Zig defer deinit ran) is a safe no-op with zero double-release!
+    expect(() => env.releaseZigCallback(2)).to.not.throw();
+    expect(() => badOnceFn(14)).to.throw(/already been released/);
   });
 });

@@ -191,6 +191,10 @@ pub fn useResourceWithDeferAsyncDispose(res: Ref(js.Any)) i32 {
     return 77;
 }
 
+pub fn tryAsyncDisp(res: Ref(js.Any)) !void {
+    return res.tryAsyncDispose();
+}
+
 pub fn useResourceWithTryAsyncDispose(alloc: std.mem.Allocator, res: Ref(js.Any)) ![]const u8 {
     if (res.tryAsyncDispose()) |_| {
         return alloc.dupe(u8, "ok");
@@ -352,4 +356,67 @@ pub fn exerciseOnceClosuresAndAbaSafety(emitter: Ref(js.Object)) !i32 {
     if (!fresh_once_unused.isActive()) return error.InvalidCallback;
 
     return first_out;
+}
+
+pub fn makeDetachedOnceClosure(bonus: i32) !Ref(js.Function) {
+    const pool = CountingPoolAllocator.allocator();
+    const cl = try js.Closure(OncePayload, OncePayload.compute).tryOnce(
+        pool,
+        .{ .bonus = bonus },
+    );
+    return cl.cloneRef();
+}
+
+pub fn exerciseOnceConversionErrorCleanup(driver: Ref(js.Object)) !void {
+    defer driver.deinit();
+    var dbg_gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer {
+        if (dbg_gpa.deinit() == .leak) @panic("DebugAllocator detected HeapBox leak");
+    }
+    const dbg_alloc = dbg_gpa.allocator();
+    const pool = CountingPoolAllocator.allocator();
+    const baseline_handles = js.activeHandleCount();
+    const baseline_cbs = js.activeCallbackCount();
+
+    // A. Calling `onceFn('not a number')` FOLLOWED by `defer once_with_deinit.deinit()`
+    {
+        var once_with_deinit = try js.Closure(OncePayload, OncePayload.compute).tryOnce(
+            pool,
+            .{ .bonus = 10 },
+        );
+        defer once_with_deinit.deinit();
+
+        if (live_box_allocs != 1) return error.InvalidCallback;
+        if (driver.tryCall(fn (js.Closure(OncePayload, OncePayload.compute)) js.Error!void, "callBadArg", .{once_with_deinit})) |_| {
+            return error.InvalidCallback;
+        } else |err| {
+            if (err != error.JsException) return err;
+            js.clearLastError();
+        }
+
+        if (once_with_deinit.isActive()) return error.InvalidCallback;
+        if (live_box_allocs != 0) return error.InvalidCallback;
+        if (js.activeCallbackCount() != baseline_cbs) return error.InvalidCallback;
+        if (js.activeHandleCount() != baseline_handles) return error.InvalidCallback;
+    }
+    if (js.activeCallbackCount() != baseline_cbs) return error.InvalidCallback;
+    if (js.activeHandleCount() != baseline_handles) return error.InvalidCallback;
+
+    // B. Calling `onceFn('not a number')` WITHOUT calling `closure.deinit()` (verified by DebugAllocator!)
+    {
+        const once_without_deinit = try js.Closure(OncePayload, OncePayload.compute).tryOnce(
+            dbg_alloc,
+            .{ .bonus = 20 },
+        );
+        if (driver.tryCall(fn (js.Closure(OncePayload, OncePayload.compute)) js.Error!void, "callBadArg", .{once_without_deinit})) |_| {
+            return error.InvalidCallback;
+        } else |err| {
+            if (err != error.JsException) return err;
+            js.clearLastError();
+        }
+
+        if (once_without_deinit.isActive()) return error.InvalidCallback;
+        if (js.activeCallbackCount() != baseline_cbs) return error.InvalidCallback;
+        if (js.activeHandleCount() != baseline_handles) return error.InvalidCallback;
+    }
 }

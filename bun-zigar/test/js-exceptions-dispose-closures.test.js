@@ -56,7 +56,7 @@ describe('Bun Native JS Exception Bridging, Symbol.dispose/asyncDispose, and Zig
     expect(undefSummary).to.equal('type=undefined|name=<null>|code=<null>|msg=<null>|stack=no');
   });
 
-  it('should support Symbol.dispose and Symbol.asyncDispose on Bun N-API with zero handle leaks', function() {
+  it('should support Symbol.dispose and Symbol.asyncDispose on Bun N-API with zero handle leaks and intact run-to-completion', async function() {
     const log = [];
     mod.resetSyncDisposeDeferRuns();
 
@@ -77,12 +77,11 @@ describe('Bun Native JS Exception Bridging, Symbol.dispose/asyncDispose, and Zig
     expect(caughtSync).to.include('type=object|name=Error|code=EIO|msg=bun sync close failed|');
 
     expect(mod.useResourceWithTryAsyncDispose({
-      async [Symbol.asyncDispose]() {
-        await Promise.resolve();
-        log.push('bun-async-ok');
+      [Symbol.asyncDispose]() {
+        log.push('bun-sync-async-ok');
       },
     }).string).to.equal('ok');
-    expect(log).to.include('bun-async-ok');
+    expect(log).to.include('bun-sync-async-ok');
 
     expect(mod.useResourceWithTryAsyncDispose({
       [Symbol.dispose]() {
@@ -91,19 +90,55 @@ describe('Bun Native JS Exception Bridging, Symbol.dispose/asyncDispose, and Zig
     }).string).to.equal('ok');
     expect(log).to.include('bun-async-fallback');
 
-    const caughtAsync = mod.useResourceWithTryAsyncDispose({
-      async [Symbol.asyncDispose]() {
-        await Promise.resolve();
-        throw Object.assign(new Error('bun async reject'), { code: 'EPIPE' });
+    const caughtSyncAsync = mod.useResourceWithTryAsyncDispose({
+      [Symbol.asyncDispose]() {
+        throw Object.assign(new Error('bun sync asyncDispose throw'), { code: 'EPIPE' });
       },
     }).string;
-    expect(caughtAsync).to.include('type=object|name=Error|code=EPIPE|msg=bun async reject|');
+    expect(caughtSyncAsync).to.include('type=object|name=Error|code=EPIPE|msg=bun sync asyncDispose throw|');
+
+    expect(mod.useResourceWithTryAsyncDispose({
+      async [Symbol.asyncDispose]() {
+        await Promise.resolve();
+      },
+    }).string).to.equal('HostUnavailable');
+    expect(Number(mod.activeHandles())).to.equal(0);
+
+    expect(mod.useResourceWithTryAsyncDispose({
+      [Symbol.asyncDispose]() {
+        return Promise.reject(new Error('bun rejected asyncDispose'));
+      },
+    }).string).to.equal('HostUnavailable');
+    expect(Number(mod.activeHandles())).to.equal(0);
 
     expect(mod.useResourceWithTryAsyncDispose({
       [Symbol.asyncDispose]() {
         return new Promise((resolve) => setTimeout(resolve, 10));
       },
     }).string).to.equal('HostUnavailable');
+
+    // Regression A: process.nextTick MUST NOT run inside synchronous tryAsyncDisp call!
+    const orderLog = [];
+    process.nextTick(() => orderLog.push('nextTick'));
+    orderLog.push('before');
+    expect(() => mod.tryAsyncDisp({
+      async [Symbol.asyncDispose]() {
+        await Promise.resolve();
+      },
+    })).to.throw();
+    orderLog.push('after');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(orderLog).to.deep.equal([ 'before', 'after', 'nextTick' ]);
+
+    // Regression B: unrelated Promise.reject handled later in the same tick MUST NOT trigger unhandled-rejection crash!
+    const pending = Promise.reject(new Error('handled later in same tick'));
+    expect(() => mod.tryAsyncDisp({
+      async [Symbol.asyncDispose]() {
+        await Promise.resolve();
+      },
+    })).to.throw();
+    pending.catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 5));
   });
 
   it('should support stateful Closure, owned HeapBox, re-entrant .deinit(), and .once() with ABA-safe cleanup', function() {
@@ -126,5 +161,24 @@ describe('Bun Native JS Exception Bridging, Symbol.dispose/asyncDispose, and Zig
     };
     expect(mod.exerciseOnceClosuresAndAbaSafety(emitter)).to.equal(62);
     expect(() => savedOnce(5)).to.throw(/already been released/);
+
+    let lastBadOnce = null;
+    mod.exerciseOnceConversionErrorCleanup({
+      callBadArg(fn) {
+        lastBadOnce = fn;
+        return fn('not a number');
+      },
+    });
+    expect(() => lastBadOnce(1)).to.throw(/already been released/);
+
+    const detachedOnce = mod.makeDetachedOnceClosure(33);
+    expect(Number(mod.activeHandles())).to.equal(1);
+    expect(Number(mod.activeCallbacks())).to.equal(1);
+    expect(Number(mod.liveBoxAllocs())).to.equal(1);
+    expect(() => detachedOnce('not a number')).to.throw(/Cannot convert/);
+    expect(Number(mod.activeHandles())).to.equal(0);
+    expect(Number(mod.activeCallbacks())).to.equal(0);
+    expect(Number(mod.liveBoxAllocs())).to.equal(0);
+    expect(() => detachedOnce(1)).to.throw(/already been released/);
   });
 });

@@ -169,7 +169,7 @@ describe('JS Exception Bridging, Symbol.dispose/asyncDispose, and Zig Closures (
         expect(await mod.getSyncDisposeDeferRuns()).to.equal(1);
       });
 
-      it('should support Symbol.asyncDispose (microtask, sync fallback, and JSPI timer suspension / sync HostUnavailable)', async function() {
+      it('should support Symbol.asyncDispose (sync return, sync fallback, and JSPI suspension / sync HostUnavailable)', async function() {
         const log = [];
 
         if (target.useJSPI) {
@@ -248,16 +248,15 @@ describe('JS Exception Bridging, Symbol.dispose/asyncDispose, and Zig Closures (
           expect(deferErr.message).to.equal('delayed defer boom');
           expect(await mod.getSyncDisposeDeferRuns()).to.equal(1);
         } else {
-          // Synchronous non-JSPI stack: microtask-settled async [Symbol.asyncDispose] & [Symbol.dispose] fallback work synchronously!
-          const rMicro = mod.useResourceWithTryAsyncDispose({
-            id: 'micro',
-            async [Symbol.asyncDispose]() {
-              await Promise.resolve();
-              log.push(`async:${this.id}`);
+          // Synchronous non-JSPI stack: synchronous [Symbol.asyncDispose]() (non-Promise) & [Symbol.dispose]() fallback succeed
+          const rSyncAsync = mod.useResourceWithTryAsyncDispose({
+            id: 'sync-impl',
+            [Symbol.asyncDispose]() {
+              log.push(`sync-async:${this.id}`);
             },
           });
-          expect(rMicro.string).to.equal('ok');
-          expect(log).to.deep.equal([ 'async:micro' ]);
+          expect(rSyncAsync.string).to.equal('ok');
+          expect(log).to.deep.equal([ 'sync-async:sync-impl' ]);
 
           const rFallback = mod.useResourceWithTryAsyncDispose({
             id: 'sync-fallback',
@@ -266,26 +265,50 @@ describe('JS Exception Bridging, Symbol.dispose/asyncDispose, and Zig Closures (
             },
           });
           expect(rFallback.string).to.equal('ok');
-          expect(log).to.deep.equal([ 'async:micro', 'fallback:sync-fallback' ]);
+          expect(log).to.deep.equal([ 'sync-async:sync-impl', 'fallback:sync-fallback' ]);
 
-          const rDeferAsync = mod.useResourceWithDeferAsyncDispose({
-            async [Symbol.asyncDispose]() {
-              await Promise.resolve();
-              log.push('defer-async-ok');
+          const rDeferSyncAsync = mod.useResourceWithDeferAsyncDispose({
+            [Symbol.asyncDispose]() {
+              log.push('defer-sync-async-ok');
             },
           });
-          expect(rDeferAsync).to.equal(77);
-          expect(log).to.include('defer-async-ok');
+          expect(rDeferSyncAsync).to.equal(77);
+          expect(log).to.include('defer-sync-async-ok');
 
-          const rMicroRej = mod.useResourceWithTryAsyncDispose({
-            async [Symbol.asyncDispose]() {
-              await Promise.resolve();
-              throw Object.assign(new Error('async close failed'), { code: 'EBADF' });
+          const rDeferFallback = mod.useResourceWithDeferAsyncDispose({
+            [Symbol.dispose]() {
+              log.push('defer-fallback-ok');
             },
           });
-          expect(rMicroRej.string).to.equal('type=object|name=Error|code=EBADF|msg=async close failed|stack=yes');
+          expect(rDeferFallback).to.equal(77);
+          expect(log).to.include('defer-fallback-ok');
 
-          // Non-JSPI sync stack: timer Promise returns HostUnavailable immediately without deadlocking or leaking handles
+          // Synchronous throw inside [Symbol.asyncDispose]() surfaces error.JsException + takeLastError()
+          const rSyncThrow = mod.useResourceWithTryAsyncDispose({
+            [Symbol.asyncDispose]() {
+              throw Object.assign(new Error('sync throw in asyncDispose'), { code: 'EBADF' });
+            },
+          });
+          expect(rSyncThrow.string).to.equal('type=object|name=Error|code=EBADF|msg=sync throw in asyncDispose|stack=yes');
+
+          // Promise-returning [Symbol.asyncDispose]() (both resolving and rejecting) on a sync stack
+          // releases handle, returns HostUnavailable, and NEVER causes UnhandledPromiseRejection
+          const rResolvingPromise = mod.useResourceWithTryAsyncDispose({
+            async [Symbol.asyncDispose]() {
+              await Promise.resolve();
+            },
+          });
+          expect(rResolvingPromise.string).to.equal('HostUnavailable');
+          expect(Number(mod.activeHandles())).to.equal(0);
+
+          const rRejectingPromise = mod.useResourceWithTryAsyncDispose({
+            [Symbol.asyncDispose]() {
+              return Promise.reject(new Error('sync-stack rejected asyncDispose'));
+            },
+          });
+          expect(rRejectingPromise.string).to.equal('HostUnavailable');
+          expect(Number(mod.activeHandles())).to.equal(0);
+
           const rSyncTimer = mod.useResourceWithTryAsyncDispose({
             [Symbol.asyncDispose]() {
               return new Promise((resolve) => setTimeout(resolve, 10));
@@ -293,13 +316,28 @@ describe('JS Exception Bridging, Symbol.dispose/asyncDispose, and Zig Closures (
           });
           expect(rSyncTimer.string).to.equal('HostUnavailable');
 
-          // Inside a V8 microtask continuation where V8 forbids nested PerformMicrotaskCheckpoint, returns HostUnavailable cleanly
-          const nestedMicroResult = await Promise.resolve().then(() => mod.useResourceWithTryAsyncDispose({
+          // Regression A: process.nextTick MUST NOT run inside synchronous tryAsyncDisp call!
+          const orderLog = [];
+          process.nextTick(() => orderLog.push('nextTick'));
+          orderLog.push('before');
+          expect(() => mod.tryAsyncDisp({
             async [Symbol.asyncDispose]() {
               await Promise.resolve();
             },
-          }));
-          expect(nestedMicroResult.string).to.equal('HostUnavailable');
+          })).to.throw();
+          orderLog.push('after');
+          await new Promise((resolve) => setImmediate(resolve));
+          expect(orderLog).to.deep.equal([ 'before', 'after', 'nextTick' ]);
+
+          // Regression B: unrelated Promise.reject handled later in the same tick MUST NOT trigger unhandled-rejection crash!
+          const pending = Promise.reject(new Error('handled later in same tick'));
+          expect(() => mod.tryAsyncDisp({
+            async [Symbol.asyncDispose]() {
+              await Promise.resolve();
+            },
+          })).to.throw();
+          pending.catch(() => {});
+          await new Promise((resolve) => setImmediate(resolve));
         }
       });
 
@@ -328,6 +366,27 @@ describe('JS Exception Bridging, Symbol.dispose/asyncDispose, and Zig Closures (
         };
         expect(await mod.exerciseOnceClosuresAndAbaSafety(emitter)).to.equal(62);
         expect(() => savedOnce(5)).to.throw(/already been released/);
+
+        // Pre-trampoline JS arg conversion throw on .once() both WITH closure.deinit() and WITHOUT closure.deinit()
+        let lastBadOnce = null;
+        await mod.exerciseOnceConversionErrorCleanup({
+          callBadArg(fn) {
+            lastBadOnce = fn;
+            return fn('not a number');
+          },
+        });
+        expect(() => lastBadOnce(1)).to.throw(/already been released/);
+
+        // Top-level detached .once() closure called with invalid JS arg releases handle, slot, and HeapBox
+        const detachedOnce = await mod.makeDetachedOnceClosure(33);
+        expect(Number(await mod.activeHandles())).to.equal(1);
+        expect(Number(await mod.activeCallbacks())).to.equal(1);
+        expect(Number(await mod.liveBoxAllocs())).to.equal(1);
+        expect(() => detachedOnce('not a number')).to.throw(/Cannot convert/);
+        expect(Number(await mod.activeHandles())).to.equal(0);
+        expect(Number(await mod.activeCallbacks())).to.equal(0);
+        expect(Number(await mod.liveBoxAllocs())).to.equal(0);
+        expect(() => detachedOnce(1)).to.throw(/already been released/);
       });
 
       if (target.useJSPI) {

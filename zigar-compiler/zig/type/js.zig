@@ -90,6 +90,7 @@ pub const CallbackDescriptor = extern struct {
     reserved: u32 = 0,
     trampoline_thunk: usize = 0,
     register_thunk: usize = 0,
+    cancel_thunk: usize = 0,
 };
 
 pub const Any = opaque {};
@@ -1347,6 +1348,18 @@ pub fn Js(comptime host: type) type {
             }
         };
 
+        fn cancelCallbackThunk(raw_id_ptr: *const anyopaque, _: *anyopaque) anyerror!void {
+            const callback_id: u32 = @truncate(@intFromPtr(raw_id_ptr));
+            const fn_handle = if (CallbackRegistry.resolve(callback_id)) |r| r.entry.fn_handle else module.reserved_undefined_handle;
+            if (CallbackRegistry.release(callback_id)) {
+                if (@hasDecl(host, "releaseZigCallback")) {
+                    host.releaseZigCallback(callback_id);
+                } else if (fn_handle > module.reserved_global_this_handle) {
+                    host.releaseJsValue(fn_handle);
+                }
+            }
+        }
+
         pub fn activeCallbackCount() u32 {
             return CallbackRegistry.active_count;
         }
@@ -1407,7 +1420,7 @@ pub fn Js(comptime host: type) type {
                     }
                     defer {
                         CallbackRegistry.finishCall(resolved.slot_index, entry);
-                        if (consumed_once) {
+                        if (consumed_once and !@hasDecl(host, "releaseZigCallback")) {
                             if (once_handle > module.reserved_global_this_handle) {
                                 host.releaseJsValue(once_handle);
                             }
@@ -1421,6 +1434,7 @@ pub fn Js(comptime host: type) type {
                     const target_desc = if (is_once or cb_flags.once) &descriptor_once else &descriptor;
                     if (target_desc.trampoline_thunk == 0) {
                         target_desc.trampoline_thunk = @intFromPtr(&trampolineThunk);
+                        target_desc.cancel_thunk = @intFromPtr(&cancelCallbackThunk);
                         if (!builtin.target.cpu.arch.isWasm() and @hasDecl(host, "getTypeFactoryThunk")) {
                             target_desc.register_thunk = @intFromPtr(host.getTypeFactoryThunk(Args));
                         }
@@ -1697,8 +1711,9 @@ pub fn Js(comptime host: type) type {
                     if (CallbackRegistry.release(slot_id)) {
                         if (@hasDecl(host, "releaseZigCallback")) {
                             host.releaseZigCallback(slot_id);
+                        } else {
+                            fn_ref.deinit();
                         }
-                        fn_ref.deinit();
                     }
                 }
             };
@@ -2105,8 +2120,9 @@ pub fn Js(comptime host: type) type {
                     if (CallbackRegistry.release(slot_id)) {
                         if (@hasDecl(host, "releaseZigCallback")) {
                             host.releaseZigCallback(slot_id);
+                        } else {
+                            fn_ref.deinit();
                         }
-                        fn_ref.deinit();
                     }
                 }
             };
@@ -2236,6 +2252,14 @@ pub fn Js(comptime host: type) type {
                     }
                     if (@hasDecl(host, "asyncDisposeJsValue")) {
                         host.asyncDisposeJsValue(self.handle);
+                        return;
+                    }
+                    if (@hasDecl(host, "tryAsyncDisposeJsValue")) {
+                        host.tryAsyncDisposeJsValue(self.handle) catch |err| switch (err) {
+                            error.JsException => {},
+                            error.OffJsThread => @panic("JsValue operations require the JS thread"),
+                            error.HostUnavailable => @panic("Async disposal of Promise-returning [Symbol.asyncDispose] requires an async/JSPI context"),
+                        };
                         return;
                     }
                     if (!isJsThread()) @panic("JsValue operations require the JS thread");
@@ -2556,7 +2580,9 @@ test "HostOpDescriptor ABI layout, 9 host operations, Ref helpers, and 160 state
     try expectEqual(@as(usize, 0), @offsetOf(CallbackDescriptor, "signature"));
     try expectEqual(@as(usize, 8), @offsetOf(CallbackDescriptor, "flags"));
     try expectEqual(@as(usize, 16), @offsetOf(CallbackDescriptor, "trampoline_thunk"));
-    try expectEqual(@as(usize, 16 + 2 * @sizeOf(usize)), @sizeOf(CallbackDescriptor));
+    try expectEqual(@as(usize, 16 + @sizeOf(usize)), @offsetOf(CallbackDescriptor, "register_thunk"));
+    try expectEqual(@as(usize, 16 + 2 * @sizeOf(usize)), @offsetOf(CallbackDescriptor, "cancel_thunk"));
+    try expectEqual(@as(usize, 16 + 3 * @sizeOf(usize)), @sizeOf(CallbackDescriptor));
 
     const DispatchMockHost = struct {
         var active_handles: u32 = 0;
@@ -2661,6 +2687,7 @@ test "HostOpDescriptor ABI layout, 9 host operations, Ref helpers, and 160 state
 
         pub fn releaseZigCallback(_: u32) void {
             active_callbacks -= 1;
+            active_handles -= 1;
         }
     };
 
@@ -2924,6 +2951,7 @@ test "JsException lazy capture, Module exact Error!T preservation, Ref dispose/a
         var next_slot: u32 = 16;
         var active_callbacks: u32 = 0;
         var stored_trampoline: usize = 0;
+        var stored_cancel_thunk: usize = 0;
         var last_cb_flags: u32 = 0;
 
         var has_captured_err: bool = false;
@@ -3083,6 +3111,7 @@ test "JsException lazy capture, Module exact Error!T preservation, Ref dispose/a
         pub fn createZigCallback(desc_ptr: *const anyopaque, _: u32) Error!u32 {
             const desc: *const CallbackDescriptor = @ptrCast(@alignCast(desc_ptr));
             stored_trampoline = desc.trampoline_thunk;
+            stored_cancel_thunk = desc.cancel_thunk;
             last_cb_flags = desc.flags;
             active_callbacks += 1;
             return allocTagged(40);
@@ -3090,7 +3119,9 @@ test "JsException lazy capture, Module exact Error!T preservation, Ref dispose/a
 
         pub fn releaseZigCallback(_: u32) void {
             std.debug.assert(active_callbacks > 0);
+            std.debug.assert(active_handles > 0);
             active_callbacks -= 1;
+            active_handles -= 1;
         }
     };
 
@@ -3281,5 +3312,35 @@ test "JsException lazy capture, Module exact Error!T preservation, Ref dispose/a
         cl_owned_unfired.deinit();
         try expectEqual(@as(u32, 0), js.activeCallbackCount());
         try expectEqual(@as(u32, 0), js.activeHandleCount());
+    }
+
+    // Form D: Pre-trampoline JS arg conversion throw cancel via `cancel_thunk` both WITH and WITHOUT `deinit()`
+    {
+        var empty_byte: u8 = 0;
+        const cl_cancelled_with_deinit = try js.Closure(Counter, Counter.add).tryOnce(
+            std.testing.allocator,
+            .{ .total = 300 },
+        );
+        defer cl_cancelled_with_deinit.deinit();
+        const cancel_fn: TrampolineThunk = @ptrFromInt(LifecycleMockHost.stored_cancel_thunk);
+        try cancel_fn(@ptrFromInt(cl_cancelled_with_deinit.id), @ptrCast(&empty_byte));
+        try expect(!cl_cancelled_with_deinit.isActive());
+        try expectEqual(@as(u32, 0), js.activeCallbackCount());
+        try expectEqual(@as(u32, 0), js.activeHandleCount());
+        try expectEqual(@as(u32, 0), LifecycleMockHost.active_callbacks);
+    }
+    {
+        var empty_byte: u8 = 0;
+        const cl_cancelled_without_deinit = try js.Closure(Counter, Counter.add).tryOnce(
+            std.testing.allocator,
+            .{ .total = 400 },
+        );
+        const cancel_fn: TrampolineThunk = @ptrFromInt(LifecycleMockHost.stored_cancel_thunk);
+        try cancel_fn(@ptrFromInt(cl_cancelled_without_deinit.id), @ptrCast(&empty_byte));
+        // `std.testing.allocator` verifies HeapBox was freed even though `.deinit()` is never called!
+        try expect(!cl_cancelled_without_deinit.isActive());
+        try expectEqual(@as(u32, 0), js.activeCallbackCount());
+        try expectEqual(@as(u32, 0), js.activeHandleCount());
+        try expectEqual(@as(u32, 0), LifecycleMockHost.active_callbacks);
     }
 }

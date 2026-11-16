@@ -3,7 +3,7 @@ import {
   VisitorFlag,
 } from '../constants.js';
 import { mixin } from '../environment.js';
-import { Deadlock, isErrorJSON, NotInErrorSet } from '../errors.js';
+import { isErrorJSON, NotInErrorSet } from '../errors.js';
 import {
   ALLOCATOR, CLASS, FALLBACK, MEMORY, RESTORE, RETURN, SLOTS, THROWING, VISIT, VIVIFICATE, ZIG,
 } from '../symbols.js';
@@ -142,7 +142,6 @@ export default mixin({
       }
       const asyncSym = getAsyncDisposeSymbol();
       let method = asyncSym !== undefined ? target[asyncSym] : undefined;
-      let usedSyncFallback = false;
       if (method === undefined || method === null) {
         const syncSym = getDisposeSymbol();
         method = syncSym !== undefined ? target[syncSym] : undefined;
@@ -152,42 +151,30 @@ export default mixin({
         if (typeof(method) !== 'function') {
           throw createNotCallableError('[Symbol.dispose] is not a function');
         }
-        usedSyncFallback = true;
       } else if (typeof(method) !== 'function') {
         throw createNotCallableError('[Symbol.asyncDispose] is not a function');
       }
       const rawResult = Reflect.apply(method, target, []);
-      if (usedSyncFallback || !isThenable(rawResult)) {
-        return 0;
-      }
-      const promise = isPromise(rawResult) ? rawResult : Promise.resolve(rawResult);
-      const state = { settled: false, ok: false, err: undefined };
-      const tracked = promise.then(
-        () => {
-          state.settled = true;
-          state.ok = true;
-        },
-        (err) => {
-          state.settled = true;
-          state.ok = false;
-          state.err = err;
-        },
-      );
-      for (let i = 0; i < 16 && !state.settled; i++) {
-        drainMicrotasksSync();
-      }
-      if (state.settled) {
-        if (state.ok) {
-          return 0;
-        }
-        if (shouldCatch) {
-          this.recordCapturedError(state.err);
-          return 1;
-        }
-        this.recordPendingHostError(state.err);
+      const then = (rawResult !== null && (typeof(rawResult) === 'object' || typeof(rawResult) === 'function'))
+        ? rawResult.then
+        : undefined;
+      if (typeof(then) !== 'function') {
         return 0;
       }
       if (allowSuspend && this.useJSPI && this.activeContinuation) {
+        const state = { ok: false, err: undefined };
+        const promise = isPromise(rawResult)
+          ? rawResult
+          : new Promise((resolve, reject) => Reflect.apply(then, rawResult, [ resolve, reject ]));
+        const tracked = promise.then(
+          () => {
+            state.ok = true;
+          },
+          (err) => {
+            state.ok = false;
+            state.err = err;
+          },
+        );
         const ticket = this.nextAsyncDisposalTicket;
         this.nextAsyncDisposalTicket = (ticket >= 0x1FFFFFFF) ? 1 : ticket + 1;
         this.pendingAsyncDisposals.set(ticket, {
@@ -200,11 +187,12 @@ export default mixin({
         deferredRelease = true;
         return ((ticket << 2) | 3) >>> 0;
       }
-      if (shouldCatch) {
-        return 2;
+      if (isPromise(rawResult)) {
+        rawResult.then(undefined, noop);
+      } else {
+        new Promise((resolve, reject) => Reflect.apply(then, rawResult, [ resolve, reject ])).then(undefined, noop);
       }
-      this.recordPendingHostError(new Deadlock());
-      return 0;
+      return 2;
     } catch (err) {
       if (shouldCatch) {
         this.recordCapturedError(err);
@@ -924,13 +912,14 @@ export default mixin({
     }
     const is64 = Boolean(this.memory64 || process.env.BITS == 64);
     const ptrSize = is64 ? 8 : 4;
-    const descSize = 16 + 2 * ptrSize;
+    const descSize = 16 + 3 * ptrSize;
     const dv = this.obtainZigView(descriptorAddr, descSize, false);
     const le = this.littleEndian;
     const signature = dv.getBigUint64(0, le);
     const flags = dv.getUint32(8, le);
     const trampolineThunk = readUsize(dv, 16, ptrSize, le, is64);
     const registerThunk = readUsize(dv, 16 + ptrSize, ptrSize, le, is64);
+    const cancelThunk = readUsize(dv, 16 + 2 * ptrSize, ptrSize, le, is64);
 
     const argStructStructure = this.resolveArgStructBySignature(signature, registerThunk);
     const ArgStruct = argStructStructure.constructor;
@@ -943,6 +932,7 @@ export default mixin({
     template = {
       ArgStruct,
       thunkHolder,
+      cancelThunk,
       unwrapString,
       is64,
       sync: !(flags & 1),
@@ -951,6 +941,25 @@ export default mixin({
     this.zigCallbackTemplateCache.set(descriptorAddr, template);
     return template;
   },
+  cancelZigCallbackSlot(cancelThunk, slotAddr, zeroAddr) {
+    if (!cancelThunk) {
+      return;
+    }
+    if (process.env.TARGET === 'wasm') {
+      const runner = this.runThunkSync ?? this.runThunk;
+      if (runner) {
+        const prevContinuation = this.activeContinuation;
+        this.activeContinuation = null;
+        try {
+          runner(cancelThunk, slotAddr, zeroAddr);
+        } finally {
+          this.activeContinuation = prevContinuation;
+        }
+      }
+    } else {
+      this.runThunk?.(cancelThunk, slotAddr, zeroAddr);
+    }
+  },
   createZigCallback(descriptorAddr, callbackId) {
     const savedPending = this.savePendingHostError();
     try {
@@ -958,10 +967,12 @@ export default mixin({
       const template = this.getZigCallbackTemplate(descriptorAddr);
       const caller = this.createOutboundCaller(template.thunkHolder, template.ArgStruct);
       caller.zigarSync = template.sync;
+      const slotAddr = template.is64 ? BigInt(id) : id;
+      const zeroAddr = template.is64 ? 0n : 0;
       const slotDV = new DataView(new ArrayBuffer(0));
-      slotDV[ZIG] = { address: template.is64 ? BigInt(id) : id, len: 0 };
+      slotDV[ZIG] = { address: slotAddr, len: 0 };
       caller[MEMORY] = slotDV;
-      const state = { id, released: false, handle: 0 };
+      const state = { id, released: false, handle: 0, handleReleased: false };
       const unwrapString = template.unwrapString;
       const isOnce = template.once;
       const unwrapResult = (res) => {
@@ -976,13 +987,18 @@ export default mixin({
         }
         return res;
       };
+      const finishOnceCleanup = () => {
+        if (this.zigCallbackMap.get(id) === state) {
+          this.cancelZigCallbackSlot(template.cancelThunk, slotAddr, zeroAddr);
+          this.releaseZigCallback(id);
+        }
+      };
       const wrapper = (...args) => {
         if (state.released) {
           throw new Error('Zig callback has already been released');
         }
         if (isOnce) {
           state.released = true;
-          this.zigCallbackMap.delete(id);
         }
         let asyncResult = false;
         try {
@@ -997,14 +1013,14 @@ export default mixin({
               (resolved) => unwrapResult(resolved),
             ).finally(() => {
               if (isOnce) {
-                this.releaseJsValueIfValid(state.handle);
+                finishOnceCleanup();
               }
             });
           }
           return unwrapResult(res);
         } finally {
           if (isOnce && !asyncResult) {
-            this.releaseJsValueIfValid(state.handle);
+            finishOnceCleanup();
           }
         }
       };
@@ -1027,6 +1043,10 @@ export default mixin({
     if (state) {
       state.released = true;
       this.zigCallbackMap.delete(id);
+      if (!state.handleReleased) {
+        state.handleReleased = true;
+        this.releaseJsValueIfValid(state.handle);
+      }
     }
   },
   getActiveZigCallbackCount() {
@@ -1102,25 +1122,7 @@ function getAsyncDisposeSymbol() {
   return Symbol.asyncDispose ?? Symbol.for('nodejs.asyncDispose');
 }
 
-function isThenable(val) {
-  return val !== null && (typeof(val) === 'object' || typeof(val) === 'function') && typeof(val.then) === 'function';
-}
-
-const noopMicrotaskTick = () => {};
-
-function drainMicrotasksSync() {
-  try {
-    const proc = globalThis.process;
-    if (globalThis.Bun) {
-      proc?.getBuiltinModule?.('bun:jsc')?.drainMicrotasks?.();
-    } else if (typeof(proc?._tickCallback) === 'function') {
-      if (typeof(proc.nextTick) === 'function') {
-        proc.nextTick(noopMicrotaskTick);
-      }
-      proc._tickCallback();
-    }
-  } catch {}
-}
+const noop = () => {};
 
 function hasDefaultFallbackTarget(val) {
   return val !== null && (typeof(val) === 'object' || typeof(val) === 'function');

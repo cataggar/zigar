@@ -321,6 +321,8 @@ pub fn asyncDisposeJsValue(handle: u32) void {
     const code = _beginAsyncDisposeJsValue(handle, false);
     if ((code & 3) == 3) {
         _ = _awaitAsyncDisposeJsValue(code >> 2);
+    } else if ((code & 3) == 2) {
+        @panic("Async disposal of Promise-returning [Symbol.asyncDispose] requires an async/JSPI context");
     }
 }
 

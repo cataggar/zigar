@@ -41,45 +41,46 @@ pub fn WorkQueue(ns: type) type {
 
 var gpa = std.heap.DebugAllocator(.{}).init;
 const allocator = gpa.allocator();
+const fallback = struct {
+    fn cloneJsValue(_: *Module.Host, _: u32, _: *u32) callconv(.c) E {
+        return .NOSYS;
+    }
+    fn releaseJsValue(_: *Module.Host, _: u32) callconv(.c) E {
+        return .NOSYS;
+    }
+    fn typeofJsValue(_: *Module.Host, _: u32, _: *u8) callconv(.c) E {
+        return .NOSYS;
+    }
+    fn instanceofJsValue(_: *Module.Host, _: u32, _: u32, _: *bool) callconv(.c) E {
+        return .NOSYS;
+    }
+    fn equalJsValue(_: *Module.Host, _: u32, _: u32, _: *bool) callconv(.c) E {
+        return .NOSYS;
+    }
+    fn getJsValueCount(_: *Module.Host, _: *u32) callconv(.c) E {
+        return .NOSYS;
+    }
+    fn invokeJsHostOp(_: *Module.Host, _: usize, _: usize, _: usize) callconv(.c) E {
+        return .NOSYS;
+    }
+    fn createZigCallback(_: *Module.Host, _: usize, _: u32, _: *u32) callconv(.c) E {
+        return .NOSYS;
+    }
+    fn releaseZigCallback(_: *Module.Host, _: u32) callconv(.c) E {
+        return .NOSYS;
+    }
+    fn controlLastJsError(_: *Module.Host, _: u32, _: *u32) callconv(.c) E {
+        return .NOSYS;
+    }
+    fn disposeJsValue(_: *Module.Host, _: u32, _: bool) callconv(.c) E {
+        return .NOSYS;
+    }
+    fn asyncDisposeJsValue(_: *Module.Host, _: u32, _: bool) callconv(.c) E {
+        return .NOSYS;
+    }
+};
+
 var imports: Module.Imports = init: {
-    const fallback = struct {
-        fn cloneJsValue(_: *Module.Host, _: u32, _: *u32) callconv(.c) E {
-            return .NOSYS;
-        }
-        fn releaseJsValue(_: *Module.Host, _: u32) callconv(.c) E {
-            return .NOSYS;
-        }
-        fn typeofJsValue(_: *Module.Host, _: u32, _: *u8) callconv(.c) E {
-            return .NOSYS;
-        }
-        fn instanceofJsValue(_: *Module.Host, _: u32, _: u32, _: *bool) callconv(.c) E {
-            return .NOSYS;
-        }
-        fn equalJsValue(_: *Module.Host, _: u32, _: u32, _: *bool) callconv(.c) E {
-            return .NOSYS;
-        }
-        fn getJsValueCount(_: *Module.Host, _: *u32) callconv(.c) E {
-            return .NOSYS;
-        }
-        fn invokeJsHostOp(_: *Module.Host, _: usize, _: usize, _: usize) callconv(.c) E {
-            return .NOSYS;
-        }
-        fn createZigCallback(_: *Module.Host, _: usize, _: u32, _: *u32) callconv(.c) E {
-            return .NOSYS;
-        }
-        fn releaseZigCallback(_: *Module.Host, _: u32) callconv(.c) E {
-            return .NOSYS;
-        }
-        fn controlLastJsError(_: *Module.Host, _: u32, _: *u32) callconv(.c) E {
-            return .NOSYS;
-        }
-        fn disposeJsValue(_: *Module.Host, _: u32, _: bool) callconv(.c) E {
-            return .NOSYS;
-        }
-        fn asyncDisposeJsValue(_: *Module.Host, _: u32, _: bool) callconv(.c) E {
-            return .NOSYS;
-        }
-    };
     var imp: Module.Imports = undefined;
     imp.clone_js_value = fallback.cloneJsValue;
     imp.release_js_value = fallback.releaseJsValue;
@@ -611,10 +612,13 @@ pub fn tryAsyncDisposeJsValue(handle: u32) js.Error!void {
 
 pub fn asyncDisposeJsValue(handle: u32) void {
     if (!initialized) @panic("JsValue operations require the JS thread");
+    if (imports.async_dispose_js_value == &fallback.asyncDisposeJsValue) {
+        @panic("JsValue host imports unavailable");
+    }
     mapJsValueStatus(imports.async_dispose_js_value(instance, handle, false)) catch |err| switch (err) {
         error.JsException => {},
         error.OffJsThread => @panic("JsValue operations require the JS thread"),
-        error.HostUnavailable => @panic("JsValue host imports unavailable"),
+        error.HostUnavailable => @panic("Async disposal of Promise-returning [Symbol.asyncDispose] requires an async/JSPI context"),
     };
 }
 

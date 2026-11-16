@@ -58,7 +58,7 @@ describe('Native JS Exception Bridging, Symbol.dispose/asyncDispose, and Zig Clo
     expect(undefSummary).to.equal('type=undefined|name=<null>|code=<null>|msg=<null>|stack=no');
   });
 
-  it('should support Symbol.dispose and Symbol.asyncDispose on native N-API with zero handle leaks', function() {
+  it('should support Symbol.dispose and Symbol.asyncDispose on native N-API with zero handle leaks and intact run-to-completion', async function() {
     const log = [];
     mod.resetSyncDisposeDeferRuns();
 
@@ -89,15 +89,13 @@ describe('Native JS Exception Bridging, Symbol.dispose/asyncDispose, and Zig Clo
     })).to.throw('native defer dispose boom');
     expect(mod.getSyncDisposeDeferRuns()).to.equal(1);
 
-    // Symbol.asyncDispose: microtask settlement, [Symbol.dispose] fallback, rejection capture, and non-deadlocking timer fallback
+    // Symbol.asyncDispose: synchronous non-Promise [Symbol.asyncDispose](), [Symbol.dispose]() fallback, and sync throw
     expect(mod.useResourceWithTryAsyncDispose({
-      async [Symbol.asyncDispose]() {
-        await Promise.resolve();
-        await Promise.resolve();
-        log.push('native-async-ok');
+      [Symbol.asyncDispose]() {
+        log.push('native-sync-async-ok');
       },
     }).string).to.equal('ok');
-    expect(log).to.include('native-async-ok');
+    expect(log).to.include('native-sync-async-ok');
 
     expect(mod.useResourceWithTryAsyncDispose({
       [Symbol.dispose]() {
@@ -107,26 +105,70 @@ describe('Native JS Exception Bridging, Symbol.dispose/asyncDispose, and Zig Clo
     expect(log).to.include('native-async-fallback');
 
     expect(mod.useResourceWithDeferAsyncDispose({
-      async [Symbol.asyncDispose]() {
-        await Promise.resolve();
-        log.push('native-defer-async');
+      [Symbol.asyncDispose]() {
+        log.push('native-defer-sync-async');
       },
     })).to.equal(77);
-    expect(log).to.include('native-defer-async');
+    expect(log).to.include('native-defer-sync-async');
 
-    const caughtAsync = mod.useResourceWithTryAsyncDispose({
-      async [Symbol.asyncDispose]() {
-        await Promise.resolve();
-        throw Object.assign(new Error('native async reject'), { code: 'EPIPE' });
+    expect(mod.useResourceWithDeferAsyncDispose({
+      [Symbol.dispose]() {
+        log.push('native-defer-fallback');
+      },
+    })).to.equal(77);
+    expect(log).to.include('native-defer-fallback');
+
+    const caughtSyncAsync = mod.useResourceWithTryAsyncDispose({
+      [Symbol.asyncDispose]() {
+        throw Object.assign(new Error('native sync asyncDispose throw'), { code: 'EPIPE' });
       },
     }).string;
-    expect(caughtAsync).to.equal('type=object|name=Error|code=EPIPE|msg=native async reject|stack=yes');
+    expect(caughtSyncAsync).to.equal('type=object|name=Error|code=EPIPE|msg=native sync asyncDispose throw|stack=yes');
+
+    // Promise-returning [Symbol.asyncDispose]() (both resolving and rejecting) on a sync native stack
+    // releases handle, returns HostUnavailable, and NEVER causes UnhandledPromiseRejection
+    expect(mod.useResourceWithTryAsyncDispose({
+      async [Symbol.asyncDispose]() {
+        await Promise.resolve();
+      },
+    }).string).to.equal('HostUnavailable');
+    expect(Number(mod.activeHandles())).to.equal(0);
+
+    expect(mod.useResourceWithTryAsyncDispose({
+      [Symbol.asyncDispose]() {
+        return Promise.reject(new Error('native rejected asyncDispose'));
+      },
+    }).string).to.equal('HostUnavailable');
+    expect(Number(mod.activeHandles())).to.equal(0);
 
     expect(mod.useResourceWithTryAsyncDispose({
       [Symbol.asyncDispose]() {
         return new Promise((resolve) => setTimeout(resolve, 10));
       },
     }).string).to.equal('HostUnavailable');
+
+    // Regression A: process.nextTick MUST NOT run inside synchronous tryAsyncDisp call!
+    const orderLog = [];
+    process.nextTick(() => orderLog.push('nextTick'));
+    orderLog.push('before');
+    expect(() => mod.tryAsyncDisp({
+      async [Symbol.asyncDispose]() {
+        await Promise.resolve();
+      },
+    })).to.throw();
+    orderLog.push('after');
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(orderLog).to.deep.equal([ 'before', 'after', 'nextTick' ]);
+
+    // Regression B: unrelated Promise.reject handled later in the same tick MUST NOT trigger unhandled-rejection crash!
+    const pending = Promise.reject(new Error('handled later in same tick'));
+    expect(() => mod.tryAsyncDisp({
+      async [Symbol.asyncDispose]() {
+        await Promise.resolve();
+      },
+    })).to.throw();
+    pending.catch(() => {});
+    await new Promise((resolve) => setImmediate(resolve));
   });
 
   it('should support stateful Closure, owned HeapBox, re-entrant .deinit(), and .once() with ABA-safe cleanup', function() {
@@ -149,5 +191,26 @@ describe('Native JS Exception Bridging, Symbol.dispose/asyncDispose, and Zig Clo
     };
     expect(mod.exerciseOnceClosuresAndAbaSafety(emitter)).to.equal(62);
     expect(() => savedOnce(5)).to.throw(/already been released/);
+
+    // Pre-trampoline JS arg conversion throw on .once() both WITH closure.deinit() and WITHOUT closure.deinit()
+    let lastBadOnce = null;
+    mod.exerciseOnceConversionErrorCleanup({
+      callBadArg(fn) {
+        lastBadOnce = fn;
+        return fn('not a number');
+      },
+    });
+    expect(() => lastBadOnce(1)).to.throw(/already been released/);
+
+    // Top-level detached .once() closure called with invalid JS arg releases handle, slot, and HeapBox
+    const detachedOnce = mod.makeDetachedOnceClosure(33);
+    expect(Number(mod.activeHandles())).to.equal(1);
+    expect(Number(mod.activeCallbacks())).to.equal(1);
+    expect(Number(mod.liveBoxAllocs())).to.equal(1);
+    expect(() => detachedOnce('not a number')).to.throw(/Cannot convert/);
+    expect(Number(mod.activeHandles())).to.equal(0);
+    expect(Number(mod.activeCallbacks())).to.equal(0);
+    expect(Number(mod.liveBoxAllocs())).to.equal(0);
+    expect(() => detachedOnce(1)).to.throw(/already been released/);
   });
 });
