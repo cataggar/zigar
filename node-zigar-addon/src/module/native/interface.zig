@@ -30,7 +30,8 @@ pub fn Module(comptime Value: type) type {
             debug: bool,
             persistent: bool,
             js_value: bool = false,
-            _: u25 = 0,
+            js_host_op: bool = false,
+            _: u24 = 0,
         };
         pub const Imports = extern struct { // vtable that's filled by the addon
             create_bool: *const fn (*Host, bool, *Value) callconv(.c) E,
@@ -67,6 +68,9 @@ pub fn Module(comptime Value: type) type {
             instanceof_js_value: *const fn (*Host, u32, u32, *bool) callconv(.c) E,
             equal_js_value: *const fn (*Host, u32, u32, *bool) callconv(.c) E,
             get_js_value_count: *const fn (*Host, *u32) callconv(.c) E,
+            invoke_js_host_op: *const fn (*Host, usize, usize, usize) callconv(.c) E,
+            create_zig_callback: *const fn (*Host, usize, u32, *u32) callconv(.c) E,
+            release_zig_callback: *const fn (*Host, u32) callconv(.c) E,
         };
         pub const Exports = extern struct { // vtable that's used by the addon
             set_host_instance: *const fn (*Host) callconv(.c) E,

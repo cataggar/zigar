@@ -171,7 +171,7 @@ var callMarshalingOutbound = mixin({
     const syncRunner = this[`${runnerName}Sync`] ;
     let useSyncRunner = false;
     if (syncRunner) {
-      if (this.comptime) {
+      if (this.comptime || fn.zigarSync || this.syncCallDepth > 0) {
         useSyncRunner = true;
       } else if (this.useJSPI && this.jspiMode !== 'all' && !this.customWASI) {
         const fnSlot = Number(fnAddress);

@@ -61,6 +61,15 @@ var imports: Module.Imports = init: {
         fn getJsValueCount(_: *Module.Host, _: *u32) callconv(.c) E {
             return .NOSYS;
         }
+        fn invokeJsHostOp(_: *Module.Host, _: usize, _: usize, _: usize) callconv(.c) E {
+            return .NOSYS;
+        }
+        fn createZigCallback(_: *Module.Host, _: usize, _: u32, _: *u32) callconv(.c) E {
+            return .NOSYS;
+        }
+        fn releaseZigCallback(_: *Module.Host, _: u32) callconv(.c) E {
+            return .NOSYS;
+        }
     };
     var imp: Module.Imports = undefined;
     imp.clone_js_value = fallback.cloneJsValue;
@@ -69,6 +78,9 @@ var imports: Module.Imports = init: {
     imp.instanceof_js_value = fallback.instanceofJsValue;
     imp.equal_js_value = fallback.equalJsValue;
     imp.get_js_value_count = fallback.getJsValueCount;
+    imp.invoke_js_host_op = fallback.invokeJsHostOp;
+    imp.create_zig_callback = fallback.createZigCallback;
+    imp.release_zig_callback = fallback.releaseZigCallback;
     break :init imp;
 };
 
@@ -521,6 +533,36 @@ pub fn getJsValueCount() u32 {
     };
 }
 
+pub fn getTypeFactoryThunk(comptime T: type) zig_fn.Thunk {
+    return exporter.getTypeFactoryThunk(@This(), T);
+}
+
+pub fn registerType(comptime T: type) void {
+    exporter.registerType(@This(), T);
+}
+
+pub fn invokeJsHostOp(descriptor_ptr: *const anyopaque, arg_ptr: *anyopaque, arg_size: usize) E {
+    if (!initialized) return .PERM;
+    return imports.invoke_js_host_op(instance, @intFromPtr(descriptor_ptr), @intFromPtr(arg_ptr), arg_size);
+}
+
+pub fn createZigCallback(descriptor_ptr: *const anyopaque, callback_id: u32) js.Error!u32 {
+    if (!initialized) return error.OffJsThread;
+    var handle: u32 = 0;
+    try mapJsValueStatus(imports.create_zig_callback(instance, @intFromPtr(descriptor_ptr), callback_id, &handle));
+    if (handle == 0) return error.JsException;
+    return handle;
+}
+
+pub fn releaseZigCallback(callback_id: u32) void {
+    if (!initialized) @panic("JsValue operations require the JS thread");
+    mapJsValueStatus(imports.release_zig_callback(instance, callback_id)) catch |err| switch (err) {
+        error.JsException => {},
+        error.OffJsThread => @panic("JsValue operations require the JS thread"),
+        error.HostUnavailable => @panic("JsValue host imports unavailable"),
+    };
+}
+
 pub fn isRedirecting(comptime literal: @TypeOf(.enum_literal)) bool {
     if (!exporter.options.use_redirection) unreachable;
     if (redirection_suppressed) return false;
@@ -557,6 +599,7 @@ pub fn createModule(comptime module_ns: type) Module {
             .debug = builtin.mode == .debug,
             .persistent = exporter.options.persistent,
             .js_value = true,
+            .js_host_op = true,
         },
         .module_path = switch (builtin.mode) {
             .debug => exporter.options.module_path.ptr,

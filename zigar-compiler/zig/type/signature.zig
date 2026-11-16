@@ -4,6 +4,7 @@ const expectEqual = std.testing.expectEqual;
 const util = @import("util.zig");
 
 pub fn get(comptime T: type) u64 {
+    @setEvalBranchQuota(2_000_000);
     return calculate(T, .{});
 }
 

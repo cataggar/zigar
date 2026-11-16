@@ -111,8 +111,15 @@ var argStruct = mixin({
     return constructor;
   },
   finalizeArgStruct(structure, staticDescriptors) {
-    const { flags } = structure;
+    const { flags, signature } = structure;
     staticDescriptors[THROWING] = defineValue(!!(flags & ArgStructFlag.IsThrowing));
+    if (signature !== undefined) {
+      let map = this.argStructSignatureMap;
+      if (!map) {
+        map = this.argStructSignatureMap = new Map();
+      }
+      map.set(signature, structure);
+    }
   },
   updateArgStructMembers(structure, memberFlags) {
     const {

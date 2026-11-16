@@ -1269,6 +1269,23 @@ pub fn getFactoryThunk(comptime host: type, comptime module: type) zig_fn.Thunk 
     return ns.exportStructures;
 }
 
+pub fn getTypeFactoryThunk(comptime host: type, comptime T: type) zig_fn.Thunk {
+    const ns = struct {
+        fn exportType(_: *const anyopaque, _: *anyopaque) anyerror!void {
+            @setEvalBranchQuota(options.eval_branch_quota);
+            const factory: Factory(host, opaque {}) = .{};
+            _ = try factory.getStructure(T);
+        }
+    };
+    return ns.exportType;
+}
+
+pub fn registerType(comptime host: type, comptime T: type) void {
+    @setEvalBranchQuota(options.eval_branch_quota);
+    const factory: Factory(host, opaque {}) = .{};
+    _ = factory.getStructure(T) catch {};
+}
+
 fn removeComptimeValues(comptime value: anytype) ComptimeFree(@TypeOf(value)) {
     const T = @TypeOf(value);
     const RT = ComptimeFree(T);

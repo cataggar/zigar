@@ -41,6 +41,8 @@ export function stripUnused(binary, options = {}) {
     /^getFactoryThunk$/,
     /^getModuleAttributes$/,
     /^export(?:er)?\.getFactoryThunk/,
+    /^__zigar_js_reg_/,
+    /\.registerTypeExport$/,
   ];
 
   function getSection(type) {
@@ -128,6 +130,14 @@ export function stripUnused(binary, options = {}) {
   }
 
   // mark blacklisted functions as unused
+  const exportSectionForBlacklist = getSection(SectionType.Export);
+  if (exportSectionForBlacklist) {
+    for (const object of exportSectionForBlacklist.exports) {
+      if (object.type === ObjectType.Function && blacklist.some(re => re.test(object.name))) {
+        functions[object.index].using = false;
+      }
+    }
+  }
   for (const fn of functions) {
     if (fn.name && blacklist.some(re => re.test(fn.name))) {
       fn.using = false;

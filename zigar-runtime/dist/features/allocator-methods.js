@@ -2,10 +2,11 @@ import { StructureType } from '../constants.js';
 import { mixin } from '../environment.js';
 import { TypeMismatch, PreviouslyFreed } from '../errors.js';
 import { ZIG, MEMORY, TYPE, ALIGN } from '../symbols.js';
-import { copyView, isInvalidUsize, encodeText } from '../utils.js';
+import { copyView, isInvalidUsize, defineProperty, encodeText } from '../utils.js';
 
 var allocatorMethods = mixin({
   defineAlloc() {
+    const thisEnv = this;
     return {
       value(len, align = 1) {
         const lz = Math.clz32(align);        
@@ -18,11 +19,22 @@ var allocatorMethods = mixin({
         if (!slicePtr) {
           throw new Error('Out of memory');
         }
-        // alloc returns a [*]u8, which has a initial length of 1
-        slicePtr.length = len;
-        const dv = slicePtr['*'][MEMORY];
-        // attach alignment so we can find it again
-        dv[ZIG].align = align;
+        let dv;
+        if (slicePtr instanceof DataView) {
+          dv = slicePtr;
+        } else {
+          // alloc returns a [*]u8, which has a initial length of 1
+          slicePtr.length = len;
+          dv = slicePtr['*'][MEMORY];
+        }
+        if (!dv[ZIG]) {
+          // Re-attach the one-shot JS-backed Zig tag consumed by vtable.alloc's return pointer
+          const address = thisEnv.getViewAddress(dv);
+          defineProperty(dv, ZIG, { value: { address, len, align, js: true }, writable: true, configurable: true, enumerable: false });
+        } else {
+          // attach alignment so we can find it again
+          dv[ZIG].align = align;
+        }
         return dv;
       }
     };

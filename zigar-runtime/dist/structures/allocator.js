@@ -74,7 +74,7 @@ var allocator = mixin({
     }
   },
   freeHostMemory(ptr, buf, ptrAlign) {
-    const dv = buf['*'][MEMORY];
+    const dv = (buf instanceof DataView) ? buf : buf['*'][MEMORY];
     const address = this.getViewAddress(dv);
     const len = dv.byteLength;
     const entry = this.unregisterMemory(address, len);

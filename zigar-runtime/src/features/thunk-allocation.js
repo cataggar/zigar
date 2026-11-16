@@ -27,11 +27,7 @@ export default mixin({
       const imports = { env, wasi, wasi_snapshot_preview1: wasiPreview };
       for (const { module, name, kind } of w.Module.imports(this.executable)) {
         if (kind === 'function') {
-          if (module === 'env') {
-            env[name] = empty;
-          } else if (module === 'wasi_snapshot_preview1') {
-            wasiPreview[name] = empty;
-          }
+          (imports[module] ??= {})[name] = empty;
         }
       }
       const initialPages = memoryInitial ?? (this.memory.buffer.byteLength / 65536);
@@ -76,7 +72,9 @@ export default mixin({
       let source, sourceAddress = 0;
       for (source of this.thunkSources) {
         sourceAddress = source.createJsThunk(controllerAddress, funcId);
-        break;
+        if (sourceAddress) {
+          break;
+        }
       }
       if (!sourceAddress) {
         source = this.addJsThunkSource();

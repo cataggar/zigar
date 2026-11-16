@@ -1,0 +1,295 @@
+import { expect } from 'chai';
+import { mkdir, writeFile } from 'fs/promises';
+import os from 'os';
+import { join, resolve } from 'path';
+import { fileURLToPath, pathToFileURL } from 'url';
+import { transpile } from '../src/transpilation.js';
+
+const testDir = fileURLToPath(new URL('.', import.meta.url));
+const compilerRoot = resolve(testDir, '..');
+const runtimeDistUrl = pathToFileURL(resolve(compilerRoot, '../zigar-runtime/dist') + '/').href;
+
+let moduleCounter = 0;
+
+async function compileAndImport(zigPath, options = {}) {
+  const {
+    memory64 = false,
+    useJSPI = false,
+    useWazig = true,
+    stripWASM = true,
+    optimize = 'ReleaseSmall',
+    exposeEnv = false,
+  } = options;
+  const result = await transpile(zigPath, {
+    nodeCompat: false,
+    embedWASM: true,
+    topLevelAwait: true,
+    stripWASM,
+    optimize,
+    memory64,
+    useJSPI,
+    useWazig,
+  });
+  const tmpBase = process.env.TMPDIR || os.tmpdir();
+  const outDir = join(tmpBase, 'zigar-jshostop-test');
+  await mkdir(outDir, { recursive: true });
+  const mjsPath = join(
+    outDir,
+    `jshostop-${memory64 ? 'wasm64' : 'wasm32'}-${useWazig ? 'wazig' : 'legacy'}-${useJSPI ? 'jspi' : 'sync'}-${++moduleCounter}.mjs`,
+  );
+  let runnableCode = result.code
+    .replace(/from\s+(['"])zigar-runtime\1/g, `from "${runtimeDistUrl}index.js"`)
+    .replace(/from\s+(['"])zigar-runtime\/([^'"]+)\1/g, `from "${runtimeDistUrl}$2"`)
+    .replace(/import\s+(['"])zigar-runtime\/([^'"]+)\1/g, `import "${runtimeDistUrl}$2"`);
+  if (exposeEnv) {
+    runnableCode += '\nexport { env as __debugEnv };\n';
+  }
+  await writeFile(mjsPath, runnableCode, 'utf-8');
+  const mod = await import(pathToFileURL(mjsPath).href);
+  return { mod, result };
+}
+
+class StatefulCounter {
+  constructor(initial) {
+    this.count = initial;
+  }
+  increment(delta) {
+    if (!(this instanceof StatefulCounter)) {
+      throw new TypeError('method lost `this` binding');
+    }
+    this.count += delta;
+    return this.count;
+  }
+  describe(tag) {
+    if (!(this instanceof StatefulCounter)) {
+      throw new TypeError('method lost `this` binding');
+    }
+    return `counter(${tag})=${this.count}`;
+  }
+}
+
+class PayloadBox {
+  constructor(payload) {
+    this.computed = Number(payload.tag) + Number(payload.value);
+  }
+}
+
+describe('Table-Driven JS Host-Op Dispatcher & Dynamic Zig Callbacks (WASM32 / WASM64 / JSPI)', function() {
+  this.timeout(300000);
+
+  const samplePath = resolve(testDir, './zig-samples/js-value/host-ops.zig');
+  const plainZigPath = resolve(testDir, './zig-samples/basic/integers.zig');
+
+  it('should tree-shake js-host-op.js completely when a Zig module does not use zigar.js host operations', async function() {
+    const plain = await transpile(plainZigPath, {
+      nodeCompat: false,
+      embedWASM: true,
+      topLevelAwait: true,
+      optimize: 'ReleaseSmall',
+    });
+    expect(plain.code).to.not.include('features/js-host-op.js');
+    expect(plain.code).to.not.include('features/js-value-registry.js');
+  });
+
+  const targets = [
+    { label: 'wasm32 (useWazig=true)', memory64: false, useWazig: true, useJSPI: false },
+    { label: 'wasm64 (useWazig=true, JSPI)', memory64: true, useWazig: true, useJSPI: true },
+    { label: 'wasm32 (useWazig=false)', memory64: false, useWazig: false, useJSPI: false },
+    { label: 'wasm64 (useWazig=false)', memory64: true, useWazig: false, useJSPI: false },
+  ];
+
+  for (const target of targets) {
+    describe(`Target: ${target.label}`, function() {
+      let mod;
+      let transpiled;
+      let debugEnv;
+
+      before(async function() {
+        const loaded = await compileAndImport(samplePath, { ...target, exposeEnv: true });
+        mod = loaded.mod;
+        transpiled = loaded.result;
+        debugEnv = mod.__debugEnv;
+        mod.__zigar.set('modules', {
+          'virtual:toolkit': {
+            label: 'tk',
+            version: 3,
+            combine(a, b) {
+              return a + b;
+            },
+          },
+        });
+      });
+
+      afterEach(function() {
+        expect(Number(mod.activeCallbacks())).to.equal(0);
+        expect(Number(mod.activeHandles())).to.equal(0);
+      });
+
+      it('should emit js-host-op.js mixin and strip __zigar_js_reg_* exports from stripped WASM', function() {
+        expect(transpiled.code).to.include('zigar-runtime/features/js-host-op.js');
+        expect(transpiled.code).to.not.include('__zigar_js_reg_');
+      });
+
+      it('should execute all 9 host operations, bind `this`, intern UTF-8 keys once, and support Symbol keys', async function() {
+        const modRes = await mod.callVirtualModuleStaticAndDynamic(19, 23);
+        expect(modRes.string).to.equal('tk:42@v3');
+
+        const bag = {};
+        const sym = Symbol('wasm-prop');
+        // Warm up once, then run 50 rounds and verify zero extra UTF-8 key decodes!
+        await mod.testGlobalAndPropOps(bag, sym, 1);
+        const decodesAfterWarmup = debugEnv.jsKeyDecodeCount;
+        const propSum = await mod.testGlobalAndPropOps(bag, sym, 50);
+        expect(debugEnv.jsKeyDecodeCount).to.equal(decodesAfterWarmup);
+        // 15 (Math.abs) + sum_{i=0..49}(i + 10) + 42 (dynKey) + 77 (sym)
+        // sum_{i=0..49}(i + 10) = 50*10 + 49*50/2 = 500 + 1225 = 1725 -> + 15 + 42 + 77 = 1859
+        expect(propSum).to.equal(1859);
+        expect(bag[sym]).to.equal(77);
+        expect('counter' in bag).to.be.false;
+        expect('dynKey' in bag).to.be.false;
+
+        const ctorAndMethodRes = await mod.testCallFnMethodAndConstruct(
+          (a, b) => a * 2 + b,
+          StatefulCounter,
+          10,
+        );
+        // base = 10 * 2 + 5 = 25; inst = new StatefulCounter(25); increment(7) -> 32
+        expect(ctorAndMethodRes.string).to.equal('counter(ok)=32:32');
+      });
+
+      it('should propagate JS exceptions into E!T error unions across call/method/construct/get/set without handle leaks', async function() {
+        const faultyObj = {
+          notAFunction: 42,
+          validate(n) {
+            if (n < 0) {
+              const err = new Error('negative');
+              err.error = 'ValidationFailed';
+              throw err;
+            }
+            return { ok: true };
+          },
+        };
+        Object.defineProperty(faultyObj, 'throwingProp', {
+          get() {
+            throw new RangeError('getter boom');
+          },
+        });
+        Object.defineProperty(faultyObj, 'readOnlyProp', {
+          set() {
+            throw new TypeError('setter boom');
+          },
+        });
+        function BadCtor() {
+          throw new Error('ctor boom');
+        }
+        const badFn = () => {
+          throw new Error('fn boom');
+        };
+
+        const mask = await mod.testFallibleHostOps(faultyObj, BadCtor, badFn);
+        expect(mask).to.equal(0b111111);
+      });
+
+      it('should invoke >64 (80) distinct host-op signatures in one WASM module with zero js-fn thunkSources', async function() {
+        const standaloneFn = (p) => Number(p.tag) + Number(p.value) * 2;
+        const helperObj = {
+          evalPayload(p, bonus) {
+            if (this !== helperObj) {
+              throw new TypeError('wrong receiver');
+            }
+            return Number(p.value) - Number(p.tag) + bonus;
+          },
+          makePayload(tag, value) {
+            if (this !== helperObj) {
+              throw new TypeError('wrong receiver');
+            }
+            return { tag, value };
+          },
+        };
+
+        let expected = 0n;
+        for (let i = 0; i < 80; i++) {
+          const val = i * 3 + 1;
+          switch (i % 5) {
+            case 0:
+              expected += BigInt(i + val * 2);
+              break;
+            case 1:
+              expected += BigInt(val - i + i);
+              break;
+            case 2:
+              expected += BigInt(val + i);
+              break;
+            case 3:
+              expected += BigInt(i + val);
+              break;
+            case 4:
+              expected += BigInt((i + 10) + i);
+              break;
+          }
+        }
+
+        const actual = await mod.stress80DistinctHostSignatures(standaloneFn, helperObj, PayloadBox);
+        expect(BigInt(actual)).to.equal(expected);
+        // Zero consumption of the 16-thunk js-fn.zig pool!
+        expect(debugEnv.thunkSources.length).to.equal(0);
+      });
+
+      it('should register, re-entrantly invoke, release, and recycle 64 simultaneous stateful Zig callbacks', async function() {
+        const createBus = () => ({
+          listeners: new Map(),
+          register(idx, fn) {
+            this.listeners.set(idx, fn);
+          },
+          emitAll(input) {
+            let total = 0n;
+            for (const fn of this.listeners.values()) {
+              total += BigInt(fn(input));
+            }
+            return total;
+          },
+        });
+
+        for (let cycle = 0; cycle < 2; cycle++) {
+          const bus = createBus();
+          await mod.register64StatefulCallbacks(bus);
+          expect(bus.listeners.size).to.equal(64);
+          expect(Number(mod.activeCallbacks())).to.equal(64);
+          expect(Number(mod.activeHandles())).to.equal(64);
+
+          // 1. Direct JS -> Zig invocation of all 64 distinct stateful closures
+          let directSum = 0n;
+          let expectedRound1 = 0n;
+          for (let i = 0; i < 64; i++) {
+            const id = i + 1;
+            const mul = i + 2;
+            const out = bus.listeners.get(i)(3);
+            expect(out).to.equal(id * 100 + 3 * mul);
+            directSum += BigInt(out);
+            expectedRound1 += BigInt(id * 100 + 3 * mul);
+          }
+          expect(directSum).to.equal(expectedRound1);
+
+          // 2. Re-entrant JS -> Zig -> invokeJsHostOp (bus.emitAll) -> 64 Zig callbacks -> Zig!
+          let expectedRound2 = 0n;
+          for (let i = 0; i < 64; i++) {
+            expectedRound2 += BigInt((i + 1) * 100 + 5 * (i + 2));
+          }
+          const reentrantSum = await mod.triggerBusFromZig(bus, 5);
+          expect(BigInt(reentrantSum)).to.equal(expectedRound2);
+
+          expect(Number(await mod.inspectCallbackTotalCalls())).to.equal(128);
+          expect(BigInt(await mod.inspectCallbackTotalAccum())).to.equal(expectedRound1 + expectedRound2);
+          expect(debugEnv.thunkSources.length).to.equal(0);
+
+          const staleSample = bus.listeners.get(0);
+          await mod.release64StatefulCallbacks();
+          expect(Number(mod.activeCallbacks())).to.equal(0);
+          expect(Number(mod.activeHandles())).to.equal(0);
+          expect(debugEnv.getActiveZigCallbackCount()).to.equal(0);
+          expect(() => staleSample(1)).to.throw(/already been released/);
+        }
+      });
+    });
+  }
+});

@@ -85,13 +85,13 @@ export default mixin({
       this.registerMemory(address, len, align, true, targetDV);
       // pretend that the view holds Zig memory to get around code that prevents pointers
       // in Zig memory to point at JS memory
-      defineProperty(targetDV, ZIG, { value: { address, len, js: true }, enumerable: false });
+      defineProperty(targetDV, ZIG, { value: { address, len, js: true }, writable: true, configurable: true, enumerable: false });
       list?.push({ address, len });
       return targetDV;
     }
   },
   freeHostMemory(ptr, buf, ptrAlign) {
-    const dv = buf['*'][MEMORY];
+    const dv = (buf instanceof DataView) ? buf : buf['*'][MEMORY];
     const address = this.getViewAddress(dv);
     const len = dv.byteLength;
     if (process.env.DEV) {

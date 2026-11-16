@@ -186,7 +186,7 @@ export default mixin({
     const syncRunner = (process.env.TARGET === 'wasm') ? this[`${runnerName}Sync`] : null;
     let useSyncRunner = false;
     if (process.env.TARGET === 'wasm' && syncRunner) {
-      if (this.comptime) {
+      if (this.comptime || fn.zigarSync || this.syncCallDepth > 0) {
         useSyncRunner = true;
       } else if (this.useJSPI && this.jspiMode !== 'all' && !this.customWASI) {
         const fnSlot = Number(fnAddress);
