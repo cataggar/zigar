@@ -229,6 +229,7 @@ pub const DeclIr = struct {
     logical_name: []const u8,
     wire_name: []const u8,
     is_exported: bool,
+    is_js_exported: bool = true,
     is_default_export: bool,
     jsdoc: ?JsDocIr,
     kind: DeclKindIr,
@@ -434,6 +435,8 @@ fn LowerCtx(comptime GraphType: type) type {
         decl_locations: std.AutoHashMapUnmanaged(u32, DeclLocation) = .empty,
         merged_ns_consumed: std.AutoHashMapUnmanaged(u32, void) = .empty,
         ns_child_ids: std.AutoHashMapUnmanaged(u32, void) = .empty,
+        child_to_parent_ns: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+        js_exported_decls: std.AutoHashMapUnmanaged(u32, void) = .empty,
         decl_to_cand: std.AutoHashMapUnmanaged(u32, u32) = .empty,
         cand_to_final_map: ?[]?u32 = null,
 
@@ -451,6 +454,8 @@ fn LowerCtx(comptime GraphType: type) type {
             self.decl_locations.deinit(self.scratch);
             self.merged_ns_consumed.deinit(self.scratch);
             self.ns_child_ids.deinit(self.scratch);
+            self.child_to_parent_ns.deinit(self.scratch);
+            self.js_exported_decls.deinit(self.scratch);
             self.decl_to_cand.deinit(self.scratch);
         }
 
@@ -670,21 +675,41 @@ fn LowerCtx(comptime GraphType: type) type {
             }
         }
 
-        fn resolveOrCreateOwnerCandForFileMod(self: *Self, owner_mod: anytype) !u32 {
-            if (self.source_mod_to_cand.get(owner_mod.id)) |existing| return existing;
-            // If `owner_mod` is an ambient-only `.d.ts` file (no ES exports / `export =` / globals),
-            // keep unexported helper declarations inside its ambient module candidate rather than
-            // synthesizing a bogus file-named `.zig` stub!
-            if (owner_mod.ambient_modules.len > 0 and
+        fn markJsExportedDecl(self: *Self, did: u32) !void {
+            if (did >= self.graph.decls.len) return;
+            const d = self.graph.decls[did];
+            if (d.kind == .import_equals_decl and !d.modifiers.export_decl) return;
+            try self.js_exported_decls.put(self.scratch, did, {});
+            for (d.merged_with) |mid| {
+                if (mid < self.graph.decls.len and self.graph.decls[mid].module == d.module) {
+                    try self.js_exported_decls.put(self.scratch, mid, {});
+                }
+            }
+        }
+
+        fn isAmbientOnlyFileMod(owner_mod: anytype) bool {
+            return owner_mod.ambient_modules.len > 0 and
                 owner_mod.exports.len == 0 and
                 owner_mod.star_re_exports.len == 0 and
                 owner_mod.default_export == null and
                 owner_mod.export_equals == null and
-                owner_mod.global_augmentations.len == 0)
-            {
-                if (try self.findAmbientCandidateIdx(self.str(owner_mod.ambient_modules[0].module_name))) |amb_c| {
-                    return amb_c;
+                owner_mod.global_augmentations.len == 0;
+        }
+
+        fn resolveOrCreateOwnerCandForFileMod(self: *Self, owner_mod: anytype) !u32 {
+            if (self.source_mod_to_cand.get(owner_mod.id)) |existing| return existing;
+            // If `owner_mod` is a single-block ambient-only `.d.ts` file, route same-file unowned
+            // helpers to that sole ambient module. When `ambient_modules.len > 1`, Step 2a has
+            // already routed helpers reachable from each ambient block; any truly unreferenced
+            // orphan must NOT pollute `ambient_modules[0]` or create a primary file stub.
+            if (isAmbientOnlyFileMod(owner_mod)) {
+                if (owner_mod.ambient_modules.len == 1) {
+                    if (try self.findAmbientCandidateIdx(self.str(owner_mod.ambient_modules[0].module_name))) |amb_c| {
+                        return amb_c;
+                    }
                 }
+                const ws = try self.deriveFileLogicalSpecifier(owner_mod);
+                return try self.getOrCreateCandidate(ws, null);
             }
             const ws = try self.deriveFileLogicalSpecifier(owner_mod);
             return try self.getOrCreateCandidate(ws, owner_mod.id);
@@ -730,6 +755,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     return;
                 }
                 try appendUniqueU32(&self.candidates.items[c_idx].decl_ids, self.scratch, did);
+                try self.markJsExportedDecl(did);
                 if (!is_default_export and !d.modifiers.default_export) {
                     try appendUniqueU32(&self.candidates.items[c_idx].exported_decl_ids, self.scratch, did);
                 }
@@ -738,6 +764,9 @@ fn LowerCtx(comptime GraphType: type) type {
             }
             if (d.kind == .import_equals_decl) {
                 try appendUniqueU32(&self.candidates.items[c_idx].decl_ids, self.scratch, did);
+                if (d.modifiers.export_decl) {
+                    try self.markJsExportedDecl(did);
+                }
                 if (d.modifiers.export_decl and !is_default_export and !d.modifiers.default_export) {
                     try appendUniqueU32(&self.candidates.items[c_idx].exported_decl_ids, self.scratch, did);
                 }
@@ -754,6 +783,9 @@ fn LowerCtx(comptime GraphType: type) type {
                     if (!self.isBundledLibModule(owner_mod)) {
                         owner_cand = try self.resolveOrCreateOwnerCandForFileMod(owner_mod);
                         try self.registerCanonicalDeclInCandidate(owner_cand, did);
+                        if (d.modifiers.export_decl or d.modifiers.default_export) {
+                            try self.markJsExportedDecl(did);
+                        }
                         if (!d.modifiers.default_export and !self.ns_child_ids.contains(did)) {
                             try appendUniqueU32(&self.candidates.items[owner_cand].exported_decl_ids, self.scratch, did);
                         }
@@ -767,6 +799,7 @@ fn LowerCtx(comptime GraphType: type) type {
 
             if (owner_cand == c_idx) {
                 try self.registerCanonicalDeclInCandidate(c_idx, did);
+                try self.markJsExportedDecl(did);
                 if (!is_default_export and !d.modifiers.default_export and !self.ns_child_ids.contains(did)) {
                     try appendUniqueU32(&self.candidates.items[c_idx].exported_decl_ids, self.scratch, did);
                 }
@@ -786,6 +819,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 if (d.kind == .namespace_decl) {
                     for (d.kind.namespace_decl) |cid| {
                         try self.ns_child_ids.put(self.scratch, cid, {});
+                        try self.child_to_parent_ns.put(self.scratch, cid, d.id);
                     }
                 }
             }
@@ -861,6 +895,17 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
             }
 
+            // 2a. Route unowned same-file helper declarations (`interface Hid` in
+            // `declare module "p2" { interface Hid ...; export function g(h: Hid): void; export {}; }`)
+            // by reachability from each ambient module block's declarations BEFORE Step 2b!
+            for (self.graph.modules) |mod| {
+                if (self.isBundledLibModule(mod)) continue;
+                for (mod.ambient_modules) |amb| {
+                    const amb_cand = (try self.findAmbientCandidateIdx(self.str(amb.module_name))) orelse continue;
+                    try self.claimSameFileAmbientHelpers(amb_cand, mod.id, amb.decls);
+                }
+            }
+
             // 2b. Register declarations from transitively type-imported modules (`import type { X } from "./peer"`)
             // where the extractor recorded `d.module` without populating `mod.exports`.
             for (self.graph.decls) |d| {
@@ -885,6 +930,15 @@ fn LowerCtx(comptime GraphType: type) type {
                 const c_idx = try self.resolveOrCreateOwnerCandForFileMod(owner_mod);
                 try appendUniqueU32(&self.candidates.items[c_idx].decl_ids, self.scratch, d.id);
                 try self.appendDeclRecursiveToCand(d.id, c_idx);
+                if (d.modifiers.export_decl and
+                    owner_mod.exports.len == 0 and
+                    owner_mod.ambient_modules.len == 0 and
+                    owner_mod.default_export == null and
+                    owner_mod.export_equals == null and
+                    owner_mod.global_augmentations.len == 0)
+                {
+                    try self.markJsExportedDecl(d.id);
+                }
             }
 
             // 3. Support dotted namespace `-m` filters such as `-m monaco.editor`.
@@ -901,6 +955,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         const c_idx = try self.getOrCreateCandidate(mod_pat, null);
                         for (ns_decls) |did| {
                             try appendUniqueU32(&self.candidates.items[c_idx].decl_ids, self.scratch, did);
+                            try self.markJsExportedDecl(did);
                             // Point these decls to the synthesized dotted namespace module.
                             try self.decl_to_cand.put(self.scratch, did, c_idx);
                         }
@@ -909,11 +964,81 @@ fn LowerCtx(comptime GraphType: type) type {
             }
         }
 
-        fn collectReferencedCandsFromType(
+        fn claimSameFileAmbientHelpers(
+            self: *Self,
+            amb_cand: u32,
+            mod_id: u32,
+            seed_decls: []const u32,
+        ) error{OutOfMemory}!void {
+            var worklist: std.ArrayList(u32) = .empty;
+            defer worklist.deinit(self.scratch);
+
+            var visited_decls: std.AutoHashMapUnmanaged(u32, void) = .empty;
+            defer visited_decls.deinit(self.scratch);
+
+            var visited_types: std.AutoHashMapUnmanaged(u32, void) = .empty;
+            defer visited_types.deinit(self.scratch);
+
+            for (seed_decls) |did| {
+                if (did >= self.graph.decls.len) continue;
+                if (self.decl_to_cand.get(did) == amb_cand) {
+                    try worklist.append(self.scratch, did);
+                    for (self.graph.decls[did].merged_with) |mid| {
+                        if (mid < self.graph.decls.len and self.decl_to_cand.get(mid) == amb_cand) {
+                            try worklist.append(self.scratch, mid);
+                        }
+                    }
+                }
+            }
+
+            const HelperClaimVisitor = struct {
+                amb_cand: u32,
+                mod_id: u32,
+                worklist: *std.ArrayList(u32),
+
+                fn onDeclRef(v: *@This(), ctx: *Self, target_did: u32) error{OutOfMemory}!void {
+                    var root_did = target_did;
+                    while (ctx.child_to_parent_ns.get(root_did)) |p_ns| {
+                        root_did = p_ns;
+                    }
+                    if (root_did >= ctx.graph.decls.len) return;
+                    if (ctx.decl_to_cand.contains(root_did)) return;
+                    const rd = ctx.graph.decls[root_did];
+                    if (rd.module != v.mod_id) return;
+
+                    try ctx.registerCanonicalDeclInCandidate(v.amb_cand, root_did);
+                    try v.worklist.append(ctx.scratch, root_did);
+                    for (rd.merged_with) |mid| {
+                        if (mid < ctx.graph.decls.len and ctx.graph.decls[mid].module == v.mod_id) {
+                            try v.worklist.append(ctx.scratch, mid);
+                        }
+                    }
+                }
+
+                fn onModuleIdRef(_: *@This(), _: *Self, _: u32) error{OutOfMemory}!void {}
+                fn onModuleSpecRef(_: *@This(), _: *Self, _: []const u8) error{OutOfMemory}!void {}
+            };
+
+            var visitor = HelperClaimVisitor{
+                .amb_cand = amb_cand,
+                .mod_id = mod_id,
+                .worklist = &worklist,
+            };
+
+            var cursor: usize = 0;
+            while (cursor < worklist.items.len) : (cursor += 1) {
+                const cur_did = worklist.items[cursor];
+                if (visited_decls.contains(cur_did)) continue;
+                try visited_decls.put(self.scratch, cur_did, {});
+                try self.walkDeclRefs(cur_did, &visited_types, &visitor);
+            }
+        }
+
+        fn walkTypeRefs(
             self: *Self,
             ty_id: u32,
             visited_types: *std.AutoHashMapUnmanaged(u32, void),
-            queue: *std.ArrayList(u32),
+            visitor: anytype,
         ) error{OutOfMemory}!void {
             if (ty_id >= self.graph.types.len) return;
             if (visited_types.contains(ty_id)) return;
@@ -923,73 +1048,222 @@ fn LowerCtx(comptime GraphType: type) type {
             switch (tn.kind) {
                 .reference => |ref| {
                     if (ref.target_decl) |td| {
-                        if (self.decl_to_cand.get(td)) |dep_cand| {
-                            if (!self.candidates.items[dep_cand].included) {
-                                self.candidates.items[dep_cand].included = true;
-                                try queue.append(self.scratch, dep_cand);
-                            }
-                        }
+                        try visitor.onDeclRef(self, td);
                     } else if (tn.resolved_type) |rt| {
-                        try self.collectReferencedCandsFromType(rt, visited_types, queue);
+                        if (rt != ty_id) try self.walkTypeRefs(rt, visited_types, visitor);
                     }
                     for (ref.type_args) |arg_ty| {
-                        try self.collectReferencedCandsFromType(arg_ty, visited_types, queue);
+                        try self.walkTypeRefs(arg_ty, visited_types, visitor);
                     }
+                },
+                .typeof_query => |tq| {
+                    if (tq.target_decl) |td| {
+                        try visitor.onDeclRef(self, td);
+                    } else if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) try self.walkTypeRefs(rt, visited_types, visitor);
+                    }
+                    for (tq.type_args) |arg_ty| {
+                        try self.walkTypeRefs(arg_ty, visited_types, visitor);
+                    }
+                },
+                .import_type => |it| {
+                    try visitor.onModuleSpecRef(self, self.str(it.module_specifier));
+                    for (it.type_args) |arg_ty| {
+                        try self.walkTypeRefs(arg_ty, visited_types, visitor);
+                    }
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) try self.walkTypeRefs(rt, visited_types, visitor);
+                    }
+                },
+                .template_literal => |tl| {
+                    for (tl.spans) |sp| try self.walkTypeRefs(sp.ty, visited_types, visitor);
                 },
                 .array, .readonly_array, .keyof_type => |inner| {
-                    try self.collectReferencedCandsFromType(inner, visited_types, queue);
+                    try self.walkTypeRefs(inner, visited_types, visitor);
                 },
                 .tuple, .readonly_tuple => |elems| {
-                    for (elems) |el| try self.collectReferencedCandsFromType(el.ty, visited_types, queue);
+                    for (elems) |el| try self.walkTypeRefs(el.ty, visited_types, visitor);
                 },
                 .union_type, .intersection => |arms| {
-                    for (arms) |arm| try self.collectReferencedCandsFromType(arm, visited_types, queue);
+                    for (arms) |arm| try self.walkTypeRefs(arm, visited_types, visitor);
                 },
                 .object_literal => |obj| {
-                    for (obj.properties) |pid| {
-                        if (pid < self.graph.properties.len) {
-                            try self.collectReferencedCandsFromType(self.graph.properties[pid].ty, visited_types, queue);
-                        }
+                    try self.walkPropsRefs(obj.properties, visited_types, visitor);
+                    for (obj.call_signatures) |sid| try self.walkSigRefs(sid, visited_types, visitor);
+                    for (obj.construct_signatures) |sid| try self.walkSigRefs(sid, visited_types, visitor);
+                    for (obj.index_signatures) |isig| {
+                        try self.walkTypeRefs(isig.key_type, visited_types, visitor);
+                        try self.walkTypeRefs(isig.value_type, visited_types, visitor);
                     }
-                    for (obj.call_signatures) |sid| try self.collectReferencedCandsFromSig(sid, visited_types, queue);
-                    for (obj.construct_signatures) |sid| try self.collectReferencedCandsFromSig(sid, visited_types, queue);
                 },
                 .function_type, .constructor_type => |sid| {
-                    try self.collectReferencedCandsFromSig(sid, visited_types, queue);
+                    try self.walkSigRefs(sid, visited_types, visitor);
+                },
+                .indexed_access => |ia| {
+                    try self.walkTypeRefs(ia.object_ty, visited_types, visitor);
+                    try self.walkTypeRefs(ia.index_ty, visited_types, visitor);
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) try self.walkTypeRefs(rt, visited_types, visitor);
+                    }
+                },
+                .conditional => |cond| {
+                    try self.walkTypeRefs(cond.check_type, visited_types, visitor);
+                    try self.walkTypeRefs(cond.extends_type, visited_types, visitor);
+                    try self.walkTypeRefs(cond.true_type, visited_types, visitor);
+                    try self.walkTypeRefs(cond.false_type, visited_types, visitor);
+                    try self.walkTypeParamsRefs(cond.infer_params, visited_types, visitor);
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) try self.walkTypeRefs(rt, visited_types, visitor);
+                    }
+                },
+                .mapped => |mp| {
+                    try self.walkTypeParamsRefs(&.{mp.type_param}, visited_types, visitor);
+                    if (mp.name_type) |nt| try self.walkTypeRefs(nt, visited_types, visitor);
+                    try self.walkTypeRefs(mp.value_type, visited_types, visitor);
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) try self.walkTypeRefs(rt, visited_types, visitor);
+                    }
+                },
+                .type_predicate => |tp| {
+                    if (tp.target_type) |tt| try self.walkTypeRefs(tt, visited_types, visitor);
                 },
                 else => {
                     if (tn.resolved_type) |rt| {
-                        try self.collectReferencedCandsFromType(rt, visited_types, queue);
+                        if (rt != ty_id) try self.walkTypeRefs(rt, visited_types, visitor);
                     }
                 },
             }
         }
 
-        fn collectReferencedCandsFromTypeParams(
+        fn walkTypeParamsRefs(
             self: *Self,
             tp_ids: []const u32,
             visited_types: *std.AutoHashMapUnmanaged(u32, void),
-            queue: *std.ArrayList(u32),
+            visitor: anytype,
         ) error{OutOfMemory}!void {
             for (tp_ids) |tp_id| {
                 if (tp_id >= self.graph.type_params.len) continue;
                 const tp = self.graph.type_params[tp_id];
-                if (tp.constraint) |ct| try self.collectReferencedCandsFromType(ct, visited_types, queue);
-                if (tp.default_type) |dt| try self.collectReferencedCandsFromType(dt, visited_types, queue);
+                if (tp.constraint) |ct| try self.walkTypeRefs(ct, visited_types, visitor);
+                if (tp.default_type) |dt| try self.walkTypeRefs(dt, visited_types, visitor);
             }
         }
 
-        fn collectReferencedCandsFromSig(
+        fn walkPropsRefs(
+            self: *Self,
+            prop_ids: []const u32,
+            visited_types: *std.AutoHashMapUnmanaged(u32, void),
+            visitor: anytype,
+        ) error{OutOfMemory}!void {
+            for (prop_ids) |pid| {
+                if (pid >= self.graph.properties.len) continue;
+                const prop = self.graph.properties[pid];
+                if (prop.computed_symbol) |cs| {
+                    if (cs == .unique) try visitor.onDeclRef(self, cs.unique);
+                }
+                try self.walkTypeRefs(prop.ty, visited_types, visitor);
+                if (prop.setter_ty) |sty| try self.walkTypeRefs(sty, visited_types, visitor);
+            }
+        }
+
+        fn walkHeritageRefs(
+            self: *Self,
+            hc: anytype,
+            visited_types: *std.AutoHashMapUnmanaged(u32, void),
+            visitor: anytype,
+        ) error{OutOfMemory}!void {
+            if (hc.target_decl) |td| try visitor.onDeclRef(self, td);
+            try self.walkTypeRefs(hc.target_type, visited_types, visitor);
+            for (hc.type_args) |arg_ty| try self.walkTypeRefs(arg_ty, visited_types, visitor);
+        }
+
+        fn walkSigRefs(
             self: *Self,
             sig_id: u32,
             visited_types: *std.AutoHashMapUnmanaged(u32, void),
-            queue: *std.ArrayList(u32),
+            visitor: anytype,
         ) error{OutOfMemory}!void {
             if (sig_id >= self.graph.signatures.len) return;
             const sig = self.graph.signatures[sig_id];
-            try self.collectReferencedCandsFromTypeParams(sig.type_params, visited_types, queue);
-            for (sig.params) |p| try self.collectReferencedCandsFromType(p.ty, visited_types, queue);
-            try self.collectReferencedCandsFromType(sig.return_type, visited_types, queue);
+            try self.walkTypeParamsRefs(sig.type_params, visited_types, visitor);
+            if (sig.this_param) |tp| try self.walkTypeRefs(tp, visited_types, visitor);
+            for (sig.params) |p| try self.walkTypeRefs(p.ty, visited_types, visitor);
+            try self.walkTypeRefs(sig.return_type, visited_types, visitor);
+            if (sig.type_predicate) |tpred| {
+                if (tpred.target_type) |tt| try self.walkTypeRefs(tt, visited_types, visitor);
+            }
+        }
+
+        fn walkDeclRefs(
+            self: *Self,
+            decl_id: u32,
+            visited_types: *std.AutoHashMapUnmanaged(u32, void),
+            visitor: anytype,
+        ) error{OutOfMemory}!void {
+            if (decl_id >= self.graph.decls.len) return;
+            const d = self.graph.decls[decl_id];
+            try self.walkTypeParamsRefs(d.type_params, visited_types, visitor);
+            for (d.merged_with) |mid| {
+                try visitor.onDeclRef(self, mid);
+            }
+            switch (d.kind) {
+                .function_decl => |sigs| {
+                    for (sigs) |sid| try self.walkSigRefs(sid, visited_types, visitor);
+                },
+                .variable_decl => |ty| try self.walkTypeRefs(ty, visited_types, visitor),
+                .type_alias_decl => |ty| try self.walkTypeRefs(ty, visited_types, visitor),
+                .interface_decl => |iface| {
+                    for (iface.extends_clauses) |hc| try self.walkHeritageRefs(hc, visited_types, visitor);
+                    try self.walkPropsRefs(iface.properties, visited_types, visitor);
+                    for (iface.methods) |m| {
+                        if (m.computed_symbol) |cs| {
+                            if (cs == .unique) try visitor.onDeclRef(self, cs.unique);
+                        }
+                        for (m.signatures) |sid| try self.walkSigRefs(sid, visited_types, visitor);
+                    }
+                    for (iface.call_signatures) |sid| try self.walkSigRefs(sid, visited_types, visitor);
+                    for (iface.construct_signatures) |sid| try self.walkSigRefs(sid, visited_types, visitor);
+                    for (iface.index_signatures) |isig| {
+                        try self.walkTypeRefs(isig.key_type, visited_types, visitor);
+                        try self.walkTypeRefs(isig.value_type, visited_types, visitor);
+                    }
+                },
+                .class_decl => |cls| {
+                    if (cls.extends_clause) |hc| try self.walkHeritageRefs(hc, visited_types, visitor);
+                    for (cls.implements_clauses) |hc| try self.walkHeritageRefs(hc, visited_types, visitor);
+                    for (cls.constructors) |sid| try self.walkSigRefs(sid, visited_types, visitor);
+                    try self.walkPropsRefs(cls.properties, visited_types, visitor);
+                    for (cls.methods) |m| {
+                        if (m.computed_symbol) |cs| {
+                            if (cs == .unique) try visitor.onDeclRef(self, cs.unique);
+                        }
+                        for (m.signatures) |sid| try self.walkSigRefs(sid, visited_types, visitor);
+                    }
+                    for (cls.index_signatures) |isig| {
+                        try self.walkTypeRefs(isig.key_type, visited_types, visitor);
+                        try self.walkTypeRefs(isig.value_type, visited_types, visitor);
+                    }
+                },
+                .namespace_decl => |children| {
+                    for (children) |cid| try self.walkDeclRefs(cid, visited_types, visitor);
+                },
+                .re_export_decl => |re| {
+                    if (re.target_module) |tmid| try visitor.onModuleIdRef(self, tmid);
+                    if (re.target_decl) |tdid| {
+                        try visitor.onDeclRef(self, tdid);
+                    } else if (re.target_module == null) {
+                        try visitor.onModuleSpecRef(self, self.str(re.module_specifier));
+                    }
+                },
+                .import_equals_decl => |ie| {
+                    if (ie.target_decl) |tdid| {
+                        try visitor.onDeclRef(self, tdid);
+                    } else if (ie.module_specifier) |msid| {
+                        try visitor.onModuleSpecRef(self, self.str(msid));
+                    }
+                },
+                .enum_decl => {},
+            }
         }
 
         fn collectReferencedCandsFromDecl(
@@ -998,91 +1272,37 @@ fn LowerCtx(comptime GraphType: type) type {
             visited_types: *std.AutoHashMapUnmanaged(u32, void),
             queue: *std.ArrayList(u32),
         ) error{OutOfMemory}!void {
-            if (decl_id >= self.graph.decls.len) return;
-            const d = self.graph.decls[decl_id];
-            switch (d.kind) {
-                .function_decl => |sigs| {
-                    for (sigs) |sid| try self.collectReferencedCandsFromSig(sid, visited_types, queue);
-                },
-                .variable_decl => |ty| try self.collectReferencedCandsFromType(ty, visited_types, queue),
-                .type_alias_decl => |ty| {
-                    try self.collectReferencedCandsFromTypeParams(d.type_params, visited_types, queue);
-                    try self.collectReferencedCandsFromType(ty, visited_types, queue);
-                },
-                .interface_decl => |iface| {
-                    try self.collectReferencedCandsFromTypeParams(d.type_params, visited_types, queue);
-                    for (iface.properties) |pid| {
-                        if (pid < self.graph.properties.len) {
-                            try self.collectReferencedCandsFromType(self.graph.properties[pid].ty, visited_types, queue);
-                        }
+            const CandReachVisitor = struct {
+                queue: *std.ArrayList(u32),
+
+                fn markCand(v: *@This(), ctx: *Self, dep_cand: u32) error{OutOfMemory}!void {
+                    if (!ctx.candidates.items[dep_cand].included) {
+                        ctx.candidates.items[dep_cand].included = true;
+                        try v.queue.append(ctx.scratch, dep_cand);
                     }
-                    for (iface.methods) |m| {
-                        for (m.signatures) |sid| try self.collectReferencedCandsFromSig(sid, visited_types, queue);
+                }
+
+                fn onDeclRef(v: *@This(), ctx: *Self, td: u32) error{OutOfMemory}!void {
+                    if (ctx.decl_to_cand.get(td)) |dep_cand| {
+                        try v.markCand(ctx, dep_cand);
                     }
-                    for (iface.call_signatures) |sid| try self.collectReferencedCandsFromSig(sid, visited_types, queue);
-                    for (iface.construct_signatures) |sid| try self.collectReferencedCandsFromSig(sid, visited_types, queue);
-                },
-                .class_decl => |cls| {
-                    try self.collectReferencedCandsFromTypeParams(d.type_params, visited_types, queue);
-                    for (cls.constructors) |sid| try self.collectReferencedCandsFromSig(sid, visited_types, queue);
-                    for (cls.properties) |pid| {
-                        if (pid < self.graph.properties.len) {
-                            try self.collectReferencedCandsFromType(self.graph.properties[pid].ty, visited_types, queue);
-                        }
+                }
+
+                fn onModuleIdRef(v: *@This(), ctx: *Self, tmid: u32) error{OutOfMemory}!void {
+                    if (ctx.source_mod_to_cand.get(tmid)) |dep_cand| {
+                        try v.markCand(ctx, dep_cand);
                     }
-                    for (cls.methods) |m| {
-                        for (m.signatures) |sid| try self.collectReferencedCandsFromSig(sid, visited_types, queue);
+                }
+
+                fn onModuleSpecRef(v: *@This(), ctx: *Self, mspec: []const u8) error{OutOfMemory}!void {
+                    if (try ctx.resolveSpecToCandidateIdx(mspec)) |dep_cand| {
+                        try v.markCand(ctx, dep_cand);
                     }
-                },
-                .namespace_decl => |children| {
-                    for (children) |cid| try self.collectReferencedCandsFromDecl(cid, visited_types, queue);
-                },
-                .re_export_decl => |re| {
-                    if (re.target_module) |tmid| {
-                        if (self.source_mod_to_cand.get(tmid)) |dep_cand| {
-                            if (!self.candidates.items[dep_cand].included) {
-                                self.candidates.items[dep_cand].included = true;
-                                try queue.append(self.scratch, dep_cand);
-                            }
-                        }
-                    }
-                    if (re.target_decl) |tdid| {
-                        if (self.decl_to_cand.get(tdid)) |dep_cand| {
-                            if (!self.candidates.items[dep_cand].included) {
-                                self.candidates.items[dep_cand].included = true;
-                                try queue.append(self.scratch, dep_cand);
-                            }
-                        }
-                    } else if (re.target_module == null) {
-                        const mspec = self.str(re.module_specifier);
-                        if (try self.resolveSpecToCandidateIdx(mspec)) |dep_cand| {
-                            if (!self.candidates.items[dep_cand].included) {
-                                self.candidates.items[dep_cand].included = true;
-                                try queue.append(self.scratch, dep_cand);
-                            }
-                        }
-                    }
-                },
-                .import_equals_decl => |ie| {
-                    if (ie.target_decl) |tdid| {
-                        if (self.decl_to_cand.get(tdid)) |dep_cand| {
-                            if (!self.candidates.items[dep_cand].included) {
-                                self.candidates.items[dep_cand].included = true;
-                                try queue.append(self.scratch, dep_cand);
-                            }
-                        }
-                    } else if (ie.module_specifier) |msid| {
-                        const mspec = self.str(msid);
-                        if (try self.resolveSpecToCandidateIdx(mspec)) |dep_cand| {
-                            if (!self.candidates.items[dep_cand].included) {
-                                self.candidates.items[dep_cand].included = true;
-                                try queue.append(self.scratch, dep_cand);
-                            }
-                        }
-                    }
-                },
-                .enum_decl => {},
-            }
+                }
+            };
+
+            var visitor = CandReachVisitor{ .queue = queue };
+            try self.walkDeclRefs(decl_id, visited_types, &visitor);
         }
 
         fn resolveRelativeVfsPath(allocator: std.mem.Allocator, from_file_path: []const u8, rel_path: []const u8) ![]u8 {
@@ -2279,6 +2499,7 @@ fn LowerCtx(comptime GraphType: type) type {
             self: *Self,
             final_mod_idx: u32,
             decl_id: u32,
+            is_top_level: bool,
             scope: *naming.ScopeNamer,
             prebound_names: *const std.AutoHashMapUnmanaged(u32, naming.BoundName),
             prebound_overloads: *const std.AutoHashMapUnmanaged(u32, []naming.BoundName),
@@ -2294,6 +2515,10 @@ fn LowerCtx(comptime GraphType: type) type {
             const bound = prebound_names.get(decl_id) orelse return;
             const top_jsdoc = try self.lowerJsDoc(d.jsdoc);
             const is_exported = !d.modifiers.private_mod and !d.modifiers.protected_mod;
+            const is_js_exported = if (is_top_level)
+                (is_exported and self.js_exported_decls.contains(decl_id))
+            else
+                (is_exported and d.modifiers.export_decl);
             const is_default_export = d.modifiers.default_export;
 
             switch (d.kind) {
@@ -2314,6 +2539,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             .logical_name = bound.logical_name,
                             .wire_name = bound.wire_name,
                             .is_exported = is_exported,
+                            .is_js_exported = is_js_exported,
                             .is_default_export = is_default_export,
                             .jsdoc = top_jsdoc,
                             .kind = .{ .function_decl = empty_sig },
@@ -2351,6 +2577,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             .logical_name = logical,
                             .wire_name = bound.wire_name,
                             .is_exported = is_exported,
+                            .is_js_exported = is_js_exported,
                             .is_default_export = is_default_export and s_idx == 0,
                             .jsdoc = sig_ir.jsdoc orelse top_jsdoc,
                             .kind = .{ .function_decl = sig_ir },
@@ -2376,6 +2603,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             .logical_name = bound.logical_name,
                             .wire_name = bound.wire_name,
                             .is_exported = is_exported,
+                            .is_js_exported = is_js_exported,
                             .is_default_export = is_default_export,
                             .jsdoc = top_jsdoc,
                             .kind = .{ .const_literal = .{ .ty = lowered_ty, .value = lit_ir } },
@@ -2388,6 +2616,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             .logical_name = bound.logical_name,
                             .wire_name = bound.wire_name,
                             .is_exported = is_exported,
+                            .is_js_exported = is_js_exported,
                             .is_default_export = is_default_export,
                             .jsdoc = top_jsdoc,
                             .kind = .{ .global_var = lowered_ty },
@@ -2420,6 +2649,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         .logical_name = bound.logical_name,
                         .wire_name = bound.wire_name,
                         .is_exported = is_exported,
+                        .is_js_exported = is_js_exported,
                         .is_default_export = is_default_export,
                         .jsdoc = top_jsdoc,
                         .kind = .{ .struct_decl = struct_ir },
@@ -2451,6 +2681,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         .logical_name = bound.logical_name,
                         .wire_name = bound.wire_name,
                         .is_exported = is_exported,
+                        .is_js_exported = is_js_exported,
                         .is_default_export = is_default_export,
                         .jsdoc = top_jsdoc,
                         .kind = .{ .struct_decl = struct_ir },
@@ -2485,6 +2716,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         .logical_name = bound.logical_name,
                         .wire_name = bound.wire_name,
                         .is_exported = is_exported,
+                        .is_js_exported = is_js_exported,
                         .is_default_export = is_default_export,
                         .jsdoc = top_jsdoc,
                         .kind = .{ .enum_decl = .{ .is_const = en.is_const, .members = members } },
@@ -2511,6 +2743,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                 .logical_name = bound.logical_name,
                                 .wire_name = bound.wire_name,
                                 .is_exported = is_exported,
+                                .is_js_exported = is_js_exported,
                                 .is_default_export = is_default_export,
                                 .jsdoc = top_jsdoc,
                                 .kind = .{ .string_enum_decl = str_members },
@@ -2527,6 +2760,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             .logical_name = bound.logical_name,
                             .wire_name = bound.wire_name,
                             .is_exported = is_exported,
+                            .is_js_exported = is_js_exported,
                             .is_default_export = is_default_export,
                             .jsdoc = top_jsdoc,
                             .kind = .{ .union_decl = .{ .type_params = tp_res.ir, .variants = variants } },
@@ -2580,6 +2814,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                 .logical_name = bound.logical_name,
                                 .wire_name = bound.wire_name,
                                 .is_exported = is_exported,
+                                .is_js_exported = is_js_exported,
                                 .is_default_export = is_default_export,
                                 .jsdoc = top_jsdoc,
                                 .kind = .{ .struct_decl = struct_ir },
@@ -2597,6 +2832,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         .logical_name = bound.logical_name,
                         .wire_name = bound.wire_name,
                         .is_exported = is_exported,
+                        .is_js_exported = is_js_exported,
                         .is_default_export = is_default_export,
                         .jsdoc = top_jsdoc,
                         .kind = .{ .type_alias = .{ .type_params = tp_res.ir, .target = target } },
@@ -2618,6 +2854,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         try self.lowerDeclIntoList(
                             final_mod_idx,
                             cid,
+                            false,
                             &ns_scope,
                             prebound_names,
                             prebound_overloads,
@@ -2633,6 +2870,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         .logical_name = bound.logical_name,
                         .wire_name = bound.wire_name,
                         .is_exported = is_exported,
+                        .is_js_exported = is_js_exported,
                         .is_default_export = is_default_export,
                         .jsdoc = top_jsdoc,
                         .kind = .{ .namespace_decl = try child_irs.toOwnedSlice(self.alloc) },
@@ -2986,6 +3224,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         try self.lowerDeclIntoList(
                             final_mod_idx,
                             cid,
+                            false,
                             &struct_scope,
                             prebound_names,
                             prebound_overloads,
@@ -3466,6 +3705,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     try self.lowerDeclIntoList(
                         final_mod_idx,
                         did,
+                        true,
                         ms,
                         &prebound_names,
                         &prebound_overloads,

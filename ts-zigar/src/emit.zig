@@ -995,7 +995,7 @@ fn renderModuleRaw(
     try ctx.emitStringLit(mod.wire_specifier);
     try ctx.out.appendSlice(allocator, ",\n.exports = .{\n");
     for (mod.decls) |d| {
-        if (!d.is_exported) continue;
+        if (!d.is_exported or !d.is_js_exported) continue;
         try ctx.out.appendSlice(allocator, ".{ .name = ");
         try ctx.emitStringLit(d.logical_name);
         try ctx.out.appendSlice(allocator, ", .js_name = ");
@@ -1071,7 +1071,7 @@ fn renderRootRaw(
     defer barrel_exports.deinit(allocator);
     if (barrel_mod) |bm| {
         for (bm.decls) |d| {
-            if (!d.is_exported) continue;
+            if (!d.is_exported or !d.is_js_exported) continue;
             if (root_scope.isTaken(d.logical_name)) continue;
             try root_scope.reserve(d.logical_name);
             try barrel_exports.append(allocator, d);

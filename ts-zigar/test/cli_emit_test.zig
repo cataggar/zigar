@@ -1666,3 +1666,188 @@ test "Regression Round 4: ambient export * from '...' inside declare module expa
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", r_ref_zig });
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
 }
+
+test "Regression Round 5: multi-block ambient files route private helpers to owning ambient module and omit them from zigar_js.exports" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-r5-multi-amb-helpers", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const src_dir = try std.fmt.allocPrint(alloc, "{s}/src", .{sandbox});
+    defer alloc.free(src_dir);
+    const out_full = try std.fmt.allocPrint(alloc, "{s}/out-full", .{sandbox});
+    defer alloc.free(out_full);
+    const out_p2 = try std.fmt.allocPrint(alloc, "{s}/out-p2", .{sandbox});
+    defer alloc.free(out_p2);
+    try cwd.createDirPath(io, src_dir);
+
+    {
+        var sd = try cwd.openDir(io, src_dir, .{});
+        defer sd.close(io);
+        try sd.writeFile(io, .{
+            .sub_path = "index.d.ts",
+            .data =
+            \\/// <reference path="b.d.ts" />
+            ,
+        });
+        try sd.writeFile(io, .{
+            .sub_path = "b.d.ts",
+            .data =
+            \\declare module "p1" {
+            \\  export interface P1 {
+            \\    a: number;
+            \\  }
+            \\}
+            \\declare module "p2" {
+            \\  interface HidBase {
+            \\    tag: string;
+            \\  }
+            \\  namespace HelperNs {
+            \\    export interface NestedHid {
+            \\      flag: boolean;
+            \\    }
+            \\  }
+            \\  interface Hid extends HidBase {
+            \\    s: number;
+            \\    nested?: HelperNs.NestedHid;
+            \\  }
+            \\  export function g(h: Hid): void;
+            \\  export {};
+            \\}
+            \\declare module "p3" {
+            \\  import { AliasP4 } from "p4";
+            \\  export function useP4(v: AliasP4): void;
+            \\}
+            \\declare module "p4" {
+            \\  interface HidP4 {
+            \\    secret: number;
+            \\  }
+            \\  export type AliasP4 = {
+            \\    payload: HidP4;
+            \\  };
+            \\  export {};
+            \\}
+            ,
+        });
+    }
+
+    const index_dts = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{src_dir});
+    defer alloc.free(index_dts);
+
+    // 1. Full package emit (`-t index.d.ts -d out-full`)
+    {
+        const cli_args = [_][]const u8{ "-t", index_dts, "-d", out_full };
+        var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+        defer parsed.deinit(alloc);
+        var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+        defer res.deinit(alloc);
+        if (res == .err) {
+            std.debug.print("Round 5 Full emit error: {s}\n", .{res.err});
+        }
+        try std.testing.expect(res == .ok);
+
+        var out_h = try cwd.openDir(io, out_full, .{});
+        defer out_h.close(io);
+        try std.testing.expectError(error.FileNotFound, out_h.statFile(io, "index.zig", .{}));
+        try std.testing.expectError(error.FileNotFound, out_h.statFile(io, "b.zig", .{}));
+        _ = try out_h.statFile(io, "p1.zig", .{});
+        _ = try out_h.statFile(io, "p2.zig", .{});
+        _ = try out_h.statFile(io, "p3.zig", .{});
+        _ = try out_h.statFile(io, "p4.zig", .{});
+
+        const p2_src = try out_h.readFileAlloc(io, "p2.zig", alloc, .limited(64 * 1024));
+        defer alloc.free(p2_src);
+        try std.testing.expect(std.mem.indexOf(u8, p2_src, "p1.zig") == null);
+    }
+
+    // 2. Filtered `-m p2` emit (`-t index.d.ts -m p2 -d out-p2`): must NOT pull in `p1.zig`!
+    {
+        const cli_args = [_][]const u8{ "-t", index_dts, "-m", "p2", "-d", out_p2 };
+        var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+        defer parsed.deinit(alloc);
+        var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+        defer res.deinit(alloc);
+        if (res == .err) {
+            std.debug.print("Round 5 -m p2 error: {s}\n", .{res.err});
+        }
+        try std.testing.expect(res == .ok);
+
+        var out_h = try cwd.openDir(io, out_p2, .{});
+        defer out_h.close(io);
+        _ = try out_h.statFile(io, "p2.zig", .{});
+        try std.testing.expectError(error.FileNotFound, out_h.statFile(io, "p1.zig", .{}));
+        try std.testing.expectError(error.FileNotFound, out_h.statFile(io, "p3.zig", .{}));
+        try std.testing.expectError(error.FileNotFound, out_h.statFile(io, "p4.zig", .{}));
+        try std.testing.expectError(error.FileNotFound, out_h.statFile(io, "index.zig", .{}));
+        try std.testing.expectError(error.FileNotFound, out_h.statFile(io, "b.zig", .{}));
+    }
+
+    const consumer_zig = try std.fmt.allocPrint(alloc, "{s}/consumer_r5.zig", .{sandbox});
+    defer alloc.free(consumer_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "consumer_r5.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r_full = @import("out-full/root.zig");
+            \\const r_p2 = @import("out-p2/root.zig");
+            \\
+            \\test "Round 5: helpers land in owning ambient module and stay out of zigar_js.exports" {
+            \\    // `Hid`, `HidBase`, and `NestedHid` belong to `p2.zig` and NOT `p1.zig`!
+            \\    try std.testing.expect(@hasDecl(r_full.p2, "Hid"));
+            \\    try std.testing.expect(@hasDecl(r_full.p2, "HidBase"));
+            \\    try std.testing.expect(@hasDecl(r_full.p2, "NestedHid"));
+            \\    try std.testing.expect(@hasDecl(r_full.p2, "g"));
+            \\    try std.testing.expect(!@hasDecl(r_full.p1, "Hid"));
+            \\    try std.testing.expect(!@hasDecl(r_full.p1, "HidBase"));
+            \\    try std.testing.expect(!@hasDecl(r_full.p1, "NestedHid"));
+            \\
+            \\    // `p1.zigar_js.exports` has only `P1`; `p2.zigar_js.exports` has only `g` (NOT `Hid`/`HidBase`/`NestedHid`)!
+            \\    try std.testing.expectEqual(@as(usize, 1), r_full.p1.zigar_js.exports.len);
+            \\    try std.testing.expectEqualStrings("P1", r_full.p1.zigar_js.exports[0].js_name);
+            \\    try std.testing.expectEqual(@as(usize, 1), r_full.p2.zigar_js.exports.len);
+            \\    try std.testing.expectEqualStrings("g", r_full.p2.zigar_js.exports[0].js_name);
+            \\
+            \\    // Reverse-order cross-ambient alias: `HidP4` belongs to `p4.zig` (NOT `p3.zig`) and is excluded from `p4.zigar_js.exports`!
+            \\    try std.testing.expect(@hasDecl(r_full.p4, "HidP4"));
+            \\    try std.testing.expect(!@hasDecl(r_full.p3, "HidP4"));
+            \\    try std.testing.expectEqual(@as(usize, 1), r_full.p4.zigar_js.exports.len);
+            \\    try std.testing.expectEqualStrings("AliasP4", r_full.p4.zigar_js.exports[0].js_name);
+            \\
+            \\    // `-m p2` output works standalone without `p1`, barrel-exports `g` (not private `Hid`), and types `r_p2.p2.Hid`!
+            \\    try std.testing.expect(!@hasDecl(r_p2, "p1"));
+            \\    try std.testing.expect(@hasDecl(r_p2, "g"));
+            \\    try std.testing.expect(!@hasDecl(r_p2, "Hid"));
+            \\    try std.testing.expect(&r_p2.g == &r_p2.p2.g);
+            \\    try std.testing.expectEqual(@as(usize, 1), r_p2.p2.zigar_js.exports.len);
+            \\    try std.testing.expectEqualStrings("g", r_p2.p2.zigar_js.exports[0].js_name);
+            \\    const hid_val: r_p2.p2.Hid = .{ .s = 7, .nested = .{ .flag = true } };
+            \\    try std.testing.expectEqual(@as(f64, 7), hid_val.s);
+            \\    _ = &r_p2.g;
+            \\}
+            ,
+        });
+    }
+
+    const r_full_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_full});
+    defer alloc.free(r_full_zig);
+    const r_p2_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_p2});
+    defer alloc.free(r_p2_zig);
+
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", r_full_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", r_p2_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
+}
