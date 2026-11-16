@@ -2,14 +2,17 @@
 
 import { copyFile, readFile, writeFile } from 'fs/promises';
 import { createRequire } from 'module';
-import { buildAddon, optionsForAddon } from 'node-zigar-addon';
 import os from 'os';
 import { dirname, extname, join, parse, relative, resolve } from 'path';
-import {
+import { fileURLToPath } from 'url';
+
+const zigarCompiler = await import('zigar-compiler').catch(
+  () => import(new URL('../../zigar-compiler/dist/index.js', import.meta.url))
+);
+const {
   compile, findConfigFile, generateCode, getArch, getPlatform, hideStatus, optionsForCompile,
   processConfig, showResult, showStatus, test,
-} from 'zigar-compiler';
-import * as zigarCompiler from 'zigar-compiler';
+} = zigarCompiler;
 
 const require = createRequire(import.meta.url);
 
@@ -22,6 +25,9 @@ const possibleArchs = [
 ];
 
 async function buildModules() {
+  const { buildAddon, optionsForAddon } = await import('node-zigar-addon').catch(
+    () => import(new URL('../../node-zigar-addon/dist/index.js', import.meta.url))
+  );
   // load node-zigar.config.js
   const configPath = await findConfigFile('bun-zigar.toml', process.cwd());
   if (!configPath) {
@@ -212,9 +218,12 @@ async function copyBuildExtraFile() {
 }
 
 function findZigarCompiler() {
-  const require = createRequire(import.meta.url);
-  const jsPath = require.resolve('zigar-compiler');
-  return resolve(jsPath, '../..');
+  try {
+    const jsPath = require.resolve('zigar-compiler');
+    return resolve(jsPath, '../..');
+  } catch {
+    return fileURLToPath(new URL('../../zigar-compiler', import.meta.url));
+  }
 }
 
 async function runTests(args) {
@@ -242,6 +251,16 @@ async function runWitCommand(args) {
   }
 }
 
+async function runTsCommand(args) {
+  if (typeof zigarCompiler.runTs !== 'function') {
+    throw new Error('Installed zigar-compiler does not export runTs');
+  }
+  const { code } = await zigarCompiler.runTs(args);
+  if (code) {
+    process.exit(code);
+  }
+}
+
 function printHelp() {
   const lines = [
     'Usage: bunx bun-zigar [command]',
@@ -255,6 +274,7 @@ function printHelp() {
     '  preload       Add bun-zigar as preloaded module to bunfig.toml',
     '  test <path>   Run a Zig module\'s unit tests',
     '  wit [args]    Generate Zig bindings from WIT or inspect zigar:abi sections',
+    '  ts [args]     Generate Zig bindings from TypeScript declarations',
     '',
     '  help          Show this message',
     '',
@@ -287,6 +307,9 @@ try {
       break;
     case 'wit':
       await runWitCommand(process.argv.slice(3));
+      break;
+    case 'ts':
+      await runTsCommand(process.argv.slice(3));
       break;
     case 'help':
     case undefined:

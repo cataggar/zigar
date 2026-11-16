@@ -547,7 +547,13 @@ export function instantiateComponentHost(wasmSourceOrPath, options = {}) {
   }
 
   const registry = getComponentHostRegistry();
-  const instanceId = (options.instanceId !== undefined ? options.instanceId : registry.nextId++) >>> 0;
+  const instanceId = (
+    options.instanceId !== undefined
+      ? options.instanceId
+      : options.register === false
+        ? 0
+        : registry.nextId++
+  ) >>> 0;
 
   const host = {
     instanceId,

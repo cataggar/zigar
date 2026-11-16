@@ -9,7 +9,8 @@
     "./transpiler": "./dist/transpiler.js"
   },
   "bin": {
-    "zigar": "bin/cli.js"
+    "zigar": "bin/cli.js",
+    "ts2zig": "bin/ts2zig.js"
   },
   "type": "module",
   "directories": {
@@ -23,8 +24,8 @@
     "debug": "DEV=1 TARGET=wasm BITS=32 MIXIN=track mocha --reporter spec --inspect-brk -- test/*.test.js",
     "coverage": "DEV=1 TARGET=wasm BITS=32 MIXIN=track c8 mocha -- test/*.test.js",
     "rollup": "rollup -c rollup.config.js",
-    "prepack": "rm -rf zig/wit-zigar && mkdir -p zig/wit-zigar && cp -r ../wit-zigar/src zig/wit-zigar/src",
-    "postpack": "rm -rf zig/wit-zigar"
+    "prepack": "rm -rf zig/wit-zigar zig/ts-zigar && mkdir -p zig/wit-zigar zig/ts-zigar/component && cp -r ../wit-zigar/src zig/wit-zigar/src && cp -r ../ts-zigar/src zig/ts-zigar/src && cp -r ../ts-zigar/wit zig/ts-zigar/wit && cp ../ts-zigar/component/build-component.mjs zig/ts-zigar/component/build-component.mjs && (test ! -d ../ts-zigar/component/dist || cp -r ../ts-zigar/component/dist zig/ts-zigar/component/dist)",
+    "postpack": "rm -rf zig/wit-zigar zig/ts-zigar"
   },
   "files": [
     "dist/*",

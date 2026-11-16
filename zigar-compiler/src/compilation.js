@@ -9,6 +9,7 @@ import {
   acquireLock, copyFile, copyZonFile, createDirectory, deleteDirectory, deleteFile, getArch,
   getDirectoryStats, getLibraryExt, getPlatform, releaseLock, sha1
 } from './utility-functions.js';
+import { instantiateComponentHost, wrapWasiImportsUnsigned } from './component-host.js';
 import { fixWasm64TlsGlobals } from './wasm-decoding.js';
 
 const execFileAsync = promisify(execFile);
@@ -288,6 +289,506 @@ export async function runWit(args = [], options = {}) {
     } else {
       throw err;
     }
+  }
+  const stdout = Buffer.concat(stdoutChunks).toString('utf-8');
+  const stderr = Buffer.concat(stderrChunks).toString('utf-8');
+  return { code, stdout, stderr };
+}
+
+const tsWasmModuleCache = new Map();
+const tsComponentBytesCache = new Map();
+
+async function findTsZigarDir() {
+  const candidates = [
+    fileURLToPath(new URL('../zig/ts-zigar', import.meta.url)),
+    fileURLToPath(new URL('../../ts-zigar', import.meta.url)),
+  ];
+  for (const dir of candidates) {
+    try {
+      const [ mainInfo, witInfo ] = await Promise.all([
+        stat(join(dir, 'src', 'main.zig')),
+        stat(join(dir, 'wit', 'typescript.wit')),
+      ]);
+      if (mainInfo.isFile() && witInfo.isFile()) {
+        return dir;
+      }
+    } catch {}
+  }
+  throw new Error('Unable to locate ts-zigar directory (src/main.zig and wit/typescript.wit)');
+}
+
+async function isExistingFile(filePath) {
+  if (!filePath) return false;
+  try {
+    const info = await stat(filePath);
+    return info.isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function resolveOrBuildTsComponentWasm({
+  explicitComponentPath,
+  componentOptionPath,
+  tsZigarDir,
+  buildDir,
+}) {
+  if (explicitComponentPath) {
+    if (await isExistingFile(explicitComponentPath)) {
+      return explicitComponentPath;
+    }
+    // Leave null so `ts-zigar` CLI emits its crisp missing-component diagnostic & non-zero exit code.
+    return null;
+  }
+  if (componentOptionPath) {
+    if (await isExistingFile(componentOptionPath)) {
+      return componentOptionPath;
+    }
+    throw new Error(`TypeScript component WASM not found: ${componentOptionPath}`);
+  }
+  const envCandidates = [
+    process.env.TS_ZIGAR_COMPONENT_PATH,
+    process.env.TS_ZIGAR_COMPONENT_WASM,
+  ];
+  for (const envPath of envCandidates) {
+    if (envPath && (await isExistingFile(envPath))) {
+      return resolve(envPath);
+    }
+  }
+  const staticCandidates = [
+    join(tsZigarDir, 'component', 'dist', 'typescript-compiler.component.wasm'),
+    join(tsZigarDir, 'dist', 'typescript-compiler.component.wasm'),
+    join(buildDir, 'typescript-compiler.component.wasm'),
+  ];
+  for (const cand of staticCandidates) {
+    if (await isExistingFile(cand)) {
+      return cand;
+    }
+  }
+
+  const buildScript = join(tsZigarDir, 'component', 'build-component.mjs');
+  if (await isExistingFile(buildScript)) {
+    const lockPath = join(buildDir, 'ts-zigar-component.pid');
+    await acquireLock(lockPath);
+    try {
+      for (const cand of staticCandidates) {
+        if (await isExistingFile(cand)) {
+          return cand;
+        }
+      }
+      let targetOut = join(tsZigarDir, 'component', 'dist', 'typescript-compiler.component.wasm');
+      try {
+        await createDirectory(dirname(targetOut));
+      } catch {
+        targetOut = join(buildDir, 'typescript-compiler.component.wasm');
+        await createDirectory(dirname(targetOut));
+      }
+      await execFileAsync(process.execPath, [ buildScript, '-o', targetOut ], {
+        cwd: tsZigarDir,
+        env: process.env,
+      });
+      if (await isExistingFile(targetOut)) {
+        return targetOut;
+      }
+    } finally {
+      await releaseLock(lockPath);
+    }
+  }
+
+  throw new Error(
+    'Unable to locate or build typescript-compiler.component.wasm (set TS_ZIGAR_COMPONENT_PATH or pass --component <path>)',
+  );
+}
+
+async function loadCachedComponentBytes(wasmFilePath) {
+  const info = await stat(wasmFilePath);
+  const cached = tsComponentBytesCache.get(wasmFilePath);
+  if (cached && cached.mtimeMs === info.mtimeMs && cached.size === info.size) {
+    return cached.bytes;
+  }
+  const buf = await readFile(wasmFilePath);
+  const bytes = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  tsComponentBytesCache.set(wasmFilePath, {
+    mtimeMs: info.mtimeMs,
+    size: info.size,
+    bytes,
+  });
+  return bytes;
+}
+
+export async function runTs(args = [], options = {}) {
+  const {
+    cwd: runCwd = process.cwd(),
+    silent = false,
+    buildDir = process.env.ZIGAR_CACHE_DIR || join(os.tmpdir(), 'zigar-build'),
+    optimize = 'ReleaseSmall',
+    recompile = false,
+    zigPath: zigPathOption,
+    useWazig: useWazigOption,
+    componentPath: componentOptionPath,
+    onStart,
+    onEnd,
+  } = options;
+  const [ witZigarSrcDir, tsZigarDir ] = await Promise.all([
+    findWitZigarSrcDir(),
+    findTsZigarDir(),
+  ]);
+  const tsSrcDir = join(tsZigarDir, 'src');
+  const tsWitPath = join(tsZigarDir, 'wit', 'typescript.wit');
+  const zigPath = resolveWitZigPath(zigPathOption, useWazigOption);
+  const tsBuildDir = join(
+    buildDir,
+    'ts-zigar-cli-' + sha1(`${tsZigarDir}:${witZigarSrcDir}:${zigPath}`).slice(0, 8),
+  );
+  const wasmPath = join(tsBuildDir, optimize, 'ts-zigar.wasm');
+  const metaPath = join(tsBuildDir, optimize, 'ts-zigar.meta.json');
+  const pidPath = `${tsBuildDir}.pid`;
+
+  await acquireLock(pidPath);
+  let wasmModule;
+  try {
+    const getWasmMTime = async () => {
+      try {
+        const stats = await stat(wasmPath);
+        return stats.mtimeMs;
+      } catch {}
+    };
+    const getSavedMeta = async () => {
+      try {
+        return JSON.parse(await readFile(metaPath, 'utf-8'));
+      } catch {
+        return null;
+      }
+    };
+    const [ wasmMTimeBefore, tsSrcStats, witFileStats, witZigarStats, savedMeta ] = await Promise.all([
+      getWasmMTime(),
+      getDirectoryStats(tsSrcDir),
+      stat(tsWitPath),
+      getDirectoryStats(witZigarSrcDir),
+      getSavedMeta(),
+    ]);
+    const latestInputMtime = Math.max(
+      tsSrcStats.mtimeMs,
+      witFileStats.mtimeMs,
+      witZigarStats.mtimeMs,
+    );
+    const metaMatches = Boolean(
+      savedMeta &&
+      savedMeta.tsSize === tsSrcStats.size &&
+      savedMeta.tsMtimeMs === tsSrcStats.mtimeMs &&
+      savedMeta.witSize === witFileStats.size &&
+      savedMeta.witMtimeMs === witFileStats.mtimeMs &&
+      savedMeta.witZigarSize === witZigarStats.size &&
+      savedMeta.witZigarMtimeMs === witZigarStats.mtimeMs &&
+      savedMeta.zigPath === zigPath
+    );
+    if (!wasmMTimeBefore || !metaMatches || wasmMTimeBefore < latestInputMtime || recompile === true) {
+      await stageDirectory(tsSrcDir, join(tsBuildDir, 'src'), (name, isDir) => {
+        if (isDir) {
+          return !['.zig-cache', 'zig-cache', 'zig-out', 'node_modules'].includes(name);
+        }
+        return name.endsWith('.zig');
+      });
+      await stageDirectory(witZigarSrcDir, join(tsBuildDir, 'wit-zigar'), (name, isDir) => {
+        if (isDir) {
+          return !['.zig-cache', 'zig-cache', 'zig-out', 'node_modules'].includes(name);
+        }
+        return name.endsWith('.zig');
+      });
+      await createDirectory(join(tsBuildDir, 'generated'));
+      await createDirectory(join(tsBuildDir, optimize));
+
+      const gen32Path = join(tsBuildDir, 'generated', 'generated_ts_wasm32.zig');
+      const gen64Path = join(tsBuildDir, 'generated', 'generated_ts_wasm64.zig');
+      const witRes32 = await runWit([ tsWitPath, '-o', gen32Path ], {
+        cwd: tsBuildDir,
+        silent: true,
+        buildDir,
+        optimize,
+        zigPath,
+      });
+      if (witRes32.code !== 0) {
+        throw new Error(`wit-zigar failed generating wasm32 TS bindings:\n${witRes32.stderr}`);
+      }
+      const witRes64 = await runWit([ tsWitPath, '--wasm64', '-o', gen64Path ], {
+        cwd: tsBuildDir,
+        silent: true,
+        buildDir,
+        optimize,
+        zigPath,
+      });
+      if (witRes64.code !== 0) {
+        throw new Error(`wit-zigar failed generating wasm64 TS bindings:\n${witRes64.stderr}`);
+      }
+
+      const buildOptionsSource = [
+        'pub const default_component_path: []const u8 = "";',
+        'pub const build_component_script_path: []const u8 = "";',
+        'pub const default_node_exe: []const u8 = "node";',
+        '',
+      ].join('\n');
+      await writeFile(join(tsBuildDir, 'generated', 'build_options.zig'), buildOptionsSource, 'utf-8');
+
+      const sharedCacheDir = join(buildDir, `.zig-cache-${sha1(zigPath).slice(0, 8)}`);
+      const localCacheDir = join(tsBuildDir, '.zig-cache');
+      await syncCacheDir(sharedCacheDir, localCacheDir);
+      const zigArgs = [
+        'build-exe',
+        '--cache-dir', '.zig-cache',
+        '--global-cache-dir', '.zig-cache',
+        '-target', 'wasm32-wasi',
+        '-O' + optimize,
+        '-fsingle-threaded',
+        '--dep', 'ts_zigar',
+        '--dep', 'build_options',
+        '-Mroot=src/main.zig',
+        '--dep', 'wit_zigar',
+        '--dep', 'generated_ts_wasm32',
+        '--dep', 'generated_ts_wasm64',
+        '-Mts_zigar=src/root.zig',
+        '-Mbuild_options=generated/build_options.zig',
+        '-Mwit_zigar=wit-zigar/root.zig',
+        '-Mgenerated_ts_wasm32=generated/generated_ts_wasm32.zig',
+        '-Mgenerated_ts_wasm64=generated/generated_ts_wasm64.zig',
+        `-femit-bin=${join(optimize, 'ts-zigar.wasm')}`,
+      ];
+      await runCompiler(zigPath, zigArgs, { cwd: tsBuildDir, onStart, onEnd });
+      await syncCacheDir(localCacheDir, sharedCacheDir);
+      await writeFile(metaPath, JSON.stringify({
+        tsSize: tsSrcStats.size,
+        tsMtimeMs: tsSrcStats.mtimeMs,
+        witSize: witFileStats.size,
+        witMtimeMs: witFileStats.mtimeMs,
+        witZigarSize: witZigarStats.size,
+        witZigarMtimeMs: witZigarStats.mtimeMs,
+        zigPath,
+      }));
+    }
+    const wasmMTime = await getWasmMTime();
+    const cached = tsWasmModuleCache.get(wasmPath);
+    if (
+      cached &&
+      !recompile &&
+      cached.mtimeMs === wasmMTime &&
+      cached.tsMtimeMs === tsSrcStats.mtimeMs &&
+      cached.tsSize === tsSrcStats.size
+    ) {
+      wasmModule = cached.module;
+    } else {
+      const wasmBytes = await readFile(wasmPath);
+      wasmModule = await WebAssembly.compile(wasmBytes);
+      tsWasmModuleCache.set(wasmPath, {
+        mtimeMs: wasmMTime,
+        tsMtimeMs: tsSrcStats.mtimeMs,
+        tsSize: tsSrcStats.size,
+        module: wasmModule,
+      });
+    }
+  } finally {
+    await releaseLock(pidPath);
+  }
+
+  const hostRoot = parse(resolve(runCwd)).root || '/';
+  const toWasiPath = (p) => {
+    if (p === '') return '';
+    const resolved = resolve(runCwd, p);
+    const rel = relative(hostRoot, resolved);
+    if (isAbsolute(rel) || rel.startsWith('..')) {
+      throw new Error(`Path lies outside WASI preopen root (${hostRoot}): ${p}`);
+    }
+    return rel.split(sep).join('/') || '.';
+  };
+
+  const normalizedArgs = [];
+  let hasHelpOrVersion = false;
+  let hasTypes = false;
+  let hasOutDir = false;
+  let explicitComponentPath = null;
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = String(args[i]);
+    if (arg === '-h' || arg === '--help' || arg === '-v' || arg === '--version') {
+      hasHelpOrVersion = true;
+      normalizedArgs.push(arg);
+    } else if (arg === '-t' || arg === '--types') {
+      normalizedArgs.push(arg);
+      if (i + 1 < args.length) {
+        const val = String(args[++i]);
+        if (val.length > 0) hasTypes = true;
+        normalizedArgs.push(toWasiPath(val));
+      }
+    } else if (arg.startsWith('-t=') || arg.startsWith('--types=')) {
+      const eq = arg.indexOf('=');
+      const prefix = arg.slice(0, eq + 1);
+      const val = arg.slice(eq + 1);
+      if (val.length > 0) hasTypes = true;
+      normalizedArgs.push(prefix + toWasiPath(val));
+    } else if (arg === '-d' || arg === '--out-dir') {
+      normalizedArgs.push(arg);
+      if (i + 1 < args.length) {
+        const val = String(args[++i]);
+        if (val.length > 0) hasOutDir = true;
+        normalizedArgs.push(toWasiPath(val));
+      }
+    } else if (arg.startsWith('-d=') || arg.startsWith('--out-dir=')) {
+      const eq = arg.indexOf('=');
+      const prefix = arg.slice(0, eq + 1);
+      const val = arg.slice(eq + 1);
+      if (val.length > 0) hasOutDir = true;
+      normalizedArgs.push(prefix + toWasiPath(val));
+    } else if (arg === '--component') {
+      normalizedArgs.push(arg);
+      if (i + 1 < args.length) {
+        const val = String(args[++i]);
+        if (val.length > 0) {
+          explicitComponentPath = resolve(runCwd, val);
+        }
+        normalizedArgs.push(toWasiPath(val));
+      }
+    } else if (arg.startsWith('--component=')) {
+      const eq = arg.indexOf('=');
+      const prefix = arg.slice(0, eq + 1);
+      const val = arg.slice(eq + 1);
+      if (val.length > 0) {
+        explicitComponentPath = resolve(runCwd, val);
+      }
+      normalizedArgs.push(prefix + toWasiPath(val));
+    } else if (arg === '-m' || arg === '--module' || arg === '-s' || arg === '--substitute') {
+      normalizedArgs.push(arg);
+      if (i + 1 < args.length) {
+        normalizedArgs.push(String(args[++i]));
+      }
+    } else {
+      normalizedArgs.push(arg);
+    }
+  }
+
+  let componentBytes = null;
+  if (!hasHelpOrVersion && hasTypes && hasOutDir) {
+    const resolvedCompPath = await resolveOrBuildTsComponentWasm({
+      explicitComponentPath,
+      componentOptionPath: componentOptionPath ? resolve(runCwd, componentOptionPath) : null,
+      tsZigarDir,
+      buildDir,
+    });
+    if (resolvedCompPath) {
+      componentBytes = await loadCachedComponentBytes(resolvedCompPath);
+    }
+  }
+
+  const origEmitWarning = process.emitWarning;
+  let WASI;
+  let wasi;
+  process.emitWarning = function(warning, ...warningArgs) {
+    const msg = typeof warning === 'string' ? warning : warning?.message;
+    if (String(msg).includes('WASI')) return;
+    return origEmitWarning.call(this, warning, ...warningArgs);
+  };
+  try {
+    ({ WASI } = await import('node:wasi'));
+    wasi = new WASI({
+      version: 'preview1',
+      args: [ 'ts-zigar', ...normalizedArgs ],
+      env: process.env,
+      preopens: { '/': hostRoot },
+      returnOnExit: true,
+    });
+  } finally {
+    process.emitWarning = origEmitWarning;
+  }
+
+  const rawImports = wrapWasiImportsUnsigned(
+    typeof wasi.getImportObject === 'function'
+      ? wasi.getImportObject()
+      : { wasi_snapshot_preview1: wasi.wasiImport },
+  );
+  const wasiImport = { ...rawImports.wasi_snapshot_preview1 };
+  const importObject = { ...rawImports, wasi_snapshot_preview1: wasiImport };
+  const origPathOpen = wasiImport.path_open;
+  if (typeof origPathOpen === 'function') {
+    wasiImport.path_open = (fd, dirflags, pathPtr, pathLen, oflags, fsRightsBase, fsRightsInheriting, fdflags, openedFdPtr) => {
+      return origPathOpen(fd, dirflags, pathPtr, pathLen, oflags, fsRightsBase, 0xfffffffn, fdflags, openedFdPtr);
+    };
+  }
+  wasiImport.proc_exit = (rval) => {
+    const exitErr = new Error(`WASI exit: ${rval}`);
+    exitErr.isWasiExit = true;
+    exitErr.code = rval >>> 0;
+    throw exitErr;
+  };
+  const origFdWrite = wasiImport.fd_write;
+  const stdoutChunks = [];
+  const stderrChunks = [];
+  let instance;
+  wasiImport.fd_write = (fd, iovsPtr, iovsLen, nwrittenPtr) => {
+    if (fd === 1 || fd === 2) {
+      const uIovsPtr = iovsPtr >>> 0;
+      const uNwrittenPtr = nwrittenPtr >>> 0;
+      const { buffer } = instance.exports.memory;
+      const view = new DataView(buffer);
+      let total = 0;
+      for (let i = 0; i < iovsLen; i++) {
+        const ptr = view.getUint32(uIovsPtr + i * 8, true);
+        const len = view.getUint32(uIovsPtr + i * 8 + 4, true);
+        if (len > 0) {
+          const chunk = Buffer.from(buffer.slice(ptr, ptr + len));
+          if (fd === 1) {
+            stdoutChunks.push(chunk);
+            if (!silent) {
+              process.stdout.write(chunk);
+            }
+          } else {
+            stderrChunks.push(chunk);
+            if (!silent) {
+              process.stderr.write(chunk);
+            }
+          }
+          total += len;
+        }
+      }
+      view.setUint32(uNwrittenPtr, total, true);
+      return 0;
+    }
+    return origFdWrite(fd, iovsPtr, iovsLen, nwrittenPtr);
+  };
+
+  let componentHost = null;
+  let realHostImports = null;
+  const ensureHostImports = () => {
+    if (!realHostImports) {
+      if (!componentBytes) {
+        throw new Error('TypeScript 7.1 component WASM is not loaded');
+      }
+      componentHost = instantiateComponentHost(componentBytes, { register: false });
+      realHostImports = componentHost.createWasmImports(() => instance.exports.memory)['zigar:component-host'];
+    }
+    return realHostImports;
+  };
+  const hostBridge = {};
+  for (const imp of WebAssembly.Module.imports(wasmModule)) {
+    if (imp.module === 'zigar:component-host' && imp.kind === 'function') {
+      hostBridge[imp.name] = (...callArgs) => ensureHostImports()[imp.name](...callArgs);
+    }
+  }
+  importObject['zigar:component-host'] = hostBridge;
+
+  instance = await WebAssembly.instantiate(wasmModule, importObject);
+  let code = 0;
+  try {
+    const startResult = wasi.start(instance);
+    if (typeof startResult === 'number') {
+      code = startResult;
+    }
+  } catch (err) {
+    if (err?.isWasiExit) {
+      code = err.code;
+    } else {
+      throw err;
+    }
+  } finally {
+    try {
+      componentHost?.dispose();
+    } catch {}
   }
   const stdout = Buffer.concat(stdoutChunks).toString('utf-8');
   const stderr = Buffer.concat(stderrChunks).toString('utf-8');
