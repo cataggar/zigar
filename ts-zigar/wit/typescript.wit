@@ -292,6 +292,7 @@ interface types {
         return-type: type-id,
         type-predicate: option<type-predicate-data>,
         is-abstract: bool,
+        modifiers: modifier-flags,
         jsdoc: option<jsdoc-info>,
     }
 
@@ -409,6 +410,8 @@ interface types {
     record ambient-module-node {
         module-name: string-id,
         decls: list<decl-id>,
+        default-export: option<decl-id>,
+        export-equals: option<decl-id>,
     }
 
     /// Resolved TypeScript source or `.d.ts` module in `declaration-graph.modules`.

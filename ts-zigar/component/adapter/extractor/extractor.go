@@ -160,6 +160,12 @@ type localAliasKey struct {
 	targetDecl uint32
 }
 
+type nsAliasKey struct {
+	nsDeclID   uint32
+	exportName string
+	targetDecl uint32
+}
+
 type graphBuilder struct {
 	prog   *export_zigar_typescript_compiler.Program
 	tsProg *compiler.Program
@@ -186,8 +192,11 @@ type graphBuilder struct {
 	declBySymCat        map[symCatKey]uint32
 	declByNode          map[*ast.Node]uint32
 	localAliasReExports map[localAliasKey]uint32
+	nsAliasReExports    map[nsAliasKey]uint32
 	allDeclsForSym      map[*ast.Symbol][]uint32
 	extractedSymSet     map[*ast.Symbol]bool
+	activeNsSyms        []*ast.Symbol
+	activeNsDeclIDs     []uint32
 
 	astTypeMemo      map[*ast.Node]uint32
 	checkerTypeMemo  map[*checker.Type]uint32
@@ -240,6 +249,7 @@ func newGraphBuilder(
 		declBySymCat:        map[symCatKey]uint32{},
 		declByNode:          map[*ast.Node]uint32{},
 		localAliasReExports: map[localAliasKey]uint32{},
+		nsAliasReExports:    map[nsAliasKey]uint32{},
 		allDeclsForSym:      map[*ast.Symbol][]uint32{},
 		extractedSymSet:     map[*ast.Symbol]bool{},
 		astTypeMemo:         map[*ast.Node]uint32{},

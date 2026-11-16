@@ -204,19 +204,28 @@ const SourceCollector = struct {
         };
         errdefer self.allocator.free(contents);
 
+        try self.files.ensureUnusedCapacity(self.allocator, 1);
+        try self.vfs_seen.ensureUnusedCapacity(self.allocator, 1);
+
+        const do_enqueue = enqueue_scan and isTypeScriptDeclarationOrSource(vfs_path);
+        var dp_copy: []u8 = &.{};
+        errdefer if (dp_copy.len > 0) self.allocator.free(dp_copy);
+        var vp_copy: []u8 = &.{};
+        errdefer if (vp_copy.len > 0) self.allocator.free(vp_copy);
+        if (do_enqueue) {
+            dp_copy = try self.allocator.dupe(u8, disk_path);
+            vp_copy = try self.allocator.dupe(u8, vfs_path);
+            try self.scan_queue.ensureUnusedCapacity(self.allocator, 1);
+        }
+
         const idx = self.files.items.len;
-        try self.files.append(self.allocator, .{
+        self.files.appendAssumeCapacity(.{
             .vfs_path = vfs_path,
             .contents = contents,
         });
-        try self.vfs_seen.put(self.allocator, vfs_path, idx);
-
-        if (enqueue_scan and isTypeScriptDeclarationOrSource(vfs_path)) {
-            const dp_copy = try self.allocator.dupe(u8, disk_path);
-            errdefer self.allocator.free(dp_copy);
-            const vp_copy = try self.allocator.dupe(u8, vfs_path);
-            errdefer self.allocator.free(vp_copy);
-            try self.scan_queue.append(self.allocator, .{
+        self.vfs_seen.putAssumeCapacity(vfs_path, idx);
+        if (do_enqueue) {
+            self.scan_queue.appendAssumeCapacity(.{
                 .disk_path = dp_copy,
                 .vfs_path = vp_copy,
             });
@@ -821,10 +830,11 @@ pub fn runPipelineWithHost(
     defer extract_roots_set.deinit(allocator);
 
     for (program_roots.items) |rp| {
+        try extract_roots.ensureUnusedCapacity(allocator, 1);
+        try extract_roots_set.ensureUnusedCapacity(allocator, 1);
         const owned = try allocator.dupe(u8, rp);
-        errdefer allocator.free(owned);
-        try extract_roots.append(allocator, owned);
-        try extract_roots_set.put(allocator, owned, {});
+        extract_roots.appendAssumeCapacity(owned);
+        extract_roots_set.putAssumeCapacity(owned, {});
     }
 
     var extract_root_slices: std.ArrayList([]const u8) = .empty;
@@ -842,7 +852,7 @@ pub fn runPipelineWithHost(
     defer if (graph_res_active) host_mod.TypeScriptHost.freeValue(@TypeOf(graph_res), allocator, graph_res);
 
     var iter: usize = 0;
-    while (iter < 8 and graph_res == .ok) : (iter += 1) {
+    while (iter < 64 and graph_res == .ok) : (iter += 1) {
         const g = graph_res.ok;
         var newly_discovered: std.ArrayList([]u8) = .empty;
         errdefer {
@@ -863,7 +873,9 @@ pub fn runPipelineWithHost(
                 }
             }
             if (dup_in_batch) continue;
-            try newly_discovered.append(allocator, try allocator.dupe(u8, fp));
+            try newly_discovered.ensureUnusedCapacity(allocator, 1);
+            const duped = try allocator.dupe(u8, fp);
+            newly_discovered.appendAssumeCapacity(duped);
         }
 
         if (newly_discovered.items.len == 0) {
@@ -871,14 +883,19 @@ pub fn runPipelineWithHost(
             break;
         }
 
+        try extract_roots.ensureUnusedCapacity(allocator, newly_discovered.items.len);
+        try extract_roots_set.ensureUnusedCapacity(allocator, @intCast(newly_discovered.items.len));
+        try extract_root_slices.ensureUnusedCapacity(allocator, newly_discovered.items.len);
+
         host_mod.TypeScriptHost.freeValue(@TypeOf(graph_res), allocator, graph_res);
         graph_res_active = false;
 
         for (newly_discovered.items) |owned_fp| {
-            try extract_roots.append(allocator, owned_fp);
-            try extract_roots_set.put(allocator, owned_fp, {});
-            try extract_root_slices.append(allocator, owned_fp);
+            extract_roots.appendAssumeCapacity(owned_fp);
+            extract_roots_set.putAssumeCapacity(owned_fp, {});
+            extract_root_slices.appendAssumeCapacity(owned_fp);
         }
+        newly_discovered.clearRetainingCapacity();
         newly_discovered.deinit(allocator);
 
         graph_res = ts_host.extractModuleGraph(

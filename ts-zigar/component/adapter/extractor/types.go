@@ -1203,14 +1203,19 @@ func (b *graphBuilder) buildCheckerObjectTypeKind(t *checker.Type, expandAlias b
 
 	// 6. Structural ObjectLiteral (includes evaluated Partial<T>, Pick<T, K>, Record<string, V>, etc.!).
 	propIDs := make([]uint32, 0, len(props))
+	skippedPrivate := false
 	for _, propSym := range props {
 		if propSym == nil {
 			continue
 		}
 		if !b.cfg.IncludePrivateMembers && b.isPrivateSymbol(propSym) {
+			skippedPrivate = true
 			continue
 		}
 		propIDs = append(propIDs, b.extractCheckerPropertySymbol(propSym, t))
+	}
+	if skippedPrivate {
+		propIDs = append(propIDs, b.allocPrivateBrandProp())
 	}
 
 	callSigIDs := make([]uint32, 0, len(callSigs))

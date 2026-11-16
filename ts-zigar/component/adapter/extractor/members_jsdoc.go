@@ -212,12 +212,14 @@ func (b *graphBuilder) extractMemberNodes(
 	accessors := map[string]*accessorAccum{}
 	var methodOrder []string
 	methodGroups := map[string]*methodAccum{}
+	skippedPrivateMember := false
 
 	for _, m := range members {
 		if m == nil {
 			continue
 		}
-		if !b.cfg.IncludePrivateMembers && b.isPrivateMemberNode(m) {
+		if m.Kind != ast.KindConstructor && !b.cfg.IncludePrivateMembers && b.isPrivateMemberNode(m) {
+			skippedPrivateMember = true
 			continue
 		}
 
@@ -229,6 +231,7 @@ func (b *graphBuilder) extractMemberNodes(
 				for _, p := range pl.Nodes {
 					if p != nil && ast.IsParameterPropertyDeclaration(p, m) {
 						if !b.cfg.IncludePrivateMembers && b.isPrivateMemberNode(p) {
+							skippedPrivateMember = true
 							continue
 						}
 						props = append(props, b.extractPropertyNode(p))
@@ -355,6 +358,10 @@ func (b *graphBuilder) extractMemberNodes(
 		props = append(props, propID)
 	}
 
+	if skippedPrivateMember {
+		props = append(props, b.allocPrivateBrandProp())
+	}
+
 	// Finalize overloaded methods.
 	for _, key := range methodOrder {
 		mg := methodGroups[key]
@@ -461,6 +468,19 @@ func (b *graphBuilder) extractCheckerPropertySymbol(sym *ast.Symbol, containingT
 		HasSetter:      hasSetter,
 		Modifiers:      mods,
 		Jsdoc:          b.extractJsdocForNodes(sym.Declarations()),
+	})
+}
+
+func (b *graphBuilder) allocPrivateBrandProp() uint32 {
+	return b.allocProp(zigar_typescript_types.PropNode{
+		Name:           b.intern("#private"),
+		ComputedSymbol: witTypes.None[zigar_typescript_types.SymbolKey](),
+		Ty:             b.allocType(zigar_typescript_types.MakeTypeKindAnyType()),
+		SetterTy:       witTypes.None[uint32](),
+		HasGetter:      false,
+		HasSetter:      false,
+		Modifiers:      zigar_typescript_types.ModifierFlags_PrivateMod,
+		Jsdoc:          witTypes.None[zigar_typescript_types.JsdocInfo](),
 	})
 }
 
@@ -861,6 +881,7 @@ func (b *graphBuilder) extractSignatureFromDecl(decl *ast.Node) uint32 {
 		ReturnType:    retTyID,
 		TypePredicate: predOpt,
 		IsAbstract:    isAbstract,
+		Modifiers:     b.extractNodeModifiers(decl, false),
 		Jsdoc:         b.extractJsdocForNode(decl),
 	}
 	return sigID
@@ -985,6 +1006,11 @@ func (b *graphBuilder) extractCheckerSignature(sig *checker.Signature, isAbstrac
 		}
 	}
 
+	var sigMods zigar_typescript_types.ModifierFlags
+	if decl != nil {
+		sigMods = b.extractNodeModifiers(decl, false)
+	}
+
 	b.signatures[sigID] = zigar_typescript_types.SignatureNode{
 		Id:            sigID,
 		TypeParams:    tpIDs,
@@ -993,6 +1019,7 @@ func (b *graphBuilder) extractCheckerSignature(sig *checker.Signature, isAbstrac
 		ReturnType:    retTyID,
 		TypePredicate: predOpt,
 		IsAbstract:    isAbstract || sig.Flags()&checker.SignatureFlagsAbstract != 0,
+		Modifiers:     sigMods,
 		Jsdoc:         b.extractJsdocForNode(decl),
 	}
 	return sigID

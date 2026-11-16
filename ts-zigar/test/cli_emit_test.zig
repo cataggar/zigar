@@ -1851,3 +1851,343 @@ test "Regression Round 5: multi-block ambient files route private helpers to own
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", r_p2_zig });
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
 }
+
+test "Issue #45 H2: synthetic cyclic namespace_decl graph terminates cleanly and passes AstGen" {
+    const alloc = std.testing.allocator;
+    const wt = ts_zigar.host.types;
+
+    // Strings: 0="/cyclic.d.ts", 1="NsA", 2="NsB", 3="val"
+    const strings = [_][]const u8{ "/cyclic.d.ts", "NsA", "NsB", "val" };
+
+    const types = [_]wt.TypeNode{
+        .{ .id = 0, .kind = .number_type, .resolved_type = null },
+    };
+
+    // Hostile cyclic graph:
+    //   decl 0 (`NsA`): children = [0, 1, 2] (self-cycle 0->0 + mutual cycle 0->1->0), merged_with = [0, 1]
+    //   decl 1 (`NsB`): children = [0, 1, 2] (self-cycle 1->1 + mutual cycle 1->0->1), merged_with = [0, 1]
+    //   decl 2 (`val`): shared child referenced by both cyclic namespaces!
+    const ns_children = [_]u32{ 0, 1, 2 };
+    const cyclic_merged = [_]u32{ 0, 1 };
+    const mod_exports = [_]u32{ 0, 1 };
+
+    const decls = [_]wt.DeclNode{
+        .{
+            .id = 0,
+            .name = 1,
+            .export_name = 1,
+            .module = 0,
+            .modifiers = .{ .export_decl = true, .declare_ambient = true },
+            .type_params = &.{},
+            .kind = .{ .namespace_decl = &ns_children },
+            .merged_with = &cyclic_merged,
+            .jsdoc = null,
+        },
+        .{
+            .id = 1,
+            .name = 2,
+            .export_name = 2,
+            .module = 0,
+            .modifiers = .{ .export_decl = true, .declare_ambient = true },
+            .type_params = &.{},
+            .kind = .{ .namespace_decl = &ns_children },
+            .merged_with = &cyclic_merged,
+            .jsdoc = null,
+        },
+        .{
+            .id = 2,
+            .name = 3,
+            .export_name = 3,
+            .module = 0,
+            .modifiers = .{ .export_decl = true, .const_mod = true },
+            .type_params = &.{},
+            .kind = .{ .variable_decl = 0 },
+            .merged_with = &.{},
+            .jsdoc = null,
+        },
+    };
+
+    const modules = [_]wt.ModuleNode{
+        .{
+            .id = 0,
+            .specifier = 0,
+            .file_path = 0,
+            .exports = &mod_exports,
+            .default_export = null,
+            .export_equals = null,
+            .umd_namespace = null,
+            .star_re_exports = &.{},
+            .ambient_modules = &.{},
+            .global_augmentations = &.{},
+            .triple_slash_types = &.{},
+            .triple_slash_paths = &.{},
+            .triple_slash_libs = &.{},
+        },
+    };
+
+    const entry_modules = [_]u32{0};
+    const graph = wt.DeclarationGraph{
+        .strings = &strings,
+        .modules = &modules,
+        .entry_modules = &entry_modules,
+        .decls = &decls,
+        .types = &types,
+        .signatures = &.{},
+        .type_params = &.{},
+        .properties = &.{},
+        .diagnostics = &.{},
+    };
+
+    var pkg_ir = try ts_zigar.ir.lowerGraph(alloc, graph, .{
+        .base_dir = "/",
+        .primary_vfs_paths = &.{"/cyclic.d.ts"},
+    });
+    defer pkg_ir.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), pkg_ir.modules.len);
+
+    var emit_outcome = try ts_zigar.emit.emitPackage(alloc, &pkg_ir);
+    defer emit_outcome.deinit(alloc);
+
+    switch (emit_outcome) {
+        .ok => |bundle| try std.testing.expect(bundle.files.len >= 2),
+        .ast_error => |diag| {
+            std.debug.print("H2 cyclic graph AstGen failed:\n{s}\n", .{diag});
+            return error.TestUnexpectedResult;
+        },
+    }
+}
+
+test "Issue #45 H1, H3, H4, M2, L3: merged namespace self-export, shared DAG hoisting, ambient export=/default, private constructors, and unknown declare enum" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue45-m2-adversarial", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const src_dir = try std.fmt.allocPrint(alloc, "{s}/src", .{sandbox});
+    defer alloc.free(src_dir);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+
+    try cwd.createDirPath(io, src_dir);
+    {
+        var d = try cwd.openDir(io, src_dir, .{});
+        defer d.close(io);
+
+        // H1 + H4: `declare module "node:events"` (3-way generic class + interface + namespace re-exporting itself + `export = EventEmitter`),
+        // `declare module "node:path"` (`namespace path { ... } export = path`), and `declare module "virtual:def"` (`export default class`).
+        try d.writeFile(io, .{
+            .sub_path = "ambient.d.ts",
+            .data =
+            \\declare module "node:events" {
+            \\    interface BaseEmitter<T> {
+            \\        listenerCount(eventName: string): number;
+            \\    }
+            \\    class EventEmitter<T = Record<string, any>> {
+            \\        static defaultMaxListeners: number;
+            \\        on(eventName: string, listener: (...args: any[]) => void): this;
+            \\    }
+            \\    interface EventEmitter<T = Record<string, any>> extends BaseEmitter<T> {
+            \\        emit(eventName: string, ...args: any[]): boolean;
+            \\    }
+            \\    namespace EventEmitter {
+            \\        export { EventEmitter };
+            \\        export function once(emitter: EventEmitter, name: string): Promise<any[]>;
+            \\        export interface Abortable {
+            \\            signal?: boolean;
+            \\        }
+            \\    }
+            \\    export = EventEmitter;
+            \\}
+            \\declare module "node:path" {
+            \\    namespace path {
+            \\        export interface ParsedPath {
+            \\            root: string;
+            \\            dir: string;
+            \\            base: string;
+            \\        }
+            \\        export function join(...paths: string[]): string;
+            \\        export function resolve(...paths: string[]): string;
+            \\        export const sep: string;
+            \\        export const posix: typeof path;
+            \\    }
+            \\    export = path;
+            \\}
+            \\declare module "virtual:def" {
+            \\    export default class DefaultRunner {
+            \\        start(): boolean;
+            \\    }
+            \\}
+            ,
+        });
+
+        // H3: 6-level diamond DAG of `typeof` / multi-member anonymous object literals.
+        // Without closed-DAG hoisting, `Level6` expands `Level0` 64 times inline; with hoisting, each level is emitted once!
+        try d.writeFile(io, .{
+            .sub_path = "dag.d.ts",
+            .data =
+            \\declare const level0: {
+            \\    f0: string; f1: number; f2: boolean; f3: string; f4: number;
+            \\    f5: boolean; f6: string; f7: number; f8: boolean; f9: string;
+            \\};
+            \\declare const level1: { left: typeof level0; right: typeof level0; tag1: string };
+            \\declare const level2: { left: typeof level1; right: typeof level1; tag2: string };
+            \\declare const level3: { left: typeof level2; right: typeof level2; tag3: string };
+            \\declare const level4: { left: typeof level3; right: typeof level3; tag4: string };
+            \\declare const level5: { left: typeof level4; right: typeof level4; tag5: string };
+            \\export declare const level6: { left: typeof level5; right: typeof level5; tag6: string };
+            \\export declare function consumeDag(input?: typeof level6): typeof level6;
+            ,
+        });
+
+        // M2 + L3: `private constructor()`, `protected constructor()`, `#private` brand, and `declare enum` unknown runtime values vs known ordinal enum.
+        try d.writeFile(io, .{
+            .sub_path = "m2_l3.d.ts",
+            .data =
+            \\export declare class Singleton {
+            \\    private secret: number;
+            \\    #brand: unknown;
+            \\    private constructor();
+            \\    static getInstance(): Singleton;
+            \\    ping(): string;
+            \\}
+            \\export declare class ProtectedBase {
+            \\    protected constructor(seed: number);
+            \\    id(): number;
+            \\}
+            \\export declare enum DynamicEnum {
+            \\    Alpha,
+            \\    Beta,
+            \\}
+            \\export declare enum KnownEnum {
+            \\    Zero = 0,
+            \\    One = 1,
+            \\}
+            ,
+        });
+
+        try d.writeFile(io, .{
+            .sub_path = "index.d.ts",
+            .data =
+            \\/// <reference path="./ambient.d.ts" />
+            \\export * from "./dag";
+            \\export * from "./m2_l3";
+            ,
+        });
+    }
+
+    const index_dts = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{src_dir});
+    defer alloc.free(index_dts);
+
+    const cli_args = [_][]const u8{ "-t", index_dts, "-d", out_dir };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Issue #45 pipeline error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+
+    // Verify H3 size bound and hoisted helper emission on `dag.zig`!
+    {
+        var out_h = try cwd.openDir(io, out_dir, .{});
+        defer out_h.close(io);
+        const dag_src = try out_h.readFileAlloc(io, "dag.zig", alloc, .limited(64 * 1024));
+        defer alloc.free(dag_src);
+        try std.testing.expect(dag_src.len < 8192);
+        try std.testing.expect(std.mem.indexOf(u8, dag_src, "__zigar_AnonObj_") != null);
+    }
+
+    const consumer_zig = try std.fmt.allocPrint(alloc, "{s}/consumer_issue45.zig", .{sandbox});
+    defer alloc.free(consumer_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "consumer_issue45.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r = @import("out/root.zig");
+            \\const dag = @import("out/dag.zig");
+            \\const m2_l3 = @import("out/m2_l3.zig");
+            \\
+            \\fn hasExportJsName(comptime exports: anytype, want: []const u8) bool {
+            \\    inline for (exports) |e| {
+            \\        if (std.mem.eql(u8, e.js_name, want)) return true;
+            \\    }
+            \\    return false;
+            \\}
+            \\
+            \\test "Issue #45 consumer Sema: H1, H3, H4, M2, L3" {
+            \\    // H1 + H4: `node:events` (`export = EventEmitter` with merged class + interface + namespace!)
+            \\    try std.testing.expectEqualStrings("EventEmitter", r.node_events.zigar_js.export_equals);
+            \\    try std.testing.expect(@hasDecl(r.node_events, "EventEmitter"));
+            \\    try std.testing.expect(@hasDecl(r.node_events, "once"));
+            \\    try std.testing.expect(@hasDecl(r.node_events, "Abortable"));
+            \\    const EE = r.node_events.EventEmitter(struct {});
+            \\    try std.testing.expect(@hasDecl(EE, "on"));
+            \\    try std.testing.expect(@hasDecl(EE, "emit"));
+            \\    try std.testing.expect(@hasDecl(EE, "listenerCount"));
+            \\    try std.testing.expect(@hasDecl(EE, "once"));
+            \\
+            \\    // H4: `node:path` (`export = path` exposes `join`, `resolve`, `sep`, `posix`, `ParsedPath` with `export_equals` metadata and NO bogus `.js_name = "path"`!)
+            \\    try std.testing.expect(r.node_path.zigar_js.export_equals.len > 0);
+            \\    try std.testing.expect(!hasExportJsName(r.node_path.zigar_js.exports, "path"));
+            \\    try std.testing.expect(@hasDecl(r.node_path, "join"));
+            \\    try std.testing.expect(@hasDecl(r.node_path, "resolve"));
+            \\    try std.testing.expect(@hasDecl(r.node_path, "sep"));
+            \\    try std.testing.expect(@hasDecl(r.node_path, "posix"));
+            \\    try std.testing.expect(@hasDecl(r.node_path, "ParsedPath"));
+            \\
+            \\    // H4: `virtual:def` (`export default class DefaultRunner`)
+            \\    try std.testing.expect(@hasDecl(r.virtual_def, "Default"));
+            \\    try std.testing.expect(@hasDecl(r.virtual_def.Default, "start"));
+            \\    try std.testing.expectEqual(@as(usize, 1), r.virtual_def.zigar_js.exports.len);
+            \\    try std.testing.expectEqualStrings("default", r.virtual_def.zigar_js.exports[0].js_name);
+            \\    try std.testing.expect(r.virtual_def.zigar_js.exports[0].is_default);
+            \\
+            \\    // H3: hoisted shared DAG compiles cleanly and preserves field structure
+            \\    _ = &dag.level6;
+            \\    _ = &dag.consumeDag;
+            \\
+            \\    // M2: `Singleton` and `ProtectedBase` do NOT emit public `pub fn init(...)` and record constructor/private metadata!
+            \\    try std.testing.expect(!@hasDecl(m2_l3.Singleton, "init"));
+            \\    try std.testing.expect(@hasDecl(m2_l3.Singleton, "getInstance"));
+            \\    try std.testing.expect(@hasDecl(m2_l3.Singleton, "ping"));
+            \\    try std.testing.expect(m2_l3.Singleton.zigar_js.has_private_constructor);
+            \\    try std.testing.expect(m2_l3.Singleton.zigar_js.has_non_public_members);
+            \\    try std.testing.expect(!@hasDecl(m2_l3.ProtectedBase, "init"));
+            \\    try std.testing.expect(m2_l3.ProtectedBase.zigar_js.has_private_constructor);
+            \\
+            \\    // L3: `KnownEnum` stays a Zig `enum`, while ambient `DynamicEnum` uses runtime-backed `Global` wrapper without bogus 0/1 ordinals!
+            \\    try std.testing.expect(@typeInfo(m2_l3.KnownEnum) == .@"enum");
+            \\    try std.testing.expectEqual(@as(i64, 0), @intFromEnum(m2_l3.KnownEnum.zero));
+            \\    try std.testing.expectEqual(@as(i64, 1), @intFromEnum(m2_l3.KnownEnum.one));
+            \\    try std.testing.expect(@typeInfo(m2_l3.DynamicEnum) == .@"struct");
+            \\    try std.testing.expect(m2_l3.DynamicEnum.zigar_js.has_unknown_values);
+            \\    _ = &m2_l3.DynamicEnum.alpha;
+            \\    _ = &m2_l3.DynamicEnum.beta;
+            \\}
+            ,
+        });
+    }
+
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
+}
+
