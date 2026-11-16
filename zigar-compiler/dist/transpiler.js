@@ -2257,6 +2257,9 @@ function extractLimits(binary) {
 }
 
 function isSuspendingImport(module, name) {
+  if (module === 'zigar:component-host') {
+    return false;
+  }
   if (module === 'wasi_snapshot_preview1' && (name === 'proc_exit' || PURE_SYNC_WASI_IMPORTS$1.has(name))) {
     return false;
   }
@@ -8108,6 +8111,7 @@ var moduleLoading = mixin({
       const functions = this.exportFunctions();
       const env = {}, wasi = {}, wasiPreview = {};
       const exports = this.exportedModules = { env, wasi, wasi_snapshot_preview1: wasiPreview };
+      let needsComponentHostImports = false;
       for (const { module, name, kind } of WA.Module.imports(executable)) {
         if (kind === 'function') {
           if (module === 'env') {
@@ -8119,8 +8123,13 @@ var moduleLoading = mixin({
             }
           } else if (module === 'wasi') {
             wasi[name] = this.getThreadHandler?.(name) ?? empty;
+          } else if (module === 'zigar:component-host') {
+            needsComponentHostImports = true;
           }
         }
+      }
+      if (needsComponentHostImports) {
+        exports['zigar:component-host'] = this.createDefaultComponentHostImports();
       }
       debugger;
       if (memoryInitial) {
@@ -8149,7 +8158,132 @@ var moduleLoading = mixin({
         });
       }
       this.initialTableLength = tableInitial;
+      const extraWasmImports = typeof options?.wasmImports === 'function'
+        ? options.wasmImports(() => this.memory)
+        : options?.wasmImports;
+      if (extraWasmImports) {
+        for (const [ns, modImports] of Object.entries(extraWasmImports)) {
+          exports[ns] = { ...(exports[ns] || {}), ...modImports };
+        }
+      }
       return WA.instantiate(executable, exports);
+    },
+    createDefaultComponentHostImports() {
+      const registrySym = Symbol.for('zigar.componentHosts');
+      const resolveHost = (instId) => {
+        const h = globalThis[registrySym]?.hosts?.get(Number(instId) >>> 0);
+        if (!h) {
+          throw new Error(`Unknown component host instance id: ${Number(instId) >>> 0}`);
+        }
+        return h;
+      };
+      const callerOffset = (ptr) => toBufferOffset(ptr);
+      const callerBytes = (ptr, len) => {
+        const n = Number(len) >>> 0;
+        const off = callerOffset(ptr);
+        return new Uint8Array(this.memory.buffer, off, n);
+      };
+      const callerStr = (ptr, len) => decodeText(callerBytes(ptr, len));
+      return {
+        alloc: (instId, reallocPtr, reallocLen, alignBytes, byteLen, outAddrPtr) => {
+          try {
+            const h = resolveHost(instId);
+            const addr = h.alloc(callerStr(reallocPtr, reallocLen), Number(alignBytes) >>> 0, Number(byteLen) >>> 0);
+            new DataView(this.memory.buffer, callerOffset(outAddrPtr), 4).setUint32(0, addr >>> 0, true);
+            return 0;
+          } catch {
+            return 1;
+          }
+        },
+        write: (instId, guestAddr, srcPtr, byteLen) => {
+          try {
+            const h = resolveHost(instId);
+            h.write(Number(guestAddr) >>> 0, callerBytes(srcPtr, byteLen));
+            return 0;
+          } catch {
+            return 1;
+          }
+        },
+        read: (instId, guestAddr, dstPtr, byteLen) => {
+          try {
+            const h = resolveHost(instId);
+            const src = h.read(Number(guestAddr) >>> 0, Number(byteLen) >>> 0);
+            callerBytes(dstPtr, byteLen).set(src);
+            return 0;
+          } catch {
+            return 1;
+          }
+        },
+        memory_size: (instId) => {
+          const h = resolveHost(instId);
+          return BigInt(h.memoryByteLength());
+        },
+        call_core: (instId, expPtr, expLen, paramsPtr, paramsCount, expectedRetTag, resultPtr) => {
+          try {
+            const h = resolveHost(instId);
+            const expName = callerStr(expPtr, expLen);
+            const count = Number(paramsCount) >>> 0;
+            const params = new Array(count);
+            if (count > 0) {
+              const dv = new DataView(this.memory.buffer, callerOffset(paramsPtr), count * 16);
+              for (let i = 0; i < count; i++) {
+                params[i] = {
+                  tag: dv.getUint32(i * 16, true),
+                  bits: dv.getBigUint64(i * 16 + 8, true),
+                };
+              }
+            }
+            const res = h.callCore(expName, params, Number(expectedRetTag) >>> 0);
+            const resDV = new DataView(this.memory.buffer, callerOffset(resultPtr), 16);
+            resDV.setUint32(0, res.tag >>> 0, true);
+            resDV.setUint32(4, 0, true);
+            resDV.setBigUint64(8, res.bits, true);
+            return 0;
+          } catch {
+            return 1;
+          }
+        },
+        call_post_return: (instId, expPtr, expLen, valTag, valBits) => {
+          try {
+            const h = resolveHost(instId);
+            h.callPostReturn(callerStr(expPtr, expLen), Number(valTag) >>> 0, BigInt.asUintN(64, BigInt(valBits)));
+            return 0;
+          } catch {
+            return 1;
+          }
+        },
+        resource_new: (instId, ifacePtr, ifaceLen, resPtr, resLen, rep) => {
+          try {
+            const h = resolveHost(instId);
+            return h.resourceNew(callerStr(ifacePtr, ifaceLen), callerStr(resPtr, resLen), Number(rep) | 0);
+          } catch {
+            return -1;
+          }
+        },
+        resource_rep: (instId, ifacePtr, ifaceLen, resPtr, resLen, handle, outRepPtr) => {
+          try {
+            const h = resolveHost(instId);
+            const rep = h.resourceRep(callerStr(ifacePtr, ifaceLen), callerStr(resPtr, resLen), Number(handle) | 0);
+            new DataView(this.memory.buffer, callerOffset(outRepPtr), 4).setInt32(0, rep | 0, true);
+            return 0;
+          } catch {
+            return 1;
+          }
+        },
+        resource_drop: (instId, ifacePtr, ifaceLen, resPtr, resLen, handle) => {
+          try {
+            const h = resolveHost(instId);
+            h.resourceDrop(callerStr(ifacePtr, ifaceLen), callerStr(resPtr, resLen), Number(handle) | 0);
+            return 0;
+          } catch {
+            return 1;
+          }
+        },
+        live_resource_count: (instId) => {
+          const h = resolveHost(instId);
+          return h.liveResourceCount() >>> 0;
+        },
+      };
     },
     loadModule(source, options) {
       return this.initPromise = (async () => {

@@ -1185,6 +1185,130 @@ test "exported resource Own.rep() invokes [resource-rep] while Borrow.borrowRep(
     try testing.expectEqual(@as(i32, 1042), gen_bor.borrowRep());
 }
 
+test "generated bindHost / HostClient invokes ComponentHost across separate guest linear memory with cabi_post_*" {
+    const alloc = testing.allocator;
+    const ch = wit_zigar.component_host;
+
+    const Handler = struct {
+        fn onCall(
+            mock: *ch.MockGuestBackend,
+            export_name: []const u8,
+            params: []const ch.CoreVal,
+            _expected: ?canon.FlatValType,
+        ) ch.HostError!ch.CoreVal {
+            _ = _expected;
+            if (std.mem.eql(u8, export_name, GuestService.transform_rect_meta.export_name)) {
+                const ox = params[0].f32;
+                const oy = params[1].f32;
+                const ex = params[2].f32;
+                const ey = params[3].f32;
+                const id: u32 = @bitCast(params[4].i32);
+                const layer: u8 = @intCast(@as(u32, @bitCast(params[5].i32)) & 0xff);
+                const tag: u16 = @intCast(@as(u32, @bitCast(params[6].i32)) & 0xffff);
+                const scale = params[7].f32;
+
+                const ret_addr: u32 = @intCast(try mock.guestAlloc(4, 24));
+                const out = ST.Rect{
+                    .origin = .{ .x = ox * scale, .y = oy * scale },
+                    .extent = .{ .x = ex * scale, .y = ey * scale },
+                    .id = id + 50,
+                    .layer = layer,
+                    .tag = tag,
+                };
+                const dst = try mock.guestSlice(ret_addr, 24);
+                @memcpy(dst, std.mem.asBytes(&out));
+                return .{ .i32 = @bitCast(ret_addr) };
+            }
+            if (std.mem.eql(u8, export_name, GuestService.inspect_record_meta.export_name)) {
+                // `inspect-record` spills >16 flat params to a single guest pointer (`params[0].i32`)
+                const arg_ptr: u32 = @bitCast(params[0].i32);
+                const arg_bytes = try mock.guestSlice(arg_ptr, 16);
+                const id = std.mem.readInt(u64, arg_bytes[0..8], .little);
+                const label_ptr = std.mem.readInt(u32, arg_bytes[8..12], .little);
+                const label_len = std.mem.readInt(u32, arg_bytes[12..16], .little);
+                const label_copy = try mock.allocator.dupe(u8, try mock.guestSlice(label_ptr, label_len));
+                defer mock.allocator.free(label_copy);
+
+                const ret_addr: u32 = @intCast(try mock.guestAlloc(4, 12));
+                if (id == 0) {
+                    const slot = try mock.guestSlice(ret_addr, 12);
+                    slot[0] = 1; // .err
+                    std.mem.writeInt(u32, slot[4..8], @intFromEnum(ST.ErrorKind.not_found), .little);
+                } else {
+                    const reply = try std.fmt.allocPrint(mock.allocator, "ok:{s}", .{label_copy});
+                    defer mock.allocator.free(reply);
+                    const s_ptr: u32 = @intCast(try mock.guestAlloc(1, @intCast(reply.len)));
+                    @memcpy(try mock.guestSlice(s_ptr, reply.len), reply);
+                    const slot = try mock.guestSlice(ret_addr, 12);
+                    slot[0] = 0; // .ok
+                    std.mem.writeInt(u32, slot[4..8], s_ptr, .little);
+                    std.mem.writeInt(u32, slot[8..12], @intCast(reply.len), .little);
+                }
+                return .{ .i32 = @bitCast(ret_addr) };
+            }
+            return error.CoreExportNotFound;
+        }
+    };
+
+    var mock = try ch.MockGuestBackend.init(alloc, .{
+        .initial_bytes = 2048,
+        .grow_on_every_alloc = true,
+    });
+    defer mock.deinit();
+    mock.on_call_core = Handler.onCall;
+
+    var host = ch.ComponentHost.init(mock.backend());
+    const world_client = sample.bindHost(&host);
+    const gs = world_client.guest_service;
+
+    const r_out = try gs.transformRect(alloc, .{
+        .origin = .{ .x = 2.0, .y = 3.0 },
+        .extent = .{ .x = 4.0, .y = 5.0 },
+        .id = 7,
+        .layer = 1,
+        .tag = 9,
+    }, 3.0);
+    try testing.expectEqual(ST.Point{ .x = 6.0, .y = 9.0 }, r_out.origin);
+    try testing.expectEqual(@as(u32, 57), r_out.id);
+    // `Rect` has no heap pointers -> `needs_post_return == false`
+    try testing.expectEqual(@as(usize, 0), mock.post_return_count);
+
+    const rec = ST.ComplexRecord{
+        .id = 42,
+        .label = "cross-mem-client",
+        .points = &[_]ST.Point{.{ .x = 1.0, .y = 2.0 }},
+        .tags = &[_][]const u8{ "a", "b" },
+        .maybe_score = 10,
+        .maybe_note = "note",
+        .outcome = .{ .ok = .{ .x = 3.0, .y = 4.0 } },
+        .tint = .red,
+        .glyph = 'A',
+        .f8 = .{},
+        .f16 = .{},
+        .f32_val = .{},
+        .f64_val = .{},
+        .f70 = .{},
+        .v_if = .{ .as_int = 1 },
+        .v_ii = .{ .as_int32 = 2 },
+        .v_ff = .{ .as_f32 = 3.0 },
+        .v_multi = .{ .empty = {} },
+    };
+    const ok_res = try gs.inspectRecord(alloc, rec);
+    defer ch.ComponentHost.free(@TypeOf(ok_res), alloc, ok_res);
+    try testing.expect(ok_res == .ok);
+    try testing.expectEqualStrings("ok:cross-mem-client", ok_res.ok);
+    try testing.expectEqual(@as(usize, 1), mock.post_return_count);
+
+    var err_rec = rec;
+    err_rec.id = 0;
+    const err_res = try gs.inspect_record(alloc, err_rec);
+    defer ch.ComponentHost.free(@TypeOf(err_res), alloc, err_res);
+    try testing.expect(err_res == .err);
+    try testing.expectEqual(ST.ErrorKind.not_found, err_res.err);
+    try testing.expectEqual(@as(usize, 2), mock.post_return_count);
+}
+
+
 
 
 

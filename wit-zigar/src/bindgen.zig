@@ -114,6 +114,42 @@ pub fn toPascalCase(alloc: Allocator, wit_name: []const u8) Allocator.Error![]u8
     return raw;
 }
 
+/// Convert a WIT `kebab-case` function/method name (e.g. `compiler-version`,
+/// `type-to-string`, `extract-module-graph`) into raw unescaped `camelCase`.
+fn toRawCamelCase(alloc: Allocator, wit_name: []const u8) Allocator.Error![]u8 {
+    const clean = stripPercent(wit_name);
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+
+    var it = std.mem.tokenizeAny(u8, clean, "-_");
+    var first_seg = true;
+    while (it.next()) |seg| {
+        if (seg.len == 0) continue;
+        if (first_seg) {
+            first_seg = false;
+            for (seg) |ch| {
+                try buf.append(alloc, std.ascii.toLower(ch));
+            }
+        } else {
+            try buf.append(alloc, std.ascii.toUpper(seg[0]));
+            for (seg[1..]) |ch| {
+                try buf.append(alloc, std.ascii.toLower(ch));
+            }
+        }
+    }
+    return buf.toOwnedSlice(alloc);
+}
+
+/// Convert a WIT `kebab-case` identifier into a Zig-escaped `camelCase` identifier.
+pub fn toCamelCase(alloc: Allocator, wit_name: []const u8) Allocator.Error![]u8 {
+    const raw = try toRawCamelCase(alloc, wit_name);
+    if (needsZigEscape(raw)) {
+        defer alloc.free(raw);
+        return std.fmt.allocPrint(alloc, "@\"{s}\"", .{raw});
+    }
+    return raw;
+}
+
 fn stripPercent(s: []const u8) []const u8 {
     if (s.len > 0 and s[0] == '%') return s[1..];
     return s;
@@ -3463,6 +3499,163 @@ fn emitTypeDef(
                     }
                 }
             }
+
+            if (ext) |we| {
+                if (we.is_export) {
+                    try w.print(
+                        \\
+                        \\{s}    pub fn HostClient(comptime HostType: type) type {{
+                        \\{s}        const _Res = @This();
+                        \\{s}        return struct {{
+                        \\{s}            host: *HostType,
+                        \\{s}            own: Own(_Res),
+                        \\{s}            is_dropped: bool = false,
+                        \\
+                        \\{s}            pub fn wrap(host_ptr: *HostType, own_val: anytype) @This() {{
+                        \\{s}                comptime std.debug.assert(@TypeOf(own_val) == Own(_Res) or @TypeOf(own_val) == _Res);
+                        \\{s}                return .{{ .host = host_ptr, .own = .{{ .handle = own_val.handle }} }};
+                        \\{s}            }}
+                        \\
+                        \\{s}            pub fn handle(self: @This()) i32 {{
+                        \\{s}                return self.own.handle;
+                        \\{s}            }}
+                        \\
+                        \\{s}            pub fn asBorrow(self: @This()) Borrow(_Res) {{
+                        \\{s}                std.debug.assert(!self.is_dropped);
+                        \\{s}                return .{{ .handle = self.own.handle }};
+                        \\{s}            }}
+                        \\
+                        \\{s}            pub fn drop(self: *@This()) !void {{
+                        \\{s}                if (self.is_dropped) return;
+                        \\{s}                self.is_dropped = true;
+                        \\{s}                try self.host.dropResource("{s}", _Res.resource_name, self.own.handle);
+                        \\{s}            }}
+                        \\
+                        \\{s}            pub fn deinit(self: *@This()) void {{
+                        \\{s}                self.drop() catch {{}};
+                        \\{s}            }}
+                        \\
+                    , .{
+                        indent, indent, indent, indent, indent, indent,
+                        indent, indent, indent, indent,
+                        indent, indent, indent,
+                        indent, indent, indent, indent,
+                        indent, indent, indent, indent, iface_lit, indent,
+                        indent, indent, indent,
+                    });
+
+                    var seen_res_client = std.StringHashMapUnmanaged(void).empty;
+                    for ([_][]const u8{
+                        "host", "own", "is_dropped", "wrap", "handle", "asBorrow", "drop", "deinit",
+                    }) |reserved| {
+                        try seen_res_client.put(ar, reserved, {});
+                    }
+
+                    for (methods) |m| {
+                        if (m.func.is_async) continue;
+                        const ext_name = try formatResourceMemberName(ar, m.kind, td.name, m.name);
+                        if (findFuncRef(we.funcs, ext_name) == null) continue;
+                        const m_raw = switch (m.kind) {
+                            .constructor => try ar.dupe(u8, "constructor"),
+                            .method, .static => try toRawSnakeCase(ar, m.name),
+                        };
+
+                        switch (m.kind) {
+                            .constructor => {
+                                if (seen_res_client.contains("create")) continue;
+                                try seen_res_client.put(ar, "create", {});
+                                try w.print("\n{s}            pub fn create(host_ptr: *HostType, allocator: std.mem.Allocator", .{indent});
+                                for (m.func.params, 0..) |p, idx| {
+                                    const p_ty = try formatWitType(ar, p.type);
+                                    try w.print(", arg_{d}: {s}", .{ idx, p_ty });
+                                }
+                                try w.writeAll(") !@This() {\n");
+                                try w.print("{s}                const own_val = try host_ptr.callMeta(_Res.constructor_Fn, _Res.constructor_meta, allocator, .{{", .{indent});
+                                for (0..m.func.params.len) |idx| {
+                                    if (idx > 0) try w.writeAll(", ");
+                                    try w.print("arg_{d}", .{idx});
+                                }
+                                try w.writeAll("});\n");
+                                try w.print("{s}                return .{{ .host = host_ptr, .own = own_val }};\n", .{indent});
+                                try w.print("{s}            }}\n", .{indent});
+                            },
+                            .method => {
+                                const raw_camel = try toRawCamelCase(ar, m.name);
+                                const primary_raw = if (!seen_res_client.contains(raw_camel))
+                                    raw_camel
+                                else if (!seen_res_client.contains(m_raw))
+                                    m_raw
+                                else
+                                    continue;
+                                try seen_res_client.put(ar, primary_raw, {});
+                                const primary_ident = try escapeZigId(ar, primary_raw);
+                                const ret_str = if (m.func.result) |r| try formatWitType(ar, r) else "void";
+
+                                try w.print("\n{s}            pub fn {s}(self: @This(), allocator: std.mem.Allocator", .{ indent, primary_ident });
+                                for (m.func.params, 0..) |p, idx| {
+                                    const p_ty = try formatWitType(ar, p.type);
+                                    try w.print(", arg_{d}: {s}", .{ idx, p_ty });
+                                }
+                                try w.print(") !{s} {{\n", .{ret_str});
+                                try w.print("{s}                std.debug.assert(!self.is_dropped);\n", .{indent});
+                                try w.print("{s}                return self.host.callMeta(_Res.{s}_Fn, _Res.{s}_meta, allocator, .{{ self.asBorrow()", .{ indent, m_raw, m_raw });
+                                for (0..m.func.params.len) |idx| {
+                                    try w.print(", arg_{d}", .{idx});
+                                }
+                                try w.writeAll(" });\n");
+                                try w.print("{s}            }}\n", .{indent});
+
+                                if (!std.mem.eql(u8, m_raw, primary_raw) and !seen_res_client.contains(m_raw)) {
+                                    try seen_res_client.put(ar, m_raw, {});
+                                    const snake_ident = try escapeZigId(ar, m_raw);
+                                    try w.print("{s}            pub const {s} = @This().{s};\n", .{ indent, snake_ident, primary_ident });
+                                }
+                            },
+                            .static => {
+                                const raw_camel = try toRawCamelCase(ar, m.name);
+                                const primary_raw = if (!seen_res_client.contains(raw_camel))
+                                    raw_camel
+                                else if (!seen_res_client.contains(m_raw))
+                                    m_raw
+                                else
+                                    continue;
+                                try seen_res_client.put(ar, primary_raw, {});
+                                const primary_ident = try escapeZigId(ar, primary_raw);
+                                const ret_str = if (m.func.result) |r| try formatWitType(ar, r) else "void";
+
+                                try w.print("\n{s}            pub fn {s}(host_ptr: *HostType, allocator: std.mem.Allocator", .{ indent, primary_ident });
+                                for (m.func.params, 0..) |p, idx| {
+                                    const p_ty = try formatWitType(ar, p.type);
+                                    try w.print(", arg_{d}: {s}", .{ idx, p_ty });
+                                }
+                                try w.print(") !{s} {{\n", .{ret_str});
+                                try w.print("{s}                return host_ptr.callMeta(_Res.{s}_Fn, _Res.{s}_meta, allocator, .{{", .{ indent, m_raw, m_raw });
+                                for (0..m.func.params.len) |idx| {
+                                    if (idx > 0) try w.writeAll(", ");
+                                    try w.print("arg_{d}", .{idx});
+                                }
+                                try w.writeAll("});\n");
+                                try w.print("{s}            }}\n", .{indent});
+
+                                if (!std.mem.eql(u8, m_raw, primary_raw) and !seen_res_client.contains(m_raw)) {
+                                    try seen_res_client.put(ar, m_raw, {});
+                                    const snake_ident = try escapeZigId(ar, m_raw);
+                                    try w.print("{s}            pub const {s} = @This().{s};\n", .{ indent, snake_ident, primary_ident });
+                                }
+                            },
+                        }
+                    }
+
+                    try w.print("{s}        }};\n", .{indent});
+                    try w.print("{s}    }}\n\n", .{indent});
+                    try w.print(
+                        \\{s}    pub fn bindHost(host_ptr: anytype, own_val: anytype) @This().HostClient(@TypeOf(host_ptr.*)) {{
+                        \\{s}        return @This().HostClient(@TypeOf(host_ptr.*)).wrap(host_ptr, own_val);
+                        \\{s}    }}
+                        \\
+                    , .{ indent, indent, indent });
+                }
+            }
             try w.print("{s}}};\n\n", .{indent});
         },
     }
@@ -4124,7 +4317,151 @@ fn emitExportBindingsHelper(
         indent, indent, indent, indent, indent, indent, indent,
     });
     try w.print("{s}    }};\n", .{indent});
-    try w.print("{s}}}\n", .{indent});
+    try w.print("{s}}}\n\n", .{indent});
+
+    try emitExportHostClientHelper(ar, w, items, ext_funcs, import_collisions, indent);
+}
+
+fn emitExportHostClientHelper(
+    ar: Allocator,
+    w: anytype,
+    items: []const ast.InterfaceItem,
+    ext_funcs: []const metadata_decode.FuncRef,
+    import_collisions: std.StringHashMapUnmanaged(void),
+    indent: []const u8,
+) BindgenError!void {
+    try w.print("{s}pub fn HostClient(comptime HostType: type) type {{\n", .{indent});
+    try w.print("{s}    const _Outer = @This();\n", .{indent});
+    try w.print("{s}    return struct {{\n", .{indent});
+    try w.print("{s}        pub const Interface = _Outer;\n", .{indent});
+    try w.print("{s}        host: *HostType,\n\n", .{indent});
+    try w.print("{s}        pub fn init(host_ptr: *HostType) @This() {{\n", .{indent});
+    try w.print("{s}            return .{{ .host = host_ptr }};\n", .{indent});
+    try w.print("{s}        }}\n", .{indent});
+
+    var seen_client = std.StringHashMapUnmanaged(void).empty;
+    for ([_][]const u8{ "Interface", "host", "init" }) |reserved| {
+        try seen_client.put(ar, reserved, {});
+    }
+    // Reserve type names in `_Outer` so `HostClient` methods never shadow parameter/return types
+    for (items) |it| {
+        switch (it) {
+            .use => |u| for (u.names) |un| {
+                const p_name = try toPascalCase(ar, un.rename orelse un.name);
+                try seen_client.put(ar, p_name, {});
+            },
+            .type => |td| {
+                const p_name = try toPascalCase(ar, td.name);
+                try seen_client.put(ar, p_name, {});
+            },
+            .func => {},
+        }
+    }
+
+    // Emit `<Resource>Client`, `wrap<Resource>`, and `create<Resource>` helpers
+    for (items) |it| {
+        if (it != .type or it.type.kind != .resource) continue;
+        const res_pascal = try toPascalCase(ar, it.type.name);
+        const client_name = try std.fmt.allocPrint(ar, "{s}Client", .{res_pascal});
+        if (!seen_client.contains(client_name)) {
+            try seen_client.put(ar, client_name, {});
+            try w.print("\n{s}        pub const {s} = _Outer.{s}.HostClient(HostType);\n", .{
+                indent,
+                client_name,
+                res_pascal,
+            });
+        }
+        const wrap_name = try std.fmt.allocPrint(ar, "wrap{s}", .{res_pascal});
+        if (!seen_client.contains(wrap_name)) {
+            try seen_client.put(ar, wrap_name, {});
+            try w.print(
+                \\{s}        pub fn {s}(self: @This(), own_val: anytype) _Outer.{s}.HostClient(HostType) {{
+                \\{s}            return _Outer.{s}.HostClient(HostType).wrap(self.host, own_val);
+                \\{s}        }}
+                \\
+            , .{ indent, wrap_name, res_pascal, indent, res_pascal, indent });
+        }
+
+        for (it.type.kind.resource) |m| {
+            if (m.kind != .constructor or m.func.is_async) continue;
+            const ext_name = try formatResourceMemberName(ar, .constructor, it.type.name, m.name);
+            if (findFuncRef(ext_funcs, ext_name) == null) continue;
+            const create_name = try std.fmt.allocPrint(ar, "create{s}", .{res_pascal});
+            if (seen_client.contains(create_name)) break;
+            try seen_client.put(ar, create_name, {});
+            try w.print("{s}        pub fn {s}(self: @This(), allocator: std.mem.Allocator", .{ indent, create_name });
+            for (m.func.params, 0..) |p, idx| {
+                const p_ty = try formatWitType(ar, p.type);
+                try w.print(", arg_{d}: {s}", .{ idx, p_ty });
+            }
+            try w.print(") !_Outer.{s}.HostClient(HostType) {{\n", .{res_pascal});
+            try w.print("{s}            return _Outer.{s}.HostClient(HostType).create(self.host, allocator", .{ indent, res_pascal });
+            for (0..m.func.params.len) |idx| {
+                try w.print(", arg_{d}", .{idx});
+            }
+            try w.writeAll(");\n");
+            try w.print("{s}        }}\n", .{indent});
+            break;
+        }
+    }
+
+    // Emit freestanding exported functions (`camelCase` + `snake_case` alias)
+    for (items) |it| {
+        if (it != .func or it.func.func.is_async) continue;
+        if (findFuncRef(ext_funcs, it.func.name) == null) continue;
+        const raw_snake = try toRawSnakeCase(ar, it.func.name);
+        const collides = import_collisions.contains(it.func.name);
+        const decl_base = if (collides)
+            try std.fmt.allocPrint(ar, "export_{s}", .{raw_snake})
+        else
+            raw_snake;
+        const raw_camel = try toRawCamelCase(ar, it.func.name);
+
+        const primary_raw = if (!seen_client.contains(raw_camel))
+            raw_camel
+        else if (!seen_client.contains(raw_snake))
+            raw_snake
+        else if (!seen_client.contains(decl_base))
+            decl_base
+        else
+            continue;
+        try seen_client.put(ar, primary_raw, {});
+        const primary_ident = try escapeZigId(ar, primary_raw);
+        const ret_str = if (it.func.func.result) |r| try formatWitType(ar, r) else "void";
+
+        try w.print("\n{s}        pub fn {s}(self: @This(), allocator: std.mem.Allocator", .{ indent, primary_ident });
+        for (it.func.func.params, 0..) |p, idx| {
+            const p_ty = try formatWitType(ar, p.type);
+            try w.print(", arg_{d}: {s}", .{ idx, p_ty });
+        }
+        try w.print(") !{s} {{\n", .{ret_str});
+        try w.print("{s}            return self.host.callMeta(_Outer.{s}_Fn, _Outer.{s}_meta, allocator, .{{", .{
+            indent,
+            decl_base,
+            decl_base,
+        });
+        for (0..it.func.func.params.len) |idx| {
+            if (idx > 0) try w.writeAll(", ");
+            try w.print("arg_{d}", .{idx});
+        }
+        try w.writeAll("});\n");
+        try w.print("{s}        }}\n", .{indent});
+
+        if (!std.mem.eql(u8, raw_snake, primary_raw) and !seen_client.contains(raw_snake)) {
+            try seen_client.put(ar, raw_snake, {});
+            const snake_ident = try escapeZigId(ar, raw_snake);
+            try w.print("{s}        pub const {s} = @This().{s};\n", .{ indent, snake_ident, primary_ident });
+        }
+    }
+
+    try w.print("{s}    }};\n", .{indent});
+    try w.print("{s}}}\n\n", .{indent});
+    try w.print(
+        \\{s}pub fn bindHost(host_ptr: anytype) @This().HostClient(@TypeOf(host_ptr.*)) {{
+        \\{s}    return @This().HostClient(@TypeOf(host_ptr.*)).init(host_ptr);
+        \\{s}}}
+        \\
+    , .{ indent, indent, indent });
 }
 
 fn emitWorldInterfaceZigarBridgeHelper(
@@ -4296,6 +4633,62 @@ fn emitWorldInterfaceZigarBridgeHelper(
     try w.writeAll("    };\n");
     try w.writeAll("}\n");
     try w.writeAll("pub const exportWorldZigarBridge = exportZigarBridge;\n\n");
+
+    try w.writeAll("pub fn HostClient(comptime HostType: type) type {\n");
+    try w.writeAll("    const _World = @This();\n");
+    try w.writeAll("    return struct {\n");
+    try w.writeAll("        pub const World = _World;\n");
+    try w.writeAll("        host: *HostType,\n");
+
+    var seen_world_fields = std.StringHashMapUnmanaged(void).empty;
+    for ([_][]const u8{ "World", "host", "init" }) |reserved| {
+        try seen_world_fields.put(ar, reserved, {});
+    }
+    var emitted_world_ifaces = std.ArrayListUnmanaged(@typeInfo(@TypeOf(iface_bindings)).pointer.child).empty;
+    for (iface_bindings) |ib| {
+        if (ib.is_synth_world or !ib.ext.is_export) continue;
+        if (!seen_world_fields.contains(ib.zig_ident)) {
+            try seen_world_fields.put(ar, ib.zig_ident, {});
+            try emitted_world_ifaces.append(ar, ib);
+            try w.print("        {s}: _World.{s}.HostClient(HostType),\n", .{ ib.zig_ident, ib.zig_ident });
+            if (ib.alias_ident) |al| {
+                if (!seen_world_fields.contains(al)) {
+                    try seen_world_fields.put(ar, al, {});
+                    try w.print("        {s}: _World.{s}.HostClient(HostType),\n", .{ al, ib.zig_ident });
+                }
+            }
+        }
+    }
+
+    try w.writeAll("\n        pub fn init(host_ptr: *HostType) @This() {\n");
+    try w.writeAll("            return .{\n");
+    try w.writeAll("                .host = host_ptr,\n");
+    var seen_world_init = std.StringHashMapUnmanaged(void).empty;
+    for ([_][]const u8{ "World", "host", "init" }) |reserved| {
+        try seen_world_init.put(ar, reserved, {});
+    }
+    for (emitted_world_ifaces.items) |ib| {
+        try seen_world_init.put(ar, ib.zig_ident, {});
+        try w.print("                .{s} = _World.{s}.bindHost(host_ptr),\n", .{ ib.zig_ident, ib.zig_ident });
+        if (ib.alias_ident) |al| {
+            if (!seen_world_init.contains(al)) {
+                try seen_world_init.put(ar, al, {});
+                try w.print("                .{s} = _World.{s}.bindHost(host_ptr),\n", .{ al, ib.zig_ident });
+            }
+        }
+    }
+    try w.writeAll("            };\n");
+    try w.writeAll("        }\n");
+
+    try w.writeAll("    };\n");
+    try w.writeAll("}\n\n");
+    try w.writeAll(
+        \\pub fn bindHost(host_ptr: anytype) @This().HostClient(@TypeOf(host_ptr.*)) {
+        \\    return @This().HostClient(@TypeOf(host_ptr.*)).init(host_ptr);
+        \\}
+        \\
+        \\
+    );
 }
 
 fn emitWorldZigarAbiNamespace(
