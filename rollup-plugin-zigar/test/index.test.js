@@ -186,6 +186,12 @@ describe('Loader', function() {
       expect(mod.exerciseNamespaceShadowMutation().string).to.equal(
         '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
       );
+      expect(mod.exerciseNamedCjs().string).to.equal(
+        '1|2=2|42->43|del=true:has=false:def_has=false|restored=1',
+      );
+      expect(mod.exerciseFalsyEsm().string).to.equal(
+        'z=0|b=false|null=true|undef=true|set_err=true:def=100:del=false',
+      );
       expect(Number(mod.activeHandles())).to.equal(0);
 
       // Also verify Rollup multi-chunk code splitting with dynamicJsImports: true!
@@ -223,6 +229,12 @@ describe('Loader', function() {
       const dynEntryMod = await import(pathToFileURL(join(dynChunkDir, 'entry.mjs')).href);
       expect(dynEntryMod.exerciseNamespaceShadowMutation().string).to.equal(
         '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
+      );
+      expect(dynEntryMod.exerciseNamedCjs().string).to.equal(
+        '1|2=2|42->43|del=true:has=false:def_has=false|restored=1',
+      );
+      expect(dynEntryMod.exerciseFalsyEsm().string).to.equal(
+        'z=0|b=false|null=true|undef=true|set_err=true:def=100:del=false',
       );
       expect(Number(dynEntryMod.activeHandles())).to.equal(0);
     })

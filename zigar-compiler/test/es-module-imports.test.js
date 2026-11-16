@@ -95,8 +95,10 @@ describe('Tree-Shaken ES Module Imports & CJS/ESM Interop (zigar-compiler WASM)'
         './cjs-export-equals.cjs',
         './cjs-class.cjs',
         './singleton-esm.mjs',
+        './named.cjs',
+        './falsy.mjs',
       ]);
-      expect(result.jsModules).to.have.lengthOf(6);
+      expect(result.jsModules).to.have.lengthOf(8);
 
       const tmpBase = process.env.TMPDIR || os.tmpdir();
       const outDir = join(tmpBase, 'zigar-esmod-wasm');
@@ -116,6 +118,12 @@ describe('Tree-Shaken ES Module Imports & CJS/ESM Interop (zigar-compiler WASM)'
       );
       expect(mod.exerciseNamespaceShadowMutation().string).to.equal(
         '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
+      );
+      expect(mod.exerciseNamedCjs().string).to.equal(
+        '1|2=2|42->43|del=true:has=false:def_has=false|restored=1',
+      );
+      expect(mod.exerciseFalsyEsm().string).to.equal(
+        'z=0|b=false|null=true|undef=true|set_err=true:def=100:del=false',
       );
       expect(Number(mod.activeHandles())).to.equal(0);
     });
@@ -157,6 +165,12 @@ describe('Tree-Shaken ES Module Imports & CJS/ESM Interop (zigar-compiler WASM)'
     expect(cjsMod.exerciseNamespaceShadowMutation().string).to.equal(
       '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
     );
+    expect(cjsMod.exerciseNamedCjs().string).to.equal(
+      '1|2=2|42->43|del=true:has=false:def_has=false|restored=1',
+    );
+    expect(cjsMod.exerciseFalsyEsm().string).to.equal(
+      'z=0|b=false|null=true|undef=true|set_err=true:def=100:del=false',
+    );
     expect(Number(cjsMod.activeHandles())).to.equal(0);
 
     // dynamicJsImports: true mode — write generated ESM alongside local helper modules and import from an unrelated cwd!
@@ -179,7 +193,7 @@ describe('Tree-Shaken ES Module Imports & CJS/ESM Interop (zigar-compiler WASM)'
     const unrelatedCwd = join(tmpBase, `zigar-unrelated-cwd-${runId}`);
     await mkdir(dynOutDir, { recursive: true });
     await mkdir(unrelatedCwd, { recursive: true });
-    for (const helperFile of [ 'esm-helper.mjs', 'cjs-export-equals.cjs', 'cjs-class.cjs', 'singleton-esm.mjs' ]) {
+    for (const helperFile of [ 'esm-helper.mjs', 'cjs-export-equals.cjs', 'cjs-class.cjs', 'singleton-esm.mjs', 'named.cjs', 'falsy.mjs' ]) {
       await copyFile(join(sampleDir, helperFile), join(dynOutDir, helperFile));
     }
     const dynPath = join(dynOutDir, 'parity-dyn.mjs');
@@ -201,6 +215,12 @@ describe('Tree-Shaken ES Module Imports & CJS/ESM Interop (zigar-compiler WASM)'
       );
       expect(dynMod.exerciseNamespaceShadowMutation().string).to.equal(
         '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
+      );
+      expect(dynMod.exerciseNamedCjs().string).to.equal(
+        '1|2=2|42->43|del=true:has=false:def_has=false|restored=1',
+      );
+      expect(dynMod.exerciseFalsyEsm().string).to.equal(
+        'z=0|b=false|null=true|undef=true|set_err=true:def=100:del=false',
       );
       expect(dynMod.bumpSingletonVisits(9)).to.equal(9);
       expect(singletonFromJs.visits).to.equal(9);
@@ -246,6 +266,12 @@ describe('Tree-Shaken ES Module Imports & CJS/ESM Interop (zigar-compiler WASM)'
     );
     expect(mod.exerciseNamespaceShadowMutation().string).to.equal(
       '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
+    );
+    expect(mod.exerciseNamedCjs().string).to.equal(
+      '1|2=2|42->43|del=true:has=false:def_has=false|restored=1',
+    );
+    expect(mod.exerciseFalsyEsm().string).to.equal(
+      'z=0|b=false|null=true|undef=true|set_err=true:def=100:del=false',
     );
     expect(Number(mod.activeHandles())).to.equal(0);
   });

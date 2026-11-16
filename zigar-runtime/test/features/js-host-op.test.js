@@ -1020,4 +1020,167 @@ describe('Feature: js-host-op', function() {
     env.releaseJsValue(hNs);
     expect(env.getJsValueCount()).to.equal(0);
   });
+
+  it('should unwrap Node CJS-wrapped ESM namespaces to live module.exports across GetProp, SetProp, DeleteProp, HasProp, and CallMethod', function() {
+    const env = new Env();
+    env.littleEndian = true;
+    const harness = createMemoryHarness(env);
+    const s = defineHostOpStructures(env, harness.is64);
+
+    const errUnionVoid = {
+      type: StructureType.ErrorUnion,
+      name: 'HostError!void',
+      byteSize: 2,
+      align: 2,
+      flags: StructureFlag.HasValue,
+      signature: 450n,
+      instance: {
+        members: [
+          { type: MemberType.Void, bitSize: 0, bitOffset: 0, byteSize: 0, structure: s.voidStruct },
+          { type: MemberType.Uint, flags: MemberFlag.IsSelector, bitSize: 16, bitOffset: 0, byteSize: 2, structure: s.errSet },
+        ],
+      },
+      static: {},
+    };
+    env.beginStructure(errUnionVoid);
+    env.finishStructure(errUnionVoid);
+
+    // Simulate Node's frozen ESM wrapper over `./named.cjs` where `cjsNs.counter` is a dead load-time snapshot (1)
+    // while `cjsNs.default` and `cjsNs['module.exports']` point to the live `module.exports` object.
+    const liveExports = {
+      counter: 1,
+      bump() {
+        liveExports.counter += 1;
+        return liveExports.counter;
+      },
+    };
+    const cjsNamespace = Object.create(null);
+    Object.defineProperties(cjsNamespace, {
+      [Symbol.toStringTag]: { value: 'Module' },
+      counter: { value: 1, writable: false, enumerable: true, configurable: false },
+      bump: { value: liveExports.bump, writable: false, enumerable: true, configurable: false },
+      default: { value: liveExports, writable: false, enumerable: true, configurable: false },
+      'module.exports': { value: liveExports, writable: false, enumerable: true, configurable: false },
+    });
+    Object.freeze(cjsNamespace);
+
+    const tsDefaultFn = () => 999;
+    const tsCjsExports = Object.defineProperty({ default: tsDefaultFn }, '__esModule', { value: true });
+    const tsCjsNamespace = Object.create(null);
+    Object.defineProperties(tsCjsNamespace, {
+      [Symbol.toStringTag]: { value: 'Module' },
+      default: { value: tsCjsExports, enumerable: true },
+      'module.exports': { value: tsCjsExports, enumerable: true },
+    });
+    Object.freeze(tsCjsNamespace);
+
+    env.registerJsModules({
+      'pkg-cjs-no-ext': cjsNamespace,
+      'pkg-ts-cjs': tsCjsNamespace,
+    });
+
+    const argsImport = s.makeArgStruct(451n, s.jsRef, []);
+    const argsGetI32 = s.makeArgStruct(452n, s.i32, [ s.jsRef ]);
+    const argsCallBump = s.makeArgStruct(453n, s.i32, [ s.jsRef ]);
+    const argsSetFallible = s.makeArgStruct(454n, errUnionVoid, [ s.jsRef, s.i32 ]);
+    const argsDelete = s.makeArgStruct(455n, s.boolStruct, [ s.jsRef ]);
+    const argsHas = s.makeArgStruct(456n, s.boolStruct, [ s.jsRef ]);
+    const argsGetRef = s.makeArgStruct(457n, s.jsRef, [ s.jsRef ]);
+
+    const enc = new TextEncoder();
+    let strOff = 0x100;
+    const putKey = (text) => {
+      const bytes = enc.encode(text);
+      const view = harness.viewAt(strOff, bytes.length);
+      new Uint8Array(view.buffer, view.byteOffset, bytes.length).set(bytes);
+      const out = { keyAddr: harness.addrOf(strOff), keyLen: harness.is64 ? BigInt(bytes.length) : bytes.length };
+      strOff += (bytes.length + 7) & ~7;
+      return out;
+    };
+
+    const kCounter = putKey('counter');
+    const kBump = putKey('bump');
+    const kDefault = putKey('default');
+    const kModExports = putKey('module.exports');
+    const kPkgCjs = putKey('pkg-cjs-no-ext');
+    const kPkgTsCjs = putKey('pkg-ts-cjs');
+
+    const dGetCounter = writeDescriptor(harness, 0x300, { signature: 452n, op: HostOpCode.GetProp, ...kCounter, argSize: argsGetI32.byteSize });
+    const dCallBump = writeDescriptor(harness, 0x340, { signature: 453n, op: HostOpCode.CallMethod, ...kBump, argSize: argsCallBump.byteSize });
+    const dSetCounter = writeDescriptor(harness, 0x380, { signature: 454n, op: HostOpCode.SetProp, ...kCounter, argSize: argsSetFallible.byteSize });
+    const dDelCounter = writeDescriptor(harness, 0x3c0, { signature: 455n, op: HostOpCode.DeleteProp, ...kCounter, argSize: argsDelete.byteSize });
+    const dHasCounter = writeDescriptor(harness, 0x400, { signature: 456n, op: HostOpCode.HasProp, ...kCounter, argSize: argsHas.byteSize });
+    const dImportDef = writeDescriptor(harness, 0x440, { signature: 451n, op: HostOpCode.ImportModule, flags: HostOpFlag.ModuleDefault, ...kPkgCjs, argSize: argsImport.byteSize });
+    const dImportTsDef = writeDescriptor(harness, 0x480, { signature: 451n, op: HostOpCode.ImportModule, flags: HostOpFlag.ModuleDefault, ...kPkgTsCjs, argSize: argsImport.byteSize });
+    const dGetDefaultProp = writeDescriptor(harness, 0x4c0, { signature: 457n, op: HostOpCode.GetProp, ...kDefault, argSize: argsGetRef.byteSize });
+    const dGetModExportsProp = writeDescriptor(harness, 0x500, { signature: 457n, op: HostOpCode.GetProp, ...kModExports, argSize: argsGetRef.byteSize });
+
+    const frameAddr = harness.addrOf(0x900);
+    const frameDV = harness.viewAt(0x900, 64);
+    const hNs = env.allocJsValue(cjsNamespace);
+
+    // 1. Initial GetProp('counter') == 1
+    frameDV.setUint32(argsGetI32.instance.members[1].bitOffset / 8, hNs, true);
+    expect(env.invokeJsHostOp(dGetCounter, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getInt32(0, true)).to.equal(1);
+
+    // 2. CallMethod('bump') -> 2, and subsequent GetProp('counter') reads live 2 (NOT stale snapshot cjsNamespace.counter === 1)
+    frameDV.setUint32(argsCallBump.instance.members[1].bitOffset / 8, hNs, true);
+    expect(env.invokeJsHostOp(dCallBump, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getInt32(0, true)).to.equal(2);
+    expect(cjsNamespace.counter).to.equal(1);
+
+    frameDV.setUint32(argsGetI32.instance.members[1].bitOffset / 8, hNs, true);
+    expect(env.invokeJsHostOp(dGetCounter, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getInt32(0, true)).to.equal(2);
+
+    // 3. SetProp('counter', 42) mutates liveExports.counter without throwing on frozen cjsNamespace
+    frameDV.setUint16(0, 0xffff, true);
+    frameDV.setUint32(argsSetFallible.instance.members[1].bitOffset / 8, hNs, true);
+    frameDV.setInt32(argsSetFallible.instance.members[2].bitOffset / 8, 42, true);
+    expect(env.invokeJsHostOp(dSetCounter, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint16(0, true)).to.equal(0);
+    expect(liveExports.counter).to.equal(42);
+
+    frameDV.setUint32(argsGetI32.instance.members[1].bitOffset / 8, hNs, true);
+    expect(env.invokeJsHostOp(dGetCounter, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getInt32(0, true)).to.equal(42);
+
+    // 4. DeleteProp('counter') -> true, and HasProp('counter') -> false even though 'counter' in cjsNamespace is still true
+    frameDV.setUint32(argsDelete.instance.members[1].bitOffset / 8, hNs, true);
+    expect(env.invokeJsHostOp(dDelCounter, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint8(0)).to.equal(1);
+    expect('counter' in cjsNamespace).to.be.true;
+    expect('counter' in liveExports).to.be.false;
+
+    frameDV.setUint32(argsHas.instance.members[1].bitOffset / 8, hNs, true);
+    expect(env.invokeJsHostOp(dHasCounter, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint8(0)).to.equal(0);
+
+    // 5. ModuleDefault, GetProp('default'), GetProp('module.exports'), and __esModule CJS default unwrap cleanly
+    expect(env.invokeJsHostOp(dImportDef, frameAddr)).to.equal(PosixError.NONE);
+    const hDef = frameDV.getUint32(0, true);
+    expect(env.getJsValue(hDef)).to.equal(liveExports);
+
+    expect(env.invokeJsHostOp(dImportTsDef, frameAddr)).to.equal(PosixError.NONE);
+    const hTsDef = frameDV.getUint32(0, true);
+    expect(env.getJsValue(hTsDef)).to.equal(tsDefaultFn);
+
+    frameDV.setUint32(argsGetRef.instance.members[1].bitOffset / 8, hNs, true);
+    expect(env.invokeJsHostOp(dGetDefaultProp, frameAddr)).to.equal(PosixError.NONE);
+    const hGetDef = frameDV.getUint32(0, true);
+    expect(env.getJsValue(hGetDef)).to.equal(liveExports);
+
+    frameDV.setUint32(argsGetRef.instance.members[1].bitOffset / 8, hNs, true);
+    expect(env.invokeJsHostOp(dGetModExportsProp, frameAddr)).to.equal(PosixError.NONE);
+    const hGetModExp = frameDV.getUint32(0, true);
+    expect(env.getJsValue(hGetModExp)).to.equal(liveExports);
+
+    env.releaseJsValue(hNs);
+    env.releaseJsValue(hDef);
+    env.releaseJsValue(hTsDef);
+    env.releaseJsValue(hGetDef);
+    env.releaseJsValue(hGetModExp);
+    expect(env.getJsValueCount()).to.equal(0);
+  });
 });

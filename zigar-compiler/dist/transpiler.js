@@ -8268,6 +8268,7 @@ var jsHostOp = mixin({
     this.jsModuleCache = new Map();
     this.jsModuleLoaders = new Map();
     this.jsModuleNamespaces = new WeakSet();
+    this.jsCjsNamespaces = new WeakSet();
     this.moduleBaseURL = null;
     this.zigCallbackTemplateCache = new Map();
     this.zigCallbackMap = new Map();
@@ -8311,14 +8312,70 @@ var jsHostOp = mixin({
     target.pendingHostError = undefined;
     return { error };
   },
-  trackJsModuleNamespace(moduleExports) {
+  trackJsModuleNamespace(moduleExports, specifier) {
     if (moduleExports !== null && (typeof(moduleExports) === 'object' || typeof(moduleExports) === 'function')) {
       this.jsModuleNamespaces.add(moduleExports);
+      if (isEsModuleNamespaceObject(moduleExports) && hasDefaultFallbackTarget(moduleExports.default)) {
+        if (
+          isCjsWrappedNamespace(moduleExports)
+          || (typeof(specifier) === 'string' && /\.c[jt]s(?:$|[?#])/i.test(specifier))
+          || (typeof(specifier) === 'string' && Boolean(globalThis.Bun) && this.isBunCjsModule(specifier, moduleExports))
+        ) {
+          this.jsCjsNamespaces.add(moduleExports);
+        }
+      }
     }
   },
+  isBunCjsModule(specifier, moduleExports) {
+    try {
+      const proc = globalThis.process;
+      const nodeModule = proc?.getBuiltinModule?.('node:module');
+      if (typeof(nodeModule?.createRequire) !== 'function') {
+        return false;
+      }
+      const fallbackBase = `${proc.cwd?.() ?? '/'}/_zigar_host_.js`;
+      const strippedBase = String(this.moduleBaseURL || fallbackBase)
+        .replace(/^zigar:/, '')
+        .split(/[?#]/)[0];
+      const usableBase = (strippedBase.includes('://') && !strippedBase.startsWith('file://'))
+        ? fallbackBase
+        : strippedBase;
+      const basePath = usableBase.endsWith('/') ? `${usableBase}_zigar_host_.js` : usableBase;
+      const req = nodeModule.createRequire(basePath);
+      const spec = specifier.startsWith('file://') ? new URL(specifier) : specifier;
+      const resolved = req.resolve(spec);
+      return req.cache?.[resolved]?.exports === moduleExports.default;
+    } catch {
+      return false;
+    }
+  },
+  isJsCjsNamespace(target) {
+    if (target === null || typeof(target) !== 'object') {
+      return false;
+    }
+    if (this.jsCjsNamespaces.has(target)) {
+      return true;
+    }
+    if (this.jsModuleNamespaces.has(target) && isCjsWrappedNamespace(target)) {
+      this.jsCjsNamespaces.add(target);
+      return true;
+    }
+    return false;
+  },
+  unwrapCjsNamespace(target, propKey) {
+    if (!this.isJsCjsNamespace(target)) {
+      return target;
+    }
+    const cjsExports = target.default;
+    if ((propKey === 'default' || propKey === 'module.exports') && !(propKey in Object(cjsExports))) {
+      return target;
+    }
+    return cjsExports;
+  },
   registerJsModule(specifier, moduleExports) {
-    this.jsModuleCache.set(String(specifier), moduleExports);
-    this.trackJsModuleNamespace(moduleExports);
+    const spec = String(specifier);
+    this.jsModuleCache.set(spec, moduleExports);
+    this.trackJsModuleNamespace(moduleExports, spec);
   },
   registerJsModules(modules) {
     if (!modules || typeof(modules) !== 'object') {
@@ -8653,8 +8710,9 @@ var jsHostOp = mixin({
             break;
           }
           case HostOpCode.GetProp: {
-            const target = jsArgs[0];
+            const rawTarget = jsArgs[0];
             const propKey = dynamicKey ? jsArgs[1] : key;
+            const target = this.unwrapCjsNamespace(rawTarget, propKey);
             if (
               target !== null
               && target !== undefined
@@ -8669,9 +8727,10 @@ var jsHostOp = mixin({
             break;
           }
           case HostOpCode.SetProp: {
-            const target = jsArgs[0];
+            const rawTarget = jsArgs[0];
             const propKey = dynamicKey ? jsArgs[1] : key;
             const value = dynamicKey ? jsArgs[2] : jsArgs[1];
+            const target = this.unwrapCjsNamespace(rawTarget, propKey);
             if (
               target !== null
               && target !== undefined
@@ -8688,8 +8747,9 @@ var jsHostOp = mixin({
             break;
           }
           case HostOpCode.DeleteProp: {
-            const target = jsArgs[0];
+            const rawTarget = jsArgs[0];
             const propKey = dynamicKey ? jsArgs[1] : key;
+            const target = this.unwrapCjsNamespace(rawTarget, propKey);
             if (
               target !== null
               && target !== undefined
@@ -8705,8 +8765,9 @@ var jsHostOp = mixin({
             break;
           }
           case HostOpCode.HasProp: {
-            const target = jsArgs[0];
+            const rawTarget = jsArgs[0];
             const propKey = dynamicKey ? jsArgs[1] : key;
+            const target = this.unwrapCjsNamespace(rawTarget, propKey);
             let present = Reflect.has(target, propKey);
             if (
               !present
@@ -8736,9 +8797,10 @@ var jsHostOp = mixin({
             break;
           }
           case HostOpCode.CallMethod: {
-            const target = jsArgs[0];
+            const rawTarget = jsArgs[0];
             const methodKey = dynamicKey ? jsArgs[1] : key;
             const callArgs = dynamicKey ? jsArgs.slice(2) : jsArgs.slice(1);
+            const target = this.unwrapCjsNamespace(rawTarget, methodKey);
             if (target === null || target === undefined) {
               throw new TypeError(`Cannot read properties of ${target} (reading '${String(methodKey)}')`);
             }
@@ -8948,6 +9010,17 @@ function hasDefaultFallbackTarget(val) {
   return val !== null && (typeof(val) === 'object' || typeof(val) === 'function');
 }
 
+function isEsModuleNamespaceObject(mod) {
+  return mod !== null && typeof(mod) === 'object' && mod[Symbol.toStringTag] === 'Module';
+}
+
+function isCjsWrappedNamespace(mod) {
+  return isEsModuleNamespaceObject(mod)
+    && hasDefaultFallbackTarget(mod.default)
+    && ('module.exports' in mod)
+    && mod['module.exports'] === mod.default;
+}
+
 function isModuleNamespaceLike(mod) {
   if (mod === null || typeof(mod) !== 'object') {
     return false;
@@ -8959,7 +9032,11 @@ function isModuleNamespaceLike(mod) {
 
 function unwrapModuleDefault(mod) {
   if (isModuleNamespaceLike(mod)) {
-    return mod.default;
+    const def = mod.default;
+    if (def !== null && (typeof(def) === 'object' || typeof(def) === 'function') && def.__esModule === true && ('default' in def)) {
+      return def.default;
+    }
+    return def;
   }
   if (mod !== null && (typeof(mod) === 'object' || typeof(mod) === 'function') && ('default' in mod)) {
     return mod.default;

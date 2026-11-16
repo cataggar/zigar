@@ -29,6 +29,12 @@ describe('Bun Native ES Module Imports, Tree-Shaking & CJS/ESM Interop (bun-ziga
     expect(mod.exerciseNamespaceShadowMutation().string).to.equal(
       '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
     );
+    expect(mod.exerciseNamedCjs().string).to.equal(
+      '1|2=2|42->43|del=true:has=false:def_has=false|restored=1',
+    );
+    expect(mod.exerciseFalsyEsm().string).to.equal(
+      'z=0|b=false|null=true|undef=true|set_err=true:def=100:del=false',
+    );
     expect(mod.exerciseRuntimeRelativeImport('./cjs-export-equals.cjs', 3, 19)).to.equal(319);
     expect(Number(mod.activeHandles())).to.equal(0);
   });

@@ -13,6 +13,8 @@ const LocalEsm = js.Module("./esm-helper.mjs");
 const LocalCjsFn = js.Module("./cjs-export-equals.cjs");
 const LocalCjsClass = js.Module("./cjs-class.cjs");
 const SingletonEsm = js.Module("./singleton-esm.mjs");
+const NamedCjs = js.Module("./named.cjs");
+const FalsyEsm = js.Module("./falsy.mjs");
 
 pub const unused_mod_desc = js.Module("unused-parity-mod");
 
@@ -180,6 +182,77 @@ pub fn exerciseNamespaceShadowMutation(alloc: std.mem.Allocator) ![]const u8 {
 
 pub fn bumpSingletonVisits(delta: i32) !i32 {
     return SingletonEsm.call(fn (i32) HostError!i32, "recordVisit", .{delta});
+}
+
+pub fn exerciseNamedCjs(alloc: std.mem.Allocator) ![]const u8 {
+    const initial = try NamedCjs.get(i32, "counter");
+    const bumped = try NamedCjs.call(fn () HostError!i32, "bump", .{});
+    const after_bump = try NamedCjs.get(i32, "counter");
+
+    try NamedCjs.set("counter", @as(i32, 42));
+    const after_set = try NamedCjs.get(i32, "counter");
+    const bumped_after_set = try NamedCjs.call(fn () HostError!i32, "bump", .{});
+
+    const deleted = try NamedCjs.delete("counter");
+    const has_after_del = try NamedCjs.has("counter");
+
+    const def_obj = try NamedCjs.default(Ref(js.Object));
+    defer def_obj.deinit();
+    const def_has_after_del = def_obj.has("counter");
+
+    try NamedCjs.set("counter", @as(i32, 1));
+    const restored = try NamedCjs.get(i32, "counter");
+
+    return std.fmt.allocPrint(
+        alloc,
+        "{d}|{d}={d}|{d}->{d}|del={any}:has={any}:def_has={any}|restored={d}",
+        .{
+            initial,
+            bumped,
+            after_bump,
+            after_set,
+            bumped_after_set,
+            deleted,
+            has_after_del,
+            def_has_after_del,
+            restored,
+        },
+    );
+}
+
+pub fn exerciseFalsyEsm(alloc: std.mem.Allocator) ![]const u8 {
+    const zero = try FalsyEsm.get(i32, "zero");
+    const nope = try FalsyEsm.get(bool, "nope");
+    const nil_ref = try FalsyEsm.get(Ref(js.Any), "nil");
+    defer nil_ref.deinit();
+    const undef_ref = try FalsyEsm.get(Ref(js.Any), "undef");
+    defer undef_ref.deinit();
+
+    var set_failed = false;
+    if (FalsyEsm.set("live", @as(i32, 5))) |_| {
+        return error.UnexpectedMutationSuccess;
+    } else |err| {
+        if (err != error.TypeError and err != error.JsException) return err;
+        set_failed = true;
+    }
+    const def_obj = try FalsyEsm.default(Ref(js.Object));
+    defer def_obj.deinit();
+    const def_live = def_obj.get(i32, "live");
+    const deleted_live = try FalsyEsm.delete("live");
+
+    return std.fmt.allocPrint(
+        alloc,
+        "z={d}|b={any}|null={any}|undef={any}|set_err={any}:def={d}:del={any}",
+        .{
+            zero,
+            nope,
+            nil_ref.handle == js.reserved_null_handle,
+            undef_ref.handle == js.reserved_undefined_handle,
+            set_failed,
+            def_live,
+            deleted_live,
+        },
+    );
 }
 
 pub fn exerciseRuntimeRelativeImport(spec: []const u8, a: i32, b: i32) !i32 {
