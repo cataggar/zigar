@@ -219,7 +219,11 @@ var callMarshalingOutbound = mixin({
       }
     };
     const prevErrorFrame = this.activeHostErrorFrame;
+    const prevWorkerId = this.activeWorkerId;
+    const prevWorkerErrorFrame = this.activeWorkerErrorFrame;
     this.activeHostErrorFrame = errorFrame;
+    this.activeWorkerId = 0n;
+    this.activeWorkerErrorFrame = null;
     try {
       if (useSyncRunner) {
         const prevContinuation = this.activeContinuation;
@@ -238,6 +242,8 @@ var callMarshalingOutbound = mixin({
       }
     } catch (err) {
       this.activeHostErrorFrame = prevErrorFrame;
+      this.activeWorkerId = prevWorkerId;
+      this.activeWorkerErrorFrame = prevWorkerErrorFrame;
       const pending = consumeErrorFrame();
       const isCleanExit = !pending && (err instanceof Exit && err.code === 0);
       if (!finalized) {
@@ -249,6 +255,8 @@ var callMarshalingOutbound = mixin({
       throw err;
     }
     this.activeHostErrorFrame = prevErrorFrame;
+    this.activeWorkerId = prevWorkerId;
+    this.activeWorkerErrorFrame = prevWorkerErrorFrame;
     const finishCall = (success) => {
       const pending = consumeErrorFrame();
       if (pending) {

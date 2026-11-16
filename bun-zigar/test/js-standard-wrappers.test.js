@@ -208,4 +208,70 @@ describe('Bun Native Standard zigar.js Wrappers & WorkQueue Async Promise/AsyncI
     await mod.shutdown();
     queueStarted = false;
   });
+
+  it('should isolate error frames when a worker-bridged JS op synchronously re-enters main-thread Zig exports or closures', async function() {
+    await mod.startup(2);
+    queueStarted = true;
+
+    const boomObj = {
+      boom() {
+        throw new Error('inner-boom');
+      },
+    };
+
+    // 1a. worker -> JS -> sync Zig export calling infallible obj.call("boom"), caught in JS
+    let caughtInJs = null;
+    const caughtExportVal = await mod.workerNestedSyncReentrancy(() => {
+      try {
+        return mod.syncCallInfallibleBoom(boomObj);
+      } catch (err) {
+        caughtInJs = err.message;
+        return -77;
+      }
+    });
+    expect(caughtInJs).to.equal('inner-boom');
+    expect(caughtExportVal).to.equal(-77);
+
+    // 1b. worker -> JS -> sync Zig export calling infallible obj.call("boom"), uncaught -> propagates as error.JsException
+    const propagatedExportMsg = (await mod.workerNestedSyncPropagateError(() => mod.syncCallInfallibleBoom(boomObj))).string;
+    expect(propagatedExportMsg).to.equal('inner-boom');
+
+    // 2. worker -> JS -> sync Zig export calling obj.tryCall("boom") catch -1 -> returns -1 with hasLastError() == false on worker
+    const recoveredExportVal = await mod.workerNestedSyncReentrancy(() => mod.syncTryCallRecover(boomObj));
+    expect(recoveredExportVal).to.equal(-1);
+
+    // 3. Pre-existing worker captured error is preserved (neither overwritten nor evicted) across nested syncTryCallRecover
+    const preservedOuterMsg = (await mod.workerNestedPreserveOuterError(
+      () => {
+        throw new Error('outer-worker-boom');
+      },
+      () => mod.syncTryCallRecover(boomObj),
+    )).string;
+    expect(preservedOuterMsg).to.equal('outer-worker-boom');
+
+    // 4. Same guarantees for nested main-thread Zig Closure (`createZigCallback`) invoked from worker-bridged JS op
+    const onceBoomCatch = mod.makeOnceClosureInfallibleBoom(boomObj);
+    let caughtClosureMsg = null;
+    const caughtClosureVal = await mod.workerNestedSyncReentrancy(() => {
+      try {
+        return onceBoomCatch();
+      } catch (err) {
+        caughtClosureMsg = err.message;
+        return -88;
+      }
+    });
+    expect(caughtClosureMsg).to.equal('inner-boom');
+    expect(caughtClosureVal).to.equal(-88);
+
+    const onceBoomProp = mod.makeOnceClosureInfallibleBoom(boomObj);
+    const propagatedClosureMsg = (await mod.workerNestedSyncPropagateError(() => onceBoomProp())).string;
+    expect(propagatedClosureMsg).to.equal('inner-boom');
+
+    const onceTryRecover = mod.makeOnceClosureTryRecover(boomObj);
+    const recoveredClosureVal = await mod.workerNestedSyncReentrancy(() => onceTryRecover());
+    expect(recoveredClosureVal).to.equal(-1);
+
+    await mod.shutdown();
+    queueStarted = false;
+  });
 });

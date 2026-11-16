@@ -1574,19 +1574,36 @@ export default mixin({
     if (!cancelThunk) {
       return;
     }
-    if (process.env.TARGET === 'wasm') {
-      const runner = this.runThunkSync ?? this.runThunk;
-      if (runner) {
-        const prevContinuation = this.activeContinuation;
-        this.activeContinuation = null;
-        try {
-          runner(cancelThunk, slotAddr, zeroAddr);
-        } finally {
-          this.activeContinuation = prevContinuation;
+    const prevErrorFrame = this.activeHostErrorFrame;
+    const prevWorkerId = this.activeWorkerId;
+    const prevWorkerErrorFrame = this.activeWorkerErrorFrame;
+    this.activeHostErrorFrame = {
+      hasPendingHostError: false,
+      pendingHostError: undefined,
+      hasCapturedError: false,
+      capturedError: undefined,
+    };
+    this.activeWorkerId = 0n;
+    this.activeWorkerErrorFrame = null;
+    try {
+      if (process.env.TARGET === 'wasm') {
+        const runner = this.runThunkSync ?? this.runThunk;
+        if (runner) {
+          const prevContinuation = this.activeContinuation;
+          this.activeContinuation = null;
+          try {
+            runner(cancelThunk, slotAddr, zeroAddr);
+          } finally {
+            this.activeContinuation = prevContinuation;
+          }
         }
+      } else {
+        this.runThunk?.(cancelThunk, slotAddr, zeroAddr);
       }
-    } else {
-      this.runThunk?.(cancelThunk, slotAddr, zeroAddr);
+    } finally {
+      this.activeHostErrorFrame = prevErrorFrame;
+      this.activeWorkerId = prevWorkerId;
+      this.activeWorkerErrorFrame = prevWorkerErrorFrame;
     }
   },
   createZigCallback(descriptorAddr, callbackId) {
@@ -1629,6 +1646,7 @@ export default mixin({
         if (isOnce) {
           state.released = true;
         }
+        const savedOuterPending = this.savePendingHostError();
         let asyncResult = false;
         try {
           const res = caller(...args);
@@ -1648,6 +1666,9 @@ export default mixin({
           }
           return unwrapResult(res);
         } finally {
+          if (savedOuterPending) {
+            this.restorePendingHostError(savedOuterPending);
+          }
           if (isOnce && !asyncResult) {
             finishOnceCleanup();
           }

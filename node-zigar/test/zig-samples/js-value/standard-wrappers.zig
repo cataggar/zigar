@@ -61,6 +61,57 @@ pub const workerAwaitCatchUninspected = work_queue.promisify(worker_ns.awaitCatc
 pub const workerVerifyCleanErrorState = work_queue.promisify(worker_ns.verifyCleanErrorState);
 pub const workerConsumeAsyncIterator = work_queue.promisify(worker_ns.consumeAsyncIterator);
 pub const workerSyncWrappersAndAsyncDispose = work_queue.promisify(worker_ns.syncWrappersAndAsyncDispose);
+pub const workerNestedSyncReentrancy = work_queue.promisify(worker_ns.nestedSyncReentrancy);
+pub const workerNestedSyncPropagateError = work_queue.promisify(worker_ns.nestedSyncPropagateError);
+pub const workerNestedPreserveOuterError = work_queue.promisify(worker_ns.nestedPreserveOuterError);
+
+const NestedBoomCtx = struct {
+    obj: Ref(js.Object),
+};
+
+const NestedClosureHooks = struct {
+    fn infallibleBoom(ctx: *NestedBoomCtx) i32 {
+        defer ctx.obj.deinit();
+        _ = ctx.obj.call(fn () i32, "boom", .{});
+        return 100;
+    }
+
+    fn tryCallRecover(ctx: *NestedBoomCtx) i32 {
+        defer ctx.obj.deinit();
+        return ctx.obj.tryCall(fn () i32, "boom", .{}) catch -1;
+    }
+};
+
+pub fn syncCallInfallibleBoom(obj: Ref(js.Object)) i32 {
+    defer obj.deinit();
+    _ = obj.call(fn () i32, "boom", .{});
+    return 100;
+}
+
+pub fn syncTryCallRecover(obj: Ref(js.Object)) i32 {
+    defer obj.deinit();
+    return obj.tryCall(fn () i32, "boom", .{}) catch -1;
+}
+
+pub fn makeOnceClosureInfallibleBoom(obj: Ref(js.Object)) !Ref(js.Function) {
+    defer obj.deinit();
+    const cloned = obj.clone();
+    errdefer cloned.deinit();
+    const cl = try js.Closure(NestedBoomCtx, NestedClosureHooks.infallibleBoom).tryOnceOwned(tracked_alloc, .{
+        .obj = cloned,
+    });
+    return cl.cloneRef();
+}
+
+pub fn makeOnceClosureTryRecover(obj: Ref(js.Object)) !Ref(js.Function) {
+    defer obj.deinit();
+    const cloned = obj.clone();
+    errdefer cloned.deinit();
+    const cl = try js.Closure(NestedBoomCtx, NestedClosureHooks.tryCallRecover).tryOnceOwned(tracked_alloc, .{
+        .obj = cloned,
+    });
+    return cl.cloneRef();
+}
 
 pub fn activeHandles() u32 {
     return js.activeHandleCount();
@@ -488,5 +539,50 @@ const worker_ns = struct {
         defer tracked_alloc.free(bi_str);
 
         return std.fmt.allocPrint(allocator, "buf={}|got={d}|bi={s}", .{ is_buf, got, bi_str });
+    }
+
+    pub fn nestedSyncReentrancy(hook: Ref(js.Function)) !i32 {
+        defer hook.deinit();
+        if (js.hasLastError()) return error.UnexpectedPriorWorkerError;
+        const val = try hook.tryInvoke(fn () i32, .{});
+        if (js.hasLastError()) return error.StaleWorkerLastError;
+        return val;
+    }
+
+    pub fn nestedSyncPropagateError(allocator: std.mem.Allocator, hook: Ref(js.Function)) ![]const u8 {
+        defer hook.deinit();
+        if (hook.tryInvoke(fn () i32, .{})) |_| {
+            return error.ExpectedJsException;
+        } else |err| {
+            if (err != error.JsException) return err;
+            var exc = (try js.tryTakeLastError()) orelse return error.MissingCapturedError;
+            defer exc.deinit();
+            if (js.hasLastError()) return error.StaleWorkerLastError;
+            return (try exc.message(allocator)) orelse return error.MissingMessage;
+        }
+    }
+
+    pub fn nestedPreserveOuterError(
+        allocator: std.mem.Allocator,
+        outer_boom: Ref(js.Function),
+        inner_try_recover_hook: Ref(js.Function),
+    ) ![]const u8 {
+        defer outer_boom.deinit();
+        defer inner_try_recover_hook.deinit();
+        if (outer_boom.tryInvoke(fn () i32, .{})) |_| {
+            return error.ExpectedOuterJsException;
+        } else |err| {
+            if (err != error.JsException) return err;
+        }
+        if (!js.hasLastError()) return error.ExpectedOuterCapturedError;
+
+        const inner_val = try inner_try_recover_hook.tryInvoke(fn () i32, .{});
+        if (inner_val != -1) return error.UnexpectedInnerReturnValue;
+        if (!js.hasLastError()) return error.LostOuterCapturedError;
+
+        var exc = (try js.tryTakeLastError()) orelse return error.MissingOuterCapturedError;
+        defer exc.deinit();
+        if (js.hasLastError()) return error.StaleWorkerLastError;
+        return (try exc.message(allocator)) orelse return error.MissingMessage;
     }
 };
