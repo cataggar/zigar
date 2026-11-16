@@ -1003,6 +1003,7 @@ function generateCode(definition, params) {
     moduleFormat,
     dynamicJsImports = false,
     jsModuleResolver,
+    moduleBaseURL,
   } = params;
   const exports = getExports(structures);
   const lines = [];
@@ -1017,14 +1018,9 @@ function generateCode(definition, params) {
     }
   }
   const staticJsImports = [];
+  const dynamicJsModuleEntries = [];
   const preloadJsModules = [];
   for (const spec of uniqueJsModules) {
-    if (dynamicJsImports) {
-      if (!spec.startsWith('virtual:') && !spec.startsWith('\0')) {
-        preloadJsModules.push(spec);
-      }
-      continue;
-    }
     let importSpec;
     if (typeof(jsModuleResolver) === 'function') {
       importSpec = jsModuleResolver(spec);
@@ -1032,6 +1028,13 @@ function generateCode(definition, params) {
       importSpec = null;
     } else {
       importSpec = spec;
+    }
+    if (dynamicJsImports) {
+      if (typeof(importSpec) === 'string' && importSpec.length > 0) {
+        dynamicJsModuleEntries.push({ specifier: spec, importSpecifier: importSpec });
+        preloadJsModules.push(spec);
+      }
+      continue;
     }
     if (typeof(importSpec) === 'string' && importSpec.length > 0) {
       const ident = `__zigar_js_mod_${staticJsImports.length}`;
@@ -1103,8 +1106,14 @@ function generateCode(definition, params) {
   }
   add(`\n// create runtime environment`);
   add(`const env = createEnvironment();`);
-  if (type === 'cjs' && (definition.settings?.hasJsHostOps || uniqueJsModules.length > 0)) {
-    add(`if (typeof __filename === 'string') env.moduleBaseURL = __filename;`);
+  if (definition.settings?.hasJsHostOps || uniqueJsModules.length > 0) {
+    if (typeof(moduleBaseURL) === 'string' && moduleBaseURL.length > 0) {
+      add(`env.moduleBaseURL = ${escapeJsString(moduleBaseURL)};`);
+    } else if (type === 'cjs') {
+      add(`if (typeof __filename === 'string') env.moduleBaseURL = __filename;`);
+    } else {
+      add(`if (typeof import.meta?.url === 'string') env.moduleBaseURL = import.meta.url;`);
+    }
   }
   if (staticJsImports.length > 0) {
     add(`env.registerJsModules({`);
@@ -1113,11 +1122,19 @@ function generateCode(definition, params) {
     }
     add(`});`);
   }
+  const inlineNativeDynamicAwait = Boolean(dynamicJsImports && dynamicJsModuleEntries.length > 0 && !moduleOptions && type === 'esm' && topLevelAwait);
+  if (dynamicJsImports && dynamicJsModuleEntries.length > 0 && !inlineNativeDynamicAwait) {
+    add(`env.registerJsModuleLoaders({`);
+    for (const { specifier, importSpecifier } of dynamicJsModuleEntries) {
+      add(`${escapeJsString(specifier)}: () => import(${escapeJsString(importSpecifier)}),`);
+    }
+    add(`});`);
+  }
   add(`\n// recreate structures`);
   add(`env.recreateStructures(structures, settings);`);
-  if (dynamicJsImports && preloadJsModules.length > 0 && !moduleOptions && type === 'esm' && topLevelAwait) {
-    for (const spec of preloadJsModules) {
-      add(`env.registerJsModule(${escapeJsString(spec)}, await import(${escapeJsString(spec)}));`);
+  if (inlineNativeDynamicAwait) {
+    for (const { specifier, importSpecifier } of dynamicJsModuleEntries) {
+      add(`env.registerJsModule(${escapeJsString(specifier)}, await import(${escapeJsString(importSpecifier)}));`);
     }
   }
   if (binarySource) {
@@ -1132,7 +1149,7 @@ function generateCode(definition, params) {
       ...moduleOptions,
       ...(preloadJsModules.length > 0 ? { preloadJsModules } : {}),
     } : null;
-    add(`env.loadModule(source, ${loadOptions ? JSON.stringify(loadOptions) : null});`);
+    add(`env.loadModule(source, ${loadOptions ? escapeJsonLiteral(loadOptions) : null});`);
     // if top level await is used, we don't need to write changes into Zig memory buffers
     add(`env.linkVariables(${!topLevelAwait});`);
   } else if (standaloneLoader?.moduleDir) {
@@ -1188,7 +1205,11 @@ function generateCode(definition, params) {
 }
 
 function escapeJsString(value) {
-  return JSON.stringify(String(value))
+  return escapeJsonLiteral(String(value));
+}
+
+function escapeJsonLiteral(value) {
+  return JSON.stringify(value)
     .replace(/\u2028/g, '\\u2028')
     .replace(/\u2029/g, '\\u2029');
 }
@@ -8245,6 +8266,7 @@ var jsHostOp = mixin({
     this.jsKeyCache = new Map();
     this.jsKeyDecodeCount = 0;
     this.jsModuleCache = new Map();
+    this.jsModuleLoaders = new Map();
     this.jsModuleNamespaces = new WeakSet();
     this.moduleBaseURL = null;
     this.zigCallbackTemplateCache = new Map();
@@ -8307,6 +8329,20 @@ var jsHostOp = mixin({
       this.registerJsModule(specifier, moduleExports);
     }
   },
+  registerJsModuleLoader(specifier, loader) {
+    if (typeof(loader) === 'function') {
+      this.jsModuleLoaders.set(String(specifier), loader);
+    }
+  },
+  registerJsModuleLoaders(loaders) {
+    if (!loaders || typeof(loaders) !== 'object') {
+      return;
+    }
+    const entries = (loaders instanceof Map) ? loaders.entries() : Object.entries(loaders);
+    for (const [ specifier, loader ] of entries) {
+      this.registerJsModuleLoader(specifier, loader);
+    }
+  },
   resolveJsModule(specifier) {
     const spec = String(specifier);
     if (this.jsModuleCache.has(spec)) {
@@ -8323,8 +8359,14 @@ var jsHostOp = mixin({
       }
       const nodeModule = proc.getBuiltinModule('node:module');
       if (typeof(nodeModule?.createRequire) === 'function') {
-        const rawBase = (this.moduleBaseURL || `${proc.cwd?.() ?? '/'}/_zigar_host_.js`).split(/[?#]/)[0];
-        const basePath = rawBase.endsWith('/') ? `${rawBase}_zigar_host_.js` : rawBase;
+        const fallbackBase = `${proc.cwd?.() ?? '/'}/_zigar_host_.js`;
+        const strippedBase = String(this.moduleBaseURL || fallbackBase)
+          .replace(/^zigar:/, '')
+          .split(/[?#]/)[0];
+        const usableBase = (strippedBase.includes('://') && !strippedBase.startsWith('file://'))
+          ? fallbackBase
+          : strippedBase;
+        const basePath = usableBase.endsWith('/') ? `${usableBase}_zigar_host_.js` : usableBase;
         try {
           const req = nodeModule.createRequire(basePath);
           const loaded = req(spec);
@@ -8633,6 +8675,7 @@ var jsHostOp = mixin({
             if (
               target !== null
               && target !== undefined
+              && !(propKey in Object(target))
               && this.jsModuleNamespaces.has(target)
               && isModuleNamespaceLike(target)
               && hasDefaultFallbackTarget(target.default)
@@ -8650,6 +8693,7 @@ var jsHostOp = mixin({
             if (
               target !== null
               && target !== undefined
+              && !(propKey in Object(target))
               && this.jsModuleNamespaces.has(target)
               && isModuleNamespaceLike(target)
               && hasDefaultFallbackTarget(target.default)
@@ -8852,39 +8896,46 @@ var jsHostOp = mixin({
   getActiveZigCallbackCount() {
     return this.zigCallbackMap.size;
   },
-  ...({
-    async preloadJsModules(specifiers = this.jsModules, baseURL = this.moduleBaseURL) {
-      if (!Array.isArray(specifiers) || specifiers.length === 0) {
-        return;
+  async preloadJsModules(specifiers = this.jsModules, baseURL = this.moduleBaseURL) {
+    if (baseURL && !this.moduleBaseURL) {
+      this.moduleBaseURL = baseURL;
+    }
+    if (!Array.isArray(specifiers) || specifiers.length === 0) {
+      return;
+    }
+    for (const rawSpec of specifiers) {
+      const spec = String(rawSpec);
+      if (!spec || this.jsModuleCache.has(spec) || spec.startsWith('virtual:') || spec.startsWith('\0')) {
+        continue;
       }
-      for (const rawSpec of specifiers) {
-        const spec = String(rawSpec);
-        if (!spec || this.jsModuleCache.has(spec) || spec.startsWith('virtual:') || spec.startsWith('\0')) {
-          continue;
+      const customLoader = this.jsModuleLoaders.get(spec);
+      try {
+        let loaded;
+        if (typeof(customLoader) === 'function') {
+          loaded = await customLoader();
+        } else {
+          let importTarget = spec;
+          const effectiveBase = baseURL ?? this.moduleBaseURL;
+          if ((spec.startsWith('./') || spec.startsWith('../')) && effectiveBase) {
+            const cleanBase = String(effectiveBase).replace(/^zigar:/, '').split(/[?#]/)[0];
+            const baseHref = cleanBase.includes('://')
+              ? cleanBase
+              : `file://${cleanBase.startsWith('/') ? '' : '/'}${cleanBase.replace(/\\/g, '/')}`;
+            importTarget = new URL(spec, baseHref).href;
+          }
+          loaded = await import(importTarget);
         }
-        let importTarget = spec;
-        if ((spec.startsWith('./') || spec.startsWith('../')) && baseURL) {
-          const cleanBase = String(baseURL).split(/[?#]/)[0];
-          const baseHref = cleanBase.includes('://')
-            ? cleanBase
-            : `file://${cleanBase.startsWith('/') ? '' : '/'}${cleanBase}`;
-          importTarget = new URL(spec, baseHref).href;
-        }
+        this.registerJsModule(spec, loaded);
+      } catch (importErr) {
         try {
-          const loaded = await import(importTarget);
-          this.registerJsModule(spec, loaded);
-        } catch (importErr) {
-          if (baseURL && !this.moduleBaseURL) {
-            this.moduleBaseURL = baseURL;
-          }
-          try {
-            this.resolveJsModule(spec);
-          } catch {
-            throw importErr;
-          }
+          this.resolveJsModule(spec);
+        } catch {
+          throw importErr;
         }
       }
-    },
+    }
+  },
+  ...({
     exports: {
       invokeJsHostOp: { argType: 'aaz', returnType: 'i' },
       createZigCallback: { argType: 'ai', returnType: 'i' },
@@ -17866,7 +17917,7 @@ async function transpile(srcPath, options) {
     }
   }
   let syncJsModuleResolver;
-  if (typeof(jsModuleResolver) === 'function' && Array.isArray(definition.jsModules) && !dynamicJsImports) {
+  if (typeof(jsModuleResolver) === 'function' && Array.isArray(definition.jsModules)) {
     const resolvedMap = new Map();
     for (const spec of definition.jsModules) {
       const key = String(spec);

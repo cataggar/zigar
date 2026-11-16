@@ -12,6 +12,7 @@ const NodeUrl = js.Module("node:url");
 const LocalEsm = js.Module("./esm-helper.mjs");
 const LocalCjsFn = js.Module("./cjs-export-equals.cjs");
 const LocalCjsClass = js.Module("./cjs-class.cjs");
+const SingletonEsm = js.Module("./singleton-esm.mjs");
 
 pub const unused_mod_desc = js.Module("unused-parity-mod");
 
@@ -126,3 +127,64 @@ pub fn exerciseLocalCjsExportEquals(alloc: std.mem.Allocator, a: i32, b: i32) ![
         .{ computed, extra, described, direct_call, class_tag, acc_total },
     );
 }
+
+pub fn exerciseNamespaceShadowMutation(alloc: std.mem.Allocator) ![]const u8 {
+    const live_before = try SingletonEsm.get(i32, "live");
+    const def_obj = try SingletonEsm.default(Ref(js.Object));
+    defer def_obj.deinit();
+    const def_live_before = def_obj.get(i32, "live");
+
+    var set_failed = false;
+    if (SingletonEsm.set("live", @as(i32, 5))) |_| {
+        return error.UnexpectedMutationSuccess;
+    } else |err| {
+        if (err != error.TypeError and err != error.JsException) return err;
+        set_failed = true;
+    }
+
+    const live_after_set = try SingletonEsm.get(i32, "live");
+    const def_live_after_set = def_obj.get(i32, "live");
+
+    const deleted_live = try SingletonEsm.delete("live");
+    const has_live = try SingletonEsm.has("live");
+    const def_live_after_del = def_obj.get(i32, "live");
+
+    try SingletonEsm.set("onlyOnDefault", @as(i32, 77));
+    const only_via_mod = try SingletonEsm.get(i32, "onlyOnDefault");
+    const only_via_def = def_obj.get(i32, "onlyOnDefault");
+
+    const deleted_only = try SingletonEsm.delete("onlyOnDefault");
+    const has_only_after_del = try SingletonEsm.has("onlyOnDefault");
+
+    try SingletonEsm.set("onlyOnDefault", @as(i32, 42));
+
+    return std.fmt.allocPrint(
+        alloc,
+        "{d}:{d}|{s}|{d}:{d}|del={any}:has={any}:def={d}|only={d}={d}|del_only={any}:has_only={any}",
+        .{
+            live_before,
+            def_live_before,
+            if (set_failed) "set_err" else "no_err",
+            live_after_set,
+            def_live_after_set,
+            deleted_live,
+            has_live,
+            def_live_after_del,
+            only_via_mod,
+            only_via_def,
+            deleted_only,
+            has_only_after_del,
+        },
+    );
+}
+
+pub fn bumpSingletonVisits(delta: i32) !i32 {
+    return SingletonEsm.call(fn (i32) HostError!i32, "recordVisit", .{delta});
+}
+
+pub fn exerciseRuntimeRelativeImport(spec: []const u8, a: i32, b: i32) !i32 {
+    const dyn_mod = try js.importModuleDynamicAs(HostError!Ref(js.Function), spec);
+    defer dyn_mod.deinit();
+    return dyn_mod.invoke(fn (i32, i32) HostError!i32, .{ a, b });
+}
+

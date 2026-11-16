@@ -1,5 +1,7 @@
 import { expect } from 'chai';
+import { mkdir } from 'node:fs/promises';
 import { createRequire } from 'node:module';
+import os from 'node:os';
 import { join } from 'node:path';
 import '../dist/index.cjs';
 import { load } from '../dist/index.js';
@@ -38,6 +40,18 @@ describe('Native ES Module Imports, Tree-Shaking & CJS/ESM Interop (node-zigar)'
     expect(mod.exerciseLocalCjsExportEquals(4, 23).string).to.equal(
       '423|cjs-static-extra|cjs-static-extra:ok|708|cjs-ctor-tag|155',
     );
+    expect(mod.exerciseNamespaceShadowMutation().string).to.equal(
+      '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
+    );
+    const unrelatedCwd = join(process.env.TMPDIR || os.tmpdir(), 'node-zigar-unrelated-cwd');
+    await mkdir(unrelatedCwd, { recursive: true });
+    const prevCwd = process.cwd();
+    process.chdir(unrelatedCwd);
+    try {
+      expect(mod.exerciseRuntimeRelativeImport('./cjs-export-equals.cjs', 3, 19)).to.equal(319);
+    } finally {
+      process.chdir(prevCwd);
+    }
     expect(Number(mod.activeHandles())).to.equal(0);
   });
 
@@ -53,6 +67,10 @@ describe('Native ES Module Imports, Tree-Shaking & CJS/ESM Interop (node-zigar)'
     expect(mod.exerciseLocalCjsExportEquals(4, 23).string).to.equal(
       '423|cjs-static-extra|cjs-static-extra:ok|708|cjs-ctor-tag|155',
     );
+    expect(mod.exerciseNamespaceShadowMutation().string).to.equal(
+      '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
+    );
+    expect(mod.exerciseRuntimeRelativeImport('./cjs-export-equals.cjs', 3, 19)).to.equal(319);
     expect(Number(mod.activeHandles())).to.equal(0);
   });
 });

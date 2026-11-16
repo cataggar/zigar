@@ -887,4 +887,137 @@ describe('Feature: js-host-op', function() {
     env.releaseJsValue(hNs);
     expect(env.getJsValueCount()).to.equal(0);
   });
+
+  it('should not shadow real named exports onto target.default on SetProp/DeleteProp and should support registerJsModuleLoaders', async function() {
+    const env = new Env();
+    env.littleEndian = true;
+    const harness = createMemoryHarness(env);
+    const s = defineHostOpStructures(env, harness.is64);
+
+    const errUnionVoid = {
+      type: StructureType.ErrorUnion,
+      name: 'HostError!void',
+      byteSize: 2,
+      align: 2,
+      flags: StructureFlag.HasValue,
+      signature: 420n,
+      instance: {
+        members: [
+          { type: MemberType.Void, bitSize: 0, bitOffset: 0, byteSize: 0, structure: s.voidStruct },
+          { type: MemberType.Uint, flags: MemberFlag.IsSelector, bitSize: 16, bitOffset: 0, byteSize: 2, structure: s.errSet },
+        ],
+      },
+      static: {},
+    };
+    env.beginStructure(errUnionVoid);
+    env.finishStructure(errUnionVoid);
+
+    const defaultObj = { live: 100, onlyOnDefault: 42 };
+    const esmNamespace = Object.create(null);
+    Object.defineProperties(esmNamespace, {
+      [Symbol.toStringTag]: { value: 'Module' },
+      live: {
+        get: () => 1,
+        enumerable: true,
+        configurable: false,
+      },
+      default: {
+        get: () => defaultObj,
+        enumerable: true,
+        configurable: false,
+      },
+    });
+    Object.freeze(esmNamespace);
+
+    let loaderCalls = 0;
+    env.registerJsModuleLoaders({
+      './singleton-esm.mjs': async () => {
+        loaderCalls++;
+        return esmNamespace;
+      },
+    });
+    await env.preloadJsModules([ './singleton-esm.mjs' ]);
+    expect(loaderCalls).to.equal(1);
+    expect(env.resolveJsModule('./singleton-esm.mjs')).to.equal(esmNamespace);
+
+    const argsSetFallible = s.makeArgStruct(421n, errUnionVoid, [ s.jsRef, s.i32 ]);
+    const argsGetI32 = s.makeArgStruct(422n, s.i32, [ s.jsRef ]);
+    const argsDelete = s.makeArgStruct(423n, s.boolStruct, [ s.jsRef ]);
+    const argsHas = s.makeArgStruct(424n, s.boolStruct, [ s.jsRef ]);
+
+    const enc = new TextEncoder();
+    let strOff = 0x100;
+    const putKey = (text) => {
+      const bytes = enc.encode(text);
+      const view = harness.viewAt(strOff, bytes.length);
+      new Uint8Array(view.buffer, view.byteOffset, bytes.length).set(bytes);
+      const out = { keyAddr: harness.addrOf(strOff), keyLen: harness.is64 ? BigInt(bytes.length) : bytes.length };
+      strOff += (bytes.length + 7) & ~7;
+      return out;
+    };
+
+    const kLive = putKey('live');
+    const kOnly = putKey('onlyOnDefault');
+
+    const dSetLive = writeDescriptor(harness, 0x300, { signature: 421n, op: HostOpCode.SetProp, ...kLive, argSize: argsSetFallible.byteSize });
+    const dGetLive = writeDescriptor(harness, 0x340, { signature: 422n, op: HostOpCode.GetProp, ...kLive, argSize: argsGetI32.byteSize });
+    const dDelLive = writeDescriptor(harness, 0x380, { signature: 423n, op: HostOpCode.DeleteProp, ...kLive, argSize: argsDelete.byteSize });
+    const dHasLive = writeDescriptor(harness, 0x3c0, { signature: 424n, op: HostOpCode.HasProp, ...kLive, argSize: argsHas.byteSize });
+
+    const dSetOnly = writeDescriptor(harness, 0x400, { signature: 421n, op: HostOpCode.SetProp, ...kOnly, argSize: argsSetFallible.byteSize });
+    const dGetOnly = writeDescriptor(harness, 0x440, { signature: 422n, op: HostOpCode.GetProp, ...kOnly, argSize: argsGetI32.byteSize });
+    const dDelOnly = writeDescriptor(harness, 0x480, { signature: 423n, op: HostOpCode.DeleteProp, ...kOnly, argSize: argsDelete.byteSize });
+    const dHasOnly = writeDescriptor(harness, 0x4c0, { signature: 424n, op: HostOpCode.HasProp, ...kOnly, argSize: argsHas.byteSize });
+
+    const frameAddr = harness.addrOf(0x900);
+    const frameDV = harness.viewAt(0x900, 64);
+    const hNs = env.allocJsValue(esmNamespace);
+
+    // 1. SetProp('live', 5) fails with JsException (selector == 1) and does NOT mutate defaultObj.live (100)
+    frameDV.setUint16(0, 0, true);
+    frameDV.setUint32(argsSetFallible.instance.members[1].bitOffset / 8, hNs, true);
+    frameDV.setInt32(argsSetFallible.instance.members[2].bitOffset / 8, 5, true);
+    expect(env.invokeJsHostOp(dSetLive, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint16(0, true)).to.equal(1);
+    expect(defaultObj.live).to.equal(100);
+
+    frameDV.setUint32(argsGetI32.instance.members[1].bitOffset / 8, hNs, true);
+    expect(env.invokeJsHostOp(dGetLive, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getInt32(0, true)).to.equal(1);
+
+    // 2. DeleteProp('live') returns false (0) and does NOT delete defaultObj.live (100)
+    frameDV.setUint32(argsDelete.instance.members[1].bitOffset / 8, hNs, true);
+    expect(env.invokeJsHostOp(dDelLive, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint8(0)).to.equal(0);
+    expect(defaultObj.live).to.equal(100);
+    expect('live' in defaultObj).to.be.true;
+
+    frameDV.setUint32(argsHas.instance.members[1].bitOffset / 8, hNs, true);
+    expect(env.invokeJsHostOp(dHasLive, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint8(0)).to.equal(1);
+
+    // 3. SetProp & DeleteProp on 'onlyOnDefault' (NOT on namespace) still fall back to defaultObj
+    frameDV.setUint16(0, 0xffff, true);
+    frameDV.setUint32(argsSetFallible.instance.members[1].bitOffset / 8, hNs, true);
+    frameDV.setInt32(argsSetFallible.instance.members[2].bitOffset / 8, 77, true);
+    expect(env.invokeJsHostOp(dSetOnly, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint16(0, true)).to.equal(0);
+    expect(defaultObj.onlyOnDefault).to.equal(77);
+
+    frameDV.setUint32(argsGetI32.instance.members[1].bitOffset / 8, hNs, true);
+    expect(env.invokeJsHostOp(dGetOnly, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getInt32(0, true)).to.equal(77);
+
+    frameDV.setUint32(argsDelete.instance.members[1].bitOffset / 8, hNs, true);
+    expect(env.invokeJsHostOp(dDelOnly, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint8(0)).to.equal(1);
+    expect('onlyOnDefault' in defaultObj).to.be.false;
+
+    frameDV.setUint32(argsHas.instance.members[1].bitOffset / 8, hNs, true);
+    expect(env.invokeJsHostOp(dHasOnly, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint8(0)).to.equal(0);
+
+    env.releaseJsValue(hNs);
+    expect(env.getJsValueCount()).to.equal(0);
+  });
 });

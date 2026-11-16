@@ -104,7 +104,13 @@ if (!globalThis[pluginRegistered]) {
           return spec;
         }
       };
-      const { code } = generateCode(definition, { runtimeURL, binarySource, envVariables, jsModuleResolver });
+      const { code } = generateCode(definition, {
+        runtimeURL,
+        binarySource,
+        envVariables,
+        jsModuleResolver,
+        moduleBaseURL: fileBaseURL,
+      });
       return {
         contents: code,
         loader: 'js',

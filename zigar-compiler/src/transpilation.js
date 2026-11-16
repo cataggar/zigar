@@ -132,7 +132,7 @@ export async function transpile(srcPath, options) {
     }
   }
   let syncJsModuleResolver;
-  if (typeof(jsModuleResolver) === 'function' && Array.isArray(definition.jsModules) && !dynamicJsImports) {
+  if (typeof(jsModuleResolver) === 'function' && Array.isArray(definition.jsModules)) {
     const resolvedMap = new Map();
     for (const spec of definition.jsModules) {
       const key = String(spec);

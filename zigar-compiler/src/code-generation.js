@@ -21,6 +21,7 @@ export function generateCode(definition, params) {
     moduleFormat,
     dynamicJsImports = false,
     jsModuleResolver,
+    moduleBaseURL,
   } = params;
   const exports = getExports(structures);
   const lines = [];
@@ -35,14 +36,9 @@ export function generateCode(definition, params) {
     }
   }
   const staticJsImports = [];
+  const dynamicJsModuleEntries = [];
   const preloadJsModules = [];
   for (const spec of uniqueJsModules) {
-    if (dynamicJsImports) {
-      if (!spec.startsWith('virtual:') && !spec.startsWith('\0')) {
-        preloadJsModules.push(spec);
-      }
-      continue;
-    }
     let importSpec;
     if (typeof(jsModuleResolver) === 'function') {
       importSpec = jsModuleResolver(spec);
@@ -50,6 +46,13 @@ export function generateCode(definition, params) {
       importSpec = null;
     } else {
       importSpec = spec;
+    }
+    if (dynamicJsImports) {
+      if (typeof(importSpec) === 'string' && importSpec.length > 0) {
+        dynamicJsModuleEntries.push({ specifier: spec, importSpecifier: importSpec });
+        preloadJsModules.push(spec);
+      }
+      continue;
     }
     if (typeof(importSpec) === 'string' && importSpec.length > 0) {
       const ident = `__zigar_js_mod_${staticJsImports.length}`;
@@ -121,8 +124,14 @@ export function generateCode(definition, params) {
   }
   add(`\n// create runtime environment`);
   add(`const env = createEnvironment();`);
-  if (type === 'cjs' && (definition.settings?.hasJsHostOps || uniqueJsModules.length > 0)) {
-    add(`if (typeof __filename === 'string') env.moduleBaseURL = __filename;`);
+  if (definition.settings?.hasJsHostOps || uniqueJsModules.length > 0) {
+    if (typeof(moduleBaseURL) === 'string' && moduleBaseURL.length > 0) {
+      add(`env.moduleBaseURL = ${escapeJsString(moduleBaseURL)};`);
+    } else if (type === 'cjs') {
+      add(`if (typeof __filename === 'string') env.moduleBaseURL = __filename;`);
+    } else {
+      add(`if (typeof import.meta?.url === 'string') env.moduleBaseURL = import.meta.url;`);
+    }
   }
   if (staticJsImports.length > 0) {
     add(`env.registerJsModules({`);
@@ -131,11 +140,19 @@ export function generateCode(definition, params) {
     }
     add(`});`);
   }
+  const inlineNativeDynamicAwait = Boolean(dynamicJsImports && dynamicJsModuleEntries.length > 0 && !moduleOptions && type === 'esm' && topLevelAwait);
+  if (dynamicJsImports && dynamicJsModuleEntries.length > 0 && !inlineNativeDynamicAwait) {
+    add(`env.registerJsModuleLoaders({`);
+    for (const { specifier, importSpecifier } of dynamicJsModuleEntries) {
+      add(`${escapeJsString(specifier)}: () => import(${escapeJsString(importSpecifier)}),`);
+    }
+    add(`});`);
+  }
   add(`\n// recreate structures`);
   add(`env.recreateStructures(structures, settings);`);
-  if (dynamicJsImports && preloadJsModules.length > 0 && !moduleOptions && type === 'esm' && topLevelAwait) {
-    for (const spec of preloadJsModules) {
-      add(`env.registerJsModule(${escapeJsString(spec)}, await import(${escapeJsString(spec)}));`);
+  if (inlineNativeDynamicAwait) {
+    for (const { specifier, importSpecifier } of dynamicJsModuleEntries) {
+      add(`env.registerJsModule(${escapeJsString(specifier)}, await import(${escapeJsString(importSpecifier)}));`);
     }
   }
   if (binarySource) {
@@ -150,7 +167,7 @@ export function generateCode(definition, params) {
       ...moduleOptions,
       ...(preloadJsModules.length > 0 ? { preloadJsModules } : {}),
     } : null;
-    add(`env.loadModule(source, ${loadOptions ? JSON.stringify(loadOptions) : null});`);
+    add(`env.loadModule(source, ${loadOptions ? escapeJsonLiteral(loadOptions) : null});`);
     // if top level await is used, we don't need to write changes into Zig memory buffers
     add(`env.linkVariables(${!topLevelAwait});`);
   } else if (standaloneLoader?.moduleDir) {
@@ -206,7 +223,11 @@ export function generateCode(definition, params) {
 }
 
 function escapeJsString(value) {
-  return JSON.stringify(String(value))
+  return escapeJsonLiteral(String(value));
+}
+
+function escapeJsonLiteral(value) {
+  return JSON.stringify(value)
     .replace(/\u2028/g, '\\u2028')
     .replace(/\u2029/g, '\\u2029');
 }

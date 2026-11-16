@@ -27,6 +27,7 @@ var jsHostOp = mixin({
     this.jsKeyCache = new Map();
     this.jsKeyDecodeCount = 0;
     this.jsModuleCache = new Map();
+    this.jsModuleLoaders = new Map();
     this.jsModuleNamespaces = new WeakSet();
     this.moduleBaseURL = null;
     this.zigCallbackTemplateCache = new Map();
@@ -89,6 +90,20 @@ var jsHostOp = mixin({
       this.registerJsModule(specifier, moduleExports);
     }
   },
+  registerJsModuleLoader(specifier, loader) {
+    if (typeof(loader) === 'function') {
+      this.jsModuleLoaders.set(String(specifier), loader);
+    }
+  },
+  registerJsModuleLoaders(loaders) {
+    if (!loaders || typeof(loaders) !== 'object') {
+      return;
+    }
+    const entries = (loaders instanceof Map) ? loaders.entries() : Object.entries(loaders);
+    for (const [ specifier, loader ] of entries) {
+      this.registerJsModuleLoader(specifier, loader);
+    }
+  },
   resolveJsModule(specifier) {
     const spec = String(specifier);
     if (this.jsModuleCache.has(spec)) {
@@ -105,8 +120,14 @@ var jsHostOp = mixin({
       }
       const nodeModule = proc.getBuiltinModule('node:module');
       if (typeof(nodeModule?.createRequire) === 'function') {
-        const rawBase = (this.moduleBaseURL || `${proc.cwd?.() ?? '/'}/_zigar_host_.js`).split(/[?#]/)[0];
-        const basePath = rawBase.endsWith('/') ? `${rawBase}_zigar_host_.js` : rawBase;
+        const fallbackBase = `${proc.cwd?.() ?? '/'}/_zigar_host_.js`;
+        const strippedBase = String(this.moduleBaseURL || fallbackBase)
+          .replace(/^zigar:/, '')
+          .split(/[?#]/)[0];
+        const usableBase = (strippedBase.includes('://') && !strippedBase.startsWith('file://'))
+          ? fallbackBase
+          : strippedBase;
+        const basePath = usableBase.endsWith('/') ? `${usableBase}_zigar_host_.js` : usableBase;
         try {
           const req = nodeModule.createRequire(basePath);
           const loaded = req(spec);
@@ -415,6 +436,7 @@ var jsHostOp = mixin({
             if (
               target !== null
               && target !== undefined
+              && !(propKey in Object(target))
               && this.jsModuleNamespaces.has(target)
               && isModuleNamespaceLike(target)
               && hasDefaultFallbackTarget(target.default)
@@ -432,6 +454,7 @@ var jsHostOp = mixin({
             if (
               target !== null
               && target !== undefined
+              && !(propKey in Object(target))
               && this.jsModuleNamespaces.has(target)
               && isModuleNamespaceLike(target)
               && hasDefaultFallbackTarget(target.default)
@@ -634,39 +657,46 @@ var jsHostOp = mixin({
   getActiveZigCallbackCount() {
     return this.zigCallbackMap.size;
   },
-  ...({
-    async preloadJsModules(specifiers = this.jsModules, baseURL = this.moduleBaseURL) {
-      if (!Array.isArray(specifiers) || specifiers.length === 0) {
-        return;
+  async preloadJsModules(specifiers = this.jsModules, baseURL = this.moduleBaseURL) {
+    if (baseURL && !this.moduleBaseURL) {
+      this.moduleBaseURL = baseURL;
+    }
+    if (!Array.isArray(specifiers) || specifiers.length === 0) {
+      return;
+    }
+    for (const rawSpec of specifiers) {
+      const spec = String(rawSpec);
+      if (!spec || this.jsModuleCache.has(spec) || spec.startsWith('virtual:') || spec.startsWith('\0')) {
+        continue;
       }
-      for (const rawSpec of specifiers) {
-        const spec = String(rawSpec);
-        if (!spec || this.jsModuleCache.has(spec) || spec.startsWith('virtual:') || spec.startsWith('\0')) {
-          continue;
+      const customLoader = this.jsModuleLoaders.get(spec);
+      try {
+        let loaded;
+        if (typeof(customLoader) === 'function') {
+          loaded = await customLoader();
+        } else {
+          let importTarget = spec;
+          const effectiveBase = baseURL ?? this.moduleBaseURL;
+          if ((spec.startsWith('./') || spec.startsWith('../')) && effectiveBase) {
+            const cleanBase = String(effectiveBase).replace(/^zigar:/, '').split(/[?#]/)[0];
+            const baseHref = cleanBase.includes('://')
+              ? cleanBase
+              : `file://${cleanBase.startsWith('/') ? '' : '/'}${cleanBase.replace(/\\/g, '/')}`;
+            importTarget = new URL(spec, baseHref).href;
+          }
+          loaded = await import(importTarget);
         }
-        let importTarget = spec;
-        if ((spec.startsWith('./') || spec.startsWith('../')) && baseURL) {
-          const cleanBase = String(baseURL).split(/[?#]/)[0];
-          const baseHref = cleanBase.includes('://')
-            ? cleanBase
-            : `file://${cleanBase.startsWith('/') ? '' : '/'}${cleanBase}`;
-          importTarget = new URL(spec, baseHref).href;
-        }
+        this.registerJsModule(spec, loaded);
+      } catch (importErr) {
         try {
-          const loaded = await import(importTarget);
-          this.registerJsModule(spec, loaded);
-        } catch (importErr) {
-          if (baseURL && !this.moduleBaseURL) {
-            this.moduleBaseURL = baseURL;
-          }
-          try {
-            this.resolveJsModule(spec);
-          } catch {
-            throw importErr;
-          }
+          this.resolveJsModule(spec);
+        } catch {
+          throw importErr;
         }
       }
-    },
+    }
+  },
+  ...({
     exports: {
       invokeJsHostOp: { argType: 'aaz', returnType: 'i' },
       createZigCallback: { argType: 'ai', returnType: 'i' },

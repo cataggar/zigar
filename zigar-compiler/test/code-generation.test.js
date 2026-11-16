@@ -378,6 +378,7 @@ describe('Code generation', function() {
       expect(esmCode).to.contain('import * as __zigar_js_mod_0 from "node:path";');
       expect(esmCode).to.contain('import * as __zigar_js_mod_1 from "./local.mjs";');
       expect(esmCode).to.not.contain('from "virtual:skip-me"');
+      expect(esmCode).to.contain('if (typeof import.meta?.url === \'string\') env.moduleBaseURL = import.meta.url;');
       expect(esmCode).to.contain('env.registerJsModules({');
       expect(esmCode).to.contain('"node:path": __zigar_js_mod_0,');
       expect(esmCode).to.contain('"./local.mjs": __zigar_js_mod_1,');
@@ -392,6 +393,7 @@ describe('Code generation', function() {
         topLevelAwait: false,
       });
       expect(cjsCode).to.contain('const { createEnvironment } = require("zigar-runtime");');
+      expect(cjsCode).to.contain('if (typeof __filename === \'string\') env.moduleBaseURL = __filename;');
       expect(cjsCode).to.contain('const __zigar_js_mod_0 = require("node:path");');
       expect(cjsCode).to.contain('const __zigar_js_mod_1 = require("./local.mjs");');
       expect(cjsCode).to.contain('module.exports = {');
@@ -404,7 +406,12 @@ describe('Code generation', function() {
         dynamicJsImports: true,
       });
       expect(dynCode).to.not.contain('import * as __zigar_js_mod_');
+      expect(dynCode).to.contain('if (typeof import.meta?.url === \'string\') env.moduleBaseURL = import.meta.url;');
+      expect(dynCode).to.contain('env.registerJsModuleLoaders({');
+      expect(dynCode).to.contain('"node:path": () => import("node:path"),');
+      expect(dynCode).to.contain('"./local.mjs": () => import("./local.mjs"),');
       expect(dynCode).to.contain('"preloadJsModules":["node:path","./local.mjs"]');
+      expect(dynCode.indexOf('env.registerJsModuleLoaders(')).to.be.below(dynCode.indexOf('env.loadModule('));
     })
     it('should safely escape malicious JS module specifiers via JSON.stringify to prevent code injection', function() {
       const rootStructure = {
@@ -440,6 +447,13 @@ describe('Code generation', function() {
         binarySource: null,
         moduleFormat: 'cjs',
       });
+      const { code: dynEsmCode } = generateCode(def, {
+        declareFeatures: true,
+        runtimeURL: 'zigar-runtime',
+        binarySource: '"/mod.wasm"',
+        moduleOptions: { multithreaded: false },
+        dynamicJsImports: true,
+      });
 
       for (const spec of maliciousSpecifiers) {
         const expectedEscaped = JSON.stringify(spec)
@@ -449,9 +463,10 @@ describe('Code generation', function() {
         expect(esmCode).to.contain(`from ${expectedEscaped};`);
         expect(esmCode).to.contain(`${expectedEscaped}: __zigar_js_mod_`);
         expect(cjsCode).to.contain(`require(${expectedEscaped});`);
+        expect(dynEsmCode).to.contain(`${expectedEscaped}: () => import(${expectedEscaped}),`);
       }
 
-      for (const line of [ ...esmCode.split('\n'), ...cjsCode.split('\n') ]) {
+      for (const line of [ ...esmCode.split('\n'), ...cjsCode.split('\n'), ...dynEsmCode.split('\n') ]) {
         const trimmed = line.trim();
         expect(trimmed.startsWith('globalThis.__INJECTED_')).to.be.false;
         expect(trimmed).to.not.match(/;\s*globalThis\.__INJECTED_[A-Z_]+\s*=\s*1\s*;\s*$/);

@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import { join, resolve } from 'node:path';
@@ -94,8 +94,9 @@ describe('Tree-Shaken ES Module Imports & CJS/ESM Interop (zigar-compiler WASM)'
         './esm-helper.mjs',
         './cjs-export-equals.cjs',
         './cjs-class.cjs',
+        './singleton-esm.mjs',
       ]);
-      expect(result.jsModules).to.have.lengthOf(5);
+      expect(result.jsModules).to.have.lengthOf(6);
 
       const tmpBase = process.env.TMPDIR || os.tmpdir();
       const outDir = join(tmpBase, 'zigar-esmod-wasm');
@@ -113,11 +114,14 @@ describe('Tree-Shaken ES Module Imports & CJS/ESM Interop (zigar-compiler WASM)'
       expect(mod.exerciseLocalCjsExportEquals(4, 23).string).to.equal(
         '423|cjs-static-extra|cjs-static-extra:ok|708|cjs-ctor-tag|155',
       );
+      expect(mod.exerciseNamespaceShadowMutation().string).to.equal(
+        '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
+      );
       expect(Number(mod.activeHandles())).to.equal(0);
     });
   }
 
-  it('should support CJS output (moduleFormat: "cjs") and dynamicJsImports: true preload mode with identical CJS/ESM semantics', async function() {
+  it('should support CJS output (moduleFormat: "cjs") and dynamicJsImports: true from a different cwd without manual moduleBaseURL injection', async function() {
     const sampleFileURL = pathToFileURL(parityZig).href;
     const cjsRes = await transpile(parityZig, {
       nodeCompat: true,
@@ -150,9 +154,12 @@ describe('Tree-Shaken ES Module Imports & CJS/ESM Interop (zigar-compiler WASM)'
     expect(cjsMod.exerciseLocalCjsExportEquals(4, 23).string).to.equal(
       '423|cjs-static-extra|cjs-static-extra:ok|708|cjs-ctor-tag|155',
     );
+    expect(cjsMod.exerciseNamespaceShadowMutation().string).to.equal(
+      '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
+    );
     expect(Number(cjsMod.activeHandles())).to.equal(0);
 
-    // dynamicJsImports: true mode
+    // dynamicJsImports: true mode — write generated ESM alongside local helper modules and import from an unrelated cwd!
     const dynRes = await transpile(parityZig, {
       nodeCompat: false,
       embedWASM: true,
@@ -162,21 +169,46 @@ describe('Tree-Shaken ES Module Imports & CJS/ESM Interop (zigar-compiler WASM)'
       dynamicJsImports: true,
     });
     expect(dynRes.code).to.not.contain('import * as __zigar_js_mod_');
+    expect(dynRes.code).to.contain('if (typeof import.meta?.url === \'string\') env.moduleBaseURL = import.meta.url;');
+    expect(dynRes.code).to.contain('env.registerJsModuleLoaders({');
+    expect(dynRes.code).to.contain('"./singleton-esm.mjs": () => import("./singleton-esm.mjs"),');
     expect(dynRes.code).to.contain('"preloadJsModules"');
-    const dynCode = rewriteRuntimeImports(dynRes.code).replace(
-      'const env = createEnvironment();',
-      `const env = createEnvironment();\nenv.moduleBaseURL = ${JSON.stringify(sampleFileURL)};`,
-    );
-    const dynPath = join(outDir, `parity-dyn-${++counter}.mjs`);
-    await writeFile(dynPath, dynCode, 'utf-8');
-    const dynMod = await import(pathToFileURL(dynPath).href);
-    expect(dynMod.exerciseLocalEsm('dyn').string).to.equal(
-      'v17=v17|zig<->esm|esm-default:dyn|esm-default:handle',
-    );
-    expect(dynMod.exerciseLocalCjsExportEquals(4, 23).string).to.equal(
-      '423|cjs-static-extra|cjs-static-extra:ok|708|cjs-ctor-tag|155',
-    );
-    expect(Number(dynMod.activeHandles())).to.equal(0);
+
+    const runId = ++counter;
+    const dynOutDir = join(tmpBase, `zigar-esmod-dyn-${runId}`);
+    const unrelatedCwd = join(tmpBase, `zigar-unrelated-cwd-${runId}`);
+    await mkdir(dynOutDir, { recursive: true });
+    await mkdir(unrelatedCwd, { recursive: true });
+    for (const helperFile of [ 'esm-helper.mjs', 'cjs-export-equals.cjs', 'cjs-class.cjs', 'singleton-esm.mjs' ]) {
+      await copyFile(join(sampleDir, helperFile), join(dynOutDir, helperFile));
+    }
+    const dynPath = join(dynOutDir, 'parity-dyn.mjs');
+    // Zero manual env.moduleBaseURL injection — must resolve via import.meta.url & local () => import(...) thunks!
+    await writeFile(dynPath, rewriteRuntimeImports(dynRes.code), 'utf-8');
+
+    const prevCwd = process.cwd();
+    process.chdir(unrelatedCwd);
+    try {
+      const singletonFromJs = await import(pathToFileURL(join(dynOutDir, 'singleton-esm.mjs')).href);
+      expect(singletonFromJs.visits).to.equal(0);
+
+      const dynMod = await import(pathToFileURL(dynPath).href);
+      expect(dynMod.exerciseLocalEsm('dyn').string).to.equal(
+        'v17=v17|zig<->esm|esm-default:dyn|esm-default:handle',
+      );
+      expect(dynMod.exerciseLocalCjsExportEquals(4, 23).string).to.equal(
+        '423|cjs-static-extra|cjs-static-extra:ok|708|cjs-ctor-tag|155',
+      );
+      expect(dynMod.exerciseNamespaceShadowMutation().string).to.equal(
+        '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
+      );
+      expect(dynMod.bumpSingletonVisits(9)).to.equal(9);
+      expect(singletonFromJs.visits).to.equal(9);
+      expect(dynMod.exerciseRuntimeRelativeImport('./cjs-export-equals.cjs', 3, 19)).to.equal(319);
+      expect(Number(dynMod.activeHandles())).to.equal(0);
+    } finally {
+      process.chdir(prevCwd);
+    }
   });
 
   it('should support in-memory JIT WASM execution via createEnvironment + preloadJsModules without writing a JS wrapper', async function() {
@@ -211,6 +243,9 @@ describe('Tree-Shaken ES Module Imports & CJS/ESM Interop (zigar-compiler WASM)'
     );
     expect(mod.exerciseLocalCjsExportEquals(4, 23).string).to.equal(
       '423|cjs-static-extra|cjs-static-extra:ok|708|cjs-ctor-tag|155',
+    );
+    expect(mod.exerciseNamespaceShadowMutation().string).to.equal(
+      '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
     );
     expect(Number(mod.activeHandles())).to.equal(0);
   });

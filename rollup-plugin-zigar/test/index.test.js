@@ -183,7 +183,48 @@ describe('Loader', function() {
       expect(mod.exerciseLocalCjsExportEquals(4, 23).string).to.equal(
         '423|cjs-static-extra|cjs-static-extra:ok|708|cjs-ctor-tag|155',
       );
+      expect(mod.exerciseNamespaceShadowMutation().string).to.equal(
+        '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
+      );
       expect(Number(mod.activeHandles())).to.equal(0);
+
+      // Also verify Rollup multi-chunk code splitting with dynamicJsImports: true!
+      const dynChunkDir = join(tmpdir(), 'rollup-esmod-dyn-chunks');
+      const dynBundle = await rollup({
+        input: parityZig,
+        external: (id) => id.startsWith('node:'),
+        plugins: [
+          {
+            name: 'external-cjs',
+            resolveId(source, importer) {
+              if (source.endsWith('.cjs') && importer) {
+                let rel = relative(dynChunkDir, resolve(dirname(importer), source)).replace(/\\/g, '/');
+                if (!rel.startsWith('.')) rel = './' + rel;
+                return { id: rel, external: true };
+              }
+              return null;
+            },
+          },
+          Zigar({ embedWASM: true, optimize: 'ReleaseSmall', dynamicJsImports: true }),
+          NodeResolve({
+            modulePaths: [ absolute(`../node_modules`) ],
+          }),
+        ],
+      });
+      try {
+        await dynBundle.write({
+          dir: dynChunkDir,
+          entryFileNames: 'entry.mjs',
+          format: 'esm',
+        });
+      } finally {
+        await dynBundle.close();
+      }
+      const dynEntryMod = await import(pathToFileURL(join(dynChunkDir, 'entry.mjs')).href);
+      expect(dynEntryMod.exerciseNamespaceShadowMutation().string).to.equal(
+        '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
+      );
+      expect(Number(dynEntryMod.activeHandles())).to.equal(0);
     })
   })
 })
