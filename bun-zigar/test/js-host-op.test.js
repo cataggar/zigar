@@ -184,4 +184,44 @@ describe('Bun Native JS Host-Op Dispatcher & Dynamic Zig Callbacks Integration',
     expect(Number(mod.activeHandles())).to.equal(0);
     expect(() => staleSample(1)).to.throw(/already been released/);
   });
+
+  it('should survive 2,200+ caught infallible JS throws, Callback throws, nested throws, and NotInErrorSet on Bun N-API', function() {
+    const cleanup = { deferCount: 0 };
+    for (let i = 0; i < 2200; i++) {
+      expect(() => mod.callInfallibleWithStackAndDefer(() => {
+        throw new Error('boom');
+      }, i < 50 ? cleanup : null)).to.throw('boom');
+    }
+    expect(cleanup.deferCount).to.equal(50);
+    expect(Number(mod.activeHandles())).to.equal(0);
+
+    const cbFn = mod.createOwnedThrowingCallback();
+    expect(() => cbFn(() => {
+      throw new Error('cb-boom');
+    })).to.throw('cb-boom');
+    expect(Number(mod.deinitOwnedThrowingCallback())).to.equal(1);
+    expect(Number(mod.activeCallbacks())).to.equal(0);
+    expect(Number(mod.liveOwnedCallbackAllocs())).to.equal(0);
+
+    expect(mod.nestedOuterFallible(() => {
+      try {
+        mod.nestedInnerInfallible(() => {
+          throw new Error('inner');
+        });
+        return -1;
+      } catch {
+        return 777;
+      }
+    })).to.equal(777);
+    expect(mod.nestedOuterCatching(() => mod.nestedInnerInfallible(() => {
+      throw new Error('inner');
+    }))).to.equal(-999);
+
+    const tracker = { deferRuns: 0 };
+    expect(() => mod.callMismatchedErrorSetWithDefer(() => {
+      throw new RangeError('unlisted');
+    }, tracker)).to.throw();
+    expect(tracker.deferRuns).to.equal(1);
+    expect(Number(mod.activeHandles())).to.equal(0);
+  });
 });

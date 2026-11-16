@@ -210,4 +210,88 @@ describe('Native JS Host-Op Dispatcher & Dynamic Zig Callbacks Integration', fun
       expect(() => staleSample(1)).to.throw(/already been released/);
     }
   });
+
+  it('should survive 2,200+ caught infallible JS throws on native N-API without leaking Ref handles', function() {
+    const cleanup = { deferCount: 0 };
+    let caught = 0;
+    for (let i = 0; i < 2200; i++) {
+      const thrower = () => {
+        throw new Error('boom');
+      };
+      const track = (i < 200) ? cleanup : null;
+      expect(() => mod.callInfallibleWithStackAndDefer(thrower, track)).to.throw('boom');
+      caught++;
+    }
+    expect(caught).to.equal(2200);
+    expect(cleanup.deferCount).to.equal(200);
+    expect(Number(mod.activeHandles())).to.equal(0);
+  });
+
+  it('should run Zig defers and free owned Callback slots cleanly when infallible host-op inside Callback throws', function() {
+    const cbFn = mod.createOwnedThrowingCallback();
+    expect(Number(mod.activeCallbacks())).to.equal(1);
+    expect(Number(mod.liveOwnedCallbackAllocs())).to.equal(1);
+
+    for (let i = 0; i < 10; i++) {
+      expect(() => cbFn(() => {
+        throw new Error(`cb-boom-${i}`);
+      })).to.throw(`cb-boom-${i}`);
+    }
+    expect(cbFn(() => 123)).to.equal(123);
+
+    const deferRuns = mod.deinitOwnedThrowingCallback();
+    expect(Number(deferRuns)).to.equal(11);
+    expect(Number(mod.activeCallbacks())).to.equal(0);
+    expect(Number(mod.activeHandles())).to.equal(0);
+    expect(Number(mod.liveOwnedCallbackAllocs())).to.equal(0);
+  });
+
+  it('should isolate nested JS -> Zig outer (E!i32) -> JS mid -> Zig inner (i32) -> throwing JS op on native N-API', function() {
+    const midCaught = () => {
+      try {
+        mod.nestedInnerInfallible(() => {
+          throw new Error('inner-boom');
+        });
+        return -1;
+      } catch (err) {
+        expect(err.message).to.equal('inner-boom');
+        return 777;
+      }
+    };
+    expect(mod.nestedOuterFallible(midCaught)).to.equal(777);
+    expect(Number(mod.activeHandles())).to.equal(0);
+
+    const midUncaught = () => mod.nestedInnerInfallible(() => {
+      throw new Error('uncaught-inner-boom');
+    });
+    expect(mod.nestedOuterCatching(midUncaught)).to.equal(-999);
+    let outerErr = null;
+    try {
+      mod.nestedOuterFallible(midUncaught);
+    } catch (err) {
+      outerErr = err;
+    }
+    expect(outerErr).to.be.instanceOf(Error);
+    expect(outerErr.message).to.equal('Js exception');
+    expect(JSON.parse(JSON.stringify(outerErr))).to.deep.equal({ error: 'Js exception' });
+    expect(Number(mod.activeHandles())).to.equal(0);
+  });
+
+  it('should throw NotInErrorSet cleanly in JS on native N-API while running Zig defers', function() {
+    const tracker = { deferRuns: 0 };
+    for (let i = 0; i < 60; i++) {
+      let thrown = null;
+      try {
+        mod.callMismatchedErrorSetWithDefer(() => {
+          throw new RangeError('unlisted-js-error');
+        }, tracker);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).to.be.instanceOf(TypeError);
+      expect(thrown.message).to.match(/not a part of error set .*unlisted-js-error/);
+    }
+    expect(tracker.deferRuns).to.equal(60);
+    expect(Number(mod.activeHandles())).to.equal(0);
+  });
 });

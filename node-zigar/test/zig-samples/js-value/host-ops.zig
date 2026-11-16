@@ -279,3 +279,128 @@ pub fn release64StatefulCallbacks() void {
         cb.deinit();
     }
 }
+
+pub const OtherOnlyError = error{Other};
+
+pub fn callInfallibleWithStackAndDefer(f: Ref(js.Function), cleanup_obj: ?Ref(js.Object)) i32 {
+    defer f.deinit();
+    defer if (cleanup_obj) |obj| {
+        const prev = obj.get(i32, "deferCount");
+        obj.set("deferCount", prev + 1);
+        obj.deinit();
+    };
+    var stack_buf: [256]u8 = undefined;
+    @memset(&stack_buf, 0xA5);
+    std.mem.doNotOptimizeAway(&stack_buf);
+    const res = js.callFn(fn () i32, f, .{});
+    return res + @as(i32, stack_buf[0] & 0);
+}
+
+var owned_cb_live_allocs: u32 = 0;
+var owned_cb_backing: [64]u8 align(16) = undefined;
+
+const CountingSingleAllocator = struct {
+    fn alloc(_: *anyopaque, len: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+        if (owned_cb_live_allocs != 0 or len > owned_cb_backing.len) return null;
+        owned_cb_live_allocs += 1;
+        return &owned_cb_backing;
+    }
+
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+
+    fn free(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize) void {
+        owned_cb_live_allocs -= 1;
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn allocator() std.mem.Allocator {
+        return .{
+            .ptr = @ptrFromInt(16),
+            .vtable = &vtable,
+        };
+    }
+};
+
+const ThrowingCallback = js.Callback(fn (Ref(js.Function)) i32);
+var throwing_cb: ThrowingCallback = .{};
+var throwing_cb_defers: u32 = 0;
+
+const OwnedThrowingState = struct {
+    tag: u32,
+
+    fn onCall(self: *OwnedThrowingState, f: Ref(js.Function)) i32 {
+        defer f.deinit();
+        defer throwing_cb_defers += self.tag;
+        var stack_buf: [256]u8 = undefined;
+        @memset(&stack_buf, 0x7E);
+        std.mem.doNotOptimizeAway(&stack_buf);
+        return js.callFn(fn () i32, f, .{}) + @as(i32, stack_buf[0] & 0);
+    }
+};
+
+pub fn createOwnedThrowingCallback() !Ref(js.Function) {
+    throwing_cb_defers = 0;
+    throwing_cb = try ThrowingCallback.tryInitOwned(
+        CountingSingleAllocator.allocator(),
+        OwnedThrowingState{ .tag = 1 },
+        OwnedThrowingState.onCall,
+    );
+    return throwing_cb.toRef().clone();
+}
+
+pub fn deinitOwnedThrowingCallback() u32 {
+    throwing_cb.deinit();
+    return throwing_cb_defers;
+}
+
+pub fn liveOwnedCallbackAllocs() u32 {
+    return owned_cb_live_allocs;
+}
+
+pub fn nestedOuterFallible(mid_fn: Ref(js.Function)) HostError!i32 {
+    defer mid_fn.deinit();
+    return js.callFn(fn () HostError!i32, mid_fn, .{});
+}
+
+pub fn nestedOuterCatching(mid_fn: Ref(js.Function)) i32 {
+    if (nestedOuterFallible(mid_fn)) |val| {
+        return val;
+    } else |err| {
+        return if (err == error.JsException) -999 else -1;
+    }
+}
+
+pub fn nestedInnerInfallible(leaf_fn: Ref(js.Function)) i32 {
+    defer leaf_fn.deinit();
+    var stack_buf: [256]u8 = undefined;
+    @memset(&stack_buf, 0x5A);
+    std.mem.doNotOptimizeAway(&stack_buf);
+    return js.callFn(fn () i32, leaf_fn, .{}) + @as(i32, stack_buf[0] & 0);
+}
+
+pub fn callMismatchedErrorSetWithDefer(f: Ref(js.Function), tracker: Ref(js.Object)) OtherOnlyError!i32 {
+    defer f.deinit();
+    defer {
+        const prev = tracker.get(i32, "deferRuns");
+        tracker.set("deferRuns", prev + 1);
+        tracker.deinit();
+    }
+    var stack_buf: [256]u8 = undefined;
+    @memset(&stack_buf, 0x3C);
+    std.mem.doNotOptimizeAway(&stack_buf);
+    const v = try js.callFn(fn () OtherOnlyError!i32, f, .{});
+    return v + @as(i32, stack_buf[0] & 0);
+}
+

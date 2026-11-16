@@ -3,6 +3,7 @@ import {
   MemberFlag,
   MemberType,
   PointerFlag,
+  PosixError,
   PrimitiveFlag,
   SliceFlag,
   StructFlag,
@@ -607,5 +608,119 @@ describe('Feature: js-host-op', function() {
       expect(exported.createZigCallback).to.be.a('function');
       expect(exported.releaseZigCallback).to.be.a('function');
     }
+  });
+
+  it('should capture uncaught infallible and NotInErrorSet exceptions as pending errors and preserve first error across defer host-ops', function() {
+    const env = new Env();
+    env.littleEndian = true;
+    const harness = createMemoryHarness(env);
+    const types = defineHostOpStructures(env, harness.is64);
+
+    // Narrow error set without JsException (`error{OnlyBoom}!i32`)
+    const narrowErrSet = {
+      type: StructureType.ErrorSet,
+      name: 'NarrowError',
+      byteSize: 2,
+      align: 2,
+      flags: StructureFlag.HasValue,
+      signature: 301n,
+      instance: { members: [] },
+      static: {},
+    };
+    narrowErrSet.instance.members.push({ type: MemberType.Uint, bitSize: 16, bitOffset: 0, byteSize: 2, structure: narrowErrSet });
+    env.beginStructure(narrowErrSet);
+    narrowErrSet.static = {
+      members: [
+        { name: 'OnlyBoom', type: MemberType.Object, flags: MemberFlag.IsPartOfSet, slot: 0, structure: narrowErrSet },
+      ],
+      template: {
+        [SLOTS]: {
+          0: env.createInstance(narrowErrSet, new DataView(new Uint16Array([ 1 ]).buffer)),
+        },
+      },
+    };
+    env.finishStructure(narrowErrSet);
+
+    const narrowEuI32 = {
+      type: StructureType.ErrorUnion,
+      name: 'NarrowError!i32',
+      byteSize: 8,
+      align: 4,
+      flags: StructureFlag.HasValue,
+      signature: 302n,
+      instance: {
+        members: [
+          { type: MemberType.Int, bitSize: 32, bitOffset: 0, byteSize: 4, structure: types.i32 },
+          { type: MemberType.Uint, flags: MemberFlag.IsSelector, bitSize: 16, bitOffset: 32, byteSize: 2, structure: narrowErrSet },
+        ],
+      },
+      static: {},
+    };
+    env.beginStructure(narrowEuI32);
+    env.finishStructure(narrowEuI32);
+
+    const argsInfallibleCall = types.makeArgStruct(303n, types.i32, [ types.jsRef ]);
+    const argsNarrowCall = types.makeArgStruct(304n, narrowEuI32, [ types.jsRef ]);
+    const argsSetProp = types.makeArgStruct(305n, types.voidStruct, [ types.jsRef, types.i32 ]);
+
+    const enc = new TextEncoder();
+    const keyBytes = enc.encode('cleaned');
+    const keyView = harness.viewAt(0x100, keyBytes.length);
+    new Uint8Array(keyView.buffer, keyView.byteOffset, keyBytes.length).set(keyBytes);
+    const kCleaned = { keyAddr: harness.addrOf(0x100), keyLen: harness.is64 ? BigInt(keyBytes.length) : keyBytes.length };
+
+    const dInfallible = writeDescriptor(harness, 0x300, { signature: 303n, op: HostOpCode.CallFn, argSize: argsInfallibleCall.byteSize });
+    const dNarrow = writeDescriptor(harness, 0x340, { signature: 304n, op: HostOpCode.CallFn, argSize: argsNarrowCall.byteSize });
+    const dSetCleaned = writeDescriptor(harness, 0x380, { signature: 305n, op: HostOpCode.SetProp, ...kCleaned, argSize: argsSetProp.byteSize });
+
+    const frameAddr = harness.addrOf(0x900);
+    const frameDV = harness.viewAt(0x900, 64);
+
+    // 1. Infallible throw returns PosixError.EFAULT (never throws across FFI!) and records pendingHostError
+    const firstBoom = new Error('infallible boom');
+    const badFnHandle = env.allocJsValue(() => {
+      throw firstBoom;
+    });
+    frameDV.setUint32(4, badFnHandle, true);
+    expect(env.invokeJsHostOp(dInfallible, frameAddr)).to.equal(PosixError.EFAULT);
+    expect(env.hasPendingHostError).to.be.true;
+    expect(env.pendingHostError).to.equal(firstBoom);
+
+    // 2. Simulated Zig `defer` host-op runs cleanly while pending error is saved & restored (first-error-wins!)
+    const targetObj = { cleaned: 0 };
+    const objHandle = env.allocJsValue(targetObj);
+    const setArg0Off = argsSetProp.instance.members[1].bitOffset / 8;
+    const setArg1Off = argsSetProp.instance.members[2].bitOffset / 8;
+    frameDV.setUint32(setArg0Off, objHandle, true);
+    frameDV.setInt32(setArg1Off, 1, true);
+    expect(env.invokeJsHostOp(dSetCleaned, frameAddr)).to.equal(PosixError.NONE);
+    expect(targetObj.cleaned).to.equal(1);
+    expect(env.hasPendingHostError).to.be.true;
+    expect(env.pendingHostError).to.equal(firstBoom);
+
+    // Even if a secondary defer host-op also throws, firstBoom is preserved!
+    const secondFnHandle = env.allocJsValue(() => {
+      throw new Error('secondary defer error');
+    });
+    frameDV.setUint32(4, secondFnHandle, true);
+    expect(env.invokeJsHostOp(dInfallible, frameAddr)).to.equal(PosixError.EFAULT);
+    expect(env.pendingHostError).to.equal(firstBoom);
+
+    const consumed = env.consumePendingHostError();
+    expect(consumed?.error).to.equal(firstBoom);
+    expect(env.hasPendingHostError).to.be.false;
+
+    // 3. NotInErrorSet mismatch also returns PosixError.EFAULT and records NotInErrorSet as pendingHostError
+    const narrowArg0Off = argsNarrowCall.instance.members[1].bitOffset / 8;
+    frameDV.setUint32(narrowArg0Off, badFnHandle, true);
+    expect(env.invokeJsHostOp(dNarrow, frameAddr)).to.equal(PosixError.EFAULT);
+    const narrowPending = env.consumePendingHostError();
+    expect(narrowPending?.error).to.be.an('error');
+    expect(narrowPending?.error.constructor.name).to.equal('NotInErrorSet');
+
+    env.releaseJsValue(badFnHandle);
+    env.releaseJsValue(secondFnHandle);
+    env.releaseJsValue(objHandle);
+    expect(env.getJsValueCount()).to.equal(0);
   });
 });

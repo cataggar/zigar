@@ -290,6 +290,108 @@ describe('Table-Driven JS Host-Op Dispatcher & Dynamic Zig Callbacks (WASM32 / W
           expect(() => staleSample(1)).to.throw(/already been released/);
         }
       });
+
+      it('should survive 2,200+ caught infallible JS throws without leaking WASM __stack_pointer or Ref handles', async function() {
+        const spBefore = debugEnv.stackPointerGlobal?.value;
+        const cleanup = { deferCount: 0 };
+        let caught = 0;
+        for (let i = 0; i < 2200; i++) {
+          const thrower = () => {
+            throw new Error('boom');
+          };
+          const track = (i < 200) ? cleanup : null;
+          try {
+            await mod.callInfallibleWithStackAndDefer(thrower, track);
+            expect.fail('Expected infallible host-op throw to propagate to JS caller');
+          } catch (err) {
+            expect(err).to.be.instanceOf(Error);
+            expect(err.message).to.equal('boom');
+            caught++;
+          }
+        }
+        expect(caught).to.equal(2200);
+        expect(cleanup.deferCount).to.equal(200);
+        if (spBefore !== undefined) {
+          expect(debugEnv.stackPointerGlobal.value).to.equal(spBefore);
+        }
+        expect(Number(mod.activeHandles())).to.equal(0);
+      });
+
+      it('should run Zig defers and release owned Callback slots cleanly when infallible host-op inside Callback throws', async function() {
+        const cbFn = await mod.createOwnedThrowingCallback();
+        expect(Number(mod.activeCallbacks())).to.equal(1);
+        expect(Number(mod.liveOwnedCallbackAllocs())).to.equal(1);
+
+        for (let i = 0; i < 10; i++) {
+          expect(() => cbFn(() => {
+            throw new Error(`cb-boom-${i}`);
+          })).to.throw(`cb-boom-${i}`);
+        }
+        expect(cbFn(() => 123)).to.equal(123);
+
+        const deferRuns = await mod.deinitOwnedThrowingCallback();
+        expect(Number(deferRuns)).to.equal(11);
+        expect(Number(mod.activeCallbacks())).to.equal(0);
+        expect(Number(mod.activeHandles())).to.equal(0);
+        expect(Number(mod.liveOwnedCallbackAllocs())).to.equal(0);
+        expect(debugEnv.getActiveZigCallbackCount()).to.equal(0);
+      });
+
+      it('should isolate nested JS -> Zig outer (E!i32) -> JS mid -> Zig inner (i32) -> throwing JS op', async function() {
+        // 1. `mid` catches `inner`'s infallible throw -> `outer` succeeds cleanly!
+        const midCaught = () => {
+          try {
+            mod.nestedInnerInfallible(() => {
+              throw new Error('inner-boom');
+            });
+            return -1;
+          } catch (err) {
+            expect(err.message).to.equal('inner-boom');
+            return 777;
+          }
+        };
+        expect(await mod.nestedOuterFallible(midCaught)).to.equal(777);
+        expect(Number(mod.activeHandles())).to.equal(0);
+
+        // 2. `mid` does NOT catch `inner`'s throw -> `outer` receives `error.JsException`!
+        const midUncaught = () => mod.nestedInnerInfallible(() => {
+          throw new Error('uncaught-inner-boom');
+        });
+        expect(await mod.nestedOuterCatching(midUncaught)).to.equal(-999);
+
+        let outerErr = null;
+        try {
+          await mod.nestedOuterFallible(midUncaught);
+        } catch (err) {
+          outerErr = err;
+        }
+        expect(outerErr).to.be.instanceOf(Error);
+        expect(outerErr.message).to.equal('Js exception');
+        expect(JSON.parse(JSON.stringify(outerErr))).to.deep.equal({ error: 'Js exception' });
+        expect(Number(mod.activeHandles())).to.equal(0);
+      });
+
+      it('should throw NotInErrorSet cleanly in JS while running Zig defers and restoring __stack_pointer', async function() {
+        const spBefore = debugEnv.stackPointerGlobal?.value;
+        const tracker = { deferRuns: 0 };
+        for (let i = 0; i < 60; i++) {
+          let thrown = null;
+          try {
+            await mod.callMismatchedErrorSetWithDefer(() => {
+              throw new RangeError('unlisted-js-error');
+            }, tracker);
+          } catch (err) {
+            thrown = err;
+          }
+          expect(thrown).to.be.instanceOf(TypeError);
+          expect(thrown.message).to.match(/not a part of error set .*unlisted-js-error/);
+        }
+        expect(tracker.deferRuns).to.equal(60);
+        if (spBefore !== undefined) {
+          expect(debugEnv.stackPointerGlobal.value).to.equal(spBefore);
+        }
+        expect(Number(mod.activeHandles())).to.equal(0);
+      });
     });
   }
 });

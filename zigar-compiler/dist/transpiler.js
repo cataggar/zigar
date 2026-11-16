@@ -6346,6 +6346,18 @@ var callMarshalingOutbound = mixin({
       }
     }
     let success;
+    const errorFrame = { hasPendingHostError: false, pendingHostError: undefined };
+    const consumeErrorFrame = () => {
+      if (!errorFrame.hasPendingHostError) {
+        return undefined;
+      }
+      const error = errorFrame.pendingHostError;
+      errorFrame.hasPendingHostError = false;
+      errorFrame.pendingHostError = undefined;
+      return { error };
+    };
+    const prevErrorFrame = this.activeHostErrorFrame;
+    this.activeHostErrorFrame = errorFrame;
     try {
       if (useSyncRunner) {
         const prevContinuation = this.activeContinuation;
@@ -6363,12 +6375,25 @@ var callMarshalingOutbound = mixin({
           : this.runThunk(thunkAddress, fnAddress, argAddress);
       }
     } catch (err) {
+      this.activeHostErrorFrame = prevErrorFrame;
+      const pending = consumeErrorFrame();
       if (!finalized) {
         finalize(!(err instanceof Exit && err.code === 0));
       }
+      if (pending) {
+        throw pending.error;
+      }
       throw err;
     }
+    this.activeHostErrorFrame = prevErrorFrame;
     const finishCall = (success) => {
+      const pending = consumeErrorFrame();
+      if (pending) {
+        if (!finalized) {
+          finalize(true);
+        }
+        throw pending.error;
+      }
       if (!success) {
         if (!finalized) {
           finalize(true);
@@ -6422,9 +6447,13 @@ var callMarshalingOutbound = mixin({
     };
     if (isPromise(success)) {
       const promise = success.then(finishCall, (err) => {
-        const isCleanExit = (err instanceof Exit && err.code === 0);
+        const pending = consumeErrorFrame();
+        const isCleanExit = !pending && (err instanceof Exit && err.code === 0);
         if (!finalized) {
           finalize(!isCleanExit);
+        }
+        if (pending) {
+          throw pending.error;
         }
         if (isCleanExit) {
           return;
@@ -6910,6 +6939,44 @@ var jsHostOp = mixin({
     this.zigCallbackTemplateCache = new Map();
     this.zigCallbackMap = new Map();
     this.syncCallDepth = 0;
+    this.hasPendingHostError = false;
+    this.pendingHostError = undefined;
+    this.activeHostErrorFrame = null;
+  },
+  getHostErrorTarget() {
+    return this.activeContinuation?.hostErrorFrame ?? this.activeHostErrorFrame ?? this;
+  },
+  recordPendingHostError(err) {
+    const target = this.getHostErrorTarget();
+    if (!target.hasPendingHostError) {
+      target.hasPendingHostError = true;
+      target.pendingHostError = err;
+    }
+  },
+  savePendingHostError() {
+    const target = this.getHostErrorTarget();
+    if (!target.hasPendingHostError) {
+      return null;
+    }
+    const saved = { target, error: target.pendingHostError };
+    target.hasPendingHostError = false;
+    target.pendingHostError = undefined;
+    return saved;
+  },
+  restorePendingHostError(saved) {
+    if (saved) {
+      saved.target.hasPendingHostError = true;
+      saved.target.pendingHostError = saved.error;
+    }
+  },
+  consumePendingHostError(target = this.getHostErrorTarget()) {
+    if (!target?.hasPendingHostError) {
+      return undefined;
+    }
+    const error = target.pendingHostError;
+    target.hasPendingHostError = false;
+    target.pendingHostError = undefined;
+    return { error };
   },
   registerJsModule(specifier, moduleExports) {
     this.jsModuleCache.set(String(specifier), moduleExports);
@@ -7121,19 +7188,13 @@ var jsHostOp = mixin({
               for (const handle of allocatedHandles) {
                 thisEnv.releaseJsValue(handle);
               }
-              writeError(argStruct, convErr);
-              return;
+              throw convErr;
             } finally {
               thisEnv.pendingJsHandles = prevPending;
               thisEnv.writingUninitZig = prevUninit;
             }
           } else {
-            try {
-              setValue.call(euObj, normalized, argStruct[ALLOCATOR]);
-            } catch (convErr) {
-              writeError(argStruct, convErr);
-              return;
-            }
+            setValue.call(euObj, normalized, argStruct[ALLOCATOR]);
           }
         }
         setErrorNumber.call(euObj, 0);
@@ -7178,116 +7239,127 @@ var jsHostOp = mixin({
     };
   },
   invokeJsHostOp(descriptorAddr, argAddr, argSize) {
-    const entry = this.getHostOpEntry(descriptorAddr);
-    const byteLen = Number(argSize || entry.argByteSize);
-    const dv = this.obtainZigView(argAddr, byteLen, false);
-    const { ArgStruct, extractors, op, dynamicKey, key, isErrorUnionReturn, writeSuccess, writeError } = entry;
-    const argStruct = ArgStruct(dv);
+    const savedPending = this.savePendingHostError();
     let context = null;
-    if (VISIT in argStruct) {
-      argStruct[VISIT]('reset', VisitorFlag.IgnoreUncreated);
-      context = this.startContext();
-      this.updatePointerTargets(context, argStruct, true);
-      this.updateShadowTargets(context);
-    }
     this.syncCallDepth++;
     try {
-      const jsArgs = [];
-      for (const ext of extractors) {
-        if (ext.isAllocator) {
-          ext.read(argStruct);
-        } else {
-          jsArgs.push(ext.read(argStruct));
-        }
+      const entry = this.getHostOpEntry(descriptorAddr);
+      const byteLen = Number(argSize || entry.argByteSize);
+      const dv = this.obtainZigView(argAddr, byteLen, false);
+      const { ArgStruct, extractors, op, dynamicKey, key, isErrorUnionReturn, writeSuccess, writeError } = entry;
+      const argStruct = ArgStruct(dv);
+      if (VISIT in argStruct) {
+        argStruct[VISIT]('reset', VisitorFlag.IgnoreUncreated);
+        context = this.startContext();
+        this.updatePointerTargets(context, argStruct, true);
+        this.updateShadowTargets(context);
       }
-      let result;
-      switch (op) {
-        case HostOpCode.ImportModule: {
-          const spec = dynamicKey ? jsArgs[0] : key;
-          result = this.resolveJsModule(spec);
-          break;
-        }
-        case HostOpCode.GetGlobal: {
-          const propKey = dynamicKey ? jsArgs[0] : key;
-          result = globalThis[propKey];
-          break;
-        }
-        case HostOpCode.GetProp: {
-          const target = jsArgs[0];
-          const propKey = dynamicKey ? jsArgs[1] : key;
-          result = target[propKey];
-          break;
-        }
-        case HostOpCode.SetProp: {
-          const target = jsArgs[0];
-          const propKey = dynamicKey ? jsArgs[1] : key;
-          const value = dynamicKey ? jsArgs[2] : jsArgs[1];
-          target[propKey] = value;
-          result = undefined;
-          break;
-        }
-        case HostOpCode.DeleteProp: {
-          const target = jsArgs[0];
-          const propKey = dynamicKey ? jsArgs[1] : key;
-          result = Reflect.deleteProperty(target, propKey);
-          break;
-        }
-        case HostOpCode.HasProp: {
-          const target = jsArgs[0];
-          const propKey = dynamicKey ? jsArgs[1] : key;
-          result = Reflect.has(target, propKey);
-          break;
-        }
-        case HostOpCode.CallFn: {
-          const callee = jsArgs[0];
-          if (typeof(callee) !== 'function') {
-            throw createNotCallableError('Target is not a function');
+      try {
+        const jsArgs = [];
+        for (const ext of extractors) {
+          if (ext.isAllocator) {
+            ext.read(argStruct);
+          } else {
+            jsArgs.push(ext.read(argStruct));
           }
-          result = Reflect.apply(callee, undefined, jsArgs.slice(1));
-          break;
         }
-        case HostOpCode.CallMethod: {
-          const receiver = jsArgs[0];
-          const methodKey = dynamicKey ? jsArgs[1] : key;
-          const callArgs = dynamicKey ? jsArgs.slice(2) : jsArgs.slice(1);
-          if (receiver === null || receiver === undefined) {
-            throw new TypeError(`Cannot read properties of ${receiver} (reading '${String(methodKey)}')`);
+        let result;
+        switch (op) {
+          case HostOpCode.ImportModule: {
+            const spec = dynamicKey ? jsArgs[0] : key;
+            result = this.resolveJsModule(spec);
+            break;
           }
-          const method = receiver[methodKey];
-          if (typeof(method) !== 'function') {
-            throw createNotCallableError(`${String(methodKey)} is not a function`);
+          case HostOpCode.GetGlobal: {
+            const propKey = dynamicKey ? jsArgs[0] : key;
+            result = globalThis[propKey];
+            break;
           }
-          result = Reflect.apply(method, receiver, callArgs);
-          break;
+          case HostOpCode.GetProp: {
+            const target = jsArgs[0];
+            const propKey = dynamicKey ? jsArgs[1] : key;
+            result = target[propKey];
+            break;
+          }
+          case HostOpCode.SetProp: {
+            const target = jsArgs[0];
+            const propKey = dynamicKey ? jsArgs[1] : key;
+            const value = dynamicKey ? jsArgs[2] : jsArgs[1];
+            target[propKey] = value;
+            result = undefined;
+            break;
+          }
+          case HostOpCode.DeleteProp: {
+            const target = jsArgs[0];
+            const propKey = dynamicKey ? jsArgs[1] : key;
+            result = Reflect.deleteProperty(target, propKey);
+            break;
+          }
+          case HostOpCode.HasProp: {
+            const target = jsArgs[0];
+            const propKey = dynamicKey ? jsArgs[1] : key;
+            result = Reflect.has(target, propKey);
+            break;
+          }
+          case HostOpCode.CallFn: {
+            const callee = jsArgs[0];
+            if (typeof(callee) !== 'function') {
+              throw createNotCallableError('Target is not a function');
+            }
+            result = Reflect.apply(callee, undefined, jsArgs.slice(1));
+            break;
+          }
+          case HostOpCode.CallMethod: {
+            const receiver = jsArgs[0];
+            const methodKey = dynamicKey ? jsArgs[1] : key;
+            const callArgs = dynamicKey ? jsArgs.slice(2) : jsArgs.slice(1);
+            if (receiver === null || receiver === undefined) {
+              throw new TypeError(`Cannot read properties of ${receiver} (reading '${String(methodKey)}')`);
+            }
+            const method = receiver[methodKey];
+            if (typeof(method) !== 'function') {
+              throw createNotCallableError(`${String(methodKey)} is not a function`);
+            }
+            result = Reflect.apply(method, receiver, callArgs);
+            break;
+          }
+          case HostOpCode.Construct: {
+            const ctor = jsArgs[0];
+            if (typeof(ctor) !== 'function') {
+              throw createNotCallableError('Target is not a constructor');
+            }
+            result = Reflect.construct(ctor, jsArgs.slice(1));
+            break;
+          }
+          default:
+            throw new Error(`Unknown JS host operation: ${op}`);
         }
-        case HostOpCode.Construct: {
-          const ctor = jsArgs[0];
-          if (typeof(ctor) !== 'function') {
-            throw createNotCallableError('Target is not a constructor');
-          }
-          result = Reflect.construct(ctor, jsArgs.slice(1));
-          break;
-        }
-        default:
-          throw new Error(`Unknown JS host operation: ${op}`);
-      }
-      writeSuccess(argStruct, result);
-      if ("wasm" === 'node') ;
-      return PosixError.NONE;
-    } catch (err) {
-      if (isErrorUnionReturn) {
-        writeError(argStruct, err);
+        writeSuccess(argStruct, result);
+        if ("wasm" === 'node') ;
         return PosixError.NONE;
+      } catch (err) {
+        if (isErrorUnionReturn) {
+          writeError(argStruct, err);
+          if ("wasm" === 'node') ;
+          return PosixError.NONE;
+        }
+        if (ArgStruct[THROWING] && err instanceof Error) {
+          argStruct[RETURN](err);
+          if ("wasm" === 'node') ;
+          return PosixError.NONE;
+        }
+        throw err;
       }
-      if (ArgStruct[THROWING] && err instanceof Error) {
-        argStruct[RETURN](err);
-        return PosixError.NONE;
-      }
-      throw err;
+    } catch (unhandledErr) {
+      this.recordPendingHostError(unhandledErr);
+      return PosixError.EFAULT;
     } finally {
       this.syncCallDepth--;
       if (context) {
         this.endContext();
+      }
+      if (savedPending) {
+        this.restorePendingHostError(savedPending);
       }
     }
   },
@@ -7325,35 +7397,49 @@ var jsHostOp = mixin({
     return template;
   },
   createZigCallback(descriptorAddr, callbackId) {
-    const id = Number(callbackId) >>> 0;
-    const template = this.getZigCallbackTemplate(descriptorAddr);
-    const caller = this.createOutboundCaller(template.thunkHolder, template.ArgStruct);
-    caller.zigarSync = template.sync;
-    const slotDV = new DataView(new ArrayBuffer(0));
-    slotDV[ZIG] = { address: template.is64 ? BigInt(id) : id, len: 0 };
-    caller[MEMORY] = slotDV;
-    const state = { id, released: false, handle: 0 };
-    const unwrapString = template.unwrapString;
-    const wrapper = (...args) => {
-      if (state.released) {
-        throw new Error('Zig callback has already been released');
-      }
-      const res = caller(...args);
-      if (unwrapString && res && typeof(res) === 'object' && MEMORY in res) {
-        if (typeof(res.string) === 'string') {
-          return res.string;
+    const savedPending = this.savePendingHostError();
+    try {
+      const id = Number(callbackId) >>> 0;
+      const template = this.getZigCallbackTemplate(descriptorAddr);
+      const caller = this.createOutboundCaller(template.thunkHolder, template.ArgStruct);
+      caller.zigarSync = template.sync;
+      const slotDV = new DataView(new ArrayBuffer(0));
+      slotDV[ZIG] = { address: template.is64 ? BigInt(id) : id, len: 0 };
+      caller[MEMORY] = slotDV;
+      const state = { id, released: false, handle: 0 };
+      const unwrapString = template.unwrapString;
+      const wrapper = (...args) => {
+        if (state.released) {
+          throw new Error('Zig callback has already been released');
         }
-        const mem = res[MEMORY];
-        if (mem) {
-          return decodeText(new Uint8Array(mem.buffer, mem.byteOffset, mem.byteLength));
+        const res = caller(...args);
+        const pending = this.consumePendingHostError();
+        if (pending) {
+          throw pending.error;
         }
+        if (unwrapString && res && typeof(res) === 'object' && MEMORY in res) {
+          if (typeof(res.string) === 'string') {
+            return res.string;
+          }
+          const mem = res[MEMORY];
+          if (mem) {
+            return decodeText(new Uint8Array(mem.buffer, mem.byteOffset, mem.byteLength));
+          }
+        }
+        return res;
+      };
+      const handle = this.allocJsValue(wrapper);
+      state.handle = handle;
+      this.zigCallbackMap.set(id, state);
+      return handle;
+    } catch (err) {
+      this.recordPendingHostError(err);
+      return 0;
+    } finally {
+      if (savedPending) {
+        this.restorePendingHostError(savedPending);
       }
-      return res;
-    };
-    const handle = this.allocJsValue(wrapper);
-    state.handle = handle;
-    this.zigCallbackMap.set(id, state);
-    return handle;
+    }
   },
   releaseZigCallback(callbackId) {
     const id = Number(callbackId) >>> 0;
@@ -8537,6 +8623,7 @@ var moduleLoading = mixin({
         sp: stackTop,
         parentSp: spGlobal ? spGlobal.value : (isSp64 ? 0n : 0),
         parentContinuation: prevCont,
+        hostErrorFrame: this.activeHostErrorFrame,
         suspended: false,
         finish: null,
       };

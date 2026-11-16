@@ -1811,7 +1811,16 @@ const ModuleHost = struct {
     fn invokeJsHostOp(self: *@This(), descriptor_addr: usize, arg_addr: usize, arg_size: usize) !E {
         if (!self.isOwnerJsThread()) return .PERM;
         const env = self.env;
-        if (try env.isExceptionPending()) return .FAULT;
+        const saved_exc: ?Value = if (try env.isExceptionPending())
+            try env.getAndClearLastException()
+        else
+            null;
+        defer if (saved_exc) |exc| {
+            if (env.isExceptionPending() catch false) {
+                _ = env.getAndClearLastException() catch {};
+            }
+            env.throw(exc) catch {};
+        };
         const scope = try env.openHandleScope();
         defer env.closeHandleScope(scope) catch {};
         const result = try env.callFunction(
@@ -1830,7 +1839,16 @@ const ModuleHost = struct {
     fn createZigCallback(self: *@This(), descriptor_addr: usize, callback_id: u32, dest: *u32) !E {
         if (!self.isOwnerJsThread()) return .PERM;
         const env = self.env;
-        if (try env.isExceptionPending()) return .FAULT;
+        const saved_exc: ?Value = if (try env.isExceptionPending())
+            try env.getAndClearLastException()
+        else
+            null;
+        defer if (saved_exc) |exc| {
+            if (env.isExceptionPending() catch false) {
+                _ = env.getAndClearLastException() catch {};
+            }
+            env.throw(exc) catch {};
+        };
         const scope = try env.openHandleScope();
         defer env.closeHandleScope(scope) catch {};
         const result = try env.callFunction(
@@ -1842,7 +1860,7 @@ const ModuleHost = struct {
             },
         );
         dest.* = try env.getValueUint32(result);
-        return .SUCCESS;
+        return if (dest.* == 0) .FAULT else .SUCCESS;
     }
 
     fn releaseZigCallback(self: *@This(), callback_id: u32) !E {

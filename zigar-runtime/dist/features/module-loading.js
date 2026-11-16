@@ -286,6 +286,7 @@ var moduleLoading = mixin({
         sp: stackTop,
         parentSp: spGlobal ? spGlobal.value : (isSp64 ? 0n : 0),
         parentContinuation: prevCont,
+        hostErrorFrame: this.activeHostErrorFrame,
         suspended: false,
         finish: null,
       };

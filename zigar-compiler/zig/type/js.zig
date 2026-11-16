@@ -191,6 +191,12 @@ fn errorSetContains(comptime ESet: type, comptime name: []const u8) bool {
     return false;
 }
 
+fn pointerAlign(comptime pt: anytype) usize {
+    const child_align: usize = if (@typeInfo(pt.child) == .@"opaque") 1 else @alignOf(pt.child);
+    const explicit_align: usize = if (pt.attrs.@"align") |al| @intCast(al) else child_align;
+    return @max(explicit_align, child_align, 1);
+}
+
 fn defaultFallbackValue(comptime T: type) T {
     if (comptime util.getInternalType(T) == .js_value) {
         return .{ .handle = reserved_undefined_handle };
@@ -199,13 +205,101 @@ fn defaultFallbackValue(comptime T: type) T {
         .void => {},
         .bool => false,
         .int, .float => 0,
-        .optional => null,
+        .optional, .null => null,
+        .undefined => undefined,
         .pointer => |pt| switch (pt.size) {
-            .slice => &.{},
-            else => @panic("Uncaught JS exception in infallible host operation"),
+            .slice => init: {
+                const a = comptime pointerAlign(pt);
+                if (pt.sentinel_ptr) |sp| {
+                    const s_val = @as(*const pt.child, @ptrCast(@alignCast(sp))).*;
+                    if (pt.attrs.@"const") {
+                        const S = struct {
+                            const buf: [0:s_val]pt.child align(a) = .{};
+                        };
+                        break :init &S.buf;
+                    } else {
+                        const S = struct {
+                            var buf: [0:s_val]pt.child align(a) = .{};
+                        };
+                        break :init &S.buf;
+                    }
+                }
+                const dangling: [*]align(a) pt.child = @ptrFromInt(a);
+                break :init dangling[0..0];
+            },
+            .c => null,
+            .many => init: {
+                const a = comptime pointerAlign(pt);
+                if (pt.sentinel_ptr) |sp| {
+                    const s_val = @as(*const pt.child, @ptrCast(@alignCast(sp))).*;
+                    if (pt.attrs.@"const") {
+                        const S = struct {
+                            const buf: [0:s_val]pt.child align(a) = .{};
+                        };
+                        break :init &S.buf;
+                    } else {
+                        const S = struct {
+                            var buf: [0:s_val]pt.child align(a) = .{};
+                        };
+                        break :init &S.buf;
+                    }
+                }
+                const child_size = comptime if (@typeInfo(pt.child) == .@"opaque" or @typeInfo(pt.child) == .@"fn") 1 else @max(@sizeOf(pt.child), 1);
+                const S = struct {
+                    var bytes: [child_size]u8 align(a) = std.mem.zeroes([child_size]u8);
+                };
+                break :init @ptrCast(&S.bytes);
+            },
+            .one => init: {
+                const a = comptime pointerAlign(pt);
+                if (@typeInfo(pt.child) == .@"fn") {
+                    break :init @ptrFromInt(a);
+                }
+                const child_size = comptime if (@typeInfo(pt.child) == .@"opaque") 1 else @max(@sizeOf(pt.child), 1);
+                const S = struct {
+                    var bytes: [child_size]u8 align(a) = std.mem.zeroes([child_size]u8);
+                };
+                break :init @ptrCast(&S.bytes);
+            },
         },
-        .@"enum" => |en| @enumFromInt(en.fields[0].value),
-        .error_union => @panic("Uncaught JS exception in host operation"),
+        .@"enum" => |en| if (en.field_names.len > 0) @field(T, en.field_names[0]) else @enumFromInt(0),
+        .@"struct" => |st| init: {
+            var s: T = undefined;
+            inline for (st.field_names, 0..) |field_name, index| {
+                if (!st.field_attrs[index].@"comptime") {
+                    @field(s, field_name) = defaultFallbackValue(st.field_types[index]);
+                }
+            }
+            break :init s;
+        },
+        .@"union" => |un| if (un.field_names.len > 0)
+            @unionInit(T, un.field_names[0], defaultFallbackValue(un.field_types[0]))
+        else
+            undefined,
+        .array => |ar| init: {
+            var arr: T = undefined;
+            for (&arr) |*elem| {
+                elem.* = defaultFallbackValue(ar.child);
+            }
+            if (ar.sentinel_ptr) |sp| {
+                const s_val = @as(*const ar.child, @ptrCast(@alignCast(sp))).*;
+                @as([*]ar.child, @ptrCast(&arr))[ar.len] = s_val;
+            }
+            break :init arr;
+        },
+        .vector => |vec| @splat(defaultFallbackValue(vec.child)),
+        .error_union => |eu| init: {
+            if (@typeInfo(eu.error_set).error_set.error_names) |names| {
+                if (names.len > 0) break :init @field(eu.error_set, names[0]);
+            }
+            break :init defaultFallbackValue(eu.payload);
+        },
+        .error_set => |es| init: {
+            if (es.error_names) |names| {
+                if (names.len > 0) break :init @field(T, names[0]);
+            }
+            @panic("Uncaught JS exception in empty error set host operation");
+        },
         else => init: {
             var zeroed: T = undefined;
             @memset(std.mem.asBytes(&zeroed), 0);
@@ -1752,3 +1846,70 @@ test "HostOpDescriptor ABI layout, 9 host operations, Ref helpers, and 160 state
     try expectEqual(@as(u32, 0), js.activeHandleCount());
     try std.testing.expectError(error.InvalidCallback, thunk(@ptrFromInt(saved_once_id), @ptrCast(&once_frame)));
 }
+
+test "defaultFallbackValue and mapHostFailure safely construct all Zig return types on FAULT" {
+    const FaultHost = struct {
+        pub fn invokeJsHostOp(_: *const anyopaque, _: *anyopaque, _: usize) E {
+            return .FAULT;
+        }
+    };
+    const js = Js(FaultHost);
+    const NonZeroEnum = enum(i32) { alpha = 7, beta = 9 };
+    const OpenEnum = enum(u8) { first = 3, _ };
+    const RecursiveNode = struct {
+        next: *@This(),
+        value: i32,
+    };
+    const SampleUnion = union(enum) {
+        num: i32,
+        flag: bool,
+    };
+    const Composite = struct {
+        ptr: *i32,
+        node: *RecursiveNode,
+        opaque_ptr: *anyopaque,
+        fn_ptr: *const fn () void,
+        slice: []u8,
+        const_slice: []const u8,
+        z_slice: [:0]const u8,
+        mut_z_slice: [:0]u8,
+        many_z: [*:0]const u8,
+        c_ptr: [*c]u8,
+        en: NonZeroEnum,
+        open_en: OpenEnum,
+        un: SampleUnion,
+        arr: [3]NonZeroEnum,
+        z_arr: [2:0]u8,
+        vec: @Vector(4, i32),
+        ref: js.Ref(js.Object),
+        opt: ?*i32,
+    };
+
+    js.setProp(js.Ref(js.Object).undefined, "noop", @as(i32, 1));
+    try std.testing.expectEqual(@as(i32, 0), js.getGlobal(i32, "x"));
+    try std.testing.expectEqual(false, js.getGlobal(bool, "x"));
+    try std.testing.expectEqual(@as(f64, 0), js.getGlobal(f64, "x"));
+    try std.testing.expectEqual(NonZeroEnum.alpha, js.getGlobal(NonZeroEnum, "x"));
+    try std.testing.expectEqual(OpenEnum.first, js.getGlobal(OpenEnum, "x"));
+    try std.testing.expect(js.getGlobal(js.Ref(js.Object), "x").isUndefined());
+    try std.testing.expectError(error.Other, js.getGlobal(error{Other}!i32, "x"));
+    try std.testing.expectEqual(@as(i32, 0), try js.getGlobal(error{}!i32, "x"));
+
+    const comp = defaultFallbackValue(Composite);
+    try std.testing.expectEqual(@as(i32, 0), comp.ptr.*);
+    try std.testing.expectEqual(@as(usize, 0), comp.slice.len);
+    try std.testing.expectEqual(@as(usize, 0), comp.const_slice.len);
+    try std.testing.expectEqual(@as(usize, 0), comp.z_slice.len);
+    try std.testing.expectEqual(@as(usize, 0), comp.mut_z_slice.len);
+    try std.testing.expectEqual(@as(u8, 0), comp.many_z[0]);
+    try std.testing.expectEqual(@as([*c]u8, null), comp.c_ptr);
+    try std.testing.expectEqual(NonZeroEnum.alpha, comp.en);
+    try std.testing.expectEqual(OpenEnum.first, comp.open_en);
+    try std.testing.expectEqual(SampleUnion{ .num = 0 }, comp.un);
+    try std.testing.expectEqual(NonZeroEnum.alpha, comp.arr[2]);
+    try std.testing.expectEqual(@as(u8, 0), comp.z_arr[0]);
+    try std.testing.expect(comp.ref.isUndefined());
+    try std.testing.expectEqual(@as(?*i32, null), comp.opt);
+}
+
+
