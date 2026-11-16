@@ -44,6 +44,7 @@ pub const ParamIr = struct {
 };
 
 pub const SignatureIr = struct {
+    self_param_ident: ?[]const u8 = null,
     type_params: []const TypeParamIr,
     params: []const ParamIr,
     return_type: *const TypeIr,
@@ -143,7 +144,7 @@ pub const TypeIr = union(enum) {
     js_value,
     js_object,
     js_symbol,
-    self_type,
+    self_type: []const u8,
     type_param_ref: []const u8,
     optional: *const TypeIr,
     pointer_const: *const TypeIr,
@@ -178,6 +179,7 @@ pub const ConstructorIr = struct {
 pub const StructDeclIr = struct {
     is_class: bool,
     is_abstract: bool,
+    self_ident: []const u8,
     type_params: []const TypeParamIr,
     fields: []const FieldIr,
     static_props: []const StaticPropIr,
@@ -210,7 +212,7 @@ pub const DeclKindIr = union(enum) {
     namespace_decl: []const DeclIr,
     re_export_decl: struct {
         target_module_index: u32,
-        target_zig_ident: []const u8,
+        target_zig_path: []const []const u8,
     },
     namespace_re_export: struct {
         target_module_index: u32,
@@ -240,6 +242,7 @@ pub const ModuleIr = struct {
     wire_specifier: []const u8,
     rel_zig_path: []const u8,
     root_export_ident: []const u8,
+    root_export_logical_name: []const u8,
     is_primary: bool,
     needs_root_runtime: bool,
     imports: []const ModuleImportIr,
@@ -366,12 +369,19 @@ fn LowerCtx(comptime GraphType: type) type {
     return struct {
         const Self = @This();
 
+        const ForeignExportEntry = struct {
+            decl_id: u32,
+            wire_name_override: ?[]const u8 = null,
+            is_default_export: bool = false,
+        };
+
         const CandidateModule = struct {
             wire_specifier: []const u8,
             substituted_specifier: []const u8,
             rel_zig_path: []const u8,
             source_mod_ids: std.ArrayList(u32) = .empty,
             decl_ids: std.ArrayList(u32) = .empty,
+            foreign_exports: std.ArrayList(ForeignExportEntry) = .empty,
             star_re_export_source_mods: std.ArrayList(u32) = .empty,
             is_primary: bool = false,
             included: bool = false,
@@ -391,6 +401,16 @@ fn LowerCtx(comptime GraphType: type) type {
         const StarExportItem = struct {
             target_mod_idx: u32,
             decl_id: u32,
+        };
+
+        const PlannedReExport = struct {
+            source_decl_id: u32,
+            zig_ident: []const u8,
+            logical_name: []const u8,
+            wire_name: []const u8,
+            is_default_export: bool,
+            target_module_index: u32,
+            target_zig_path: []const []const u8,
         };
 
         const LoweredTypeParams = struct {
@@ -414,6 +434,7 @@ fn LowerCtx(comptime GraphType: type) type {
             for (self.candidates.items) |*c| {
                 c.source_mod_ids.deinit(self.scratch);
                 c.decl_ids.deinit(self.scratch);
+                c.foreign_exports.deinit(self.scratch);
                 c.star_re_export_source_mods.deinit(self.scratch);
             }
             self.candidates.deinit(self.scratch);
@@ -561,47 +582,136 @@ fn LowerCtx(comptime GraphType: type) type {
             return false;
         }
 
+        fn findGraphModuleIndexById(self: *const Self, mod_id: u32) ?usize {
+            if (mod_id < self.graph.modules.len and self.graph.modules[mod_id].id == mod_id) {
+                return mod_id;
+            }
+            for (self.graph.modules, 0..) |m, midx| {
+                if (m.id == mod_id) return midx;
+            }
+            return null;
+        }
+
+        fn appendUniqueForeignExport(
+            list: *std.ArrayList(ForeignExportEntry),
+            allocator: std.mem.Allocator,
+            entry: ForeignExportEntry,
+        ) !void {
+            for (list.items) |existing| {
+                if (existing.decl_id == entry.decl_id and existing.is_default_export == entry.is_default_export) {
+                    const same_override = if (existing.wire_name_override) |a|
+                        (if (entry.wire_name_override) |b| std.mem.eql(u8, a, b) else false)
+                    else
+                        entry.wire_name_override == null;
+                    if (same_override) return;
+                }
+            }
+            try list.append(allocator, entry);
+        }
+
+        fn registerCanonicalDeclInCandidate(self: *Self, owner_cand: u32, did: u32) !void {
+            if (did >= self.graph.decls.len) return;
+            try appendUniqueU32(&self.candidates.items[owner_cand].decl_ids, self.scratch, did);
+            try self.appendDeclRecursiveToCand(did, owner_cand);
+            const d = self.graph.decls[did];
+            for (d.merged_with) |mid| {
+                if (mid < self.graph.decls.len and self.graph.decls[mid].module == d.module) {
+                    try appendUniqueU32(&self.candidates.items[owner_cand].decl_ids, self.scratch, mid);
+                    try self.appendDeclRecursiveToCand(mid, owner_cand);
+                }
+            }
+        }
+
+        fn registerCandidateDeclOrForeignExport(
+            self: *Self,
+            c_idx: u32,
+            current_mod_id: ?u32,
+            did: u32,
+            wire_override: ?[]const u8,
+            is_default_export: bool,
+        ) !void {
+            if (did >= self.graph.decls.len) return;
+            const d = self.graph.decls[did];
+
+            if (d.kind == .re_export_decl or d.kind == .import_equals_decl) {
+                try appendUniqueU32(&self.candidates.items[c_idx].decl_ids, self.scratch, did);
+                try self.appendDeclRecursiveToCand(did, c_idx);
+                return;
+            }
+
+            var owner_cand: u32 = c_idx;
+            if (current_mod_id != null and d.module != current_mod_id.?) {
+                if (self.findGraphModuleIndexById(d.module)) |om_idx| {
+                    const owner_mod = self.graph.modules[om_idx];
+                    if (!self.isBundledLibModule(owner_mod)) {
+                        owner_cand = self.source_mod_to_cand.get(owner_mod.id) orelse blk: {
+                            const ws = try self.deriveFileLogicalSpecifier(owner_mod);
+                            break :blk try self.getOrCreateCandidate(ws, owner_mod.id);
+                        };
+                        try self.registerCanonicalDeclInCandidate(owner_cand, did);
+                    } else {
+                        owner_cand = self.decl_to_cand.get(did) orelse c_idx;
+                    }
+                } else {
+                    owner_cand = self.decl_to_cand.get(did) orelse c_idx;
+                }
+            } else if (self.decl_to_cand.get(did)) |existing_cand| {
+                owner_cand = existing_cand;
+            }
+
+            if (owner_cand == c_idx) {
+                try self.registerCanonicalDeclInCandidate(c_idx, did);
+            } else {
+                try appendUniqueForeignExport(&self.candidates.items[c_idx].foreign_exports, self.scratch, .{
+                    .decl_id = did,
+                    .wire_name_override = wire_override,
+                    .is_default_export = is_default_export,
+                });
+            }
+        }
+
         fn discoverCandidates(self: *Self) !void {
+            // 1. Ambient modules (`declare module "node:http" { ... }`).
             for (self.graph.modules) |mod| {
                 if (self.isBundledLibModule(mod)) continue;
-
-                // 1. Ambient modules (`declare module "node:http" { ... }`).
                 for (mod.ambient_modules) |amb| {
                     const amb_name = self.str(amb.module_name);
                     const c_idx = try self.getOrCreateCandidate(amb_name, null);
                     for (amb.decls) |did| {
-                        try appendUniqueU32(&self.candidates.items[c_idx].decl_ids, self.scratch, did);
-                        try self.appendDeclRecursiveToCand(did, c_idx);
+                        try self.registerCandidateDeclOrForeignExport(c_idx, mod.id, did, null, false);
                     }
                 }
+            }
 
-                // 2. File-level module exports / star re-exports / export = / global augmentations.
+            // 2. File-level module exports / star re-exports / export = / global augmentations.
+            for (self.graph.modules) |mod| {
+                if (self.isBundledLibModule(mod)) continue;
+
                 const has_file_content = mod.exports.len > 0 or
                     mod.star_re_exports.len > 0 or
                     mod.default_export != null or
                     mod.export_equals != null or
                     (mod.ambient_modules.len == 0 and mod.global_augmentations.len > 0) or
-                    (mod.ambient_modules.len == 0 and self.graph.modules.len == 1);
+                    (mod.ambient_modules.len == 0 and self.graph.modules.len == 1) or
+                    self.source_mod_to_cand.contains(mod.id);
 
                 if (has_file_content) {
-                    const wire_spec = try self.deriveFileLogicalSpecifier(mod);
-                    const c_idx = try self.getOrCreateCandidate(wire_spec, mod.id);
+                    const c_idx = self.source_mod_to_cand.get(mod.id) orelse blk: {
+                        const wire_spec = try self.deriveFileLogicalSpecifier(mod);
+                        break :blk try self.getOrCreateCandidate(wire_spec, mod.id);
+                    };
 
                     for (mod.exports) |did| {
-                        try appendUniqueU32(&self.candidates.items[c_idx].decl_ids, self.scratch, did);
-                        try self.appendDeclRecursiveToCand(did, c_idx);
+                        try self.registerCandidateDeclOrForeignExport(c_idx, mod.id, did, null, false);
                     }
                     if (mod.default_export) |def_id| {
-                        try appendUniqueU32(&self.candidates.items[c_idx].decl_ids, self.scratch, def_id);
-                        try self.appendDeclRecursiveToCand(def_id, c_idx);
+                        try self.registerCandidateDeclOrForeignExport(c_idx, mod.id, def_id, "default", true);
                     }
                     if (mod.export_equals) |eq_id| {
-                        try appendUniqueU32(&self.candidates.items[c_idx].decl_ids, self.scratch, eq_id);
-                        try self.appendDeclRecursiveToCand(eq_id, c_idx);
+                        try self.registerCandidateDeclOrForeignExport(c_idx, mod.id, eq_id, null, false);
                     }
                     for (mod.global_augmentations) |did| {
-                        try appendUniqueU32(&self.candidates.items[c_idx].decl_ids, self.scratch, did);
-                        try self.appendDeclRecursiveToCand(did, c_idx);
+                        try self.registerCandidateDeclOrForeignExport(c_idx, mod.id, did, null, false);
                     }
                     for (mod.star_re_exports) |target_smid| {
                         try appendUniqueU32(
@@ -885,6 +995,17 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                     }
 
+                    const foreign_snapshot = try self.scratch.dupe(ForeignExportEntry, self.candidates.items[c_idx].foreign_exports.items);
+                    defer self.scratch.free(foreign_snapshot);
+                    for (foreign_snapshot) |fe| {
+                        if (self.decl_to_cand.get(fe.decl_id)) |dep_cand| {
+                            if (!self.candidates.items[dep_cand].included) {
+                                self.candidates.items[dep_cand].included = true;
+                                try queue.append(self.scratch, dep_cand);
+                            }
+                        }
+                    }
+
                     const decl_snapshot = try self.scratch.dupe(u32, self.candidates.items[c_idx].decl_ids.items);
                     defer self.scratch.free(decl_snapshot);
                     for (decl_snapshot) |did| {
@@ -923,6 +1044,7 @@ fn LowerCtx(comptime GraphType: type) type {
             scope: *naming.ScopeNamer,
             prefix_path: []const []const u8,
             prebound_names: *std.AutoHashMapUnmanaged(u32, naming.BoundName),
+            prebound_overloads: *std.AutoHashMapUnmanaged(u32, []naming.BoundName),
         ) error{OutOfMemory}!void {
             // Detect interface/class + namespace declaration merging in the same scope so merged
             // namespace children fold cleanly inside the struct rather than colliding!
@@ -960,6 +1082,21 @@ fn LowerCtx(comptime GraphType: type) type {
                 bound.deinit(self.scratch);
                 try prebound_names.put(self.scratch, did, owned_bound);
 
+                if (d.kind == .function_decl and d.kind.function_decl.len > 1) {
+                    const extra_count = d.kind.function_decl.len - 1;
+                    var extras = try self.alloc.alloc(naming.BoundName, extra_count);
+                    for (0..extra_count) |ei| {
+                        const ov = try scope.bind(owned_bound.wire_name, .camel);
+                        extras[ei] = .{
+                            .zig_ident = try self.alloc.dupe(u8, ov.zig_ident),
+                            .logical_name = try self.alloc.dupe(u8, ov.logical_name),
+                            .wire_name = owned_bound.wire_name,
+                        };
+                        ov.deinit(self.scratch);
+                    }
+                    try prebound_overloads.put(self.scratch, did, extras);
+                }
+
                 var full_path = try self.alloc.alloc([]const u8, prefix_path.len + 1);
                 @memcpy(full_path[0..prefix_path.len], prefix_path);
                 full_path[prefix_path.len] = owned_bound.zig_ident;
@@ -978,21 +1115,31 @@ fn LowerCtx(comptime GraphType: type) type {
                     .type_param_defaults = defaults,
                 });
 
-                // Recurse into child declarations of namespaces or merged namespaces on structs.
-                var nested_scope = naming.ScopeNamer.init(self.scratch, scope);
-                defer nested_scope.deinit();
-                try nested_scope.reserve("Self");
-                try nested_scope.reserve("zigar_js");
-
                 switch (d.kind) {
                     .namespace_decl => |children| {
-                        try self.prebindScopeDecls(final_mod_idx, children, &nested_scope, full_path, prebound_names);
+                        var nested_scope = naming.ScopeNamer.initContainer(self.scratch, scope);
+                        defer nested_scope.deinit();
+                        try nested_scope.reserve("zigar_js");
+                        try self.prebindScopeDecls(final_mod_idx, children, &nested_scope, full_path, prebound_names, prebound_overloads);
                     },
                     .interface_decl, .class_decl => {
+                        var preview_tp_scope = naming.ScopeNamer.initParam(self.scratch, scope);
+                        defer preview_tp_scope.deinit();
+                        for (d.type_params) |tp_id| {
+                            const raw_tp = if (tp_id < self.graph.type_params.len)
+                                self.str(self.graph.type_params[tp_id].name)
+                            else
+                                "T";
+                            const tb = try preview_tp_scope.bindWithFallbackSuffix(raw_tp, .pascal, "T");
+                            tb.deinit(self.scratch);
+                        }
+                        var nested_scope = naming.ScopeNamer.initContainer(self.scratch, &preview_tp_scope);
+                        defer nested_scope.deinit();
+                        try nested_scope.reserve("zigar_js");
                         for (d.merged_with) |mid| {
                             if (self.merged_ns_consumed.contains(mid)) {
                                 const mchildren = self.graph.decls[mid].kind.namespace_decl;
-                                try self.prebindScopeDecls(final_mod_idx, mchildren, &nested_scope, full_path, prebound_names);
+                                try self.prebindScopeDecls(final_mod_idx, mchildren, &nested_scope, full_path, prebound_names, prebound_overloads);
                             }
                         }
                     },
@@ -1078,7 +1225,7 @@ fn LowerCtx(comptime GraphType: type) type {
             raw_tp_ids: []const u32,
             tp_scope: *naming.ScopeNamer,
             outer_active_tps: []const ActiveTypeParam,
-            in_self_container: bool,
+            self_ident_opt: ?[]const u8,
             imports_used: *std.AutoHashMapUnmanaged(u32, void),
             needs_runtime: *bool,
         ) error{OutOfMemory}!LoweredTypeParams {
@@ -1123,7 +1270,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         ct,
                         false,
                         combined_active,
-                        in_self_container,
+                        self_ident_opt,
                         &visited,
                         imports_used,
                         needs_runtime,
@@ -1135,7 +1282,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         dt,
                         false,
                         combined_active,
-                        in_self_container,
+                        self_ident_opt,
                         &visited,
                         imports_used,
                         needs_runtime,
@@ -1151,7 +1298,7 @@ fn LowerCtx(comptime GraphType: type) type {
             ty_id: u32,
             is_return_pos: bool,
             active_tps: []const ActiveTypeParam,
-            in_self_container: bool,
+            self_ident_opt: ?[]const u8,
             visited: *std.AutoHashMapUnmanaged(u32, void),
             imports_used: *std.AutoHashMapUnmanaged(u32, void),
             needs_runtime: *bool,
@@ -1196,8 +1343,8 @@ fn LowerCtx(comptime GraphType: type) type {
                     return self.makeType(.js_object);
                 },
                 .this_type => {
-                    if (in_self_container) {
-                        const self_t = try self.makeType(.self_type);
+                    if (self_ident_opt) |sid| {
+                        const self_t = try self.makeType(.{ .self_type = sid });
                         return self.makeType(.{ .pointer_const = self_t });
                     }
                     needs_runtime.* = true;
@@ -1225,11 +1372,11 @@ fn LowerCtx(comptime GraphType: type) type {
                     return self.makeType(.js_value);
                 },
                 .array, .readonly_array => |elem_id| {
-                    const elem = try self.lowerType(elem_id, false, active_tps, in_self_container, visited, imports_used, needs_runtime);
+                    const elem = try self.lowerType(elem_id, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                     return self.makeType(.{ .slice = elem });
                 },
                 .tuple, .readonly_tuple => |elems| {
-                    var tup_scope = naming.ScopeNamer.init(self.scratch, null);
+                    var tup_scope = naming.ScopeNamer.initContainer(self.scratch, null);
                     defer tup_scope.deinit();
                     try tup_scope.reserve("zigar_js");
 
@@ -1241,7 +1388,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         const zig_ident = try self.alloc.dupe(u8, bound.zig_ident);
                         bound.deinit(self.scratch);
 
-                        var elem_ty = try self.lowerType(el.ty, false, active_tps, in_self_container, visited, imports_used, needs_runtime);
+                        var elem_ty = try self.lowerType(el.ty, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                         if (el.variadic) {
                             elem_ty = try self.makeType(.{ .slice = elem_ty });
                         } else if (el.optional) {
@@ -1281,7 +1428,7 @@ fn LowerCtx(comptime GraphType: type) type {
 
                     var base_ty: *TypeIr = undefined;
                     if (non_null.items.len == 1) {
-                        base_ty = try self.lowerType(non_null.items[0], false, active_tps, in_self_container, visited, imports_used, needs_runtime);
+                        base_ty = try self.lowerType(non_null.items[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                     } else if (self.allArmsSameScalarKind(non_null.items)) |scalar_ty| {
                         base_ty = try self.makeType(scalar_ty);
                     } else {
@@ -1314,9 +1461,9 @@ fn LowerCtx(comptime GraphType: type) type {
 
                             for (0..final_len) |ai| {
                                 if (ai < ref.type_args.len) {
-                                    lowered_args[ai] = try self.lowerType(ref.type_args[ai], false, active_tps, in_self_container, visited, imports_used, needs_runtime);
+                                    lowered_args[ai] = try self.lowerType(ref.type_args[ai], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                                 } else if (ai < loc.type_param_defaults.len and loc.type_param_defaults[ai] != null) {
-                                    lowered_args[ai] = try self.lowerType(loc.type_param_defaults[ai].?, false, active_tps, in_self_container, visited, imports_used, needs_runtime);
+                                    lowered_args[ai] = try self.lowerType(loc.type_param_defaults[ai].?, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                                 } else {
                                     needs_runtime.* = true;
                                     lowered_args[ai] = try self.makeType(.js_value);
@@ -1340,7 +1487,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         std.mem.eql(u8, ref_name, "Set") or std.mem.eql(u8, ref_name, "ReadonlySet"))
                     {
                         const elem = if (ref.type_args.len > 0)
-                            try self.lowerType(ref.type_args[0], false, active_tps, in_self_container, visited, imports_used, needs_runtime)
+                            try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
                         else blk: {
                             needs_runtime.* = true;
                             break :blk try self.makeType(.js_value);
@@ -1350,7 +1497,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     if (std.mem.eql(u8, ref_name, "Promise") or std.mem.eql(u8, ref_name, "PromiseLike")) {
                         needs_runtime.* = true;
                         const inner = if (ref.type_args.len > 0)
-                            try self.lowerType(ref.type_args[0], false, active_tps, in_self_container, visited, imports_used, needs_runtime)
+                            try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
                         else
                             try self.makeType(.void_type);
                         return self.makeType(.{ .promise = inner });
@@ -1367,11 +1514,11 @@ fn LowerCtx(comptime GraphType: type) type {
                     if (std.mem.eql(u8, ref_name, "Map") or std.mem.eql(u8, ref_name, "ReadonlyMap")) {
                         needs_runtime.* = true;
                         const k = if (ref.type_args.len > 0)
-                            try self.lowerType(ref.type_args[0], false, active_tps, in_self_container, visited, imports_used, needs_runtime)
+                            try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
                         else
                             try self.makeType(.js_value);
                         const v = if (ref.type_args.len > 1)
-                            try self.lowerType(ref.type_args[1], false, active_tps, in_self_container, visited, imports_used, needs_runtime)
+                            try self.lowerType(ref.type_args[1], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
                         else
                             try self.makeType(.js_value);
                         return self.makeType(.{ .js_map = .{ .key = k, .value = v } });
@@ -1381,14 +1528,14 @@ fn LowerCtx(comptime GraphType: type) type {
                     // use the TypeScript 7.1 Checker's `resolved_type` if available!
                     if (tn.resolved_type) |rt| {
                         if (rt != ty_id) {
-                            return self.lowerType(rt, is_return_pos, active_tps, in_self_container, visited, imports_used, needs_runtime);
+                            return self.lowerType(rt, is_return_pos, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                         }
                     }
 
                     if (std.mem.eql(u8, ref_name, "Record") and ref.type_args.len == 2) {
                         needs_runtime.* = true;
-                        const k = try self.lowerType(ref.type_args[0], false, active_tps, in_self_container, visited, imports_used, needs_runtime);
-                        const v = try self.lowerType(ref.type_args[1], false, active_tps, in_self_container, visited, imports_used, needs_runtime);
+                        const k = try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                        const v = try self.lowerType(ref.type_args[1], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                         return self.makeType(.{ .js_map = .{ .key = k, .value = v } });
                     }
 
@@ -1402,7 +1549,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         if (sig.type_params.len == 0) {
                             var p_types = try self.alloc.alloc(*const TypeIr, sig.params.len);
                             for (sig.params, 0..) |p, idx| {
-                                var pt = try self.lowerType(p.ty, false, active_tps, in_self_container, visited, imports_used, needs_runtime);
+                                var pt = try self.lowerType(p.ty, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                                 if (p.rest) {
                                     if (pt.* != .slice) pt = try self.makeType(.{ .slice = pt });
                                 } else if (p.optional) {
@@ -1413,7 +1560,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             const ret = if (sig.type_predicate) |pred|
                                 (if (pred.asserts) try self.makeType(.void_type) else try self.makeType(.bool_type))
                             else
-                                try self.lowerType(sig.return_type, true, active_tps, in_self_container, visited, imports_used, needs_runtime);
+                                try self.lowerType(sig.return_type, true, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                             return self.makeType(.{ .fn_ptr = .{ .params = p_types, .return_type = ret } });
                         }
                     }
@@ -1427,16 +1574,19 @@ fn LowerCtx(comptime GraphType: type) type {
                             const sig = self.graph.signatures[sid];
                             var p_types = try self.alloc.alloc(*const TypeIr, sig.params.len);
                             for (sig.params, 0..) |p, idx| {
-                                var pt = try self.lowerType(p.ty, false, active_tps, in_self_container, visited, imports_used, needs_runtime);
+                                var pt = try self.lowerType(p.ty, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                                 if (p.optional and !p.rest) pt = try self.wrapOptional(pt);
                                 p_types[idx] = pt;
                             }
-                            const ret = try self.lowerType(sig.return_type, true, active_tps, in_self_container, visited, imports_used, needs_runtime);
+                            const ret = try self.lowerType(sig.return_type, true, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                             return self.makeType(.{ .fn_ptr = .{ .params = p_types, .return_type = ret } });
                         }
                     }
                     if (obj.properties.len > 0) {
-                        const fields = try self.lowerFields(obj.properties, false, active_tps, in_self_container, visited, imports_used, needs_runtime);
+                        var anon_scope = naming.ScopeNamer.initContainer(self.scratch, null);
+                        defer anon_scope.deinit();
+                        try anon_scope.reserve("zigar_js");
+                        const fields = try self.lowerFields(obj.properties, false, &anon_scope, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                         return self.makeType(.{ .anon_struct = fields });
                     }
                     needs_runtime.* = true;
@@ -1445,7 +1595,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 else => {
                     if (tn.resolved_type) |rt| {
                         if (rt != ty_id) {
-                            return self.lowerType(rt, is_return_pos, active_tps, in_self_container, visited, imports_used, needs_runtime);
+                            return self.lowerType(rt, is_return_pos, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                         }
                     }
                     needs_runtime.* = true;
@@ -1491,15 +1641,13 @@ fn LowerCtx(comptime GraphType: type) type {
             self: *Self,
             prop_ids: []const u32,
             only_instance: bool,
+            field_scope: *naming.ScopeNamer,
             active_tps: []const ActiveTypeParam,
-            in_self_container: bool,
+            self_ident_opt: ?[]const u8,
             visited: *std.AutoHashMapUnmanaged(u32, void),
             imports_used: *std.AutoHashMapUnmanaged(u32, void),
             needs_runtime: *bool,
         ) error{OutOfMemory}![]FieldIr {
-            var field_scope = naming.ScopeNamer.init(self.scratch, null);
-            defer field_scope.deinit();
-
             var list: std.ArrayList(FieldIr) = .empty;
             errdefer list.deinit(self.alloc);
 
@@ -1514,7 +1662,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 const wire_copy = try self.alloc.dupe(u8, bound.wire_name);
                 bound.deinit(self.scratch);
 
-                var f_ty = try self.lowerType(p.ty, false, active_tps, in_self_container, visited, imports_used, needs_runtime);
+                var f_ty = try self.lowerType(p.ty, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                 if (p.modifiers.optional_mod) {
                     f_ty = try self.wrapOptional(f_ty);
                 }
@@ -1537,14 +1685,23 @@ fn LowerCtx(comptime GraphType: type) type {
             self: *Self,
             sig_id: u32,
             enclosing_scope: *const naming.ScopeNamer,
-            reserve_self: bool,
+            has_self_receiver: bool,
             outer_active_tps: []const ActiveTypeParam,
-            in_self_container: bool,
+            self_ident_opt: ?[]const u8,
             imports_used: *std.AutoHashMapUnmanaged(u32, void),
             needs_runtime: *bool,
         ) error{OutOfMemory}!SignatureIr {
             if (sig_id >= self.graph.signatures.len) {
+                var fallback_self_ident: ?[]const u8 = null;
+                if (has_self_receiver) {
+                    var fn_scope_fb = naming.ScopeNamer.initParam(self.scratch, enclosing_scope);
+                    defer fn_scope_fb.deinit();
+                    const sb = try fn_scope_fb.bindWithFallbackSuffix("self", .snake, "arg");
+                    fallback_self_ident = try self.alloc.dupe(u8, sb.zig_ident);
+                    sb.deinit(self.scratch);
+                }
                 return .{
+                    .self_param_ident = fallback_self_ident,
                     .type_params = &.{},
                     .params = &.{},
                     .return_type = try self.makeType(.void_type),
@@ -1555,17 +1712,21 @@ fn LowerCtx(comptime GraphType: type) type {
             }
 
             const sig = self.graph.signatures[sig_id];
-            var fn_scope = naming.ScopeNamer.init(self.scratch, enclosing_scope);
+            var fn_scope = naming.ScopeNamer.initParam(self.scratch, enclosing_scope);
             defer fn_scope.deinit();
-            if (reserve_self) {
-                try fn_scope.reserve("self");
+
+            var self_param_ident: ?[]const u8 = null;
+            if (has_self_receiver) {
+                const sb = try fn_scope.bindWithFallbackSuffix("self", .snake, "arg");
+                self_param_ident = try self.alloc.dupe(u8, sb.zig_ident);
+                sb.deinit(self.scratch);
             }
 
             const tp_res = try self.lowerTypeParams(
                 sig.type_params,
                 &fn_scope,
                 outer_active_tps,
-                in_self_container,
+                self_ident_opt,
                 imports_used,
                 needs_runtime,
             );
@@ -1583,7 +1744,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 bound.deinit(self.scratch);
 
                 visited.clearRetainingCapacity();
-                var pt = try self.lowerType(p.ty, false, tp_res.active, in_self_container, &visited, imports_used, needs_runtime);
+                var pt = try self.lowerType(p.ty, false, tp_res.active, self_ident_opt, &visited, imports_used, needs_runtime);
                 if (p.rest) {
                     if (pt.* != .slice) pt = try self.makeType(.{ .slice = pt });
                 } else if (p.optional) {
@@ -1606,9 +1767,10 @@ fn LowerCtx(comptime GraphType: type) type {
             const ret_ty = if (has_pred)
                 (if (pred_asserts) try self.makeType(.void_type) else try self.makeType(.bool_type))
             else
-                try self.lowerType(sig.return_type, true, tp_res.active, in_self_container, &visited, imports_used, needs_runtime);
+                try self.lowerType(sig.return_type, true, tp_res.active, self_ident_opt, &visited, imports_used, needs_runtime);
 
             return .{
+                .self_param_ident = self_param_ident,
                 .type_params = tp_res.ir,
                 .params = params,
                 .return_type = ret_ty,
@@ -1687,7 +1849,7 @@ fn LowerCtx(comptime GraphType: type) type {
             var variants = try self.alloc.alloc(UnionVariantIr, non_null.items.len);
             for (non_null.items, 0..) |aid, idx| {
                 visited.clearRetainingCapacity();
-                const payload = try self.lowerType(aid, false, active_tps, false, &visited, imports_used, needs_runtime);
+                const payload = try self.lowerType(aid, false, active_tps, null, &visited, imports_used, needs_runtime);
                 const hint = self.deriveVariantTagHint(aid, idx);
                 const bound = try var_scope.bind(hint, .snake);
                 variants[idx] = .{
@@ -1736,6 +1898,7 @@ fn LowerCtx(comptime GraphType: type) type {
             decl_id: u32,
             scope: *naming.ScopeNamer,
             prebound_names: *const std.AutoHashMapUnmanaged(u32, naming.BoundName),
+            prebound_overloads: *const std.AutoHashMapUnmanaged(u32, []naming.BoundName),
             outer_active_tps: []const ActiveTypeParam,
             imports_used: *std.AutoHashMapUnmanaged(u32, void),
             needs_runtime: *bool,
@@ -1754,6 +1917,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 .function_decl => |sigs| {
                     if (sigs.len == 0) {
                         const empty_sig = SignatureIr{
+                            .self_param_ident = null,
                             .type_params = &.{},
                             .params = &.{},
                             .return_type = try self.makeType(.void_type),
@@ -1774,23 +1938,29 @@ fn LowerCtx(comptime GraphType: type) type {
                         return;
                     }
 
+                    const ov_slice = prebound_overloads.get(decl_id) orelse &[_]naming.BoundName{};
                     for (sigs, 0..) |sid, s_idx| {
                         const sig_ir = try self.lowerSignature(
                             sid,
                             scope,
                             false,
                             outer_active_tps,
-                            false,
+                            null,
                             imports_used,
                             needs_runtime,
                         );
                         var ident = bound.zig_ident;
                         var logical = bound.logical_name;
                         if (s_idx > 0) {
-                            const ov = try scope.bind(bound.wire_name, .camel);
-                            ident = try self.alloc.dupe(u8, ov.zig_ident);
-                            logical = try self.alloc.dupe(u8, ov.logical_name);
-                            ov.deinit(self.scratch);
+                            if (s_idx - 1 < ov_slice.len) {
+                                ident = ov_slice[s_idx - 1].zig_ident;
+                                logical = ov_slice[s_idx - 1].logical_name;
+                            } else {
+                                const ov = try scope.bind(bound.wire_name, .camel);
+                                ident = try self.alloc.dupe(u8, ov.zig_ident);
+                                logical = try self.alloc.dupe(u8, ov.logical_name);
+                                ov.deinit(self.scratch);
+                            }
                         }
                         try out_list.append(self.alloc, .{
                             .source_decl_id = decl_id,
@@ -1807,7 +1977,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 .variable_decl => |ty_id| {
                     var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
                     defer visited.deinit(self.scratch);
-                    const lowered_ty = try self.lowerType(ty_id, false, outer_active_tps, false, &visited, imports_used, needs_runtime);
+                    const lowered_ty = try self.lowerType(ty_id, false, outer_active_tps, null, &visited, imports_used, needs_runtime);
 
                     if (ty_id < self.graph.types.len and self.graph.types[ty_id].kind == .literal) {
                         const lit = self.graph.types[ty_id].kind.literal;
@@ -1856,6 +2026,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         d.merged_with,
                         scope,
                         prebound_names,
+                        prebound_overloads,
                         outer_active_tps,
                         imports_used,
                         needs_runtime,
@@ -1886,6 +2057,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         d.merged_with,
                         scope,
                         prebound_names,
+                        prebound_overloads,
                         outer_active_tps,
                         imports_used,
                         needs_runtime,
@@ -1902,7 +2074,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     });
                 },
                 .enum_decl => |en| {
-                    var member_scope = naming.ScopeNamer.init(self.scratch, null);
+                    var member_scope = naming.ScopeNamer.initContainer(self.scratch, null);
                     defer member_scope.deinit();
                     try member_scope.reserve("zigar_js");
 
@@ -1936,13 +2108,13 @@ fn LowerCtx(comptime GraphType: type) type {
                     });
                 },
                 .type_alias_decl => |ty_id| {
-                    var tp_scope = naming.ScopeNamer.init(self.scratch, scope);
+                    var tp_scope = naming.ScopeNamer.initParam(self.scratch, scope);
                     defer tp_scope.deinit();
                     const tp_res = try self.lowerTypeParams(
                         d.type_params,
                         &tp_scope,
                         outer_active_tps,
-                        false,
+                        null,
                         imports_used,
                         needs_runtime,
                     );
@@ -2014,6 +2186,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                 &.{},
                                 scope,
                                 prebound_names,
+                                prebound_overloads,
                                 outer_active_tps,
                                 imports_used,
                                 needs_runtime,
@@ -2034,7 +2207,7 @@ fn LowerCtx(comptime GraphType: type) type {
 
                     var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
                     defer visited.deinit(self.scratch);
-                    const target = try self.lowerType(ty_id, false, tp_res.active, false, &visited, imports_used, needs_runtime);
+                    const target = try self.lowerType(ty_id, false, tp_res.active, null, &visited, imports_used, needs_runtime);
                     try out_list.append(self.alloc, .{
                         .source_decl_id = decl_id,
                         .zig_ident = bound.zig_ident,
@@ -2047,11 +2220,14 @@ fn LowerCtx(comptime GraphType: type) type {
                     });
                 },
                 .namespace_decl => |children| {
-                    var ns_scope = naming.ScopeNamer.init(self.scratch, scope);
+                    var ns_scope = naming.ScopeNamer.initContainer(self.scratch, scope);
                     defer ns_scope.deinit();
                     try ns_scope.reserve("zigar_js");
                     for (children) |cid| {
                         if (prebound_names.get(cid)) |cb| try ns_scope.reserve(cb.logical_name);
+                        if (prebound_overloads.get(cid)) |ovs| {
+                            for (ovs) |ov| try ns_scope.reserve(ov.logical_name);
+                        }
                     }
 
                     var child_irs: std.ArrayList(DeclIr) = .empty;
@@ -2061,6 +2237,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             cid,
                             &ns_scope,
                             prebound_names,
+                            prebound_overloads,
                             outer_active_tps,
                             imports_used,
                             needs_runtime,
@@ -2101,8 +2278,13 @@ fn LowerCtx(comptime GraphType: type) type {
                     }
                     if (re.target_decl) |tdid| {
                         if (self.decl_locations.get(tdid)) |loc| {
-                            if (loc.module_index != final_mod_idx and loc.zig_path.len > 0) {
-                                try imports_used.put(self.scratch, loc.module_index, {});
+                            const is_self_noop = loc.module_index == final_mod_idx and
+                                loc.zig_path.len == 1 and
+                                std.mem.eql(u8, loc.zig_path[0], bound.zig_ident);
+                            if (!is_self_noop and loc.zig_path.len > 0) {
+                                if (loc.module_index != final_mod_idx) {
+                                    try imports_used.put(self.scratch, loc.module_index, {});
+                                }
                                 try out_list.append(self.alloc, .{
                                     .source_decl_id = decl_id,
                                     .zig_ident = bound.zig_ident,
@@ -2114,7 +2296,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                     .kind = .{
                                         .re_export_decl = .{
                                             .target_module_index = loc.module_index,
-                                            .target_zig_ident = loc.zig_path[0],
+                                            .target_zig_path = loc.zig_path,
                                         },
                                     },
                                 });
@@ -2126,8 +2308,13 @@ fn LowerCtx(comptime GraphType: type) type {
                     if (!d.modifiers.export_decl) return;
                     if (ie.target_decl) |tdid| {
                         if (self.decl_locations.get(tdid)) |loc| {
-                            if (loc.module_index != final_mod_idx and loc.zig_path.len > 0) {
-                                try imports_used.put(self.scratch, loc.module_index, {});
+                            const is_self_noop = loc.module_index == final_mod_idx and
+                                loc.zig_path.len == 1 and
+                                std.mem.eql(u8, loc.zig_path[0], bound.zig_ident);
+                            if (!is_self_noop and loc.zig_path.len > 0) {
+                                if (loc.module_index != final_mod_idx) {
+                                    try imports_used.put(self.scratch, loc.module_index, {});
+                                }
                                 try out_list.append(self.alloc, .{
                                     .source_decl_id = decl_id,
                                     .zig_ident = bound.zig_ident,
@@ -2139,7 +2326,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                     .kind = .{
                                         .re_export_decl = .{
                                             .target_module_index = loc.module_index,
-                                            .target_zig_ident = loc.zig_path[0],
+                                            .target_zig_path = loc.zig_path,
                                         },
                                     },
                                 });
@@ -2187,44 +2374,81 @@ fn LowerCtx(comptime GraphType: type) type {
             merged_ids: []const u32,
             parent_scope: *const naming.ScopeNamer,
             prebound_names: *const std.AutoHashMapUnmanaged(u32, naming.BoundName),
+            prebound_overloads: *const std.AutoHashMapUnmanaged(u32, []naming.BoundName),
             outer_active_tps: []const ActiveTypeParam,
             imports_used: *std.AutoHashMapUnmanaged(u32, void),
             needs_runtime: *bool,
         ) error{OutOfMemory}!StructDeclIr {
-            var tp_scope = naming.ScopeNamer.init(self.scratch, parent_scope);
+            var self_taken_in_tp_or_merged = parent_scope.isTaken("Self") and parent_scope.is_param_scope;
+            if (!self_taken_in_tp_or_merged) {
+                var pcur = parent_scope.parent;
+                while (pcur) |pp| : (pcur = pp.parent) {
+                    if (pp.is_param_scope and pp.used.contains("Self")) {
+                        self_taken_in_tp_or_merged = true;
+                        break;
+                    }
+                }
+            }
+            for (raw_tps) |tp_id| {
+                const raw_tp = if (tp_id < self.graph.type_params.len) self.str(self.graph.type_params[tp_id].name) else "T";
+                const styled_tp = try naming.toPascalCase(self.scratch, raw_tp);
+                defer self.scratch.free(styled_tp);
+                if (std.mem.eql(u8, styled_tp, "Self")) self_taken_in_tp_or_merged = true;
+            }
+            for (merged_ids) |mid| {
+                if (self.merged_ns_consumed.contains(mid)) {
+                    for (self.graph.decls[mid].kind.namespace_decl) |cid| {
+                        if (prebound_names.get(cid)) |cb| {
+                            if (std.mem.eql(u8, cb.logical_name, "Self")) self_taken_in_tp_or_merged = true;
+                        }
+                    }
+                }
+            }
+            const provisional_self_ident: []const u8 = if (self_taken_in_tp_or_merged) "Self_2" else "Self";
+
+            var tp_scope = naming.ScopeNamer.initParam(self.scratch, parent_scope);
             defer tp_scope.deinit();
 
             const tp_res = try self.lowerTypeParams(
                 raw_tps,
                 &tp_scope,
                 outer_active_tps,
-                true,
+                provisional_self_ident,
                 imports_used,
                 needs_runtime,
             );
 
-            var struct_scope = naming.ScopeNamer.init(self.scratch, &tp_scope);
+            var struct_scope = naming.ScopeNamer.initContainer(self.scratch, &tp_scope);
             defer struct_scope.deinit();
-            try struct_scope.reserve("Self");
             try struct_scope.reserve("zigar_js");
 
-            // Reserve merged namespace child decl names in struct_scope first.
+            // Reserve merged namespace child decl names (and overloads) in `struct_scope` first.
             for (merged_ids) |mid| {
                 if (self.merged_ns_consumed.contains(mid)) {
                     for (self.graph.decls[mid].kind.namespace_decl) |cid| {
                         if (prebound_names.get(cid)) |cb| try struct_scope.reserve(cb.logical_name);
+                        if (prebound_overloads.get(cid)) |ovs| {
+                            for (ovs) |ov| try struct_scope.reserve(ov.logical_name);
+                        }
                     }
                 }
             }
 
+            const self_bound = try struct_scope.bind("Self", .preserve);
+            const self_ident = try self.alloc.dupe(u8, self_bound.zig_ident);
+            self_bound.deinit(self.scratch);
+
             var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
             defer visited.deinit(self.scratch);
 
+            // Instance fields share `struct_scope` so fields, static props, constructors, methods,
+            // `Self`, and `zigar_js` can NEVER collide inside the same Zig struct!
             const fields = try self.lowerFields(
                 raw_prop_ids,
                 true,
+                &struct_scope,
                 tp_res.active,
-                true,
+                self_ident,
                 &visited,
                 imports_used,
                 needs_runtime,
@@ -2240,7 +2464,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 const style: naming.NameStyle = if (isAllUpperOrUnderscore(wire)) .preserve else .snake;
                 const sb = try struct_scope.bind(wire, style);
                 visited.clearRetainingCapacity();
-                const sty = try self.lowerType(p.ty, false, tp_res.active, true, &visited, imports_used, needs_runtime);
+                const sty = try self.lowerType(p.ty, false, tp_res.active, self_ident, &visited, imports_used, needs_runtime);
 
                 var lit_opt: ?LiteralValueIr = null;
                 if (p.ty < self.graph.types.len and self.graph.types[p.ty].kind == .literal) {
@@ -2320,8 +2544,8 @@ fn LowerCtx(comptime GraphType: type) type {
 
             // Now `struct_scope` knows EVERY declaration inside this struct — lower constructors & methods!
             for (all_ctor_sigs, 0..) |sid, idx| {
-                var c_sig = try self.lowerSignature(sid, &struct_scope, false, tp_res.active, true, imports_used, needs_runtime);
-                c_sig.return_type = try self.makeType(.self_type);
+                var c_sig = try self.lowerSignature(sid, &struct_scope, false, tp_res.active, self_ident, imports_used, needs_runtime);
+                c_sig.return_type = try self.makeType(.{ .self_type = self_ident });
                 ctors[idx] = .{
                     .zig_ident = ctor_idents[idx],
                     .signature = c_sig,
@@ -2336,7 +2560,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     &struct_scope,
                     !slot.is_static,
                     tp_res.active,
-                    true,
+                    self_ident,
                     imports_used,
                     needs_runtime,
                 );
@@ -2359,6 +2583,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             cid,
                             &struct_scope,
                             prebound_names,
+                            prebound_overloads,
                             tp_res.active,
                             imports_used,
                             needs_runtime,
@@ -2371,6 +2596,7 @@ fn LowerCtx(comptime GraphType: type) type {
             return .{
                 .is_class = is_class,
                 .is_abstract = is_abstract,
+                .self_ident = self_ident,
                 .type_params = tp_res.ir,
                 .fields = fields,
                 .static_props = try static_props.toOwnedSlice(self.alloc),
@@ -2456,10 +2682,10 @@ fn LowerCtx(comptime GraphType: type) type {
             }
             self.cand_to_final_map = map_slice;
 
-            // Pre-bind module-level scopes & declaration locations across all selected modules first
-            // so cross-module and cyclic references resolve deterministically in a single lowering pass!
+            // Pass 1: Pre-bind canonical module-level scopes & declaration locations across all
+            // selected modules first so cross-module and cyclic references resolve deterministically!
             var mod_scopes = try self.scratch.alloc(naming.ScopeNamer, selected_cands.len);
-            for (mod_scopes) |*ms| ms.* = naming.ScopeNamer.init(self.scratch, null);
+            for (mod_scopes) |*ms| ms.* = naming.ScopeNamer.initContainer(self.scratch, null);
             defer {
                 for (mod_scopes) |*ms| ms.deinit();
                 self.scratch.free(mod_scopes);
@@ -2468,12 +2694,20 @@ fn LowerCtx(comptime GraphType: type) type {
             var prebound_names: std.AutoHashMapUnmanaged(u32, naming.BoundName) = .empty;
             defer prebound_names.deinit(self.scratch);
 
+            var prebound_overloads: std.AutoHashMapUnmanaged(u32, []naming.BoundName) = .empty;
+            defer prebound_overloads.deinit(self.scratch);
+
             for (selected_cands, 0..) |cand_idx, final_i| {
                 var ms = &mod_scopes[final_i];
-                try ms.reserve("std");
                 try ms.reserve("__root");
+                try ms.reserve("__zigar_mod");
                 try ms.reserve("__zigar_js");
                 try ms.reserve("zigar_js");
+                for (0..selected_cands.len) |dep_i| {
+                    const mod_alias = try std.fmt.allocPrint(self.scratch, "__mod_{d}", .{dep_i});
+                    defer self.scratch.free(mod_alias);
+                    try ms.reserve(mod_alias);
+                }
 
                 try self.prebindScopeDecls(
                     @intCast(final_i),
@@ -2481,45 +2715,66 @@ fn LowerCtx(comptime GraphType: type) type {
                     ms,
                     &.{},
                     &prebound_names,
+                    &prebound_overloads,
                 );
             }
 
-            // Assign unique `root.zig` export identifiers for all emitted modules.
-            var root_scope = naming.ScopeNamer.init(self.scratch, null);
-            defer root_scope.deinit();
-            try root_scope.reserve("std");
-            try root_scope.reserve("zigar_js");
-
-            var modules = try self.alloc.alloc(ModuleIr, selected_cands.len);
+            // Pass 2: Pre-bind foreign exports (`export *` expanded into `mod.exports`, cross-module
+            // `default_export` / `export_equals`) and `star_re_export_source_mods` into `mod_scopes`
+            // BEFORE lowering any module's functions so no parameter can shadow a re-exported symbol!
+            var planned_re_exports = try self.scratch.alloc(std.ArrayList(PlannedReExport), selected_cands.len);
+            for (planned_re_exports) |*pl| pl.* = .empty;
+            defer {
+                for (planned_re_exports) |*pl| pl.deinit(self.scratch);
+                self.scratch.free(planned_re_exports);
+            }
 
             for (selected_cands, 0..) |cand_idx, final_i| {
                 const cand = &self.candidates.items[cand_idx];
                 const final_mod_idx: u32 = @intCast(final_i);
                 var ms = &mod_scopes[final_i];
 
-                const rb = try root_scope.bind(cand.substituted_specifier, .snake);
-                const root_export_ident = try self.alloc.dupe(u8, rb.zig_ident);
-                rb.deinit(self.scratch);
+                var seen_non_default_decls: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                defer seen_non_default_decls.deinit(self.scratch);
 
-                var imports_used: std.AutoHashMapUnmanaged(u32, void) = .empty;
-                defer imports_used.deinit(self.scratch);
-                var needs_runtime = false;
+                for (cand.foreign_exports.items) |fe| {
+                    if (self.merged_ns_consumed.contains(fe.decl_id)) continue;
+                    if (fe.decl_id >= self.graph.decls.len) continue;
+                    const sd = self.graph.decls[fe.decl_id];
+                    const loc = self.decl_locations.get(fe.decl_id) orelse continue;
+                    if (loc.zig_path.len == 0 or loc.module_index == final_mod_idx) continue;
 
-                var decl_irs: std.ArrayList(DeclIr) = .empty;
-                for (cand.decl_ids.items) |did| {
-                    try self.lowerDeclIntoList(
-                        final_mod_idx,
-                        did,
-                        ms,
-                        &prebound_names,
-                        &.{},
-                        &imports_used,
-                        &needs_runtime,
-                        &decl_irs,
-                    );
+                    const export_wire = fe.wire_name_override orelse
+                        (if (sd.export_name) |esid| self.str(esid) else self.str(sd.name));
+                    const style: naming.NameStyle = if (fe.wire_name_override != null) .preserve else self.declNameStyle(sd);
+
+                    if (!fe.is_default_export) {
+                        if (seen_non_default_decls.contains(fe.decl_id)) continue;
+                        const desired_styled = switch (style) {
+                            .preserve => try self.scratch.dupe(u8, export_wire),
+                            .camel => try naming.toCamelCase(self.scratch, export_wire),
+                            .pascal => try naming.toPascalCase(self.scratch, export_wire),
+                            .snake => try naming.toSnakeCase(self.scratch, export_wire),
+                        };
+                        defer self.scratch.free(desired_styled);
+                        const base_check = if (desired_styled.len == 0) "_empty" else desired_styled;
+                        if (ms.isTaken(base_check)) continue;
+                        try seen_non_default_decls.put(self.scratch, fe.decl_id, {});
+                    }
+
+                    const sb = try ms.bind(export_wire, style);
+                    try planned_re_exports[final_i].append(self.scratch, .{
+                        .source_decl_id = fe.decl_id,
+                        .zig_ident = try self.alloc.dupe(u8, sb.zig_ident),
+                        .logical_name = try self.alloc.dupe(u8, sb.logical_name),
+                        .wire_name = try self.alloc.dupe(u8, sb.wire_name),
+                        .is_default_export = fe.is_default_export,
+                        .target_module_index = loc.module_index,
+                        .target_zig_path = loc.zig_path,
+                    });
+                    sb.deinit(self.scratch);
                 }
 
-                // Expand `export * from "..."` star re-exports explicitly without `usingnamespace`!
                 var visited_star_smods: std.AutoHashMapUnmanaged(u32, void) = .empty;
                 defer visited_star_smods.deinit(self.scratch);
                 for (cand.source_mod_ids.items) |self_smid| {
@@ -2533,11 +2788,13 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
 
                 for (star_items.items) |item| {
+                    if (seen_non_default_decls.contains(item.decl_id)) continue;
                     if (self.merged_ns_consumed.contains(item.decl_id)) continue;
+                    if (item.decl_id >= self.graph.decls.len) continue;
                     const sd = self.graph.decls[item.decl_id];
                     if (sd.modifiers.default_export) continue;
                     const loc = self.decl_locations.get(item.decl_id) orelse continue;
-                    if (loc.zig_path.len == 0) continue;
+                    if (loc.zig_path.len == 0 or loc.module_index == final_mod_idx) continue;
 
                     const export_wire = if (sd.export_name) |esid| self.str(esid) else self.str(sd.name);
                     const desired_styled = switch (self.declNameStyle(sd)) {
@@ -2547,28 +2804,80 @@ fn LowerCtx(comptime GraphType: type) type {
                         .snake => try naming.toSnakeCase(self.scratch, export_wire),
                     };
                     defer self.scratch.free(desired_styled);
+                    const base_check = if (desired_styled.len == 0) "_empty" else desired_styled;
 
                     // `export *` in TypeScript does NOT override a direct export of the same name.
-                    if (ms.isTaken(desired_styled)) continue;
+                    if (ms.isTaken(base_check)) continue;
+                    try seen_non_default_decls.put(self.scratch, item.decl_id, {});
 
                     const sb = try ms.bind(export_wire, self.declNameStyle(sd));
-                    try imports_used.put(self.scratch, item.target_mod_idx, {});
-                    try decl_irs.append(self.alloc, .{
+                    try planned_re_exports[final_i].append(self.scratch, .{
                         .source_decl_id = item.decl_id,
                         .zig_ident = try self.alloc.dupe(u8, sb.zig_ident),
                         .logical_name = try self.alloc.dupe(u8, sb.logical_name),
                         .wire_name = try self.alloc.dupe(u8, sb.wire_name),
-                        .is_exported = true,
                         .is_default_export = false,
+                        .target_module_index = loc.module_index,
+                        .target_zig_path = loc.zig_path,
+                    });
+                    sb.deinit(self.scratch);
+                }
+            }
+
+            // Assign unique `root.zig` export identifiers for all emitted modules.
+            var root_scope = naming.ScopeNamer.initContainer(self.scratch, null);
+            defer root_scope.deinit();
+            try root_scope.reserve("zigar_js");
+
+            var modules = try self.alloc.alloc(ModuleIr, selected_cands.len);
+
+            // Pass 3: Lower declarations and append planned cross-module re-export aliases!
+            for (selected_cands, 0..) |cand_idx, final_i| {
+                const cand = &self.candidates.items[cand_idx];
+                const final_mod_idx: u32 = @intCast(final_i);
+                const ms = &mod_scopes[final_i];
+
+                const rb = try root_scope.bind(cand.substituted_specifier, .snake);
+                const root_export_ident = try self.alloc.dupe(u8, rb.zig_ident);
+                const root_export_logical = try self.alloc.dupe(u8, rb.logical_name);
+                rb.deinit(self.scratch);
+
+                var imports_used: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                defer imports_used.deinit(self.scratch);
+                var needs_runtime = false;
+
+                var decl_irs: std.ArrayList(DeclIr) = .empty;
+                for (cand.decl_ids.items) |did| {
+                    try self.lowerDeclIntoList(
+                        final_mod_idx,
+                        did,
+                        ms,
+                        &prebound_names,
+                        &prebound_overloads,
+                        &.{},
+                        &imports_used,
+                        &needs_runtime,
+                        &decl_irs,
+                    );
+                }
+
+                for (planned_re_exports[final_i].items) |pre| {
+                    try imports_used.put(self.scratch, pre.target_module_index, {});
+                    try decl_irs.append(self.alloc, .{
+                        .source_decl_id = pre.source_decl_id,
+                        .zig_ident = pre.zig_ident,
+                        .logical_name = pre.logical_name,
+                        .wire_name = pre.wire_name,
+                        .is_exported = true,
+                        .is_default_export = pre.is_default_export,
                         .jsdoc = null,
                         .kind = .{
                             .re_export_decl = .{
-                                .target_module_index = item.target_mod_idx,
-                                .target_zig_ident = loc.zig_path[0],
+                                .target_module_index = pre.target_module_index,
+                                .target_zig_path = pre.target_zig_path,
                             },
                         },
                     });
-                    sb.deinit(self.scratch);
                 }
 
                 // Deterministic sorted module imports (excluding self-imports).
@@ -2604,6 +2913,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     .wire_specifier = cand.wire_specifier,
                     .rel_zig_path = cand.rel_zig_path,
                     .root_export_ident = root_export_ident,
+                    .root_export_logical_name = root_export_logical,
                     .is_primary = cand.is_primary,
                     .needs_root_runtime = needs_runtime,
                     .imports = mod_imports,
@@ -2750,10 +3060,14 @@ fn dfsValueCycleDeclByPath(
             try dfsValueCycleTypeByPath(state_alloc, ir_alloc, @constCast(ta.target), decl_map, state);
         },
         .re_export_decl => |re| {
-            const target_key = try formatDeclCycleKey(state_alloc, re.target_module_index, &.{}, re.target_zig_ident);
+            const target_key = try formatDeclCycleKey(state_alloc, re.target_module_index, re.target_zig_path, null);
             defer state_alloc.free(target_key);
             if (decl_map.get(target_key)) |target_decl| {
-                try dfsValueCycleDeclByPath(state_alloc, ir_alloc, re.target_module_index, &.{}, target_decl, decl_map, state);
+                const parent_prefix = if (re.target_zig_path.len > 1)
+                    re.target_zig_path[0 .. re.target_zig_path.len - 1]
+                else
+                    &[_][]const u8{};
+                try dfsValueCycleDeclByPath(state_alloc, ir_alloc, re.target_module_index, parent_prefix, target_decl, decl_map, state);
             }
         },
         .namespace_decl => |children| {
@@ -2783,9 +3097,9 @@ fn dfsValueCycleTypeByPath(
     switch (ty.*) {
         // Indirection boundaries (pointer/slice/fn/runtime handle) cannot cause a value-size dependency loop!
         .slice, .pointer_const, .fn_ptr, .promise, .js_map => return,
-        .self_type => {
+        .self_type => |sid| {
             const inner = try ir_alloc.create(TypeIr);
-            inner.* = .self_type;
+            inner.* = .{ .self_type = sid };
             ty.* = .{ .pointer_const = inner };
         },
         .optional => |inner| {

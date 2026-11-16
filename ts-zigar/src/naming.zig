@@ -312,17 +312,44 @@ pub const BoundName = struct {
 };
 
 /// Deterministic scope-aware identifier allocator that deduplicates collisions within a scope
-/// and prevents shadowing of optional parent/enclosing scope declarations while preserving exact
-/// JS wire names.
+/// and prevents shadowing of enclosing scope declarations where Zig 0.17 scoping rules require it,
+/// while preserving exact JS wire names.
 pub const ScopeNamer = struct {
     allocator: std.mem.Allocator,
     used: std.StringHashMapUnmanaged(void) = .empty,
     parent: ?*const ScopeNamer = null,
+    is_param_scope: bool = false,
+    check_all_ancestors: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, parent: ?*const ScopeNamer) ScopeNamer {
         return .{
             .allocator = allocator,
             .parent = parent,
+            .is_param_scope = false,
+            .check_all_ancestors = true,
+        };
+    }
+
+    /// Initializes a Zig container scope (module, namespace, `struct`, `enum`, or `union`).
+    /// Container members may share names with outer container declarations, EXCEPT they must
+    /// never shadow an enclosing function or comptime generic parameter!
+    pub fn initContainer(allocator: std.mem.Allocator, parent: ?*const ScopeNamer) ScopeNamer {
+        return .{
+            .allocator = allocator,
+            .parent = parent,
+            .is_param_scope = false,
+            .check_all_ancestors = false,
+        };
+    }
+
+    /// Initializes a Zig function/method/constructor/comptime-type parameter scope.
+    /// Zig 0.17 forbids parameters from shadowing ANY declaration in ANY enclosing scope!
+    pub fn initParam(allocator: std.mem.Allocator, parent: ?*const ScopeNamer) ScopeNamer {
+        return .{
+            .allocator = allocator,
+            .parent = parent,
+            .is_param_scope = true,
+            .check_all_ancestors = true,
         };
     }
 
@@ -336,7 +363,21 @@ pub const ScopeNamer = struct {
 
     pub fn isTaken(self: *const ScopeNamer, logical: []const u8) bool {
         if (self.used.contains(logical)) return true;
-        if (self.parent) |p| return p.isTaken(logical);
+        if (self.check_all_ancestors) {
+            return self.isTakenInAnyAncestor(logical);
+        }
+        var cur = self.parent;
+        while (cur) |p| : (cur = p.parent) {
+            if (p.is_param_scope and p.used.contains(logical)) return true;
+        }
+        return false;
+    }
+
+    fn isTakenInAnyAncestor(self: *const ScopeNamer, logical: []const u8) bool {
+        var cur = self.parent;
+        while (cur) |p| : (cur = p.parent) {
+            if (p.used.contains(logical)) return true;
+        }
         return false;
     }
 

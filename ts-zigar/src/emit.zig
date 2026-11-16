@@ -92,6 +92,23 @@ pub fn validateAndFormatZigSource(
         return .{ .diagnostic = try diag.toOwnedSlice(allocator) };
     }
 
+    var zir = try std.zig.AstGen.generate(allocator, tree);
+    defer zir.deinit(allocator);
+
+    if (zir.hasCompileErrors()) {
+        var wip = try std.zig.ErrorBundle.Wip.init(allocator);
+        defer wip.deinit();
+        try wip.addZirErrorMessages(zir, tree, source_z, file_label);
+        var bundle = try wip.toOwnedBundle("");
+        defer bundle.deinit(allocator);
+
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        aw.writer.print("Zig 0.17 ZIR (AstGen) validation failed for '{s}':\n", .{file_label}) catch return error.OutOfMemory;
+        bundle.renderToWriter(.{}, &aw.writer) catch return error.OutOfMemory;
+        return .{ .diagnostic = try aw.toOwnedSlice() };
+    }
+
     const formatted = try tree.renderAlloc(allocator);
     return .{ .formatted = formatted };
 }
@@ -344,17 +361,51 @@ fn appendSafePrefixAndLine(
     try out.appendSlice(allocator, line);
 }
 
+fn unquoteZigIdent(ident: []const u8) []const u8 {
+    if (ident.len >= 3 and std.mem.startsWith(u8, ident, "@\"") and ident[ident.len - 1] == '"') {
+        return ident[2 .. ident.len - 1];
+    }
+    return ident;
+}
+
 const ModuleEmitCtx = struct {
     allocator: std.mem.Allocator,
     pkg: *const ir.PackageIr,
     mod: *const ir.ModuleIr,
     out: std.ArrayList(u8) = .empty,
+    nested_decl_scopes: std.ArrayList([]const []const u8) = .empty,
+    used_self_mod_alias: bool = false,
+
+    fn deinit(self: *ModuleEmitCtx) void {
+        self.out.deinit(self.allocator);
+        self.nested_decl_scopes.deinit(self.allocator);
+    }
 
     fn lookupImportAlias(self: *const ModuleEmitCtx, target_mod_idx: u32) ?[]const u8 {
         for (self.mod.imports) |imp| {
             if (imp.target_module_index == target_mod_idx) return imp.local_alias;
         }
         return null;
+    }
+
+    fn isShadowedInNestedScope(self: *const ModuleEmitCtx, ident: []const u8) bool {
+        const needle = unquoteZigIdent(ident);
+        for (self.nested_decl_scopes.items) |frame| {
+            for (frame) |cand| {
+                if (std.mem.eql(u8, unquoteZigIdent(cand), needle)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn emitIdentSegment(self: *ModuleEmitCtx, seg: []const u8) !void {
+        if (seg.len >= 3 and std.mem.startsWith(u8, seg, "@\"") and seg[seg.len - 1] == '"') {
+            try self.out.appendSlice(self.allocator, seg);
+            return;
+        }
+        const formatted = try naming.formatIdentifier(self.allocator, seg);
+        defer self.allocator.free(formatted);
+        try self.out.appendSlice(self.allocator, formatted);
     }
 
     fn emitStringLit(self: *ModuleEmitCtx, s: []const u8) !void {
@@ -375,7 +426,7 @@ const ModuleEmitCtx = struct {
             .js_value => try self.out.appendSlice(self.allocator, "__zigar_js.JsValue"),
             .js_object => try self.out.appendSlice(self.allocator, "__zigar_js.JsObject"),
             .js_symbol => try self.out.appendSlice(self.allocator, "__zigar_js.JsSymbol"),
-            .self_type => try self.out.appendSlice(self.allocator, "Self"),
+            .self_type => |sid| try self.emitIdentSegment(sid),
             .type_param_ref => |tp_ident| try self.out.appendSlice(self.allocator, tp_ident),
             .optional => |inner| {
                 try self.out.append(self.allocator, '?');
@@ -452,10 +503,13 @@ const ModuleEmitCtx = struct {
                     if (self.lookupImportAlias(dref.module_index)) |alias| {
                         try self.out.print(self.allocator, "{s}.", .{alias});
                     }
+                } else if (dref.decl_zig_path.len > 0 and self.isShadowedInNestedScope(dref.decl_zig_path[0])) {
+                    self.used_self_mod_alias = true;
+                    try self.out.appendSlice(self.allocator, "__zigar_mod.");
                 }
                 for (dref.decl_zig_path, 0..) |seg, idx| {
                     if (idx > 0) try self.out.append(self.allocator, '.');
-                    try self.out.appendSlice(self.allocator, seg);
+                    try self.emitIdentSegment(seg);
                 }
                 if (dref.type_args.len > 0) {
                     try self.out.append(self.allocator, '(');
@@ -534,9 +588,10 @@ const ModuleEmitCtx = struct {
             param_count += 1;
         }
 
+        const recv_ident = sig.self_param_ident orelse "self";
         if (self_param_type) |spt| {
             if (param_count > 0) try self.out.appendSlice(self.allocator, ", ");
-            try self.out.print(self.allocator, "self: {s}", .{spt});
+            try self.out.print(self.allocator, "{s}: {s}", .{ recv_ident, spt });
             param_count += 1;
         }
 
@@ -557,7 +612,7 @@ const ModuleEmitCtx = struct {
             }
         }
         if (self_param_type != null) {
-            try self.out.appendSlice(self.allocator, "_ = self;\n");
+            try self.out.print(self.allocator, "_ = {s};\n", .{recv_ident});
         }
         for (sig.params) |p| {
             try self.out.print(self.allocator, "_ = {s};\n", .{p.zig_ident});
@@ -570,8 +625,35 @@ const ModuleEmitCtx = struct {
         wire_name: []const u8,
         st: ir.StructDeclIr,
     ) error{OutOfMemory}!void {
+        const frame_count = 2 + st.static_props.len + st.constructors.len + st.methods.len + st.nested_decls.len;
+        var frame = try self.allocator.alloc([]const u8, frame_count);
+        defer self.allocator.free(frame);
+        var fi: usize = 0;
+        frame[fi] = st.self_ident;
+        fi += 1;
+        frame[fi] = "zigar_js";
+        fi += 1;
+        for (st.static_props) |sp| {
+            frame[fi] = sp.zig_ident;
+            fi += 1;
+        }
+        for (st.constructors) |ctor| {
+            frame[fi] = ctor.zig_ident;
+            fi += 1;
+        }
+        for (st.methods) |m| {
+            frame[fi] = m.zig_ident;
+            fi += 1;
+        }
+        for (st.nested_decls) |nd| {
+            frame[fi] = nd.zig_ident;
+            fi += 1;
+        }
+        try self.nested_decl_scopes.append(self.allocator, frame);
+        defer _ = self.nested_decl_scopes.pop();
+
         try self.out.appendSlice(self.allocator, "struct {\n");
-        try self.out.appendSlice(self.allocator, "const Self = @This();\n");
+        try self.out.print(self.allocator, "const {s} = @This();\n", .{st.self_ident});
 
         for (st.fields) |f| {
             if (f.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
@@ -601,9 +683,12 @@ const ModuleEmitCtx = struct {
             try self.emitFunction("pub ", ctor.zig_ident, null, ctor.signature);
         }
 
+        const self_ptr_ty = try std.fmt.allocPrint(self.allocator, "*const {s}", .{st.self_ident});
+        defer self.allocator.free(self_ptr_ty);
+
         for (st.methods) |m| {
             if (m.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
-            const self_ty: ?[]const u8 = if (m.is_static) null else "*const Self";
+            const self_ty: ?[]const u8 = if (m.is_static) null else self_ptr_ty;
             try self.emitFunction("pub ", m.zig_ident, self_ty, m.signature);
         }
 
@@ -784,6 +869,15 @@ const ModuleEmitCtx = struct {
                 }
             },
             .namespace_decl => |children| {
+                const frame = try self.allocator.alloc([]const u8, children.len + 1);
+                defer self.allocator.free(frame);
+                for (children, 0..) |cd, idx| {
+                    frame[idx] = cd.zig_ident;
+                }
+                frame[children.len] = "zigar_js";
+                try self.nested_decl_scopes.append(self.allocator, frame);
+                defer _ = self.nested_decl_scopes.pop();
+
                 try self.out.print(self.allocator, "{s}const {s} = struct {{\n", .{ pub_kw, d.zig_ident });
                 for (children) |cd| {
                     try self.emitDecl(cd);
@@ -793,13 +887,35 @@ const ModuleEmitCtx = struct {
                 try self.out.appendSlice(self.allocator, " };\n};\n");
             },
             .re_export_decl => |re| {
-                if (self.lookupImportAlias(re.target_module_index)) |alias| {
-                    try self.out.print(self.allocator, "{s}const {s} = {s}.{s};\n", .{
-                        pub_kw,
-                        d.zig_ident,
-                        alias,
-                        re.target_zig_ident,
-                    });
+                if (re.target_zig_path.len > 0) {
+                    if (re.target_module_index != self.mod.index) {
+                        if (self.lookupImportAlias(re.target_module_index)) |alias| {
+                            try self.out.print(self.allocator, "{s}const {s} = {s}", .{
+                                pub_kw,
+                                d.zig_ident,
+                                alias,
+                            });
+                            for (re.target_zig_path) |seg| {
+                                try self.out.append(self.allocator, '.');
+                                try self.emitIdentSegment(seg);
+                            }
+                            try self.out.appendSlice(self.allocator, ";\n");
+                        }
+                    } else {
+                        try self.out.print(self.allocator, "{s}const {s} = ", .{
+                            pub_kw,
+                            d.zig_ident,
+                        });
+                        if (self.isShadowedInNestedScope(re.target_zig_path[0])) {
+                            self.used_self_mod_alias = true;
+                            try self.out.appendSlice(self.allocator, "__zigar_mod.");
+                        }
+                        for (re.target_zig_path, 0..) |seg, idx| {
+                            if (idx > 0) try self.out.append(self.allocator, '.');
+                            try self.emitIdentSegment(seg);
+                        }
+                        try self.out.appendSlice(self.allocator, ";\n");
+                    }
                 }
             },
             .namespace_re_export => |nre| {
@@ -871,23 +987,7 @@ fn renderModuleRaw(
         .pkg = pkg,
         .mod = mod,
     };
-    errdefer ctx.out.deinit(allocator);
-
-    try ctx.out.appendSlice(allocator, "// Generated by ts-zigar (TypeScript 7.1). Do not edit manually.\n\n");
-
-    if (mod.needs_root_runtime) {
-        const rel_to_root = try naming.relativeImportPath(allocator, mod.rel_zig_path, "root.zig");
-        defer allocator.free(rel_to_root);
-        try ctx.out.appendSlice(allocator, "const __zigar_js = @import(");
-        try ctx.emitStringLit(rel_to_root);
-        try ctx.out.appendSlice(allocator, ").zigar_js;\n");
-    }
-
-    for (mod.imports) |imp| {
-        try ctx.out.print(allocator, "const {s} = @import(", .{imp.local_alias});
-        try ctx.emitStringLit(imp.rel_import_path);
-        try ctx.out.appendSlice(allocator, ");\n");
-    }
+    defer ctx.deinit();
 
     try ctx.out.appendSlice(allocator, "\npub const zigar_js = .{\n.specifier = ");
     try ctx.emitStringLit(mod.specifier);
@@ -912,7 +1012,31 @@ fn renderModuleRaw(
         try ctx.out.append(allocator, '\n');
     }
 
-    return try ctx.out.toOwnedSlice(allocator);
+    var header: std.ArrayList(u8) = .empty;
+    errdefer header.deinit(allocator);
+
+    try header.appendSlice(allocator, "// Generated by ts-zigar (TypeScript 7.1). Do not edit manually.\n\n");
+
+    if (mod.needs_root_runtime) {
+        const rel_to_root = try naming.relativeImportPath(allocator, mod.rel_zig_path, "root.zig");
+        defer allocator.free(rel_to_root);
+        const rel_lit = try naming.formatStringLiteral(allocator, rel_to_root);
+        defer allocator.free(rel_lit);
+        try header.print(allocator, "const __zigar_js = @import({s}).zigar_js;\n", .{rel_lit});
+    }
+
+    for (mod.imports) |imp| {
+        const imp_lit = try naming.formatStringLiteral(allocator, imp.rel_import_path);
+        defer allocator.free(imp_lit);
+        try header.print(allocator, "const {s} = @import({s});\n", .{ imp.local_alias, imp_lit });
+    }
+
+    if (ctx.used_self_mod_alias) {
+        try header.appendSlice(allocator, "const __zigar_mod = @This();\n");
+    }
+
+    try header.appendSlice(allocator, ctx.out.items);
+    return try header.toOwnedSlice(allocator);
 }
 
 fn renderRootRaw(
@@ -922,50 +1046,9 @@ fn renderRootRaw(
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
-    try out.appendSlice(allocator,
-        \\// Generated by ts-zigar (TypeScript 7.1). Do not edit manually.
-        \\
-        \\pub const zigar_js = struct {
-        \\    pub const JsValue = struct {
-        \\        handle: u32 = 0,
-        \\    };
-        \\    pub const JsObject = struct {
-        \\        handle: u32 = 0,
-        \\    };
-        \\    pub const JsSymbol = struct {
-        \\        id: u32 = 0,
-        \\    };
-        \\    pub fn Promise(comptime T: type) type {
-        \\        return struct {
-        \\            pub const Payload = T;
-        \\            handle: u32 = 0,
-        \\        };
-        \\    }
-        \\    pub fn JsMap(comptime K: type, comptime V: type) type {
-        \\        return struct {
-        \\            pub const Key = K;
-        \\            pub const Value = V;
-        \\            handle: u32 = 0,
-        \\        };
-        \\    }
-        \\    pub fn Global(comptime T: type) type {
-        \\        return struct {
-        \\            pub const ValueType = T;
-        \\            js_name: []const u8,
-        \\            pub fn get(self: @This()) T {
-        \\                _ = self;
-        \\                @panic("ts-zigar host stub");
-        \\            }
-        \\        };
-        \\    }
-        \\};
-        \\
-        \\
-    );
-
-    var root_used: std.StringHashMapUnmanaged(void) = .empty;
-    defer root_used.deinit(allocator);
-    try root_used.put(allocator, "zigar_js", {});
+    var root_scope = naming.ScopeNamer.initContainer(allocator, null);
+    defer root_scope.deinit();
+    try root_scope.reserve("zigar_js");
 
     var primary_count: usize = 0;
     var single_primary: ?*const ir.ModuleIr = null;
@@ -978,35 +1061,142 @@ fn renderRootRaw(
         if (std.mem.eql(u8, m.specifier, "index")) {
             index_primary = m;
         }
-        const path_lit = try naming.formatStringLiteral(allocator, m.rel_zig_path);
-        defer allocator.free(path_lit);
-        try out.print(allocator, "pub const {s} = @import({s});\n", .{ m.root_export_ident, path_lit });
-        try root_used.put(allocator, naming.logicalSymbolName(m.root_export_ident), {});
+        try root_scope.reserve(m.root_export_logical_name);
     }
 
     // Re-export top-level symbols directly on `root.zig` (without `usingnamespace`, which does not
     // exist in Zig 0.17) when there is a single primary module or an `index` entry module!
     const barrel_mod = if (primary_count == 1) single_primary else index_primary;
+    var barrel_exports: std.ArrayList(ir.DeclIr) = .empty;
+    defer barrel_exports.deinit(allocator);
     if (barrel_mod) |bm| {
-        try out.append(allocator, '\n');
         for (bm.decls) |d| {
             if (!d.is_exported) continue;
-            if (root_used.contains(d.logical_name)) continue;
-            try root_used.put(allocator, d.logical_name, {});
-            try out.print(allocator, "pub const {s} = {s}.{s};\n", .{
-                d.zig_ident,
-                bm.root_export_ident,
-                d.zig_ident,
-            });
+            if (root_scope.isTaken(d.logical_name)) continue;
+            try root_scope.reserve(d.logical_name);
+            try barrel_exports.append(allocator, d);
+        }
+    }
+
+    // Allocate non-shadowing parameter names inside `zigar_js` helpers so top-level exports
+    // named `T`, `K`, `V`, `self`, `Promise`, `JsMap`, `Global`, etc. never collide or shadow!
+    var zigar_js_scope = naming.ScopeNamer.initContainer(allocator, &root_scope);
+    defer zigar_js_scope.deinit();
+    try zigar_js_scope.reserve("JsValue");
+    try zigar_js_scope.reserve("JsObject");
+    try zigar_js_scope.reserve("JsSymbol");
+    try zigar_js_scope.reserve("Promise");
+    try zigar_js_scope.reserve("JsMap");
+    try zigar_js_scope.reserve("Global");
+
+    var promise_p = naming.ScopeNamer.initParam(allocator, &zigar_js_scope);
+    defer promise_p.deinit();
+    const tp_promise = try promise_p.bind("T", .pascal);
+    defer tp_promise.deinit(allocator);
+
+    var map_p = naming.ScopeNamer.initParam(allocator, &zigar_js_scope);
+    defer map_p.deinit();
+    const tp_k = try map_p.bind("K", .pascal);
+    defer tp_k.deinit(allocator);
+    const tp_v = try map_p.bind("V", .pascal);
+    defer tp_v.deinit(allocator);
+
+    var global_p = naming.ScopeNamer.initParam(allocator, &zigar_js_scope);
+    defer global_p.deinit();
+    const tp_global = try global_p.bind("T", .pascal);
+    defer tp_global.deinit(allocator);
+
+    var global_struct_scope = naming.ScopeNamer.initContainer(allocator, &global_p);
+    defer global_struct_scope.deinit();
+    try global_struct_scope.reserve("ValueType");
+    try global_struct_scope.reserve("get");
+
+    var global_get_p = naming.ScopeNamer.initParam(allocator, &global_struct_scope);
+    defer global_get_p.deinit();
+    const p_self = try global_get_p.bind("self", .preserve);
+    defer p_self.deinit(allocator);
+
+    try out.print(
+        allocator,
+        \\// Generated by ts-zigar (TypeScript 7.1). Do not edit manually.
+        \\
+        \\pub const zigar_js = struct {{
+        \\    pub const JsValue = struct {{
+        \\        handle: u32 = 0,
+        \\    }};
+        \\    pub const JsObject = struct {{
+        \\        handle: u32 = 0,
+        \\    }};
+        \\    pub const JsSymbol = struct {{
+        \\        id: u32 = 0,
+        \\    }};
+        \\    pub fn Promise(comptime {s}: type) type {{
+        \\        return struct {{
+        \\            pub const Payload = {s};
+        \\            handle: u32 = 0,
+        \\        }};
+        \\    }}
+        \\    pub fn JsMap(comptime {s}: type, comptime {s}: type) type {{
+        \\        return struct {{
+        \\            pub const Key = {s};
+        \\            pub const Value = {s};
+        \\            handle: u32 = 0,
+        \\        }};
+        \\    }}
+        \\    pub fn Global(comptime {s}: type) type {{
+        \\        return struct {{
+        \\            pub const ValueType = {s};
+        \\            js_name: []const u8,
+        \\            pub fn get({s}: @This()) {s} {{
+        \\                _ = {s};
+        \\                @panic("ts-zigar host stub");
+        \\            }}
+        \\        }};
+        \\    }}
+        \\}};
+        \\
+        \\
+    ,
+        .{
+            tp_promise.zig_ident,
+            tp_promise.zig_ident,
+            tp_k.zig_ident,
+            tp_v.zig_ident,
+            tp_k.zig_ident,
+            tp_v.zig_ident,
+            tp_global.zig_ident,
+            tp_global.zig_ident,
+            p_self.zig_ident,
+            tp_global.zig_ident,
+            p_self.zig_ident,
+        },
+    );
+
+    for (pkg.modules) |*m| {
+        if (!m.is_primary) continue;
+        const path_lit = try naming.formatStringLiteral(allocator, m.rel_zig_path);
+        defer allocator.free(path_lit);
+        try out.print(allocator, "pub const {s} = @import({s});\n", .{ m.root_export_ident, path_lit });
+    }
+
+    if (barrel_mod) |bm| {
+        if (barrel_exports.items.len > 0) {
+            try out.append(allocator, '\n');
+            for (barrel_exports.items) |d| {
+                try out.print(allocator, "pub const {s} = {s}.{s};\n", .{
+                    d.zig_ident,
+                    bm.root_export_ident,
+                    d.zig_ident,
+                });
+            }
         }
     }
 
     try out.appendSlice(allocator, "\ntest \"ts-zigar generated module graph\" {\n");
-    try out.appendSlice(allocator, "    const std = @import(\"std\");\n");
-    try out.appendSlice(allocator, "    std.testing.refAllDecls(@This());\n");
+    try out.appendSlice(allocator, "    @import(\"std\").testing.refAllDecls(@This());\n");
     for (pkg.modules) |*m| {
         if (!m.is_primary) continue;
-        try out.print(allocator, "    std.testing.refAllDecls({s});\n", .{m.root_export_ident});
+        try out.print(allocator, "    @import(\"std\").testing.refAllDecls({s});\n", .{m.root_export_ident});
     }
     try out.appendSlice(allocator, "}\n");
 
@@ -1069,6 +1259,48 @@ test "validateAndFormatZigSource reports detailed line, column, and snippet on i
             defer alloc.free(diag);
             try std.testing.expect(std.mem.indexOf(u8, diag, "broken.zig:") != null);
             try std.testing.expect(std.mem.indexOf(u8, diag, "^") != null);
+        },
+    }
+}
+
+test "validateAndFormatZigSource catches ZIR errors via AstGen (duplicate struct members and parameter shadowing)" {
+    const alloc = std.testing.allocator;
+
+    const dup_struct =
+        \\pub const Bad = struct {
+        \\    init: bool,
+        \\    pub fn init() void {}
+        \\};
+    ;
+    switch (try validateAndFormatZigSource(alloc, "dup_struct.zig", dup_struct)) {
+        .formatted => |fmt| {
+            alloc.free(fmt);
+            return error.TestUnexpectedResult;
+        },
+        .diagnostic => |diag| {
+            defer alloc.free(diag);
+            try std.testing.expect(std.mem.indexOf(u8, diag, "AstGen") != null);
+            try std.testing.expect(std.mem.indexOf(u8, diag, "duplicate struct member") != null);
+        },
+    }
+
+    const shadow_param =
+        \\pub const self: u32 = 1;
+        \\pub const A = struct {
+        \\    pub fn m(self: *const @This()) void {
+        \\        _ = self;
+        \\    }
+        \\};
+    ;
+    switch (try validateAndFormatZigSource(alloc, "shadow_param.zig", shadow_param)) {
+        .formatted => |fmt| {
+            alloc.free(fmt);
+            return error.TestUnexpectedResult;
+        },
+        .diagnostic => |diag| {
+            defer alloc.free(diag);
+            try std.testing.expect(std.mem.indexOf(u8, diag, "AstGen") != null);
+            try std.testing.expect(std.mem.indexOf(u8, diag, "function parameter shadows") != null);
         },
     }
 }

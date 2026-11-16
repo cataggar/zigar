@@ -311,3 +311,397 @@ test "installed ts-zigar native CLI binary handles --help, --version, invalid fl
         try std.testing.expect(term.exited != 0);
     }
 }
+
+test "Regression Bug 1: struct member collisions, outer/parameter/receiver/type-param shadowing, and root.zig prelude safety" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-bug1-shadow", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const src_dir = try std.fmt.allocPrint(alloc, "{s}/src", .{sandbox});
+    defer alloc.free(src_dir);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+    try cwd.createDirPath(io, src_dir);
+
+    const dts_path = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{src_dir});
+    defer alloc.free(dts_path);
+    {
+        var sd = try cwd.openDir(io, src_dir, .{});
+        defer sd.close(io);
+        try sd.writeFile(io, .{
+            .sub_path = "index.d.ts",
+            .data =
+            \\export declare const self: number;
+            \\export declare const n: number;
+            \\export declare const std: number;
+            \\export type T = number;
+            \\export declare class K {
+            \\  value: string;
+            \\}
+            \\export type V = string;
+            \\export declare const Promise: number;
+            \\export declare const JsMap: number;
+            \\export declare const Global: number;
+            \\export declare const zigar_js: number;
+            \\
+            \\export declare class Widget {
+            \\  init: boolean;
+            \\  count: number;
+            \\  Self: string;
+            \\  handle: number;
+            \\  zigar_js: number;
+            \\  static count: number;
+            \\  static init: string;
+            \\  constructor(n: string, self?: number);
+            \\  m(n: K, self?: T): this;
+            \\  check<T, K>(v: T, k: K): V;
+            \\}
+            \\
+            \\export declare class ShadowRef {
+            \\  static K: number;
+            \\  useTop(x: K): K;
+            \\}
+            \\
+            \\export declare class Box<Self, T> {
+            \\  item: Self;
+            \\  extra: T;
+            \\  clone(self: number): this;
+            \\}
+            \\
+            \\export declare function foo(n: string): void;
+            \\export declare function foo(n: number, foo_2: boolean): void;
+            \\export declare function foo_2(x: string): void;
+            \\
+            \\export namespace Outer {
+            \\  export const x: number;
+            \\  export function inner(x: string, self: boolean): K;
+            \\}
+            ,
+        });
+    }
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const cli_args = [_][]const u8{ "-t", dts_path, "-d", out_dir };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Bug 1 pipeline error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+
+    const consumer_zig = try std.fmt.allocPrint(alloc, "{s}/consumer_bug1.zig", .{sandbox});
+    defer alloc.free(consumer_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "consumer_bug1.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r = @import("out/root.zig");
+            \\
+            \\test "Widget deduplicates colliding members and preserves outer declarations without shadowing" {
+            \\    try std.testing.expect(r.T == f64);
+            \\    try std.testing.expect(r.V == []const u8);
+            \\    try std.testing.expectEqualStrings("self", r.self.js_name);
+            \\    try std.testing.expectEqualStrings("n", r.n.js_name);
+            \\    try std.testing.expectEqualStrings("std", r.std.js_name);
+            \\
+            \\    const w: r.Widget = .{
+            \\        .init = true,
+            \\        .count = 1,
+            \\        .self = "ok",
+            \\        .handle = 2,
+            \\        .zigar_js_2 = 3,
+            \\    };
+            \\    try std.testing.expect(w.init);
+            \\    try std.testing.expectEqualStrings("Widget", r.Widget.zigar_js.js_name);
+            \\
+            \\    const B = r.Box(u32, bool);
+            \\    const b: B = .{ .item = 7, .extra = true };
+            \\    try std.testing.expectEqual(@as(u32, 7), b.item);
+            \\
+            \\    const use_top_fn: *const fn (*const r.ShadowRef, r.K) r.K = &r.ShadowRef.useTop;
+            \\    _ = use_top_fn;
+            \\}
+            ,
+        });
+    }
+
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "ast-check", root_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
+}
+
+test "Regression Bug 2: export * and named re-exports emit alias constants preserving nominal Zig type identity" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-bug2-star", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const pkg_dir = try std.fmt.allocPrint(alloc, "{s}/pkg", .{sandbox});
+    defer alloc.free(pkg_dir);
+    const sub_dir = try std.fmt.allocPrint(alloc, "{s}/pkg/sub", .{sandbox});
+    defer alloc.free(sub_dir);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+    try cwd.createDirPath(io, sub_dir);
+
+    {
+        var pd = try cwd.openDir(io, pkg_dir, .{});
+        defer pd.close(io);
+        try pd.writeFile(io, .{
+            .sub_path = "package.json",
+            .data =
+            \\{
+            \\  "name": "star-pkg",
+            \\  "version": "1.0.0",
+            \\  "types": "./index.d.ts"
+            \\}
+            ,
+        });
+        try pd.writeFile(io, .{
+            .sub_path = "index.d.ts",
+            .data =
+            \\import type { Starry, Nebula, Phase } from "./sub/star.js";
+            \\export * from "./sub/star.js";
+            \\export { NamedItem, OrigItem as AliasedItem } from "./sub/extra.js";
+            \\export declare function take(s: Starry, n: Nebula, p: Phase): Starry;
+            \\export declare function checkShadow(makeStar: string): Starry;
+            ,
+        });
+        try pd.writeFile(io, .{
+            .sub_path = "sub/star.d.ts",
+            .data =
+            \\export interface Starry {
+            \\  id: number;
+            \\  label: string;
+            \\}
+            \\export declare class Nebula {
+            \\  radius: number;
+            \\  ping(): Starry;
+            \\}
+            \\export enum Phase {
+            \\  New = 0,
+            \\  Full = 1,
+            \\}
+            \\export declare function makeStar(label: string): Starry;
+            ,
+        });
+        try pd.writeFile(io, .{
+            .sub_path = "sub/extra.d.ts",
+            .data =
+            \\export interface NamedItem {
+            \\  code: string;
+            \\}
+            \\export interface OrigItem {
+            \\  flag: boolean;
+            \\}
+            ,
+        });
+    }
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const cli_args = [_][]const u8{ "-t", pkg_dir, "-d", out_dir };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Bug 2 pipeline error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+
+    const consumer_zig = try std.fmt.allocPrint(alloc, "{s}/consumer_bug2.zig", .{sandbox});
+    defer alloc.free(consumer_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "consumer_bug2.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r = @import("out/root.zig");
+            \\const idx = @import("out/index.zig");
+            \\const sub_star = @import("out/sub/star.zig");
+            \\const sub_extra = @import("out/sub/extra.zig");
+            \\
+            \\test "nominal type identity across export * and named re-exports" {
+            \\    try std.testing.expect(r.Starry == sub_star.Starry);
+            \\    try std.testing.expect(idx.Starry == sub_star.Starry);
+            \\    try std.testing.expect(r.Nebula == sub_star.Nebula);
+            \\    try std.testing.expect(r.Phase == sub_star.Phase);
+            \\    try std.testing.expect(r.NamedItem == sub_extra.NamedItem);
+            \\    try std.testing.expect(r.AliasedItem == sub_extra.OrigItem);
+            \\    try std.testing.expect(&r.makeStar == &sub_star.makeStar);
+            \\
+            \\    const s: sub_star.Starry = .{ .id = 42, .label = "vega" };
+            \\    const n: sub_star.Nebula = .{ .radius = 10 };
+            \\    try std.testing.expectEqual(@as(f64, 42), s.id);
+            \\    try std.testing.expectEqual(@as(f64, 10), n.radius);
+            \\
+            \\    // Passing `sub_star.Starry` to `r.take` must type-check identically!
+            \\    const take_fn: *const fn (sub_star.Starry, sub_star.Nebula, sub_star.Phase) sub_star.Starry = &r.take;
+            \\    _ = take_fn;
+            \\}
+            ,
+        });
+    }
+
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
+}
+
+test "Regression Bug 3: export import Foo = Bar.Baz emits full multi-segment nested target path" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-bug3-nested", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const pkg_dir = try std.fmt.allocPrint(alloc, "{s}/pkg", .{sandbox});
+    defer alloc.free(pkg_dir);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+    try cwd.createDirPath(io, pkg_dir);
+
+    {
+        var pd = try cwd.openDir(io, pkg_dir, .{});
+        defer pd.close(io);
+        try pd.writeFile(io, .{
+            .sub_path = "package.json",
+            .data =
+            \\{
+            \\  "name": "nested-import-equals-pkg",
+            \\  "version": "1.0.0",
+            \\  "types": "./index.d.ts"
+            \\}
+            ,
+        });
+        try pd.writeFile(io, .{
+            .sub_path = "other.d.ts",
+            .data =
+            \\export namespace Bar {
+            \\  export interface Baz {
+            \\    ok: boolean;
+            \\  }
+            \\  export namespace Deep {
+            \\    export interface Leaf {
+            \\      depth: number;
+            \\    }
+            \\    export function compute(leaf: Leaf): Baz;
+            \\  }
+            \\}
+            ,
+        });
+        try pd.writeFile(io, .{
+            .sub_path = "index.d.ts",
+            .data =
+            \\import { Bar } from "./other.js";
+            \\export import Foo = Bar.Baz;
+            \\export import Leaf = Bar.Deep.Leaf;
+            \\export import computeLeaf = Bar.Deep.compute;
+            \\
+            \\export namespace LocalNs {
+            \\  export interface Inner {
+            \\    tag: string;
+            \\  }
+            \\}
+            \\export import LocalInner = LocalNs.Inner;
+            \\
+            \\export declare function consume(f: Foo, l: Leaf, loc: LocalInner): Foo;
+            ,
+        });
+    }
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const index_dts = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{pkg_dir});
+    defer alloc.free(index_dts);
+    const other_dts = try std.fmt.allocPrint(alloc, "{s}/other.d.ts", .{pkg_dir});
+    defer alloc.free(other_dts);
+
+    const cli_args = [_][]const u8{ "-t", index_dts, "-t", other_dts, "-d", out_dir };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Bug 3 pipeline error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+
+    const index_zig = try std.fmt.allocPrint(alloc, "{s}/index.zig", .{out_dir});
+    defer alloc.free(index_zig);
+    const index_src = try cwd.readFileAlloc(io, index_zig, alloc, .limited(1024 * 1024));
+    defer alloc.free(index_src);
+    try std.testing.expect(std.mem.indexOf(u8, index_src, ".Bar.Baz;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_src, ".Bar.Deep.Leaf;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_src, ".Bar.Deep.compute;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_src, "pub const LocalInner = LocalNs.Inner;") != null);
+
+    const consumer_zig = try std.fmt.allocPrint(alloc, "{s}/consumer_bug3.zig", .{sandbox});
+    defer alloc.free(consumer_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "consumer_bug3.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r = @import("out/root.zig");
+            \\const other = @import("out/other.zig");
+            \\
+            \\test "export import Foo = Bar.Baz preserves full nested path and nominal identity" {
+            \\    try std.testing.expect(r.Foo == other.Bar.Baz);
+            \\    try std.testing.expect(r.Leaf == other.Bar.Deep.Leaf);
+            \\    try std.testing.expect(&r.computeLeaf == &other.Bar.Deep.compute);
+            \\    try std.testing.expect(r.LocalInner == r.LocalNs.Inner);
+            \\
+            \\    const consume_fn: *const fn (other.Bar.Baz, other.Bar.Deep.Leaf, r.LocalNs.Inner) other.Bar.Baz = &r.consume;
+            \\    _ = consume_fn;
+            \\}
+            ,
+        });
+    }
+
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
+}
