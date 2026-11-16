@@ -21,6 +21,7 @@ describe('Bun Native JsValue Handle Registry & zigar.js.Ref(T) Integration', fun
   this.timeout(300000);
 
   const sampleURL = new URL('../../node-zigar/test/zig-samples/js-value/handles.zig', import.meta.url).href;
+  const relayURL = new URL('../../node-zigar/test/zig-samples/js-value/relay.zig', import.meta.url).href;
   const samplePath = fileURLToPath(sampleURL);
   const workerScriptURL = new URL('./js-value-worker.mjs', import.meta.url);
   const workerScriptPath = fileURLToPath(workerScriptURL);
@@ -128,6 +129,27 @@ describe('Bun Native JsValue Handle Registry & zigar.js.Ref(T) Integration', fun
       /Invalid or released JS value handle/,
     );
     expect(Number(mod.activeCount())).to.equal(0);
+  });
+
+  it('should restore active ModuleHost across M1 -> N -> M2 re-entrancy when M1 and M2 share the same .so', async function() {
+    global.__test_options = { optimize: 'ReleaseSafe', recompile: false, quiet: true };
+    const mod2 = await import(`${sampleURL}?quiet=1`);
+    global.__test_options = { optimize: 'ReleaseSafe', recompile: false, quiet: true };
+    const relayMod = await import(relayURL);
+
+    const m1Fn = () => 'bun-m1';
+    const m2Obj = new CustomWidget('bun-m2');
+    let m2Seen = null;
+    const outerType = mod.checkTypeAfterCallback(m1Fn, () => {
+      relayMod.relay(() => {
+        m2Seen = mod2.identityObject(m2Obj);
+      });
+    });
+    expect(m2Seen).to.equal(m2Obj);
+    expect(String(outerType)).to.equal('function');
+    expect(Number(mod.activeCount())).to.equal(0);
+    expect(Number(mod2.activeCount())).to.equal(0);
+    expect(Number(relayMod.activeCount())).to.equal(0);
   });
 
   it('should fail fast on Zig background threads and isolate handles across Bun Workers', async function() {

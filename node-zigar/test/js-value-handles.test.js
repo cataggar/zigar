@@ -23,6 +23,7 @@ describe('Native JsValue Handle Registry & zigar.js.Ref(T) Integration', functio
   this.timeout(300000);
 
   const sampleURL = new URL('./zig-samples/js-value/handles.zig?optimize=ReleaseSafe&quiet=1', import.meta.url);
+  const relayURL = new URL('./zig-samples/js-value/relay.zig?optimize=ReleaseSafe&recompile=0&quiet=1', import.meta.url);
   const debugSampleURL = new URL('./zig-samples/js-value/handles.zig?optimize=Debug&quiet=1', import.meta.url);
   const loaderPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
   const cjsEntryPath = fileURLToPath(new URL('../dist/index.cjs', import.meta.url));
@@ -476,6 +477,69 @@ describe('Native JsValue Handle Registry & zigar.js.Ref(T) Integration', functio
       { env: { ...process.env, DISABLE_EXTERNAL_BUFFER: '1' } },
     );
     expect(stdout).to.contain('FALLBACK_OK');
+  });
+
+  it('should restore active ModuleHost across M1 -> N -> M2 re-entrancy when M1 and M2 share the same .so', async function() {
+    const require = createRequire(import.meta.url);
+    require(cjsEntryPath);
+    // M1 (`mod`) and M2 (`cjsMod`) are distinct Environments sharing the exact same dlopen'd `handles.so` Module,
+    // while `relayMod` (`N`) is a separate native `.so` Module sitting between them on the call stack.
+    const cjsMod = require(`${sampleFilePath}?optimize=ReleaseSafe&recompile=0&quiet=1`);
+    const relayMod = await import(relayURL.href);
+
+    // Sanity check: M1 and M2 have distinct realm tags (distinct environments)
+    const m1Fn = () => 'm1-outer';
+    const m2Obj = new CustomWidget('m2-inner');
+    const m1Realm = (mod.inspectRawHandle(m1Fn) >>> 14) & 0x3F;
+    const m2Realm = (cjsMod.inspectRawHandle(m2Obj) >>> 14) & 0x3F;
+    expect(m1Realm).to.not.equal(m2Realm);
+
+    // 1. 3-step interleaving: M1.checkTypeAfterCallback -> N.relay -> M2.identityObject
+    let m2Seen = null;
+    const outerType = mod.checkTypeAfterCallback(m1Fn, () => {
+      relayMod.relay(() => {
+        m2Seen = cjsMod.identityObject(m2Obj);
+      });
+    });
+    expect(m2Seen).to.equal(m2Obj);
+    expect(String(outerType)).to.equal('function');
+    expect(Number(mod.activeCount())).to.equal(0);
+    expect(Number(cjsMod.activeCount())).to.equal(0);
+    expect(Number(relayMod.activeCount())).to.equal(0);
+
+    // 2. 4-step interleaving with active Ref handles in M1, N, and M2 simultaneously:
+    //    M1.callWithBorrowedRef -> N.relayWithRef -> M2.callWithBorrowedRef -> M1.identityObject
+    const m1Obj = new CustomWidget('m1-borrowed');
+    const nObj = { relayPayload: 99 };
+    const finalResult = mod.callWithBorrowedRef(m1Obj, (m1Borrowed) => {
+      expect(m1Borrowed).to.equal(m1Obj);
+      return relayMod.relayWithRef(nObj, (nBorrowed) => {
+        expect(nBorrowed).to.equal(nObj);
+        return cjsMod.callWithBorrowedRef(m2Obj, (m2Borrowed) => {
+          expect(m2Borrowed).to.equal(m2Obj);
+          return mod.identityObject(m1Borrowed);
+        });
+      });
+    });
+    expect(finalResult).to.equal(m1Obj);
+    expect(Number(mod.activeCount())).to.equal(0);
+    expect(Number(cjsMod.activeCount())).to.equal(0);
+    expect(Number(relayMod.activeCount())).to.equal(0);
+
+    // 3. Loading a third Environment M3 sharing `handles.so` mid-callback (without invoking M3 thunks)
+    const sym = Symbol('mid-thunk-load');
+    const cjsSpecM3 = `${sampleFilePath}?optimize=ReleaseSafe&recompile=0&quiet=true`;
+    let m3Mod = null;
+    const symType = mod.checkTypeAfterCallback(sym, () => {
+      relayMod.relay(() => {
+        m3Mod = require(cjsSpecM3);
+      });
+    });
+    expect(m3Mod.activeCount).to.be.a('function');
+    expect(String(symType)).to.equal('symbol');
+    expect(Number(mod.activeCount())).to.equal(0);
+    expect(Number(m3Mod.activeCount())).to.equal(0);
+    expect(Number(relayMod.activeCount())).to.equal(0);
   });
 
   it('should fail fast on Zig background threads (error.OffJsThread for try* and @panic for infallible methods)', async function() {

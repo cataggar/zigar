@@ -168,7 +168,13 @@ const ModuleHost = struct {
     pub threadlocal var trapping_syscalls: bool = false;
     pub threadlocal var main_thread_syscall_trap_count: usize = 0;
     pub threadlocal var in_main_thread: bool = false;
-    threadlocal var active_thunk_host: ?*@This() = null;
+
+    const ActiveThunkFrame = struct {
+        host: *ModuleHost,
+        module: *Module,
+        prev: ?*const ActiveThunkFrame,
+    };
+    threadlocal var active_thunk_frame: ?*const ActiveThunkFrame = null;
 
     var next_realm_tag: std.atomic.Value(u32) = .init(0);
 
@@ -403,7 +409,9 @@ const ModuleHost = struct {
                 },
             }
         };
-        _ = module.exports.set_host_instance(@ptrCast(self));
+        var load_frame: ActiveThunkFrame = undefined;
+        self.enterModuleHost(module, &load_frame);
+        defer restoreModuleHost(&load_frame);
         try self.exportFunctionsToModule();
         if (env.getValueBool(redirectingIO) catch true) {
             // hooks are installed even when io redirection is disabled, because they're needed for
@@ -595,11 +603,23 @@ const ModuleHost = struct {
         return try env.createUsize(thunk_address);
     }
 
-    fn restoreModuleHost(prev_host: ?*@This(), current_module: *Module) void {
-        active_thunk_host = prev_host;
-        if (prev_host) |prev| {
-            if (prev.module == current_module) {
-                _ = current_module.exports.set_host_instance(@ptrCast(prev));
+    fn enterModuleHost(self: *@This(), module: *Module, frame: *ActiveThunkFrame) void {
+        frame.* = .{
+            .host = self,
+            .module = module,
+            .prev = active_thunk_frame,
+        };
+        active_thunk_frame = frame;
+        _ = module.exports.set_host_instance(@ptrCast(self));
+    }
+
+    fn restoreModuleHost(frame: *const ActiveThunkFrame) void {
+        active_thunk_frame = frame.prev;
+        var it = frame.prev;
+        while (it) |enclosing| : (it = enclosing.prev) {
+            if (enclosing.module == frame.module) {
+                _ = frame.module.exports.set_host_instance(@ptrCast(enclosing.host));
+                break;
             }
         }
     }
@@ -612,10 +632,9 @@ const ModuleHost = struct {
     ) !Value {
         const env = self.env;
         const module = self.module orelse return error.NoLoadedModule;
-        const prev_host = active_thunk_host;
-        active_thunk_host = self;
-        _ = module.exports.set_host_instance(@ptrCast(self));
-        defer restoreModuleHost(prev_host, module);
+        var thunk_frame: ActiveThunkFrame = undefined;
+        self.enterModuleHost(module, &thunk_frame);
+        defer restoreModuleHost(&thunk_frame);
         const result = module.exports.run_thunk(
             try env.getValueUsize(thunk_address),
             try env.getValueUsize(fn_address),
@@ -634,10 +653,9 @@ const ModuleHost = struct {
     ) !Value {
         const env = self.env;
         const module = self.module orelse return error.NoLoadedModule;
-        const prev_host = active_thunk_host;
-        active_thunk_host = self;
-        _ = module.exports.set_host_instance(@ptrCast(self));
-        defer restoreModuleHost(prev_host, module);
+        var thunk_frame: ActiveThunkFrame = undefined;
+        self.enterModuleHost(module, &thunk_frame);
+        defer restoreModuleHost(&thunk_frame);
         const result = module.exports.run_variadic_thunk(
             try env.getValueUsize(thunk_address),
             try env.getValueUsize(fn_address),
@@ -652,10 +670,9 @@ const ModuleHost = struct {
         const env = self.env;
         var thunk_address: usize = 0;
         const module = self.module orelse return error.NoLoadedModule;
-        const prev_host = active_thunk_host;
-        active_thunk_host = self;
-        _ = module.exports.set_host_instance(@ptrCast(self));
-        defer restoreModuleHost(prev_host, module);
+        var thunk_frame: ActiveThunkFrame = undefined;
+        self.enterModuleHost(module, &thunk_frame);
+        defer restoreModuleHost(&thunk_frame);
         _ = module.exports.create_js_thunk(
             try env.getValueUsize(controller_address),
             try env.getValueUint32(fn_id),
@@ -668,10 +685,9 @@ const ModuleHost = struct {
         const env = self.env;
         var fn_id: usize = 0;
         const module = self.module orelse return error.NoLoadedModule;
-        const prev_host = active_thunk_host;
-        active_thunk_host = self;
-        _ = module.exports.set_host_instance(@ptrCast(self));
-        defer restoreModuleHost(prev_host, module);
+        var thunk_frame: ActiveThunkFrame = undefined;
+        self.enterModuleHost(module, &thunk_frame);
+        defer restoreModuleHost(&thunk_frame);
         _ = module.exports.destroy_js_thunk(
             try env.getValueUsize(controller_address),
             try env.getValueUsize(fn_address),

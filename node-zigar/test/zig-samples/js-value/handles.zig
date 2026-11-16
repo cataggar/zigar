@@ -239,6 +239,15 @@ pub fn callWithBorrowedRef(
     return out;
 }
 
+pub fn checkTypeAfterCallback(
+    val: Ref(js.Any),
+    cb: *const fn () void,
+) js.JsType {
+    defer val.deinit();
+    cb();
+    return val.typeof();
+}
+
 pub fn callWithBorrowedComposites(
     first: Ref(js.Any),
     second: Ref(js.Any),
