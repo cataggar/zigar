@@ -352,5 +352,132 @@ describe('Code generation', function() {
       expect(nativeCode).to.not.contain('features/js-value-registry.js');
       expect(nativeCode).to.not.contain('structures/js-value.js');
     })
+    it('should emit deduplicated static ESM imports, CJS requires, and dynamicJsImports preload options', function() {
+      const rootStructure = {
+        constructor: null,
+        type: StructureType.Struct,
+        name: 'RootMod',
+        byteSize: 0,
+        hasPointer: false,
+        instance: { members: [], methods: [], template: null },
+        static: { members: [], methods: [], template: null },
+      };
+      const def = {
+        structures: [ rootStructure ],
+        settings: { ...settings, hasJsHostOps: true },
+        jsModules: [ 'node:path', './local.mjs', 'node:path', 'virtual:skip-me' ],
+      };
+
+      const { code: esmCode, jsModules } = generateCode(def, {
+        declareFeatures: true,
+        runtimeURL: 'zigar-runtime',
+        binarySource: '"/mod.wasm"',
+        moduleOptions: { multithreaded: false },
+      });
+      expect(jsModules).to.deep.equal([ 'node:path', './local.mjs', 'virtual:skip-me' ]);
+      expect(esmCode).to.contain('import * as __zigar_js_mod_0 from "node:path";');
+      expect(esmCode).to.contain('import * as __zigar_js_mod_1 from "./local.mjs";');
+      expect(esmCode).to.not.contain('from "virtual:skip-me"');
+      expect(esmCode).to.contain('if (typeof import.meta?.url === \'string\') env.moduleBaseURL = import.meta.url;');
+      expect(esmCode).to.contain('env.registerJsModules({');
+      expect(esmCode).to.contain('"node:path": __zigar_js_mod_0,');
+      expect(esmCode).to.contain('"./local.mjs": __zigar_js_mod_1,');
+      expect(esmCode.indexOf('env.registerJsModules(')).to.be.below(esmCode.indexOf('env.loadModule('));
+
+      const { code: cjsCode } = generateCode(def, {
+        declareFeatures: true,
+        runtimeURL: 'zigar-runtime',
+        binarySource: '"/mod.wasm"',
+        moduleOptions: { multithreaded: false },
+        moduleFormat: 'cjs',
+        topLevelAwait: false,
+      });
+      expect(cjsCode).to.contain('const { createEnvironment } = require("zigar-runtime");');
+      expect(cjsCode).to.contain('if (typeof __filename === \'string\') env.moduleBaseURL = __filename;');
+      expect(cjsCode).to.contain('const __zigar_js_mod_0 = require("node:path");');
+      expect(cjsCode).to.contain('const __zigar_js_mod_1 = require("./local.mjs");');
+      expect(cjsCode).to.contain('module.exports = {');
+
+      const { code: dynCode } = generateCode(def, {
+        declareFeatures: true,
+        runtimeURL: 'zigar-runtime',
+        binarySource: '"/mod.wasm"',
+        moduleOptions: { multithreaded: false },
+        dynamicJsImports: true,
+      });
+      expect(dynCode).to.not.contain('import * as __zigar_js_mod_');
+      expect(dynCode).to.contain('if (typeof import.meta?.url === \'string\') env.moduleBaseURL = import.meta.url;');
+      expect(dynCode).to.contain('env.registerJsModuleLoaders({');
+      expect(dynCode).to.contain('"node:path": () => import("node:path"),');
+      expect(dynCode).to.contain('"./local.mjs": () => import("./local.mjs"),');
+      expect(dynCode).to.contain('"preloadJsModules":["node:path","./local.mjs"]');
+      expect(dynCode.indexOf('env.registerJsModuleLoaders(')).to.be.below(dynCode.indexOf('env.loadModule('));
+    })
+    it('should safely escape malicious JS module specifiers via JSON.stringify to prevent code injection', function() {
+      const rootStructure = {
+        constructor: null,
+        type: StructureType.Struct,
+        name: 'SecRoot',
+        byteSize: 0,
+        hasPointer: false,
+        instance: { members: [], methods: [], template: null },
+        static: { members: [], methods: [], template: null },
+      };
+      const lineSep = String.fromCharCode(0x2028) + String.fromCharCode(0x2029);
+      const maliciousSpecifiers = [
+        `pkg'; globalThis.__INJECTED_SINGLE__ = 1; //`,
+        `pkg"; globalThis.__INJECTED_DOUBLE__ = 1; //`,
+        'pkg\n; globalThis.__INJECTED_NEWLINE__ = 1;\r//\\backslash',
+        'pkg` + (globalThis.__INJECTED_TEMPLATE__ = 1) + `' + lineSep,
+      ];
+      const def = {
+        structures: [ rootStructure ],
+        settings: { ...settings, hasJsHostOps: true },
+        jsModules: maliciousSpecifiers,
+      };
+
+      const { code: esmCode } = generateCode(def, {
+        declareFeatures: true,
+        runtimeURL: 'zigar-runtime',
+        binarySource: null,
+      });
+      const { code: cjsCode } = generateCode(def, {
+        declareFeatures: false,
+        runtimeURL: 'zigar-runtime',
+        binarySource: null,
+        moduleFormat: 'cjs',
+      });
+      const { code: dynEsmCode } = generateCode(def, {
+        declareFeatures: true,
+        runtimeURL: 'zigar-runtime',
+        binarySource: '"/mod.wasm"',
+        moduleOptions: { multithreaded: false },
+        dynamicJsImports: true,
+      });
+
+      for (const spec of maliciousSpecifiers) {
+        const expectedEscaped = JSON.stringify(spec)
+          .replaceAll(String.fromCharCode(0x2028), '\\u2028')
+          .replaceAll(String.fromCharCode(0x2029), '\\u2029');
+        expect(esmCode).to.contain('import * as __zigar_js_mod_');
+        expect(esmCode).to.contain(`from ${expectedEscaped};`);
+        expect(esmCode).to.contain(`${expectedEscaped}: __zigar_js_mod_`);
+        expect(cjsCode).to.contain(`require(${expectedEscaped});`);
+        expect(dynEsmCode).to.contain(`${expectedEscaped}: () => import(${expectedEscaped}),`);
+      }
+
+      for (const line of [ ...esmCode.split('\n'), ...cjsCode.split('\n'), ...dynEsmCode.split('\n') ]) {
+        const trimmed = line.trim();
+        expect(trimmed.startsWith('globalThis.__INJECTED_')).to.be.false;
+        expect(trimmed).to.not.match(/;\s*globalThis\.__INJECTED_[A-Z_]+\s*=\s*1\s*;\s*$/);
+      }
+
+      const checkSyntax = new Function('require', 'module', '__filename', cjsCode);
+      expect(checkSyntax).to.be.a('function');
+      expect(globalThis.__INJECTED_SINGLE__).to.be.undefined;
+      expect(globalThis.__INJECTED_DOUBLE__).to.be.undefined;
+      expect(globalThis.__INJECTED_NEWLINE__).to.be.undefined;
+      expect(globalThis.__INJECTED_TEMPLATE__).to.be.undefined;
+    })
   })
 })

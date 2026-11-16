@@ -42,7 +42,9 @@ export function stripUnused(binary, options = {}) {
     /^getModuleAttributes$/,
     /^export(?:er)?\.getFactoryThunk/,
     /^__zigar_js_reg_/,
+    /^__zigar_js_mod_/,
     /\.registerTypeExport$/,
+    /\.registerModuleExport$/,
   ];
 
   function getSection(type) {

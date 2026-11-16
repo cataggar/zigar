@@ -258,6 +258,10 @@ pub fn registerType(comptime T: type) void {
     exporter.registerType(@This(), T);
 }
 
+pub fn registerJsModule(prefixed_key: []const u8) void {
+    setStructure(prefixed_key, null) catch {};
+}
+
 pub fn invokeJsHostOp(descriptor_ptr: *const anyopaque, arg_ptr: *anyopaque, arg_size: usize) E {
     if (!isJsThread()) return .PERM;
     return _invokeJsHostOp(descriptor_ptr, arg_ptr, arg_size);

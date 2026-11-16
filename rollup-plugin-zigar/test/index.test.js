@@ -1,11 +1,12 @@
+import CommonJS from '@rollup/plugin-commonjs';
 import NodeResolve from '@rollup/plugin-node-resolve';
 import { expect } from 'chai';
 import { readFile } from 'fs/promises';
 import 'mocha-skip-if';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { dirname, join, relative, resolve } from 'path';
 import { rollup } from 'rollup';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { createServer } from 'vite';
 import Zigar from '../dist/index.js';
 
@@ -92,6 +93,226 @@ describe('Loader', function() {
       expect(wasmBlob).to.be.a('blob');
       expect(wasmBlob.size).to.be.at.least(100000);
       server.close();
+    })
+  })
+
+  describe('ES Module Imports & Comptime Tree-Shaking', function() {
+    const treeshakeZig = absolute('../../zigar-compiler/test/zig-samples/js-value/module-imports/treeshake-app.zig');
+    const parityZig = absolute('../../zigar-compiler/test/zig-samples/js-value/module-imports/module-parity.zig');
+
+    it('should tree-shake 49 unreferenced js.Module declarations and emit only node:path in Rollup bundle', async function() {
+      const outDir = join(tmpdir(), 'rollup-esmod-treeshake');
+      const jsPath = join(outDir, 'treeshake-bundle.mjs');
+      const bundle = await rollup({
+        input: treeshakeZig,
+        external: (id) => id.startsWith('node:'),
+        plugins: [
+          Zigar({ embedWASM: true, optimize: 'ReleaseSmall' }),
+          NodeResolve({
+            modulePaths: [ absolute(`../node_modules`) ],
+          }),
+        ],
+      });
+      try {
+        await bundle.write({ file: jsPath, format: 'esm' });
+      } finally {
+        await bundle.close();
+      }
+      const code = await readFile(jsPath, 'utf-8');
+      expect(code).to.match(/import\s+\*\s+as\s+\w+\s+from\s+['"]node:path['"]/);
+      for (let i = 1; i <= 49; i++) {
+        const pkg = `pkg-${String(i).padStart(2, '0')}`;
+        expect(code).to.not.include(pkg);
+      }
+      expect(code).to.not.include('unused-mod');
+      expect(code).to.not.include('unused-public-mod');
+      expect(code).to.not.include('unused-2');
+
+      const mod = await import(pathToFileURL(jsPath).href);
+      expect(mod.joinPaths('alpha', 'beta').string).to.equal('alpha/beta');
+      expect(Number(mod.activeHandles())).to.equal(0);
+    })
+
+    it('should statically bundle multi-export ESM and interoperate with CJS export = callable/class modules', async function() {
+      const outDir = join(tmpdir(), 'rollup-esmod-parity');
+      const jsPath = join(outDir, 'parity-bundle.mjs');
+      const bundle = await rollup({
+        input: parityZig,
+        external: (id) => id.startsWith('node:'),
+        plugins: [
+          {
+            name: 'external-cjs',
+            resolveId(source, importer) {
+              if (source.endsWith('.cjs') && importer) {
+                let rel = relative(outDir, resolve(dirname(importer), source)).replace(/\\/g, '/');
+                if (!rel.startsWith('.')) rel = './' + rel;
+                return { id: rel, external: true };
+              }
+              return null;
+            },
+          },
+          Zigar({ embedWASM: true, optimize: 'ReleaseSmall' }),
+          NodeResolve({
+            modulePaths: [ absolute(`../node_modules`) ],
+          }),
+        ],
+      });
+      try {
+        await bundle.write({
+          file: jsPath,
+          format: 'esm',
+        });
+      } finally {
+        await bundle.close();
+      }
+      const code = await readFile(jsPath, 'utf-8');
+      // ./esm-helper.mjs is bundled inline into the Rollup output (not left as an external import)
+      expect(code).to.not.match(/from\s+['"][^'"]*esm-helper\.mjs['"]/);
+      expect(code).to.include('esm-default:');
+      expect(code).to.not.include('unused-parity-mod');
+      for (let i = 1; i <= 49; i++) {
+        expect(code).to.not.include(`pkg-${String(i).padStart(2, '0')}`);
+      }
+
+      const mod = await import(pathToFileURL(jsPath).href);
+      expect(mod.exerciseNodeBuiltins().string).to.equal(
+        'item.zig|p/item.zig|https://example.org/docs/spec?v=2|file:',
+      );
+      expect(mod.exerciseLocalEsm('rollup').string).to.equal(
+        'v17=v17|zig<->esm|esm-default:rollup|esm-default:handle',
+      );
+      expect(mod.exerciseLocalCjsExportEquals(4, 23).string).to.equal(
+        '423|cjs-static-extra|cjs-static-extra:ok|708|cjs-ctor-tag|155',
+      );
+      expect(mod.exerciseNamespaceShadowMutation().string).to.equal(
+        '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
+      );
+      expect(mod.exerciseNamedCjs().string).to.equal(
+        '1|2=2|42->43|del=true:has=false:def_has=false|restored=1',
+      );
+      expect(mod.exerciseFalsyEsm().string).to.equal(
+        'z=0|b=false|null=true|undef=true|set_err=true:def=100:del=false',
+      );
+      expect(mod.exerciseEsmFacade().string).to.equal(
+        'has=true:v=2|set_err=true:named_has=false:del=false:after=2|extra=33=33:del=true:has=false',
+      );
+      expect(mod.exerciseFnCjs().string).to.equal(
+        '11:1|20->30|del=true:has=false|restored=11',
+      );
+      expect(mod.exerciseTsEsModuleCjs().string).to.equal(
+        'named=true:5|inner=true:9=9|added=true:1=1|del=true:has=false',
+      );
+      expect(Number(mod.activeHandles())).to.equal(0);
+
+      // Also verify Rollup multi-chunk code splitting with dynamicJsImports: true!
+      const dynChunkDir = join(tmpdir(), 'rollup-esmod-dyn-chunks');
+      const dynBundle = await rollup({
+        input: parityZig,
+        external: (id) => id.startsWith('node:'),
+        plugins: [
+          {
+            name: 'external-cjs',
+            resolveId(source, importer) {
+              if (source.endsWith('.cjs') && importer) {
+                let rel = relative(dynChunkDir, resolve(dirname(importer), source)).replace(/\\/g, '/');
+                if (!rel.startsWith('.')) rel = './' + rel;
+                return { id: rel, external: true };
+              }
+              return null;
+            },
+          },
+          Zigar({ embedWASM: true, optimize: 'ReleaseSmall', dynamicJsImports: true }),
+          NodeResolve({
+            modulePaths: [ absolute(`../node_modules`) ],
+          }),
+        ],
+      });
+      try {
+        await dynBundle.write({
+          dir: dynChunkDir,
+          entryFileNames: 'entry.mjs',
+          format: 'esm',
+        });
+      } finally {
+        await dynBundle.close();
+      }
+      const dynEntryMod = await import(pathToFileURL(join(dynChunkDir, 'entry.mjs')).href);
+      expect(dynEntryMod.exerciseNamespaceShadowMutation().string).to.equal(
+        '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
+      );
+      expect(dynEntryMod.exerciseNamedCjs().string).to.equal(
+        '1|2=2|42->43|del=true:has=false:def_has=false|restored=1',
+      );
+      expect(dynEntryMod.exerciseFalsyEsm().string).to.equal(
+        'z=0|b=false|null=true|undef=true|set_err=true:def=100:del=false',
+      );
+      expect(dynEntryMod.exerciseEsmFacade().string).to.equal(
+        'has=true:v=2|set_err=true:named_has=false:del=false:after=2|extra=33=33:del=true:has=false',
+      );
+      expect(dynEntryMod.exerciseFnCjs().string).to.equal(
+        '11:1|20->30|del=true:has=false|restored=11',
+      );
+      expect(dynEntryMod.exerciseTsEsModuleCjs().string).to.equal(
+        'named=true:5|inner=true:9=9|added=true:1=1|del=true:has=false',
+      );
+      expect(Number(dynEntryMod.activeHandles())).to.equal(0);
+    })
+
+    it('should bundle named.cjs, fn.cjs, ts.cjs, and facade.mjs in-bundle with @rollup/plugin-commonjs without marking .cjs external', async function() {
+      const outDir = join(tmpdir(), 'rollup-commonjs-inbundle');
+      const jsPath = join(outDir, 'parity-cjs-inbundle.mjs');
+      const bundle = await rollup({
+        input: parityZig,
+        external: (id) => id.startsWith('node:'),
+        plugins: [
+          Zigar({ embedWASM: true, optimize: 'ReleaseSmall' }),
+          CommonJS(),
+          NodeResolve({
+            modulePaths: [ absolute(`../node_modules`) ],
+          }),
+        ],
+      });
+      try {
+        await bundle.write({
+          file: jsPath,
+          format: 'esm',
+        });
+      } finally {
+        await bundle.close();
+      }
+      const code = await readFile(jsPath, 'utf-8');
+      expect(code).to.include('_mergeNamespaces');
+      expect(code).to.not.match(/from\s+['"][^'"]*\.cjs['"]/);
+
+      const mod = await import(pathToFileURL(jsPath).href);
+      expect(mod.exerciseNodeBuiltins().string).to.equal(
+        'item.zig|p/item.zig|https://example.org/docs/spec?v=2|file:',
+      );
+      expect(mod.exerciseLocalEsm('rollup-cjs').string).to.equal(
+        'v17=v17|zig<->esm|esm-default:rollup-cjs|esm-default:handle',
+      );
+      expect(mod.exerciseLocalCjsExportEquals(4, 23).string).to.equal(
+        '423|cjs-static-extra|cjs-static-extra:ok|708|cjs-ctor-tag|155',
+      );
+      expect(mod.exerciseNamespaceShadowMutation().string).to.equal(
+        '1:100|set_err|1:100|del=false:has=true:def=100|only=77=77|del_only=true:has_only=false',
+      );
+      expect(mod.exerciseNamedCjs().string).to.equal(
+        '1|2=2|42->43|del=true:has=false:def_has=false|restored=1',
+      );
+      expect(mod.exerciseFalsyEsm().string).to.equal(
+        'z=0|b=false|null=true|undef=true|set_err=true:def=100:del=false',
+      );
+      expect(mod.exerciseEsmFacade().string).to.equal(
+        'has=true:v=2|set_err=true:named_has=false:del=false:after=2|extra=33=33:del=true:has=false',
+      );
+      expect(mod.exerciseFnCjs().string).to.equal(
+        '11:1|20->30|del=true:has=false|restored=11',
+      );
+      expect(mod.exerciseTsEsModuleCjs().string).to.equal(
+        'named=true:5|inner=true:9=9|added=true:1=1|del=true:has=false',
+      );
+      expect(Number(mod.activeHandles())).to.equal(0);
     })
   })
 })

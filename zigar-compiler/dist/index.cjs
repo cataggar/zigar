@@ -351,7 +351,7 @@ async function copyZonFile(srcPath, dstPath) {
 }
 
 function generateCode(definition, params) {
-  const { structures } = definition;
+  const { structures, jsModules = [] } = definition;
   const {
     declareFeatures = false,
     runtimeURL,
@@ -362,10 +362,47 @@ function generateCode(definition, params) {
     moduleOptions,
     envVariables = {},
     standaloneLoader,
+    moduleFormat,
+    dynamicJsImports = false,
+    jsModuleResolver,
+    moduleBaseURL,
   } = params;
   const exports = getExports(structures);
   const lines = [];
-  const type = standaloneLoader?.type ?? 'esm';
+  const type = standaloneLoader?.type ?? moduleFormat ?? 'esm';
+  const uniqueJsModules = [];
+  const seenJsModules = new Set();
+  for (const rawSpec of jsModules) {
+    const spec = String(rawSpec);
+    if (spec && !seenJsModules.has(spec)) {
+      seenJsModules.add(spec);
+      uniqueJsModules.push(spec);
+    }
+  }
+  const staticJsImports = [];
+  const dynamicJsModuleEntries = [];
+  const preloadJsModules = [];
+  for (const spec of uniqueJsModules) {
+    let importSpec;
+    if (typeof(jsModuleResolver) === 'function') {
+      importSpec = jsModuleResolver(spec);
+    } else if (spec.startsWith('virtual:') || spec.startsWith('\0')) {
+      importSpec = null;
+    } else {
+      importSpec = spec;
+    }
+    if (dynamicJsImports) {
+      if (typeof(importSpec) === 'string' && importSpec.length > 0) {
+        dynamicJsModuleEntries.push({ specifier: spec, importSpecifier: importSpec });
+        preloadJsModules.push(spec);
+      }
+      continue;
+    }
+    if (typeof(importSpec) === 'string' && importSpec.length > 0) {
+      const ident = `__zigar_js_mod_${staticJsImports.length}`;
+      staticJsImports.push({ specifier: spec, importSpecifier: importSpec, ident });
+    }
+  }
   const add = manageIndentation(lines);
   if (standaloneLoader) {
     const { addonDir } = standaloneLoader;
@@ -387,39 +424,81 @@ function generateCode(definition, params) {
     add(`const ext = getLibraryExt(platform);`);
     add(`const moduleName = \`\${platform}.\${arch}.\${ext}\`;`);
     add(`const addonName = \`\${platform}.\${arch}.node\`;`);
-    add(`const { createEnvironment } = require(resolve(__dirname, ${JSON.stringify(addonDir)}, addonName));`);
+    add(`const { createEnvironment } = require(resolve(__dirname, ${escapeJsString(addonDir)}, addonName));`);
+  } else if (type === 'cjs') {
+    add(`const { createEnvironment } = require(${escapeJsString(runtimeURL)});`);
   } else {
-    // loading through node-zigar/bun-zigar
-    add(`import { createEnvironment } from ${JSON.stringify(runtimeURL)};`);
+    // loading through node-zigar/bun-zigar or WASM ESM
+    add(`import { createEnvironment } from ${escapeJsString(runtimeURL)};`);
   }
   const effectiveMixinPaths = [ ...mixinPaths ];
   if (declareFeatures && !standaloneLoader && runtimeURL) {
-    if (structures.some(s => s.purpose === StructurePurpose.JsValue) || definition.settings?.hasJsHostOps) {
+    if (structures.some(s => s.purpose === StructurePurpose.JsValue) || definition.settings?.hasJsHostOps || uniqueJsModules.length > 0) {
       for (const reqPath of [ 'features/js-value-registry.js', 'structures/js-value.js' ]) {
         if (!effectiveMixinPaths.includes(reqPath)) {
           effectiveMixinPaths.push(reqPath);
         }
       }
     }
-    if (definition.settings?.hasJsHostOps && !effectiveMixinPaths.includes('features/js-host-op.js')) {
+    if ((definition.settings?.hasJsHostOps || uniqueJsModules.length > 0) && !effectiveMixinPaths.includes('features/js-host-op.js')) {
       effectiveMixinPaths.push('features/js-host-op.js');
     }
   }
   for (const mixinPath of effectiveMixinPaths) {
-    add(`import '${runtimeURL}/${mixinPath}';`);
+    if (type === 'cjs') {
+      add(`require(${escapeJsString(`${runtimeURL}/${mixinPath}`)});`);
+    } else {
+      add(`import '${runtimeURL}/${mixinPath}';`);
+    }
+  }
+  for (const { importSpecifier, ident } of staticJsImports) {
+    if (type === 'cjs') {
+      add(`const ${ident} = require(${escapeJsString(importSpecifier)});`);
+    } else {
+      add(`import * as ${ident} from ${escapeJsString(importSpecifier)};`);
+    }
   }
   // write out the structures as object literals
   addStructureDefinitions(lines, definition, moduleOptions);
   if (Object.keys(envVariables).length > 0) {
     add(`\n// set environment variables`);
     for (const [ name, value ] of Object.entries(envVariables)) {
-      add(`process.env.${name} = ${JSON.stringify(value)};`);
+      add(`process.env.${name} = ${escapeJsString(value)};`);
     }
   }
   add(`\n// create runtime environment`);
   add(`const env = createEnvironment();`);
+  if (definition.settings?.hasJsHostOps || uniqueJsModules.length > 0) {
+    if (typeof(moduleBaseURL) === 'string' && moduleBaseURL.length > 0) {
+      add(`env.moduleBaseURL = ${escapeJsString(moduleBaseURL)};`);
+    } else if (type === 'cjs') {
+      add(`if (typeof __filename === 'string') env.moduleBaseURL = __filename;`);
+    } else {
+      add(`if (typeof import.meta?.url === 'string') env.moduleBaseURL = import.meta.url;`);
+    }
+  }
+  if (staticJsImports.length > 0) {
+    add(`env.registerJsModules({`);
+    for (const { specifier, ident } of staticJsImports) {
+      add(`${escapeJsString(specifier)}: ${ident},`);
+    }
+    add(`});`);
+  }
+  const inlineNativeDynamicAwait = Boolean(dynamicJsImports && dynamicJsModuleEntries.length > 0 && !moduleOptions && type === 'esm' && topLevelAwait);
+  if (dynamicJsImports && dynamicJsModuleEntries.length > 0 && !inlineNativeDynamicAwait) {
+    add(`env.registerJsModuleLoaders({`);
+    for (const { specifier, importSpecifier } of dynamicJsModuleEntries) {
+      add(`${escapeJsString(specifier)}: () => import(${escapeJsString(importSpecifier)}),`);
+    }
+    add(`});`);
+  }
   add(`\n// recreate structures`);
   add(`env.recreateStructures(structures, settings);`);
+  if (inlineNativeDynamicAwait) {
+    for (const { specifier, importSpecifier } of dynamicJsModuleEntries) {
+      add(`env.registerJsModule(${escapeJsString(specifier)}, await import(${escapeJsString(importSpecifier)}));`);
+    }
+  }
   if (binarySource) {
     if (moduleOptions) {
       add(`\n// initiate loading and compilation of WASM bytecodes`);
@@ -430,8 +509,9 @@ function generateCode(definition, params) {
     const loadOptions = (moduleOptions) ? {
       delay: !topLevelAwait,
       ...moduleOptions,
+      ...(preloadJsModules.length > 0 ? { preloadJsModules } : {}),
     } : null;
-    add(`env.loadModule(source, ${loadOptions ? JSON.stringify(loadOptions) : null});`);
+    add(`env.loadModule(source, ${loadOptions ? escapeJsonLiteral(loadOptions) : null});`);
     // if top level await is used, we don't need to write changes into Zig memory buffers
     add(`env.linkVariables(${!topLevelAwait});`);
   } else if (standaloneLoader?.moduleDir) {
@@ -483,7 +563,17 @@ function generateCode(definition, params) {
     add(`\n${getLibraryExt}`);
   }
   const code = lines.join('\n');
-  return { code, exports, structures };
+  return { code, exports, structures, jsModules: uniqueJsModules };
+}
+
+function escapeJsString(value) {
+  return escapeJsonLiteral(String(value));
+}
+
+function escapeJsonLiteral(value) {
+  return JSON.stringify(value)
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 }
 
 function addStructureDefinitions(lines, definition, moduleOptions) {
@@ -4728,6 +4818,15 @@ const optionsForTranspile = {
   useResizableBuffer: {
     type: 'boolean',
     title: 'Use resizable ArrayBuffer for WebAssembly memory',
+  },
+  moduleFormat: {
+    type: 'string',
+    enum: [ 'esm', 'cjs' ],
+    title: 'Output JavaScript module format',
+  },
+  dynamicJsImports: {
+    type: 'boolean',
+    title: 'Load referenced JS modules dynamically instead of emitting static imports',
   },
 };
 

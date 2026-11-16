@@ -579,6 +579,29 @@ pub fn isRedirecting(comptime literal: @TypeOf(.enum_literal)) bool {
     }
 }
 
+var js_module_head: ?*js.JsModuleNode = null;
+var js_module_tail: ?*js.JsModuleNode = null;
+
+pub fn registerJsModuleNode(node: *js.JsModuleNode) void {
+    if (!node.registered) {
+        node.registered = true;
+        node.next = null;
+        if (js_module_tail) |tail| {
+            tail.next = node;
+        } else {
+            js_module_head = node;
+        }
+        js_module_tail = node;
+    }
+}
+
+pub fn exportJsModules() !void {
+    var cur = js_module_head;
+    while (cur) |node| : (cur = node.next) {
+        try setStructure(node.key, null);
+    }
+}
+
 pub fn createModule(comptime module_ns: type) Module {
     const host = @This();
     const ns = struct {

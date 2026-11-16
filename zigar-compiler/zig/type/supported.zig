@@ -30,7 +30,7 @@ fn check(comptime T: type, comptime checking: anytype) bool {
             if (pt.child == C) break true;
         } else check(pt.child, checking),
         inline .array, .vector, .optional => |ar| check(ar.child, checking),
-        .@"struct" => T != std.Options,
+        .@"struct" => T != std.Options and !(@hasDecl(T, "is_js_module_descriptor") and @TypeOf(T.is_js_module_descriptor) == bool and T.is_js_module_descriptor),
         .@"fn" => |f| inline for (f.param_types) |param_type| {
             if (param_type == null) break false;
         } else inline for (.{1}) |_| {
@@ -43,9 +43,13 @@ fn check(comptime T: type, comptime checking: anytype) bool {
 }
 
 test "is" {
+    const DummyModDesc = struct {
+        pub const is_js_module_descriptor = true;
+    };
     try expectEqual(true, is(i32));
     try expectEqual(true, is(type));
     try expectEqual(false, is(std.Options));
+    try expectEqual(false, is(DummyModDesc));
     try expectEqual(false, is(fn (anytype) void));
     try expectEqual(false, is(*const fn (anytype) void));
     try expectEqual(false, is(*const fn () type));

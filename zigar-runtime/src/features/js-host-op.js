@@ -23,6 +23,7 @@ export const HostOpCode = {
 
 export const HostOpFlag = {
   DynamicKey: 1 << 0,
+  ModuleDefault: 1 << 1,
 };
 
 export default mixin({
@@ -31,6 +32,11 @@ export default mixin({
     this.jsKeyCache = new Map();
     this.jsKeyDecodeCount = 0;
     this.jsModuleCache = new Map();
+    this.jsModuleLoaders = new Map();
+    this.jsModuleNamespaces = new WeakSet();
+    this.jsCjsNamespaces = new WeakSet();
+    this.jsEsmNamespaces = new WeakSet();
+    this.moduleBaseURL = null;
     this.zigCallbackTemplateCache = new Map();
     this.zigCallbackMap = new Map();
     this.syncCallDepth = 0;
@@ -73,8 +79,146 @@ export default mixin({
     target.pendingHostError = undefined;
     return { error };
   },
+  trackJsModuleNamespace(moduleExports, specifier) {
+    if (moduleExports !== null && (typeof(moduleExports) === 'object' || typeof(moduleExports) === 'function')) {
+      this.jsModuleNamespaces.add(moduleExports);
+      if (isEsmExtension(specifier)) {
+        this.jsEsmNamespaces.add(moduleExports);
+        return;
+      }
+      if (
+        isSyntheticCjsNamespace(moduleExports, specifier)
+        || (
+          isEsModuleNamespaceObject(moduleExports)
+          && hasDefaultFallbackTarget(moduleExports.default)
+          && hasOnlyCjsMirroredExports(moduleExports)
+          && typeof(specifier) === 'string'
+          && Boolean(globalThis.Bun)
+          && this.isBunCjsModule(specifier, moduleExports)
+        )
+      ) {
+        this.jsCjsNamespaces.add(moduleExports);
+      }
+    }
+  },
+  isBunCjsModule(specifier, moduleExports) {
+    try {
+      const proc = globalThis.process;
+      const nodeModule = proc?.getBuiltinModule?.('node:module');
+      if (typeof(nodeModule?.createRequire) !== 'function') {
+        return false;
+      }
+      const fallbackBase = `${proc.cwd?.() ?? '/'}/_zigar_host_.js`;
+      const strippedBase = String(this.moduleBaseURL || fallbackBase)
+        .replace(/^zigar:/, '')
+        .split(/[?#]/)[0];
+      const usableBase = (strippedBase.includes('://') && !strippedBase.startsWith('file://'))
+        ? fallbackBase
+        : strippedBase;
+      const basePath = usableBase.endsWith('/') ? `${usableBase}_zigar_host_.js` : usableBase;
+      const req = nodeModule.createRequire(basePath);
+      const spec = specifier.startsWith('file://') ? new URL(specifier) : specifier;
+      const resolved = req.resolve(spec);
+      return req.cache?.[resolved]?.exports === moduleExports.default;
+    } catch {
+      return false;
+    }
+  },
+  isJsCjsNamespace(target) {
+    if (target === null || typeof(target) !== 'object') {
+      return false;
+    }
+    if (this.jsEsmNamespaces.has(target)) {
+      return false;
+    }
+    if (this.jsCjsNamespaces.has(target)) {
+      return true;
+    }
+    if (this.jsModuleNamespaces.has(target) && (isCjsWrappedNamespace(target) || isRollupMergedCjsNamespace(target))) {
+      this.jsCjsNamespaces.add(target);
+      return true;
+    }
+    return false;
+  },
+  unwrapCjsNamespace(target, propKey) {
+    if (!this.isJsCjsNamespace(target)) {
+      return target;
+    }
+    const cjsExports = target.default;
+    if ((propKey === 'default' || propKey === 'module.exports') && !(propKey in Object(cjsExports))) {
+      return target;
+    }
+    return cjsExports;
+  },
+  recoverRequiredEsmNamespace(spec, moduleExports) {
+    if (
+      moduleExports === null
+      || (typeof(moduleExports) !== 'object' && typeof(moduleExports) !== 'function')
+      || isEsModuleNamespaceObject(moduleExports)
+      || isFrozenNullProtoNamespace(moduleExports)
+      || spec.startsWith('node:')
+      || isCjsExtension(spec)
+    ) {
+      return moduleExports;
+    }
+    try {
+      const proc = globalThis.process;
+      const nodeModule = proc?.getBuiltinModule?.('node:module');
+      if (typeof(nodeModule?.createRequire) !== 'function') {
+        return moduleExports;
+      }
+      const fallbackBase = `${proc.cwd?.() ?? '/'}/_zigar_host_.js`;
+      const strippedBase = String(this.moduleBaseURL || fallbackBase)
+        .replace(/^zigar:/, '')
+        .split(/[?#]/)[0];
+      const usableBase = (strippedBase.includes('://') && !strippedBase.startsWith('file://'))
+        ? fallbackBase
+        : strippedBase;
+      const basePath = usableBase.endsWith('/') ? `${usableBase}_zigar_host_.js` : usableBase;
+      const req = nodeModule.createRequire(basePath);
+      const getEntryNamespace = (entry) => {
+        if (entry) {
+          for (const sym of Object.getOwnPropertySymbols(entry)) {
+            if (typeof(entry[sym]?.getNamespace) === 'function') {
+              return entry[sym].getNamespace();
+            }
+          }
+        }
+        return undefined;
+      };
+      try {
+        const specTarget = spec.startsWith('file://') ? new URL(spec) : spec;
+        const resolved = req.resolve(specTarget);
+        const ns = getEntryNamespace(req.cache?.[resolved]);
+        if (ns !== undefined) {
+          return ns;
+        }
+      } catch {
+        const cleanTail = spec.split(/[?#]/)[0].replace(/^(?:\.\/|\.\.\/)+/, '');
+        if (cleanTail && nodeModule._cache) {
+          for (const entry of Object.values(nodeModule._cache)) {
+            if (
+              entry?.exports === moduleExports
+              && typeof(entry.filename) === 'string'
+              && entry.filename.replace(/\\/g, '/').endsWith(`/${cleanTail}`)
+            ) {
+              const ns = getEntryNamespace(entry);
+              if (ns !== undefined) {
+                return ns;
+              }
+            }
+          }
+        }
+      }
+    } catch {}
+    return moduleExports;
+  },
   registerJsModule(specifier, moduleExports) {
-    this.jsModuleCache.set(String(specifier), moduleExports);
+    const spec = String(specifier);
+    const normalized = this.recoverRequiredEsmNamespace(spec, moduleExports);
+    this.jsModuleCache.set(spec, normalized);
+    this.trackJsModuleNamespace(normalized, spec);
+    return normalized;
   },
   registerJsModules(modules) {
     if (!modules || typeof(modules) !== 'object') {
@@ -82,7 +226,21 @@ export default mixin({
     }
     const entries = (modules instanceof Map) ? modules.entries() : Object.entries(modules);
     for (const [ specifier, moduleExports ] of entries) {
-      this.jsModuleCache.set(String(specifier), moduleExports);
+      this.registerJsModule(specifier, moduleExports);
+    }
+  },
+  registerJsModuleLoader(specifier, loader) {
+    if (typeof(loader) === 'function') {
+      this.jsModuleLoaders.set(String(specifier), loader);
+    }
+  },
+  registerJsModuleLoaders(loaders) {
+    if (!loaders || typeof(loaders) !== 'object') {
+      return;
+    }
+    const entries = (loaders instanceof Map) ? loaders.entries() : Object.entries(loaders);
+    for (const [ specifier, loader ] of entries) {
+      this.registerJsModuleLoader(specifier, loader);
     }
   },
   resolveJsModule(specifier) {
@@ -92,21 +250,43 @@ export default mixin({
     }
     const proc = globalThis.process;
     if (typeof(proc?.getBuiltinModule) === 'function') {
-      let mod = proc.getBuiltinModule(spec);
-      if (mod === undefined && !spec.includes(':') && !spec.startsWith('.') && !spec.startsWith('/')) {
-        mod = proc.getBuiltinModule(`node:${spec}`);
-      }
-      if (mod !== undefined) {
-        this.jsModuleCache.set(spec, mod);
-        return mod;
+      if (spec.startsWith('node:')) {
+        const builtin = proc.getBuiltinModule(spec);
+        if (builtin !== undefined) {
+          this.registerJsModule(spec, builtin);
+          return builtin;
+        }
       }
       const nodeModule = proc.getBuiltinModule('node:module');
       if (typeof(nodeModule?.createRequire) === 'function') {
-        const basePath = `${proc.cwd?.() ?? '/'}/_zigar_host_.js`;
-        const req = nodeModule.createRequire(basePath);
-        const loaded = req(spec);
-        this.jsModuleCache.set(spec, loaded);
-        return loaded;
+        const fallbackBase = `${proc.cwd?.() ?? '/'}/_zigar_host_.js`;
+        const strippedBase = String(this.moduleBaseURL || fallbackBase)
+          .replace(/^zigar:/, '')
+          .split(/[?#]/)[0];
+        const usableBase = (strippedBase.includes('://') && !strippedBase.startsWith('file://'))
+          ? fallbackBase
+          : strippedBase;
+        const basePath = usableBase.endsWith('/') ? `${usableBase}_zigar_host_.js` : usableBase;
+        try {
+          const req = nodeModule.createRequire(basePath);
+          const loaded = req(spec);
+          return this.registerJsModule(spec, loaded);
+        } catch (reqErr) {
+          if (!spec.includes(':') && !spec.startsWith('.') && !spec.startsWith('/')) {
+            const builtin = proc.getBuiltinModule(spec) ?? proc.getBuiltinModule(`node:${spec}`);
+            if (builtin !== undefined) {
+              this.registerJsModule(spec, builtin);
+              return builtin;
+            }
+          }
+          throw reqErr;
+        }
+      } else if (!spec.includes(':') && !spec.startsWith('.') && !spec.startsWith('/')) {
+        const builtin = proc.getBuiltinModule(spec) ?? proc.getBuiltinModule(`node:${spec}`);
+        if (builtin !== undefined) {
+          this.registerJsModule(spec, builtin);
+          return builtin;
+        }
       }
     }
     const err = new Error(`Cannot find JS module '${spec}'`);
@@ -341,7 +521,7 @@ export default mixin({
       const entry = this.getHostOpEntry(descriptorAddr);
       const byteLen = Number(argSize || entry.argByteSize);
       const dv = this.obtainZigView(argAddr, byteLen, false);
-      const { ArgStruct, extractors, op, dynamicKey, key, isErrorUnionReturn, writeSuccess, writeError } = entry;
+      const { ArgStruct, extractors, op, flags, dynamicKey, key, isErrorUnionReturn, writeSuccess, writeError } = entry;
       const argStruct = ArgStruct(dv);
       if (VISIT in argStruct) {
         argStruct[VISIT]('reset', VisitorFlag.IgnoreUncreated);
@@ -362,7 +542,8 @@ export default mixin({
         switch (op) {
           case HostOpCode.ImportModule: {
             const spec = dynamicKey ? jsArgs[0] : key;
-            result = this.resolveJsModule(spec);
+            const mod = this.resolveJsModule(spec);
+            result = (flags & HostOpFlag.ModuleDefault) ? unwrapModuleDefault(mod) : mod;
             break;
           }
           case HostOpCode.GetGlobal: {
@@ -371,33 +552,92 @@ export default mixin({
             break;
           }
           case HostOpCode.GetProp: {
-            const target = jsArgs[0];
+            const rawTarget = jsArgs[0];
             const propKey = dynamicKey ? jsArgs[1] : key;
-            result = target[propKey];
+            const isModuleRoot = this.jsModuleNamespaces.has(rawTarget);
+            const target = this.unwrapCjsNamespace(rawTarget, propKey);
+            if (
+              target !== null
+              && target !== undefined
+              && !(propKey in Object(target))
+              && isModuleRoot
+              && hasDefaultFallbackTarget(target.default)
+            ) {
+              result = target.default[propKey];
+            } else {
+              result = target[propKey];
+            }
             break;
           }
           case HostOpCode.SetProp: {
-            const target = jsArgs[0];
+            const rawTarget = jsArgs[0];
             const propKey = dynamicKey ? jsArgs[1] : key;
             const value = dynamicKey ? jsArgs[2] : jsArgs[1];
-            target[propKey] = value;
+            const isModuleRoot = this.jsModuleNamespaces.has(rawTarget);
+            const target = this.unwrapCjsNamespace(rawTarget, propKey);
+            if (
+              target !== null
+              && target !== undefined
+              && !(propKey in Object(target))
+              && isModuleRoot
+              && isModuleNamespaceLike(target)
+              && hasDefaultFallbackTarget(target.default)
+            ) {
+              target.default[propKey] = value;
+            } else {
+              target[propKey] = value;
+            }
             result = undefined;
             break;
           }
           case HostOpCode.DeleteProp: {
-            const target = jsArgs[0];
+            const rawTarget = jsArgs[0];
             const propKey = dynamicKey ? jsArgs[1] : key;
-            result = Reflect.deleteProperty(target, propKey);
+            const isModuleRoot = this.jsModuleNamespaces.has(rawTarget);
+            const target = this.unwrapCjsNamespace(rawTarget, propKey);
+            if (
+              target !== null
+              && target !== undefined
+              && !(propKey in Object(target))
+              && isModuleRoot
+              && isModuleNamespaceLike(target)
+              && hasDefaultFallbackTarget(target.default)
+            ) {
+              result = Reflect.deleteProperty(Object(target.default), propKey);
+            } else {
+              result = Reflect.deleteProperty(target, propKey);
+            }
             break;
           }
           case HostOpCode.HasProp: {
-            const target = jsArgs[0];
+            const rawTarget = jsArgs[0];
             const propKey = dynamicKey ? jsArgs[1] : key;
-            result = Reflect.has(target, propKey);
+            const isModuleRoot = this.jsModuleNamespaces.has(rawTarget);
+            const target = this.unwrapCjsNamespace(rawTarget, propKey);
+            let present = Reflect.has(target, propKey);
+            if (
+              !present
+              && isModuleRoot
+              && hasDefaultFallbackTarget(target.default)
+            ) {
+              present = Reflect.has(Object(target.default), propKey);
+            }
+            result = present;
             break;
           }
           case HostOpCode.CallFn: {
-            const callee = jsArgs[0];
+            const rawCallee = jsArgs[0];
+            const isModuleRoot = this.jsModuleNamespaces.has(rawCallee);
+            let callee = this.isJsCjsNamespace(rawCallee) ? rawCallee.default : rawCallee;
+            if (
+              typeof(callee) !== 'function'
+              && callee !== null
+              && callee !== undefined
+              && isModuleRoot
+              && typeof(callee.default) === 'function'
+            ) {
+              callee = callee.default;
+            }
             if (typeof(callee) !== 'function') {
               throw createNotCallableError('Target is not a function');
             }
@@ -405,13 +645,24 @@ export default mixin({
             break;
           }
           case HostOpCode.CallMethod: {
-            const receiver = jsArgs[0];
+            const rawTarget = jsArgs[0];
             const methodKey = dynamicKey ? jsArgs[1] : key;
             const callArgs = dynamicKey ? jsArgs.slice(2) : jsArgs.slice(1);
-            if (receiver === null || receiver === undefined) {
-              throw new TypeError(`Cannot read properties of ${receiver} (reading '${String(methodKey)}')`);
+            const isModuleRoot = this.jsModuleNamespaces.has(rawTarget);
+            const target = this.unwrapCjsNamespace(rawTarget, methodKey);
+            if (target === null || target === undefined) {
+              throw new TypeError(`Cannot read properties of ${target} (reading '${String(methodKey)}')`);
             }
-            const method = receiver[methodKey];
+            let receiver = target;
+            let method = target[methodKey];
+            if (isModuleRoot && hasDefaultFallbackTarget(target.default)) {
+              if (!(methodKey in Object(target))) {
+                receiver = target.default;
+                method = receiver[methodKey];
+              } else if (target.default[methodKey] === method) {
+                receiver = target.default;
+              }
+            }
             if (typeof(method) !== 'function') {
               throw createNotCallableError(`${String(methodKey)} is not a function`);
             }
@@ -419,7 +670,18 @@ export default mixin({
             break;
           }
           case HostOpCode.Construct: {
-            const ctor = jsArgs[0];
+            const rawCtor = jsArgs[0];
+            const isModuleRoot = this.jsModuleNamespaces.has(rawCtor);
+            let ctor = this.isJsCjsNamespace(rawCtor) ? rawCtor.default : rawCtor;
+            if (
+              typeof(ctor) !== 'function'
+              && ctor !== null
+              && ctor !== undefined
+              && isModuleRoot
+              && typeof(ctor.default) === 'function'
+            ) {
+              ctor = ctor.default;
+            }
             if (typeof(ctor) !== 'function') {
               throw createNotCallableError('Target is not a constructor');
             }
@@ -553,6 +815,45 @@ export default mixin({
   getActiveZigCallbackCount() {
     return this.zigCallbackMap.size;
   },
+  async preloadJsModules(specifiers = this.jsModules, baseURL = this.moduleBaseURL) {
+    if (baseURL && !this.moduleBaseURL) {
+      this.moduleBaseURL = baseURL;
+    }
+    if (!Array.isArray(specifiers) || specifiers.length === 0) {
+      return;
+    }
+    for (const rawSpec of specifiers) {
+      const spec = String(rawSpec);
+      if (!spec || this.jsModuleCache.has(spec) || spec.startsWith('virtual:') || spec.startsWith('\0')) {
+        continue;
+      }
+      const customLoader = this.jsModuleLoaders.get(spec);
+      try {
+        let loaded;
+        if (typeof(customLoader) === 'function') {
+          loaded = await customLoader();
+        } else {
+          let importTarget = spec;
+          const effectiveBase = baseURL ?? this.moduleBaseURL;
+          if ((spec.startsWith('./') || spec.startsWith('../')) && effectiveBase) {
+            const cleanBase = String(effectiveBase).replace(/^zigar:/, '').split(/[?#]/)[0];
+            const baseHref = cleanBase.includes('://')
+              ? cleanBase
+              : `file://${cleanBase.startsWith('/') ? '' : '/'}${cleanBase.replace(/\\/g, '/')}`;
+            importTarget = new URL(spec, baseHref).href;
+          }
+          loaded = await import(importTarget);
+        }
+        this.registerJsModule(spec, loaded);
+      } catch (importErr) {
+        try {
+          this.resolveJsModule(spec);
+        } catch {
+          throw importErr;
+        }
+      }
+    }
+  },
   ...(process.env.TARGET === 'wasm' ? {
     exports: {
       invokeJsHostOp: { argType: 'aaz', returnType: 'i' },
@@ -568,6 +869,108 @@ export default mixin({
   /* c8 ignore next */
   } : undefined),
 });
+
+function hasDefaultFallbackTarget(val) {
+  return val !== null && (typeof(val) === 'object' || typeof(val) === 'function');
+}
+
+function isEsModuleNamespaceObject(mod) {
+  return mod !== null && typeof(mod) === 'object' && mod[Symbol.toStringTag] === 'Module';
+}
+
+function isFrozenNullProtoNamespace(mod) {
+  return mod !== null
+    && typeof(mod) === 'object'
+    && Object.getPrototypeOf(mod) === null
+    && Object.isFrozen(mod);
+}
+
+function isEsmExtension(specifier) {
+  return typeof(specifier) === 'string' && /\.m[jt]s(?:$|[?#])/i.test(specifier);
+}
+
+function isCjsExtension(specifier) {
+  return typeof(specifier) === 'string' && /\.c[jt]s(?:$|[?#])/i.test(specifier);
+}
+
+function hasOnlyCjsMirroredExports(mod, cjsExports = mod.default) {
+  const target = Object(cjsExports);
+  for (const key of Reflect.ownKeys(mod)) {
+    if (typeof(key) !== 'string' || key === 'default' || key === 'module.exports') {
+      continue;
+    }
+    if (!(key in target) && mod[key] !== undefined) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isCjsWrappedNamespace(mod) {
+  return isEsModuleNamespaceObject(mod)
+    && hasDefaultFallbackTarget(mod.default)
+    && ('module.exports' in mod)
+    && mod['module.exports'] === mod.default
+    && hasOnlyCjsMirroredExports(mod);
+}
+
+function isRollupMergedCjsNamespace(mod) {
+  if (isEsModuleNamespaceObject(mod) || !isFrozenNullProtoNamespace(mod) || !hasDefaultFallbackTarget(mod.default)) {
+    return false;
+  }
+  if (!hasOnlyCjsMirroredExports(mod)) {
+    return false;
+  }
+  let hasGetterExport = false;
+  for (const key of Reflect.ownKeys(mod)) {
+    if (typeof(key) !== 'string' || key === 'default') {
+      continue;
+    }
+    const desc = Object.getOwnPropertyDescriptor(mod, key);
+    if (!desc || typeof(desc.get) !== 'function' || desc.set !== undefined) {
+      return false;
+    }
+    hasGetterExport = true;
+  }
+  return hasGetterExport;
+}
+
+function isSyntheticCjsNamespace(mod, specifier) {
+  if (
+    isCjsExtension(specifier)
+    && isEsModuleNamespaceObject(mod)
+    && hasDefaultFallbackTarget(mod.default)
+  ) {
+    return true;
+  }
+  if (isCjsWrappedNamespace(mod)) {
+    return true;
+  }
+  return isRollupMergedCjsNamespace(mod);
+}
+
+function isModuleNamespaceLike(mod) {
+  if (mod === null || typeof(mod) !== 'object') {
+    return false;
+  }
+  return mod[Symbol.toStringTag] === 'Module'
+    || mod.__esModule === true
+    || Object.getPrototypeOf(mod) === null;
+}
+
+function unwrapModuleDefault(mod) {
+  if (isModuleNamespaceLike(mod)) {
+    const def = mod.default;
+    if (def !== null && (typeof(def) === 'object' || typeof(def) === 'function') && def.__esModule === true && ('default' in def)) {
+      return def.default;
+    }
+    return def;
+  }
+  if (mod !== null && (typeof(mod) === 'object' || typeof(mod) === 'function') && ('default' in mod)) {
+    return mod.default;
+  }
+  return mod;
+}
 
 function readUsize(dv, byteOffset, ptrSize, littleEndian, asBigInt) {
   if (ptrSize === 8) {

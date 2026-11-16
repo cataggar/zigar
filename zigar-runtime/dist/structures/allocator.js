@@ -1,5 +1,5 @@
 import { mixin } from '../environment.js';
-import { MEMORY, RESET } from '../symbols.js';
+import { MEMORY, ZIG, RESET } from '../symbols.js';
 import '../utils.js';
 
 var allocator = mixin({
@@ -74,7 +74,10 @@ var allocator = mixin({
     }
   },
   freeHostMemory(ptr, buf, ptrAlign) {
-    const dv = (buf instanceof DataView) ? buf : buf['*'][MEMORY];
+    let dv = (buf instanceof DataView) ? buf : buf['*'][MEMORY];
+    if (!dv[ZIG]) {
+      dv = this.findShadowView(dv) ?? dv;
+    }
     const address = this.getViewAddress(dv);
     const len = dv.byteLength;
     const entry = this.unregisterMemory(address, len);

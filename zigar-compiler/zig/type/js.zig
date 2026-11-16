@@ -51,7 +51,14 @@ pub const HostOp = enum(u32) {
 
 pub const HostOpFlags = packed struct(u32) {
     dynamic_key: bool = false,
-    _: u31 = 0,
+    module_default: bool = false,
+    _: u30 = 0,
+};
+
+pub const JsModuleNode = struct {
+    key: []const u8,
+    registered: bool = false,
+    next: ?*JsModuleNode = null,
 };
 
 pub const CallbackFlags = packed struct(u32) {
@@ -317,6 +324,7 @@ pub fn Js(comptime host: type) type {
         pub const JsType = module.JsType;
         pub const HostOp = module.HostOp;
         pub const HostOpFlags = module.HostOpFlags;
+        pub const JsModuleNode = module.JsModuleNode;
         pub const CallbackFlags = module.CallbackFlags;
         pub const HostOpDescriptor = module.HostOpDescriptor;
         pub const CallbackDescriptor = module.CallbackDescriptor;
@@ -348,6 +356,45 @@ pub fn Js(comptime host: type) type {
                         const h1 = std.hash.Wyhash.hash(~sig, @typeName(T));
                         const export_name = std.fmt.comptimePrint("__zigar_js_reg_{x:0>16}{x:0>16}", .{ h0, h1 });
                         @export(&registerTypeExport, .{ .name = export_name });
+                    }
+                }
+            };
+        }
+
+        fn ModuleRegistration(comptime len: usize, comptime bytes: [len]u8) type {
+            return struct {
+                const prefix = "__zigar_js_mod:";
+                const key_arr: [prefix.len + len]u8 = prefix.* ++ bytes;
+                var node: module.JsModuleNode = .{ .key = &key_arr };
+
+                fn registerModuleExport() callconv(.c) void {
+                    if (@hasDecl(host, "registerJsModule")) {
+                        host.registerJsModule(&key_arr);
+                    }
+                }
+
+                fn registerModuleInit() callconv(.c) void {
+                    if (@hasDecl(host, "registerJsModuleNode")) {
+                        host.registerJsModuleNode(&node);
+                    }
+                }
+
+                comptime {
+                    const h0 = std.hash.Wyhash.hash(0x6a73_6d6f_6475_6c65, &bytes);
+                    const h1 = std.hash.Wyhash.hash(~@as(u64, 0x6a73_6d6f_6475_6c65), &bytes);
+                    const export_name = std.fmt.comptimePrint("__zigar_js_mod_{x:0>16}{x:0>16}", .{ h0, h1 });
+                    if (builtin.target.cpu.arch.isWasm() and @hasDecl(host, "registerJsModule")) {
+                        @export(&registerModuleExport, .{ .name = export_name });
+                    } else if (!builtin.target.cpu.arch.isWasm() and @hasDecl(host, "registerJsModuleNode")) {
+                        const init_section = switch (builtin.target.os.tag) {
+                            .macos, .ios, .tvos, .watchos, .visionos, .driverkit => "__DATA,__mod_init_func",
+                            .windows => ".CRT$XCU",
+                            else => ".init_array",
+                        };
+                        const Holder = struct {
+                            const ctor_ptr: *const fn () callconv(.c) void linksection(init_section) = &registerModuleInit;
+                        };
+                        @export(&Holder.ctor_ptr, .{ .name = export_name });
                     }
                 }
             };
@@ -453,6 +500,10 @@ pub fn Js(comptime host: type) type {
             const RT = FnReturnType(HostFn);
             const reg = TypeRegistration(Args);
             _ = reg;
+            if (comptime (op == .import_module and !flags.dynamic_key)) {
+                const mod_reg = ModuleRegistration(key_name.len, key_name[0..key_name.len].*);
+                _ = &mod_reg.key_arr;
+            }
 
             const Site = struct {
                 var descriptor: module.HostOpDescriptor = .{
@@ -576,6 +627,16 @@ pub fn Js(comptime host: type) type {
             return dispatchHostOp(.import_module, .{}, specifier, HostFn, .{});
         }
 
+        pub fn importModuleDefaultAs(comptime RT: type, comptime specifier: []const u8) RT {
+            const HostFn = buildFnType(&.{}, RT);
+            return dispatchHostOp(.import_module, .{ .module_default = true }, specifier, HostFn, .{});
+        }
+
+        pub fn importModuleDefaultAllocAs(allocator: std.mem.Allocator, comptime RT: type, comptime specifier: []const u8) RT {
+            const HostFn = buildFnType(&.{std.mem.Allocator}, RT);
+            return dispatchHostOp(.import_module, .{ .module_default = true }, specifier, HostFn, .{allocator});
+        }
+
         pub fn importModule(comptime specifier: []const u8) module.CallError!Ref(module.Object) {
             return importModuleAs(module.CallError!Ref(module.Object), specifier);
         }
@@ -597,9 +658,42 @@ pub fn Js(comptime host: type) type {
             return struct {
                 const ModNs = @This();
                 pub const module_specifier = specifier;
+                pub const is_js_module_descriptor = true;
 
                 pub fn resolve() module.CallError!Ref(module.Object) {
                     return JsNs.importModule(specifier);
+                }
+
+                pub fn namespace() module.CallError!Ref(module.Object) {
+                    return resolve();
+                }
+
+                pub fn default(comptime RT: type) EnsureErrorReturn(RT) {
+                    return JsNs.importModuleDefaultAs(EnsureErrorReturn(RT), specifier);
+                }
+
+                pub fn defaultAlloc(allocator: std.mem.Allocator, comptime RT: type) EnsureErrorReturn(RT) {
+                    return JsNs.importModuleDefaultAllocAs(allocator, EnsureErrorReturn(RT), specifier);
+                }
+
+                pub fn callDefault(comptime FnSig: type, args: anytype) EnsureErrorReturn(FnReturnType(FnSig)) {
+                    const callee = try ModNs.default(Ref(module.Function));
+                    defer callee.deinit();
+                    return JsNs.callFn(WrapFnWithCallError(FnSig), callee, args);
+                }
+
+                pub fn callExportEquals(comptime FnSig: type, args: anytype) EnsureErrorReturn(FnReturnType(FnSig)) {
+                    return ModNs.callDefault(FnSig, args);
+                }
+
+                pub fn constructDefault(comptime CtorSig: type, args: anytype) EnsureErrorReturn(FnReturnType(CtorSig)) {
+                    const ctor = try ModNs.default(Ref(module.Function));
+                    defer ctor.deinit();
+                    return JsNs.construct(WrapFnWithCallError(CtorSig), ctor, args);
+                }
+
+                pub fn constructExportEquals(comptime CtorSig: type, args: anytype) EnsureErrorReturn(FnReturnType(CtorSig)) {
+                    return ModNs.constructDefault(CtorSig, args);
                 }
 
                 pub fn getProp(comptime RT: type, comptime name: []const u8) module.CallError!PayloadOf(RT) {
@@ -1911,5 +2005,93 @@ test "defaultFallbackValue and mapHostFailure safely construct all Zig return ty
     try std.testing.expect(comp.ref.isUndefined());
     try std.testing.expectEqual(@as(?*i32, null), comp.opt);
 }
+
+test "Js.Module descriptor markers and default/export= interop flags" {
+    const ModMockHost = struct {
+        var active_handles: u32 = 0;
+        var next_slot: u32 = 32;
+        var last_op: u32 = 0;
+        var last_flags: u32 = 0;
+        var last_key: []const u8 = "";
+
+        fn allocHandle() u32 {
+            active_handles += 1;
+            defer next_slot += 1;
+            return (1 << 20) | next_slot;
+        }
+
+        pub fn releaseJsValue(handle: u32) void {
+            if (handle >= 8) active_handles -= 1;
+        }
+
+        pub fn getJsValueCount() u32 {
+            return active_handles;
+        }
+
+        pub fn invokeJsHostOp(desc_ptr: *const anyopaque, arg_ptr: *anyopaque, _: usize) E {
+            const desc: *const HostOpDescriptor = @ptrCast(@alignCast(desc_ptr));
+            last_op = desc.op;
+            last_flags = desc.flags;
+            last_key = if (desc.key_ptr) |p| p[0..desc.key_len] else "";
+            const op: HostOp = @enumFromInt(desc.op);
+            switch (op) {
+                .import_module => {
+                    const out_bytes: [*]u8 = @ptrCast(arg_ptr);
+                    const handle_out: *u32 = @ptrCast(@alignCast(out_bytes));
+                    handle_out.* = allocHandle();
+                    out_bytes[4] = 0;
+                },
+                .call_fn => {
+                    const Frame = arg_struct.ArgStruct(WrapFn(fn (Js(@This()).Ref(Function), i32) i32));
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    frame.retval = frame.@"1" * 3;
+                },
+                .construct => {
+                    const Frame = arg_struct.ArgStruct(WrapFn(fn (Js(@This()).Ref(Function), i32) Js(@This()).Ref(Object)));
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    frame.retval = .{ .handle = allocHandle() };
+                },
+                else => return .FAULT,
+            }
+            return .SUCCESS;
+        }
+
+        fn WrapFn(comptime FnSig: type) type {
+            const f = @typeInfo(FnSig).@"fn";
+            var param_types: [f.param_types.len]type = undefined;
+            var param_attrs: [f.param_types.len]std.lang.Type.Fn.ParamAttributes = undefined;
+            for (f.param_types, 0..) |pt, i| {
+                param_types[i] = pt.?;
+                param_attrs[i] = .{};
+            }
+            return @Fn(&param_types, &param_attrs, CallError!(f.return_type orelse void), .{});
+        }
+    };
+
+    const js = Js(ModMockHost);
+    const UnusedMod = js.Module("pkg-unused");
+    const ExportEqMod = js.Module("./cjs-fn.cjs");
+    try expect(UnusedMod.is_js_module_descriptor);
+    try expect(ExportEqMod.is_js_module_descriptor);
+    try std.testing.expectEqualStrings("./cjs-fn.cjs", ExportEqMod.module_specifier);
+
+    const ns = try ExportEqMod.namespace();
+    try expectEqual(@as(u32, @intFromEnum(HostOp.import_module)), ModMockHost.last_op);
+    try expectEqual(@as(u32, 0), ModMockHost.last_flags);
+    ns.deinit();
+
+    const def_fn = try ExportEqMod.default(js.Ref(js.Function));
+    try expectEqual(@as(u32, @intFromEnum(HostOp.import_module)), ModMockHost.last_op);
+    try expectEqual(@as(u32, @bitCast(HostOpFlags{ .module_default = true })), ModMockHost.last_flags);
+    def_fn.deinit();
+
+    const call_res = try ExportEqMod.callExportEquals(fn (i32) i32, .{14});
+    try expectEqual(@as(i32, 42), call_res);
+
+    const inst = try ExportEqMod.constructExportEquals(fn (i32) js.Ref(js.Object), .{7});
+    inst.deinit();
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+}
+
 
 

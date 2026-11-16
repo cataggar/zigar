@@ -790,11 +790,11 @@ fn Factory(comptime host: type, comptime module: type) type {
                                 const decl_value = decl_ptr.*;
                                 const DT = @TypeOf(decl_value);
                                 // export type only if it's supported
-                                const is_value_supported = switch (DT) {
+                                const is_value_supported = comptime switch (DT) {
                                     type => supported.is(decl_value),
                                     else => true,
                                 };
-                                const should_export = if (is_value_supported) switch (@typeInfo(DT)) {
+                                const should_export = comptime if (is_value_supported) switch (@typeInfo(DT)) {
                                     .@"fn" => !options.omit_functions,
                                     else => !options.omit_variables or @typeInfo(PT).pointer.attrs.@"const",
                                 } else false;
@@ -874,11 +874,11 @@ fn Factory(comptime host: type, comptime module: type) type {
                             if (comptime supported.is(PT)) {
                                 const decl_value = decl_ptr.*;
                                 const DT = @TypeOf(decl_value);
-                                const is_value_supported = switch (DT) {
+                                const is_value_supported = comptime switch (DT) {
                                     type => supported.is(decl_value),
                                     else => true,
                                 };
-                                const should_export = if (is_value_supported) switch (@typeInfo(DT)) {
+                                const should_export = comptime if (is_value_supported) switch (@typeInfo(DT)) {
                                     .@"fn" => !options.omit_functions,
                                     else => !options.omit_variables or @typeInfo(PT).pointer.attrs.@"const",
                                 } else false;
@@ -1259,6 +1259,9 @@ pub fn getFactoryThunk(comptime host: type, comptime module: type) zig_fn.Thunk 
     const ns = struct {
         fn exportStructures(_: *const anyopaque, _: *anyopaque) anyerror!void {
             @setEvalBranchQuota(options.eval_branch_quota);
+            if (@hasDecl(host, "exportJsModules")) {
+                try host.exportJsModules();
+            }
             const factory: Factory(host, module) = .{};
             _ = factory.getStructure(module) catch |err| {
                 std.debug.print("Error ecountered during export processs: {s}\n", .{@errorName(err)});

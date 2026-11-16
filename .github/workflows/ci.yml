@@ -102,6 +102,7 @@ jobs:
             test/compilation.test.js \
             test/wit-zigar-bridge.test.js \
             test/js-value-handles.test.js \
+            test/es-module-imports.test.js \
             --grep "compile code for Windows$|should fail when directory is illegal$" \
             --invert
 
@@ -182,6 +183,7 @@ jobs:
             test/transpilation.test.js \
             test/compilation.test.js \
             test/js-value-handles.test.js \
+            test/es-module-imports.test.js \
             --grep "compile code for Windows$|should fail when directory is illegal$" \
             --invert
 
@@ -256,14 +258,15 @@ jobs:
             test/index-cjs.test.js \
             test/index.test.js \
             test/worker.test.js \
-            test/js-value-handles.test.js
+            test/js-value-handles.test.js \
+            test/es-module-imports.test.js
 
       - name: Run bun-zigar native JsValue handle tests
         env:
           USE_WAZIG: '0'
         run: |
           cd bun-zigar
-          bun node_modules/mocha/bin/mocha.js --timeout 300000 -- test/js-value-handles.test.js
+          bun node_modules/mocha/bin/mocha.js --timeout 300000 -- test/js-value-handles.test.js test/es-module-imports.test.js
 
   benchmarks:
     name: Wazig vs Zig Benchmarks

@@ -24,6 +24,9 @@ export async function transpile(srcPath, options) {
     continuationStackSize,
     memory64 = false,
     useResizableBuffer,
+    moduleFormat = 'esm',
+    dynamicJsImports = false,
+    jsModuleResolver,
     moduleResolver = (name) => name,
     wasmLoader,
     ...compileOptions
@@ -128,7 +131,18 @@ export async function transpile(srcPath, options) {
       binarySource = await wasmLoader(srcPath, dv);
     }
   }
-  const { code, exports, structures } = generateCode(definition, {
+  let syncJsModuleResolver;
+  if (typeof(jsModuleResolver) === 'function' && Array.isArray(definition.jsModules)) {
+    const resolvedMap = new Map();
+    for (const spec of definition.jsModules) {
+      const key = String(spec);
+      if (!resolvedMap.has(key)) {
+        resolvedMap.set(key, await jsModuleResolver(key));
+      }
+    }
+    syncJsModuleResolver = (spec) => resolvedMap.get(spec);
+  }
+  const { code, exports, structures, jsModules } = generateCode(definition, {
     declareFeatures: true,
     runtimeURL,
     binarySource,
@@ -136,8 +150,11 @@ export async function transpile(srcPath, options) {
     omitExports,
     moduleOptions,
     mixinPaths,
+    moduleFormat,
+    dynamicJsImports,
+    jsModuleResolver: syncJsModuleResolver,
   });
-  return { code, exports, structures, sourcePaths };
+  return { code, exports, structures, sourcePaths, jsModules };
 }
 
 function embed(path, dv) {

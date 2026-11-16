@@ -88,15 +88,22 @@ export default function createPlugin(options = {}) {
             }
           }
         };
-        const { code, exports, structures, sourcePaths } = await transpile(id, {
+        const { code, exports, structures, sourcePaths, jsModules } = await transpile(id, {
           ...otherOptions,
           optimize,
           nodeCompat,
           wasmLoader,
           embedWASM,
+          jsModuleResolver: async (spec) => {
+            if (spec.startsWith('virtual:') || spec.startsWith('\0')) {
+              const resolved = await this.resolve(spec, id);
+              return resolved ? spec : null;
+            }
+            return spec;
+          },
         });
         const meta = {
-          zigar: { exports, structures, sourcePaths },
+          zigar: { exports, structures, sourcePaths, jsModules },
         };
         if (sourcePaths) {
           for (const sourcePath of sourcePaths) {
