@@ -57,6 +57,7 @@ export default mixin({
       this.executable = null;
       this.instance = null;
       this.memory = null;
+      this.initialMemoryPages = 0;
       this.table = null;
       this.initialTableLength = 0;
       this.exportedFunctions = null;
@@ -412,6 +413,7 @@ export default mixin({
     importFunctions(exports) {
       if (!this.memory && exports.memory) {
         this.memory = exports.memory;
+        this.initialMemoryPages = this.memory.buffer.byteLength / 65536;
         this.enableResizableMemory(this.memory);
       }
       if (!this.table && exports.__indirect_function_table) {
@@ -545,6 +547,7 @@ export default mixin({
       }
       debugger;
       if (memoryInitial) {
+        this.initialMemoryPages = memoryInitial;
         this.memory = env.memory = new WA.Memory(this.memory64 ? {
           initial: BigInt(memoryInitial),
           ...(memoryMax !== undefined ? { maximum: BigInt(memoryMax) } : undefined),

@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { StructurePurpose, StructureType } from '../../src/constants.js';
+import { MemberType, StructureFlag, StructurePurpose, StructureType } from '../../src/constants.js';
 import { defineEnvironment } from '../../src/environment.js';
 import { InvalidJsValueHandle } from '../../src/errors.js';
 import {
@@ -10,7 +10,7 @@ import {
   RESERVED_TRUE,
   RESERVED_UNDEFINED,
 } from '../../src/features/js-value-registry.js';
-import { FALLBACK, MEMORY, TARGET, ZIG } from '../../src/symbols.js';
+import { FALLBACK, MEMORY, SLOTS, TARGET, ZIG } from '../../src/symbols.js';
 import '../../src/mixins.js';
 
 const Env = defineEnvironment();
@@ -105,24 +105,120 @@ describe('Feature: js-value-registry', function() {
     expect(env.getJsValueCount()).to.equal(0);
   });
 
-  it('should handle high-bit signed i32 handles and wrap 12-bit generation from 4095 to 1', function() {
+  it('should cycle freed slots FIFO, retire slots at generation 4095, and never alias stale handles across 10,000 cycles', function() {
     const env = new Env();
-    const target = { tag: 'wrap' };
-    let lastHandle = 0;
-    for (let i = 0; i < 4100; i++) {
-      const h = env.allocJsValue(target);
-      expect(h & 0x000FFFFF).to.equal(8);
+
+    // Verify FIFO free-queue ordering across multiple freed slots
+    const fa = env.allocJsValue({ slot: 'a' });
+    const fb = env.allocJsValue({ slot: 'b' });
+    const fc = env.allocJsValue({ slot: 'c' });
+    expect([ fa & 0x000FFFFF, fb & 0x000FFFFF, fc & 0x000FFFFF ]).to.deep.equal([ 8, 9, 10 ]);
+    env.releaseJsValue(fa);
+    env.releaseJsValue(fb);
+    env.releaseJsValue(fc);
+    const ra = env.allocJsValue({ slot: 'a2' });
+    const rb = env.allocJsValue({ slot: 'b2' });
+    const rc = env.allocJsValue({ slot: 'c2' });
+    expect([ ra & 0x000FFFFF, rb & 0x000FFFFF, rc & 0x000FFFFF ]).to.deep.equal([ 8, 9, 10 ]);
+    expect([ ra >>> 20, rb >>> 20, rc >>> 20 ]).to.deep.equal([ 2, 2, 2 ]);
+    env.releaseJsValue(ra);
+    env.releaseJsValue(rb);
+    env.releaseJsValue(rc);
+
+    // Run 10,000 create/release cycles on a fresh environment while retaining stale handles
+    const freshEnv = new Env();
+    let staleIter1 = 0;
+    let staleIter4095 = 0;
+    let handleIter4096 = 0;
+    for (let i = 1; i <= 10000; i++) {
+      const target = { cycle: i };
+      const h = freshEnv.allocJsValue(target);
       const gen = h >>> 20;
       expect(gen).to.be.at.least(1);
       expect(gen).to.be.at.most(4095);
+      if (i === 1) {
+        expect(h & 0x000FFFFF).to.equal(8);
+        expect(gen).to.equal(1);
+        staleIter1 = h;
+      } else if (i === 4095) {
+        expect(h & 0x000FFFFF).to.equal(8);
+        expect(gen).to.equal(4095);
+        staleIter4095 = h;
+      } else if (i === 4096) {
+        // Slot 8 retired permanently at generation 4095; allocation advances to slot 9 generation 1!
+        expect(h & 0x000FFFFF).to.equal(9);
+        expect(gen).to.equal(1);
+        handleIter4096 = h;
+      }
       // Verify signed i32 representation (as passed across WebAssembly i32 boundary when gen >= 2048)
       const signedI32 = h | 0;
-      expect(env.getJsValue(signedI32)).to.equal(target);
-      env.releaseJsValue(signedI32);
-      lastHandle = h;
+      expect(freshEnv.getJsValue(signedI32)).to.equal(target);
+      if (i > 1) {
+        expect(() => freshEnv.getJsValue(staleIter1)).to.throw(InvalidJsValueHandle);
+      }
+      if (i > 4095) {
+        expect(() => freshEnv.getJsValue(staleIter4095)).to.throw(InvalidJsValueHandle);
+      }
+      freshEnv.releaseJsValue(signedI32);
     }
-    expect(lastHandle >>> 20).to.equal(5);
+    expect(handleIter4096 & 0x000FFFFF).to.equal(9);
+    expect(freshEnv.getJsValueCount()).to.equal(0);
+
+    // Allocate one more live object and verify neither stale handle aliases it
+    const finalLive = freshEnv.allocJsValue({ final: true });
+    expect(() => freshEnv.getJsValue(staleIter1)).to.throw(InvalidJsValueHandle);
+    expect(() => freshEnv.getJsValue(staleIter4095)).to.throw(InvalidJsValueHandle);
+    expect(freshEnv.getJsValue(finalLive)).to.deep.equal({ final: true });
+    freshEnv.releaseJsValue(finalLive);
+    expect(freshEnv.getJsValueCount()).to.equal(0);
+  });
+
+  it('should release remaining valid sibling handles when consuming a composite containing a stale handle', function() {
+    const env = new Env();
+    env.littleEndian = true;
+    const staleFirst = env.allocJsValue({ stale: true });
+    env.releaseJsValue(staleFirst);
+    const validSecond = env.allocJsValue({ valid: true });
+    expect(env.getJsValueCount()).to.equal(1);
+
+    const buf = new ArrayBuffer(8);
+    const dv = new DataView(buf);
+    dv.setUint32(0, staleFirst, true);
+    dv.setUint32(4, validSecond, true);
+
+    const jsValStruct = {
+      purpose: StructurePurpose.JsValue,
+      type: StructureType.Struct,
+      flags: StructureFlag.HasJsValue,
+      byteSize: 4,
+    };
+    const pairStruct = {
+      purpose: StructurePurpose.Unknown,
+      type: StructureType.Struct,
+      flags: StructureFlag.HasJsValue | StructureFlag.HasSlot,
+      byteSize: 8,
+      instance: {
+        members: [
+          { type: MemberType.Object, offset: 0, bitOffset: 0, slot: 0, structure: jsValStruct },
+          { type: MemberType.Object, offset: 4, bitOffset: 32, slot: 1, structure: jsValStruct },
+        ],
+      },
+    };
+    const refFirst = { [MEMORY]: new DataView(buf, 0, 4) };
+    const refSecond = { [MEMORY]: new DataView(buf, 4, 4) };
+    const pairObj = {
+      [MEMORY]: dv,
+      [SLOTS]: { 0: refFirst, 1: refSecond },
+    };
+    const argObj = {
+      [SLOTS]: { 0: pairObj },
+    };
+
+    expect(() => env.consumeJsValueSlot(argObj, 0, pairStruct)).to.throw(InvalidJsValueHandle);
     expect(env.getJsValueCount()).to.equal(0);
+    expect(refSecond[TARGET]).to.deep.equal({ valid: true });
+    expect(dv.getUint32(0, true)).to.equal(0);
+    expect(dv.getUint32(4, true)).to.equal(0);
   });
 
   it('should clone dynamic handles into independent slots and grow capacity cleanly', function() {

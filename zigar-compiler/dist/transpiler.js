@@ -8912,31 +8912,48 @@ var jsHostOp = mixin({
   trackJsModuleNamespace(moduleExports, specifier) {
     if (moduleExports !== null && (typeof(moduleExports) === 'object' || typeof(moduleExports) === 'function')) {
       this.jsModuleNamespaces.add(moduleExports);
+      if (this.jsEsmNamespaces.has(moduleExports) || this.jsCjsNamespaces.has(moduleExports)) {
+        return;
+      }
       if (isEsmExtension(specifier)) {
         this.jsEsmNamespaces.add(moduleExports);
         return;
       }
-      if (
-        isSyntheticCjsNamespace(moduleExports, specifier)
-        || (
-          isEsModuleNamespaceObject(moduleExports)
-          && hasDefaultFallbackTarget(moduleExports.default)
-          && hasOnlyCjsMirroredExports(moduleExports)
-          && typeof(specifier) === 'string'
-          && Boolean(globalThis.Bun)
-          && this.isBunCjsModule(specifier, moduleExports)
-        )
-      ) {
+      if (isCjsExtension(specifier)) {
+        if (isEsModuleNamespaceObject(moduleExports) && hasDefaultFallbackTarget(moduleExports.default)) {
+          this.jsCjsNamespaces.add(moduleExports);
+        }
+        return;
+      }
+      if (isRollupMergedCjsNamespace(moduleExports)) {
         this.jsCjsNamespaces.add(moduleExports);
+        return;
+      }
+      if (
+        isEsModuleNamespaceObject(moduleExports)
+        && hasDefaultFallbackTarget(moduleExports.default)
+        && hasOnlyCjsMirroredExports(moduleExports)
+      ) {
+        const runtimeKind = this.classifyAmbiguousModuleNamespace(specifier, moduleExports);
+        if (runtimeKind === 'cjs') {
+          this.jsCjsNamespaces.add(moduleExports);
+        } else if (runtimeKind === 'esm') {
+          this.jsEsmNamespaces.add(moduleExports);
+        } else if (isCjsWrappedNamespace(moduleExports)) {
+          this.jsCjsNamespaces.add(moduleExports);
+        }
       }
     }
   },
-  isBunCjsModule(specifier, moduleExports) {
+  classifyAmbiguousModuleNamespace(specifier, moduleExports) {
+    if (typeof(specifier) !== 'string' || !specifier) {
+      return undefined;
+    }
     try {
       const proc = globalThis.process;
       const nodeModule = proc?.getBuiltinModule?.('node:module');
       if (typeof(nodeModule?.createRequire) !== 'function') {
-        return false;
+        return undefined;
       }
       const fallbackBase = `${proc.cwd?.() ?? '/'}/_zigar_host_.js`;
       const strippedBase = String(this.moduleBaseURL || fallbackBase)
@@ -8947,12 +8964,53 @@ var jsHostOp = mixin({
         : strippedBase;
       const basePath = usableBase.endsWith('/') ? `${usableBase}_zigar_host_.js` : usableBase;
       const req = nodeModule.createRequire(basePath);
-      const spec = specifier.startsWith('file://') ? new URL(specifier) : specifier;
-      const resolved = req.resolve(spec);
-      return req.cache?.[resolved]?.exports === moduleExports.default;
-    } catch {
-      return false;
-    }
+      try {
+        const cleanSpec = specifier.startsWith('file://')
+          ? new URL(specifier.split(/[?#]/)[0])
+          : (specifier.split(/[?#]/)[0] || specifier);
+        const resolved = req.resolve(cleanSpec);
+        const entry = req.cache?.[resolved];
+        if (entry) {
+          if (getRequiredEsmNamespace(entry) !== undefined) {
+            return 'esm';
+          }
+          if (entry.exports === moduleExports.default) {
+            return 'cjs';
+          }
+        }
+        return 'esm';
+      } catch {
+        const cacheObj = req.cache || nodeModule._cache;
+        if (cacheObj) {
+          const cleanTail = specifier.split(/[?#]/)[0].replace(/^(?:\.\/|\.\.\/)+/, '');
+          let anyCjsHasDefault = false;
+          for (const entry of Object.values(cacheObj)) {
+            if (!entry) {
+              continue;
+            }
+            const reqNs = getRequiredEsmNamespace(entry);
+            const fnMatch = Boolean(
+              cleanTail
+              && typeof(entry.filename) === 'string'
+              && entry.filename.replace(/\\/g, '/').endsWith(`/${cleanTail}`),
+            );
+            if (fnMatch && reqNs !== undefined) {
+              return 'esm';
+            }
+            if (reqNs === undefined && entry.exports === moduleExports.default) {
+              anyCjsHasDefault = true;
+              if (fnMatch) {
+                return 'cjs';
+              }
+            }
+          }
+          if (anyCjsHasDefault) {
+            return 'esm';
+          }
+        }
+      }
+    } catch {}
+    return undefined;
   },
   isJsCjsNamespace(target) {
     if (target === null || typeof(target) !== 'object') {
@@ -9006,21 +9064,12 @@ var jsHostOp = mixin({
         : strippedBase;
       const basePath = usableBase.endsWith('/') ? `${usableBase}_zigar_host_.js` : usableBase;
       const req = nodeModule.createRequire(basePath);
-      const getEntryNamespace = (entry) => {
-        if (entry) {
-          for (const sym of Object.getOwnPropertySymbols(entry)) {
-            if (typeof(entry[sym]?.getNamespace) === 'function') {
-              return entry[sym].getNamespace();
-            }
-          }
-        }
-        return undefined;
-      };
       try {
         const specTarget = spec.startsWith('file://') ? new URL(spec) : spec;
         const resolved = req.resolve(specTarget);
-        const ns = getEntryNamespace(req.cache?.[resolved]);
+        const ns = getRequiredEsmNamespace(req.cache?.[resolved]);
         if (ns !== undefined) {
+          this.jsEsmNamespaces.add(ns);
           return ns;
         }
       } catch {
@@ -9032,8 +9081,9 @@ var jsHostOp = mixin({
               && typeof(entry.filename) === 'string'
               && entry.filename.replace(/\\/g, '/').endsWith(`/${cleanTail}`)
             ) {
-              const ns = getEntryNamespace(entry);
+              const ns = getRequiredEsmNamespace(entry);
               if (ns !== undefined) {
+                this.jsEsmNamespaces.add(ns);
                 return ns;
               }
             }
@@ -10034,6 +10084,17 @@ function isCjsWrappedNamespace(mod) {
     && hasOnlyCjsMirroredExports(mod);
 }
 
+function getRequiredEsmNamespace(entry) {
+  if (entry) {
+    for (const sym of Object.getOwnPropertySymbols(entry)) {
+      if (typeof(entry[sym]?.getNamespace) === 'function') {
+        return entry[sym].getNamespace();
+      }
+    }
+  }
+  return undefined;
+}
+
 function isRollupMergedCjsNamespace(mod) {
   if (isEsModuleNamespaceObject(mod) || !isFrozenNullProtoNamespace(mod) || !hasDefaultFallbackTarget(mod.default)) {
     return false;
@@ -10041,6 +10102,7 @@ function isRollupMergedCjsNamespace(mod) {
   if (!hasOnlyCjsMirroredExports(mod)) {
     return false;
   }
+  const target = Object(mod.default);
   let hasGetterExport = false;
   for (const key of Reflect.ownKeys(mod)) {
     if (typeof(key) !== 'string' || key === 'default') {
@@ -10050,23 +10112,12 @@ function isRollupMergedCjsNamespace(mod) {
     if (!desc || typeof(desc.get) !== 'function' || desc.set !== undefined) {
       return false;
     }
+    if (!Object.is(mod[key], target[key])) {
+      return false;
+    }
     hasGetterExport = true;
   }
   return hasGetterExport;
-}
-
-function isSyntheticCjsNamespace(mod, specifier) {
-  if (
-    isCjsExtension(specifier)
-    && isEsModuleNamespaceObject(mod)
-    && hasDefaultFallbackTarget(mod.default)
-  ) {
-    return true;
-  }
-  if (isCjsWrappedNamespace(mod)) {
-    return true;
-  }
-  return isRollupMergedCjsNamespace(mod);
 }
 
 function isModuleNamespaceLike(mod) {
@@ -10612,8 +10663,9 @@ const JS_TYPE_CODES = {
 function initRegistryState(env) {
   env.jsValueSlots = new Array(INITIAL_CAPACITY);
   env.jsValueGenerations = new Uint16Array(INITIAL_CAPACITY);
-  env.jsValueFreeNext = new Int32Array(INITIAL_CAPACITY);
+  env.jsValueFreeNext = new Int32Array(INITIAL_CAPACITY).fill(-1);
   env.jsValueFreeHead = -1;
+  env.jsValueFreeTail = -1;
   env.jsValueNextSlot = FIRST_DYNAMIC_SLOT;
   env.jsValueActiveCount = 0;
   env.pendingJsHandles = null;
@@ -10635,14 +10687,14 @@ var jsValueRegistry = mixin({
   growJsValueRegistry() {
     const oldCap = this.jsValueSlots.length;
     if (oldCap >= MAX_SLOTS) {
-      throw new RangeError('JsValue handle table exhausted');
+      throw new RangeError('JsValueRegistry exhausted');
     }
     const newCap = Math.min(oldCap * 2, MAX_SLOTS);
     this.jsValueSlots.length = newCap;
     const nextGen = new Uint16Array(newCap);
     nextGen.set(this.jsValueGenerations);
     this.jsValueGenerations = nextGen;
-    const nextFree = new Int32Array(newCap);
+    const nextFree = new Int32Array(newCap).fill(-1);
     nextFree.set(this.jsValueFreeNext);
     this.jsValueFreeNext = nextFree;
   },
@@ -10658,9 +10710,14 @@ var jsValueRegistry = mixin({
     let slot, gen;
     if (this.jsValueFreeHead >= 0) {
       slot = this.jsValueFreeHead;
-      this.jsValueFreeHead = this.jsValueFreeNext[slot];
+      const next = this.jsValueFreeNext[slot];
+      this.jsValueFreeHead = next;
+      if (next < 0) {
+        this.jsValueFreeTail = -1;
+      }
+      this.jsValueFreeNext[slot] = -1;
       const prevGen = this.jsValueGenerations[slot] & GEN_MASK;
-      gen = (prevGen >= GEN_MASK) ? 1 : prevGen + 1;
+      gen = prevGen + 1;
     } else {
       if (this.jsValueNextSlot >= this.jsValueSlots.length) {
         this.growJsValueRegistry();
@@ -10721,11 +10778,24 @@ var jsValueRegistry = mixin({
       || gen === 0 || this.jsValueGenerations[slot] !== (ACTIVE_BIT | gen)) {
       throw new InvalidJsValueHandle(handle);
     }
-    this.jsValueGenerations[slot] = gen;
     this.jsValueSlots[slot] = undefined;
-    this.jsValueFreeNext[slot] = this.jsValueFreeHead;
-    this.jsValueFreeHead = slot;
     this.jsValueActiveCount--;
+    if (gen >= GEN_MASK) {
+      // Permanently retire slots once their 12-bit generation reaches 0xFFF (4095)
+      // so a (gen, slot) handle pair is never re-issued across the instance lifetime.
+      this.jsValueGenerations[slot] = 0;
+      this.jsValueFreeNext[slot] = -1;
+    } else {
+      this.jsValueGenerations[slot] = gen;
+      this.jsValueFreeNext[slot] = -1;
+      if (this.jsValueFreeTail >= 0) {
+        this.jsValueFreeNext[this.jsValueFreeTail] = slot;
+        this.jsValueFreeTail = slot;
+      } else {
+        this.jsValueFreeHead = slot;
+        this.jsValueFreeTail = slot;
+      }
+    }
   },
   typeofJsValue(handle) {
     const value = this.getJsValue(handle);
@@ -10766,26 +10836,38 @@ var jsValueRegistry = mixin({
       return;
     }
     const dv = refObj[MEMORY];
-    const handle = dv.getUint32(0, this.littleEndian);
-    const value = this.getJsValue(handle);
-    this.releaseJsValue(handle);
-    refObj[TARGET] = value;
-    dv.setUint32(0, RESERVED_UNDEFINED, this.littleEndian);
+    try {
+      const handle = dv.getUint32(0, this.littleEndian);
+      const value = this.getJsValue(handle);
+      this.releaseJsValue(handle);
+      refObj[TARGET] = value;
+    } finally {
+      dv.setUint32(0, RESERVED_UNDEFINED, this.littleEndian);
+    }
   },
-  consumeJsValueSlot(parent, slot, structure) {
+  consumeJsValueSlot(parent, slot, structure, errState = null) {
     if (!hasJsValue(structure)) {
       return;
     }
+    const isRoot = !errState;
+    const state = errState ?? { error: null };
     const obj = parent[SLOTS][slot] ?? parent[VIVIFICATE](slot);
     if (structure.purpose === StructurePurpose.JsValue) {
-      this.consumeJsValueObject(obj);
+      try {
+        this.consumeJsValueObject(obj);
+      } catch (err) {
+        state.error ??= err;
+      }
+      if (isRoot && state.error) {
+        throw state.error;
+      }
       return;
     }
     switch (structure.type) {
       case StructureType.Struct: {
         for (const member of structure.instance.members) {
           if (member.type === MemberType.Object) {
-            this.consumeJsValueSlot(obj, member.slot, member.structure);
+            this.consumeJsValueSlot(obj, member.slot, member.structure, state);
           }
         }
         break;
@@ -10794,7 +10876,7 @@ var jsValueRegistry = mixin({
         const [ valueMember, presentMember ] = structure.instance.members;
         if (valueMember.type === MemberType.Object
           && isNonZeroBytes(obj[MEMORY], presentMember.bitOffset >> 3, presentMember.byteSize)) {
-          this.consumeJsValueSlot(obj, valueMember.slot, valueMember.structure);
+          this.consumeJsValueSlot(obj, valueMember.slot, valueMember.structure, state);
         }
         break;
       }
@@ -10802,14 +10884,14 @@ var jsValueRegistry = mixin({
         const [ valueMember, errorMember ] = structure.instance.members;
         if (valueMember.type === MemberType.Object
           && !isNonZeroBytes(obj[MEMORY], errorMember.bitOffset >> 3, errorMember.byteSize)) {
-          this.consumeJsValueSlot(obj, valueMember.slot, valueMember.structure);
+          this.consumeJsValueSlot(obj, valueMember.slot, valueMember.structure, state);
         }
         break;
       }
       case StructureType.Union: {
         const activeMember = getActiveUnionMember(structure, obj[MEMORY], 0, this.littleEndian);
         if (activeMember?.type === MemberType.Object) {
-          this.consumeJsValueSlot(obj, activeMember.slot, activeMember.structure);
+          this.consumeJsValueSlot(obj, activeMember.slot, activeMember.structure, state);
         }
         break;
       }
@@ -10817,11 +10899,14 @@ var jsValueRegistry = mixin({
         const [ elementMember ] = structure.instance.members;
         if (elementMember.type === MemberType.Object) {
           for (let i = 0; i < structure.length; i++) {
-            this.consumeJsValueSlot(obj, i, elementMember.structure);
+            this.consumeJsValueSlot(obj, i, elementMember.structure, state);
           }
         }
         break;
       }
+    }
+    if (isRoot && state.error) {
+      throw state.error;
     }
   },
   releaseZigJsValues(structure, dv, offset = 0) {
@@ -10895,6 +10980,11 @@ var jsValueRegistry = mixin({
     };
     visit(structure, offset);
   },
+  // Releases by-value `Ref(T)` handles written into `argStruct.retval` when a call aborts or
+  // leaves a pending host exception. Pointers and Zig slices (`[]const Ref(T)` / `*Ref(T)`,
+  // represented as `StructureType.Pointer` to `StructureType.Slice` or target memory) are
+  // intentionally NOT walked here — matching `hasJsValue` in `utils.js` — because handles behind
+  // pointers/slices reside in Zig-owned memory and are borrowed rather than ownership-transferred.
   discardJsValueRetval(argStruct) {
     const retvalMember = argStruct?.[VIVIFICATE]?.retvalMember;
     if (!retvalMember || retvalMember.type !== MemberType.Object || this.jsValueActiveCount === 0) {
@@ -11463,6 +11553,7 @@ var moduleLoading = mixin({
       this.executable = null;
       this.instance = null;
       this.memory = null;
+      this.initialMemoryPages = 0;
       this.table = null;
       this.initialTableLength = 0;
       this.exportedFunctions = null;
@@ -11818,6 +11909,7 @@ var moduleLoading = mixin({
     importFunctions(exports) {
       if (!this.memory && exports.memory) {
         this.memory = exports.memory;
+        this.initialMemoryPages = this.memory.buffer.byteLength / 65536;
         this.enableResizableMemory(this.memory);
       }
       if (!this.table && exports.__indirect_function_table) {
@@ -11951,6 +12043,7 @@ var moduleLoading = mixin({
       }
       debugger;
       if (memoryInitial) {
+        this.initialMemoryPages = memoryInitial;
         this.memory = env.memory = new WA.Memory(this.memory64 ? {
           initial: BigInt(memoryInitial),
           ...(memoryMax !== undefined ? { maximum: BigInt(memoryMax) } : undefined),
@@ -12846,22 +12939,121 @@ var thunkAllocation = mixin({
       const w = WebAssembly;
       const env = {}, wasi = {}, wasiPreview = {};
       const imports = { env, wasi, wasi_snapshot_preview1: wasiPreview };
+      let secMemory = null;
+      let secSpGlobal = null;
+      let secLowWaterSp = null;
+      let secSuspendedCount = 0;
+      const forwardHandleJscall = (fnId, secArgAddr, argSize, canWait) => {
+        const byteLen = Number(argSize);
+        const secOffset = toBufferOffset(secArgAddr);
+        const scratchAddr = (byteLen > 0)
+          ? this.allocateScratchMemory(byteLen, 16)
+          : (this.memory64 ? 0n : 0);
+        if (byteLen > 0) {
+          const src = new Uint8Array(secMemory.buffer, secOffset, byteLen);
+          const dst = new Uint8Array(this.memory.buffer, toBufferOffset(scratchAddr), byteLen);
+          dst.set(src);
+        }
+        const copyBackAndFree = () => {
+          if (this.abandoned) {
+            return;
+          }
+          try {
+            if (byteLen > 0) {
+              const src = new Uint8Array(this.memory.buffer, toBufferOffset(scratchAddr), byteLen);
+              const dst = new Uint8Array(secMemory.buffer, secOffset, byteLen);
+              dst.set(src);
+            }
+          } finally {
+            if (byteLen > 0) {
+              this.freeScratchMemory(scratchAddr, byteLen, 16);
+            }
+          }
+        };
+        let res;
+        try {
+          res = this.handleJscall(fnId, scratchAddr, byteLen, canWait);
+        } catch (err) {
+          if (byteLen > 0 && !this.abandoned) {
+            this.freeScratchMemory(scratchAddr, byteLen, 16);
+          }
+          throw err;
+        }
+        if (isPromise(res)) {
+          if (secSpGlobal) {
+            const curSp = Number(secSpGlobal.value);
+            const step = Math.max(4096, (byteLen + 255) & -16);
+            const baseSp = (secLowWaterSp !== null) ? Math.min(secLowWaterSp, curSp) : curSp;
+            const targetSp = (baseSp - step) & -16;
+            if (targetSp >= 4096) {
+              secLowWaterSp = targetSp;
+              try {
+                secSpGlobal.value = (typeof secSpGlobal.value === 'bigint') ? BigInt(targetSp) : targetSp;
+              } catch {}
+            }
+          }
+          secSuspendedCount++;
+          const finishSuspend = () => {
+            if (--secSuspendedCount === 0) {
+              secLowWaterSp = null;
+            }
+          };
+          return res.then(
+            (code) => {
+              finishSuspend();
+              if (this.abandoned) {
+                return PosixError.EFAULT;
+              }
+              copyBackAndFree();
+              return code;
+            },
+            (err) => {
+              finishSuspend();
+              if (byteLen > 0 && !this.abandoned) {
+                this.freeScratchMemory(scratchAddr, byteLen, 16);
+              }
+              throw err;
+            },
+          );
+        }
+        copyBackAndFree();
+        return res;
+      };
+      let importsMemory = false;
       for (const { module, name, kind } of w.Module.imports(this.executable)) {
         if (kind === 'function') {
-          (imports[module] ??= {})[name] = empty;
+          if (module === 'env' && name === '_handleJscall' && this.exportFunction) {
+            (imports[module] ??= {})[name] = this.exportFunction(forwardHandleJscall, 'zazb', 'i', 'handleJscall');
+          } else if (module === 'env' && name === '_displayPanic' && this.exportFunction) {
+            (imports[module] ??= {})[name] = this.exportFunction((address, len) => {
+              if (secMemory) {
+                const array = new Uint8Array(secMemory.buffer, toBufferOffset(address), Number(len));
+                console.error(`Zig panic: ${decodeText(array)}`);
+              }
+            }, 'az', '');
+          } else if (module === 'wasi_snapshot_preview1' && name === 'proc_exit' && this.getWASIHandler) {
+            (imports[module] ??= {})[name] = this.getWASIHandler('proc_exit');
+          } else {
+            (imports[module] ??= {})[name] = empty;
+          }
+        } else if (kind === 'memory' && module === 'env' && name === 'memory') {
+          importsMemory = true;
         }
       }
-      const initialPages = memoryInitial ?? (this.memory.buffer.byteLength / 65536);
-      env.memory = new w.Memory(this.memory64 ? {
-        initial: BigInt(initialPages),
-        ...(memoryMax !== undefined ? { maximum: BigInt(memoryMax) } : undefined),
-        shared: multithreaded,
-        address: 'i64',
-      } : {
-        initial: initialPages,
-        maximum: memoryMax,
-        shared: multithreaded,
-      });
+      if (importsMemory) {
+        const initialPages = memoryInitial
+          ?? (this.initialMemoryPages || ((this.memory?.buffer.byteLength ?? 65536) / 65536));
+        env.memory = new w.Memory(this.memory64 ? {
+          initial: BigInt(initialPages),
+          ...(memoryMax !== undefined ? { maximum: BigInt(memoryMax) } : undefined),
+          shared: multithreaded,
+          address: 'i64',
+        } : {
+          initial: initialPages,
+          maximum: memoryMax,
+          shared: multithreaded,
+        });
+      }
       let table;
       const initialTable = tableInitial || this.initialTableLength;
       if (initialTable) {
@@ -12875,6 +13067,8 @@ var thunkAllocation = mixin({
         });
       }
       const { exports } = new w.Instance(this.executable, imports);
+      secMemory = env.memory ?? exports.memory ?? null;
+      secSpGlobal = exports.__stack_pointer ?? null;
       table ??= exports.__indirect_function_table;
       const createJsThunk = exports.createJsThunk && this.importFunction(exports.createJsThunk, 'az', 'a');
       const destroyJsThunk = exports.destroyJsThunk && this.importFunction(exports.destroyJsThunk, 'aa', 'z');
@@ -12951,7 +13145,6 @@ var thunkAllocation = mixin({
       const isTable64 = typeof this.table.length === 'bigint';
       const tableIdx = isTable64 ? BigInt(thunkAddress) : Number(thunkAddress);
       const thunkObject = this.table.get(tableIdx);
-      this.table.set(tableIdx, null);
       const entry = this.thunkMap.get(thunkObject);
       if (entry) {
         const { source, sourceAddress } = entry;

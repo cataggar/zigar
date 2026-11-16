@@ -65,6 +65,10 @@ pub const workerNestedSyncReentrancy = work_queue.promisify(worker_ns.nestedSync
 pub const workerNestedSyncPropagateError = work_queue.promisify(worker_ns.nestedSyncPropagateError);
 pub const workerNestedPreserveOuterError = work_queue.promisify(worker_ns.nestedPreserveOuterError);
 
+pub fn pushDetachedWorkerAwaitNoPromise(p: js.Promise(i32)) !void {
+    try work_queue.push(worker_ns.awaitCatchUninspected, .{p}, null);
+}
+
 const NestedBoomCtx = struct {
     obj: Ref(js.Object),
 };
@@ -586,3 +590,49 @@ const worker_ns = struct {
         return (try exc.message(allocator)) orelse return error.MissingMessage;
     }
 };
+
+pub const AbortedJscallFn = *const fn () error{Unexpected}!void;
+
+var aborted_jscall_ready: std.atomic.Value(u32) = .init(0);
+var aborted_jscall_state: std.atomic.Value(u32) = .init(0);
+var aborted_jscall_thread: ?std.Thread = null;
+var aborted_jscall_fn: ?AbortedJscallFn = null;
+
+fn runAbortedJscallWorker(cb: AbortedJscallFn) void {
+    aborted_jscall_ready.store(1, .release);
+    if (cb()) |_| {
+        aborted_jscall_state.store(2, .release);
+    } else |_| {
+        aborted_jscall_state.store(1, .release);
+    }
+}
+
+pub fn triggerAbortedQueuedJscall(cb: AbortedJscallFn) !void {
+    aborted_jscall_ready.store(0, .release);
+    aborted_jscall_state.store(0, .release);
+    aborted_jscall_fn = cb;
+    try zigar.thread.use();
+    const t = try std.Thread.spawn(.{}, runAbortedJscallWorker, .{cb});
+    aborted_jscall_thread = t;
+    while (aborted_jscall_ready.load(.acquire) == 0) {
+        std.atomic.spinLoopHint();
+    }
+    std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(15), .real) catch {};
+    zigar.thread.end();
+}
+
+pub fn pollAndJoinAbortedQueuedJscall() u32 {
+    const state = aborted_jscall_state.load(.acquire);
+    if (state != 0) {
+        if (aborted_jscall_thread) |t| {
+            aborted_jscall_thread = null;
+            t.join();
+        }
+        if (aborted_jscall_fn) |cb| {
+            aborted_jscall_fn = null;
+            zigar.function.release(cb);
+        }
+    }
+    return state;
+}
+

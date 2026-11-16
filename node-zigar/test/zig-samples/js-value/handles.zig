@@ -192,6 +192,8 @@ pub fn clearGlobal() void {
         exported_pair.second.deinit();
     }
     exported_pair = .{ .first = .@"null", .second = .@"null" };
+    releaseAllRegisteredIntFns();
+    clearBorrowedSliceRefs();
 }
 
 pub fn swapPair(pair: Pair) Pair {
@@ -525,4 +527,77 @@ pub fn leaveStaleDeinitInUninitRefAndReuseSlot(
     }
     saved_ref = keeper.clone();
     keeper.deinit();
+}
+
+pub const IntFn = *const fn (i32) i32;
+
+var stored_int_fns: [32]?IntFn = @splat(null);
+var stored_int_fn_count: usize = 0;
+
+pub fn registerIntFn(cb: IntFn) usize {
+    const idx = stored_int_fn_count;
+    if (idx >= stored_int_fns.len) unreachable;
+    stored_int_fns[idx] = cb;
+    stored_int_fn_count = idx + 1;
+    return idx;
+}
+
+pub fn callRegisteredIntFn(idx: usize, arg: i32) i32 {
+    const cb = stored_int_fns[idx] orelse unreachable;
+    return cb(arg);
+}
+
+pub fn releaseAllRegisteredIntFns() void {
+    for (0..stored_int_fn_count) |i| {
+        if (stored_int_fns[i]) |cb| {
+            zigar.function.release(cb);
+            stored_int_fns[i] = null;
+        }
+    }
+    stored_int_fn_count = 0;
+}
+
+pub fn growZigMemoryPages(byte_count: usize) !u8 {
+    const slice = try std.heap.page_allocator.alloc(u8, byte_count);
+    defer std.heap.page_allocator.free(slice);
+    @memset(slice, 0x5A);
+    return slice[byte_count - 1];
+}
+
+pub fn returnPairWithStaleFirst(first: Ref(js.Object), second: Ref(js.Object)) Pair {
+    const stale_bits = first.handle;
+    first.deinit();
+    return .{
+        .first = .{ .handle = stale_bits },
+        .second = second.cast(js.Any),
+    };
+}
+
+var borrowed_slice_storage: [2]Ref(js.Object) = .{ .@"null", .@"null" };
+
+pub fn storeBorrowedSliceRefs(a: Ref(js.Object), b: Ref(js.Object)) void {
+    clearBorrowedSliceRefs();
+    borrowed_slice_storage[0] = a;
+    borrowed_slice_storage[1] = b;
+}
+
+pub fn clearBorrowedSliceRefs() void {
+    for (&borrowed_slice_storage) |*slot| {
+        if (!slot.isReserved()) {
+            slot.deinit();
+        }
+        slot.* = .@"null";
+    }
+}
+
+pub fn returnBorrowedSliceOnHostError(thrower: Ref(js.Function)) []const Ref(js.Object) {
+    defer thrower.deinit();
+    _ = thrower.invoke(fn () i32, .{});
+    return borrowed_slice_storage[0..];
+}
+
+pub fn returnByValueRefOnHostError(thrower: Ref(js.Function), owned: Ref(js.Object)) Ref(js.Object) {
+    defer thrower.deinit();
+    _ = thrower.invoke(fn () i32, .{});
+    return owned;
 }

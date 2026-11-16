@@ -324,4 +324,130 @@ describe('Tree-Shaken ES Module Imports & CJS/ESM Interop (zigar-compiler WASM)'
     );
     expect(Number(mod.activeHandles())).to.equal(0);
   });
+
+  it('should distinguish .js CommonJS modules (including pre-mutated exports) from .js ESM facades overriding CJS star-reexports across ESM and CJS outputs', async function() {
+    const jsExtZig = join(sampleDir, 'js-ext-parity.zig');
+    const jsExtFileURL = pathToFileURL(jsExtZig).href;
+    const plainCjsURL = pathToFileURL(join(sampleDir, 'cjs-pkg/plain-cjs.js')).href;
+
+    // Pre-mutate `.js` CJS exports BEFORE loading transpiled ESM so `ns.count` (1) diverges from live `exports.count` (2)!
+    const plainNs = await import(plainCjsURL);
+    plainNs.default.count = 1;
+    expect(plainNs.default.bump()).to.equal(2);
+
+    const esmRes = await transpile(jsExtZig, {
+      nodeCompat: false,
+      embedWASM: true,
+      topLevelAwait: true,
+      stripWASM: true,
+      optimize: 'ReleaseSmall',
+      jsModuleResolver: (spec) => (spec.startsWith('./') || spec.startsWith('../'))
+        ? new URL(spec, jsExtFileURL).href
+        : spec,
+    });
+    const tmpBase = process.env.TMPDIR || os.tmpdir();
+    const outDir = join(tmpBase, 'zigar-esmod-wasm');
+    await mkdir(outDir, { recursive: true });
+    const mjsPath = join(outDir, `js-ext-esm-${++counter}.mjs`);
+    await writeFile(mjsPath, rewriteRuntimeImports(esmRes.code), 'utf-8');
+
+    const esmMod = await import(pathToFileURL(mjsPath).href);
+    expect(esmMod.exercisePlainDotJsCjs().string).to.equal('2|3=3|42->43|restored=1');
+    expect(esmMod.exerciseFacadeOverrideDotJsEsm().string).to.equal(
+      'facade=999:cjs=1|set_err=true:cjs=1:facade=999|bumped=2:facade=999:def=1',
+    );
+    expect(Number(esmMod.activeHandles())).to.equal(0);
+
+    // Also test CJS (`moduleFormat: 'cjs'`) where Node `require(esm)` loads `facade-override.js`
+    const req = createRequire(import.meta.url);
+    const plainCjs = req(join(sampleDir, 'cjs-pkg/plain-cjs.js'));
+    plainCjs.count = 1;
+    expect(plainCjs.bump()).to.equal(2);
+
+    const cjsRes = await transpile(jsExtZig, {
+      nodeCompat: true,
+      embedWASM: true,
+      topLevelAwait: false,
+      stripWASM: true,
+      optimize: 'ReleaseSmall',
+      moduleFormat: 'cjs',
+      jsModuleResolver: (spec) => (spec.startsWith('./') || spec.startsWith('../'))
+        ? fileURLToPath(new URL(spec, jsExtFileURL))
+        : spec,
+    });
+    const cjsPath = join(outDir, `js-ext-cjs-${++counter}.cjs`);
+    await writeFile(cjsPath, rewriteRuntimeImports(cjsRes.code, { cjs: true }), 'utf-8');
+
+    const cjsMod = req(cjsPath);
+    await cjsMod.__zigar.init();
+    expect(cjsMod.exercisePlainDotJsCjs().string).to.equal('2|3=3|42->43|restored=1');
+    expect(cjsMod.exerciseFacadeOverrideDotJsEsm().string).to.equal(
+      'facade=999:cjs=1|set_err=true:cjs=1:facade=999|bumped=2:facade=999:def=1',
+    );
+    expect(Number(cjsMod.activeHandles())).to.equal(0);
+
+    // Also test Rollup `_mergeNamespaces`-bundled shapes via in-memory WASM environment
+    function mergeNamespaces(n, m) {
+      m.forEach((e) => {
+        if (e && typeof e !== 'string' && !Array.isArray(e)) {
+          Object.keys(e).forEach((k) => {
+            if (k !== 'default' && !(k in n)) {
+              const d = Object.getOwnPropertyDescriptor(e, k);
+              Object.defineProperty(n, k, d.get ? d : {
+                enumerable: true,
+                get() {
+                  return e[k];
+                },
+              });
+            }
+          });
+        }
+      });
+      return Object.freeze(n);
+    }
+    const { outputPath } = await compile(jsExtZig, null, {
+      arch: 'wasm32',
+      platform: 'wasi',
+      isWASM: true,
+      optimize: 'ReleaseSmall',
+    });
+    const wasmBytes = await readFile(outputPath);
+    const dv = new DataView(wasmBytes.buffer, wasmBytes.byteOffset, wasmBytes.byteLength);
+    const limits = extractLimits(dv);
+    const Env = defineEnvironment();
+    const rollupEnv = new Env();
+    const rollupPlainTarget = {
+      count: 2,
+      bump() {
+        rollupPlainTarget.count += 1;
+        return rollupPlainTarget.count;
+      },
+    };
+    const rollupPlainMerged = mergeNamespaces(
+      Object.assign(Object.create(null), { default: rollupPlainTarget }),
+      [ rollupPlainTarget ],
+    );
+    const rollupFacadeMerged = mergeNamespaces(
+      Object.assign(Object.create(null), { default: rollupPlainTarget, count: 999 }),
+      [ rollupPlainTarget ],
+    );
+    rollupEnv.registerJsModules({
+      './cjs-pkg/plain-cjs.js': rollupPlainMerged,
+      './facade-override.js': rollupFacadeMerged,
+    });
+    rollupEnv.loadModule(wasmBytes, {
+      memoryInitial: limits.memoryInitial !== undefined ? Number(limits.memoryInitial) : undefined,
+      memoryMax: limits.memoryMax !== undefined ? Number(limits.memoryMax) : undefined,
+      tableInitial: limits.tableInitial !== undefined ? Number(limits.tableInitial) : undefined,
+      multithreaded: false,
+    });
+    await rollupEnv.initPromise;
+    rollupEnv.acquireStructures();
+    const rollupMod = rollupEnv.useStructures();
+    expect(rollupMod.exercisePlainDotJsCjs().string).to.equal('2|3=3|42->43|restored=1');
+    expect(rollupMod.exerciseFacadeOverrideDotJsEsm().string).to.equal(
+      'facade=999:cjs=1|set_err=true:cjs=1:facade=999|bumped=2:facade=999:def=1',
+    );
+    expect(Number(rollupMod.activeHandles())).to.equal(0);
+  });
 });

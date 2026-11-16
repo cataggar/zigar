@@ -35,8 +35,9 @@ const JS_TYPE_CODES = {
 function initRegistryState(env) {
   env.jsValueSlots = new Array(INITIAL_CAPACITY);
   env.jsValueGenerations = new Uint16Array(INITIAL_CAPACITY);
-  env.jsValueFreeNext = new Int32Array(INITIAL_CAPACITY);
+  env.jsValueFreeNext = new Int32Array(INITIAL_CAPACITY).fill(-1);
   env.jsValueFreeHead = -1;
+  env.jsValueFreeTail = -1;
   env.jsValueNextSlot = FIRST_DYNAMIC_SLOT;
   env.jsValueActiveCount = 0;
   env.pendingJsHandles = null;
@@ -58,14 +59,14 @@ var jsValueRegistry = mixin({
   growJsValueRegistry() {
     const oldCap = this.jsValueSlots.length;
     if (oldCap >= MAX_SLOTS) {
-      throw new RangeError('JsValue handle table exhausted');
+      throw new RangeError('JsValueRegistry exhausted');
     }
     const newCap = Math.min(oldCap * 2, MAX_SLOTS);
     this.jsValueSlots.length = newCap;
     const nextGen = new Uint16Array(newCap);
     nextGen.set(this.jsValueGenerations);
     this.jsValueGenerations = nextGen;
-    const nextFree = new Int32Array(newCap);
+    const nextFree = new Int32Array(newCap).fill(-1);
     nextFree.set(this.jsValueFreeNext);
     this.jsValueFreeNext = nextFree;
   },
@@ -81,9 +82,14 @@ var jsValueRegistry = mixin({
     let slot, gen;
     if (this.jsValueFreeHead >= 0) {
       slot = this.jsValueFreeHead;
-      this.jsValueFreeHead = this.jsValueFreeNext[slot];
+      const next = this.jsValueFreeNext[slot];
+      this.jsValueFreeHead = next;
+      if (next < 0) {
+        this.jsValueFreeTail = -1;
+      }
+      this.jsValueFreeNext[slot] = -1;
       const prevGen = this.jsValueGenerations[slot] & GEN_MASK;
-      gen = (prevGen >= GEN_MASK) ? 1 : prevGen + 1;
+      gen = prevGen + 1;
     } else {
       if (this.jsValueNextSlot >= this.jsValueSlots.length) {
         this.growJsValueRegistry();
@@ -144,11 +150,24 @@ var jsValueRegistry = mixin({
       || gen === 0 || this.jsValueGenerations[slot] !== (ACTIVE_BIT | gen)) {
       throw new InvalidJsValueHandle(handle);
     }
-    this.jsValueGenerations[slot] = gen;
     this.jsValueSlots[slot] = undefined;
-    this.jsValueFreeNext[slot] = this.jsValueFreeHead;
-    this.jsValueFreeHead = slot;
     this.jsValueActiveCount--;
+    if (gen >= GEN_MASK) {
+      // Permanently retire slots once their 12-bit generation reaches 0xFFF (4095)
+      // so a (gen, slot) handle pair is never re-issued across the instance lifetime.
+      this.jsValueGenerations[slot] = 0;
+      this.jsValueFreeNext[slot] = -1;
+    } else {
+      this.jsValueGenerations[slot] = gen;
+      this.jsValueFreeNext[slot] = -1;
+      if (this.jsValueFreeTail >= 0) {
+        this.jsValueFreeNext[this.jsValueFreeTail] = slot;
+        this.jsValueFreeTail = slot;
+      } else {
+        this.jsValueFreeHead = slot;
+        this.jsValueFreeTail = slot;
+      }
+    }
   },
   typeofJsValue(handle) {
     const value = this.getJsValue(handle);
@@ -189,26 +208,38 @@ var jsValueRegistry = mixin({
       return;
     }
     const dv = refObj[MEMORY];
-    const handle = dv.getUint32(0, this.littleEndian);
-    const value = this.getJsValue(handle);
-    this.releaseJsValue(handle);
-    refObj[TARGET] = value;
-    dv.setUint32(0, RESERVED_UNDEFINED, this.littleEndian);
+    try {
+      const handle = dv.getUint32(0, this.littleEndian);
+      const value = this.getJsValue(handle);
+      this.releaseJsValue(handle);
+      refObj[TARGET] = value;
+    } finally {
+      dv.setUint32(0, RESERVED_UNDEFINED, this.littleEndian);
+    }
   },
-  consumeJsValueSlot(parent, slot, structure) {
+  consumeJsValueSlot(parent, slot, structure, errState = null) {
     if (!hasJsValue(structure)) {
       return;
     }
+    const isRoot = !errState;
+    const state = errState ?? { error: null };
     const obj = parent[SLOTS][slot] ?? parent[VIVIFICATE](slot);
     if (structure.purpose === StructurePurpose.JsValue) {
-      this.consumeJsValueObject(obj);
+      try {
+        this.consumeJsValueObject(obj);
+      } catch (err) {
+        state.error ??= err;
+      }
+      if (isRoot && state.error) {
+        throw state.error;
+      }
       return;
     }
     switch (structure.type) {
       case StructureType.Struct: {
         for (const member of structure.instance.members) {
           if (member.type === MemberType.Object) {
-            this.consumeJsValueSlot(obj, member.slot, member.structure);
+            this.consumeJsValueSlot(obj, member.slot, member.structure, state);
           }
         }
         break;
@@ -217,7 +248,7 @@ var jsValueRegistry = mixin({
         const [ valueMember, presentMember ] = structure.instance.members;
         if (valueMember.type === MemberType.Object
           && isNonZeroBytes(obj[MEMORY], presentMember.bitOffset >> 3, presentMember.byteSize)) {
-          this.consumeJsValueSlot(obj, valueMember.slot, valueMember.structure);
+          this.consumeJsValueSlot(obj, valueMember.slot, valueMember.structure, state);
         }
         break;
       }
@@ -225,14 +256,14 @@ var jsValueRegistry = mixin({
         const [ valueMember, errorMember ] = structure.instance.members;
         if (valueMember.type === MemberType.Object
           && !isNonZeroBytes(obj[MEMORY], errorMember.bitOffset >> 3, errorMember.byteSize)) {
-          this.consumeJsValueSlot(obj, valueMember.slot, valueMember.structure);
+          this.consumeJsValueSlot(obj, valueMember.slot, valueMember.structure, state);
         }
         break;
       }
       case StructureType.Union: {
         const activeMember = getActiveUnionMember(structure, obj[MEMORY], 0, this.littleEndian);
         if (activeMember?.type === MemberType.Object) {
-          this.consumeJsValueSlot(obj, activeMember.slot, activeMember.structure);
+          this.consumeJsValueSlot(obj, activeMember.slot, activeMember.structure, state);
         }
         break;
       }
@@ -240,11 +271,14 @@ var jsValueRegistry = mixin({
         const [ elementMember ] = structure.instance.members;
         if (elementMember.type === MemberType.Object) {
           for (let i = 0; i < structure.length; i++) {
-            this.consumeJsValueSlot(obj, i, elementMember.structure);
+            this.consumeJsValueSlot(obj, i, elementMember.structure, state);
           }
         }
         break;
       }
+    }
+    if (isRoot && state.error) {
+      throw state.error;
     }
   },
   releaseZigJsValues(structure, dv, offset = 0) {
@@ -318,6 +352,11 @@ var jsValueRegistry = mixin({
     };
     visit(structure, offset);
   },
+  // Releases by-value `Ref(T)` handles written into `argStruct.retval` when a call aborts or
+  // leaves a pending host exception. Pointers and Zig slices (`[]const Ref(T)` / `*Ref(T)`,
+  // represented as `StructureType.Pointer` to `StructureType.Slice` or target memory) are
+  // intentionally NOT walked here — matching `hasJsValue` in `utils.js` — because handles behind
+  // pointers/slices reside in Zig-owned memory and are borrowed rather than ownership-transferred.
   discardJsValueRetval(argStruct) {
     const retvalMember = argStruct?.[VIVIFICATE]?.retvalMember;
     if (!retvalMember || retvalMember.type !== MemberType.Object || this.jsValueActiveCount === 0) {

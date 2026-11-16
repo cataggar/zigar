@@ -1,5 +1,6 @@
+import { PosixError } from '../constants.js';
 import { mixin } from '../environment.js';
-import { empty } from '../utils.js';
+import { decodeText, empty, isPromise, toBufferOffset } from '../utils.js';
 
 export default mixin({
   ...(process.env.TARGET === 'wasm' ? {
@@ -25,22 +26,121 @@ export default mixin({
       const w = WebAssembly;
       const env = {}, wasi = {}, wasiPreview = {};
       const imports = { env, wasi, wasi_snapshot_preview1: wasiPreview };
+      let secMemory = null;
+      let secSpGlobal = null;
+      let secLowWaterSp = null;
+      let secSuspendedCount = 0;
+      const forwardHandleJscall = (fnId, secArgAddr, argSize, canWait) => {
+        const byteLen = Number(argSize);
+        const secOffset = toBufferOffset(secArgAddr);
+        const scratchAddr = (byteLen > 0)
+          ? this.allocateScratchMemory(byteLen, 16)
+          : (this.memory64 ? 0n : 0);
+        if (byteLen > 0) {
+          const src = new Uint8Array(secMemory.buffer, secOffset, byteLen);
+          const dst = new Uint8Array(this.memory.buffer, toBufferOffset(scratchAddr), byteLen);
+          dst.set(src);
+        }
+        const copyBackAndFree = () => {
+          if (this.abandoned) {
+            return;
+          }
+          try {
+            if (byteLen > 0) {
+              const src = new Uint8Array(this.memory.buffer, toBufferOffset(scratchAddr), byteLen);
+              const dst = new Uint8Array(secMemory.buffer, secOffset, byteLen);
+              dst.set(src);
+            }
+          } finally {
+            if (byteLen > 0) {
+              this.freeScratchMemory(scratchAddr, byteLen, 16);
+            }
+          }
+        };
+        let res;
+        try {
+          res = this.handleJscall(fnId, scratchAddr, byteLen, canWait);
+        } catch (err) {
+          if (byteLen > 0 && !this.abandoned) {
+            this.freeScratchMemory(scratchAddr, byteLen, 16);
+          }
+          throw err;
+        }
+        if (isPromise(res)) {
+          if (secSpGlobal) {
+            const curSp = Number(secSpGlobal.value);
+            const step = Math.max(4096, (byteLen + 255) & ~15);
+            const baseSp = (secLowWaterSp !== null) ? Math.min(secLowWaterSp, curSp) : curSp;
+            const targetSp = (baseSp - step) & ~15;
+            if (targetSp >= 4096) {
+              secLowWaterSp = targetSp;
+              try {
+                secSpGlobal.value = (typeof secSpGlobal.value === 'bigint') ? BigInt(targetSp) : targetSp;
+              } catch {}
+            }
+          }
+          secSuspendedCount++;
+          const finishSuspend = () => {
+            if (--secSuspendedCount === 0) {
+              secLowWaterSp = null;
+            }
+          };
+          return res.then(
+            (code) => {
+              finishSuspend();
+              if (this.abandoned) {
+                return PosixError.EFAULT;
+              }
+              copyBackAndFree();
+              return code;
+            },
+            (err) => {
+              finishSuspend();
+              if (byteLen > 0 && !this.abandoned) {
+                this.freeScratchMemory(scratchAddr, byteLen, 16);
+              }
+              throw err;
+            },
+          );
+        }
+        copyBackAndFree();
+        return res;
+      };
+      let importsMemory = false;
       for (const { module, name, kind } of w.Module.imports(this.executable)) {
         if (kind === 'function') {
-          (imports[module] ??= {})[name] = empty;
+          if (module === 'env' && name === '_handleJscall' && this.exportFunction) {
+            (imports[module] ??= {})[name] = this.exportFunction(forwardHandleJscall, 'zazb', 'i', 'handleJscall');
+          } else if (module === 'env' && name === '_displayPanic' && this.exportFunction) {
+            (imports[module] ??= {})[name] = this.exportFunction((address, len) => {
+              if (secMemory) {
+                const array = new Uint8Array(secMemory.buffer, toBufferOffset(address), Number(len));
+                console.error(`Zig panic: ${decodeText(array)}`);
+              }
+            }, 'az', '');
+          } else if (module === 'wasi_snapshot_preview1' && name === 'proc_exit' && this.getWASIHandler) {
+            (imports[module] ??= {})[name] = this.getWASIHandler('proc_exit');
+          } else {
+            (imports[module] ??= {})[name] = empty;
+          }
+        } else if (kind === 'memory' && module === 'env' && name === 'memory') {
+          importsMemory = true;
         }
       }
-      const initialPages = memoryInitial ?? (this.memory.buffer.byteLength / 65536);
-      env.memory = new w.Memory(this.memory64 ? {
-        initial: BigInt(initialPages),
-        ...(memoryMax !== undefined ? { maximum: BigInt(memoryMax) } : undefined),
-        shared: multithreaded,
-        address: 'i64',
-      } : {
-        initial: initialPages,
-        maximum: memoryMax,
-        shared: multithreaded,
-      });
+      if (importsMemory) {
+        const initialPages = memoryInitial
+          ?? (this.initialMemoryPages || ((this.memory?.buffer.byteLength ?? 65536) / 65536));
+        env.memory = new w.Memory(this.memory64 ? {
+          initial: BigInt(initialPages),
+          ...(memoryMax !== undefined ? { maximum: BigInt(memoryMax) } : undefined),
+          shared: multithreaded,
+          address: 'i64',
+        } : {
+          initial: initialPages,
+          maximum: memoryMax,
+          shared: multithreaded,
+        });
+      }
       let table;
       const initialTable = tableInitial || this.initialTableLength;
       if (initialTable) {
@@ -54,6 +154,8 @@ export default mixin({
         });
       }
       const { exports } = new w.Instance(this.executable, imports);
+      secMemory = env.memory ?? exports.memory ?? null;
+      secSpGlobal = exports.__stack_pointer ?? null;
       table ??= exports.__indirect_function_table;
       const createJsThunk = exports.createJsThunk && this.importFunction(exports.createJsThunk, 'az', 'a');
       const destroyJsThunk = exports.destroyJsThunk && this.importFunction(exports.destroyJsThunk, 'aa', 'z');
@@ -130,7 +232,6 @@ export default mixin({
       const isTable64 = typeof this.table.length === 'bigint';
       const tableIdx = isTable64 ? BigInt(thunkAddress) : Number(thunkAddress);
       const thunkObject = this.table.get(tableIdx);
-      this.table.set(tableIdx, null);
       const entry = this.thunkMap.get(thunkObject);
       if (entry) {
         const { source, sourceAddress } = entry;

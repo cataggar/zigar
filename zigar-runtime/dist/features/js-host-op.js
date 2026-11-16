@@ -662,31 +662,48 @@ var jsHostOp = mixin({
   trackJsModuleNamespace(moduleExports, specifier) {
     if (moduleExports !== null && (typeof(moduleExports) === 'object' || typeof(moduleExports) === 'function')) {
       this.jsModuleNamespaces.add(moduleExports);
+      if (this.jsEsmNamespaces.has(moduleExports) || this.jsCjsNamespaces.has(moduleExports)) {
+        return;
+      }
       if (isEsmExtension(specifier)) {
         this.jsEsmNamespaces.add(moduleExports);
         return;
       }
-      if (
-        isSyntheticCjsNamespace(moduleExports, specifier)
-        || (
-          isEsModuleNamespaceObject(moduleExports)
-          && hasDefaultFallbackTarget(moduleExports.default)
-          && hasOnlyCjsMirroredExports(moduleExports)
-          && typeof(specifier) === 'string'
-          && Boolean(globalThis.Bun)
-          && this.isBunCjsModule(specifier, moduleExports)
-        )
-      ) {
+      if (isCjsExtension(specifier)) {
+        if (isEsModuleNamespaceObject(moduleExports) && hasDefaultFallbackTarget(moduleExports.default)) {
+          this.jsCjsNamespaces.add(moduleExports);
+        }
+        return;
+      }
+      if (isRollupMergedCjsNamespace(moduleExports)) {
         this.jsCjsNamespaces.add(moduleExports);
+        return;
+      }
+      if (
+        isEsModuleNamespaceObject(moduleExports)
+        && hasDefaultFallbackTarget(moduleExports.default)
+        && hasOnlyCjsMirroredExports(moduleExports)
+      ) {
+        const runtimeKind = this.classifyAmbiguousModuleNamespace(specifier, moduleExports);
+        if (runtimeKind === 'cjs') {
+          this.jsCjsNamespaces.add(moduleExports);
+        } else if (runtimeKind === 'esm') {
+          this.jsEsmNamespaces.add(moduleExports);
+        } else if (isCjsWrappedNamespace(moduleExports)) {
+          this.jsCjsNamespaces.add(moduleExports);
+        }
       }
     }
   },
-  isBunCjsModule(specifier, moduleExports) {
+  classifyAmbiguousModuleNamespace(specifier, moduleExports) {
+    if (typeof(specifier) !== 'string' || !specifier) {
+      return undefined;
+    }
     try {
       const proc = globalThis.process;
       const nodeModule = proc?.getBuiltinModule?.('node:module');
       if (typeof(nodeModule?.createRequire) !== 'function') {
-        return false;
+        return undefined;
       }
       const fallbackBase = `${proc.cwd?.() ?? '/'}/_zigar_host_.js`;
       const strippedBase = String(this.moduleBaseURL || fallbackBase)
@@ -697,12 +714,53 @@ var jsHostOp = mixin({
         : strippedBase;
       const basePath = usableBase.endsWith('/') ? `${usableBase}_zigar_host_.js` : usableBase;
       const req = nodeModule.createRequire(basePath);
-      const spec = specifier.startsWith('file://') ? new URL(specifier) : specifier;
-      const resolved = req.resolve(spec);
-      return req.cache?.[resolved]?.exports === moduleExports.default;
-    } catch {
-      return false;
-    }
+      try {
+        const cleanSpec = specifier.startsWith('file://')
+          ? new URL(specifier.split(/[?#]/)[0])
+          : (specifier.split(/[?#]/)[0] || specifier);
+        const resolved = req.resolve(cleanSpec);
+        const entry = req.cache?.[resolved];
+        if (entry) {
+          if (getRequiredEsmNamespace(entry) !== undefined) {
+            return 'esm';
+          }
+          if (entry.exports === moduleExports.default) {
+            return 'cjs';
+          }
+        }
+        return 'esm';
+      } catch {
+        const cacheObj = req.cache || nodeModule._cache;
+        if (cacheObj) {
+          const cleanTail = specifier.split(/[?#]/)[0].replace(/^(?:\.\/|\.\.\/)+/, '');
+          let anyCjsHasDefault = false;
+          for (const entry of Object.values(cacheObj)) {
+            if (!entry) {
+              continue;
+            }
+            const reqNs = getRequiredEsmNamespace(entry);
+            const fnMatch = Boolean(
+              cleanTail
+              && typeof(entry.filename) === 'string'
+              && entry.filename.replace(/\\/g, '/').endsWith(`/${cleanTail}`),
+            );
+            if (fnMatch && reqNs !== undefined) {
+              return 'esm';
+            }
+            if (reqNs === undefined && entry.exports === moduleExports.default) {
+              anyCjsHasDefault = true;
+              if (fnMatch) {
+                return 'cjs';
+              }
+            }
+          }
+          if (anyCjsHasDefault) {
+            return 'esm';
+          }
+        }
+      }
+    } catch {}
+    return undefined;
   },
   isJsCjsNamespace(target) {
     if (target === null || typeof(target) !== 'object') {
@@ -756,21 +814,12 @@ var jsHostOp = mixin({
         : strippedBase;
       const basePath = usableBase.endsWith('/') ? `${usableBase}_zigar_host_.js` : usableBase;
       const req = nodeModule.createRequire(basePath);
-      const getEntryNamespace = (entry) => {
-        if (entry) {
-          for (const sym of Object.getOwnPropertySymbols(entry)) {
-            if (typeof(entry[sym]?.getNamespace) === 'function') {
-              return entry[sym].getNamespace();
-            }
-          }
-        }
-        return undefined;
-      };
       try {
         const specTarget = spec.startsWith('file://') ? new URL(spec) : spec;
         const resolved = req.resolve(specTarget);
-        const ns = getEntryNamespace(req.cache?.[resolved]);
+        const ns = getRequiredEsmNamespace(req.cache?.[resolved]);
         if (ns !== undefined) {
+          this.jsEsmNamespaces.add(ns);
           return ns;
         }
       } catch {
@@ -782,8 +831,9 @@ var jsHostOp = mixin({
               && typeof(entry.filename) === 'string'
               && entry.filename.replace(/\\/g, '/').endsWith(`/${cleanTail}`)
             ) {
-              const ns = getEntryNamespace(entry);
+              const ns = getRequiredEsmNamespace(entry);
               if (ns !== undefined) {
+                this.jsEsmNamespaces.add(ns);
                 return ns;
               }
             }
@@ -1784,6 +1834,17 @@ function isCjsWrappedNamespace(mod) {
     && hasOnlyCjsMirroredExports(mod);
 }
 
+function getRequiredEsmNamespace(entry) {
+  if (entry) {
+    for (const sym of Object.getOwnPropertySymbols(entry)) {
+      if (typeof(entry[sym]?.getNamespace) === 'function') {
+        return entry[sym].getNamespace();
+      }
+    }
+  }
+  return undefined;
+}
+
 function isRollupMergedCjsNamespace(mod) {
   if (isEsModuleNamespaceObject(mod) || !isFrozenNullProtoNamespace(mod) || !hasDefaultFallbackTarget(mod.default)) {
     return false;
@@ -1791,6 +1852,7 @@ function isRollupMergedCjsNamespace(mod) {
   if (!hasOnlyCjsMirroredExports(mod)) {
     return false;
   }
+  const target = Object(mod.default);
   let hasGetterExport = false;
   for (const key of Reflect.ownKeys(mod)) {
     if (typeof(key) !== 'string' || key === 'default') {
@@ -1800,23 +1862,12 @@ function isRollupMergedCjsNamespace(mod) {
     if (!desc || typeof(desc.get) !== 'function' || desc.set !== undefined) {
       return false;
     }
+    if (!Object.is(mod[key], target[key])) {
+      return false;
+    }
     hasGetterExport = true;
   }
   return hasGetterExport;
-}
-
-function isSyntheticCjsNamespace(mod, specifier) {
-  if (
-    isCjsExtension(specifier)
-    && isEsModuleNamespaceObject(mod)
-    && hasDefaultFallbackTarget(mod.default)
-  ) {
-    return true;
-  }
-  if (isCjsWrappedNamespace(mod)) {
-    return true;
-  }
-  return isRollupMergedCjsNamespace(mod);
 }
 
 function isModuleNamespaceLike(mod) {

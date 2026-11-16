@@ -118,4 +118,30 @@ describe('Native ES Module Imports, Tree-Shaking & CJS/ESM Interop (node-zigar)'
     expect(mod.exerciseRuntimeRelativeImport('./cjs-export-equals.cjs', 3, 19)).to.equal(319);
     expect(Number(mod.activeHandles())).to.equal(0);
   });
+
+  it('should distinguish .js CommonJS modules (with pre-mutated exports) from .js ESM facades overriding CJS exports in both ESM and require(esm)', async function() {
+    const jsExtURL = new URL('./zig-samples/js-value/module-imports/js-ext-parity.zig?optimize=ReleaseSafe&quiet=1', import.meta.url);
+    const plainNs = await import('./zig-samples/js-value/module-imports/cjs-pkg/plain-cjs.js');
+    plainNs.default.count = 1;
+    expect(plainNs.default.bump()).to.equal(2);
+    expect(plainNs.count).to.equal(1);
+
+    const esmMod = await import(jsExtURL.href);
+    expect(esmMod.exercisePlainDotJsCjs().string).to.equal('2|3=3|42->43|restored=1');
+    expect(esmMod.exerciseFacadeOverrideDotJsEsm().string).to.equal(
+      'facade=999:cjs=1|set_err=true:cjs=1:facade=999|bumped=2:facade=999:def=1',
+    );
+    expect(Number(esmMod.activeHandles())).to.equal(0);
+
+    const require = createRequire(import.meta.url);
+    const plainCjs = require('./zig-samples/js-value/module-imports/cjs-pkg/plain-cjs.js');
+    plainCjs.count = 1;
+    expect(plainCjs.bump()).to.equal(2);
+    const cjsMod = require('./zig-samples/js-value/module-imports/js-ext-parity.zig?optimize=ReleaseSafe&recompile=0&quiet=1');
+    expect(cjsMod.exercisePlainDotJsCjs().string).to.equal('2|3=3|42->43|restored=1');
+    expect(cjsMod.exerciseFacadeOverrideDotJsEsm().string).to.equal(
+      'facade=999:cjs=1|set_err=true:cjs=1:facade=999|bumped=2:facade=999:def=1',
+    );
+    expect(Number(cjsMod.activeHandles())).to.equal(0);
+  });
 });

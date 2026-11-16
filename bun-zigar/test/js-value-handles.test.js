@@ -194,4 +194,48 @@ describe('Bun Native JsValue Handle Registry & zigar.js.Ref(T) Integration', fun
     mod.clearGlobal();
     expect(Number(mod.activeCount())).to.equal(0);
   });
+
+  it('should support 24+ live *const fn (i32) i32 JS callbacks, reclaim released slots, and enforce M1/L1/L2 handle safety on Bun', function() {
+    for (let i = 0; i < 24; i++) {
+      expect(Number(mod.registerIntFn((x) => (i + 1) * 100 + x))).to.equal(i);
+    }
+    for (let i = 0; i < 24; i++) {
+      expect(mod.callRegisteredIntFn(i, 7)).to.equal((i + 1) * 100 + 7);
+    }
+    mod.releaseAllRegisteredIntFns();
+
+    let staleIter1 = 0;
+    let staleIter4095 = 0;
+    for (let i = 1; i <= 10000 || staleIter4095 === 0; i++) {
+      const raw = mod.inspectRawHandle({ cycle: i });
+      const gen = raw >>> 20;
+      expect(gen).to.be.at.least(1);
+      expect(gen).to.be.at.most(4095);
+      if (i === 1) staleIter1 = raw;
+      if (gen === 4095 && staleIter4095 === 0) staleIter4095 = raw;
+      if (i > 30000) break;
+    }
+    const liveAfterChurn = { bunLiveAfter10k: true };
+    mod.storeGlobal(liveAfterChurn);
+    expect(() => mod.inspectRawBitsTypeof(staleIter1)).to.throw(TypeError, /Invalid or released JS value handle/);
+    expect(() => mod.inspectRawBitsTypeof(staleIter4095)).to.throw(TypeError, /Invalid or released JS value handle/);
+    expect(Object.is(mod.loadGlobalClone(), liveAfterChurn)).to.be.true;
+    mod.clearGlobal();
+    expect(Number(mod.activeCount())).to.equal(0);
+
+    expect(() => mod.returnPairWithStaleFirst({ stale: 1 }, { validSibling: 2 })).to.throw(
+      TypeError,
+      /Invalid or released JS value handle/,
+    );
+    expect(Number(mod.activeCount())).to.equal(0);
+
+    mod.storeBorrowedSliceRefs({ a: 1 }, { b: 2 });
+    expect(Number(mod.activeCount())).to.equal(2);
+    expect(() => mod.returnBorrowedSliceOnHostError(() => {
+      throw new RangeError('pending-slice-host-err');
+    })).to.throw(RangeError, /pending-slice-host-err/);
+    expect(Number(mod.activeCount())).to.equal(2);
+    mod.clearBorrowedSliceRefs();
+    expect(Number(mod.activeCount())).to.equal(0);
+  });
 });

@@ -1439,6 +1439,45 @@ describe('Feature: js-host-op', function() {
       env.releaseJsValue(hTs);
     }
 
+    // C2. Verify Rollup _mergeNamespaces ESM facade that overrides a CJS export (export * from './cjs'; export { default } from './cjs'; export const counter = 999)
+    // stays bound to the ESM namespace instead of unwrapping to default!
+    {
+      const cjsBacking = {
+        counter: 1,
+        bump() {
+          cjsBacking.counter += 1;
+          return cjsBacking.counter;
+        },
+      };
+      let overriddenCounter = 999;
+      const facadeGettersNs = Object.freeze(Object.defineProperties(Object.create(null), {
+        [Symbol.toStringTag]: { value: 'Module' },
+        default: { enumerable: true, value: cjsBacking },
+        counter: { enumerable: true, get: () => overriddenCounter },
+        bump: { enumerable: true, get: () => cjsBacking.bump },
+      }));
+      env.registerJsModules({
+        'pkg-rollup-esm-facade-override': facadeGettersNs,
+      });
+      const hFacade = env.allocJsValue(facadeGettersNs);
+
+      // Reading `counter` MUST return the ESM override (999), NOT `cjsBacking.counter` (1)!
+      frameDV.setInt32(0, 0, true);
+      frameDV.setUint32(argsGetI32.instance.members[1].bitOffset / 8, hFacade, true);
+      expect(env.invokeJsHostOp(dGetCounter, frameAddr)).to.equal(PosixError.NONE);
+      expect(frameDV.getInt32(0, true)).to.equal(999);
+
+      // Mutating `counter` on the frozen ESM namespace MUST fail rather than silently mutating `cjsBacking.counter`!
+      frameDV.setUint16(0, 0, true);
+      frameDV.setUint32(argsSetFallible.instance.members[1].bitOffset / 8, hFacade, true);
+      frameDV.setInt32(argsSetFallible.instance.members[2].bitOffset / 8, 42, true);
+      expect(env.invokeJsHostOp(dSetCounter, frameAddr)).to.equal(PosixError.NONE);
+      expect(frameDV.getUint16(0, true)).to.not.equal(0);
+      expect(cjsBacking.counter).to.equal(1);
+
+      env.releaseJsValue(hFacade);
+    }
+
     // D. Verify CJS namespaces mutated (or having properties deleted) BEFORE module registration still unwrap to live exports
     const preMutatedBareExports = {
       counter: 1,

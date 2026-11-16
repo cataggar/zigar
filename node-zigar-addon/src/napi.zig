@@ -987,8 +987,8 @@ pub const AsyncCompleteCallback = *const fn (
 ) callconv(.c) void;
 /// https://nodejs.org/api/n-api.html#napi_threadsafe_function_call_js
 pub const ThreadsafeFunctionCallJs = *const fn (
-    *@This(),
-    Value,
+    ?*@This(),
+    ?Value,
     ?*anyopaque,
     ?*anyopaque,
 ) callconv(.c) void;

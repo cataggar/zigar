@@ -52,4 +52,19 @@ describe('Bun Native ES Module Imports, Tree-Shaking & CJS/ESM Interop (bun-ziga
     expect(mod.exerciseRuntimeRelativeImport('./cjs-export-equals.cjs', 3, 19)).to.equal(319);
     expect(Number(mod.activeHandles())).to.equal(0);
   });
+
+  it('should distinguish .js CommonJS modules (with pre-mutated exports) from .js ESM facades overriding CJS exports on Bun N-API', async function() {
+    global.__test_options = { optimize: 'ReleaseSafe', quiet: true };
+    const plainNs = await import('../../node-zigar/test/zig-samples/js-value/module-imports/cjs-pkg/plain-cjs.js');
+    plainNs.default.count = 1;
+    expect(plainNs.default.bump()).to.equal(2);
+
+    const jsExtURL = new URL('../../node-zigar/test/zig-samples/js-value/module-imports/js-ext-parity.zig', import.meta.url).href;
+    const mod = await import(jsExtURL);
+    expect(mod.exercisePlainDotJsCjs().string).to.equal('2|3=3|42->43|restored=1');
+    expect(mod.exerciseFacadeOverrideDotJsEsm().string).to.equal(
+      'facade=999:cjs=1|set_err=true:cjs=1:facade=999|bumped=2:facade=999:def=1',
+    );
+    expect(Number(mod.activeHandles())).to.equal(0);
+  });
 });

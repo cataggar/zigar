@@ -278,21 +278,25 @@ describe('JsValue Handle Registry & zigar.js.Ref(T) End-to-End Integration', fun
 
       it('should reuse freed slots with incremented generation and trap on double-deinit or ABA stale handles', function() {
         const raw1 = mod.inspectRawHandle({ seq: 1 });
-        const raw2 = mod.inspectRawHandle({ seq: 2 });
-        const raw3 = mod.inspectRawHandle({ seq: 3 });
-
         const slot1 = raw1 & 0xFFFFF;
-        const slot2 = raw2 & 0xFFFFF;
-        const slot3 = raw3 & 0xFFFFF;
         const gen1 = raw1 >>> 20;
-        const gen2 = raw2 >>> 20;
-        const gen3 = raw3 >>> 20;
-
         expect(slot1).to.be.at.least(8);
-        expect(slot2).to.equal(slot1);
-        expect(slot3).to.equal(slot1);
-        expect(gen2).to.equal(gen1 + 1);
-        expect(gen3).to.equal(gen2 + 1);
+
+        // Freed slots cycle through the FIFO queue before repeating `slot1` with `gen1 + 1`
+        const seenBeforeRepeat = new Set([ slot1 ]);
+        let repeatedGen = 0;
+        for (let step = 0; step < 32; step++) {
+          const rawNext = mod.inspectRawHandle({ seq: step + 2 });
+          const nextSlot = rawNext & 0xFFFFF;
+          const nextGen = rawNext >>> 20;
+          if (nextSlot === slot1) {
+            repeatedGen = nextGen;
+            break;
+          }
+          expect(seenBeforeRepeat.has(nextSlot)).to.be.false;
+          seenBeforeRepeat.add(nextSlot);
+        }
+        expect(repeatedGen).to.equal(gen1 + 1);
 
         expect(() => mod.triggerDoubleDeinit({ doomed: true })).to.throw(
           TypeError,
@@ -681,6 +685,103 @@ describe('JsValue Handle Registry & zigar.js.Ref(T) End-to-End Integration', fun
         expect(Object.is(mod.default.outer_union.nested.js, objA)).to.be.true;
         mod.default.outer_union = { plain: 7 };
         expect(mod.default.outer_union.plain).to.equal(7);
+        expect(Number(mod.activeCount())).to.equal(0);
+      });
+
+      it('should support 24+ live *const fn (i32) i32 JS callbacks across secondary WASM instances, reclaim slots on release, and enforce M1/L1/L2 handle safety', async function() {
+        // H1 & H2: 24 distinct live `*const fn (i32) i32` functions (17..24 execute via secondary WASM instance!)
+        const fns = [];
+        for (let i = 0; i < 24; i++) {
+          if (target.useJSPI && i === 20) {
+            fns.push(async (x) => {
+              await Promise.resolve();
+              return (i + 1) * 100 + x;
+            });
+          } else if (i === 21) {
+            fns.push((x) => {
+              // Grow primary WASM memory mid-jscall inside a secondary-instance thunk!
+              expect(mod.growZigMemoryPages(512 * 1024)).to.equal(0x5A);
+              return (i + 1) * 100 + x;
+            });
+          } else {
+            fns.push((x) => (i + 1) * 100 + x);
+          }
+        }
+        for (let i = 0; i < 24; i++) {
+          expect(Number(mod.registerIntFn(fns[i]))).to.equal(i);
+        }
+        for (let i = 0; i < 24; i++) {
+          const out = await mod.callRegisteredIntFn(i, 7);
+          expect(out).to.equal((i + 1) * 100 + 7);
+        }
+        // Release all 24 functions via `zigar.function.release` (exercises findJsThunk + freeJsThunk)
+        mod.releaseAllRegisteredIntFns();
+
+        // Register and invoke a second wave of 20 fresh functions to prove secondary slot reclamation & reuse
+        for (let i = 0; i < 20; i++) {
+          expect(Number(mod.registerIntFn((x) => 9000 + i + x))).to.equal(i);
+        }
+        for (let i = 0; i < 20; i++) {
+          expect(await mod.callRegisteredIntFn(i, 3)).to.equal(9003 + i);
+        }
+        mod.releaseAllRegisteredIntFns();
+
+        // M1: 10,000+ create/release cycles retiring max-gen (4095) slots permanently without ABA aliasing
+        let staleIter1 = 0;
+        let staleIter4095 = 0;
+        for (let i = 1; i <= 10000 || staleIter4095 === 0; i++) {
+          const raw = mod.inspectRawHandle({ cycle: i });
+          const gen = raw >>> 20;
+          expect(gen).to.be.at.least(1);
+          expect(gen).to.be.at.most(4095);
+          if (i === 1) staleIter1 = raw;
+          if (gen === 4095 && staleIter4095 === 0) staleIter4095 = raw;
+          if (i > 30000) break;
+        }
+        // Step past `staleIter4095` to ensure its slot is retired and a fresh live handle is allocated
+        const liveAfterChurn = { liveAfter10k: true };
+        mod.storeGlobal(liveAfterChurn);
+        expect(() => mod.inspectRawBitsTypeof(staleIter1)).to.throw(TypeError, /Invalid or released JS value handle/);
+        expect(() => mod.inspectRawBitsTypeof(staleIter4095)).to.throw(TypeError, /Invalid or released JS value handle/);
+        expect(Object.is(mod.loadGlobalClone(), liveAfterChurn)).to.be.true;
+        mod.clearGlobal();
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        // L1: Returning composite `Pair` with stale `first` and valid `second` releases `second` before throwing!
+        expect(() => mod.returnPairWithStaleFirst({ stale: 1 }, { validSibling: 2 })).to.throw(
+          TypeError,
+          /Invalid or released JS value handle/,
+        );
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        // L2: Returning borrowed `[]const Ref(Object)` alongside a pending host error preserves Zig-owned handles,
+        // while returning by-value `Ref(Object)` alongside a pending host error releases the unconsumed retval handle!
+        const sliceRefA = { borrowedA: 1 };
+        const sliceRefB = { borrowedB: 2 };
+        mod.storeBorrowedSliceRefs(sliceRefA, sliceRefB);
+        expect(Number(mod.activeCount())).to.equal(2);
+        let sliceHostErr;
+        try {
+          await mod.returnBorrowedSliceOnHostError(() => {
+            throw new RangeError('pending-slice-host-err');
+          });
+        } catch (err) {
+          sliceHostErr = err;
+        }
+        expect(sliceHostErr).to.be.instanceOf(RangeError);
+        expect(Number(mod.activeCount())).to.equal(2);
+        mod.clearBorrowedSliceRefs();
+        expect(Number(mod.activeCount())).to.equal(0);
+
+        let byValHostErr;
+        try {
+          await mod.returnByValueRefOnHostError(() => {
+            throw new RangeError('pending-byval-host-err');
+          }, { discardedByValue: true });
+        } catch (err) {
+          byValHostErr = err;
+        }
+        expect(byValHostErr).to.be.instanceOf(RangeError);
         expect(Number(mod.activeCount())).to.equal(0);
       });
     });

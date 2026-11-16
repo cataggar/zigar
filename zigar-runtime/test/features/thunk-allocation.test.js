@@ -373,9 +373,11 @@ if (process.env.TARGET === 'wasm') {
           expect(env.table.get(addrsB[i])()).to.equal(2001 + i);
         }
 
-        // Identify first pair (findJsThunk clears table entry without freeing source slot)
+        // Identify first pair (findJsThunk must NOT clear table entry or corrupt secondary source tracking)
         expect(env.findJsThunk(ctrlA, addrsA[0])).to.equal(1001);
         expect(env.findJsThunk(ctrlB, addrsB[0])).to.equal(2001);
+        expect(env.table.get(addrsA[0])).to.be.a('function');
+        expect(env.table.get(addrsB[0])).to.be.a('function');
 
         // Free remaining 19 pairs -> 8 thunkSources drained completely, leaving only the 2 holding A[0] and B[0]
         for (let i = 1; i < 20; i++) {
@@ -383,6 +385,66 @@ if (process.env.TARGET === 'wasm') {
           expect(env.freeJsThunk(ctrlB, addrsB[i])).to.equal(2001 + i);
         }
         expect(env.thunkSources).to.have.lengthOf(2);
+
+        // Free A[0] and B[0] -> all secondary thunkSources must now drain cleanly to 0!
+        expect(env.freeJsThunk(ctrlA, addrsA[0])).to.equal(1001);
+        expect(env.freeJsThunk(ctrlB, addrsB[0])).to.equal(2001);
+        expect(env.thunkSources).to.have.lengthOf(0);
+      })
+    })
+    describe('secondary WASM thunk forwarding (17+ live JS functions)', function() {
+      it('should invoke 24+ distinct live JS functions via secondary WASM instances and reclaim slots on release', async function() {
+        const wasmPath = absolute('./wasm-samples/fn-pointer.wasm');
+        const binary = await readFile(wasmPath);
+        const env = new Env();
+        await env.loadModule(binary, {
+          tableInitial: 100,
+          multithreaded: false,
+        });
+        env.acquireStructures();
+        const { call } = env.useStructures();
+        const fns = [];
+        const results = [];
+        for (let i = 0; i < 24; i++) {
+          const offset = (i + 1) * 100;
+          fns.push(() => {
+            results.push(offset + 7);
+          });
+        }
+        // Pass all 24 distinct live functions; 17..24 overflow primary 16-slot pool into secondary WASM instance!
+        for (let i = 0; i < 24; i++) {
+          call(fns[i]);
+        }
+        expect(env.thunkSources.length).to.be.at.least(1);
+        expect(results).to.have.lengthOf(24);
+        for (let i = 0; i < 24; i++) {
+          expect(results[i]).to.equal((i + 1) * 100 + 7);
+        }
+        // Release all 24 functions via freeFunction (exercises identifyJsThunk -> findJsThunk -> destroyJsThunk -> freeJsThunk)
+        for (const fn of fns) {
+          env.freeFunction(fn);
+        }
+        expect(env.thunkSources).to.have.lengthOf(0);
+
+        // Allocate and invoke 20 fresh functions afterwards to verify clean reuse
+        const secondWave = [];
+        const secondResults = [];
+        for (let i = 0; i < 20; i++) {
+          const val = 5000 + i;
+          const fn = () => {
+            secondResults.push(val);
+          };
+          secondWave.push(fn);
+          call(fn);
+        }
+        expect(secondResults).to.have.lengthOf(20);
+        for (let i = 0; i < 20; i++) {
+          expect(secondResults[i]).to.equal(5000 + i);
+        }
+        for (const fn of secondWave) {
+          env.freeFunction(fn);
+        }
+        expect(env.thunkSources).to.have.lengthOf(0);
       })
     })
   })
