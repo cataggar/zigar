@@ -110,6 +110,7 @@ pub const DemoReport = struct {
     exported_symbols: []const ExportedSymbolSummary,
     emitted_declarations: []const EmittedDeclarationSummary,
     transpiled_js: []const u8,
+    broken_diagnostic_count: u32,
     broken_diagnostic: DiagnosticSummary,
     live_resources_after_drop: u32,
 
@@ -305,7 +306,8 @@ fn runPipeline(
 
     const broken_diags = try broken_program.getSemanticDiagnostics(scratch, broken_ts_path);
     defer ch.freeValue([]const bindings.types.Diagnostic, scratch, broken_diags);
-    if (broken_diags.len == 0) {
+    const broken_diagnostic_count: u32 = @intCast(broken_diags.len);
+    if (broken_diagnostic_count == 0) {
         return error.ExpectedSemanticTypeError;
     }
 
@@ -344,6 +346,7 @@ fn runPipeline(
         .exported_symbols = exported_symbols,
         .emitted_declarations = emitted_declarations,
         .transpiled_js = transpiled_js,
+        .broken_diagnostic_count = broken_diagnostic_count,
         .broken_diagnostic = broken_diagnostic,
         .live_resources_after_drop = live_resources_after_drop,
     };
@@ -378,7 +381,7 @@ pub const native = if (!builtin.cpu.arch.isWasm()) struct {
 /// across separate WebAssembly linear memories, with `DebugAllocator` leak checking
 /// on all intermediate Canonical ABI allocations.
 pub fn runWasmDemo(allocator: std.mem.Allocator, instance_id: u32) !DemoReport {
-    var gpa_impl: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_impl: std.heap.DebugAllocator(.{ .safety = true }) = .init;
     defer {
         if (gpa_impl.deinit() == .leak) {
             @panic("Zig memory leak detected in runWasmDemo");

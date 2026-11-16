@@ -71,7 +71,7 @@ export async function runWasmShowcase() {
       platform: 'wasi',
       arch: 'wasm32',
       isWASM: true,
-      optimize: 'ReleaseSmall',
+      optimize: 'ReleaseSafe',
       buildDir,
     });
 
@@ -107,6 +107,7 @@ export async function runWasmShowcase() {
           contents: decl.contents.string,
         })),
         transpiledJs: raw.transpiled_js.string,
+        brokenDiagnosticCount: Number(raw.broken_diagnostic_count),
         brokenDiagnostic: {
           code: Number(raw.broken_diagnostic.code),
           fileName: raw.broken_diagnostic.file_name.string,
@@ -141,7 +142,7 @@ function formatShowcaseOutput(summary) {
     ...summary.emittedDeclarations.map((d) => `[${d.fileName}]\n${d.contents}`),
     '--- Transpiled JavaScript (/app/index.ts) ---',
     summary.transpiledJs,
-    '--- Intentional Type Error Check (/app/broken.ts) ---',
+    `--- Intentional Type Error Check (/app/broken.ts, ${summary.brokenDiagnosticCount} diagnostic) ---`,
     `TS${summary.brokenDiagnostic.code} at ${summary.brokenDiagnostic.fileName}:${summary.brokenDiagnostic.line}:${summary.brokenDiagnostic.column} - ${summary.brokenDiagnostic.message}`,
     '',
     `Live WIT resources after cleanup: ${summary.liveResourcesAfterDrop}`,

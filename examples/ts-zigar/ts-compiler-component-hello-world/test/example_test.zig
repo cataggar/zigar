@@ -74,11 +74,15 @@ test "End-to-end Zig showcase drives TypeScript 7.1 Go WASM Component with zero 
     try testing.expect(std.mem.indexOf(u8, report.transpiled_js, "interface SensorBatch") == null);
 
     // (f) Intentional semantic type error (`TS2322` in `/app/broken.ts`)
+    try testing.expectEqual(@as(u32, 1), report.broken_diagnostic_count);
     try testing.expectEqual(@as(u32, 2322), report.broken_diagnostic.code);
     try testing.expectEqualStrings(hello_lib.broken_ts_path, report.broken_diagnostic.file_name);
     try testing.expectEqual(@as(u32, 3), report.broken_diagnostic.line);
-    try testing.expect(report.broken_diagnostic.column >= 1);
-    try testing.expect(std.mem.indexOf(u8, report.broken_diagnostic.message, "number") != null);
+    try testing.expectEqual(@as(u32, 14), report.broken_diagnostic.column);
+    try testing.expectEqualStrings(
+        "Type 'string' is not assignable to type 'number'.",
+        report.broken_diagnostic.message,
+    );
 
     // (g) All WIT resources (`broken_program`, `checker`, `program`, `vfs`) dropped cleanly
     try testing.expectEqual(@as(u32, 0), report.live_resources_after_drop);

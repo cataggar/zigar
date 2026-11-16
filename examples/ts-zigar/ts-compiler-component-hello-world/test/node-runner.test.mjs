@@ -71,11 +71,15 @@ test('src/lib.zig compiled to WASM via zigar-compiler drives TypeScript 7.1 Go W
   assert.doesNotMatch(summary.transpiledJs, /interface SensorBatch/);
 
   // (f) Intentional semantic type error (`TS2322` in `/app/broken.ts`)
+  assert.equal(summary.brokenDiagnosticCount, 1);
   assert.equal(summary.brokenDiagnostic.code, 2322);
   assert.equal(summary.brokenDiagnostic.fileName, '/app/broken.ts');
   assert.equal(summary.brokenDiagnostic.line, 3);
-  assert.ok(summary.brokenDiagnostic.column >= 1);
-  assert.match(summary.brokenDiagnostic.message, /number/);
+  assert.equal(summary.brokenDiagnostic.column, 14);
+  assert.equal(
+    summary.brokenDiagnostic.message,
+    "Type 'string' is not assignable to type 'number'.",
+  );
 
   // (g) All WIT resources dropped and component host unregistered cleanly
   assert.equal(summary.liveResourcesAfterDrop, 0);

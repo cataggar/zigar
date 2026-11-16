@@ -51,7 +51,12 @@ fn runMain(init: std.process.Init) !u8 {
         report.transpiled_js,
     });
 
-    try appendFmt(&out, allocator, "--- Intentional Type Error Check ({s}) ---\n", .{hello_lib.broken_ts_path});
+    try appendFmt(
+        &out,
+        allocator,
+        "--- Intentional Type Error Check ({s}, {d} diagnostic) ---\n",
+        .{ hello_lib.broken_ts_path, report.broken_diagnostic_count },
+    );
     try appendFmt(
         &out,
         allocator,

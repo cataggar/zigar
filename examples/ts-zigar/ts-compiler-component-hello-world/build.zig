@@ -70,7 +70,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = generated_ts,
     });
 
-    // Cross-target compile check: verify `src/lib.zig` also compiles cleanly to `wasm32-wasi`
+    // Cross-target compile check: verify `src/lib.zig` (including `DebugAllocator(.{ .safety = true })`)
+    // compiles cleanly to both `wasm32-wasi` and `wasm32-freestanding`
     const wasm32_wasi_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .wasi,
@@ -78,12 +79,12 @@ pub fn build(b: *std.Build) void {
     const wit_zigar_wasm_mod = b.createModule(.{
         .root_source_file = b.path("../../../wit-zigar/src/root.zig"),
         .target = wasm32_wasi_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .ReleaseSafe,
     });
     const hello_wasm_mod = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
         .target = wasm32_wasi_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .ReleaseSafe,
     });
     hello_wasm_mod.addImport("wit_zigar", wit_zigar_wasm_mod);
     hello_wasm_mod.addAnonymousImport("generated_ts", .{
@@ -93,8 +94,33 @@ pub fn build(b: *std.Build) void {
         .name = "ts-compiler-hello-wasm32-check",
         .root_module = hello_wasm_mod,
     });
+
+    const wasm32_free_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+    });
+    const wit_zigar_free_mod = b.createModule(.{
+        .root_source_file = b.path("../../../wit-zigar/src/root.zig"),
+        .target = wasm32_free_target,
+        .optimize = .ReleaseSafe,
+    });
+    const hello_free_mod = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = wasm32_free_target,
+        .optimize = .ReleaseSafe,
+    });
+    hello_free_mod.addImport("wit_zigar", wit_zigar_free_mod);
+    hello_free_mod.addAnonymousImport("generated_ts", .{
+        .root_source_file = generated_ts,
+    });
+    const wasm_free_check_obj = b.addObject(.{
+        .name = "ts-compiler-hello-wasm32-free-check",
+        .root_module = hello_free_mod,
+    });
+
     const wasm_check_files = b.addWriteFiles();
     _ = wasm_check_files.addCopyFile(wasm_check_obj.getEmittedBin(), "ts-compiler-hello-wasm32-check.o");
+    _ = wasm_check_files.addCopyFile(wasm_free_check_obj.getEmittedBin(), "ts-compiler-hello-wasm32-free-check.o");
 
     // 5. Build options for native executable & integration tests
     const build_opts = b.addOptions();
