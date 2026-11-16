@@ -1,0 +1,11 @@
+{
+  "name": "ts-compiler-component-hello-world",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TypeScript 7.1 Go WASM Component showcase called from Zig natively and via WebAssembly in Node.js 26",
+  "scripts": {
+    "start": "node run-wasm.mjs",
+    "test": "node --test test/node-runner.test.mjs"
+  }
+}
