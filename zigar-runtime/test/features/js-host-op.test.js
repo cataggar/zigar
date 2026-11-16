@@ -12,7 +12,7 @@ import {
   StructureType,
 } from '../../src/constants.js';
 import { defineEnvironment } from '../../src/environment.js';
-import { HostOpCode, HostOpFlag } from '../../src/features/js-host-op.js';
+import { AwaitMode, BinaryInfoKind, BinaryKind, HostOpCode, HostOpFlag } from '../../src/features/js-host-op.js';
 import '../../src/mixins.js';
 import { MEMORY, SLOTS, ZIG } from '../../src/symbols.js';
 
@@ -334,6 +334,7 @@ function defineHostOpStructures(env, is64) {
     boolStruct,
     i32,
     u32,
+    usizeStruct,
     strPtr,
     jsRef,
     errSet,
@@ -1820,4 +1821,627 @@ describe('Feature: js-host-op', function() {
     expect(() => env.releaseZigCallback(2)).to.not.throw();
     expect(() => badOnceFn(14)).to.throw(/already been released/);
   });
+
+  it('should execute O(1) bulk binary operations, BigInt 64/128-bit conversions with overflow detection, and sync/async iterator ops', function() {
+    const env = new Env();
+    env.littleEndian = true;
+    const harness = createMemoryHarness(env);
+    const s = defineHostOpStructures(env, harness.is64);
+
+    const u64Struct = {
+      type: StructureType.Primitive,
+      name: 'u64',
+      byteSize: 8,
+      align: 8,
+      flags: StructureFlag.HasValue,
+      signature: 601n,
+      instance: { members: [ { type: MemberType.Uint, bitSize: 64, bitOffset: 0, byteSize: 8 } ] },
+      static: {},
+    };
+    u64Struct.instance.members[0].structure = u64Struct;
+    env.beginStructure(u64Struct);
+    env.finishStructure(u64Struct);
+
+    const errUnionRef = {
+      type: StructureType.ErrorUnion,
+      name: 'HostError!Ref',
+      byteSize: 8,
+      align: 4,
+      flags: StructureFlag.HasValue | StructureFlag.HasObject | StructureFlag.HasSlot,
+      signature: 602n,
+      instance: {
+        members: [
+          { type: MemberType.Object, bitSize: 32, bitOffset: 0, byteSize: 4, slot: 0, structure: s.jsRef },
+          { type: MemberType.Uint, flags: MemberFlag.IsSelector, bitSize: 16, bitOffset: 32, byteSize: 2, structure: s.errSet },
+        ],
+      },
+      static: {},
+    };
+    env.beginStructure(errUnionRef);
+    env.finishStructure(errUnionRef);
+
+    const errUnionUsize = {
+      type: StructureType.ErrorUnion,
+      name: 'HostError!usize',
+      byteSize: harness.ptrSize * 2,
+      align: harness.ptrSize,
+      flags: StructureFlag.HasValue,
+      signature: 603n,
+      instance: {
+        members: [
+          { type: MemberType.Uint, bitSize: harness.ptrSize * 8, bitOffset: 0, byteSize: harness.ptrSize, structure: s.usizeStruct },
+          { type: MemberType.Uint, flags: MemberFlag.IsSelector, bitSize: 16, bitOffset: harness.ptrSize * 8, byteSize: 2, structure: s.errSet },
+        ],
+      },
+      static: {},
+    };
+    env.beginStructure(errUnionUsize);
+    env.finishStructure(errUnionUsize);
+
+    const errUnionVoid = {
+      type: StructureType.ErrorUnion,
+      name: 'HostError!void',
+      byteSize: 2,
+      align: 2,
+      flags: StructureFlag.HasValue,
+      signature: 604n,
+      instance: {
+        members: [
+          { type: MemberType.Void, bitSize: 0, bitOffset: 0, byteSize: 0, structure: s.voidStruct },
+          { type: MemberType.Uint, flags: MemberFlag.IsSelector, bitSize: 16, bitOffset: 0, byteSize: 2, structure: s.errSet },
+        ],
+      },
+      static: {},
+    };
+    env.beginStructure(errUnionVoid);
+    env.finishStructure(errUnionVoid);
+
+    const errUnionU32 = {
+      type: StructureType.ErrorUnion,
+      name: 'HostError!u32',
+      byteSize: 8,
+      align: 4,
+      flags: StructureFlag.HasValue,
+      signature: 605n,
+      instance: {
+        members: [
+          { type: MemberType.Uint, bitSize: 32, bitOffset: 0, byteSize: 4, structure: s.u32 },
+          { type: MemberType.Uint, flags: MemberFlag.IsSelector, bitSize: 16, bitOffset: 32, byteSize: 2, structure: s.errSet },
+        ],
+      },
+      static: {},
+    };
+    env.beginStructure(errUnionU32);
+    env.finishStructure(errUnionU32);
+
+    // 1. Bulk BinaryCreate (Buffer=2), BinaryInfo (is_buffer=3, byte_length=0), BinaryRead, and out-of-bounds BinaryWrite
+    const argsBinCreate = s.makeArgStruct(610n, errUnionRef, [ s.usizeStruct, s.usizeStruct, s.boolStruct ]);
+    const argsBinInfoBool = s.makeArgStruct(611n, s.boolStruct, [ s.jsRef ]);
+    const argsBinRead = s.makeArgStruct(612n, errUnionUsize, [ s.jsRef, s.usizeStruct, s.usizeStruct, s.usizeStruct ]);
+    const argsBinWrite = s.makeArgStruct(613n, errUnionVoid, [ s.jsRef, s.usizeStruct, s.usizeStruct, s.usizeStruct ]);
+
+    harness.writeBytes(0x2000, new Uint8Array([ 10, 20, 30, 40, 50 ]));
+    const dCreateBuf = writeDescriptor(harness, 0x100, { signature: 610n, op: HostOpCode.BinaryCreate, flags: BinaryKind.Buffer, argSize: argsBinCreate.byteSize });
+    const dIsBuffer = writeDescriptor(harness, 0x140, { signature: 611n, op: HostOpCode.BinaryInfo, flags: BinaryInfoKind.IsBuffer, argSize: argsBinInfoBool.byteSize });
+    const dReadBuf = writeDescriptor(harness, 0x180, { signature: 612n, op: HostOpCode.BinaryRead, argSize: argsBinRead.byteSize });
+    const dWriteBuf = writeDescriptor(harness, 0x1c0, { signature: 613n, op: HostOpCode.BinaryWrite, argSize: argsBinWrite.byteSize });
+
+    const frameAddr = harness.addrOf(0x800);
+    const frameDV = harness.viewAt(0x800, 96);
+    new Uint8Array(frameDV.buffer, frameDV.byteOffset, 96).fill(0);
+    writePtr(frameDV, argsBinCreate.instance.members[1].bitOffset / 8, harness.addrOf(0x2000), harness.is64);
+    writePtr(frameDV, argsBinCreate.instance.members[2].bitOffset / 8, 5, harness.is64);
+    frameDV.setUint8(argsBinCreate.instance.members[3].bitOffset / 8, 1);
+    expect(env.invokeJsHostOp(dCreateBuf, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint16(4, true)).to.equal(0);
+    const bufHandle = frameDV.getUint32(0, true);
+    const createdBuf = env.getJsValue(bufHandle);
+    expect(Buffer.isBuffer(createdBuf)).to.be.true;
+    expect([ ...createdBuf ]).to.deep.equal([ 10, 20, 30, 40, 50 ]);
+
+    new Uint8Array(frameDV.buffer, frameDV.byteOffset, 96).fill(0);
+    frameDV.setUint32(argsBinInfoBool.instance.members[1].bitOffset / 8, bufHandle, true);
+    expect(env.invokeJsHostOp(dIsBuffer, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint8(0)).to.equal(1);
+
+    // Read slice from offset 1 into 0x2100
+    new Uint8Array(frameDV.buffer, frameDV.byteOffset, 96).fill(0);
+    frameDV.setUint32(argsBinRead.instance.members[1].bitOffset / 8, bufHandle, true);
+    writePtr(frameDV, argsBinRead.instance.members[2].bitOffset / 8, harness.addrOf(0x2100), harness.is64);
+    writePtr(frameDV, argsBinRead.instance.members[3].bitOffset / 8, 4, harness.is64);
+    writePtr(frameDV, argsBinRead.instance.members[4].bitOffset / 8, 1, harness.is64);
+    expect(env.invokeJsHostOp(dReadBuf, frameAddr)).to.equal(PosixError.NONE);
+    const readDst = harness.viewAt(0x2100, 4);
+    expect([ readDst.getUint8(0), readDst.getUint8(1), readDst.getUint8(2), readDst.getUint8(3) ]).to.deep.equal([ 20, 30, 40, 50 ]);
+
+    // Out-of-bounds BinaryWrite sets error.JsException (selector = 1)
+    new Uint8Array(frameDV.buffer, frameDV.byteOffset, 96).fill(0);
+    frameDV.setUint32(argsBinWrite.instance.members[1].bitOffset / 8, bufHandle, true);
+    writePtr(frameDV, argsBinWrite.instance.members[2].bitOffset / 8, harness.addrOf(0x2000), harness.is64);
+    writePtr(frameDV, argsBinWrite.instance.members[3].bitOffset / 8, 5, harness.is64);
+    writePtr(frameDV, argsBinWrite.instance.members[4].bitOffset / 8, 2, harness.is64);
+    expect(env.invokeJsHostOp(dWriteBuf, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint16(0, true)).to.equal(1);
+    env.controlLastJsError(3);
+    env.releaseJsValue(bufHandle);
+
+    // 2. BigIntFromWords / BigIntToWords 128-bit signed minInt(-2^127) roundtrip & 64-bit overflow status=1
+    const argsBiFromWords = s.makeArgStruct(620n, errUnionRef, [ s.boolStruct, u64Struct, u64Struct ]);
+    const argsBiToWords = s.makeArgStruct(621n, errUnionU32, [ s.jsRef, s.u32, s.boolStruct, s.usizeStruct ]);
+    const dBiFromWords = writeDescriptor(harness, 0x200, { signature: 620n, op: HostOpCode.BigIntFromWords, argSize: argsBiFromWords.byteSize });
+    const dBiToWords = writeDescriptor(harness, 0x240, { signature: 621n, op: HostOpCode.BigIntToWords, argSize: argsBiToWords.byteSize });
+
+    new Uint8Array(frameDV.buffer, frameDV.byteOffset, 96).fill(0);
+    frameDV.setUint8(argsBiFromWords.instance.members[1].bitOffset / 8, 1); // negative = true
+    frameDV.setBigUint64(argsBiFromWords.instance.members[2].bitOffset / 8, 0n, true); // lo = 0
+    frameDV.setBigUint64(argsBiFromWords.instance.members[3].bitOffset / 8, 0x8000000000000000n, true); // hi = 1 << 63 => -2^127
+    expect(env.invokeJsHostOp(dBiFromWords, frameAddr)).to.equal(PosixError.NONE);
+    const biHandle = frameDV.getUint32(0, true);
+    expect(env.getJsValue(biHandle)).to.equal(-(1n << 127n));
+
+    // Converting -2^127 to i64 returns status = 1 (overflow)
+    new Uint8Array(frameDV.buffer, frameDV.byteOffset, 96).fill(0);
+    frameDV.setUint32(argsBiToWords.instance.members[1].bitOffset / 8, biHandle, true);
+    frameDV.setUint32(argsBiToWords.instance.members[2].bitOffset / 8, 64, true);
+    frameDV.setUint8(argsBiToWords.instance.members[3].bitOffset / 8, 1);
+    writePtr(frameDV, argsBiToWords.instance.members[4].bitOffset / 8, harness.addrOf(0x2200), harness.is64);
+    expect(env.invokeJsHostOp(dBiToWords, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint16(4, true)).to.equal(0);
+    expect(frameDV.getUint32(0, true)).to.equal(1);
+
+    // Converting -2^127 to i128 succeeds with status = 0 and writes two's-complement (lo=0, hi=0x8000000000000000)
+    new Uint8Array(frameDV.buffer, frameDV.byteOffset, 96).fill(0);
+    frameDV.setUint32(argsBiToWords.instance.members[1].bitOffset / 8, biHandle, true);
+    frameDV.setUint32(argsBiToWords.instance.members[2].bitOffset / 8, 128, true);
+    frameDV.setUint8(argsBiToWords.instance.members[3].bitOffset / 8, 1);
+    writePtr(frameDV, argsBiToWords.instance.members[4].bitOffset / 8, harness.addrOf(0x2200), harness.is64);
+    expect(env.invokeJsHostOp(dBiToWords, frameAddr)).to.equal(PosixError.NONE);
+    expect(frameDV.getUint32(0, true)).to.equal(0);
+    const wordsDV = harness.viewAt(0x2200, 16);
+    expect(wordsDV.getBigUint64(0, true)).to.equal(0n);
+    expect(wordsDV.getBigUint64(8, true)).to.equal(0x8000000000000000n);
+    env.releaseJsValue(biHandle);
+
+    // 3. GetIterator (async fallback to sync Symbol.iterator), IteratorNext (doneFlagAddr), and IteratorReturn
+    const argsGetIter = s.makeArgStruct(630n, errUnionRef, [ s.jsRef ]);
+    const argsIterNext = s.makeArgStruct(631n, s.errUnionI32, [ s.jsRef, s.usizeStruct ]);
+    const argsIterRet = s.makeArgStruct(632n, errUnionVoid, [ s.jsRef ]);
+    const dGetAsyncIter = writeDescriptor(harness, 0x280, { signature: 630n, op: HostOpCode.GetIterator, flags: 1, argSize: argsGetIter.byteSize });
+    const dIterNext = writeDescriptor(harness, 0x2c0, { signature: 631n, op: HostOpCode.IteratorNext, argSize: argsIterNext.byteSize });
+    const dIterRet = writeDescriptor(harness, 0x300, { signature: 632n, op: HostOpCode.IteratorReturn, argSize: argsIterRet.byteSize });
+
+    let closedCount = 0;
+    const customIterable = {
+      [Symbol.iterator]() {
+        let i = 0;
+        return {
+          next() {
+            if (i++ === 0) return { value: 99, done: false };
+            return { value: undefined, done: true };
+          },
+          return() {
+            closedCount += 1;
+            return { done: true };
+          },
+        };
+      },
+    };
+    const iterableHandle = env.allocJsValue(customIterable);
+    new Uint8Array(frameDV.buffer, frameDV.byteOffset, 96).fill(0);
+    frameDV.setUint32(argsGetIter.instance.members[1].bitOffset / 8, iterableHandle, true);
+    expect(env.invokeJsHostOp(dGetAsyncIter, frameAddr)).to.equal(PosixError.NONE);
+    const iterHandle = frameDV.getUint32(0, true);
+    env.releaseJsValue(iterableHandle);
+
+    const doneDV = harness.viewAt(0x2300, 1);
+    doneDV.setUint8(0, 0);
+    new Uint8Array(frameDV.buffer, frameDV.byteOffset, 96).fill(0);
+    frameDV.setUint32(argsIterNext.instance.members[1].bitOffset / 8, iterHandle, true);
+    writePtr(frameDV, argsIterNext.instance.members[2].bitOffset / 8, harness.addrOf(0x2300), harness.is64);
+    expect(env.invokeJsHostOp(dIterNext, frameAddr)).to.equal(PosixError.NONE);
+    expect(doneDV.getUint8(0)).to.equal(0);
+    expect(frameDV.getInt32(0, true)).to.equal(99);
+
+    new Uint8Array(frameDV.buffer, frameDV.byteOffset, 96).fill(0);
+    frameDV.setUint32(argsIterNext.instance.members[1].bitOffset / 8, iterHandle, true);
+    writePtr(frameDV, argsIterNext.instance.members[2].bitOffset / 8, harness.addrOf(0x2300), harness.is64);
+    expect(env.invokeJsHostOp(dIterNext, frameAddr)).to.equal(PosixError.NONE);
+    expect(doneDV.getUint8(0)).to.equal(1);
+
+    new Uint8Array(frameDV.buffer, frameDV.byteOffset, 96).fill(0);
+    frameDV.setUint32(argsIterRet.instance.members[1].bitOffset / 8, iterHandle, true);
+    expect(env.invokeJsHostOp(dIterRet, frameAddr)).to.equal(PosixError.NONE);
+    expect(closedCount).to.equal(1);
+    env.releaseJsValue(iterHandle);
+    expect(env.getJsValueCount()).to.equal(0);
+  });
+
+  it('should support WASM 3-step JSPI promise suspension and Node worker-bridged promise/error isolation', async function() {
+    const env = new Env();
+    env.littleEndian = true;
+    const harness = createMemoryHarness(env);
+    const s = defineHostOpStructures(env, harness.is64);
+    const argsAwaitI32 = s.makeArgStruct(640n, s.errUnionI32, []);
+    const descAddr = writeDescriptor(harness, 0x100, { signature: 640n, op: 0, argSize: argsAwaitI32.byteSize });
+
+    if (process.env.TARGET === 'wasm') {
+      // Without JSPI active, beginAwaitJsPromise returns 2 (NOSYS in wasm.zig) without consuming the borrowed handle
+      const pNoJspi = env.allocJsValue(Promise.resolve(55));
+      expect(env.beginAwaitJsPromise(pNoJspi, AwaitMode.Promise)).to.equal(2);
+      expect(env.getJsValueCount()).to.equal(1);
+      env.releaseJsValue(pNoJspi);
+
+      // Concurrent 2-fiber JSPI simulation: fiber A resolves 321, fiber B rejects without unhandledRejection
+      env.useJSPI = true;
+      const contA = { hostErrorFrame: { hasPendingHostError: false, pendingHostError: undefined, hasCapturedError: false, capturedError: undefined } };
+      const contB = { hostErrorFrame: { hasPendingHostError: false, pendingHostError: undefined, hasCapturedError: false, capturedError: undefined } };
+      const pA = env.allocJsValue(new Promise((r) => setTimeout(() => r(321), 5)));
+      const pB = env.allocJsValue(new Promise((_, rej) => setTimeout(() => rej(new Error('fiber-B-rejected')), 5)));
+
+      env.activeContinuation = contA;
+      const rawA = env.beginAwaitJsPromise(pA, AwaitMode.Promise);
+      expect(rawA & 7).to.equal(7);
+      const tokA = rawA >>> 3;
+
+      env.activeContinuation = contB;
+      const rawB = env.beginAwaitJsPromise(pB, AwaitMode.Promise);
+      expect(rawB & 7).to.equal(7);
+      const tokB = rawB >>> 3;
+
+      // Suspend both concurrently
+      await Promise.all([ env.awaitJsPromise(tokA), env.awaitJsPromise(tokB) ]);
+
+      // Resume fiber B first -> sets error.JsException and records error ONLY on contB
+      const frameAddrB = harness.addrOf(0x900);
+      const frameDVB = harness.viewAt(0x900, 16);
+      new Uint8Array(frameDVB.buffer, frameDVB.byteOffset, 16).fill(0);
+      env.activeContinuation = contB;
+      expect(env.finishAwaitJsPromise(tokB, descAddr, frameAddrB, argsAwaitI32.byteSize, 0)).to.equal(PosixError.NONE);
+      expect(frameDVB.getUint16(4, true)).to.equal(1); // JsException
+      expect(env.controlLastJsError(2)).to.equal(1);
+      const errHandleB = env.controlLastJsError(1); // LastErrorMode.Take
+      expect(env.getJsValue(errHandleB).message).to.equal('fiber-B-rejected');
+      env.releaseJsValue(errHandleB);
+      expect(env.controlLastJsError(2)).to.equal(0);
+
+      // Resume fiber A -> succeeds with 321 and has NO pending error from fiber B!
+      const frameAddrA = harness.addrOf(0x940);
+      const frameDVA = harness.viewAt(0x940, 16);
+      new Uint8Array(frameDVA.buffer, frameDVA.byteOffset, 16).fill(0);
+      env.activeContinuation = contA;
+      expect(env.controlLastJsError(2)).to.equal(0);
+      expect(env.finishAwaitJsPromise(tokA, descAddr, frameAddrA, argsAwaitI32.byteSize, 0)).to.equal(PosixError.NONE);
+      expect(frameDVA.getUint16(4, true)).to.equal(0);
+      expect(frameDVA.getInt32(0, true)).to.equal(321);
+
+      env.activeContinuation = null;
+      env.releaseJsValue(pA);
+      env.releaseJsValue(pB);
+      expect(env.getJsValueCount()).to.equal(0);
+    } else {
+      // TARGET=node: concurrent worker-bridged awaitJsPromiseWorker + lazy per-worker error isolation
+      const woken = [];
+      env.finalizeAsyncCall = (futexHandle, status) => {
+        woken.push({ futexHandle, status });
+      };
+
+      const pWorker1 = env.allocJsValue(new Promise((r) => setTimeout(() => r(777), 5)));
+      const pWorker2 = env.allocJsValue(new Promise((_, rej) => setTimeout(() => rej(new TypeError('worker-2-boom')), 5)));
+      const frameAddr1 = harness.addrOf(0x900);
+      const frameAddr2 = harness.addrOf(0x940);
+      new Uint8Array(harness.viewAt(0x900, 16).buffer, 0x900, 16).fill(0);
+      new Uint8Array(harness.viewAt(0x940, 16).buffer, 0x940, 16).fill(0);
+
+      env.awaitJsPromiseWorker(pWorker1, AwaitMode.Promise, descAddr, frameAddr1, argsAwaitI32.byteSize, 0, 1001n, 0x5001n);
+      env.awaitJsPromiseWorker(pWorker2, AwaitMode.Promise, descAddr, frameAddr2, argsAwaitI32.byteSize, 0, 1002n, 0x5002n);
+
+      await new Promise((r) => setTimeout(r, 25));
+      expect(woken).to.have.lengthOf(2);
+      expect(woken.map((w) => w.status)).to.deep.equal([ PosixError.NONE, PosixError.NONE ]);
+
+      // Zero JsValueRegistry handles were allocated for worker 1002n's lazy error capture!
+      expect(env.getJsValueCount()).to.equal(2); // only pWorker1 and pWorker2
+
+      expect(harness.viewAt(0x900, 16).getUint16(4, true)).to.equal(0);
+      expect(harness.viewAt(0x900, 16).getInt32(0, true)).to.equal(777);
+      expect(harness.viewAt(0x940, 16).getUint16(4, true)).to.equal(1);
+
+      // Worker 1001n sees no error; main thread (0n) sees no error; worker 1002n sees its own TypeError
+      env.setWorkerJsErrorContext(1001n);
+      expect(env.controlLastJsError(2)).to.equal(0);
+      env.setWorkerJsErrorContext(0n);
+      expect(env.controlLastJsError(2)).to.equal(0);
+
+      env.setWorkerJsErrorContext(1002n);
+      expect(env.controlLastJsError(2)).to.equal(1);
+      const workerErrHandle = env.controlLastJsError(1); // LastErrorMode.Take
+      expect(env.getJsValue(workerErrHandle).message).to.equal('worker-2-boom');
+      env.releaseJsValue(workerErrHandle);
+      env.setWorkerJsErrorContext(0n);
+
+      expect(env.workerErrorFrames?.size ?? 0).to.equal(0);
+      env.releaseJsValue(pWorker1);
+      env.releaseJsValue(pWorker2);
+      expect(env.getJsValueCount()).to.equal(0);
+    }
+  });
+
+  it('should isolate nested main-thread outbound calls and Zig callbacks invoked during a worker-bridged JS op', function() {
+    const env = new Env();
+    env.littleEndian = true;
+    const harness = createMemoryHarness(env);
+    const s = defineHostOpStructures(env, harness.is64);
+
+    // Wire outbound caller memory resolution for both wasm and node targets
+    const jsBufferMap = new Map();
+    const jsAddrToBuffer = new Map();
+    let nextJsBufAddr = harness.is64 ? 0x800000n : 0x800000;
+    if (process.env.TARGET === 'wasm') {
+      let nextScratch = 0x6000;
+      env.allocateScratchMemory = (len) => {
+        const addr = nextScratch;
+        nextScratch += (len + 15) & ~15;
+        return harness.is64 ? BigInt(addr) : addr;
+      };
+      env.freeScratchMemory = () => {};
+    } else {
+      const baseObtain = env.obtainZigView;
+      env.getBufferAddress = (buffer) => {
+        let addr = jsBufferMap.get(buffer);
+        if (addr === undefined) {
+          addr = nextJsBufAddr;
+          nextJsBufAddr += harness.is64 ? 0x1000n : 0x1000;
+          jsBufferMap.set(buffer, addr);
+          jsAddrToBuffer.set(addr, buffer);
+        }
+        return addr;
+      };
+      env.obtainZigView = (address, len, cache) => {
+        const buf = jsAddrToBuffer.get(address);
+        if (buf) {
+          const dv = new DataView(buf, 0, len);
+          dv[ZIG] = { address, len };
+          return dv;
+        }
+        return baseObtain(address, len, cache);
+      };
+    }
+
+    const enc = new TextEncoder();
+    const boomBytes = enc.encode('boom');
+    harness.writeBytes(0x80, boomBytes);
+    const boomKeyAddr = harness.addrOf(0x80);
+    const boomKeyLen = harness.is64 ? BigInt(boomBytes.length) : boomBytes.length;
+
+    const argsOuterCall = s.makeArgStruct(650n, s.errUnionI32, [ s.jsRef ]);
+    const argsInnerInfallible = s.makeArgStruct(651n, s.i32, [ s.jsRef ]);
+    const argsInnerTry = s.makeArgStruct(652n, s.errUnionI32, [ s.jsRef ]);
+    const argsSyncExport = s.makeArgStruct(653n, s.i32, []);
+
+    const dOuterCall = writeDescriptor(harness, 0x100, {
+      signature: 650n,
+      op: HostOpCode.CallFn,
+      argSize: argsOuterCall.byteSize,
+    });
+    const dInnerInfallible = writeDescriptor(harness, 0x140, {
+      signature: 651n,
+      op: HostOpCode.CallMethod,
+      keyAddr: boomKeyAddr,
+      keyLen: boomKeyLen,
+      argSize: argsInnerInfallible.byteSize,
+    });
+    const dInnerTry = writeDescriptor(harness, 0x180, {
+      signature: 652n,
+      op: HostOpCode.CallMethod,
+      keyAddr: boomKeyAddr,
+      keyLen: boomKeyLen,
+      argSize: argsInnerTry.byteSize,
+    });
+
+    const fnInfallibleAddr = harness.addrOf(0x301);
+    const fnTryRecoverAddr = harness.addrOf(0x302);
+    const fnTrapAddr = harness.addrOf(0x303);
+    const cbTrampolineAddr = harness.addrOf(0x304);
+    const cbCancelAddr = harness.addrOf(0x305);
+    const thunkDV = new DataView(new ArrayBuffer(0));
+    thunkDV[ZIG] = { address: harness.addrOf(0x300), len: 0 };
+    const thunkHolder = { [MEMORY]: thunkDV };
+
+    const makeExportCaller = (fnAddr) => {
+      const caller = env.createOutboundCaller(thunkHolder, argsSyncExport.constructor);
+      const dv = new DataView(new ArrayBuffer(0));
+      dv[ZIG] = { address: fnAddr, len: 0 };
+      caller[MEMORY] = dv;
+      caller.zigarSync = true;
+      return caller;
+    };
+
+    const syncExportInfallible = makeExportCaller(fnInfallibleAddr);
+    const syncExportTryRecover = makeExportCaller(fnTryRecoverAddr);
+    const syncExportTrap = makeExportCaller(fnTrapAddr);
+
+    let boomTargetHandle = 0;
+    env.runThunk = (thunkAddr, fnAddr, argAddr) => {
+      if (thunkAddr === cbCancelAddr) {
+        // Simulate owned Closure Ctx.deinit calling a fallible JS host op during pre-trampoline cancel
+        const cancelFrameAddr = harness.addrOf(0x2800);
+        const cancelFrameDV = harness.viewAt(0x2800, 32);
+        new Uint8Array(cancelFrameDV.buffer, cancelFrameDV.byteOffset, 32).fill(0);
+        cancelFrameDV.setUint32(argsInnerTry.instance.members[1].bitOffset / 8, boomTargetHandle, true);
+        expect(env.invokeJsHostOp(dInnerTry, cancelFrameAddr)).to.equal(PosixError.NONE);
+        const cid = Number(fnAddr) >>> 0;
+        env.releaseZigCallback(cid);
+        return true;
+      }
+      if (thunkAddr === cbTrampolineAddr) {
+        const cid = Number(fnAddr) >>> 0;
+        const outDV = env.obtainZigView(argAddr, 8, false);
+        const inputVal = outDV.getInt32(4, true);
+        if (cid === 11) {
+          const innerFrameAddr = harness.addrOf(0x2700);
+          const innerFrameDV = harness.viewAt(0x2700, 32);
+          new Uint8Array(innerFrameDV.buffer, innerFrameDV.byteOffset, 32).fill(0);
+          innerFrameDV.setUint32(argsInnerInfallible.instance.members[1].bitOffset / 8, boomTargetHandle, true);
+          expect(env.invokeJsHostOp(dInnerInfallible, innerFrameAddr)).to.equal(PosixError.EFAULT);
+          outDV.setInt32(0, 999, true);
+          return true;
+        }
+        outDV.setInt32(0, inputVal + 50, true);
+        return true;
+      }
+      if (fnAddr === fnInfallibleAddr) {
+        const innerFrameAddr = harness.addrOf(0x2500);
+        const innerFrameDV = harness.viewAt(0x2500, 32);
+        new Uint8Array(innerFrameDV.buffer, innerFrameDV.byteOffset, 32).fill(0);
+        innerFrameDV.setUint32(argsInnerInfallible.instance.members[1].bitOffset / 8, boomTargetHandle, true);
+        expect(env.invokeJsHostOp(dInnerInfallible, innerFrameAddr)).to.equal(PosixError.EFAULT);
+        const outDV = env.obtainZigView(argAddr, 4, false);
+        outDV.setInt32(0, 100, true);
+        return true;
+      }
+      if (fnAddr === fnTryRecoverAddr) {
+        const innerFrameAddr = harness.addrOf(0x2600);
+        const innerFrameDV = harness.viewAt(0x2600, 32);
+        new Uint8Array(innerFrameDV.buffer, innerFrameDV.byteOffset, 32).fill(0);
+        innerFrameDV.setUint32(argsInnerTry.instance.members[1].bitOffset / 8, boomTargetHandle, true);
+        expect(env.invokeJsHostOp(dInnerTry, innerFrameAddr)).to.equal(PosixError.NONE);
+        expect(innerFrameDV.getUint16(4, true)).to.equal(1); // JsException
+        const outDV = env.obtainZigView(argAddr, 4, false);
+        outDV.setInt32(0, -1, true);
+        return true;
+      }
+      if (fnAddr === fnTrapAddr) {
+        throw new Error('wasm-or-native-trap');
+      }
+      return true;
+    };
+    if (process.env.TARGET === 'wasm') {
+      env.runThunkSync = env.runThunk;
+    }
+
+    boomTargetHandle = env.allocJsValue({
+      boom() {
+        throw new Error('inner-boom');
+      },
+    });
+
+    const outerFrameAddr = harness.addrOf(0x2400);
+    const outerFrameDV = harness.viewAt(0x2400, 32);
+    const outerFnOffset = argsOuterCall.instance.members[1].bitOffset / 8;
+
+    // 1. Worker -> JS -> syncExportInfallible(): throws 'inner-boom' to JS caller (caught in JS), leaves worker error state clean
+    let jsCaughtMsg = null;
+    const hCatchingHook = env.allocJsValue(() => {
+      try {
+        return syncExportInfallible();
+      } catch (err) {
+        jsCaughtMsg = err.message;
+        return -77;
+      }
+    });
+
+    env.setWorkerJsErrorContext(1003n);
+    const savedWorkerFrame = env.activeWorkerErrorFrame;
+    expect(savedWorkerFrame).to.be.an('object');
+    new Uint8Array(outerFrameDV.buffer, outerFrameDV.byteOffset, 32).fill(0);
+    outerFrameDV.setUint32(outerFnOffset, hCatchingHook, true);
+    expect(env.invokeJsHostOp(dOuterCall, outerFrameAddr)).to.equal(PosixError.NONE);
+    expect(jsCaughtMsg).to.equal('inner-boom');
+    expect(outerFrameDV.getUint16(4, true)).to.equal(0);
+    expect(outerFrameDV.getInt32(0, true)).to.equal(-77);
+    expect(env.activeWorkerId).to.equal(1003n);
+    expect(env.activeWorkerErrorFrame).to.equal(savedWorkerFrame);
+    expect(env.workerErrorFrames.get(1003n)).to.equal(savedWorkerFrame);
+    expect(env.controlLastJsError(2)).to.equal(0);
+    env.releaseJsValue(hCatchingHook);
+
+    // 2. Worker -> JS -> syncExportInfallible() uncaught in JS: propagates back to worker as error.JsException with 'inner-boom'
+    const hPropagatingHook = env.allocJsValue(() => syncExportInfallible());
+    new Uint8Array(outerFrameDV.buffer, outerFrameDV.byteOffset, 32).fill(0);
+    outerFrameDV.setUint32(outerFnOffset, hPropagatingHook, true);
+    expect(env.invokeJsHostOp(dOuterCall, outerFrameAddr)).to.equal(PosixError.NONE);
+    expect(outerFrameDV.getUint16(4, true)).to.equal(1); // JsException on worker!
+    expect(env.controlLastJsError(2)).to.equal(1);
+    const propagatedErrHandle = env.controlLastJsError(1); // Take
+    expect(env.getJsValue(propagatedErrHandle).message).to.equal('inner-boom');
+    env.releaseJsValue(propagatedErrHandle);
+    expect(env.controlLastJsError(2)).to.equal(0);
+    env.releaseJsValue(hPropagatingHook);
+
+    // 3. Worker -> JS -> syncExportTryRecover(): returns -1 to JS and leaves NO stale leaked error on worker
+    const hTryRecoverHook = env.allocJsValue(() => syncExportTryRecover());
+    new Uint8Array(outerFrameDV.buffer, outerFrameDV.byteOffset, 32).fill(0);
+    outerFrameDV.setUint32(outerFnOffset, hTryRecoverHook, true);
+    expect(env.invokeJsHostOp(dOuterCall, outerFrameAddr)).to.equal(PosixError.NONE);
+    expect(outerFrameDV.getUint16(4, true)).to.equal(0);
+    expect(outerFrameDV.getInt32(0, true)).to.equal(-1);
+    expect(env.controlLastJsError(2)).to.equal(0);
+
+    // Also verify pre-existing worker capturedError is neither overwritten nor evicted by nested syncExportTryRecover()
+    const outerWorkerErr = new Error('outer-worker-err');
+    env.recordCapturedError(outerWorkerErr);
+    expect(syncExportTryRecover()).to.equal(-1);
+    expect(env.workerErrorFrames.get(1003n)).to.equal(savedWorkerFrame);
+    expect(env.controlLastJsError(2)).to.equal(1);
+    const preservedHandle = env.controlLastJsError(1);
+    expect(env.getJsValue(preservedHandle)).to.equal(outerWorkerErr);
+    env.releaseJsValue(preservedHandle);
+    env.releaseJsValue(hTryRecoverHook);
+
+    // Also verify catch (err) exit path in invokeThunk restores activeWorkerId and activeWorkerErrorFrame
+    expect(() => syncExportTrap()).to.throw('wasm-or-native-trap');
+    expect(env.activeWorkerId).to.equal(1003n);
+    expect(env.activeWorkerErrorFrame).to.equal(savedWorkerFrame);
+
+    // 4. Nested Zig Callback/Closure (`createZigCallback`) invoked while outer worker has pendingHostError
+    const argsCb = s.makeArgStruct(654n, s.i32, [ s.i32 ]);
+    const cbDescOff = 0x200;
+    const cbDescDV = harness.viewAt(cbDescOff, 16 + 3 * harness.ptrSize);
+    cbDescDV.setBigUint64(0, 654n, true);
+    cbDescDV.setUint32(8, 0, true);
+    cbDescDV.setUint32(12, 0, true);
+    writePtr(cbDescDV, 16, cbTrampolineAddr, harness.is64);
+    writePtr(cbDescDV, 16 + harness.ptrSize, 0, harness.is64);
+    writePtr(cbDescDV, 16 + 2 * harness.ptrSize, cbCancelAddr, harness.is64);
+
+    const onceCbDescOff = 0x240;
+    const onceCbDescDV = harness.viewAt(onceCbDescOff, 16 + 3 * harness.ptrSize);
+    onceCbDescDV.setBigUint64(0, 654n, true);
+    onceCbDescDV.setUint32(8, 2, true); // once
+    onceCbDescDV.setUint32(12, 0, true);
+    writePtr(onceCbDescDV, 16, cbTrampolineAddr, harness.is64);
+    writePtr(onceCbDescDV, 16 + harness.ptrSize, 0, harness.is64);
+    writePtr(onceCbDescDV, 16 + 2 * harness.ptrSize, cbCancelAddr, harness.is64);
+
+    const hCbOk = env.createZigCallback(harness.addrOf(cbDescOff), 10);
+    const hCbBoom = env.createZigCallback(harness.addrOf(cbDescOff), 11);
+    const hCbOnce = env.createZigCallback(harness.addrOf(onceCbDescOff), 12);
+    const cbOk = env.getJsValue(hCbOk);
+    const cbBoom = env.getJsValue(hCbBoom);
+    const cbOnce = env.getJsValue(hCbOnce);
+
+    const earlierWorkerBoom = new Error('earlier-worker-pending-boom');
+    env.recordPendingHostError(earlierWorkerBoom);
+    // Succeeding callback must NOT steal earlierWorkerBoom from activeWorkerErrorFrame
+    expect(cbOk(7)).to.equal(57);
+    expect(savedWorkerFrame.hasPendingHostError).to.be.true;
+    expect(savedWorkerFrame.pendingHostError).to.equal(earlierWorkerBoom);
+    // Infallible-failing callback throws 'inner-boom' to JS while preserving earlierWorkerBoom on worker
+    expect(() => cbBoom(7)).to.throw('inner-boom');
+    expect(savedWorkerFrame.pendingHostError).to.equal(earlierWorkerBoom);
+    expect(env.consumePendingHostError()?.error).to.equal(earlierWorkerBoom);
+
+    // Pre-trampoline .once() cancellation triggering fallible host op inside cancelThunk does NOT leak capturedError onto worker
+    expect(() => cbOnce('bad-arg')).to.throw(Error);
+    expect(env.controlLastJsError(2)).to.equal(0);
+
+    env.releaseZigCallback(10);
+    env.releaseZigCallback(11);
+    env.setWorkerJsErrorContext(0n);
+    expect(env.workerErrorFrames.size).to.equal(0);
+    env.releaseJsValue(boomTargetHandle);
+    expect(env.getJsValueCount()).to.equal(0);
+  });
 });
+
+

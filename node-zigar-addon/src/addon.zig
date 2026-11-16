@@ -123,6 +123,11 @@ const ModuleHost = struct {
         control_last_js_error: ?Ref = null,
         dispose_js_value: ?Ref = null,
         async_dispose_js_value: ?Ref = null,
+        await_js_promise_worker: ?Ref = null,
+        async_dispose_js_value_worker: ?Ref = null,
+        suppress_promise_rejection: ?Ref = null,
+        set_worker_js_error_context: ?Ref = null,
+        clear_worker_js_errors: ?Ref = null,
 
         environ_get: ?Ref = null,
         environ_sizes_get: ?Ref = null,
@@ -167,6 +172,7 @@ const ModuleHost = struct {
     ts: struct {
         disable_multithread: ?ThreadsafeFunction = null,
         handle_jscall: ?ThreadsafeFunction = null,
+        handle_js_bridge: ?ThreadsafeFunction = null,
         handle_syscall: ?ThreadsafeFunction = null,
         release_function: ?ThreadsafeFunction = null,
     } = .{},
@@ -953,7 +959,8 @@ const ModuleHost = struct {
             const is_js_lifecycle_import = comptime std.mem.eql(u8, field_name, "control_last_js_error") or
                 std.mem.eql(u8, field_name, "dispose_js_value") or
                 std.mem.eql(u8, field_name, "async_dispose_js_value");
-            const is_js_value_import = comptime !is_js_lifecycle_import and
+            const is_js_promise_import = comptime std.mem.eql(u8, field_name, "await_js_promise");
+            const is_js_value_import = comptime !is_js_lifecycle_import and !is_js_promise_import and
                 (std.mem.endsWith(u8, field_name, "_js_value") or
                     std.mem.eql(u8, field_name, "get_js_value_count"));
             const is_js_host_op_import = comptime std.mem.eql(u8, field_name, "invoke_js_host_op") or
@@ -961,7 +968,8 @@ const ModuleHost = struct {
                 std.mem.eql(u8, field_name, "release_zig_callback");
             if ((!is_js_value_import or module.attributes.js_value) and
                 (!is_js_host_op_import or module.attributes.js_host_op) and
-                (!is_js_lifecycle_import or module.attributes.js_lifecycle))
+                (!is_js_lifecycle_import or module.attributes.js_lifecycle) and
+                (!is_js_promise_import or module.attributes.js_promise))
             {
                 @field(module.imports, field_name) = transformed_func;
             }
@@ -1706,8 +1714,82 @@ const ModuleHost = struct {
         return in_main_thread and std.Thread.getCurrentId() == self.owner_thread_id;
     }
 
-    fn cloneJsValue(self: *@This(), handle: u32, dest: *u32) !E {
-        if (!self.isOwnerJsThread()) return .PERM;
+    inline fn canBridgeWorkerJs(self: *const @This()) bool {
+        return !in_main_thread and self.multithread_count.load(.acquire) > 0 and self.ts.handle_js_bridge != null;
+    }
+
+    const JsBridgePayload = union(enum) {
+        clone_js_value: struct { handle: u32, dest: *u32 },
+        release_js_value: struct { handle: u32 },
+        typeof_js_value: struct { handle: u32, dest: *u8 },
+        instanceof_js_value: struct { handle: u32, ctor_handle: u32, dest: *bool },
+        equal_js_value: struct { lhs_handle: u32, rhs_handle: u32, dest: *bool },
+        get_js_value_count: struct { dest: *u32 },
+        invoke_js_host_op: struct { descriptor_addr: usize, arg_addr: usize, arg_size: usize },
+        create_zig_callback: struct { descriptor_addr: usize, callback_id: u32, dest: *u32 },
+        release_zig_callback: struct { callback_id: u32 },
+        control_last_js_error: struct { mode: u32, dest: *u32 },
+        dispose_js_value: struct { handle: u32, catch_mode: bool },
+        async_dispose_js_value: struct { handle: u32, catch_mode: bool },
+        await_js_promise: struct {
+            handle: u32,
+            mode: u32,
+            descriptor_addr: usize,
+            arg_addr: usize,
+            arg_size: usize,
+            done_flag_addr: usize,
+        },
+    };
+
+    const JsBridgeRequest = struct {
+        worker_id: u64 = 0,
+        futex_handle: usize = 0,
+        payload: JsBridgePayload,
+    };
+
+    fn dispatchWorkerJsBridge(self: *@This(), req: *JsBridgeRequest) !E {
+        if (!self.canBridgeWorkerJs()) return .PERM;
+        const func = self.ts.handle_js_bridge orelse return .PERM;
+        var futex: Futex = undefined;
+        req.worker_id = @intCast(@intFromPtr(&in_main_thread));
+        req.futex_handle = futex.init();
+        try napi.callThreadsafeFunction(func, @ptrCast(req), .nonblocking);
+        return futex.wait();
+    }
+
+    fn setWorkerJsErrorContextOnEnv(self: *@This(), worker_id: u64) void {
+        const ref = self.js.set_worker_js_error_context orelse return;
+        const env = self.env;
+        const saved_exc: ?Value = if (env.isExceptionPending() catch false)
+            env.getAndClearLastException() catch null
+        else
+            null;
+        defer if (saved_exc) |exc| {
+            if (env.isExceptionPending() catch false) {
+                _ = env.getAndClearLastException() catch {};
+            }
+            env.throw(exc) catch {};
+        };
+        const scope = env.openHandleScope() catch return;
+        defer env.closeHandleScope(scope) catch {};
+        const fn_val = env.getReferenceValue(ref) catch return;
+        const null_val = env.getNull() catch return;
+        const id_val = env.createBigintUint64(worker_id) catch return;
+        _ = env.callFunction(null_val, fn_val, &.{id_val}) catch {};
+    }
+
+    fn clearWorkerJsErrorsOnEnv(self: *@This()) void {
+        const ref = self.js.clear_worker_js_errors orelse return;
+        const env = self.env;
+        if (env.isExceptionPending() catch true) return;
+        const scope = env.openHandleScope() catch return;
+        defer env.closeHandleScope(scope) catch {};
+        const fn_val = env.getReferenceValue(ref) catch return;
+        const null_val = env.getNull() catch return;
+        _ = env.callFunction(null_val, fn_val, &.{}) catch {};
+    }
+
+    fn cloneJsValueOnEnv(self: *@This(), handle: u32, dest: *u32) !E {
         const env = self.env;
         if (try env.isExceptionPending()) return .FAULT;
         const scope = try env.openHandleScope();
@@ -1723,8 +1805,13 @@ const ModuleHost = struct {
         return .SUCCESS;
     }
 
-    fn releaseJsValue(self: *@This(), handle: u32) !E {
-        if (!self.isOwnerJsThread()) return .PERM;
+    fn cloneJsValue(self: *@This(), handle: u32, dest: *u32) !E {
+        if (self.isOwnerJsThread()) return self.cloneJsValueOnEnv(handle, dest);
+        var req: JsBridgeRequest = .{ .payload = .{ .clone_js_value = .{ .handle = handle, .dest = dest } } };
+        return self.dispatchWorkerJsBridge(&req);
+    }
+
+    fn releaseJsValueOnEnv(self: *@This(), handle: u32) !E {
         const env = self.env;
         const saved_exc: ?Value = if (try env.isExceptionPending())
             try env.getAndClearLastException()
@@ -1748,8 +1835,13 @@ const ModuleHost = struct {
         return .SUCCESS;
     }
 
-    fn typeofJsValue(self: *@This(), handle: u32, dest: *u8) !E {
-        if (!self.isOwnerJsThread()) return .PERM;
+    fn releaseJsValue(self: *@This(), handle: u32) !E {
+        if (self.isOwnerJsThread()) return self.releaseJsValueOnEnv(handle);
+        var req: JsBridgeRequest = .{ .payload = .{ .release_js_value = .{ .handle = handle } } };
+        return self.dispatchWorkerJsBridge(&req);
+    }
+
+    fn typeofJsValueOnEnv(self: *@This(), handle: u32, dest: *u8) !E {
         const env = self.env;
         if (try env.isExceptionPending()) return .FAULT;
         const scope = try env.openHandleScope();
@@ -1765,8 +1857,13 @@ const ModuleHost = struct {
         return .SUCCESS;
     }
 
-    fn instanceofJsValue(self: *@This(), handle: u32, ctor_handle: u32, dest: *bool) !E {
-        if (!self.isOwnerJsThread()) return .PERM;
+    fn typeofJsValue(self: *@This(), handle: u32, dest: *u8) !E {
+        if (self.isOwnerJsThread()) return self.typeofJsValueOnEnv(handle, dest);
+        var req: JsBridgeRequest = .{ .payload = .{ .typeof_js_value = .{ .handle = handle, .dest = dest } } };
+        return self.dispatchWorkerJsBridge(&req);
+    }
+
+    fn instanceofJsValueOnEnv(self: *@This(), handle: u32, ctor_handle: u32, dest: *bool) !E {
         const env = self.env;
         if (try env.isExceptionPending()) return .FAULT;
         const scope = try env.openHandleScope();
@@ -1783,8 +1880,13 @@ const ModuleHost = struct {
         return .SUCCESS;
     }
 
-    fn equalJsValue(self: *@This(), lhs_handle: u32, rhs_handle: u32, dest: *bool) !E {
-        if (!self.isOwnerJsThread()) return .PERM;
+    fn instanceofJsValue(self: *@This(), handle: u32, ctor_handle: u32, dest: *bool) !E {
+        if (self.isOwnerJsThread()) return self.instanceofJsValueOnEnv(handle, ctor_handle, dest);
+        var req: JsBridgeRequest = .{ .payload = .{ .instanceof_js_value = .{ .handle = handle, .ctor_handle = ctor_handle, .dest = dest } } };
+        return self.dispatchWorkerJsBridge(&req);
+    }
+
+    fn equalJsValueOnEnv(self: *@This(), lhs_handle: u32, rhs_handle: u32, dest: *bool) !E {
         const env = self.env;
         if (try env.isExceptionPending()) return .FAULT;
         const scope = try env.openHandleScope();
@@ -1801,8 +1903,13 @@ const ModuleHost = struct {
         return .SUCCESS;
     }
 
-    fn getJsValueCount(self: *@This(), dest: *u32) !E {
-        if (!self.isOwnerJsThread()) return .PERM;
+    fn equalJsValue(self: *@This(), lhs_handle: u32, rhs_handle: u32, dest: *bool) !E {
+        if (self.isOwnerJsThread()) return self.equalJsValueOnEnv(lhs_handle, rhs_handle, dest);
+        var req: JsBridgeRequest = .{ .payload = .{ .equal_js_value = .{ .lhs_handle = lhs_handle, .rhs_handle = rhs_handle, .dest = dest } } };
+        return self.dispatchWorkerJsBridge(&req);
+    }
+
+    fn getJsValueCountOnEnv(self: *@This(), dest: *u32) !E {
         const env = self.env;
         if (try env.isExceptionPending()) return .FAULT;
         const scope = try env.openHandleScope();
@@ -1816,8 +1923,13 @@ const ModuleHost = struct {
         return .SUCCESS;
     }
 
-    fn invokeJsHostOp(self: *@This(), descriptor_addr: usize, arg_addr: usize, arg_size: usize) !E {
-        if (!self.isOwnerJsThread()) return .PERM;
+    fn getJsValueCount(self: *@This(), dest: *u32) !E {
+        if (self.isOwnerJsThread()) return self.getJsValueCountOnEnv(dest);
+        var req: JsBridgeRequest = .{ .payload = .{ .get_js_value_count = .{ .dest = dest } } };
+        return self.dispatchWorkerJsBridge(&req);
+    }
+
+    fn invokeJsHostOpOnEnv(self: *@This(), descriptor_addr: usize, arg_addr: usize, arg_size: usize) !E {
         const env = self.env;
         const saved_exc: ?Value = if (try env.isExceptionPending())
             try env.getAndClearLastException()
@@ -1844,8 +1956,19 @@ const ModuleHost = struct {
         return @enumFromInt(status_code);
     }
 
-    fn createZigCallback(self: *@This(), descriptor_addr: usize, callback_id: u32, dest: *u32) !E {
-        if (!self.isOwnerJsThread()) return .PERM;
+    fn invokeJsHostOp(self: *@This(), descriptor_addr: usize, arg_addr: usize, arg_size: usize) !E {
+        if (self.isOwnerJsThread()) return self.invokeJsHostOpOnEnv(descriptor_addr, arg_addr, arg_size);
+        var req: JsBridgeRequest = .{
+            .payload = .{ .invoke_js_host_op = .{
+                .descriptor_addr = descriptor_addr,
+                .arg_addr = arg_addr,
+                .arg_size = arg_size,
+            } },
+        };
+        return self.dispatchWorkerJsBridge(&req);
+    }
+
+    fn createZigCallbackOnEnv(self: *@This(), descriptor_addr: usize, callback_id: u32, dest: *u32) !E {
         const env = self.env;
         const saved_exc: ?Value = if (try env.isExceptionPending())
             try env.getAndClearLastException()
@@ -1871,8 +1994,19 @@ const ModuleHost = struct {
         return if (dest.* == 0) .FAULT else .SUCCESS;
     }
 
-    fn releaseZigCallback(self: *@This(), callback_id: u32) !E {
-        if (!self.isOwnerJsThread()) return .PERM;
+    fn createZigCallback(self: *@This(), descriptor_addr: usize, callback_id: u32, dest: *u32) !E {
+        if (self.isOwnerJsThread()) return self.createZigCallbackOnEnv(descriptor_addr, callback_id, dest);
+        var req: JsBridgeRequest = .{
+            .payload = .{ .create_zig_callback = .{
+                .descriptor_addr = descriptor_addr,
+                .callback_id = callback_id,
+                .dest = dest,
+            } },
+        };
+        return self.dispatchWorkerJsBridge(&req);
+    }
+
+    fn releaseZigCallbackOnEnv(self: *@This(), callback_id: u32) !E {
         const env = self.env;
         const saved_exc: ?Value = if (try env.isExceptionPending())
             try env.getAndClearLastException()
@@ -1896,8 +2030,13 @@ const ModuleHost = struct {
         return .SUCCESS;
     }
 
-    fn controlLastJsError(self: *@This(), mode: u32, dest: *u32) !E {
-        if (!self.isOwnerJsThread()) return .PERM;
+    fn releaseZigCallback(self: *@This(), callback_id: u32) !E {
+        if (self.isOwnerJsThread()) return self.releaseZigCallbackOnEnv(callback_id);
+        var req: JsBridgeRequest = .{ .payload = .{ .release_zig_callback = .{ .callback_id = callback_id } } };
+        return self.dispatchWorkerJsBridge(&req);
+    }
+
+    fn controlLastJsErrorOnEnv(self: *@This(), mode: u32, dest: *u32) !E {
         const env = self.env;
         const saved_exc: ?Value = if (try env.isExceptionPending())
             try env.getAndClearLastException()
@@ -1922,8 +2061,13 @@ const ModuleHost = struct {
         return .SUCCESS;
     }
 
-    fn disposeJsValue(self: *@This(), handle: u32, catch_mode: bool) !E {
-        if (!self.isOwnerJsThread()) return .PERM;
+    fn controlLastJsError(self: *@This(), mode: u32, dest: *u32) !E {
+        if (self.isOwnerJsThread()) return self.controlLastJsErrorOnEnv(mode, dest);
+        var req: JsBridgeRequest = .{ .payload = .{ .control_last_js_error = .{ .mode = mode, .dest = dest } } };
+        return self.dispatchWorkerJsBridge(&req);
+    }
+
+    fn disposeJsValueOnEnv(self: *@This(), handle: u32, catch_mode: bool) !E {
         const env = self.env;
         const saved_exc: ?Value = if (try env.isExceptionPending())
             try env.getAndClearLastException()
@@ -1953,8 +2097,13 @@ const ModuleHost = struct {
         };
     }
 
-    fn asyncDisposeJsValue(self: *@This(), handle: u32, catch_mode: bool) !E {
-        if (!self.isOwnerJsThread()) return .PERM;
+    fn disposeJsValue(self: *@This(), handle: u32, catch_mode: bool) !E {
+        if (self.isOwnerJsThread()) return self.disposeJsValueOnEnv(handle, catch_mode);
+        var req: JsBridgeRequest = .{ .payload = .{ .dispose_js_value = .{ .handle = handle, .catch_mode = catch_mode } } };
+        return self.dispatchWorkerJsBridge(&req);
+    }
+
+    fn asyncDisposeJsValueOnEnv(self: *@This(), handle: u32, catch_mode: bool) !E {
         const env = self.env;
         const saved_exc: ?Value = if (try env.isExceptionPending())
             try env.getAndClearLastException()
@@ -1982,6 +2131,117 @@ const ModuleHost = struct {
             2 => .NOSYS,
             else => .FAULT,
         };
+    }
+
+    fn asyncDisposeJsValue(self: *@This(), handle: u32, catch_mode: bool) !E {
+        if (self.isOwnerJsThread()) return self.asyncDisposeJsValueOnEnv(handle, catch_mode);
+        var req: JsBridgeRequest = .{ .payload = .{ .async_dispose_js_value = .{ .handle = handle, .catch_mode = catch_mode } } };
+        return self.dispatchWorkerJsBridge(&req);
+    }
+
+    fn suppressPromiseRejectionOnEnv(self: *@This(), handle: u32, mode: u32) void {
+        const ref = self.js.suppress_promise_rejection orelse return;
+        const env = self.env;
+        if (env.isExceptionPending() catch true) return;
+        const scope = env.openHandleScope() catch return;
+        defer env.closeHandleScope(scope) catch {};
+        const fn_val = env.getReferenceValue(ref) catch return;
+        const null_val = env.getNull() catch return;
+        const h_val = env.createUint32(handle) catch return;
+        const m_val = env.createUint32(mode) catch return;
+        _ = env.callFunction(null_val, fn_val, &.{ h_val, m_val }) catch {};
+    }
+
+    fn awaitJsPromise(
+        self: *@This(),
+        handle: u32,
+        mode: u32,
+        descriptor_addr: usize,
+        arg_addr: usize,
+        arg_size: usize,
+        done_flag_addr: usize,
+    ) !E {
+        if (self.isOwnerJsThread()) {
+            self.suppressPromiseRejectionOnEnv(handle, mode);
+            return .NOSYS;
+        }
+        var req: JsBridgeRequest = .{
+            .payload = .{ .await_js_promise = .{
+                .handle = handle,
+                .mode = mode,
+                .descriptor_addr = descriptor_addr,
+                .arg_addr = arg_addr,
+                .arg_size = arg_size,
+                .done_flag_addr = done_flag_addr,
+            } },
+        };
+        return self.dispatchWorkerJsBridge(&req);
+    }
+
+    fn handleJsBridgeOnMainThread(self: *@This(), req: *JsBridgeRequest) !void {
+        var thunk_frame: ActiveThunkFrame = undefined;
+        const has_module = self.module != null;
+        if (self.module) |mod| {
+            self.enterModuleHost(mod, &thunk_frame);
+        }
+        defer if (has_module) restoreModuleHost(&thunk_frame);
+
+        self.setWorkerJsErrorContextOnEnv(req.worker_id);
+        defer self.setWorkerJsErrorContextOnEnv(0);
+
+        switch (req.payload) {
+            .await_js_promise => |p| {
+                const env = self.env;
+                const scope = try env.openHandleScope();
+                defer env.closeHandleScope(scope) catch {};
+                _ = try env.callFunction(
+                    try env.getNull(),
+                    try env.getReferenceValue(self.js.await_js_promise_worker orelse return error.Unexpected),
+                    &.{
+                        try env.createUint32(p.handle),
+                        try env.createUint32(p.mode),
+                        try env.createUsize(p.descriptor_addr),
+                        try env.createUsize(p.arg_addr),
+                        try env.createUsize(p.arg_size),
+                        try env.createUsize(p.done_flag_addr),
+                        try env.createBigintUint64(req.worker_id),
+                        try env.createUsize(req.futex_handle),
+                    },
+                );
+            },
+            .async_dispose_js_value => |d| {
+                const env = self.env;
+                const scope = try env.openHandleScope();
+                defer env.closeHandleScope(scope) catch {};
+                _ = try env.callFunction(
+                    try env.getNull(),
+                    try env.getReferenceValue(self.js.async_dispose_js_value_worker orelse return error.Unexpected),
+                    &.{
+                        try env.createUint32(d.handle),
+                        try env.getBoolean(d.catch_mode),
+                        try env.createBigintUint64(req.worker_id),
+                        try env.createUsize(req.futex_handle),
+                    },
+                );
+            },
+            else => {
+                const status: E = switch (req.payload) {
+                    .clone_js_value => |a| self.cloneJsValueOnEnv(a.handle, a.dest) catch .FAULT,
+                    .release_js_value => |a| self.releaseJsValueOnEnv(a.handle) catch .FAULT,
+                    .typeof_js_value => |a| self.typeofJsValueOnEnv(a.handle, a.dest) catch .FAULT,
+                    .instanceof_js_value => |a| self.instanceofJsValueOnEnv(a.handle, a.ctor_handle, a.dest) catch .FAULT,
+                    .equal_js_value => |a| self.equalJsValueOnEnv(a.lhs_handle, a.rhs_handle, a.dest) catch .FAULT,
+                    .get_js_value_count => |a| self.getJsValueCountOnEnv(a.dest) catch .FAULT,
+                    .invoke_js_host_op => |a| self.invokeJsHostOpOnEnv(a.descriptor_addr, a.arg_addr, a.arg_size) catch .FAULT,
+                    .create_zig_callback => |a| self.createZigCallbackOnEnv(a.descriptor_addr, a.callback_id, a.dest) catch .FAULT,
+                    .release_zig_callback => |a| self.releaseZigCallbackOnEnv(a.callback_id) catch .FAULT,
+                    .control_last_js_error => |a| self.controlLastJsErrorOnEnv(a.mode, a.dest) catch .FAULT,
+                    .dispose_js_value => |a| self.disposeJsValueOnEnv(a.handle, a.catch_mode) catch .FAULT,
+                    .await_js_promise, .async_dispose_js_value => unreachable,
+                };
+                Futex.wake(req.futex_handle, status);
+            },
+        }
     }
 
     fn releaseFunction(self: *@This(), fn_id: usize) !void {
@@ -2038,6 +2298,7 @@ const ModuleHost = struct {
             const prev_count = self.multithread_count.fetchSub(1, .monotonic);
             errdefer _ = self.multithread_count.fetchAdd(1, .monotonic);
             if (prev_count == 1) {
+                self.clearWorkerJsErrorsOnEnv();
                 const field_names = @typeInfo(@FieldType(ModuleHost, "ts")).@"struct".field_names;
                 inline for (field_names) |field_name| {
                     if (@field(self.ts, field_name)) |ref|
@@ -2058,6 +2319,14 @@ const ModuleHost = struct {
             _ = handleJscall(self, call) catch {
                 // wake caller if call fails since JavaScript isn't going to do it
                 Futex.wake(call.futex_handle, .FAULT);
+            };
+        }
+
+        fn handle_js_bridge(_: *Env, _: Value, context: *anyopaque, data: *anyopaque) callconv(.c) void {
+            const self: *ModuleHost = @ptrCast(@alignCast(context));
+            const req: *JsBridgeRequest = @ptrCast(@alignCast(data));
+            self.handleJsBridgeOnMainThread(req) catch {
+                Futex.wake(req.futex_handle, .FAULT);
             };
         }
 

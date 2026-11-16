@@ -160,9 +160,12 @@ test "NextMethodReturnValue" {
 
 pub fn IteratorReturnValue(comptime T: type) ?type {
     switch (@typeInfo(T)) {
-        .@"struct", .@"union", .@"opaque" => if (@hasDecl(T, "next")) {
-            const next = @field(T, "next");
-            return NextMethodReturnValue(@TypeOf(next), T);
+        .@"struct", .@"union", .@"opaque" => {
+            if (getInternalType(T) != null) return null;
+            if (@hasDecl(T, "next")) {
+                const next = @field(T, "next");
+                return NextMethodReturnValue(@TypeOf(next), T);
+            }
         },
         .error_union => |eu| if (IteratorReturnValue(eu.payload)) |RT| {
             return switch (@typeInfo(RT)) {

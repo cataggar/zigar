@@ -400,6 +400,12 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
             thread_start_params: ThreadStartParams,
             thread_end_params: ThreadEndParams,
         ) void {
+            if (@hasDecl(internal_ns, "onWorkerStart")) {
+                _ = @call(.auto, internal_ns.onWorkerStart, .{});
+            }
+            defer if (@hasDecl(internal_ns, "onWorkerEnd")) {
+                _ = @call(.auto, internal_ns.onWorkerEnd, .{});
+            };
             var start_succeeded = true;
             if (@hasDecl(ns, "onThreadStart")) {
                 const result = @call(.auto, ns.onThreadStart, thread_start_params);
@@ -457,6 +463,9 @@ pub fn WorkQueue(comptime ns: type, comptime internal_ns: type) type {
         }
 
         fn invokeFunction(item: WorkItem) void {
+            defer if (@hasDecl(internal_ns, "onWorkItemEnd")) {
+                _ = @call(.auto, internal_ns.onWorkItemEnd, .{});
+            };
             const un = @typeInfo(WorkItem).@"union";
             inline for (un.field_names) |field_name| {
                 const key = @field(WorkItemEnum, field_name);

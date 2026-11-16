@@ -19,6 +19,7 @@ const GEN_MASK = 0x0FFF;
 const ACTIVE_BIT = 0x1000;
 const MAX_SLOTS = SLOT_INDEX_MASK + 1;
 const INITIAL_CAPACITY = 64;
+const noop = () => {};
 
 const JS_TYPE_CODES = {
   undefined: 0,
@@ -74,6 +75,9 @@ var jsValueRegistry = mixin({
     if (value === false) return RESERVED_FALSE;
     if (value === true) return RESERVED_TRUE;
     if (value === globalThis) return RESERVED_GLOBAL_THIS;
+    if (value instanceof Promise) {
+      value.then(undefined, noop);
+    }
     let slot, gen;
     if (this.jsValueFreeHead >= 0) {
       slot = this.jsValueFreeHead;

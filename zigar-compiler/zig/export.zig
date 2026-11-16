@@ -68,10 +68,10 @@ fn Factory(comptime host: type, comptime module: type) type {
                 std.Io.File => .file,
                 std.Io.Dir => .directory,
                 else => get: {
-                    if (util.IteratorReturnValue(T) != null) break :get .iterator;
                     if (util.getInternalType(T)) |it| break :get switch (it) {
                         inline else => |t| @field(StructurePurpose, @tagName(t)),
                     };
+                    if (util.IteratorReturnValue(T) != null) break :get .iterator;
                     break :get .unknown;
                 },
             };

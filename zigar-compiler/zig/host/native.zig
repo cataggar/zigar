@@ -27,10 +27,49 @@ const interface = @import("native/interface.zig");
 
 const Module = interface.Module(Value);
 
+var queue_host_instance: ?*Module.Host = null;
+threadlocal var on_js_thread: bool = false;
+threadlocal var in_worker_queue_thread: bool = false;
+threadlocal var worker_js_error_dirty: bool = false;
+
+inline fn canUseJsBridge() bool {
+    return initialized and (on_js_thread or in_worker_queue_thread);
+}
+
+fn flushWorkerJsErrorIfNeeded() void {
+    if (worker_js_error_dirty and canUseJsBridge()) {
+        worker_js_error_dirty = false;
+        var dummy: u32 = 0;
+        _ = imports.control_last_js_error(instance, 3, &dummy);
+    }
+}
+
 pub fn WorkQueue(ns: type) type {
     return @import("../type/work-queue.zig").WorkQueue(ns, struct {
         pub fn onQueueInit() !void {
+            if (initialized) {
+                @atomicStore(?*Module.Host, &queue_host_instance, instance, .release);
+            }
             try startMultithread();
+        }
+
+        pub fn onWorkerStart() void {
+            in_worker_queue_thread = true;
+            worker_js_error_dirty = false;
+            if (!initialized) {
+                if (@atomicLoad(?*Module.Host, &queue_host_instance, .acquire)) |host_inst| {
+                    _ = setHostInstance(host_inst);
+                }
+            }
+        }
+
+        pub fn onWorkItemEnd() void {
+            flushWorkerJsErrorIfNeeded();
+        }
+
+        pub fn onWorkerEnd() void {
+            flushWorkerJsErrorIfNeeded();
+            in_worker_queue_thread = false;
         }
 
         pub fn onQueueDeinit() void {
@@ -78,6 +117,9 @@ const fallback = struct {
     fn asyncDisposeJsValue(_: *Module.Host, _: u32, _: bool) callconv(.c) E {
         return .NOSYS;
     }
+    fn awaitJsPromise(_: *Module.Host, _: u32, _: u32, _: usize, _: usize, _: usize, _: usize) callconv(.c) E {
+        return .NOSYS;
+    }
 };
 
 var imports: Module.Imports = init: {
@@ -94,6 +136,7 @@ var imports: Module.Imports = init: {
     imp.control_last_js_error = fallback.controlLastJsError;
     imp.dispose_js_value = fallback.disposeJsValue;
     imp.async_dispose_js_value = fallback.asyncDisposeJsValue;
+    imp.await_js_promise = fallback.awaitJsPromise;
     break :init imp;
 };
 
@@ -330,6 +373,7 @@ fn runThunk(
     fn_address: usize,
     arg_address: usize,
 ) callconv(.c) E {
+    on_js_thread = true;
     const thunk: zig_fn.Thunk = @ptrFromInt(thunk_address);
     const fn_ptr: *anyopaque = @ptrFromInt(fn_address);
     const arg_ptr: *anyopaque = if (arg_address != 0) @ptrFromInt(arg_address) else empty_ptr;
@@ -343,6 +387,7 @@ fn runVariadicThunk(
     attr_address: usize,
     arg_count: usize,
 ) callconv(.c) E {
+    on_js_thread = true;
     const thunk: zig_fn.VariadicThunk = @ptrFromInt(thunk_address);
     const fn_ptr: *anyopaque = @ptrFromInt(fn_address);
     const arg_ptr: *anyopaque = if (arg_address != 0) @ptrFromInt(arg_address) else empty_ptr;
@@ -355,6 +400,7 @@ fn createJsThunk(
     fn_id: usize,
     dest: *usize,
 ) callconv(.c) E {
+    on_js_thread = true;
     const controller: js_fn.ThunkController = @ptrFromInt(controller_address);
     const thunk_address = controller(.create, fn_id) catch return .FAULT;
     dest.* = thunk_address;
@@ -366,6 +412,7 @@ fn destroyJsThunk(
     fn_address: usize,
     dest: *usize,
 ) callconv(.c) E {
+    on_js_thread = true;
     const controller: js_fn.ThunkController = @ptrFromInt(controller_address);
     const fn_id = controller(.destroy, fn_address) catch return .FAULT;
     dest.* = fn_id;
@@ -453,46 +500,46 @@ fn mapJsValueStatus(status: E) js.Error!void {
 }
 
 pub fn isJsThread() bool {
-    if (!initialized) return false;
+    if (!canUseJsBridge()) return false;
     var count: u32 = 0;
     return imports.get_js_value_count(instance, &count) != .PERM;
 }
 
 pub fn tryCloneJsValue(handle: u32) js.Error!u32 {
-    if (!initialized) return error.OffJsThread;
+    if (!canUseJsBridge()) return error.OffJsThread;
     var cloned: u32 = js.reserved_undefined_handle;
     try mapJsValueStatus(imports.clone_js_value(instance, handle, &cloned));
     return cloned;
 }
 
 pub fn tryReleaseJsValue(handle: u32) js.Error!void {
-    if (!initialized) return error.OffJsThread;
+    if (!canUseJsBridge()) return error.OffJsThread;
     try mapJsValueStatus(imports.release_js_value(instance, handle));
 }
 
 pub fn tryTypeofJsValue(handle: u32) js.Error!js.JsType {
-    if (!initialized) return error.OffJsThread;
+    if (!canUseJsBridge()) return error.OffJsThread;
     var code: u8 = 0;
     try mapJsValueStatus(imports.typeof_js_value(instance, handle, &code));
     return @enumFromInt(code);
 }
 
 pub fn tryInstanceofJsValue(handle: u32, ctor_handle: u32) js.Error!bool {
-    if (!initialized) return error.OffJsThread;
+    if (!canUseJsBridge()) return error.OffJsThread;
     var result: bool = false;
     try mapJsValueStatus(imports.instanceof_js_value(instance, handle, ctor_handle, &result));
     return result;
 }
 
 pub fn tryEqualJsValue(lhs_handle: u32, rhs_handle: u32) js.Error!bool {
-    if (!initialized) return error.OffJsThread;
+    if (!canUseJsBridge()) return error.OffJsThread;
     var result: bool = false;
     try mapJsValueStatus(imports.equal_js_value(instance, lhs_handle, rhs_handle, &result));
     return result;
 }
 
 pub fn tryGetJsValueCount() js.Error!u32 {
-    if (!initialized) return error.OffJsThread;
+    if (!canUseJsBridge()) return error.OffJsThread;
     var count: u32 = 0;
     try mapJsValueStatus(imports.get_js_value_count(instance, &count));
     return count;
@@ -555,12 +602,34 @@ pub fn registerType(comptime T: type) void {
 }
 
 pub fn invokeJsHostOp(descriptor_ptr: *const anyopaque, arg_ptr: *anyopaque, arg_size: usize) E {
-    if (!initialized) return .PERM;
+    if (!canUseJsBridge()) return .PERM;
+    if (in_worker_queue_thread) worker_js_error_dirty = true;
     return imports.invoke_js_host_op(instance, @intFromPtr(descriptor_ptr), @intFromPtr(arg_ptr), arg_size);
 }
 
+pub fn awaitJsPromise(
+    handle: u32,
+    mode: u32,
+    descriptor_ptr: *const anyopaque,
+    arg_ptr: *anyopaque,
+    arg_size: usize,
+    done_flag_addr: usize,
+) E {
+    if (!canUseJsBridge()) return .PERM;
+    if (in_worker_queue_thread) worker_js_error_dirty = true;
+    return imports.await_js_promise(
+        instance,
+        handle,
+        mode,
+        @intFromPtr(descriptor_ptr),
+        @intFromPtr(arg_ptr),
+        arg_size,
+        done_flag_addr,
+    );
+}
+
 pub fn createZigCallback(descriptor_ptr: *const anyopaque, callback_id: u32) js.Error!u32 {
-    if (!initialized) return error.OffJsThread;
+    if (!canUseJsBridge()) return error.OffJsThread;
     var handle: u32 = 0;
     try mapJsValueStatus(imports.create_zig_callback(instance, @intFromPtr(descriptor_ptr), callback_id, &handle));
     if (handle == 0) return error.JsException;
@@ -568,7 +637,7 @@ pub fn createZigCallback(descriptor_ptr: *const anyopaque, callback_id: u32) js.
 }
 
 pub fn releaseZigCallback(callback_id: u32) void {
-    if (!initialized) @panic("JsValue operations require the JS thread");
+    if (!canUseJsBridge()) @panic("JsValue operations require the JS thread");
     mapJsValueStatus(imports.release_zig_callback(instance, callback_id)) catch |err| switch (err) {
         error.JsException => {},
         error.OffJsThread => @panic("JsValue operations require the JS thread"),
@@ -577,9 +646,10 @@ pub fn releaseZigCallback(callback_id: u32) void {
 }
 
 pub fn tryControlLastJsError(mode: u32) js.Error!u32 {
-    if (!initialized) return error.OffJsThread;
+    if (!canUseJsBridge()) return error.OffJsThread;
     var result: u32 = js.no_captured_error_handle;
     try mapJsValueStatus(imports.control_last_js_error(instance, mode, &result));
+    if (mode == 1 or mode == 3) worker_js_error_dirty = false;
     return result;
 }
 
@@ -592,12 +662,13 @@ pub fn controlLastJsError(mode: u32) u32 {
 }
 
 pub fn tryDisposeJsValue(handle: u32) js.Error!void {
-    if (!initialized) return error.OffJsThread;
+    if (!canUseJsBridge()) return error.OffJsThread;
+    if (in_worker_queue_thread) worker_js_error_dirty = true;
     try mapJsValueStatus(imports.dispose_js_value(instance, handle, true));
 }
 
 pub fn disposeJsValue(handle: u32) void {
-    if (!initialized) @panic("JsValue operations require the JS thread");
+    if (!canUseJsBridge()) @panic("JsValue operations require the JS thread");
     mapJsValueStatus(imports.dispose_js_value(instance, handle, false)) catch |err| switch (err) {
         error.JsException => {},
         error.OffJsThread => @panic("JsValue operations require the JS thread"),
@@ -606,12 +677,13 @@ pub fn disposeJsValue(handle: u32) void {
 }
 
 pub fn tryAsyncDisposeJsValue(handle: u32) js.Error!void {
-    if (!initialized) return error.OffJsThread;
+    if (!canUseJsBridge()) return error.OffJsThread;
+    if (in_worker_queue_thread) worker_js_error_dirty = true;
     try mapJsValueStatus(imports.async_dispose_js_value(instance, handle, true));
 }
 
 pub fn asyncDisposeJsValue(handle: u32) void {
-    if (!initialized) @panic("JsValue operations require the JS thread");
+    if (!canUseJsBridge()) @panic("JsValue operations require the JS thread");
     if (imports.async_dispose_js_value == &fallback.asyncDisposeJsValue) {
         @panic("JsValue host imports unavailable");
     }
@@ -665,6 +737,7 @@ pub fn createModule(comptime module_ns: type) Module {
     const host = @This();
     const ns = struct {
         fn getFactoryThunk(dest: *usize) callconv(.c) E {
+            on_js_thread = true;
             dest.* = @intFromPtr(exporter.getFactoryThunk(host, module_ns));
             return .SUCCESS;
         }
@@ -683,6 +756,7 @@ pub fn createModule(comptime module_ns: type) Module {
             .js_value = true,
             .js_host_op = true,
             .js_lifecycle = true,
+            .js_promise = true,
         },
         .module_path = switch (builtin.mode) {
             .debug => exporter.options.module_path.ptr,
