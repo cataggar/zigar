@@ -1065,3 +1065,339 @@ test "Regression Round 2 Issue 2: non-entry imported modules preserve namespaces
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
 }
+
+test "Regression Round 3: @types/node reference-path ambient closure, mixed ES+ambient, multi -t, and empty fallback" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-r3-ambient", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    // 1. `@types/node`-style package directory (`index.d.ts` -> `fs.d.ts`, `http.d.ts`, `globals.d.ts`,
+    //    2-hop `fs/promises.d.ts`, plus external `/// <reference types="other" />` that must NOT become primary).
+    const node_pkg = try std.fmt.allocPrint(alloc, "{s}/node-pkg", .{sandbox});
+    defer alloc.free(node_pkg);
+    const node_fs_sub = try std.fmt.allocPrint(alloc, "{s}/node-pkg/fs", .{sandbox});
+    defer alloc.free(node_fs_sub);
+    const ext_other_dir = try std.fmt.allocPrint(alloc, "{s}/node_modules/@types/other", .{sandbox});
+    defer alloc.free(ext_other_dir);
+    const out_node = try std.fmt.allocPrint(alloc, "{s}/out-node", .{sandbox});
+    defer alloc.free(out_node);
+    try cwd.createDirPath(io, node_fs_sub);
+    try cwd.createDirPath(io, ext_other_dir);
+
+    {
+        var od = try cwd.openDir(io, ext_other_dir, .{});
+        defer od.close(io);
+        try od.writeFile(io, .{
+            .sub_path = "package.json",
+            .data = "{\"name\":\"@types/other\",\"version\":\"1.0.0\",\"types\":\"index.d.ts\"}",
+        });
+        try od.writeFile(io, .{
+            .sub_path = "index.d.ts",
+            .data =
+            \\declare module "other-ext" {
+            \\  export interface UnreferencedExt { flag: boolean; }
+            \\}
+            ,
+        });
+    }
+
+    {
+        var nd = try cwd.openDir(io, node_pkg, .{});
+        defer nd.close(io);
+        try nd.writeFile(io, .{
+            .sub_path = "package.json",
+            .data = "{\"name\":\"@types/node-mock\",\"version\":\"1.0.0\",\"types\":\"index.d.ts\"}",
+        });
+        try nd.writeFile(io, .{
+            .sub_path = "index.d.ts",
+            .data =
+            \\/// <reference types="other" />
+            \\/// <reference path="globals.d.ts" />
+            \\/// <reference path="fs.d.ts" />
+            \\/// <reference path="http.d.ts" />
+            \\/// <reference path="sqlite.d.ts" />
+            ,
+        });
+        try nd.writeFile(io, .{
+            .sub_path = "sqlite.d.ts",
+            .data =
+            \\declare module "node:sqlite" {
+            \\  export class DatabaseSync {
+            \\    open: boolean;
+            \\  }
+            \\}
+            ,
+        });
+        try nd.writeFile(io, .{
+            .sub_path = "globals.d.ts",
+            .data =
+            \\declare var processVersion: string;
+            ,
+        });
+        try nd.writeFile(io, .{
+            .sub_path = "fs.d.ts",
+            .data =
+            \\/// <reference path="fs/promises.d.ts" />
+            \\declare module "fs" {
+            \\  export interface Stat {
+            \\    size: number;
+            \\  }
+            \\  export function readFileSync(path: string): string;
+            \\}
+            \\declare module "node:fs" {
+            \\  export * from "fs";
+            \\}
+            ,
+        });
+        try nd.writeFile(io, .{
+            .sub_path = "fs/promises.d.ts",
+            .data =
+            \\declare module "fs/promises" {
+            \\  export function readFile(path: string): Promise<string>;
+            \\}
+            ,
+        });
+        try nd.writeFile(io, .{
+            .sub_path = "http.d.ts",
+            .data =
+            \\declare module "http" {
+            \\  import type { Stat } from "fs";
+            \\  export interface Server {
+            \\    port: number;
+            \\    stat?: Stat;
+            \\  }
+            \\  export function createServer(): Server;
+            \\}
+            ,
+        });
+    }
+
+    {
+        const cli_args = [_][]const u8{ "-t", node_pkg, "-d", out_node };
+        var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+        defer parsed.deinit(alloc);
+        var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+        defer res.deinit(alloc);
+        if (res == .err) {
+            std.debug.print("Round 3 Subcase 1 error: {s}\n", .{res.err});
+        }
+        try std.testing.expect(res == .ok);
+
+        var out_h = try cwd.openDir(io, out_node, .{});
+        defer out_h.close(io);
+        // Reference-only `index.d.ts` and unreferenced external `@types/other` MUST NOT be emitted!
+        try std.testing.expectError(error.FileNotFound, out_h.statFile(io, "index.zig", .{}));
+        try std.testing.expectError(error.FileNotFound, out_h.statFile(io, "other-ext.zig", .{}));
+    }
+
+    // 2. Mixed file (`index.d.ts` with `export interface A`, inline `declare module "inline-mod"`,
+    //    empty `declare module "empty-inline" {}`, and `/// <reference path="./plugin.d.ts" />`).
+    const mixed_dir = try std.fmt.allocPrint(alloc, "{s}/mixed-pkg", .{sandbox});
+    defer alloc.free(mixed_dir);
+    const out_mixed = try std.fmt.allocPrint(alloc, "{s}/out-mixed", .{sandbox});
+    defer alloc.free(out_mixed);
+    try cwd.createDirPath(io, mixed_dir);
+
+    {
+        var md = try cwd.openDir(io, mixed_dir, .{});
+        defer md.close(io);
+        try md.writeFile(io, .{
+            .sub_path = "index.d.ts",
+            .data =
+            \\/// <reference path="./plugin.d.ts" />
+            \\export interface A {
+            \\  id: number;
+            \\}
+            \\export declare function makeA(id: number): A;
+            \\declare module "inline-mod" {
+            \\  export function useInline(): A;
+            \\}
+            \\declare module "empty-inline" {}
+            ,
+        });
+        try md.writeFile(io, .{
+            .sub_path = "plugin.d.ts",
+            .data =
+            \\declare module "plugin" {
+            \\  export interface PluginOpts {
+            \\    enabled: boolean;
+            \\  }
+            \\}
+            ,
+        });
+    }
+
+    {
+        const mixed_index = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{mixed_dir});
+        defer alloc.free(mixed_index);
+        const cli_args = [_][]const u8{ "-t", mixed_index, "-d", out_mixed };
+        var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+        defer parsed.deinit(alloc);
+        var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+        defer res.deinit(alloc);
+        if (res == .err) {
+            std.debug.print("Round 3 Subcase 2 error: {s}\n", .{res.err});
+        }
+        try std.testing.expect(res == .ok);
+    }
+
+    // 3. Multi-`-t` (`-t globals.d.ts -t index.d.ts` where `globals.d.ts` has `declare module "x"`).
+    const multi_dir = try std.fmt.allocPrint(alloc, "{s}/multi-pkg", .{sandbox});
+    defer alloc.free(multi_dir);
+    const out_multi = try std.fmt.allocPrint(alloc, "{s}/out-multi", .{sandbox});
+    defer alloc.free(out_multi);
+    try cwd.createDirPath(io, multi_dir);
+
+    {
+        var mtd = try cwd.openDir(io, multi_dir, .{});
+        defer mtd.close(io);
+        try mtd.writeFile(io, .{
+            .sub_path = "globals.d.ts",
+            .data =
+            \\declare module "x" {
+            \\  export interface XConfig {
+            \\    retries: number;
+            \\  }
+            \\  export function runX(cfg: XConfig): boolean;
+            \\}
+            ,
+        });
+        try mtd.writeFile(io, .{
+            .sub_path = "index.d.ts",
+            .data =
+            \\export interface B {
+            \\  label: string;
+            \\}
+            \\export declare function takeB(b: B): string;
+            ,
+        });
+    }
+
+    {
+        const globals_dts = try std.fmt.allocPrint(alloc, "{s}/globals.d.ts", .{multi_dir});
+        defer alloc.free(globals_dts);
+        const index_dts = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{multi_dir});
+        defer alloc.free(index_dts);
+        const cli_args = [_][]const u8{ "-t", globals_dts, "-t", index_dts, "-d", out_multi };
+        var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+        defer parsed.deinit(alloc);
+        var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+        defer res.deinit(alloc);
+        if (res == .err) {
+            std.debug.print("Round 3 Subcase 3 error: {s}\n", .{res.err});
+        }
+        try std.testing.expect(res == .ok);
+
+        var out_h = try cwd.openDir(io, out_multi, .{});
+        defer out_h.close(io);
+        // Ambient-only `globals.d.ts` must NOT emit an empty `globals.zig` alongside `x.zig`!
+        try std.testing.expectError(error.FileNotFound, out_h.statFile(io, "globals.zig", .{}));
+    }
+
+    // 4. Empty `.d.ts` fallback: when the entire package would otherwise emit zero modules, emit 1 fallback module.
+    const empty_dir = try std.fmt.allocPrint(alloc, "{s}/empty-pkg", .{sandbox});
+    defer alloc.free(empty_dir);
+    const out_empty = try std.fmt.allocPrint(alloc, "{s}/out-empty", .{sandbox});
+    defer alloc.free(out_empty);
+    try cwd.createDirPath(io, empty_dir);
+    {
+        var ed = try cwd.openDir(io, empty_dir, .{});
+        defer ed.close(io);
+        try ed.writeFile(io, .{ .sub_path = "empty.d.ts", .data = "" });
+    }
+    {
+        const empty_dts = try std.fmt.allocPrint(alloc, "{s}/empty.d.ts", .{empty_dir});
+        defer alloc.free(empty_dts);
+        const cli_args = [_][]const u8{ "-t", empty_dts, "-d", out_empty };
+        var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+        defer parsed.deinit(alloc);
+        var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+        defer res.deinit(alloc);
+        try std.testing.expect(res == .ok);
+        try std.testing.expectEqual(@as(usize, 1), res.ok.module_count);
+    }
+
+    // Compile and execute consumer Zig tests against all 4 generated `root.zig` packages!
+    const consumer_zig = try std.fmt.allocPrint(alloc, "{s}/consumer_r3.zig", .{sandbox});
+    defer alloc.free(consumer_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "consumer_r3.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r_node = @import("out-node/root.zig");
+            \\const r_mixed = @import("out-mixed/root.zig");
+            \\const r_multi = @import("out-multi/root.zig");
+            \\const r_empty = @import("out-empty/root.zig");
+            \\
+            \\test "Round 3: @types/node reference-path closure, mixed ES+ambient, multi -t, and empty fallback" {
+            \\    // 1. @types/node package exports fs, fs_promises, http, node_sqlite, globals — NOT empty index or external other!
+            \\    try std.testing.expect(!@hasDecl(r_node, "index"));
+            \\    try std.testing.expect(!@hasDecl(r_node, "other_ext"));
+            \\    try std.testing.expect(@hasDecl(r_node, "fs"));
+            \\    try std.testing.expect(@hasDecl(r_node, "fs_promises"));
+            \\    try std.testing.expect(@hasDecl(r_node, "http"));
+            \\    try std.testing.expect(@hasDecl(r_node, "node_sqlite"));
+            \\    try std.testing.expect(@hasDecl(r_node, "globals"));
+            \\    try std.testing.expectEqualStrings("processVersion", r_node.globals.process_version.js_name);
+            \\    const db: r_node.node_sqlite.DatabaseSync = .{ .open = true };
+            \\    try std.testing.expect(db.open);
+            \\    const srv: r_node.http.Server = .{ .port = 8080, .stat = .{ .size = 64 } };
+            \\    try std.testing.expectEqual(@as(f64, 8080), srv.port);
+            \\
+            \\    // 2. Mixed file exports A, index, inline_mod, empty_inline, and plugin!
+            \\    try std.testing.expect(r_mixed.A == r_mixed.index.A);
+            \\    try std.testing.expect(&r_mixed.makeA == &r_mixed.index.makeA);
+            \\    try std.testing.expect(@hasDecl(r_mixed, "inline_mod"));
+            \\    try std.testing.expect(@hasDecl(r_mixed, "empty_inline"));
+            \\    try std.testing.expect(@hasDecl(r_mixed, "plugin"));
+            \\    const inline_fn: *const fn () r_mixed.A = &r_mixed.inline_mod.useInline;
+            \\    _ = inline_fn;
+            \\    const p_opts: r_mixed.plugin.PluginOpts = .{ .enabled = true };
+            \\    try std.testing.expect(p_opts.enabled);
+            \\
+            \\    // 3. Multi -t exports both x and index's exports (without empty globals)!
+            \\    try std.testing.expect(!@hasDecl(r_multi, "globals"));
+            \\    try std.testing.expect(@hasDecl(r_multi, "x"));
+            \\    try std.testing.expect(@hasDecl(r_multi, "index"));
+            \\    try std.testing.expect(r_multi.B == r_multi.index.B);
+            \\    try std.testing.expect(&r_multi.takeB == &r_multi.index.takeB);
+            \\    const x_cfg: r_multi.x.XConfig = .{ .retries = 3 };
+            \\    try std.testing.expectEqual(@as(f64, 3), x_cfg.retries);
+            \\
+            \\    // 4. Empty fallback emits valid root.zig + empty.zig!
+            \\    try std.testing.expect(@hasDecl(r_empty, "empty"));
+            \\}
+            ,
+        });
+    }
+
+    const r_node_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_node});
+    defer alloc.free(r_node_zig);
+    const r_mixed_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_mixed});
+    defer alloc.free(r_mixed_zig);
+    const r_multi_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_multi});
+    defer alloc.free(r_multi_zig);
+    const r_empty_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_empty});
+    defer alloc.free(r_empty_zig);
+
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", r_node_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", r_mixed_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", r_multi_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", r_empty_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
+}

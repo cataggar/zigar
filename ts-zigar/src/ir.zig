@@ -387,6 +387,7 @@ fn LowerCtx(comptime GraphType: type) type {
             decl_ids: std.ArrayList(u32) = .empty,
             foreign_exports: std.ArrayList(ForeignExportEntry) = .empty,
             star_re_export_source_mods: std.ArrayList(u32) = .empty,
+            star_re_export_specs: std.ArrayList([]const u8) = .empty,
             is_primary: bool = false,
             included: bool = false,
         };
@@ -441,6 +442,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 c.decl_ids.deinit(self.scratch);
                 c.foreign_exports.deinit(self.scratch);
                 c.star_re_export_source_mods.deinit(self.scratch);
+                c.star_re_export_specs.deinit(self.scratch);
             }
             self.candidates.deinit(self.scratch);
             self.source_mod_to_cand.deinit(self.scratch);
@@ -677,7 +679,36 @@ fn LowerCtx(comptime GraphType: type) type {
             if (did >= self.graph.decls.len) return;
             const d = self.graph.decls[did];
 
-            if (d.kind == .re_export_decl or d.kind == .import_equals_decl) {
+            if (d.kind == .re_export_decl) {
+                const eff_name = if (d.export_name) |esid| self.str(esid) else self.str(d.name);
+                if (std.mem.eql(u8, eff_name, "*")) {
+                    if (d.kind.re_export_decl.target_module) |tmid| {
+                        try appendUniqueU32(
+                            &self.candidates.items[c_idx].star_re_export_source_mods,
+                            self.scratch,
+                            tmid,
+                        );
+                    }
+                    const mspec = self.str(d.kind.re_export_decl.module_specifier);
+                    if (mspec.len > 0) {
+                        var seen_spec = false;
+                        for (self.candidates.items[c_idx].star_re_export_specs.items) |s| {
+                            if (std.mem.eql(u8, s, mspec)) {
+                                seen_spec = true;
+                                break;
+                            }
+                        }
+                        if (!seen_spec) {
+                            try self.candidates.items[c_idx].star_re_export_specs.append(self.scratch, mspec);
+                        }
+                    }
+                    return;
+                }
+                try appendUniqueU32(&self.candidates.items[c_idx].decl_ids, self.scratch, did);
+                try self.appendDeclRecursiveToCand(did, c_idx);
+                return;
+            }
+            if (d.kind == .import_equals_decl) {
                 try appendUniqueU32(&self.candidates.items[c_idx].decl_ids, self.scratch, did);
                 try self.appendDeclRecursiveToCand(did, c_idx);
                 return;
@@ -685,7 +716,9 @@ fn LowerCtx(comptime GraphType: type) type {
 
             var owner_cand: u32 = c_idx;
             if (current_mod_id != null and d.module != current_mod_id.?) {
-                if (self.findGraphModuleIndexById(d.module)) |om_idx| {
+                if (self.decl_to_cand.get(did)) |existing_cand| {
+                    owner_cand = existing_cand;
+                } else if (self.findGraphModuleIndexById(d.module)) |om_idx| {
                     const owner_mod = self.graph.modules[om_idx];
                     if (!self.isBundledLibModule(owner_mod)) {
                         owner_cand = self.source_mod_to_cand.get(owner_mod.id) orelse blk: {
@@ -694,10 +727,8 @@ fn LowerCtx(comptime GraphType: type) type {
                         };
                         try self.registerCanonicalDeclInCandidate(owner_cand, did);
                     } else {
-                        owner_cand = self.decl_to_cand.get(did) orelse c_idx;
+                        owner_cand = c_idx;
                     }
-                } else {
-                    owner_cand = self.decl_to_cand.get(did) orelse c_idx;
                 }
             } else if (self.decl_to_cand.get(did)) |existing_cand| {
                 owner_cand = existing_cand;
@@ -725,7 +756,25 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
             }
 
-            // 1. Ambient modules (`declare module "node:http" { ... }`).
+            // 1a. Ambient modules (`declare module "node:http" { ... }`): register canonical own
+            // declarations first so cross-file ambient re-exports find their owning ambient module.
+            for (self.graph.modules) |mod| {
+                if (self.isBundledLibModule(mod)) continue;
+                for (mod.ambient_modules) |amb| {
+                    const amb_name = self.str(amb.module_name);
+                    const c_idx = try self.getOrCreateCandidate(amb_name, null);
+                    for (amb.decls) |did| {
+                        if (did >= self.graph.decls.len) continue;
+                        const d = self.graph.decls[did];
+                        if (d.kind == .re_export_decl or d.kind == .import_equals_decl) continue;
+                        if (d.module == mod.id and !self.decl_to_cand.contains(did)) {
+                            try self.registerCandidateDeclOrForeignExport(c_idx, mod.id, did, null, false);
+                        }
+                    }
+                }
+            }
+
+            // 1b. Ambient modules: register re-exports and cross-ambient foreign exports.
             for (self.graph.modules) |mod| {
                 if (self.isBundledLibModule(mod)) continue;
                 for (mod.ambient_modules) |amb| {
@@ -738,6 +787,8 @@ fn LowerCtx(comptime GraphType: type) type {
             }
 
             // 2. File-level module exports / star re-exports / export = / global augmentations.
+            // Reference-only (`/// <reference path="..." />`) and ambient-only (`declare module "..."`)
+            // files do NOT create empty file-level candidates here.
             for (self.graph.modules) |mod| {
                 if (self.isBundledLibModule(mod)) continue;
 
@@ -745,9 +796,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     mod.star_re_exports.len > 0 or
                     mod.default_export != null or
                     mod.export_equals != null or
-                    (mod.ambient_modules.len == 0 and mod.global_augmentations.len > 0) or
-                    (mod.ambient_modules.len == 0 and self.graph.modules.len == 1) or
-                    (mod.ambient_modules.len == 0 and self.isPrimaryVfsPath(self.str(mod.file_path))) or
+                    mod.global_augmentations.len > 0 or
                     self.source_mod_to_cand.contains(mod.id);
 
                 if (has_file_content) {
@@ -973,6 +1022,18 @@ fn LowerCtx(comptime GraphType: type) type {
                                 try queue.append(self.scratch, dep_cand);
                             }
                         }
+                    } else if (re.target_module == null) {
+                        const mspec = self.str(re.module_specifier);
+                        if (mspec.len > 0) {
+                            for (self.candidates.items, 0..) |*cand, idx| {
+                                if (moduleMatchesPattern(cand.wire_specifier, cand.substituted_specifier, mspec)) {
+                                    if (!cand.included) {
+                                        cand.included = true;
+                                        try queue.append(self.scratch, @intCast(idx));
+                                    }
+                                }
+                            }
+                        }
                     }
                 },
                 .import_equals_decl => |ie| {
@@ -1058,6 +1119,19 @@ fn LowerCtx(comptime GraphType: type) type {
                     }
                 }
 
+                const star_specs = try self.scratch.dupe([]const u8, self.candidates.items[c_idx].star_re_export_specs.items);
+                defer self.scratch.free(star_specs);
+                for (star_specs) |mspec| {
+                    for (self.candidates.items, 0..) |*cand, idx| {
+                        if (moduleMatchesPattern(cand.wire_specifier, cand.substituted_specifier, mspec)) {
+                            if (!cand.included) {
+                                cand.included = true;
+                                try queue.append(self.scratch, @intCast(idx));
+                            }
+                        }
+                    }
+                }
+
                 const foreign_snapshot = try self.scratch.dupe(ForeignExportEntry, self.candidates.items[c_idx].foreign_exports.items);
                 defer self.scratch.free(foreign_snapshot);
                 for (foreign_snapshot) |fe| {
@@ -1096,6 +1170,22 @@ fn LowerCtx(comptime GraphType: type) type {
             return null;
         }
 
+        fn createEmptyFallbackCandidate(self: *Self) !u32 {
+            for (self.graph.modules) |mod| {
+                if (self.isBundledLibModule(mod)) continue;
+                if (self.isPrimaryVfsPath(self.str(mod.file_path))) {
+                    const wire_spec = try self.deriveFileLogicalSpecifier(mod);
+                    return try self.getOrCreateCandidate(wire_spec, mod.id);
+                }
+            }
+            for (self.graph.modules) |mod| {
+                if (self.isBundledLibModule(mod)) continue;
+                const wire_spec = try self.deriveFileLogicalSpecifier(mod);
+                return try self.getOrCreateCandidate(wire_spec, mod.id);
+            }
+            return try self.getOrCreateCandidate("index", null);
+        }
+
         fn filterAndCloseDependencies(self: *Self) LowerError![]u32 {
             if (self.options.modules.len > 0) {
                 var queue: std.ArrayList(u32) = .empty;
@@ -1131,6 +1221,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 defer mod_bfs.deinit(self.scratch);
 
                 for (self.graph.modules) |mod| {
+                    if (self.isBundledLibModule(mod)) continue;
                     if (self.isPrimaryVfsPath(self.str(mod.file_path))) {
                         try primary_mod_ids.put(self.scratch, mod.id, {});
                         try ref_path_mod_ids.put(self.scratch, mod.id, {});
@@ -1138,8 +1229,8 @@ fn LowerCtx(comptime GraphType: type) type {
                     }
                 }
 
-                // Follow explicit `/// <reference path="..." />` directives (NOT `types="..."`!)
-                // from primary files so split ambient declarations in a package stay included.
+                // Compute transitive `/// <reference path="..." />` closure (explicitly NOT
+                // `triple_slash_types` to external `node_modules`!) starting from `primary_vfs_paths`.
                 var mb_head: usize = 0;
                 while (mb_head < mod_bfs.items.len) : (mb_head += 1) {
                     const mid = mod_bfs.items[mb_head];
@@ -1153,10 +1244,22 @@ fn LowerCtx(comptime GraphType: type) type {
                         defer self.scratch.free(resolved_fp);
                         const resolved_dts = try std.fmt.allocPrint(self.scratch, "{s}.d.ts", .{resolved_fp});
                         defer self.scratch.free(resolved_dts);
+                        const resolved_ts = try std.fmt.allocPrint(self.scratch, "{s}.ts", .{resolved_fp});
+                        defer self.scratch.free(resolved_ts);
+                        const resolved_idx_dts = try std.fmt.allocPrint(self.scratch, "{s}/index.d.ts", .{resolved_fp});
+                        defer self.scratch.free(resolved_idx_dts);
+                        const resolved_idx_ts = try std.fmt.allocPrint(self.scratch, "{s}/index.ts", .{resolved_fp});
+                        defer self.scratch.free(resolved_idx_ts);
 
                         for (self.graph.modules) |other| {
+                            if (self.isBundledLibModule(other)) continue;
                             const ofp = self.str(other.file_path);
-                            if (std.mem.eql(u8, ofp, resolved_fp) or std.mem.eql(u8, ofp, resolved_dts)) {
+                            if (std.mem.eql(u8, ofp, resolved_fp) or
+                                std.mem.eql(u8, ofp, resolved_dts) or
+                                std.mem.eql(u8, ofp, resolved_ts) or
+                                std.mem.eql(u8, ofp, resolved_idx_dts) or
+                                std.mem.eql(u8, ofp, resolved_idx_ts))
+                            {
                                 if (!ref_path_mod_ids.contains(other.id)) {
                                     try ref_path_mod_ids.put(self.scratch, other.id, {});
                                     try mod_bfs.append(self.scratch, other.id);
@@ -1166,7 +1269,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     }
                 }
 
-                var primary_seeded: usize = 0;
+                // 1. Mark non-empty file-level candidates directly owned by `primary_vfs_paths` as primary.
                 for (self.candidates.items, 0..) |*cand, idx| {
                     for (cand.source_mod_ids.items) |smid| {
                         if (primary_mod_ids.contains(smid)) {
@@ -1175,20 +1278,25 @@ fn LowerCtx(comptime GraphType: type) type {
                                 cand.included = true;
                                 try queue.append(self.scratch, @intCast(idx));
                             }
-                            primary_seeded += 1;
                             break;
                         }
                     }
                 }
 
-                // Include ambient modules (and `/// <reference path="..." />` file modules) owned
-                // by primary files; if a primary `.d.ts` file is ambient-only, mark its ambient
-                // modules `is_primary = true` so `root.zig` re-exports them!
-                const make_ambient_primary = (primary_seeded == 0);
+                // 2. Mark every ambient module (`declare module "..."`) and `declare global` / script
+                // globals module in the `primary_vfs_paths + triple_slash_paths` closure as primary!
                 for (mod_bfs.items) |mid| {
                     const midx = self.findGraphModuleIndexById(mid) orelse continue;
                     const m = self.graph.modules[midx];
-                    if (!primary_mod_ids.contains(mid)) {
+                    if (m.global_augmentations.len > 0) {
+                        if (self.source_mod_to_cand.get(mid)) |c_idx| {
+                            self.candidates.items[c_idx].is_primary = true;
+                            if (!self.candidates.items[c_idx].included) {
+                                self.candidates.items[c_idx].included = true;
+                                try queue.append(self.scratch, c_idx);
+                            }
+                        }
+                    } else if (!primary_mod_ids.contains(mid)) {
                         if (self.source_mod_to_cand.get(mid)) |c_idx| {
                             if (!self.candidates.items[c_idx].included) {
                                 self.candidates.items[c_idx].included = true;
@@ -1199,9 +1307,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     for (m.ambient_modules) |amb| {
                         if (try self.findAmbientCandidateIdx(self.str(amb.module_name))) |amb_cand_idx| {
                             var ac = &self.candidates.items[amb_cand_idx];
-                            if (make_ambient_primary and primary_mod_ids.contains(mid)) {
-                                ac.is_primary = true;
-                            }
+                            ac.is_primary = true;
                             if (!ac.included) {
                                 ac.included = true;
                                 try queue.append(self.scratch, amb_cand_idx);
@@ -1211,14 +1317,30 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
 
                 if (queue.items.len == 0) {
-                    for (self.candidates.items) |*cand| {
-                        cand.is_primary = true;
-                        cand.included = true;
-                    }
+                    // Only emit an empty fallback module when the entire package would otherwise
+                    // emit zero modules!
+                    const fb_idx = try self.createEmptyFallbackCandidate();
+                    self.candidates.items[fb_idx].is_primary = true;
+                    self.candidates.items[fb_idx].included = true;
                 } else {
+                    var has_any_primary = false;
+                    for (queue.items) |q_idx| {
+                        if (self.candidates.items[q_idx].is_primary) {
+                            has_any_primary = true;
+                            break;
+                        }
+                    }
+                    if (!has_any_primary) {
+                        for (queue.items) |q_idx| {
+                            self.candidates.items[q_idx].is_primary = true;
+                        }
+                    }
                     try self.runReachabilityClosure(&queue);
                 }
             } else {
+                if (self.candidates.items.len == 0) {
+                    _ = try self.createEmptyFallbackCandidate();
+                }
                 for (self.candidates.items) |*cand| {
                     cand.is_primary = true;
                     cand.included = true;
@@ -2468,21 +2590,30 @@ fn LowerCtx(comptime GraphType: type) type {
                 },
                 .re_export_decl => |re| {
                     if (re.is_namespace) {
-                        if (re.target_module) |tmid| {
-                            if (self.resolveFinalModFromSourceMod(tmid)) |t_mod_idx| {
-                                if (t_mod_idx != final_mod_idx) {
-                                    try imports_used.put(self.scratch, t_mod_idx, {});
-                                    try out_list.append(self.alloc, .{
-                                        .source_decl_id = decl_id,
-                                        .zig_ident = bound.zig_ident,
-                                        .logical_name = bound.logical_name,
-                                        .wire_name = bound.wire_name,
-                                        .is_exported = true,
-                                        .is_default_export = is_default_export,
-                                        .jsdoc = top_jsdoc,
-                                        .kind = .{ .namespace_re_export = .{ .target_module_index = t_mod_idx } },
-                                    });
+                        const resolved_target_mod: ?u32 = if (re.target_module) |tmid|
+                            self.resolveFinalModFromSourceMod(tmid)
+                        else blk: {
+                            const mspec = self.str(re.module_specifier);
+                            if (mspec.len > 0) {
+                                if (try self.findAmbientCandidateIdx(mspec)) |amb_cand| {
+                                    break :blk self.candToFinalIndex(amb_cand);
                                 }
+                            }
+                            break :blk null;
+                        };
+                        if (resolved_target_mod) |t_mod_idx| {
+                            if (t_mod_idx != final_mod_idx) {
+                                try imports_used.put(self.scratch, t_mod_idx, {});
+                                try out_list.append(self.alloc, .{
+                                    .source_decl_id = decl_id,
+                                    .zig_ident = bound.zig_ident,
+                                    .logical_name = bound.logical_name,
+                                    .wire_name = bound.wire_name,
+                                    .is_exported = true,
+                                    .is_default_export = is_default_export,
+                                    .jsdoc = top_jsdoc,
+                                    .kind = .{ .namespace_re_export = .{ .target_module_index = t_mod_idx } },
+                                });
                             }
                         }
                         return;
