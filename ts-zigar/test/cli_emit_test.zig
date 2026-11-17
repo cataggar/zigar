@@ -3315,7 +3315,7 @@ test "Issue #48 M3.2a Sema: plain options structs vs handle classes, divergent a
             \\    _ = &r.BaseTransport.supportedCount;
             \\    _ = &r.BaseTransport.ping;
             \\
-            \\    // 4. HttpClient: inherits `protocol` & `ping` from BaseTransport, overloaded `init`/`init_2`,
+            \\    // 4. HttpClient: inherits `protocol` & `ping` from BaseTransport, semantic `initString`/`initWithTimeout` + unified `init`,
             \\    //    divergent `endpoint` + `setEndpoint`, write-only `setAuthToken`, shared nominal `mode`/`setMode`,
             \\    //    and static RW / RO / WO / divergent accessor targets!
             \\    try std.testing.expect(r.HttpClient.zigar_js.is_handle);
@@ -3323,8 +3323,11 @@ test "Issue #48 M3.2a Sema: plain options structs vs handle classes, divergent a
             \\    try std.testing.expect(!@hasDecl(r.HttpClient, "setBaseUrl"));
             \\    try std.testing.expect(!@hasDecl(r.HttpClient, "authToken"));
             \\    try std.testing.expect(@hasDecl(r.HttpClient, "setAuthToken"));
-            \\    const c1: *const fn ([]const u8) r.zigar_js.CallError!r.HttpClient = &r.HttpClient.init;
-            \\    const c2: *const fn ([]const u8, f64) r.zigar_js.CallError!r.HttpClient = &r.HttpClient.init_2;
+            \\    try std.testing.expect(!@hasDecl(r.HttpClient, "init_2"));
+            \\    const c1: *const fn ([]const u8) r.zigar_js.CallError!r.HttpClient = &r.HttpClient.initString;
+            \\    const c2: *const fn ([]const u8, f64) r.zigar_js.CallError!r.HttpClient = &r.HttpClient.initWithTimeout;
+            \\    try std.testing.expectError(error.HostUnavailable, r.HttpClient.init("https://example.com"));
+            \\    try std.testing.expectError(error.HostUnavailable, r.HttpClient.init(.{ "https://example.com", @as(f64, 1000) }));
             \\    const inherited_ping: *const fn (r.HttpClient) r.zigar_js.CallError!bool = &r.HttpClient.ping;
             \\    const inherited_proto: *const fn (r.HttpClient, std.mem.Allocator) r.zigar_js.CallError![]const u8 = &r.HttpClient.protocolAlloc;
             \\    const get_ep: *const fn (r.HttpClient, std.mem.Allocator) r.zigar_js.CallError![]const u8 = &r.HttpClient.endpointAlloc;
@@ -3759,12 +3762,16 @@ test "Issue #49 M3.2b Sema: multi-level inheritance, diamond overloads, A & B in
             \\    const sr_ctor: *const fn (?f64) r.zigar_js.CallError!h.ServerResponse = &h.ServerResponse.init;
             \\    const sr_wh: *const fn (h.ServerResponse, f64, ?[]const u8) r.zigar_js.CallError!h.ServerResponse = &h.ServerResponse.writeHead;
             \\    const sr_sh: *const fn (h.ServerResponse, []const u8, []const u8) r.zigar_js.CallError!void = &h.ServerResponse.setHeader;
-            \\    const sr_w1: *const fn (h.ServerResponse, []const u8) r.zigar_js.CallError!bool = &h.ServerResponse.write;
-            \\    const sr_w2: *const fn (h.ServerResponse, r.zigar_js.Uint8Array) r.zigar_js.CallError!bool = &h.ServerResponse.write_2;
+            \\    const sr_w1: *const fn (h.ServerResponse, []const u8) r.zigar_js.CallError!bool = &h.ServerResponse.writeString;
+            \\    const sr_w2: *const fn (h.ServerResponse, r.zigar_js.Uint8Array) r.zigar_js.CallError!bool = &h.ServerResponse.writeUint8Array;
             \\    const sr_pipe: *const fn (h.ServerResponse, []const u8) r.zigar_js.CallError!bool = &h.ServerResponse.pipeTo;
-            \\    const sr_emit1: *const fn (h.ServerResponse, []const u8) r.zigar_js.CallError!bool = &h.ServerResponse.emit;
-            \\    const sr_emit2: *const fn (h.ServerResponse, []const u8, f64) r.zigar_js.CallError!bool = &h.ServerResponse.emit_2;
+            \\    const sr_emit1: *const fn (h.ServerResponse, []const u8) r.zigar_js.CallError!bool = &h.ServerResponse.emitString;
+            \\    const sr_emit2: *const fn (h.ServerResponse, []const u8, f64) r.zigar_js.CallError!bool = &h.ServerResponse.emitWithCode;
             \\    const sr_aug: *const fn (h.ServerResponse, std.mem.Allocator) r.zigar_js.CallError![]const u8 = &h.ServerResponse.augmentedTagAlloc;
+            \\    try std.testing.expect(@hasDecl(h.ServerResponse, "write"));
+            \\    try std.testing.expect(!@hasDecl(h.ServerResponse, "write_2"));
+            \\    try std.testing.expect(@hasDecl(h.ServerResponse, "emit"));
+            \\    try std.testing.expect(!@hasDecl(h.ServerResponse, "emit_2"));
             \\    _ = sr_ctor;
             \\    _ = sr_wh;
             \\    _ = sr_sh;
@@ -3800,12 +3807,14 @@ test "Issue #49 M3.2b Sema: multi-level inheritance, diamond overloads, A & B in
             \\
             \\    // 2. Diamond multi-interface inheritance preserves BOTH `send(string)` and `send(Uint8Array)` overloads
             \\    //    while deduplicating `SharedCore.id` and `SharedCore.close`!
-            \\    const dc_s1: *const fn (h.DuplexChannel, []const u8) r.zigar_js.CallError!f64 = &h.DuplexChannel.send;
-            \\    const dc_s2: *const fn (h.DuplexChannel, r.zigar_js.Uint8Array) r.zigar_js.CallError!f64 = &h.DuplexChannel.send_2;
+            \\    const dc_s1: *const fn (h.DuplexChannel, []const u8) r.zigar_js.CallError!f64 = &h.DuplexChannel.sendString;
+            \\    const dc_s2: *const fn (h.DuplexChannel, r.zigar_js.Uint8Array) r.zigar_js.CallError!f64 = &h.DuplexChannel.sendUint8Array;
             \\    const dc_close: *const fn (h.DuplexChannel) r.zigar_js.CallError!void = &h.DuplexChannel.close;
             \\    _ = dc_s1;
             \\    _ = dc_s2;
             \\    _ = dc_close;
+            \\    try std.testing.expect(@hasDecl(h.DuplexChannel, "send"));
+            \\    try std.testing.expect(!@hasDecl(h.DuplexChannel, "send_2"));
             \\    try std.testing.expect(!@hasDecl(h.DuplexChannel, "close_2"));
             \\    try std.testing.expect(comptime r.zigar_js.isAssignableType(h.DuplexChannel, h.SharedCore));
             \\
@@ -3914,12 +3923,16 @@ test "Issue #49 M3.2b Sema: multi-level inheritance, diamond overloads, A & B in
             \\    try std.testing.expectEqualStrings("$", cjs.zigar_js.export_equals);
             \\    _ = &@field(cjs, cjs.zigar_js.export_equals).call;
             \\    _ = &cjs.@"$".call;
-            \\    _ = &cjs.@"$".call_2;
+            \\    _ = &cjs.@"$".callString;
+            \\    _ = &cjs.@"$".callWithRoot;
+            \\    try std.testing.expect(!@hasDecl(cjs.@"$", "call_2"));
             \\    try std.testing.expectError(error.HostUnavailable, cjs.version.getAlloc(std.testing.allocator));
             \\    _ = &cjs.ajaxAlloc;
             \\    try std.testing.expect(cjs.Selection.zigar_js.is_handle);
             \\    _ = &h.@"$".call;
-            \\    _ = &h.@"$".call_2;
+            \\    _ = &h.@"$".callString;
+            \\    _ = &h.@"$".callWithRoot;
+            \\    try std.testing.expect(!@hasDecl(h.@"$", "call_2"));
             \\    try std.testing.expectError(error.HostUnavailable, h.@"$".version.getAlloc(std.testing.allocator));
             \\    _ = &h.@"$".ajaxAlloc;
             \\    try std.testing.expect(h.@"$".Selection.zigar_js.is_handle);
@@ -3943,6 +3956,241 @@ test "Issue #49 M3.2b Sema: multi-level inheritance, diamond overloads, A & B in
             \\    const out_err: h.TaggedOutcome = .{ .err = .{ .message = "boom", .request_id = "req-2" } };
             \\    try std.testing.expectEqualStrings("req-1", out_ok.ok.request_id);
             \\    try std.testing.expectEqualStrings("req-2", out_err.err.request_id);
+            \\}
+            ,
+        });
+    }
+
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
+}
+
+test "Issue #50 M3.3a Sema: smart overloads, variadic rest params, callbacks, this params, and type predicates" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    const cwd = std.Io.Dir.cwd();
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue50-functions", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const src_dir = try std.fmt.allocPrint(alloc, "{s}/src", .{sandbox});
+    defer alloc.free(src_dir);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+
+    try cwd.createDirPath(io, src_dir);
+    {
+        var sd = try cwd.openDir(io, src_dir, .{});
+        defer sd.close(io);
+        try sd.writeFile(io, .{
+            .sub_path = "m3_functions.d.ts",
+            .data =
+            \\// 1. Subsumed prefix overload deduplication
+            \\export declare function parseRecord(raw: string): number;
+            \\export declare function parseRecord(raw: string, radix?: number): number;
+            \\
+            \\// 2. Buffer.from / fs.readFile / EventEmitter.on / Emitter ctor overloads
+            \\export interface ReadOptions {
+            \\  encoding?: string;
+            \\}
+            \\export declare function readFile(path: string, cb: (err: string | null, data: Uint8Array) => void): void;
+            \\export declare function readFile(path: string, encoding: "utf8", cb: (err: string | null, data: string) => void): void;
+            \\export declare function readFile(path: string, opts: ReadOptions, cb: (err: string | null, data: string | Uint8Array) => void): void;
+            \\
+            \\export declare class Buf {
+            \\  readonly byteLength: number;
+            \\  static from(text: string, encoding?: "utf8" | "hex"): Buf;
+            \\  static from(bytes: Uint8Array): Buf;
+            \\  static from(items: readonly number[]): Buf;
+            \\}
+            \\
+            \\export declare class Emitter {
+            \\  constructor();
+            \\  constructor(maxListeners: number);
+            \\  constructor(name: string, maxListeners: number);
+            \\  on(event: "data", listener: (chunk: string) => void): this;
+            \\  on(event: "error", listener: (err: string) => void): this;
+            \\  on(event: "open", listener: () => void): this;
+            \\  on(event: "close", listener: () => void): this;
+            \\}
+            \\
+            \\// 3. Variadic rest parameters (`...args: any[]` and typed `...nums: number[]`)
+            \\export declare function consoleLog(prefix: string, ...args: any[]): string;
+            \\export declare function sumScaled(scale?: number, ...nums: number[]): number;
+            \\
+            \\// 4. Callbacks (inline fn, type alias, callable interface, optional cb, `this` cb) & HOF `Callable` return
+            \\export type StringMapper = (item: string, idx: number) => string;
+            \\export interface NumberPred {
+            \\  (val: number): boolean;
+            \\}
+            \\export interface CounterBox {
+            \\  count: number;
+            \\}
+            \\export declare function mapItems(items: readonly string[], fn: StringMapper): string[];
+            \\export declare function filterNums(nums: readonly number[], pred: NumberPred, onDone?: (kept: number) => void): number[];
+            \\export declare function runWithBoxThis(box: CounterBox, cb: (this: CounterBox, delta: number) => number): number;
+            \\export declare function makeFormatter(prefix: string): (code: number) => string;
+            \\export declare function makeThisAdder(scale: number): (this: CounterBox, delta: number) => number;
+            \\
+            \\// 5. Explicit `this: T` and `this: void` parameters on standalone functions
+            \\export declare function addToBox(this: CounterBox, step: number): number;
+            \\export declare function pureDouble(this: void, n: number): number;
+            \\
+            \\// 6. Type predicates (`x is T`, `asserts x is T`, `this is T`, `asserts this is T`, `asserts cond`)
+            \\export declare class AstNode {
+            \\  readonly kind: string;
+            \\}
+            \\export declare class BinaryExpr extends AstNode {
+            \\  readonly op: string;
+            \\}
+            \\export declare function isBinaryExpr(node: AstNode): node is BinaryExpr;
+            \\export declare function assertBinaryExpr(node: AstNode): asserts node is BinaryExpr;
+            \\export declare function isTextValue(val: unknown): val is string;
+            \\export declare function assertFlag(ok: boolean, msg?: string): asserts ok;
+            \\export declare class Conn {
+            \\  isReady(): this is ReadyConn;
+            \\  assertReady(): asserts this is ReadyConn;
+            \\}
+            \\export declare class ReadyConn extends Conn {
+            \\  readonly sessionToken: string;
+            \\}
+            ,
+        });
+    }
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const dts_path = try std.fmt.allocPrint(alloc, "{s}/m3_functions.d.ts", .{src_dir});
+    defer alloc.free(dts_path);
+    const cli_args = [_][]const u8{ "-t", dts_path, "-d", out_dir };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Issue #50 pipeline error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+
+    const consumer_zig = try std.fmt.allocPrint(alloc, "{s}/consumer_issue50.zig", .{sandbox});
+    defer alloc.free(consumer_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "consumer_issue50.zig",
+            .data =
+            \\const std = @import("std");
+            \\const root = @import("out/root.zig");
+            \\const m = root.m3_functions;
+            \\const js = root.zigar_js;
+            \\
+            \\fn onDataCb(chunk: []const u8) void {
+            \\    _ = chunk;
+            \\}
+            \\fn onCloseCb() void {}
+            \\fn onReadUtf8(err: ?[]const u8, data: []const u8) void {
+            \\    _ = err;
+            \\    _ = data;
+            \\}
+            \\fn mapUpper(item: []const u8, idx: f64) []const u8 {
+            \\    _ = idx;
+            \\    return item;
+            \\}
+            \\fn keepPos(val: f64) bool {
+            \\    return val > 0;
+            \\}
+            \\fn boxThisCb(self_box: m.CounterBox, delta: f64) f64 {
+            \\    return self_box.count + delta;
+            \\}
+            \\
+            \\test "Issue #50 M3.3a Sema assertions" {
+            \\    // 1. Subsumed overload deduplicated cleanly with zero `_2`
+            \\    try std.testing.expect(!@hasDecl(m, "parseRecord_2"));
+            \\    const pr_fn: *const fn ([]const u8, ?f64) js.CallError!f64 = &m.parseRecord;
+            \\    _ = pr_fn;
+            \\
+            \\    // 2. Semantic overload names + unified comptime dispatchers (`readFile`, `Buf.from`, `Emitter.init`, `Emitter.on`)
+            \\    try std.testing.expect(!@hasDecl(m, "readFile_2"));
+            \\    try std.testing.expect(!@hasDecl(m, "readFile_3"));
+            \\    try std.testing.expect(@hasDecl(m, "readFileCallback"));
+            \\    try std.testing.expect(@hasDecl(m, "readFileUtf8"));
+            \\    try std.testing.expect(@hasDecl(m, "readFileWithOpts"));
+            \\    try std.testing.expect(@hasDecl(m, "readFile"));
+            \\    try std.testing.expectError(error.HostUnavailable, m.readFile(.{ "a.txt", .utf8, onReadUtf8 }));
+            \\    try std.testing.expectError(error.HostUnavailable, m.readFile(.{ "a.txt", "utf8", onReadUtf8 }));
+            \\
+            \\    try std.testing.expect(!@hasDecl(m.Buf, "from_2"));
+            \\    try std.testing.expect(@hasDecl(m.Buf, "fromString"));
+            \\    try std.testing.expect(@hasDecl(m.Buf, "fromUint8Array"));
+            \\    try std.testing.expect(@hasDecl(m.Buf, "fromSlice"));
+            \\    try std.testing.expectError(error.HostUnavailable, m.Buf.from("abc"));
+            \\    try std.testing.expectError(error.HostUnavailable, m.Buf.from(.{ "abc", .hex }));
+            \\    try std.testing.expectError(error.HostUnavailable, m.Buf.from(&[_]f64{ 1, 2, 3 }));
+            \\
+            \\    try std.testing.expect(!@hasDecl(m.Emitter, "init_2"));
+            \\    try std.testing.expect(@hasDecl(m.Emitter, "initEmpty"));
+            \\    try std.testing.expect(@hasDecl(m.Emitter, "initNumber"));
+            \\    try std.testing.expectError(error.HostUnavailable, m.Emitter.init(.{}));
+            \\    try std.testing.expectError(error.HostUnavailable, m.Emitter.init(16));
+            \\    try std.testing.expectError(error.HostUnavailable, m.Emitter.init(.{ "bus", 32 }));
+            \\    try std.testing.expect(@hasDecl(m.Emitter, "onData"));
+            \\    try std.testing.expect(@hasDecl(m.Emitter, "onError"));
+            \\    try std.testing.expect(@hasDecl(m.Emitter, "onOpen"));
+            \\    try std.testing.expect(@hasDecl(m.Emitter, "onClose"));
+            \\    const fake_em: m.Emitter = .{ .ref = .@"undefined" };
+            \\    try std.testing.expectError(error.HostUnavailable, fake_em.on(.{ .data, onDataCb }));
+            \\    try std.testing.expectError(error.HostUnavailable, fake_em.on(.{ .open, onCloseCb }));
+            \\    try std.testing.expectError(error.HostUnavailable, fake_em.on(.{ .close, onCloseCb }));
+            \\    try std.testing.expectError(error.HostUnavailable, fake_em.on(.{ "close", onCloseCb }));
+            \\
+            \\    // 3. Variadic `anytype` tuple/single-arg + `*Slice` companions
+            \\    try std.testing.expectError(error.HostUnavailable, m.consoleLogAlloc(std.testing.allocator, "[info]", .{ "port", 8080, true }));
+            \\    try std.testing.expectError(error.HostUnavailable, m.consoleLogAlloc(std.testing.allocator, "[info]", 8080));
+            \\    try std.testing.expectError(error.HostUnavailable, m.consoleLogSliceAlloc(std.testing.allocator, "[info]", &[_]js.Any{}));
+            \\    try std.testing.expectError(error.HostUnavailable, m.sumScaled(2.0, .{ 10, 20, 30 }));
+            \\    try std.testing.expectError(error.HostUnavailable, m.sumScaled(null, .{}));
+            \\    try std.testing.expectError(error.HostUnavailable, m.sumScaledSlice(2.0, &[_]f64{ 1, 2, 3 }));
+            \\
+            \\    // 4. Callbacks, `once`, `closure`, `this`-callbacks, and HOF `Callable` / `CallableWithThis`
+            \\    try std.testing.expectError(error.HostUnavailable, m.mapItemsAlloc(std.testing.allocator, &.{"a"}, mapUpper));
+            \\    try std.testing.expectError(error.HostUnavailable, m.filterNumsAlloc(std.testing.allocator, &.{ 1, -2 }, keepPos, null));
+            \\    try std.testing.expectError(error.HostUnavailable, m.runWithBoxThis(.{ .count = 5 }, boxThisCb));
+            \\    const fmt_fn: *const fn ([]const u8) js.CallError!js.Callable(fn (f64) []const u8) = &m.makeFormatter;
+            \\    const add_fn: *const fn (f64) js.CallError!js.CallableWithThis(m.CounterBox, fn (f64) f64) = &m.makeThisAdder;
+            \\    _ = fmt_fn;
+            \\    _ = add_fn;
+            \\
+            \\    // 5. Explicit `this: CounterBox` vs `this: void`
+            \\    const atb: *const fn (m.CounterBox, f64) js.CallError!f64 = &m.addToBox;
+            \\    const pd: *const fn (f64) js.CallError!f64 = &m.pureDouble;
+            \\    _ = atb;
+            \\    _ = pd;
+            \\
+            \\    // 6. `x is T`, `asserts x is T`, `this is T`, `asserts this is T`, and `asserts cond`
+            \\    const ib: *const fn (m.AstNode) js.CallError!bool = &m.isBinaryExpr;
+            \\    const as_b: *const fn (m.AstNode) js.CallError!?m.BinaryExpr = &m.asBinaryExpr;
+            \\    const ab: *const fn (m.AstNode) js.CallError!void = &m.assertBinaryExpr;
+            \\    const ens_b: *const fn (m.AstNode) js.CallError!m.BinaryExpr = &m.ensureBinaryExpr;
+            \\    const itv: *const fn (js.Unknown) js.CallError!bool = &m.isTextValue;
+            \\    const as_tv: *const fn (js.Unknown) js.CallError!?[]const u8 = &m.asTextValue;
+            \\    const as_tv_alloc: *const fn (std.mem.Allocator, js.Unknown) js.CallError!?[]const u8 = &m.asTextValueAlloc;
+            \\    const af: *const fn (bool, ?[]const u8) js.CallError!void = &m.assertFlag;
+            \\    try std.testing.expect(!@hasDecl(m, "ensureFlag"));
+            \\    const conn_ir: *const fn (m.Conn) js.CallError!bool = &m.Conn.isReady;
+            \\    const conn_asr: *const fn (m.Conn) js.CallError!?m.ReadyConn = &m.Conn.asReady;
+            \\    const conn_arr: *const fn (m.Conn) js.CallError!void = &m.Conn.assertReady;
+            \\    const conn_ensr: *const fn (m.Conn) js.CallError!m.ReadyConn = &m.Conn.ensureReady;
+            \\    _ = .{ ib, as_b, ab, ens_b, itv, as_tv, as_tv_alloc, af, conn_ir, conn_asr, conn_arr, conn_ensr };
             \\}
             ,
         });

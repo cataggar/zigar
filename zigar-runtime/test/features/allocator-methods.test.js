@@ -66,6 +66,36 @@ describe('Feature: allocator-methods', function() {
       });
       expect(() => struct.alloc(16, 5)).to.throw(Error).with.property('message').to.contain('5');
     })
+    it('should bypass vtable.alloc and vtable.free for zero-length allocations', function() {
+      const env = new Env();
+      let allocCalls = 0;
+      let freeCalls = 0;
+      const struct = {
+        ptr: {},
+        vtable: {
+          alloc() {
+            allocCalls++;
+            throw new Error('vtable.alloc must not be called with len === 0');
+          },
+          free() {
+            freeCalls++;
+            throw new Error('vtable.free must not be called with len === 0');
+          },
+        }
+      };
+      defineProperties(struct, {
+        alloc: env.defineAlloc(),
+        free: env.defineFree(),
+      });
+      const dv = struct.alloc(0, 8);
+      expect(dv.byteLength).to.equal(0);
+      expect(dv[ZIG].align).to.equal(8);
+      expect(Number(dv[ZIG].address)).to.equal(8);
+      expect(allocCalls).to.equal(0);
+      expect(() => struct.free(dv)).to.not.throw();
+      expect(freeCalls).to.equal(0);
+      expect(() => struct.free(dv)).to.throw(TypeError);
+    })
 
   })
   describe('defineFree', function() {

@@ -1623,6 +1623,7 @@ export default mixin({
       is64,
       sync: !(flags & 1),
       once: Boolean(flags & 2),
+      passThis: Boolean(flags & 4),
     };
     this.zigCallbackTemplateCache.set(descriptorAddr, template);
     return template;
@@ -1676,8 +1677,10 @@ export default mixin({
       slotDV[ZIG] = { address: slotAddr, len: 0 };
       caller[MEMORY] = slotDV;
       const state = { id, released: false, handle: 0, handleReleased: false };
+      const thisEnv = this;
       const unwrapString = template.unwrapString;
       const isOnce = template.once;
+      const passThis = template.passThis;
       const unwrapResult = (res) => {
         if (unwrapString && res && typeof(res) === 'object' && MEMORY in res) {
           if (typeof(res.string) === 'string') {
@@ -1691,23 +1694,23 @@ export default mixin({
         return res;
       };
       const finishOnceCleanup = () => {
-        if (this.zigCallbackMap.get(id) === state) {
-          this.cancelZigCallbackSlot(template.cancelThunk, slotAddr, zeroAddr);
-          this.releaseZigCallback(id);
+        if (thisEnv.zigCallbackMap.get(id) === state) {
+          thisEnv.cancelZigCallbackSlot(template.cancelThunk, slotAddr, zeroAddr);
+          thisEnv.releaseZigCallback(id);
         }
       };
-      const wrapper = (...args) => {
+      const wrapper = function(...args) {
         if (state.released) {
           throw new Error('Zig callback has already been released');
         }
         if (isOnce) {
           state.released = true;
         }
-        const savedOuterPending = this.savePendingHostError();
+        const savedOuterPending = thisEnv.savePendingHostError();
         let asyncResult = false;
         try {
-          const res = caller(...args);
-          const pending = this.consumePendingHostError();
+          const res = passThis ? caller(this, ...args) : caller(...args);
+          const pending = thisEnv.consumePendingHostError();
           if (pending) {
             throw pending.error;
           }
@@ -1724,7 +1727,7 @@ export default mixin({
           return unwrapResult(res);
         } finally {
           if (savedOuterPending) {
-            this.restorePendingHostError(savedOuterPending);
+            thisEnv.restorePendingHostError(savedOuterPending);
           }
           if (isOnce && !asyncResult) {
             finishOnceCleanup();

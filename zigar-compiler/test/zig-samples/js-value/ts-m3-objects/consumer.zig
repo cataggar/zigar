@@ -157,7 +157,7 @@ pub fn exerciseClassesInheritanceAndAccessors(out_alloc: std.mem.Allocator) ![]c
         defer js.freeDecoded([]const u8, tracked_alloc, c1_proto);
         if (!std.mem.eql(u8, c1_proto, "https:")) return error.Unexpected;
 
-        var c2 = try m.HttpClient.init_2("http://localhost", 5000);
+        var c2 = try m.HttpClient.initWithTimeout("http://localhost", 5000);
         defer c2.deinit();
         if ((try c2.timeout()) != 5000) return error.Unexpected;
         try c2.setTimeout(2500);
