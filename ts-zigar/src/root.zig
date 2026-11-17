@@ -8,6 +8,7 @@ pub const host = @import("host.zig");
 pub const cli = @import("cli.zig");
 pub const naming = @import("naming.zig");
 pub const lower_types = @import("lower_types.zig");
+pub const lower_unions = @import("lower_unions.zig");
 pub const ir = @import("ir.zig");
 pub const emit = @import("emit.zig");
 pub const driver = @import("driver.zig");
@@ -26,6 +27,7 @@ test {
     _ = cli;
     _ = naming;
     _ = lower_types;
+    _ = lower_unions;
     _ = ir;
     _ = emit;
     _ = driver;

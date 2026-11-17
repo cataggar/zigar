@@ -48,6 +48,267 @@ pub const NullishKind = enum {
     null_or_undefined,
 };
 
+pub const TemplatePlaceholderKind = enum {
+    any_string,
+    number,
+    bigint,
+    boolean,
+    literal_set,
+};
+
+fn resolveTemplatePlaceholderKind(comptime raw: anytype) TemplatePlaceholderKind {
+    const RawT = @TypeOf(raw);
+    if (RawT == TemplatePlaceholderKind) return raw;
+    return switch (@typeInfo(RawT)) {
+        .enum_literal, .@"enum" => @field(TemplatePlaceholderKind, @tagName(raw)),
+        else => @compileError("Invalid template placeholder kind: " ++ @typeName(RawT)),
+    };
+}
+
+fn slotMatchesBytes(comptime raw_kind: anytype, comptime choices: anytype, seg: []const u8) bool {
+    const kind = comptime resolveTemplatePlaceholderKind(raw_kind);
+    return switch (kind) {
+        .any_string => true,
+        .boolean => std.mem.eql(u8, seg, "true") or std.mem.eql(u8, seg, "false"),
+        .bigint => blk: {
+            if (seg.len == 0) break :blk false;
+            const digits = if (seg[0] == '-') seg[1..] else seg;
+            if (digits.len == 0 or std.mem.eql(u8, seg, "-0")) break :blk false;
+            for (digits) |ch| {
+                if (ch < '0' or ch > '9') break :blk false;
+            }
+            break :blk true;
+        },
+        .number => blk: {
+            if (seg.len == 0) break :blk false;
+            if (std.mem.eql(u8, seg, "NaN") or
+                std.mem.eql(u8, seg, "Infinity") or
+                std.mem.eql(u8, seg, "-Infinity") or
+                std.mem.eql(u8, seg, "+Infinity")) break :blk true;
+            for (seg) |ch| {
+                if (ch <= ' ' or ch == '_') break :blk false;
+            }
+            if (std.mem.startsWith(u8, seg, "0x") or std.mem.startsWith(u8, seg, "0X") or
+                std.mem.startsWith(u8, seg, "0o") or std.mem.startsWith(u8, seg, "0O") or
+                std.mem.startsWith(u8, seg, "0b") or std.mem.startsWith(u8, seg, "0B"))
+            {
+                _ = std.fmt.parseInt(u64, seg, 0) catch break :blk false;
+                break :blk true;
+            }
+            for (seg) |ch| {
+                if (std.ascii.isAlphabetic(ch) and ch != 'e' and ch != 'E') break :blk false;
+            }
+            _ = std.fmt.parseFloat(f64, seg) catch break :blk false;
+            break :blk true;
+        },
+        .literal_set => blk: {
+            inline for (choices) |c| {
+                if (std.mem.eql(u8, seg, c)) break :blk true;
+            }
+            break :blk false;
+        },
+    };
+}
+
+fn matchTemplateSpansAt(
+    comptime spans: anytype,
+    comptime idx: usize,
+    rem: []const u8,
+    failed_bits: ?*[spans.len][8]u64,
+    steps_left: *usize,
+) bool {
+    if (idx >= spans.len) return rem.len == 0;
+    if (steps_left.* == 0) return false;
+    steps_left.* -= 1;
+    if (failed_bits) |fb| {
+        if (rem.len < 512) {
+            const word = rem.len >> 6;
+            const bit: u6 = @intCast(rem.len & 63);
+            if ((fb[idx][word] & (@as(u64, 1) << bit)) != 0) return false;
+        }
+    }
+    const sp = spans[idx];
+    const sep: []const u8 = sp.literal_tail;
+    if (idx + 1 == spans.len) {
+        if (!std.mem.endsWith(u8, rem, sep)) return false;
+        const ok = slotMatchesBytes(sp.placeholder, sp.choices, rem[0 .. rem.len - sep.len]);
+        if (!ok) {
+            if (failed_bits) |fb| {
+                if (rem.len < 512) fb[idx][rem.len >> 6] |= (@as(u64, 1) << @intCast(rem.len & 63));
+            }
+        }
+        return ok;
+    }
+    if (sep.len == 0) {
+        if (comptime (resolveTemplatePlaceholderKind(sp.placeholder) == .any_string and
+            resolveTemplatePlaceholderKind(spans[idx + 1].placeholder) == .any_string))
+        {
+            return matchTemplateSpansAt(spans, idx + 1, rem, failed_bits, steps_left);
+        }
+        var split: usize = 0;
+        while (split <= rem.len) : (split += 1) {
+            if (slotMatchesBytes(sp.placeholder, sp.choices, rem[0..split]) and
+                matchTemplateSpansAt(spans, idx + 1, rem[split..], failed_bits, steps_left))
+            {
+                return true;
+            }
+        }
+        if (failed_bits) |fb| {
+            if (rem.len < 512) fb[idx][rem.len >> 6] |= (@as(u64, 1) << @intCast(rem.len & 63));
+        }
+        return false;
+    }
+    var search_from: usize = 0;
+    while (search_from + sep.len <= rem.len) {
+        const rel = std.mem.indexOfPos(u8, rem, search_from, sep) orelse break;
+        if (slotMatchesBytes(sp.placeholder, sp.choices, rem[0..rel]) and
+            matchTemplateSpansAt(spans, idx + 1, rem[rel + sep.len ..], failed_bits, steps_left))
+        {
+            return true;
+        }
+        search_from = rel + 1;
+    }
+    if (failed_bits) |fb| {
+        if (rem.len < 512) fb[idx][rem.len >> 6] |= (@as(u64, 1) << @intCast(rem.len & 63));
+    }
+    return false;
+}
+
+pub fn matchTemplatePattern(comptime spec: anytype, s: []const u8) bool {
+    const head: []const u8 = spec.head;
+    if (!std.mem.startsWith(u8, s, head)) return false;
+    var pos: usize = head.len;
+    inline for (spec.spans) |sp| {
+        if (sp.literal_tail.len > 0) {
+            const found = std.mem.indexOfPos(u8, s, pos, sp.literal_tail) orelse return false;
+            pos = found + sp.literal_tail.len;
+        }
+    }
+    var steps_left: usize = 65_536;
+    if (comptime (spec.spans.len > 0 and spec.spans.len <= 32)) {
+        var fb: [spec.spans.len][8]u64 = @splat(@splat(0));
+        return matchTemplateSpansAt(spec.spans, 0, s[head.len..], &fb, &steps_left);
+    }
+    return matchTemplateSpansAt(spec.spans, 0, s[head.len..], null, &steps_left);
+}
+
+fn isStringSliceCoercible(comptime T: type) bool {
+    if (T == []const u8 or T == []u8) return true;
+    return switch (@typeInfo(T)) {
+        .pointer => |pt| pt.size == .one and @typeInfo(pt.child) == .array and @typeInfo(pt.child).array.child == u8,
+        else => false,
+    };
+}
+
+pub fn coerceUnion(comptime U: type, val: anytype) U {
+    const ValT = @TypeOf(val);
+    if (ValT == U) return val;
+    const un = @typeInfo(U).@"union";
+    comptime var exact_idx: ?usize = null;
+    comptime var exact_count: usize = 0;
+    inline for (un.field_names, 0..) |_, i| {
+        const FT = un.field_types[i];
+        if (FT != void and FT == ValT) {
+            exact_idx = i;
+            exact_count += 1;
+        }
+    }
+    if (exact_count == 1) {
+        return @unionInit(U, un.field_names[exact_idx.?], val);
+    }
+    if (comptime isStringSliceCoercible(ValT)) {
+        const slice_val: []const u8 = val;
+        if (@hasDecl(U, "zigar_js") and @hasField(@TypeOf(U.zigar_js), "variants")) {
+            inline for (U.zigar_js.variants) |v| {
+                if (@hasField(@TypeOf(v), "is_unit_literal") and @hasField(@TypeOf(v), "str_value")) {
+                    if (std.mem.eql(u8, slice_val, v.str_value)) {
+                        return @unionInit(U, v.tag, {});
+                    }
+                }
+            }
+        }
+        comptime var str_idx: ?usize = null;
+        comptime var str_count: usize = 0;
+        inline for (un.field_names, 0..) |_, i| {
+            if (un.field_types[i] == []const u8) {
+                str_idx = i;
+                str_count += 1;
+            }
+        }
+        if (str_count == 1) {
+            return @unionInit(U, un.field_names[str_idx.?], slice_val);
+        }
+    }
+    if (ValT == bool) {
+        if (@hasDecl(U, "zigar_js") and @hasField(@TypeOf(U.zigar_js), "variants")) {
+            inline for (U.zigar_js.variants) |v| {
+                if (@hasField(@TypeOf(v), "is_unit_literal") and @hasField(@TypeOf(v), "bool_value")) {
+                    if (val == v.bool_value) {
+                        return @unionInit(U, v.tag, {});
+                    }
+                }
+            }
+        }
+    }
+    if (ValT == f64) {
+        if (@hasDecl(U, "zigar_js") and @hasField(@TypeOf(U.zigar_js), "variants")) {
+            inline for (U.zigar_js.variants) |v| {
+                if (@hasField(@TypeOf(v), "is_unit_literal") and @hasField(@TypeOf(v), "num_value")) {
+                    if (val == v.num_value) {
+                        return @unionInit(U, v.tag, {});
+                    }
+                }
+            }
+        }
+    }
+    if (ValT == i64) {
+        if (@hasDecl(U, "zigar_js") and @hasField(@TypeOf(U.zigar_js), "variants")) {
+            inline for (U.zigar_js.variants) |v| {
+                if (@hasField(@TypeOf(v), "is_unit_literal") and @hasField(@TypeOf(v), "bigint_value")) {
+                    if (comptime @as(?i64, std.fmt.parseInt(i64, v.bigint_value, 0) catch null)) |iv| {
+                        if (val == iv) return @unionInit(U, v.tag, {});
+                    }
+                }
+            }
+        }
+    }
+    const val_info = @typeInfo(ValT);
+    if (val_info == .comptime_int or val_info == .comptime_float) {
+        if (@hasDecl(U, "zigar_js") and @hasField(@TypeOf(U.zigar_js), "variants")) {
+            inline for (U.zigar_js.variants) |v| {
+                if (@hasField(@TypeOf(v), "is_unit_literal") and @hasField(@TypeOf(v), "num_value")) {
+                    if (@as(f64, val) == v.num_value) {
+                        return @unionInit(U, v.tag, {});
+                    }
+                }
+            }
+            if (val_info == .comptime_int) {
+                inline for (U.zigar_js.variants) |v| {
+                    if (@hasField(@TypeOf(v), "is_unit_literal") and @hasField(@TypeOf(v), "bigint_value")) {
+                        if (comptime @as(?i64, std.fmt.parseInt(i64, v.bigint_value, 0) catch null)) |iv| {
+                            if (val == @as(comptime_int, iv)) return @unionInit(U, v.tag, {});
+                        }
+                    }
+                }
+            }
+        }
+        comptime var num_idx: ?usize = null;
+        comptime var num_count: usize = 0;
+        inline for (un.field_names, 0..) |_, i| {
+            const FT = un.field_types[i];
+            if (FT == f64 or (val_info == .comptime_int and (FT == i64 or FT == i32))) {
+                num_idx = i;
+                num_count += 1;
+            }
+        }
+        if (num_count == 1) {
+            const TargetNum = un.field_types[num_idx.?];
+            return @unionInit(U, un.field_names[num_idx.?], @as(TargetNum, val));
+        }
+    }
+    @compileError("Cannot unambiguously coerce value of type " ++ @typeName(ValT) ++ " into union " ++ @typeName(U));
+}
+
 pub fn Nullable(comptime T: type) type {
     return union(enum) {
         @"undefined",
@@ -519,6 +780,9 @@ pub fn Js(comptime host: type) type {
         pub const Function = module.Function;
         pub const NullishKind = module.NullishKind;
         pub const Nullable = module.Nullable;
+        pub const TemplatePlaceholderKind = module.TemplatePlaceholderKind;
+        pub const matchTemplatePattern = module.matchTemplatePattern;
+        pub const coerceUnion = module.coerceUnion;
 
         pub const reserved_undefined_handle = module.reserved_undefined_handle;
         pub const reserved_null_handle = module.reserved_null_handle;
@@ -3855,6 +4119,7 @@ pub fn Js(comptime host: type) type {
             return extern struct {
                 const Self = @This();
                 pub const Element = T;
+                pub const is_js_array = true;
                 pub const internal_type: util.InternalType = .js_value;
 
                 handle: u32,
@@ -4019,6 +4284,7 @@ pub fn Js(comptime host: type) type {
                 pub const Key = K;
                 pub const Value = V;
                 pub const Entry = struct { K, V };
+                pub const js_builtin_ctor = "Map";
                 pub const internal_type: util.InternalType = .js_value;
 
                 handle: u32,
@@ -4155,6 +4421,7 @@ pub fn Js(comptime host: type) type {
             return extern struct {
                 const Self = @This();
                 pub const Element = T;
+                pub const js_builtin_ctor = "Set";
                 pub const internal_type: util.InternalType = .js_value;
 
                 handle: u32,
@@ -4258,6 +4525,7 @@ pub fn Js(comptime host: type) type {
                 const Self = @This();
                 pub const Key = K;
                 pub const Value = V;
+                pub const is_js_record = true;
                 pub const internal_type: util.InternalType = .js_value;
 
                 handle: u32,
@@ -4518,6 +4786,7 @@ pub fn Js(comptime host: type) type {
 
         pub const Date = extern struct {
             const Self = @This();
+            pub const js_builtin_ctor = "Date";
             pub const internal_type: util.InternalType = .js_value;
 
             handle: u32,
@@ -4605,6 +4874,7 @@ pub fn Js(comptime host: type) type {
 
         pub const RegExp = extern struct {
             const Self = @This();
+            pub const js_builtin_ctor = "RegExp";
             pub const internal_type: util.InternalType = .js_value;
 
             handle: u32,
@@ -5006,6 +5276,562 @@ pub fn Js(comptime host: type) type {
             );
         }
 
+        fn structHasWireField(comptime T: type, comptime wire_target: []const u8) bool {
+            const st = @typeInfo(T).@"struct";
+            inline for (st.field_names) |fname| {
+                if (std.mem.eql(u8, structFieldWireName(T, fname), wire_target)) return true;
+            }
+            return false;
+        }
+
+        fn structFieldHasConstraint(comptime T: type, comptime field_name: []const u8) bool {
+            if (!@hasDecl(T, "zigar_js")) return false;
+            const meta = T.zigar_js;
+            if (!@hasField(@TypeOf(meta), "fields")) return false;
+            inline for (meta.fields) |fm| {
+                if (std.mem.eql(u8, fm.name, field_name)) {
+                    const FmT = @TypeOf(fm);
+                    return @hasField(FmT, "expected_str") or
+                        @hasField(FmT, "expected_num") or
+                        @hasField(FmT, "expected_bool") or
+                        @hasField(FmT, "expected_bigint_i64") or
+                        @hasField(FmT, "expected_bigint_str") or
+                        @hasField(FmT, "expected_enum_tag");
+                }
+            }
+            return false;
+        }
+
+        fn structFieldDisallowsNull(comptime T: type, comptime field_name: []const u8) bool {
+            if (!@hasDecl(T, "zigar_js")) return false;
+            const meta = T.zigar_js;
+            if (!@hasField(@TypeOf(meta), "fields")) return false;
+            inline for (meta.fields) |fm| {
+                if (std.mem.eql(u8, fm.name, field_name)) {
+                    if (@hasField(@TypeOf(fm), "nullish")) {
+                        const nk = specSelfNullish(fm.nullish);
+                        return nk == .none or nk == .undefined_only;
+                    }
+                    return false;
+                }
+            }
+            return false;
+        }
+
+        fn validateConcreteFieldConstraint(comptime fm: anytype, val: anytype) module.CallError!bool {
+            const FmT = @TypeOf(fm);
+            const ValT = @TypeOf(val);
+            if (comptime @hasField(FmT, "expected_str")) {
+                if (ValT == []const u8 or ValT == []u8) {
+                    return std.mem.eql(u8, val, fm.expected_str);
+                }
+                return false;
+            }
+            if (comptime @hasField(FmT, "expected_num")) {
+                if (@typeInfo(ValT) == .float) {
+                    const expected: ValT = @floatCast(fm.expected_num);
+                    return (val == expected) or (std.math.isNan(val) and std.math.isNan(expected));
+                }
+                if (@typeInfo(ValT) == .int) {
+                    return @as(f64, @floatFromInt(val)) == fm.expected_num;
+                }
+                return false;
+            }
+            if (comptime @hasField(FmT, "expected_bool")) {
+                if (ValT == bool) return val == fm.expected_bool;
+                return false;
+            }
+            if (comptime @hasField(FmT, "expected_bigint_i64")) {
+                if (ValT == i64) return val == fm.expected_bigint_i64;
+                if (ValT == BigInt) {
+                    const iv = val.toI64() catch return false;
+                    return iv == fm.expected_bigint_i64;
+                }
+                return false;
+            }
+            if (comptime @hasField(FmT, "expected_bigint_str")) {
+                if (ValT == BigInt) {
+                    const expected_bi = try BigInt.fromString(fm.expected_bigint_str);
+                    defer expected_bi.deinit();
+                    return try val.tryEql(expected_bi);
+                }
+                if (ValT == i64) {
+                    if (comptime @as(?i64, std.fmt.parseInt(i64, fm.expected_bigint_str, 0) catch null)) |iv| {
+                        return val == iv;
+                    }
+                    return false;
+                }
+                return false;
+            }
+            if (comptime @hasField(FmT, "expected_enum_tag")) {
+                if (@typeInfo(ValT) == .@"enum") {
+                    return val == @field(ValT, fm.expected_enum_tag);
+                }
+                return false;
+            }
+            return true;
+        }
+
+        fn validateStructFieldConstraint(comptime T: type, comptime field_name: []const u8, val: anytype) module.CallError!bool {
+            if (comptime !structFieldHasConstraint(T, field_name)) return true;
+            const ValT = @TypeOf(val);
+            if (comptime (@typeInfo(ValT) == .optional)) {
+                if (val) |inner| {
+                    return validateStructFieldConstraint(T, field_name, inner);
+                }
+                return true;
+            }
+            if (comptime isNullableType(ValT)) {
+                return switch (val) {
+                    .value => |inner| validateStructFieldConstraint(T, field_name, inner),
+                    else => true,
+                };
+            }
+            inline for (T.zigar_js.fields) |fm| {
+                if (comptime std.mem.eql(u8, fm.name, field_name)) {
+                    return validateConcreteFieldConstraint(fm, val);
+                }
+            }
+            return true;
+        }
+
+        fn resolveTargetCtorRef(comptime target: anytype) module.CallError!?Ref(module.Any) {
+            const TargetT = @TypeOf(target);
+            const has_mod = comptime @hasField(TargetT, "module");
+            const is_def = comptime (@hasField(TargetT, "is_default") and target.is_default);
+            const from_def = comptime (@hasField(TargetT, "from_default") and target.from_default);
+            const has_ns = comptime (@hasField(TargetT, "ns_path") and target.ns_path.len > 0);
+
+            if (comptime (is_def and has_mod and !has_ns)) {
+                return try importModuleDefaultAs(module.CallError!Ref(module.Any), target.module);
+            }
+
+            var cur: Ref(module.Any) = if (comptime (from_def and has_mod))
+                try importModuleDefaultAs(module.CallError!Ref(module.Any), target.module)
+            else if (comptime has_mod)
+                .{ .handle = (try importModule(target.module)).handle }
+            else
+                Ref(module.Any).globalThis;
+            errdefer cur.deinit();
+
+            if (comptime has_ns) {
+                inline for (target.ns_path) |seg| {
+                    if (cur.isNullOrUndefined()) {
+                        cur.deinit();
+                        return null;
+                    }
+                    const next = try getProp(module.CallError!Ref(module.Any), cur, seg);
+                    cur.deinit();
+                    cur = next;
+                }
+            }
+            if (cur.isNullOrUndefined()) {
+                cur.deinit();
+                return null;
+            }
+            const out = try getProp(module.CallError!Ref(module.Any), cur, target.name);
+            cur.deinit();
+            return out;
+        }
+
+        fn encodeUnitLiteralDescriptor(comptime desc: anytype) module.CallError!Ref(module.Any) {
+            const DescT = @TypeOf(desc);
+            if (comptime @hasField(DescT, "str_value")) {
+                return (try String.fromSlice(desc.str_value)).toRef();
+            }
+            if (comptime @hasField(DescT, "num_value")) {
+                return toJsRefWithSpecImpl(f64, desc.num_value, module.NullishKind.none, .{});
+            }
+            if (comptime @hasField(DescT, "bool_value")) {
+                return Ref(module.Any).fromBool(desc.bool_value);
+            }
+            if (comptime @hasField(DescT, "bigint_value")) {
+                if (comptime @as(?i64, std.fmt.parseInt(i64, desc.bigint_value, 0) catch null)) |iv| {
+                    return toJsRefWithSpecImpl(i64, iv, module.NullishKind.none, .{});
+                }
+                return (try BigInt.fromString(desc.bigint_value)).toRef();
+            }
+            return Ref(module.Any).@"undefined";
+        }
+
+        fn bigintRefMatchesLiteral(
+            raw: Ref(module.Any),
+            _: std.mem.Allocator,
+            comptime lit: []const u8,
+        ) module.CallError!bool {
+            const expected_bi = try BigInt.fromString(lit);
+            defer expected_bi.deinit();
+            return try raw.tryEql(expected_bi);
+        }
+
+        fn maxEnumStrLen(comptime T: type) usize {
+            var max_len: usize = 0;
+            for (T.zigar_js.members) |m| {
+                if (@hasField(@TypeOf(m), "is_alias") and m.is_alias) continue;
+                if (@hasField(@TypeOf(m), "str_value")) {
+                    if (m.str_value.len > max_len) max_len = m.str_value.len;
+                }
+            }
+            return max_len;
+        }
+
+        fn enumHasFieldKind(comptime T: type, comptime field_name: []const u8) bool {
+            for (T.zigar_js.members) |m| {
+                if (@hasField(@TypeOf(m), "is_alias") and m.is_alias) continue;
+                if (@hasField(@TypeOf(m), field_name)) return true;
+            }
+            return false;
+        }
+
+        fn unionHasUnitLiterals(comptime T: type) bool {
+            if (!@hasDecl(T, "zigar_js")) return false;
+            const meta = T.zigar_js;
+            if (!@hasField(@TypeOf(meta), "variants")) return false;
+            for (meta.variants) |vm| {
+                if (@hasField(@TypeOf(vm), "is_unit_literal") and vm.is_unit_literal) return true;
+            }
+            return false;
+        }
+
+        fn unionIsUnitLiteralField(comptime T: type, comptime fname: []const u8) bool {
+            if (!@hasDecl(T, "zigar_js")) return false;
+            const meta = T.zigar_js;
+            if (!@hasField(@TypeOf(meta), "variants")) return false;
+            for (meta.variants) |vm| {
+                if (std.mem.eql(u8, vm.tag, fname)) {
+                    return @hasField(@TypeOf(vm), "is_unit_literal") and vm.is_unit_literal;
+                }
+            }
+            return false;
+        }
+
+        fn maxUnionUnitStrLen(comptime T: type) usize {
+            var max_len: usize = 0;
+            for (T.zigar_js.variants) |vm| {
+                if (@hasField(@TypeOf(vm), "is_unit_literal") and vm.is_unit_literal and @hasField(@TypeOf(vm), "str_value")) {
+                    if (vm.str_value.len > max_len) max_len = vm.str_value.len;
+                }
+            }
+            return max_len;
+        }
+
+        fn unionHasUnitKind(comptime T: type, comptime field_name: []const u8) bool {
+            for (T.zigar_js.variants) |vm| {
+                if (@hasField(@TypeOf(vm), "is_unit_literal") and vm.is_unit_literal and @hasField(@TypeOf(vm), field_name)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        fn tryMatchUnitLiteralVariant(
+            comptime T: type,
+            raw: Ref(module.Any),
+            jt: module.JsType,
+            allocator: std.mem.Allocator,
+        ) module.CallError!?T {
+            if (comptime !unionHasUnitLiterals(T)) return null;
+            switch (jt) {
+                .string => {
+                    if (comptime !unionHasUnitKind(T, "str_value")) return null;
+                    const max_len = comptime maxUnionUnitStrLen(T);
+                    const js_str = String{ .handle = raw.handle };
+                    const byte_len = try js_str.byteLen();
+                    if (byte_len > max_len) return null;
+                    if (comptime (max_len <= 4096)) {
+                        var stack_buf: [if (max_len == 0) 16 else max_len + 16]u8 = undefined;
+                        var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
+                        const s = try js_str.toSliceAlloc(fba.allocator());
+                        inline for (T.zigar_js.variants) |vm| {
+                            if (comptime (@hasField(@TypeOf(vm), "is_unit_literal") and vm.is_unit_literal and @hasField(@TypeOf(vm), "str_value"))) {
+                                if (std.mem.eql(u8, s, vm.str_value)) return @unionInit(T, vm.tag, {});
+                            }
+                        }
+                        return null;
+                    } else {
+                        const s = try js_str.toSliceAlloc(allocator);
+                        defer allocator.free(s);
+                        inline for (T.zigar_js.variants) |vm| {
+                            if (comptime (@hasField(@TypeOf(vm), "is_unit_literal") and vm.is_unit_literal and @hasField(@TypeOf(vm), "str_value"))) {
+                                if (std.mem.eql(u8, s, vm.str_value)) return @unionInit(T, vm.tag, {});
+                            }
+                        }
+                        return null;
+                    }
+                },
+                .number => {
+                    if (comptime !unionHasUnitKind(T, "num_value")) return null;
+                    const n = try fromJsRefAlloc(f64, allocator, raw);
+                    inline for (T.zigar_js.variants) |vm| {
+                        if (comptime (@hasField(@TypeOf(vm), "is_unit_literal") and vm.is_unit_literal and @hasField(@TypeOf(vm), "num_value"))) {
+                            if (n == vm.num_value) return @unionInit(T, vm.tag, {});
+                        }
+                    }
+                    return null;
+                },
+                .boolean => {
+                    if (comptime !unionHasUnitKind(T, "bool_value")) return null;
+                    const b = try fromJsRefAlloc(bool, allocator, raw);
+                    inline for (T.zigar_js.variants) |vm| {
+                        if (comptime (@hasField(@TypeOf(vm), "is_unit_literal") and vm.is_unit_literal and @hasField(@TypeOf(vm), "bool_value"))) {
+                            if (b == vm.bool_value) return @unionInit(T, vm.tag, {});
+                        }
+                    }
+                    return null;
+                },
+                .bigint => {
+                    if (comptime !unionHasUnitKind(T, "bigint_value")) return null;
+                    inline for (T.zigar_js.variants) |vm| {
+                        if (comptime (@hasField(@TypeOf(vm), "is_unit_literal") and vm.is_unit_literal and @hasField(@TypeOf(vm), "bigint_value"))) {
+                            if (try bigintRefMatchesLiteral(raw, allocator, vm.bigint_value)) {
+                                return @unionInit(T, vm.tag, {});
+                            }
+                        }
+                    }
+                    return null;
+                },
+                else => return null,
+            }
+        }
+
+        fn maxUnionDiscStrLen(comptime T: type) usize {
+            var max_len: usize = 0;
+            for (T.zigar_js.variants) |vm| {
+                if (@hasField(@TypeOf(vm), "disc_values")) {
+                    for (vm.disc_values) |dv| {
+                        if (@hasField(@TypeOf(dv), "str_value")) {
+                            if (dv.str_value.len > max_len) max_len = dv.str_value.len;
+                        }
+                    }
+                }
+            }
+            return max_len;
+        }
+
+        fn unionHasDiscKind(comptime T: type, comptime field_name: []const u8) bool {
+            for (T.zigar_js.variants) |vm| {
+                if (@hasField(@TypeOf(vm), "disc_values")) {
+                    for (vm.disc_values) |dv| {
+                        if (@hasField(@TypeOf(dv), field_name)) return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        fn decodeDiscriminatedUnion(
+            comptime T: type,
+            allocator: std.mem.Allocator,
+            raw: Ref(module.Any),
+            jt: module.JsType,
+        ) module.CallError!T {
+            if (raw.isNullOrUndefined()) return error.TypeError;
+            if (jt != .object and jt != .function) return error.TypeError;
+            if (Array(Ref(module.Any)).isArray(raw) catch false) return error.TypeError;
+
+            const disc_ref = try getProp(module.CallError!Ref(module.Any), raw.cast(module.Object), T.zigar_js.discriminant);
+            defer disc_ref.deinit();
+            if (disc_ref.isNullOrUndefined()) return error.TypeError;
+            const disc_jt = try disc_ref.tryTypeof();
+
+            switch (disc_jt) {
+                .string => {
+                    if (comptime !unionHasDiscKind(T, "str_value")) return error.TypeError;
+                    const max_len = comptime maxUnionDiscStrLen(T);
+                    const js_str = String{ .handle = disc_ref.handle };
+                    const byte_len = try js_str.byteLen();
+                    if (byte_len > max_len) return error.TypeError;
+                    if (comptime (max_len <= 4096)) {
+                        var stack_buf: [if (max_len == 0) 16 else max_len + 16]u8 = undefined;
+                        var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
+                        const s = try js_str.toSliceAlloc(fba.allocator());
+                        inline for (T.zigar_js.variants) |vm| {
+                            if (comptime @hasField(@TypeOf(vm), "disc_values")) {
+                                inline for (vm.disc_values) |dv| {
+                                    if (comptime @hasField(@TypeOf(dv), "str_value")) {
+                                        if (std.mem.eql(u8, s, dv.str_value)) {
+                                            const PayloadT = @FieldType(T, vm.tag);
+                                            return @unionInit(T, vm.tag, try fromJsRefAlloc(PayloadT, allocator, raw));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        const s = try js_str.toSliceAlloc(allocator);
+                        defer allocator.free(s);
+                        inline for (T.zigar_js.variants) |vm| {
+                            if (comptime @hasField(@TypeOf(vm), "disc_values")) {
+                                inline for (vm.disc_values) |dv| {
+                                    if (comptime @hasField(@TypeOf(dv), "str_value")) {
+                                        if (std.mem.eql(u8, s, dv.str_value)) {
+                                            const PayloadT = @FieldType(T, vm.tag);
+                                            return @unionInit(T, vm.tag, try fromJsRefAlloc(PayloadT, allocator, raw));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return error.TypeError;
+                },
+                .number => {
+                    if (comptime !unionHasDiscKind(T, "num_value")) return error.TypeError;
+                    const n = try fromJsRefAlloc(f64, allocator, disc_ref);
+                    inline for (T.zigar_js.variants) |vm| {
+                        if (comptime @hasField(@TypeOf(vm), "disc_values")) {
+                            inline for (vm.disc_values) |dv| {
+                                if (comptime @hasField(@TypeOf(dv), "num_value")) {
+                                    if (n == dv.num_value) {
+                                        const PayloadT = @FieldType(T, vm.tag);
+                                        return @unionInit(T, vm.tag, try fromJsRefAlloc(PayloadT, allocator, raw));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return error.TypeError;
+                },
+                .boolean => {
+                    if (comptime !unionHasDiscKind(T, "bool_value")) return error.TypeError;
+                    const b = try fromJsRefAlloc(bool, allocator, disc_ref);
+                    inline for (T.zigar_js.variants) |vm| {
+                        if (comptime @hasField(@TypeOf(vm), "disc_values")) {
+                            inline for (vm.disc_values) |dv| {
+                                if (comptime @hasField(@TypeOf(dv), "bool_value")) {
+                                    if (b == dv.bool_value) {
+                                        const PayloadT = @FieldType(T, vm.tag);
+                                        return @unionInit(T, vm.tag, try fromJsRefAlloc(PayloadT, allocator, raw));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return error.TypeError;
+                },
+                .bigint => {
+                    if (comptime !unionHasDiscKind(T, "bigint_value")) return error.TypeError;
+                    inline for (T.zigar_js.variants) |vm| {
+                        if (comptime @hasField(@TypeOf(vm), "disc_values")) {
+                            inline for (vm.disc_values) |dv| {
+                                if (comptime @hasField(@TypeOf(dv), "bigint_value")) {
+                                    if (try bigintRefMatchesLiteral(disc_ref, allocator, dv.bigint_value)) {
+                                        const PayloadT = @FieldType(T, vm.tag);
+                                        return @unionInit(T, vm.tag, try fromJsRefAlloc(PayloadT, allocator, raw));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return error.TypeError;
+                },
+                else => return error.TypeError,
+            }
+        }
+
+        fn computeTypeDecodeRank(comptime FieldT: type) u8 {
+            if (FieldT == void) return 10;
+            if (util.getInternalType(FieldT) == .js_value) {
+                if (FieldT == BigInt) return 41;
+                if (@hasDecl(FieldT, "binary_kind")) {
+                    return switch (FieldT.binary_kind) {
+                        .buffer => 50,
+                        .array_buffer, .shared_array_buffer => 52,
+                        else => 51,
+                    };
+                }
+                if (@hasDecl(FieldT, "is_js_array") and FieldT.is_js_array) return 56;
+                if (FieldT == String) return 60;
+                if (@hasDecl(FieldT, "is_js_promise") and FieldT.is_js_promise) return 65;
+                if (@hasDecl(FieldT, "js_builtin_ctor")) return 65;
+                if (@hasDecl(FieldT, "is_js_record") and FieldT.is_js_record) return 90;
+                if (@hasDecl(FieldT, "Target")) {
+                    if (FieldT.Target == module.Symbol) return 45;
+                    if (FieldT.Target == module.Function) return 75;
+                    if (FieldT.Target == module.Object) return 90;
+                }
+                return 99;
+            }
+            if (isNullableType(FieldT)) return 95;
+            return switch (@typeInfo(FieldT)) {
+                .@"enum" => 20,
+                .bool => 30,
+                .int => |it| if (it.bits <= 32) 34 else 40,
+                .float => 35,
+                .pointer => |pt| switch (pt.size) {
+                    .slice => if (pt.child == u8) 60 else 55,
+                    .one => if (@typeInfo(pt.child) == .@"fn") 75 else computeTypeDecodeRank(pt.child),
+                    else => 90,
+                },
+                .@"struct" => |st| blk: {
+                    if (isTupleStructType(FieldT)) break :blk 54;
+                    if (@hasDecl(FieldT, "zigar_js")) {
+                        const meta = FieldT.zigar_js;
+                        if (@hasField(@TypeOf(meta), "is_template_literal") and meta.is_template_literal) break :blk 25;
+                        if (@hasField(@TypeOf(meta), "is_enum") and meta.is_enum) break :blk 98;
+                        if (@hasField(@TypeOf(meta), "is_class") and meta.is_class) break :blk 70;
+                    }
+                    var has_constraint = false;
+                    var has_required = false;
+                    for (st.field_names, 0..) |fname, fi| {
+                        if (structFieldHasConstraint(FieldT, fname)) has_constraint = true;
+                        if (!structFieldIsOptional(FieldT, fi)) has_required = true;
+                    }
+                    if (has_constraint) break :blk 78;
+                    if (has_required) break :blk 80;
+                    break :blk 85;
+                },
+                .@"union" => blk: {
+                    if (@hasDecl(FieldT, "zigar_js") and @hasField(@TypeOf(FieldT.zigar_js), "is_open_literal") and FieldT.zigar_js.is_open_literal) {
+                        break :blk 62;
+                    }
+                    if (@hasDecl(FieldT, "zigar_js") and @hasField(@TypeOf(FieldT.zigar_js), "discriminant")) {
+                        break :blk 77;
+                    }
+                    break :blk 88;
+                },
+                .optional => 95,
+                else => 95,
+            };
+        }
+
+        fn nonUnitUnionFieldCount(comptime T: type) usize {
+            const un = @typeInfo(T).@"union";
+            var count: usize = 0;
+            for (un.field_names, 0..) |fname, fi| {
+                if (un.field_types[fi] == void and unionIsUnitLiteralField(T, fname)) continue;
+                count += 1;
+            }
+            return count;
+        }
+
+        fn computeUnionDecodeOrder(comptime T: type) [nonUnitUnionFieldCount(T)]usize {
+            const un = @typeInfo(T).@"union";
+            const N = nonUnitUnionFieldCount(T);
+            var indices: [N]usize = undefined;
+            var ranks: [N]u8 = undefined;
+            var pos: usize = 0;
+            for (un.field_names, 0..) |fname, fi| {
+                if (un.field_types[fi] == void and unionIsUnitLiteralField(T, fname)) continue;
+                indices[pos] = fi;
+                ranks[pos] = computeTypeDecodeRank(un.field_types[fi]);
+                pos += 1;
+            }
+            var i: usize = 1;
+            while (i < N) : (i += 1) {
+                const key_idx = indices[i];
+                const key_rank = ranks[i];
+                var j: usize = i;
+                while (j > 0 and ranks[j - 1] > key_rank) : (j -= 1) {
+                    indices[j] = indices[j - 1];
+                    ranks[j] = ranks[j - 1];
+                }
+                indices[j] = key_idx;
+                ranks[j] = key_rank;
+            }
+            return indices;
+        }
+
         fn stackHasSpecId(comptime stack: anytype, comptime target_id: []const u8) bool {
             inline for (stack) |entry| {
                 if (@typeInfo(@TypeOf(entry)) == .@"struct" and
@@ -5093,7 +5919,20 @@ pub fn Js(comptime host: type) type {
                         .none, .null_only, .null_or_undefined => Ref(module.Any).@"null",
                     };
                 },
-                .int, .float => {
+                .int => |it| {
+                    if (comptime (it.bits <= 32)) {
+                        return toJsRefWithSpecImpl(f64, @floatFromInt(value), module.NullishKind.none, .{});
+                    }
+                    const HostFn = buildFnType(&.{T}, module.CallError!Ref(module.Any));
+                    return dispatchHostOpRawFlags(
+                        .collection_op,
+                        @intFromEnum(module.CollectionSubOp.value_identity),
+                        "",
+                        HostFn,
+                        .{value},
+                    );
+                },
+                .float => {
                     const HostFn = buildFnType(&.{T}, module.CallError!Ref(module.Any));
                     return dispatchHostOpRawFlags(
                         .collection_op,
@@ -5236,6 +6075,11 @@ pub fn Js(comptime host: type) type {
                         }
                     }
 
+                    if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_template_literal") and T.zigar_js.is_template_literal)) {
+                        if (!module.matchTemplatePattern(T.zigar_js, value.raw)) return error.TypeError;
+                        return (try String.fromSlice(value.raw)).toRef();
+                    }
+
                     if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_enum") and T.zigar_js.is_enum and @hasField(T, "__zigar_value")) {
                         return toJsRefWithSpecImpl(@TypeOf(value.__zigar_value), value.__zigar_value, module.NullishKind.none, .{});
                     }
@@ -5244,9 +6088,35 @@ pub fn Js(comptime host: type) type {
 
                     const rec = try Record([]const u8, Ref(module.Any)).init();
                     errdefer rec.deinit();
+                    const is_cls_out = comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_class") and T.zigar_js.is_class);
+                    if (comptime (is_cls_out and @hasField(@TypeOf(T.zigar_js), "ctor_target"))) {
+                        if (resolveTargetCtorRef(T.zigar_js.ctor_target)) |ctor_opt| {
+                            if (ctor_opt) |ctor| {
+                                defer ctor.deinit();
+                                if (!ctor.isNullOrUndefined() and (try ctor.tryTypeof()) == .function) {
+                                    const proto = try getProp(module.CallError!Ref(module.Any), ctor, "prototype");
+                                    defer proto.deinit();
+                                    if (!proto.isNullOrUndefined() and (try proto.tryTypeof()) == .object) {
+                                        const obj_ctor = try getGlobal(module.CallError!Ref(module.Object), "Object");
+                                        defer obj_ctor.deinit();
+                                        try callMethod(
+                                            fn (Ref(module.Any), Ref(module.Any)) module.CallError!void,
+                                            obj_ctor,
+                                            "setPrototypeOf",
+                                            .{ @as(Ref(module.Any), .{ .handle = rec.handle }), proto },
+                                        );
+                                    }
+                                }
+                            }
+                        } else |err| switch (err) {
+                            error.OffJsThread, error.OutOfMemory => return err,
+                            else => clearLastError(),
+                        }
+                    }
                     inline for (st.field_names, 0..) |fname, fi| {
                         const ftype = st.field_types[fi];
                         const fval = @field(value, fname);
+                        if (!(try validateStructFieldConstraint(T, fname, fval))) return error.TypeError;
                         const wire_key = comptime structFieldWireName(T, fname);
                         const is_opt = comptime structFieldIsOptional(T, fi);
                         const field_spec = comptime blk: {
@@ -5291,22 +6161,51 @@ pub fn Js(comptime host: type) type {
                 .@"enum" => {
                     if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "members")) {
                         inline for (T.zigar_js.members) |m| {
+                            if (comptime (@hasField(@TypeOf(m), "is_alias") and m.is_alias)) continue;
                             if (value == @field(T, m.tag)) {
-                                if (@hasField(@TypeOf(m), "str_value")) {
-                                    return (try String.fromSlice(m.str_value)).toRef();
-                                }
-                                if (@hasField(@TypeOf(m), "num_value")) {
-                                    return toJsRefWithSpecImpl(f64, m.num_value, module.NullishKind.none, .{});
-                                }
+                                return encodeUnitLiteralDescriptor(m);
                             }
                         }
                     }
                     return (try String.fromSlice(@tagName(value))).toRef();
                 },
-                .@"union" => {
-                    return switch (value) {
-                        inline else => |payload| toJsRefWithSpecImpl(@TypeOf(payload), payload, module.NullishKind.none, next_stack),
-                    };
+                .@"union" => |un| {
+                    const has_variants_override = comptime (@typeInfo(@TypeOf(spec)) == .@"struct" and @hasField(@TypeOf(spec), "variants"));
+                    inline for (un.field_names, 0..) |fname, fi| {
+                        if (std.mem.eql(u8, @tagName(value), fname)) {
+                            const PayloadT = un.field_types[fi];
+                            if (comptime (PayloadT == void and @hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "variants"))) {
+                                inline for (T.zigar_js.variants) |vm| {
+                                    if (comptime std.mem.eql(u8, vm.tag, fname)) {
+                                        if (comptime (@hasField(@TypeOf(vm), "is_unit_literal") and vm.is_unit_literal)) {
+                                            return encodeUnitLiteralDescriptor(vm);
+                                        }
+                                    }
+                                }
+                            }
+                            const variant_spec = comptime blk: {
+                                if (has_variants_override) {
+                                    for (spec.variants) |vo| {
+                                        if (std.mem.eql(u8, vo.name, fname)) {
+                                            if (@hasField(@TypeOf(vo), "nullish")) break :blk vo.nullish;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "variants")) {
+                                    for (T.zigar_js.variants) |vm| {
+                                        if (std.mem.eql(u8, vm.tag, fname)) {
+                                            if (@hasField(@TypeOf(vm), "nullish")) break :blk vm.nullish;
+                                            break;
+                                        }
+                                    }
+                                }
+                                break :blk module.NullishKind.null_or_undefined;
+                            };
+                            return toJsRefWithSpecImpl(PayloadT, @field(value, fname), variant_spec, next_stack);
+                        }
+                    }
+                    unreachable;
                 },
                 else => @compileError("Unsupported Zig type for JS conversion: " ++ @typeName(T)),
             }
@@ -5361,6 +6260,43 @@ pub fn Js(comptime host: type) type {
                     if (!(try binaryIsKind(raw, T.binary_kind))) return error.TypeError;
                     return .{ .handle = (try raw.tryClone()).handle };
                 }
+                if (@hasDecl(T, "is_js_array") and T.is_js_array) {
+                    if (!(try Array(Ref(module.Any)).isArray(raw))) return error.TypeError;
+                    return .{ .handle = (try raw.tryClone()).handle };
+                }
+                if (@hasDecl(T, "is_js_record") and T.is_js_record) {
+                    if (raw.isNullOrUndefined()) return error.TypeError;
+                    const jt = try raw.tryTypeof();
+                    if (jt != .object) return error.TypeError;
+                    if (Array(Ref(module.Any)).isArray(raw) catch false) return error.TypeError;
+                    return .{ .handle = (try raw.tryClone()).handle };
+                }
+                if (@hasDecl(T, "is_js_promise") and T.is_js_promise) {
+                    if (raw.isNullOrUndefined()) return error.TypeError;
+                    const jt = try raw.tryTypeof();
+                    if (jt != .object and jt != .function) return error.TypeError;
+                    const then_ref = try getProp(module.CallError!Ref(module.Any), raw, "then");
+                    defer then_ref.deinit();
+                    if (then_ref.isNullOrUndefined() or (try then_ref.tryTypeof()) != .function) {
+                        return error.TypeError;
+                    }
+                    return .{ .handle = (try raw.tryClone()).handle };
+                }
+                if (@hasDecl(T, "js_builtin_ctor")) {
+                    if (raw.isNullOrUndefined()) return error.TypeError;
+                    const jt = try raw.tryTypeof();
+                    if (jt != .object) return error.TypeError;
+                    if (getGlobal(module.CallError!Ref(module.Any), T.js_builtin_ctor)) |ctor| {
+                        defer ctor.deinit();
+                        if (!ctor.isNullOrUndefined() and (try ctor.tryTypeof()) == .function) {
+                            if (!(try raw.tryInstanceof(ctor))) return error.TypeError;
+                        }
+                    } else |err| switch (err) {
+                        error.OffJsThread, error.OutOfMemory => return err,
+                        else => clearLastError(),
+                    }
+                    return .{ .handle = (try raw.tryClone()).handle };
+                }
                 if (@hasDecl(T, "Target")) {
                     if (T.Target == module.Symbol) {
                         if ((try raw.tryTypeof()) != .symbol) return error.TypeError;
@@ -5399,9 +6335,52 @@ pub fn Js(comptime host: type) type {
                     );
                 },
                 .int => |it| {
-                    const expected_jt: module.JsType = if (it.bits > 32) .bigint else .number;
-                    const jt = try raw.tryTypeof();
-                    if (jt != expected_jt) return error.TypeError;
+                    if (comptime (it.bits <= 32)) {
+                        if ((try raw.tryTypeof()) != .number) return error.TypeError;
+                        const n = try fromJsRefAlloc(f64, allocator, raw);
+                        if (!std.math.isFinite(n) or @trunc(n) != n) return error.TypeError;
+                        const min_f: f64 = @floatFromInt(std.math.minInt(T));
+                        const max_f: f64 = @floatFromInt(std.math.maxInt(T));
+                        if (n < min_f or n > max_f) return error.TypeError;
+                        return @intFromFloat(n);
+                    }
+                    if ((try raw.tryTypeof()) != .bigint) return error.TypeError;
+                    if (comptime (it.bits <= 64)) {
+                        const bi: BigInt = .{ .handle = raw.handle };
+                        if (comptime (it.signedness == .signed)) {
+                            const v64 = bi.toI64() catch |err| return switch (err) {
+                                error.Overflow => error.TypeError,
+                                else => |e| e,
+                            };
+                            if (v64 < std.math.minInt(T) or v64 > std.math.maxInt(T)) return error.TypeError;
+                            return @intCast(v64);
+                        } else {
+                            const v64 = bi.toU64() catch |err| return switch (err) {
+                                error.Overflow => error.TypeError,
+                                else => |e| e,
+                            };
+                            if (v64 > std.math.maxInt(T)) return error.TypeError;
+                            return @intCast(v64);
+                        }
+                    }
+                    if (comptime (it.bits <= 128)) {
+                        const bi: BigInt = .{ .handle = raw.handle };
+                        if (comptime (it.signedness == .signed)) {
+                            const v128 = bi.toI128() catch |err| return switch (err) {
+                                error.Overflow => error.TypeError,
+                                else => |e| e,
+                            };
+                            if (v128 < std.math.minInt(T) or v128 > std.math.maxInt(T)) return error.TypeError;
+                            return @intCast(v128);
+                        } else {
+                            const v128 = bi.toU128() catch |err| return switch (err) {
+                                error.Overflow => error.TypeError,
+                                else => |e| e,
+                            };
+                            if (v128 > std.math.maxInt(T)) return error.TypeError;
+                            return @intCast(v128);
+                        }
+                    }
                     const HostFn = buildFnType(&.{Ref(module.Any)}, module.CallError!T);
                     return dispatchHostOpRawFlags(
                         .collection_op,
@@ -5475,7 +6454,7 @@ pub fn Js(comptime host: type) type {
                                 }
                                 break :blk req;
                             };
-                            if (arr_len < min_req) return error.TypeError;
+                            if (arr_len < min_req or arr_len > st.field_names.len) return error.TypeError;
                             inline for (st.field_names, 0..) |fname, fi| {
                                 const ftype = st.field_types[fi];
                                 if (fi < arr_len) {
@@ -5549,6 +6528,16 @@ pub fn Js(comptime host: type) type {
                         }
                     }
 
+                    if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_template_literal") and T.zigar_js.is_template_literal)) {
+                        if (!(try String.isString(raw))) return error.TypeError;
+                        const decoded = try (String{ .handle = raw.handle }).toSliceAlloc(allocator);
+                        if (!module.matchTemplatePattern(T.zigar_js, decoded)) {
+                            allocator.free(decoded);
+                            return error.TypeError;
+                        }
+                        return .{ .raw = decoded };
+                    }
+
                     if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_enum") and T.zigar_js.is_enum and @hasField(T, "__zigar_value")) {
                         return .{ .__zigar_value = try fromJsRefAlloc(@FieldType(T, "__zigar_value"), allocator, raw) };
                     }
@@ -5556,6 +6545,26 @@ pub fn Js(comptime host: type) type {
                     if (raw.isNullOrUndefined()) return error.TypeError;
                     const jt = try raw.tryTypeof();
                     if (jt != .object and jt != .function) return error.TypeError;
+
+                    const is_cls = comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_class") and T.zigar_js.is_class);
+                    if (comptime (is_cls and @hasField(@TypeOf(T.zigar_js), "ctor_target"))) {
+                        if (resolveTargetCtorRef(T.zigar_js.ctor_target)) |ctor_opt| {
+                            if (ctor_opt) |ctor| {
+                                defer ctor.deinit();
+                                if (!ctor.isNullOrUndefined() and (try ctor.tryTypeof()) == .function) {
+                                    if (!(try raw.tryInstanceof(ctor))) return error.TypeError;
+                                }
+                            }
+                        } else |err| switch (err) {
+                            error.OffJsThread, error.OutOfMemory => return err,
+                            else => clearLastError(),
+                        }
+                    } else if (comptime (!is_cls and !structHasWireField(T, "length"))) {
+                        if (jt == .object and (Array(Ref(module.Any)).isArray(raw) catch false)) {
+                            return error.TypeError;
+                        }
+                    }
+
                     if (st.field_names.len == 0) return .{};
 
                     const obj = raw.cast(module.Object);
@@ -5573,32 +6582,79 @@ pub fn Js(comptime host: type) type {
                         const wire_key = comptime structFieldWireName(T, fname);
                         const prop_ref = try getProp(module.CallError!Ref(module.Any), obj, wire_key);
                         defer prop_ref.deinit();
+                        if (comptime (structFieldHasConstraint(T, fname) and structFieldDisallowsNull(T, fname))) {
+                            if (prop_ref.isNull()) return error.TypeError;
+                        }
                         @field(out, fname) = try fromJsRefAlloc(ftype, allocator, prop_ref);
                         field_init[fi] = true;
+                        if (!(try validateStructFieldConstraint(T, fname, @field(out, fname)))) {
+                            return error.TypeError;
+                        }
                     }
                     return out;
                 },
-                .@"enum" => {
+                .@"enum" => |en_info| {
                     const jt = try raw.tryTypeof();
-                    var enum_buf: [512]u8 = undefined;
-                    var enum_fba = std.heap.FixedBufferAllocator.init(&enum_buf);
-                    const str_alloc = if (@hasDecl(host, "default_allocator")) host.default_allocator else enum_fba.allocator();
                     if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "members")) {
                         if (jt == .string) {
-                            const s = try (String{ .handle = raw.handle }).toSliceAlloc(str_alloc);
-                            defer str_alloc.free(s);
+                            if (comptime !enumHasFieldKind(T, "str_value")) return error.TypeError;
+                            const max_len = comptime maxEnumStrLen(T);
+                            const js_str = String{ .handle = raw.handle };
+                            const byte_len = try js_str.byteLen();
+                            if (byte_len > max_len) return error.TypeError;
+                            if (comptime (max_len <= 4096)) {
+                                var stack_buf: [if (max_len == 0) 16 else max_len + 16]u8 = undefined;
+                                var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
+                                const s = try js_str.toSliceAlloc(fba.allocator());
+                                inline for (T.zigar_js.members) |m| {
+                                    if (comptime (@hasField(@TypeOf(m), "is_alias") and m.is_alias)) continue;
+                                    if (comptime @hasField(@TypeOf(m), "str_value")) {
+                                        if (std.mem.eql(u8, s, m.str_value)) return @field(T, m.tag);
+                                    }
+                                }
+                                return error.TypeError;
+                            } else {
+                                const s = try js_str.toSliceAlloc(allocator);
+                                defer allocator.free(s);
+                                inline for (T.zigar_js.members) |m| {
+                                    if (comptime (@hasField(@TypeOf(m), "is_alias") and m.is_alias)) continue;
+                                    if (comptime @hasField(@TypeOf(m), "str_value")) {
+                                        if (std.mem.eql(u8, s, m.str_value)) return @field(T, m.tag);
+                                    }
+                                }
+                                return error.TypeError;
+                            }
+                        }
+                        if (jt == .number) {
+                            if (comptime !enumHasFieldKind(T, "num_value")) return error.TypeError;
+                            const n = try fromJsRefAlloc(f64, allocator, raw);
                             inline for (T.zigar_js.members) |m| {
-                                if (@hasField(@TypeOf(m), "str_value")) {
-                                    if (std.mem.eql(u8, s, m.str_value)) return @field(T, m.tag);
+                                if (comptime (@hasField(@TypeOf(m), "is_alias") and m.is_alias)) continue;
+                                if (comptime @hasField(@TypeOf(m), "num_value")) {
+                                    if (n == m.num_value) return @field(T, m.tag);
                                 }
                             }
                             return error.TypeError;
                         }
-                        if (jt == .number) {
-                            const n = try fromJsRefAlloc(f64, allocator, raw);
+                        if (jt == .boolean) {
+                            if (comptime !enumHasFieldKind(T, "bool_value")) return error.TypeError;
+                            const b = try fromJsRefAlloc(bool, allocator, raw);
                             inline for (T.zigar_js.members) |m| {
-                                if (@hasField(@TypeOf(m), "num_value")) {
-                                    if (n == m.num_value) return @field(T, m.tag);
+                                if (comptime (@hasField(@TypeOf(m), "is_alias") and m.is_alias)) continue;
+                                if (comptime @hasField(@TypeOf(m), "bool_value")) {
+                                    if (b == m.bool_value) return @field(T, m.tag);
+                                }
+                            }
+                            return error.TypeError;
+                        }
+                        if (jt == .bigint) {
+                            if (comptime !enumHasFieldKind(T, "bigint_value")) return error.TypeError;
+                            inline for (T.zigar_js.members) |m| {
+                                if (comptime (@hasField(@TypeOf(m), "is_alias") and m.is_alias)) continue;
+                                if (comptime @hasField(@TypeOf(m), "bigint_value")) {
+                                    if (try bigintRefMatchesLiteral(raw, allocator, m.bigint_value)) {
+                                        return @field(T, m.tag);
+                                    }
                                 }
                             }
                             return error.TypeError;
@@ -5606,19 +6662,62 @@ pub fn Js(comptime host: type) type {
                         return error.TypeError;
                     }
                     if (jt == .string) {
-                        const s = try (String{ .handle = raw.handle }).toSliceAlloc(str_alloc);
-                        defer str_alloc.free(s);
-                        if (std.meta.stringToEnum(T, s)) |tag| return tag;
+                        const max_tag_len = comptime blk: {
+                            var ml: usize = 0;
+                            for (en_info.fields) |ef| {
+                                if (ef.name.len > ml) ml = ef.name.len;
+                            }
+                            break :blk ml;
+                        };
+                        const js_str = String{ .handle = raw.handle };
+                        const byte_len = try js_str.byteLen();
+                        if (byte_len > max_tag_len) return error.TypeError;
+                        if (comptime (max_tag_len <= 4096)) {
+                            var stack_buf: [if (max_tag_len == 0) 16 else max_tag_len + 16]u8 = undefined;
+                            var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
+                            const s = try js_str.toSliceAlloc(fba.allocator());
+                            if (std.meta.stringToEnum(T, s)) |tag| return tag;
+                        } else {
+                            const s = try js_str.toSliceAlloc(allocator);
+                            defer allocator.free(s);
+                            if (std.meta.stringToEnum(T, s)) |tag| return tag;
+                        }
                     }
                     return error.TypeError;
                 },
                 .@"union" => |un| {
-                    inline for (un.field_names, 0..) |fname, fi| {
+                    const jt = try raw.tryTypeof();
+
+                    if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_open_literal") and T.zigar_js.is_open_literal)) {
+                        if (try tryMatchUnitLiteralVariant(T, raw, jt, allocator)) |matched| {
+                            return matched;
+                        }
+                        inline for (T.zigar_js.variants) |vm| {
+                            if (comptime (@hasField(@TypeOf(vm), "is_custom") and vm.is_custom)) {
+                                const PayloadT = @FieldType(T, vm.tag);
+                                return @unionInit(T, vm.tag, try fromJsRefAlloc(PayloadT, allocator, raw));
+                            }
+                        }
+                        return error.TypeError;
+                    }
+
+                    if (try tryMatchUnitLiteralVariant(T, raw, jt, allocator)) |matched| {
+                        return matched;
+                    }
+
+                    if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "discriminant"))) {
+                        return decodeDiscriminatedUnion(T, allocator, raw, jt);
+                    }
+
+                    const decode_order = comptime computeUnionDecodeOrder(T);
+                    inline for (decode_order) |fi| {
+                        const fname = un.field_names[fi];
                         if (fromJsRefAlloc(un.field_types[fi], allocator, raw)) |decoded| {
                             return @unionInit(T, fname, decoded);
                         } else |err| switch (err) {
                             error.OutOfMemory, error.OffJsThread, error.HostUnavailable => return err,
-                            else => {},
+                            error.TypeError => {},
+                            else => clearLastError(),
                         }
                     }
                     return error.TypeError;
@@ -7377,6 +8476,23 @@ test "Js.String, Nullable(T), needsDecodeAllocator, and tuple/slice marshaling h
             const op: HostOp = @enumFromInt(desc.op);
             const J = Js(@This());
             switch (op) {
+                .get_prop => {
+                    const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) CallError!J.Ref(Any));
+                    const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    const h = f.@"0".handle;
+                    const key = if (desc.key_ptr) |kp| kp[0..desc.key_len] else "";
+                    if (h >= 8 and entries[h & 0xFFFFF] == .rec) {
+                        for (entries[h & 0xFFFFF].rec.items) |kv| {
+                            if (std.mem.eql(u8, kv.key, key)) {
+                                f.retval = .{ .handle = cloneJsValue(kv.val) };
+                                return .SUCCESS;
+                            }
+                        }
+                        f.retval = .{ .handle = 0 };
+                        return .SUCCESS;
+                    }
+                    return .FAULT;
+                },
                 .binary_create => {
                     const Frame = arg_struct.ArgStruct(fn (usize, usize, bool) Error!J.Buffer);
                     const f: *Frame = @ptrCast(@alignCast(arg_ptr));
@@ -7562,6 +8678,18 @@ test "Js.String, Nullable(T), needsDecodeAllocator, and tuple/slice marshaling h
                         },
                         else => return .FAULT,
                     }
+                },
+                .bigint_to_words => {
+                    const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), u32, bool, usize) Error!u32);
+                    const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    const h = f.@"0".handle;
+                    if (h < 8 or entries[h & 0xFFFFF] != .bi) return .FAULT;
+                    const v: i128 = entries[h & 0xFFFFF].bi;
+                    const words_ptr: *[2]u64 = @ptrFromInt(f.@"3");
+                    const bits: u128 = @bitCast(v);
+                    words_ptr[0] = @truncate(bits);
+                    words_ptr[1] = @truncate(bits >> 64);
+                    f.retval = 0;
                 },
                 else => return .FAULT,
             }
@@ -7832,6 +8960,238 @@ test "Js.String, Nullable(T), needsDecodeAllocator, and tuple/slice marshaling h
         // Element 65 (is_optional = true, null) trimmed -> length 65; element 64 (.undefined_only, null) -> undefined!
         try expectEqual(@as(usize, 65), try w66_arr.len());
         try expect((try w66_arr.get(64)).isUndefined());
+    }
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    // 7. M3.1b: Enums (with aliases & length-bounded 0-alloc check), open literal unions, template patterns,
+    //    discriminated unions (1-probe non-fallthrough + outbound constraint check), and heterogeneous union specificity
+    {
+        const HttpMethod = enum(i32) {
+            get = 0,
+            post = 1,
+            pub const get_alias: @This() = .get;
+            pub const zigar_js = .{
+                .is_enum = true,
+                .members = .{
+                    .{ .tag = "get", .js_name = "GET", .str_value = "GET" },
+                    .{ .tag = "get", .js_name = "GET_ALIAS", .str_value = "GET", .is_alias = true },
+                    .{ .tag = "post", .js_name = "POST", .str_value = "POST" },
+                },
+            };
+        };
+        const m_ref = try js.toJsRef(HttpMethod, .post);
+        try expectEqual(HttpMethod.post, try js.fromJsRefAlloc(HttpMethod, alloc, m_ref));
+        m_ref.deinit();
+
+        const huge_str = try js.String.fromSlice("THIS_STRING_IS_WAY_LONGER_THAN_POST_AND_REJECTED_BY_BYTE_LEN");
+        try std.testing.expectError(error.TypeError, js.fromJsRefAlloc(HttpMethod, alloc, huge_str.toRef()));
+        huge_str.deinit();
+
+        const NumEnum = enum(i32) {
+            ok = 200,
+            not_found = 404,
+            pub const zigar_js = .{
+                .is_enum = true,
+                .members = .{
+                    .{ .tag = "ok", .js_name = "Ok", .num_value = @as(f64, 200) },
+                    .{ .tag = "not_found", .js_name = "NotFound", .num_value = @as(f64, 404) },
+                },
+            };
+        };
+        const ne_ref = try js.toJsRef(NumEnum, .not_found);
+        try expectEqual(NumEnum.not_found, try js.fromJsRefAlloc(NumEnum, alloc, ne_ref));
+        ne_ref.deinit();
+
+        // Open literal union: "utf8" | "hex" | (string & {})
+        const OpenEncoding = union(enum) {
+            utf8: void,
+            hex: void,
+            custom_string: []const u8,
+            pub fn from(val: anytype) @This() {
+                return js.coerceUnion(@This(), val);
+            }
+            pub const zigar_js = .{
+                .is_union = true,
+                .is_open_literal = true,
+                .variants = .{
+                    .{ .tag = "utf8", .is_unit_literal = true, .str_value = "utf8" },
+                    .{ .tag = "hex", .is_unit_literal = true, .str_value = "hex" },
+                    .{ .tag = "custom_string", .is_custom = true, .nullish = .none },
+                },
+            };
+        };
+        const oe_known_ref = try js.toJsRef(OpenEncoding, .hex);
+        const oe_known = try js.fromJsRefAlloc(OpenEncoding, alloc, oe_known_ref);
+        oe_known_ref.deinit();
+        try expectEqual(OpenEncoding.hex, oe_known);
+        js.freeDecoded(OpenEncoding, alloc, oe_known);
+
+        const oe_custom_in = OpenEncoding.from("latin1-custom");
+        const oe_custom_ref = try js.toJsRef(OpenEncoding, oe_custom_in);
+        const oe_custom = try js.fromJsRefAlloc(OpenEncoding, alloc, oe_custom_ref);
+        oe_custom_ref.deinit();
+        try std.testing.expectEqualStrings("latin1-custom", oe_custom.custom_string);
+        js.freeDecoded(OpenEncoding, alloc, oe_custom);
+
+        // Template literal pattern struct: `v${number}.${number}` + anti-ReDoS check
+        const SemVerShort = struct {
+            raw: []const u8,
+            pub const zigar_js = .{
+                .is_template_literal = true,
+                .head = "v",
+                .spans = .{
+                    .{ .placeholder = js.TemplatePlaceholderKind.number, .choices = &[_][]const u8{}, .literal_tail = "." },
+                    .{ .placeholder = js.TemplatePlaceholderKind.number, .choices = &[_][]const u8{}, .literal_tail = "" },
+                },
+            };
+        };
+        const sv_ok_ref = try js.toJsRef(SemVerShort, .{ .raw = "v26.1" });
+        const sv_ok = try js.fromJsRefAlloc(SemVerShort, alloc, sv_ok_ref);
+        sv_ok_ref.deinit();
+        try std.testing.expectEqualStrings("v26.1", sv_ok.raw);
+        js.freeDecoded(SemVerShort, alloc, sv_ok);
+
+        try std.testing.expectError(error.TypeError, js.toJsRef(SemVerShort, .{ .raw = "invalid" }));
+        const sv_bad_str = try js.String.fromSlice("v26.notanumber");
+        try std.testing.expectError(error.TypeError, js.fromJsRefAlloc(SemVerShort, alloc, sv_bad_str.toRef()));
+        sv_bad_str.deinit();
+
+        const PathologicalTpl = struct {
+            pub const head = "a";
+            pub const spans = .{
+                .{ .placeholder = js.TemplatePlaceholderKind.any_string, .choices = &[_][]const u8{}, .literal_tail = "a" },
+                .{ .placeholder = js.TemplatePlaceholderKind.any_string, .choices = &[_][]const u8{}, .literal_tail = "a" },
+                .{ .placeholder = js.TemplatePlaceholderKind.any_string, .choices = &[_][]const u8{}, .literal_tail = "a" },
+                .{ .placeholder = js.TemplatePlaceholderKind.any_string, .choices = &[_][]const u8{}, .literal_tail = "b" },
+            };
+        };
+        const a64 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        try expect(!js.matchTemplatePattern(PathologicalTpl, a64 ++ "c"));
+        try expect(js.matchTemplatePattern(PathologicalTpl, a64 ++ "b"));
+
+        // Discriminated union: `{ kind: "text", body: string } | { kind: "code" | "exit", status: number }`
+        const TextMsg = struct {
+            kind: []const u8 = "text",
+            body: []const u8,
+            pub const zigar_js = .{
+                .fields = .{
+                    .{ .name = "kind", .js_name = "kind", .is_optional = false, .nullish = .none, .expected_str = "text" },
+                    .{ .name = "body", .js_name = "body", .is_optional = false, .nullish = .none },
+                },
+            };
+        };
+        const CodeMsg = struct {
+            kind: []const u8,
+            status: f64,
+            pub const zigar_js = .{
+                .fields = .{
+                    .{ .name = "kind", .js_name = "kind", .is_optional = false, .nullish = .none },
+                    .{ .name = "status", .js_name = "status", .is_optional = false, .nullish = .none },
+                },
+            };
+        };
+        const DiscMsg = union(enum) {
+            text: TextMsg,
+            code_or_exit: CodeMsg,
+            pub const zigar_js = .{
+                .is_union = true,
+                .discriminant = "kind",
+                .variants = .{
+                    .{ .tag = "text", .nullish = .none, .disc_values = .{.{ .str_value = "text" }} },
+                    .{
+                        .tag = "code_or_exit",
+                        .nullish = .none,
+                        .disc_values = .{ .{ .str_value = "code" }, .{ .str_value = "exit" } },
+                    },
+                },
+            };
+        };
+        const dm_ref = try js.toJsRef(DiscMsg, .{ .code_or_exit = .{ .kind = "exit", .status = 0 } });
+        const dm_dec = try js.fromJsRefAlloc(DiscMsg, alloc, dm_ref);
+        dm_ref.deinit();
+        try expectEqual(std.meta.activeTag(dm_dec), .code_or_exit);
+        try std.testing.expectEqualStrings("exit", dm_dec.code_or_exit.kind);
+        try expectEqual(@as(f64, 0), dm_dec.code_or_exit.status);
+        js.freeDecoded(DiscMsg, alloc, dm_dec);
+
+        // Outbound singleton validation rejects forged discriminant!
+        try std.testing.expectError(error.TypeError, js.toJsRef(TextMsg, .{ .kind = "forged", .body = "bad" }));
+
+        // Inbound discriminated union with matched tag `"text"` but wrong `body` type MUST fail directly without leaks
+        const bad_disc_rec = try js.Record([]const u8, js.Ref(js.Any)).init();
+        const k_str = try js.String.fromSlice("text");
+        const bad_body = try js.toJsRef(f64, 99);
+        try bad_disc_rec.set("kind", k_str.toRef());
+        try bad_disc_rec.set("body", bad_body);
+        k_str.deinit();
+        bad_body.deinit();
+        try std.testing.expectError(error.TypeError, js.fromJsRefAlloc(DiscMsg, alloc, bad_disc_rec.toRef()));
+        bad_disc_rec.deinit();
+
+        // Heterogeneous union specificity: `[string] | string[] | Buffer | string | { host: string }`
+        const SingleElemTuple = struct {
+            @"0": []const u8,
+            pub const zigar_js_tuple = .{
+                .variadic_index = @as(?usize, null),
+                .optional_mask = @as(u64, 0),
+            };
+        };
+        const HostOpts = struct {
+            host: []const u8,
+            pub const zigar_js = .{
+                .fields = .{
+                    .{ .name = "host", .js_name = "host", .is_optional = false, .nullish = .none },
+                },
+            };
+        };
+        const HeteroTarget = union(enum) {
+            opts: HostOpts,
+            str: []const u8,
+            str_list: []const []const u8,
+            one_tuple: SingleElemTuple,
+            buf: js.Buffer,
+            pub const zigar_js = .{
+                .is_union = true,
+                .variants = .{
+                    .{ .tag = "opts", .nullish = .none },
+                    .{ .tag = "str", .nullish = .none },
+                    .{ .tag = "str_list", .nullish = .none },
+                    .{ .tag = "one_tuple", .nullish = .none },
+                    .{ .tag = "buf", .nullish = .none },
+                },
+            };
+        };
+
+        // 1-element array -> matches `[string]` (`one_tuple`), NOT plain struct `opts`!
+        const arr1_ref = try js.toJsRef([]const []const u8, &.{"only-one"});
+        const h_t1 = try js.fromJsRefAlloc(HeteroTarget, alloc, arr1_ref);
+        arr1_ref.deinit();
+        try expectEqual(std.meta.activeTag(h_t1), .one_tuple);
+        try std.testing.expectEqualStrings("only-one", h_t1.one_tuple.@"0");
+        js.freeDecoded(HeteroTarget, alloc, h_t1);
+
+        // 2-element array -> `[string]` rejects `len > 1` (no truncation!), falls through to `string[]` (`str_list`), NEVER `opts`!
+        const arr2_ref = try js.toJsRef([]const []const u8, &.{ "first", "second" });
+        const h_t2 = try js.fromJsRefAlloc(HeteroTarget, alloc, arr2_ref);
+        arr2_ref.deinit();
+        try expectEqual(std.meta.activeTag(h_t2), .str_list);
+        try expectEqual(@as(usize, 2), h_t2.str_list.len);
+        js.freeDecoded(HeteroTarget, alloc, h_t2);
+
+        // Buffer -> matches `.buf` before `opts`
+        const hb = try js.Buffer.alloc(4);
+        const h_tb = try js.fromJsRefAlloc(HeteroTarget, alloc, hb.toRef().cast(js.Any));
+        hb.deinit();
+        try expectEqual(std.meta.activeTag(h_tb), .buf);
+        js.freeDecoded(HeteroTarget, alloc, h_tb);
+
+        // Plain object `{ host: "example.com" }` -> matches `.opts`
+        const ho_ref = try js.toJsRef(HostOpts, .{ .host = "example.com" });
+        const h_to = try js.fromJsRefAlloc(HeteroTarget, alloc, ho_ref);
+        ho_ref.deinit();
+        try expectEqual(std.meta.activeTag(h_to), .opts);
+        try std.testing.expectEqualStrings("example.com", h_to.opts.host);
+        js.freeDecoded(HeteroTarget, alloc, h_to);
     }
     try expectEqual(@as(u32, 0), js.activeHandleCount());
 }
