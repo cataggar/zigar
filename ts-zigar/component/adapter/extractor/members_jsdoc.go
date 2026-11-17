@@ -159,7 +159,7 @@ func (b *graphBuilder) extractObjectLiteralMembersAST(tl *ast.TypeLiteralNode) z
 			SetterTy:       witTypes.None[uint32](),
 			HasGetter:      false,
 			HasSetter:      false,
-			Modifiers:      m.Modifiers,
+			Modifiers:      m.Modifiers | zigar_typescript_types.ModifierFlags_MethodMod,
 			Jsdoc:          m.Jsdoc,
 		})
 		props = append(props, propID)
@@ -431,6 +431,11 @@ func (b *graphBuilder) extractCheckerPropertySymbol(sym *ast.Symbol, containingT
 	}
 	if b.tc.IsReadonlySymbol(sym) {
 		mods |= zigar_typescript_types.ModifierFlags_ReadonlyMod
+	}
+	if sym.Flags()&ast.SymbolFlagsMethod != 0 ||
+		sym.CheckFlags()&ast.CheckFlagsSyntheticMethod != 0 ||
+		(firstDecl != nil && (firstDecl.Kind == ast.KindMethodSignature || firstDecl.Kind == ast.KindMethodDeclaration)) {
+		mods |= zigar_typescript_types.ModifierFlags_MethodMod
 	}
 
 	propTy := b.tc.GetTypeOfPropertyOfType(containingType, sym.Name())
@@ -716,14 +721,14 @@ func (b *graphBuilder) extractHeritageExpr(exprNode *ast.Node) zigar_typescript_
 	if exprNode.Kind == ast.KindTypeReference {
 		tr := exprNode.AsTypeReferenceNode()
 		typeArgs := b.extractTypeNodeList(tr.TypeArguments)
-		refKind := b.buildTypeReferenceAST(exprNode)
+		targetTypeID := b.extractTypeNode(exprNode)
 		targetDecl := witTypes.None[uint32]()
-		if refKind.Tag() == zigar_typescript_types.TypeKind_Reference {
-			targetDecl = refKind.Reference().TargetDecl
+		if int(targetTypeID) < len(b.types) && b.types[targetTypeID].Kind.Tag() == zigar_typescript_types.TypeKind_Reference {
+			targetDecl = b.types[targetTypeID].Kind.Reference().TargetDecl
 		}
 		return zigar_typescript_types.HeritageClause{
 			TargetDecl: targetDecl,
-			TargetType: b.allocType(refKind),
+			TargetType: targetTypeID,
 			TypeArgs:   typeArgs,
 		}
 	}
@@ -744,7 +749,8 @@ func (b *graphBuilder) extractHeritageExpr(exprNode *ast.Node) zigar_typescript_
 	targetDecl := witTypes.None[uint32]()
 	modSpec := witTypes.None[uint32]()
 
-	if sym := b.resolveExpressionSymbol(ewta.Expression); sym != nil {
+	sym := b.resolveExpressionSymbol(ewta.Expression)
+	if sym != nil {
 		ids := b.populateTypeTargetSymbol(sym)
 		if len(ids) > 0 {
 			targetDecl = witTypes.Some(ids[0])
@@ -763,6 +769,22 @@ func (b *graphBuilder) extractHeritageExpr(exprNode *ast.Node) zigar_typescript_
 			ModuleSpecifier: modSpec,
 			TypeArgs:        typeArgs,
 		}))
+		isAliasTarget := false
+		if sym != nil {
+			for _, d := range sym.Declarations() {
+				if d != nil && d.Kind == ast.KindTypeAliasDeclaration {
+					isAliasTarget = true
+					break
+				}
+			}
+		}
+		if b.cfg.ExpandUtilityTypes && (isAliasTarget || (targetDecl.IsNone() && len(typeArgs) > 0)) {
+			evaluated := b.tc.GetTypeFromTypeNode(exprNode)
+			if evaluated == nil || evaluated.Flags()&checker.TypeFlagsAny != 0 {
+				evaluated = b.tc.GetTypeAtLocation(exprNode)
+			}
+			b.populateExpandedResolvedType(targetTypeID, evaluated)
+		}
 	} else {
 		targetTypeID = b.extractCheckerType(b.tc.GetTypeAtLocation(exprNode))
 	}

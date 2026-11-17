@@ -77,6 +77,7 @@ export const MODIFIER_FLAGS = Object.freeze({
   constMod: 1 << 11,
   overrideMod: 1 << 12,
   accessorMod: 1 << 13,
+  methodMod: 1 << 14,
 });
 
 /**

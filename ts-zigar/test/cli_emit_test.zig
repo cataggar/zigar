@@ -420,21 +420,25 @@ test "Regression Bug 1: struct member collisions, outer/parameter/receiver/type-
             \\    try std.testing.expectEqualStrings("n", r.n.js_name);
             \\    try std.testing.expectEqualStrings("std", r.std.js_name);
             \\
-            \\    const w: r.Widget = .{
-            \\        .init = true,
-            \\        .count = 1,
-            \\        .self = "ok",
-            \\        .handle = 2,
-            \\        .zigar_js_2 = 3,
-            \\    };
-            \\    try std.testing.expect(w.init);
+            \\    try std.testing.expect(r.Widget.zigar_js.is_handle);
+            \\    try std.testing.expect(r.Widget.zigar_js.is_class);
             \\    try std.testing.expectEqualStrings("Widget", r.Widget.zigar_js.js_name);
+            \\    try std.testing.expectEqualStrings("init", r.Widget.init.js_name);
+            \\    const widget_ctor: *const fn ([]const u8, ?f64) r.zigar_js.CallError!r.Widget = &r.Widget.init_2;
+            \\    const widget_m: *const fn (r.Widget, r.K, ?r.T) r.zigar_js.CallError!r.Widget = &r.Widget.m;
+            \\    _ = widget_ctor;
+            \\    _ = widget_m;
             \\
             \\    const B = r.Box(u32, bool);
-            \\    const b: B = .{ .item = 7, .extra = true };
-            \\    try std.testing.expectEqual(@as(u32, 7), b.item);
+            \\    try std.testing.expect(B.zigar_js.is_handle);
+            \\    const box_item: *const fn (B) r.zigar_js.CallError!u32 = &B.item;
+            \\    const box_extra: *const fn (B) r.zigar_js.CallError!bool = &B.extra;
+            \\    const box_clone: *const fn (B, f64) r.zigar_js.CallError!B = &B.clone;
+            \\    _ = box_item;
+            \\    _ = box_extra;
+            \\    _ = box_clone;
             \\
-            \\    const use_top_fn: *const fn (*const r.ShadowRef, r.K) r.K = &r.ShadowRef.useTop;
+            \\    const use_top_fn: *const fn (r.ShadowRef, r.K) r.zigar_js.CallError!r.K = &r.ShadowRef.useTop;
             \\    _ = use_top_fn;
             \\}
             ,
@@ -561,9 +565,10 @@ test "Regression Bug 2: export * and named re-exports emit alias constants prese
             \\    try std.testing.expect(&r.makeStar == &sub_star.makeStar);
             \\
             \\    const s: sub_star.Starry = .{ .id = 42, .label = "vega" };
-            \\    const n: sub_star.Nebula = .{ .radius = 10 };
             \\    try std.testing.expectEqual(@as(f64, 42), s.id);
-            \\    try std.testing.expectEqual(@as(f64, 10), n.radius);
+            \\    try std.testing.expect(sub_star.Nebula.zigar_js.is_handle);
+            \\    const neb_radius: *const fn (sub_star.Nebula) r.zigar_js.CallError!f64 = &sub_star.Nebula.radius;
+            \\    _ = neb_radius;
             \\
             \\    // Passing `sub_star.Starry` to `r.take` must type-check identically!
             \\    const take_fn: *const fn (sub_star.Starry, sub_star.Nebula, sub_star.Phase) r.zigar_js.CallError!sub_star.Starry = &r.take;
@@ -846,31 +851,38 @@ test "Regression Round 2 Issue 1: Self declarations in enclosing containers or s
             \\const r = @import("out/root.zig");
             \\
             \\test "all Self collision shapes compile and preserve outer Self nominal types" {
-            \\    const s1: r.case1.Self = .{ .tag = 7 };
-            \\    try std.testing.expectEqual(@as(f64, 7), s1.tag);
-            \\    const echo_fn: *const fn (*const r.case1.Self, r.case1.Self) r.case1.Self = &r.case1.Self.echo;
+            \\    try std.testing.expect(r.case1.Self.zigar_js.is_handle);
+            \\    const tag_fn: *const fn (r.case1.Self) r.zigar_js.CallError!f64 = &r.case1.Self.tag;
+            \\    const echo_fn: *const fn (r.case1.Self, r.case1.Self) r.zigar_js.CallError!r.case1.Self = &r.case1.Self.echo;
+            \\    _ = tag_fn;
             \\    _ = echo_fn;
             \\
             \\    const s2: r.case2.Self = .{ .id = "abc" };
             \\    try std.testing.expectEqualStrings("abc", s2.id);
-            \\    const init_fn: *const fn () r.case2.Widget = &r.case2.Widget.init;
+            \\    const init_fn: *const fn () r.zigar_js.CallError!r.case2.Widget = &r.case2.Widget.init;
+            \\    const make_self_fn: *const fn (r.case2.Widget, std.mem.Allocator) r.zigar_js.CallError!r.case2.Self = &r.case2.Widget.makeSelfAlloc;
             \\    _ = init_fn;
+            \\    _ = make_self_fn;
             \\
             \\    const s3: r.case3.Self = .{ .x = 3 };
-            \\    const a3: r.case3.A = .{ .s = s3 };
-            \\    try std.testing.expectEqual(@as(f64, 3), a3.s.x);
+            \\    try std.testing.expectEqual(@as(f64, 3), s3.x);
+            \\    try std.testing.expect(r.case3.A.zigar_js.is_handle);
+            \\    const a3_s: *const fn (r.case3.A) r.zigar_js.CallError!r.case3.Self = &r.case3.A.s;
+            \\    _ = a3_s;
             \\
             \\    const ns_s: r.case4.Ns.Self = .{ .x = 9 };
-            \\    const ns_a: r.case4.Ns.A = .{ .s = ns_s };
-            \\    try std.testing.expectEqual(@as(f64, 9), ns_a.s.x);
+            \\    try std.testing.expectEqual(@as(f64, 9), ns_s.x);
+            \\    const ns_a_s: *const fn (r.case4.Ns.A) r.zigar_js.CallError!r.case4.Ns.Self = &r.case4.Ns.A.s;
+            \\    _ = ns_a_s;
             \\    const ons_s: r.case4.OuterNs.Self = .{ .z = 15 };
-            \\    const ons_b: r.case4.OuterNs.B = .{ .s = ons_s };
-            \\    try std.testing.expectEqual(@as(f64, 15), ons_b.s.z);
-            \\    const nb: r.case4.Self.NestedInSelfNs = .{ .k = 11 };
-            \\    try std.testing.expectEqual(@as(f64, 11), nb.k);
-            \\    const t: r.case4.Triple(u32) = .{ .a = .{ .y = 12 }, .val = 99 };
-            \\    try std.testing.expectEqual(@as(f64, 12), t.a.y);
-            \\    try std.testing.expectEqual(@as(u32, 99), t.val);
+            \\    try std.testing.expectEqual(@as(f64, 15), ons_s.z);
+            \\    const ons_b_s: *const fn (r.case4.OuterNs.B) r.zigar_js.CallError!r.case4.OuterNs.Self = &r.case4.OuterNs.B.s;
+            \\    _ = ons_b_s;
+            \\    const nb_k: *const fn (r.case4.Self.NestedInSelfNs) r.zigar_js.CallError!f64 = &r.case4.Self.NestedInSelfNs.k;
+            \\    _ = nb_k;
+            \\    const T32 = r.case4.Triple(u32);
+            \\    const t_val: *const fn (T32) r.zigar_js.CallError!u32 = &T32.val;
+            \\    _ = t_val;
             \\}
             ,
         });
@@ -1046,11 +1058,13 @@ test "Regression Round 2 Issue 2: non-entry imported modules preserve namespaces
             \\    try std.testing.expect(r.X == leaf.LeafNs.Inner);
             \\    try std.testing.expect(r.Y == foo_used.UsedNs.Payload);
             \\
-            \\    const top_in: leaf.Inner = .{ .top = 1 };
-            \\    const nested_in: leaf.LeafNs.Inner = .{ .nested = "hello" };
+            \\    try std.testing.expect(leaf.Inner.zigar_js.is_handle);
+            \\    try std.testing.expect(leaf.LeafNs.Inner.zigar_js.is_handle);
+            \\    const top_fn: *const fn (leaf.Inner) r.zigar_js.CallError!f64 = &leaf.Inner.top;
+            \\    const nested_fn: *const fn (leaf.LeafNs.Inner) r.zigar_js.CallError![]const u8 = &leaf.LeafNs.Inner.nested;
+            \\    _ = top_fn;
+            \\    _ = nested_fn;
             \\    const payload: foo_used.UsedNs.Payload = .{ .ok = true };
-            \\    try std.testing.expectEqual(@as(f64, 1), top_in.top);
-            \\    try std.testing.expectEqualStrings("hello", nested_in.nested);
             \\    try std.testing.expect(payload.ok);
             \\
             \\    const f_ptr: *const fn (leaf.Inner, leaf.LeafNs.Inner, foo_used.UsedNs.Payload) r.zigar_js.CallError!void = &r.f;
@@ -1354,8 +1368,9 @@ test "Regression Round 3: @types/node reference-path ambient closure, mixed ES+a
             \\    try std.testing.expect(@hasDecl(r_node, "node_sqlite"));
             \\    try std.testing.expect(@hasDecl(r_node, "globals"));
             \\    try std.testing.expectEqualStrings("processVersion", r_node.globals.process_version.js_name);
-            \\    const db: r_node.node_sqlite.DatabaseSync = .{ .open = true };
-            \\    try std.testing.expect(db.open);
+            \\    try std.testing.expect(r_node.node_sqlite.DatabaseSync.zigar_js.is_handle);
+            \\    const db_open: *const fn (r_node.node_sqlite.DatabaseSync) r_node.zigar_js.CallError!bool = &r_node.node_sqlite.DatabaseSync.open;
+            \\    _ = db_open;
             \\    const srv: r_node.http.Server = .{ .port = 8080, .stat = .{ .size = 64 } };
             \\    try std.testing.expectEqual(@as(f64, 8080), srv.port);
             \\
@@ -1834,7 +1849,8 @@ test "Regression Round 5: multi-block ambient files route private helpers to own
             \\    try std.testing.expect(&r_p2.g == &r_p2.p2.g);
             \\    try std.testing.expectEqual(@as(usize, 1), r_p2.p2.zigar_js.exports.len);
             \\    try std.testing.expectEqualStrings("g", r_p2.p2.zigar_js.exports[0].js_name);
-            \\    const hid_val: r_p2.p2.Hid = .{ .s = 7, .nested = .{ .flag = true } };
+            \\    const hid_val: r_p2.p2.Hid = .{ .tag = "base", .s = 7, .nested = .{ .flag = true } };
+            \\    try std.testing.expectEqualStrings("base", hid_val.tag);
             \\    try std.testing.expectEqual(@as(f64, 7), hid_val.s);
             \\    _ = &r_p2.g;
             \\}
@@ -3075,5 +3091,416 @@ test "Issue #47 @types/node@26 sweep: buffer, fs, events, http, stream pass AstG
 
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", probe_zig });
 }
+
+test "Issue #48 M3.2a Sema: plain options structs vs handle classes, divergent accessors, companion var ctors, callable handles, and collision safety" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    const cwd = std.Io.Dir.cwd();
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue48-objects", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const src_dir = try std.fmt.allocPrint(alloc, "{s}/src", .{sandbox});
+    defer alloc.free(src_dir);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+
+    try cwd.createDirPath(io, src_dir);
+    {
+        var sd = try cwd.openDir(io, src_dir, .{});
+        defer sd.close(io);
+        try sd.writeFile(io, .{
+            .sub_path = "m3_objects.d.ts",
+            .data =
+            \\export interface BaseOptions {
+            \\  host?: string;
+            \\  readonly keepAlive?: boolean;
+            \\}
+            \\
+            \\export interface ExtraOptions {
+            \\  retries?: number;
+            \\  onConnect?: (attempt: number) => void;
+            \\}
+            \\
+            \\export interface RequestOptions extends BaseOptions, ExtraOptions {
+            \\  host: string;
+            \\  port?: number;
+            \\}
+            \\
+            \\export interface LinkedNode {
+            \\  id: string;
+            \\  next?: LinkedNode;
+            \\}
+            \\
+            \\export declare abstract class BaseTransport {
+            \\  readonly protocol: string;
+            \\  constructor(protocol: string);
+            \\  static supportedCount(): number;
+            \\  ping(): boolean;
+            \\}
+            \\
+            \\export declare class HttpClient extends BaseTransport {
+            \\  readonly baseUrl: string;
+            \\  timeout: number;
+            \\  mode: "fast" | "slow";
+            \\  get endpoint(): string;
+            \\  set endpoint(val: string | number);
+            \\  set authToken(token: string);
+            \\  static defaultPort: number;
+            \\  static readonly version: string;
+            \\  static set logSink(sink: string);
+            \\  static get env(): string;
+            \\  static set env(val: string | null);
+            \\  constructor(baseUrl: string);
+            \\  constructor(baseUrl: string, timeout: number);
+            \\  static createDefault(): HttpClient;
+            \\  fetchText(path: string): string;
+            \\  transform<T>(input: T): T;
+            \\}
+            \\
+            \\export interface CustomUrl {
+            \\  href: string;
+            \\  readonly origin: string;
+            \\  toJSON(): string;
+            \\}
+            \\export interface CustomUrlConstructor {
+            \\  prototype: CustomUrl;
+            \\  new(input: string, base?: string): CustomUrl;
+            \\  canParse(input: string, base?: string): boolean;
+            \\  readonly schemeVersion: number;
+            \\}
+            \\export declare var CustomUrl: CustomUrlConstructor;
+            \\
+            \\export interface CallableFactory {
+            \\  (label: string): number;
+            \\  new(baseUrl: string): HttpClient;
+            \\  readonly tag: string;
+            \\}
+            \\
+            \\export declare class CollisionHandle {
+            \\  ref: number;
+            \\  self: string;
+            \\  deinit(): boolean;
+            \\  toJsRef(): number;
+            \\  fromJsRef(x: number): string;
+            \\}
+            \\
+            \\export interface Widget {
+            \\  readonly id: number;
+            \\  render(): string;
+            \\}
+            \\export declare function Widget(name: string): Widget;
+            \\
+            \\export interface FactoryConfig {
+            \\  host: string;
+            \\  port?: number;
+            \\}
+            \\export declare function FactoryConfig(host: string): FactoryConfig;
+            \\
+            \\export interface Box<T, M = string> {
+            \\  value: T;
+            \\  meta?: M;
+            \\}
+            \\export interface StrBox extends Box<string> {
+            \\  extra: number;
+            \\}
+            \\
+            \\export interface BaseEmitter<E, R = boolean> {
+            \\  emit(ev: E): R;
+            \\  readonly channel: E;
+            \\}
+            \\export interface MidEmitter<X> extends BaseEmitter<X, number> {}
+            \\export interface Svc extends MidEmitter<string> {
+            \\  port: number;
+            \\}
+            \\
+            \\export type LoggerT = {
+            \\  level: number;
+            \\  log(msg: string): string;
+            \\};
+            \\export type PickedLogger = Pick<LoggerT, "level" | "log">;
+            \\
+            \\export type OptsT = {
+            \\  a: number;
+            \\  b?: string;
+            \\};
+            \\export interface ExtOptsT extends OptsT {
+            \\  c: number;
+            \\}
+            \\export interface OptsI {
+            \\  a: number;
+            \\  b: string;
+            \\}
+            \\export interface ExtPick extends Pick<OptsI, "a"> {
+            \\  c: number;
+            \\}
+            \\export interface ExtLoggerT extends LoggerT {
+            \\  extra: number;
+            \\}
+            \\export interface ExtPickLogger extends Pick<LoggerT, "log"> {
+            \\  tag: string;
+            \\}
+            \\export type Inter = { a: number } & { run(step: number): number };
+            \\export type Both = LoggerT & { extra: number };
+            \\export declare function makeInlineInter(): { a: number } & { run(): number };
+            \\export declare function runInlineInter(x: { a: number } & { run(): number }): number;
+            \\
+            \\export interface NullableUnionBox<T> {
+            \\  x: T | string;
+            \\  y: T | "alpha" | "beta";
+            \\}
+            \\export interface NullOnlyBox extends NullableUnionBox<null> {}
+            \\
+            \\export declare function connectWith(opts: RequestOptions, node?: LinkedNode): HttpClient;
+            ,
+        });
+    }
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const dts_path = try std.fmt.allocPrint(alloc, "{s}/m3_objects.d.ts", .{src_dir});
+    defer alloc.free(dts_path);
+    const cli_args = [_][]const u8{ "-t", dts_path, "-d", out_dir };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Issue #48 pipeline error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+
+    const consumer_zig = try std.fmt.allocPrint(alloc, "{s}/consumer_issue48.zig", .{sandbox});
+    defer alloc.free(consumer_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "consumer_issue48.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r = @import("out/root.zig");
+            \\
+            \\test "Issue #48 plain options structs vs handle classes and stateful interfaces" {
+            \\    // 1. RequestOptions: plain Zig struct with inherited fields, narrowed `host: []const u8`, and `= null` defaults!
+            \\    try std.testing.expect(!@hasField(@TypeOf(r.RequestOptions.zigar_js), "is_handle"));
+            \\    const opts: r.RequestOptions = .{ .host = "127.0.0.1", .port = 8080 };
+            \\    try std.testing.expectEqualStrings("127.0.0.1", opts.host);
+            \\    try std.testing.expectEqual(@as(?f64, 8080), opts.port);
+            \\    try std.testing.expectEqual(@as(?bool, null), opts.keep_alive);
+            \\    try std.testing.expectEqual(@as(?f64, null), opts.retries);
+            \\    try std.testing.expect(opts.on_connect == null);
+            \\    try std.testing.expect(@hasDecl(r.RequestOptions, "toJsRef"));
+            \\    try std.testing.expect(@hasDecl(r.RequestOptions, "fromJsRefAlloc"));
+            \\
+            \\    // 2. Cyclic LinkedNode: plain Zig struct with `?*const LinkedNode` indirection!
+            \\    const leaf: r.LinkedNode = .{ .id = "tail" };
+            \\    const head: r.LinkedNode = .{ .id = "head", .next = &leaf };
+            \\    try std.testing.expectEqualStrings("tail", head.next.?.id);
+            \\    try std.testing.expect(@hasDecl(r.LinkedNode, "toJsRef"));
+            \\    try std.testing.expect(@hasDecl(r.LinkedNode, "fromJsRefAlloc"));
+            \\
+            \\    // 3. Abstract BaseTransport: handle wrapper WITHOUT `pub fn init`, WITH static & instance members!
+            \\    try std.testing.expect(r.BaseTransport.zigar_js.is_handle);
+            \\    try std.testing.expect(r.BaseTransport.zigar_js.is_class);
+            \\    try std.testing.expect(!@hasDecl(r.BaseTransport, "init"));
+            \\    try std.testing.expect(!@hasDecl(r.BaseTransport, "setProtocol"));
+            \\    _ = &r.BaseTransport.supportedCount;
+            \\    _ = &r.BaseTransport.ping;
+            \\
+            \\    // 4. HttpClient: inherits `protocol` & `ping` from BaseTransport, overloaded `init`/`init_2`,
+            \\    //    divergent `endpoint` + `setEndpoint`, write-only `setAuthToken`, shared nominal `mode`/`setMode`,
+            \\    //    and static RW / RO / WO / divergent accessor targets!
+            \\    try std.testing.expect(r.HttpClient.zigar_js.is_handle);
+            \\    try std.testing.expect(r.HttpClient.zigar_js.is_class);
+            \\    try std.testing.expect(!@hasDecl(r.HttpClient, "setBaseUrl"));
+            \\    try std.testing.expect(!@hasDecl(r.HttpClient, "authToken"));
+            \\    try std.testing.expect(@hasDecl(r.HttpClient, "setAuthToken"));
+            \\    const c1: *const fn ([]const u8) r.zigar_js.CallError!r.HttpClient = &r.HttpClient.init;
+            \\    const c2: *const fn ([]const u8, f64) r.zigar_js.CallError!r.HttpClient = &r.HttpClient.init_2;
+            \\    const inherited_ping: *const fn (r.HttpClient) r.zigar_js.CallError!bool = &r.HttpClient.ping;
+            \\    const inherited_proto: *const fn (r.HttpClient, std.mem.Allocator) r.zigar_js.CallError![]const u8 = &r.HttpClient.protocolAlloc;
+            \\    const get_ep: *const fn (r.HttpClient, std.mem.Allocator) r.zigar_js.CallError![]const u8 = &r.HttpClient.endpointAlloc;
+            \\    _ = c1;
+            \\    _ = c2;
+            \\    _ = inherited_ping;
+            \\    _ = inherited_proto;
+            \\    _ = get_ep;
+            \\    _ = &r.HttpClient.setEndpoint;
+            \\    try std.testing.expectError(error.HostUnavailable, r.HttpClient.default_port.get());
+            \\    try std.testing.expectError(error.HostUnavailable, r.HttpClient.default_port.set(8080));
+            \\    try std.testing.expect(!@hasDecl(@TypeOf(r.HttpClient.version), "set"));
+            \\    try std.testing.expectError(error.HostUnavailable, r.HttpClient.version.getAlloc(std.testing.allocator));
+            \\    try std.testing.expect(!@hasDecl(@TypeOf(r.HttpClient.log_sink), "get"));
+            \\    try std.testing.expectError(error.HostUnavailable, r.HttpClient.log_sink.set("stdout"));
+            \\    try std.testing.expectError(error.HostUnavailable, r.HttpClient.env.getAlloc(std.testing.allocator));
+            \\    try std.testing.expectError(error.HostUnavailable, r.HttpClient.env.set(null));
+            \\    try std.testing.expectError(error.HostUnavailable, r.HttpClient.env.set("prod"));
+            \\
+            \\    // Verify inline nominal enum `mode` shares exact type between getter and setter,
+            \\    // and divergent `setEndpoint` accepts `union(enum) { string: []const u8, number: f64 }`!
+            \\    const ModeFn = struct {
+            \\        fn roundtripMode(client: r.HttpClient) !void {
+            \\            const m = try client.mode();
+            \\            try client.setMode(m);
+            \\            try client.setEndpoint(.{ .str = "/v2" });
+            \\            try client.setEndpoint(.{ .num = 2 });
+            \\        }
+            \\    };
+            \\    _ = &ModeFn.roundtripMode;
+            \\
+            \\    // 5. Companion `interface CustomUrl` + `declare var CustomUrl: CustomUrlConstructor`:
+            \\    try std.testing.expect(r.CustomUrl.zigar_js.is_handle);
+            \\    try std.testing.expect(r.CustomUrl.zigar_js.is_class);
+            \\    try std.testing.expect(!@hasDecl(r.CustomUrl, "prototype"));
+            \\    try std.testing.expect(!@hasDecl(r.CustomUrl, "setOrigin"));
+            \\    const url_ctor: *const fn ([]const u8, ?[]const u8) r.zigar_js.CallError!r.CustomUrl = &r.CustomUrl.init;
+            \\    const can_parse: *const fn ([]const u8, ?[]const u8) r.zigar_js.CallError!bool = &r.CustomUrl.canParse;
+            \\    _ = url_ctor;
+            \\    _ = can_parse;
+            \\    try std.testing.expectError(error.HostUnavailable, r.CustomUrl.scheme_version.get());
+            \\
+            \\    // 6. Callable + constructable interface `CallableFactory`:
+            \\    try std.testing.expect(r.CallableFactory.zigar_js.is_handle);
+            \\    try std.testing.expect(r.CallableFactory.zigar_js.is_callable_handle);
+            \\    const cf_call: *const fn (r.CallableFactory, []const u8) r.zigar_js.CallError!f64 = &r.CallableFactory.call;
+            \\    const cf_ctor: *const fn (r.CallableFactory, []const u8) r.zigar_js.CallError!r.HttpClient = &r.CallableFactory.construct;
+            \\    _ = cf_call;
+            \\    _ = cf_ctor;
+            \\
+            \\    // 7. CollisionHandle (`ref`, `self`, `deinit`, `toJsRef`, `fromJsRef`):
+            \\    try std.testing.expectEqualStrings("__zigar_ref", r.CollisionHandle.zigar_js.ref_field);
+            \\    try std.testing.expect(@hasField(r.CollisionHandle, "__zigar_ref"));
+            \\    _ = &r.CollisionHandle.ref;
+            \\    _ = &r.CollisionHandle.self;
+            \\    _ = &r.CollisionHandle.deinit;
+            \\    _ = &r.CollisionHandle.toJsRef;
+            \\    _ = &r.CollisionHandle.fromJsRef;
+            \\    try std.testing.expect(!@hasDecl(r.CollisionHandle, "deinit_2"));
+            \\    try std.testing.expect(!@hasDecl(r.CollisionHandle, "toJsRef_2"));
+            \\    try std.testing.expect(!@hasDecl(r.CollisionHandle, "fromJsRef_2"));
+            \\
+            \\    // 8. Interface + same-named factory function (`Widget` handle vs `FactoryConfig` value struct):
+            \\    try std.testing.expect(r.Widget.zigar_js.is_handle);
+            \\    try std.testing.expect(!@hasField(@TypeOf(r.Widget.zigar_js), "is_callable_handle"));
+            \\    try std.testing.expect(@FieldType(r.Widget, "ref") == r.zigar_js.JsObject);
+            \\    const widget_fn: *const fn ([]const u8) r.zigar_js.CallError!r.Widget = &r.widget;
+            \\    _ = widget_fn;
+            \\    try std.testing.expect(!@hasField(@TypeOf(r.FactoryConfig.zigar_js), "is_handle"));
+            \\    const fc: r.FactoryConfig = .{ .host = "localhost" };
+            \\    try std.testing.expectEqualStrings("localhost", fc.host);
+            \\    try std.testing.expectEqual(@as(?f64, null), fc.port);
+            \\
+            \\    // 9. Generic `extends` instantiation on both value structs (`StrBox`) and chained handle interfaces (`Svc`):
+            \\    try std.testing.expect(!@hasField(@TypeOf(r.StrBox.zigar_js), "is_handle"));
+            \\    const sb: r.StrBox = .{ .value = "payload", .extra = 42 };
+            \\    try std.testing.expectEqualStrings("payload", sb.value);
+            \\    try std.testing.expectEqual(@as(?[]const u8, null), sb.meta);
+            \\    try std.testing.expectEqual(@as(f64, 42), sb.extra);
+            \\
+            \\    try std.testing.expect(r.Svc.zigar_js.is_handle);
+            \\    const svc_emit: *const fn (r.Svc, []const u8) r.zigar_js.CallError!f64 = &r.Svc.emit;
+            \\    const svc_chan: *const fn (r.Svc, std.mem.Allocator) r.zigar_js.CallError![]const u8 = &r.Svc.channelAlloc;
+            \\    const svc_port: *const fn (r.Svc) r.zigar_js.CallError!f64 = &r.Svc.port;
+            \\    _ = svc_emit;
+            \\    _ = svc_chan;
+            \\    _ = svc_port;
+            \\
+            \\    // 10. Object-literal type aliases with methods (`LoggerT` & `PickedLogger`) lower to `.handle_wrapper`:
+            \\    try std.testing.expect(r.LoggerT.zigar_js.is_handle);
+            \\    try std.testing.expect(!@hasField(@TypeOf(r.LoggerT.zigar_js), "is_callable_handle"));
+            \\    const lt_log: *const fn (r.LoggerT, std.mem.Allocator, []const u8) r.zigar_js.CallError![]const u8 = &r.LoggerT.logAlloc;
+            \\    const lt_lvl: *const fn (r.LoggerT) r.zigar_js.CallError!f64 = &r.LoggerT.level;
+            \\    const lt_set_lvl: *const fn (r.LoggerT, f64) r.zigar_js.CallError!void = &r.LoggerT.setLevel;
+            \\    _ = lt_log;
+            \\    _ = lt_lvl;
+            \\    _ = lt_set_lvl;
+            \\    try std.testing.expect(r.PickedLogger.zigar_js.is_handle);
+            \\    const pl_log: *const fn (r.PickedLogger, std.mem.Allocator, []const u8) r.zigar_js.CallError![]const u8 = &r.PickedLogger.logAlloc;
+            \\    _ = pl_log;
+            \\
+            \\    // 11. Generic `extends` with `T = null` in `T | string` and `T | "alpha" | "beta"` collapses cleanly:
+            \\    try std.testing.expect(@FieldType(r.NullOnlyBox, "x") == ?[]const u8);
+            \\    try std.testing.expectEqual(.null_only, r.NullOnlyBox.zigar_js.fields[0].nullish);
+            \\    try std.testing.expect(@typeInfo(@typeInfo(@FieldType(r.NullOnlyBox, "y")).optional.child) == .@"enum");
+            \\    try std.testing.expectEqual(.null_only, r.NullOnlyBox.zigar_js.fields[1].nullish);
+            \\    const nb: r.NullOnlyBox = .{ .x = null, .y = .alpha };
+            \\    try std.testing.expect(nb.x == null);
+            \\    try std.testing.expectEqual(.alpha, nb.y.?);
+            \\
+            \\    // 12. `interface extends` type alias (`ExtOptsT`, `ExtLoggerT`) and utility base (`ExtPick`, `ExtPickLogger`):
+            \\    try std.testing.expect(!@hasField(@TypeOf(r.ExtOptsT.zigar_js), "is_handle"));
+            \\    const eo: r.ExtOptsT = .{ .a = 1, .c = 2 };
+            \\    try std.testing.expectEqual(@as(f64, 1), eo.a);
+            \\    try std.testing.expectEqual(@as(?[]const u8, null), eo.b);
+            \\    try std.testing.expectEqual(@as(f64, 2), eo.c);
+            \\
+            \\    try std.testing.expect(!@hasField(@TypeOf(r.ExtPick.zigar_js), "is_handle"));
+            \\    try std.testing.expect(!@hasField(r.ExtPick, "b"));
+            \\    const ep: r.ExtPick = .{ .a = 10, .c = 20 };
+            \\    try std.testing.expectEqual(@as(f64, 10), ep.a);
+            \\    try std.testing.expectEqual(@as(f64, 20), ep.c);
+            \\
+            \\    try std.testing.expect(r.ExtLoggerT.zigar_js.is_handle);
+            \\    const elt_log: *const fn (r.ExtLoggerT, std.mem.Allocator, []const u8) r.zigar_js.CallError![]const u8 = &r.ExtLoggerT.logAlloc;
+            \\    const elt_lvl: *const fn (r.ExtLoggerT) r.zigar_js.CallError!f64 = &r.ExtLoggerT.level;
+            \\    const elt_ext: *const fn (r.ExtLoggerT) r.zigar_js.CallError!f64 = &r.ExtLoggerT.extra;
+            \\    _ = elt_log;
+            \\    _ = elt_lvl;
+            \\    _ = elt_ext;
+            \\
+            \\    try std.testing.expect(r.ExtPickLogger.zigar_js.is_handle);
+            \\    try std.testing.expect(!@hasDecl(r.ExtPickLogger, "level"));
+            \\    const epl_log: *const fn (r.ExtPickLogger, std.mem.Allocator, []const u8) r.zigar_js.CallError![]const u8 = &r.ExtPickLogger.logAlloc;
+            \\    const epl_tag: *const fn (r.ExtPickLogger, std.mem.Allocator) r.zigar_js.CallError![]const u8 = &r.ExtPickLogger.tagAlloc;
+            \\    _ = epl_log;
+            \\    _ = epl_tag;
+            \\
+            \\    // 13. Handle-bearing intersections (`Inter`, `Both`, and inline `{ a: number } & { run(): number }`):
+            \\    try std.testing.expect(r.Inter.zigar_js.is_handle);
+            \\    const inter_a: *const fn (r.Inter) r.zigar_js.CallError!f64 = &r.Inter.a;
+            \\    const inter_run: *const fn (r.Inter, f64) r.zigar_js.CallError!f64 = &r.Inter.run;
+            \\    _ = inter_a;
+            \\    _ = inter_run;
+            \\
+            \\    try std.testing.expect(r.Both.zigar_js.is_handle);
+            \\    const both_log: *const fn (r.Both, std.mem.Allocator, []const u8) r.zigar_js.CallError![]const u8 = &r.Both.logAlloc;
+            \\    const both_lvl: *const fn (r.Both) r.zigar_js.CallError!f64 = &r.Both.level;
+            \\    const both_ext: *const fn (r.Both) r.zigar_js.CallError!f64 = &r.Both.extra;
+            \\    _ = both_log;
+            \\    _ = both_lvl;
+            \\    _ = both_ext;
+            \\
+            \\    const InlineHelper = struct {
+            \\        fn check() !void {
+            \\            var inl = try r.makeInlineInter();
+            \\            defer inl.deinit();
+            \\            try std.testing.expect(@TypeOf(inl).zigar_js.is_handle);
+            \\            const a_val: f64 = try inl.a();
+            \\            const r_val: f64 = try inl.run();
+            \\            _ = a_val;
+            \\            _ = r_val;
+            \\            _ = try r.runInlineInter(.{ .ref = inl.ref });
+            \\        }
+            \\    };
+            \\    _ = &InlineHelper.check;
+            \\}
+            ,
+        });
+    }
+
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
+}
+
 
 

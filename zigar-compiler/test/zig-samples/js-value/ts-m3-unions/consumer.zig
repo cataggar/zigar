@@ -262,7 +262,12 @@ pub fn exerciseHeteroRecursiveAndGenericUnions(out_alloc: std.mem.Allocator) ![]
                 4 => if (std.meta.activeTag(p) != .uint8_array) return std.fmt.allocPrint(out_alloc, "tag-mismatch:4:{s}", .{@tagName(p)}),
                 5 => {
                     if (std.meta.activeTag(p) != .mini_channel) return std.fmt.allocPrint(out_alloc, "tag-mismatch:5:{s}", .{@tagName(p)});
-                    if (!std.mem.eql(u8, p.mini_channel.label, "alpha")) return std.fmt.allocPrint(out_alloc, "label-mismatch:5:{s}", .{p.mini_channel.label});
+                    const chan_label = try p.mini_channel.labelAlloc(tracked_alloc);
+                    defer js.freeDecoded([]const u8, tracked_alloc, chan_label);
+                    if (!std.mem.eql(u8, chan_label, "alpha")) return std.fmt.allocPrint(out_alloc, "label-mismatch:5:{s}", .{chan_label});
+                    const ping_res = try p.mini_channel.pingAlloc(tracked_alloc);
+                    defer js.freeDecoded([]const u8, tracked_alloc, ping_res);
+                    if (!std.mem.eql(u8, ping_res, "pong:alpha")) return std.fmt.allocPrint(out_alloc, "ping-mismatch:5:{s}", .{ping_res});
                 },
                 6 => if (std.meta.activeTag(p) != .sem_ver) return std.fmt.allocPrint(out_alloc, "tag-mismatch:6:{s}", .{@tagName(p)}),
                 7 => if (std.meta.activeTag(p) != .str) return std.fmt.allocPrint(out_alloc, "tag-mismatch:7:{s}", .{@tagName(p)}),

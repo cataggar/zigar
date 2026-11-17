@@ -911,6 +911,7 @@ describe("Go Semantic Declaration-Graph Extractor (zigar:typescript/extractor@7.
           "export const h = mkHigher<number>();",
           "export interface Box<T> { get(): T; value: T }",
           "export type P = Pick<Box<string>, 'get' | 'value'>;",
+          "export interface ExtP extends Pick<Box<string>, 'get' | 'value'> { extra: number }",
         ].join("\n"),
       );
 
@@ -1062,6 +1063,17 @@ describe("Go Semantic Declaration-Graph Extractor (zigar:typescript/extractor@7.
         assert.equal(getFnType.kind.tag, "function-type");
         const getFnSig = g.signatures[getFnType.kind.val];
         assert.equal(g.types[getFnSig.returnType].kind.tag, "string-type");
+
+        const extPDecl = findDecl(g, "ExtP", "interface-decl", instMod.id);
+        assert.ok(extPDecl);
+        assert.equal(extPDecl.kind.val.extendsClauses.length, 1);
+        const extHcType = g.types[extPDecl.kind.val.extendsClauses[0].targetType];
+        assert.notEqual(
+          extHcType.resolvedType,
+          null,
+          "Expected heritage Pick<Box<string>, ...> targetType to populate resolvedType",
+        );
+        assert.equal(g.types[extHcType.resolvedType].kind.tag, "object-literal");
 
         // Test 5: `/b.d.ts` with `followReExports: false`
         const noFollowRes = ts.extractModuleGraph(program, {
