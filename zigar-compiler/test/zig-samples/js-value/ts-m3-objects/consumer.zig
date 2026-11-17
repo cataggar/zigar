@@ -350,3 +350,57 @@ pub fn exerciseStatefulDuckHandlesAndCallableInterfaces(out_alloc: std.mem.Alloc
     try checkInvariants(handles_before, allocs_before);
     return out_alloc.dupe(u8, "stateful-duck-and-callable-handles-ok");
 }
+
+// 5. Same-named factory functions (`interface Widget` + `function Widget`, `interface FactoryConfig` + `function FactoryConfig`)
+//    and generic `extends` instantiation (`StrBox extends Box<string>`, `Svc extends MidEmitter<string>`, `NumberStore extends StoreBase<number>`).
+pub fn exerciseFactoryMergedAndGenericExtends(out_alloc: std.mem.Allocator) ![]const u8 {
+    const handles_before = js.activeHandleCount();
+    const allocs_before = live_allocs.load(.acquire);
+
+    {
+        // Plain object returned by `Widget("nav")` must decode as `JsObject` handle (NOT `JsFunction`!)
+        var w = try m.widget("nav");
+        defer w.deinit();
+        if ((try w.id()) != 7) return error.Unexpected;
+        const rendered = try w.renderAlloc(tracked_alloc);
+        defer js.freeDecoded([]const u8, tracked_alloc, rendered);
+        if (!std.mem.eql(u8, rendered, "<widget:nav>")) return error.Unexpected;
+
+        // `FactoryConfig` merged with `function FactoryConfig` stays a plain value struct!
+        const cfg1 = try m.factoryConfigAlloc(tracked_alloc, "api.zigar.dev");
+        defer js.freeDecoded(m.FactoryConfig, tracked_alloc, cfg1);
+        if (!std.mem.eql(u8, cfg1.host, "api.zigar.dev") or cfg1.port != 9000) return error.Unexpected;
+
+        const cfg_str = try m.formatFactoryConfigAlloc(tracked_alloc, .{ .host = "edge.zigar.dev" });
+        defer js.freeDecoded([]const u8, tracked_alloc, cfg_str);
+        if (!std.mem.eql(u8, cfg_str, "edge.zigar.dev:default")) return error.Unexpected;
+
+        // `StrBox extends Box<string>` inherits `value: []const u8` and `meta: ?[]const u8 = null`
+        const echoed = try m.echoStrBoxAlloc(tracked_alloc, .{ .value = "zig", .extra = 9 });
+        defer js.freeDecoded(m.StrBox, tracked_alloc, echoed);
+        if (!std.mem.eql(u8, echoed.value, "zig!") or echoed.extra != 10) return error.Unexpected;
+        if (!std.mem.eql(u8, echoed.meta orelse return error.Unexpected, "auto-meta")) return error.Unexpected;
+
+        // Chained generic handle inheritance `Svc extends MidEmitter<string>` (`BaseEmitter<string, number>`)
+        var svc = try m.makeSvc("jobs", 8081);
+        defer svc.deinit();
+        if ((try svc.port()) != 8081) return error.Unexpected;
+        const topic = try svc.topicAlloc(tracked_alloc);
+        defer js.freeDecoded([]const u8, tracked_alloc, topic);
+        if (!std.mem.eql(u8, topic, "jobs")) return error.Unexpected;
+        if ((try svc.emit("done")) != 9) return error.Unexpected;
+        try std.testing.expectError(error.TypeError, m.produceBadSvc());
+
+        // Generic base class instantiation `NumberStore extends StoreBase<number>`
+        var store = try m.NumberStore.init(10);
+        defer store.deinit();
+        if ((try store.getCurrent()) != 10) return error.Unexpected;
+        try store.setCurrent(25);
+        if ((try store.step()) != 26) return error.Unexpected;
+        if ((try store.getCurrent()) != 26) return error.Unexpected;
+    }
+
+    try checkInvariants(handles_before, allocs_before);
+    return out_alloc.dupe(u8, "factory-merged-and-generic-extends-ok");
+}
+

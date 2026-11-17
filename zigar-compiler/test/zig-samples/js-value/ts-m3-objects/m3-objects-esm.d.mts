@@ -109,3 +109,47 @@ export function produceArrayAsCounter(): LiveCounter;
 
 export function getCallableFactory(): CallableFactory;
 export function produceBadCallableFactory(): CallableFactory;
+
+// 5. Same-Named Factory Functions (`interface X` + `function X`) & Generic `extends` Instantiation
+export interface Widget {
+  readonly id: number;
+  render(): string;
+}
+export function Widget(name: string): Widget;
+
+export interface FactoryConfig {
+  host: string;
+  port?: number;
+}
+export function FactoryConfig(host: string): FactoryConfig;
+export function formatFactoryConfig(cfg: FactoryConfig): string;
+
+export interface Box<T, M = string> {
+  value: T;
+  meta?: M;
+}
+export interface StrBox extends Box<string> {
+  extra: number;
+}
+export function echoStrBox(box: StrBox): StrBox;
+
+export interface BaseEmitter<E, R = boolean> {
+  emit(event: E): R;
+  readonly topic: E;
+}
+export interface MidEmitter<X> extends BaseEmitter<X, number> {}
+export interface Svc extends MidEmitter<string> {
+  port: number;
+}
+export function makeSvc(topic: string, port: number): Svc;
+export function produceBadSvc(): Svc;
+
+export declare class StoreBase<T> {
+  getCurrent(): T;
+  setCurrent(val: T): void;
+}
+export declare class NumberStore extends StoreBase<number> {
+  constructor(initial: number);
+  step(): number;
+}
+

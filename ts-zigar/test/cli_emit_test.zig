@@ -3188,6 +3188,35 @@ test "Issue #48 M3.2a Sema: plain options structs vs handle classes, divergent a
             \\  fromJsRef(x: number): string;
             \\}
             \\
+            \\export interface Widget {
+            \\  readonly id: number;
+            \\  render(): string;
+            \\}
+            \\export declare function Widget(name: string): Widget;
+            \\
+            \\export interface FactoryConfig {
+            \\  host: string;
+            \\  port?: number;
+            \\}
+            \\export declare function FactoryConfig(host: string): FactoryConfig;
+            \\
+            \\export interface Box<T, M = string> {
+            \\  value: T;
+            \\  meta?: M;
+            \\}
+            \\export interface StrBox extends Box<string> {
+            \\  extra: number;
+            \\}
+            \\
+            \\export interface BaseEmitter<E, R = boolean> {
+            \\  emit(ev: E): R;
+            \\  readonly channel: E;
+            \\}
+            \\export interface MidEmitter<X> extends BaseEmitter<X, number> {}
+            \\export interface Svc extends MidEmitter<string> {
+            \\  port: number;
+            \\}
+            \\
             \\export declare function connectWith(opts: RequestOptions, node?: LinkedNode): HttpClient;
             ,
         });
@@ -3320,6 +3349,32 @@ test "Issue #48 M3.2a Sema: plain options structs vs handle classes, divergent a
             \\    try std.testing.expect(!@hasDecl(r.CollisionHandle, "deinit_2"));
             \\    try std.testing.expect(!@hasDecl(r.CollisionHandle, "toJsRef_2"));
             \\    try std.testing.expect(!@hasDecl(r.CollisionHandle, "fromJsRef_2"));
+            \\
+            \\    // 8. Interface + same-named factory function (`Widget` handle vs `FactoryConfig` value struct):
+            \\    try std.testing.expect(r.Widget.zigar_js.is_handle);
+            \\    try std.testing.expect(!@hasField(@TypeOf(r.Widget.zigar_js), "is_callable_handle"));
+            \\    try std.testing.expect(@FieldType(r.Widget, "ref") == r.zigar_js.JsObject);
+            \\    const widget_fn: *const fn ([]const u8) r.zigar_js.CallError!r.Widget = &r.widget;
+            \\    _ = widget_fn;
+            \\    try std.testing.expect(!@hasField(@TypeOf(r.FactoryConfig.zigar_js), "is_handle"));
+            \\    const fc: r.FactoryConfig = .{ .host = "localhost" };
+            \\    try std.testing.expectEqualStrings("localhost", fc.host);
+            \\    try std.testing.expectEqual(@as(?f64, null), fc.port);
+            \\
+            \\    // 9. Generic `extends` instantiation on both value structs (`StrBox`) and chained handle interfaces (`Svc`):
+            \\    try std.testing.expect(!@hasField(@TypeOf(r.StrBox.zigar_js), "is_handle"));
+            \\    const sb: r.StrBox = .{ .value = "payload", .extra = 42 };
+            \\    try std.testing.expectEqualStrings("payload", sb.value);
+            \\    try std.testing.expectEqual(@as(?[]const u8, null), sb.meta);
+            \\    try std.testing.expectEqual(@as(f64, 42), sb.extra);
+            \\
+            \\    try std.testing.expect(r.Svc.zigar_js.is_handle);
+            \\    const svc_emit: *const fn (r.Svc, []const u8) r.zigar_js.CallError!f64 = &r.Svc.emit;
+            \\    const svc_chan: *const fn (r.Svc, std.mem.Allocator) r.zigar_js.CallError![]const u8 = &r.Svc.channelAlloc;
+            \\    const svc_port: *const fn (r.Svc) r.zigar_js.CallError!f64 = &r.Svc.port;
+            \\    _ = svc_emit;
+            \\    _ = svc_chan;
+            \\    _ = svc_port;
             \\}
             ,
         });

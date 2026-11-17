@@ -167,6 +167,10 @@ describe('ts-zigar M3.2a Live Runtime Roundtrip: Plain Options Structs vs Handle
       it('validates stateful duck-typed handles without premature getter side effects and invokes callable/constructable interfaces', function () {
         expect(mod.exerciseStatefulDuckHandlesAndCallableInterfaces().string).to.equal('stateful-duck-and-callable-handles-ok');
       });
+
+      it('roundtrips same-named factory interfaces/functions and generic extends instantiations', function () {
+        expect(mod.exerciseFactoryMergedAndGenericExtends().string).to.equal('factory-merged-and-generic-extends-ok');
+      });
     });
   }
 });

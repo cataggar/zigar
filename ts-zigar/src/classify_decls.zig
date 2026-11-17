@@ -374,16 +374,20 @@ pub fn Classifier(comptime Graph: type) type {
         fn classifyDeclUncached(self: *Self, decl_id: u32) error{OutOfMemory}!DeclClassification {
             const d = self.graph.decls[decl_id];
             switch (d.kind) {
-                .class_decl => {
+                .class_decl => |cls| {
                     var is_callable = false;
                     for (d.merged_with) |mid| {
                         if (mid < self.graph.decls.len) {
                             const md = self.graph.decls[mid];
                             if (md.kind == .interface_decl and md.kind.interface_decl.call_signatures.len > 0) {
                                 is_callable = true;
-                            } else if (md.kind == .function_decl) {
-                                is_callable = true;
                             }
+                        }
+                    }
+                    if (!is_callable) {
+                        if (cls.extends_clause) |hc| {
+                            const base_cls = try self.classifyHeritageClause(hc);
+                            if (base_cls.is_callable_handle) is_callable = true;
                         }
                     }
                     return .{
@@ -395,20 +399,67 @@ pub fn Classifier(comptime Graph: type) type {
                 .interface_decl => |iface| {
                     var companion_var: ?u32 = null;
                     var has_merged_class = false;
-                    var has_merged_fn = false;
+                    var has_call_sigs = iface.call_signatures.len > 0;
+                    var has_construct_sigs = iface.construct_signatures.len > 0;
+                    var needs_handle = iface.methods.len > 0;
 
+                    if (!needs_handle) {
+                        for (iface.properties) |pid| {
+                            if (self.propRequiresHandle(pid)) {
+                                needs_handle = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Note: a merged `function_decl` (`interface Widget` + `declare function Widget(): Widget`)
+                    // is a separate value-level factory function and does NOT make `Widget` instances callable.
                     for (d.merged_with) |mid| {
                         if (mid >= self.graph.decls.len or mid == decl_id) continue;
                         const md = self.graph.decls[mid];
                         switch (md.kind) {
                             .class_decl => has_merged_class = true,
-                            .function_decl => has_merged_fn = true,
                             .variable_decl => |vty_id| {
                                 if (md.module == d.module and self.typeHasConstructorShape(vty_id, 0)) {
                                     companion_var = mid;
                                 }
                             },
+                            .interface_decl => |miface| {
+                                if (miface.call_signatures.len > 0) has_call_sigs = true;
+                                if (miface.construct_signatures.len > 0) has_construct_sigs = true;
+                                if (miface.methods.len > 0) needs_handle = true;
+                                if (!needs_handle) {
+                                    for (miface.properties) |pid| {
+                                        if (self.propRequiresHandle(pid)) {
+                                            needs_handle = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            },
                             else => {},
+                        }
+                    }
+
+                    var inherited_callable = false;
+                    for (iface.extends_clauses) |hc| {
+                        const base_cls = try self.classifyHeritageClause(hc);
+                        if (base_cls.kind == .handle_wrapper) {
+                            needs_handle = true;
+                            if (base_cls.is_callable_handle) inherited_callable = true;
+                        }
+                    }
+                    for (d.merged_with) |mid| {
+                        if (mid >= self.graph.decls.len or mid == decl_id) continue;
+                        const md = self.graph.decls[mid];
+                        if (md.kind == .interface_decl) {
+                            for (md.kind.interface_decl.extends_clauses) |hc| {
+                                const base_cls = try self.classifyHeritageClause(hc);
+                                if (base_cls.kind == .handle_wrapper) {
+                                    needs_handle = true;
+                                    if (base_cls.is_callable_handle) inherited_callable = true;
+                                }
+                            }
                         }
                     }
 
@@ -416,78 +467,18 @@ pub fn Classifier(comptime Graph: type) type {
                         return .{
                             .kind = .handle_wrapper,
                             .is_class = true,
-                            .is_callable_handle = has_merged_fn or (iface.call_signatures.len > 0),
+                            .is_callable_handle = has_call_sigs or inherited_callable,
                             .companion_var_decl_id = companion_var,
                         };
                     }
 
-                    if (has_merged_fn or iface.call_signatures.len > 0 or iface.construct_signatures.len > 0) {
+                    const is_callable = has_call_sigs or has_construct_sigs or inherited_callable;
+                    if (is_callable or needs_handle) {
                         return .{
                             .kind = .handle_wrapper,
                             .is_class = false,
-                            .is_callable_handle = true,
+                            .is_callable_handle = is_callable,
                         };
-                    }
-
-                    if (iface.methods.len > 0) {
-                        return .{
-                            .kind = .handle_wrapper,
-                            .is_class = false,
-                            .is_callable_handle = false,
-                        };
-                    }
-
-                    for (iface.properties) |pid| {
-                        if (self.propRequiresHandle(pid)) {
-                            return .{
-                                .kind = .handle_wrapper,
-                                .is_class = false,
-                                .is_callable_handle = false,
-                            };
-                        }
-                    }
-
-                    // Check merged sibling interfaces (if any) and transitive `extends` heritage!
-                    for (d.merged_with) |mid| {
-                        if (mid >= self.graph.decls.len or mid == decl_id) continue;
-                        const md = self.graph.decls[mid];
-                        if (md.kind == .interface_decl) {
-                            const miface = md.kind.interface_decl;
-                            if (miface.call_signatures.len > 0 or miface.construct_signatures.len > 0) {
-                                return .{
-                                    .kind = .handle_wrapper,
-                                    .is_class = false,
-                                    .is_callable_handle = true,
-                                };
-                            }
-                            if (miface.methods.len > 0) {
-                                return .{ .kind = .handle_wrapper };
-                            }
-                            for (miface.properties) |pid| {
-                                if (self.propRequiresHandle(pid)) return .{ .kind = .handle_wrapper };
-                            }
-                            for (miface.extends_clauses) |hc| {
-                                const base_cls = try self.classifyHeritageClause(hc);
-                                if (base_cls.kind == .handle_wrapper) {
-                                    return .{
-                                        .kind = .handle_wrapper,
-                                        .is_class = false,
-                                        .is_callable_handle = base_cls.is_callable_handle,
-                                    };
-                                }
-                            }
-                        }
-                    }
-
-                    for (iface.extends_clauses) |hc| {
-                        const base_cls = try self.classifyHeritageClause(hc);
-                        if (base_cls.kind == .handle_wrapper) {
-                            return .{
-                                .kind = .handle_wrapper,
-                                .is_class = false,
-                                .is_callable_handle = base_cls.is_callable_handle,
-                            };
-                        }
                     }
 
                     return .{ .kind = .value_struct };
@@ -544,6 +535,8 @@ test "Classifier distinguishes plain value_struct interfaces from classes, state
         "DefaultOpts", // 12
         "Client", // 13
         "DerivedHandle", // 14
+        "Widget", // 15
+        "FactoryConfig", // 16
     };
 
     const props = [_]ts.types.PropNode{
@@ -875,6 +868,72 @@ test "Classifier distinguishes plain value_struct interfaces from classes, state
                 },
             },
         },
+        // 10: interface Widget { log(): void } merged with 11: declare function Widget(): Widget
+        // -> .handle_wrapper, NOT callable (`is_callable_handle == false`)!
+        .{
+            .id = 10,
+            .name = 15,
+            .export_name = null,
+            .module = 0,
+            .type_params = &.{},
+            .modifiers = .{ .export_decl = true },
+            .jsdoc = null,
+            .merged_with = &.{ 10, 11 },
+            .kind = .{
+                .interface_decl = .{
+                    .extends_clauses = &.{},
+                    .properties = &.{},
+                    .methods = &logger_methods,
+                    .call_signatures = &.{},
+                    .construct_signatures = &.{},
+                    .index_signatures = &.{},
+                },
+            },
+        },
+        .{
+            .id = 11,
+            .name = 15,
+            .export_name = null,
+            .module = 0,
+            .type_params = &.{},
+            .modifiers = .{ .export_decl = true },
+            .jsdoc = null,
+            .merged_with = &.{ 10, 11 },
+            .kind = .{ .function_decl = &.{0} },
+        },
+        // 12: interface FactoryConfig { port?: number } merged with 13: declare function FactoryConfig(): FactoryConfig
+        // -> .value_struct (`is_callable_handle == false`)!
+        .{
+            .id = 12,
+            .name = 16,
+            .export_name = null,
+            .module = 0,
+            .type_params = &.{},
+            .modifiers = .{ .export_decl = true },
+            .jsdoc = null,
+            .merged_with = &.{ 12, 13 },
+            .kind = .{
+                .interface_decl = .{
+                    .extends_clauses = &.{},
+                    .properties = &.{0},
+                    .methods = &.{},
+                    .call_signatures = &.{},
+                    .construct_signatures = &.{},
+                    .index_signatures = &.{},
+                },
+            },
+        },
+        .{
+            .id = 13,
+            .name = 16,
+            .export_name = null,
+            .module = 0,
+            .type_params = &.{},
+            .modifiers = .{ .export_decl = true },
+            .jsdoc = null,
+            .merged_with = &.{ 12, 13 },
+            .kind = .{ .function_decl = &.{0} },
+        },
     };
 
     const graph = ts.types.DeclarationGraph{
@@ -921,4 +980,12 @@ test "Classifier distinguishes plain value_struct interfaces from classes, state
 
     const c9 = try cls.classifyDecl(9);
     try std.testing.expectEqual(ObjectDeclKind.handle_wrapper, c9.kind);
+
+    const c10 = try cls.classifyDecl(10);
+    try std.testing.expectEqual(ObjectDeclKind.handle_wrapper, c10.kind);
+    try std.testing.expect(!c10.is_callable_handle);
+
+    const c12 = try cls.classifyDecl(12);
+    try std.testing.expectEqual(ObjectDeclKind.value_struct, c12.kind);
+    try std.testing.expect(!c12.is_callable_handle);
 }

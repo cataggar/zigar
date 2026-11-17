@@ -268,3 +268,68 @@ export function getCallableFactory() {
 export function produceBadCallableFactory() {
   return { tag: 'not-callable' };
 }
+
+export function Widget(name) {
+  return {
+    id: 7,
+    render() {
+      return `<widget:${name}>`;
+    },
+  };
+}
+
+export function FactoryConfig(host) {
+  return { host: String(host), port: 9000 };
+}
+
+export function formatFactoryConfig(cfg) {
+  return `${cfg.host}:${'port' in cfg ? cfg.port : 'default'}`;
+}
+
+export function echoStrBox(box) {
+  return {
+    value: `${box.value}!`,
+    meta: box.meta ?? 'auto-meta',
+    extra: box.extra + 1,
+  };
+}
+
+export function makeSvc(topic, port) {
+  return {
+    topic: String(topic),
+    port: Number(port),
+    emit(event) {
+      return `${topic}:${event}`.length;
+    },
+  };
+}
+
+export function produceBadSvc() {
+  return { port: 8080, topic: 'missing-emit' };
+}
+
+export class StoreBase {
+  constructor(initial) {
+    this._val = initial;
+  }
+
+  getCurrent() {
+    return this._val;
+  }
+
+  setCurrent(val) {
+    this._val = val;
+  }
+}
+
+export class NumberStore extends StoreBase {
+  constructor(initial) {
+    super(Number(initial));
+  }
+
+  step() {
+    this._val += 1;
+    return this._val;
+  }
+}
+
