@@ -5006,11 +5006,18 @@ pub fn Js(comptime host: type) type {
             );
         }
 
-        pub fn toJsRefWithSpec(
+        fn toJsRefWithSpecImpl(
             comptime T: type,
             value: T,
-            comptime spec: anytype,
+            comptime raw_spec: anytype,
+            comptime parent_struct_spec: anytype,
         ) module.CallError!Ref(module.Any) {
+            const spec = comptime if (@typeInfo(@TypeOf(raw_spec)) == .enum_literal and
+                std.mem.eql(u8, @tagName(raw_spec), "recurse"))
+                parent_struct_spec
+            else
+                raw_spec;
+
             if (T == void) return Ref(module.Any).@"undefined";
             if (T == bool) return Ref(module.Any).fromBool(value);
             if (comptime util.getInternalType(T) == .js_value) {
@@ -5025,7 +5032,7 @@ pub fn Js(comptime host: type) type {
                 return switch (value) {
                     .@"undefined" => Ref(module.Any).@"undefined",
                     .@"null" => Ref(module.Any).@"null",
-                    .value => |v| toJsRefWithSpec(T.Value, v, child_spec),
+                    .value => |v| toJsRefWithSpecImpl(T.Value, v, child_spec, parent_struct_spec),
                 };
             }
             switch (@typeInfo(T)) {
@@ -5035,7 +5042,7 @@ pub fn Js(comptime host: type) type {
                             spec.child
                         else
                             module.NullishKind.none;
-                        return toJsRefWithSpec(op.child, v, child_spec);
+                        return toJsRefWithSpecImpl(op.child, v, child_spec, parent_struct_spec);
                     }
                     return switch (comptime specSelfNullish(spec)) {
                         .undefined_only => Ref(module.Any).@"undefined",
@@ -5065,7 +5072,7 @@ pub fn Js(comptime host: type) type {
                         const js_arr = try Array(Ref(module.Any)).withCapacity(value.len);
                         errdefer js_arr.deinit();
                         for (value, 0..) |elem, idx| {
-                            const elem_ref = try toJsRefWithSpec(pt.child, elem, elem_spec);
+                            const elem_ref = try toJsRefWithSpecImpl(pt.child, elem, elem_spec, parent_struct_spec);
                             defer elem_ref.deinit();
                             try js_arr.set(idx, elem_ref);
                         }
@@ -5079,7 +5086,7 @@ pub fn Js(comptime host: type) type {
                             const str = try String.fromSlice(value);
                             return str.toRef();
                         }
-                        return toJsRefWithSpec(pt.child, value.*, spec);
+                        return toJsRefWithSpecImpl(pt.child, value.*, spec, parent_struct_spec);
                     },
                     else => @compileError("Unsupported pointer type for JS conversion: " ++ @typeName(T)),
                 },
@@ -5087,6 +5094,7 @@ pub fn Js(comptime host: type) type {
                     if (comptime isTupleStructType(T)) {
                         const meta = T.zigar_js_tuple;
                         const var_idx_opt: ?usize = if (@hasField(@TypeOf(meta), "variadic_index")) meta.variadic_index else null;
+                        const has_tuple_override = comptime (@typeInfo(@TypeOf(spec)) == .@"struct" and @hasField(@TypeOf(spec), "tuple"));
                         const js_arr = try Array(Ref(module.Any)).init();
                         errdefer js_arr.deinit();
 
@@ -5103,12 +5111,15 @@ pub fn Js(comptime host: type) type {
                             inline for (st.field_names, 0..) |fname, fi| {
                                 if (fi < effective_len) {
                                     const fspec = comptime blk: {
+                                        if (has_tuple_override and fi < spec.tuple.len) {
+                                            break :blk spec.tuple[fi];
+                                        }
                                         if (@hasField(@TypeOf(meta), "fields") and fi < meta.fields.len and @hasField(@TypeOf(meta.fields[fi]), "nullish")) {
                                             break :blk meta.fields[fi].nullish;
                                         }
                                         break :blk tupleFieldNullishKind(T, fi);
                                     };
-                                    const elem_ref = try toJsRefWithSpec(st.field_types[fi], @field(value, fname), fspec);
+                                    const elem_ref = try toJsRefWithSpecImpl(st.field_types[fi], @field(value, fname), fspec, parent_struct_spec);
                                     defer elem_ref.deinit();
                                     _ = try js_arr.push(elem_ref);
                                 }
@@ -5134,36 +5145,45 @@ pub fn Js(comptime host: type) type {
                                 if (comptime (fi < v_idx)) {
                                     if (fi < leading_len) {
                                         const fspec = comptime blk: {
+                                            if (has_tuple_override and fi < spec.tuple.len) {
+                                                break :blk spec.tuple[fi];
+                                            }
                                             if (@hasField(@TypeOf(meta), "fields") and fi < meta.fields.len and @hasField(@TypeOf(meta.fields[fi]), "nullish")) {
                                                 break :blk meta.fields[fi].nullish;
                                             }
                                             break :blk tupleFieldNullishKind(T, fi);
                                         };
-                                        const elem_ref = try toJsRefWithSpec(ftype, @field(value, fname), fspec);
+                                        const elem_ref = try toJsRefWithSpecImpl(ftype, @field(value, fname), fspec, parent_struct_spec);
                                         defer elem_ref.deinit();
                                         _ = try js_arr.push(elem_ref);
                                     }
                                 } else if (comptime (fi == v_idx)) {
                                     const RestElem = @typeInfo(ftype).pointer.child;
                                     const rest_elem_spec = comptime blk: {
+                                        if (has_tuple_override and fi < spec.tuple.len) {
+                                            break :blk spec.tuple[fi];
+                                        }
                                         if (@hasField(@TypeOf(meta), "fields") and fi < meta.fields.len and @hasField(@TypeOf(meta.fields[fi]), "nullish")) {
                                             break :blk meta.fields[fi].nullish;
                                         }
                                         break :blk module.NullishKind.none;
                                     };
                                     for (rest_slice) |re| {
-                                        const elem_ref = try toJsRefWithSpec(RestElem, re, rest_elem_spec);
+                                        const elem_ref = try toJsRefWithSpecImpl(RestElem, re, rest_elem_spec, parent_struct_spec);
                                         defer elem_ref.deinit();
                                         _ = try js_arr.push(elem_ref);
                                     }
                                 } else {
                                     const fspec = comptime blk: {
+                                        if (has_tuple_override and fi < spec.tuple.len) {
+                                            break :blk spec.tuple[fi];
+                                        }
                                         if (@hasField(@TypeOf(meta), "fields") and fi < meta.fields.len and @hasField(@TypeOf(meta.fields[fi]), "nullish")) {
                                             break :blk meta.fields[fi].nullish;
                                         }
                                         break :blk tupleFieldNullishKind(T, fi);
                                     };
-                                    const elem_ref = try toJsRefWithSpec(ftype, @field(value, fname), fspec);
+                                    const elem_ref = try toJsRefWithSpecImpl(ftype, @field(value, fname), fspec, parent_struct_spec);
                                     defer elem_ref.deinit();
                                     _ = try js_arr.push(elem_ref);
                                 }
@@ -5173,8 +5193,11 @@ pub fn Js(comptime host: type) type {
                     }
 
                     if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_enum") and T.zigar_js.is_enum and @hasField(T, "__zigar_value")) {
-                        return toJsRefWithSpec(@TypeOf(value.__zigar_value), value.__zigar_value, module.NullishKind.none);
+                        return toJsRefWithSpecImpl(@TypeOf(value.__zigar_value), value.__zigar_value, module.NullishKind.none, module.NullishKind.none);
                     }
+
+                    const has_fields_override = comptime (@typeInfo(@TypeOf(spec)) == .@"struct" and @hasField(@TypeOf(spec), "fields"));
+                    const next_parent_struct_spec = comptime if (has_fields_override) spec else parent_struct_spec;
 
                     const rec = try Record([]const u8, Ref(module.Any)).init();
                     errdefer rec.deinit();
@@ -5184,6 +5207,14 @@ pub fn Js(comptime host: type) type {
                         const wire_key = comptime structFieldWireName(T, fname);
                         const is_opt = comptime structFieldIsOptional(T, fi);
                         const field_spec = comptime blk: {
+                            if (has_fields_override) {
+                                for (spec.fields) |fm| {
+                                    if (std.mem.eql(u8, fm.name, fname)) {
+                                        if (@hasField(@TypeOf(fm), "nullish")) break :blk fm.nullish;
+                                        break;
+                                    }
+                                }
+                            }
                             if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "fields")) {
                                 for (T.zigar_js.fields) |fm| {
                                     if (std.mem.eql(u8, fm.name, fname)) {
@@ -5196,18 +5227,18 @@ pub fn Js(comptime host: type) type {
                         };
                         if (comptime (is_opt and isNullableType(ftype))) {
                             if (fval != .@"undefined") {
-                                const prop_ref = try toJsRefWithSpec(ftype, fval, field_spec);
+                                const prop_ref = try toJsRefWithSpecImpl(ftype, fval, field_spec, next_parent_struct_spec);
                                 defer prop_ref.deinit();
                                 try rec.set(wire_key, prop_ref);
                             }
                         } else if (comptime (is_opt and @typeInfo(ftype) == .optional)) {
                             if (fval != null) {
-                                const prop_ref = try toJsRefWithSpec(ftype, fval, field_spec);
+                                const prop_ref = try toJsRefWithSpecImpl(ftype, fval, field_spec, next_parent_struct_spec);
                                 defer prop_ref.deinit();
                                 try rec.set(wire_key, prop_ref);
                             }
                         } else {
-                            const prop_ref = try toJsRefWithSpec(ftype, fval, field_spec);
+                            const prop_ref = try toJsRefWithSpecImpl(ftype, fval, field_spec, next_parent_struct_spec);
                             defer prop_ref.deinit();
                             try rec.set(wire_key, prop_ref);
                         }
@@ -5222,7 +5253,7 @@ pub fn Js(comptime host: type) type {
                                     return (try String.fromSlice(m.str_value)).toRef();
                                 }
                                 if (@hasField(@TypeOf(m), "num_value")) {
-                                    return toJsRefWithSpec(f64, m.num_value, module.NullishKind.none);
+                                    return toJsRefWithSpecImpl(f64, m.num_value, module.NullishKind.none, module.NullishKind.none);
                                 }
                             }
                         }
@@ -5231,11 +5262,19 @@ pub fn Js(comptime host: type) type {
                 },
                 .@"union" => {
                     return switch (value) {
-                        inline else => |payload| toJsRefWithSpec(@TypeOf(payload), payload, module.NullishKind.none),
+                        inline else => |payload| toJsRefWithSpecImpl(@TypeOf(payload), payload, module.NullishKind.none, parent_struct_spec),
                     };
                 },
                 else => @compileError("Unsupported Zig type for JS conversion: " ++ @typeName(T)),
             }
+        }
+
+        pub fn toJsRefWithSpec(
+            comptime T: type,
+            value: T,
+            comptime spec: anytype,
+        ) module.CallError!Ref(module.Any) {
+            return toJsRefWithSpecImpl(T, value, spec, module.NullishKind.none);
         }
 
         pub fn toJsRefWithNullish(

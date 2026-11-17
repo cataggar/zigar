@@ -285,6 +285,56 @@ export function inspectGenericAliasNullish(p, box, ...rest) {
   ].join('|');
 }
 
+export function inspectGenericContainersUndef(undefBox, node, pair) {
+  if (!('val' in undefBox) || undefBox.val === null) {
+    throw new TypeError(`expected undefBox.val undefined/number, got ${tagJsVal(undefBox.val)}`);
+  }
+  if ('opt' in undefBox && undefBox.opt === null) {
+    throw new TypeError('expected undefBox.opt undefined/number when present, never null');
+  }
+  const boxOptPart = ('opt' in undefBox) ? `opt=${tagJsVal(undefBox.opt)}` : 'no-opt';
+
+  const nodeParts = [];
+  let cur = node;
+  let guard = 0;
+  while (cur && guard < 8) {
+    if (!('val' in cur) || cur.val === null) {
+      throw new TypeError(`expected LinkedNode.val undefined/number, got ${tagJsVal(cur.val)}`);
+    }
+    const hasNext = 'next' in cur;
+    nodeParts.push(`${tagJsVal(cur.val)}:${hasNext ? 'next' : 'end'}`);
+    cur = hasNext ? cur.next : null;
+    guard += 1;
+  }
+
+  if (!Array.isArray(pair) || pair.length !== 2 || !(0 in pair) || pair[0] === null) {
+    throw new TypeError(`expected PairAlias<Undef<string>> [undefined|string, number], got [${pair.map(tagJsVal).join(',')}]`);
+  }
+
+  return `box(${tagJsVal(undefBox.val)},${boxOptPart})|nodes[${nodeParts.join('->')}]|pair[${tagJsVal(pair[0])},${tagJsVal(pair[1])}]`;
+}
+
+export function sumRestGenericAlias(...nums) {
+  let acc = 0;
+  for (const n of nums) {
+    if (typeof n !== 'number') throw new TypeError(`expected flat number arg, got ${typeof n}`);
+    acc += n;
+  }
+  return acc;
+}
+
+export function readVariadicGenericAliasTuple(t) {
+  if (!Array.isArray(t) || typeof t[0] !== 'string') {
+    throw new TypeError('expected variadic tuple array');
+  }
+  for (let i = 1; i < t.length; i++) {
+    if (typeof t[i] !== 'number') {
+      throw new TypeError(`expected flat number element at ${i}, got ${typeof t[i]}`);
+    }
+  }
+  return `${t[0]}:[${t.slice(1).join(',')}]`;
+}
+
 export function malformedTupleReturn(kind) {
   if (kind === 0) return { notAnArray: true };
   if (kind === 1) return [];

@@ -716,6 +716,49 @@ pub fn exerciseNullishFidelity(out_alloc: std.mem.Allocator) ![]const u8 {
             return error.Unexpected;
         }
 
+        // (7) Generic container call-site overrides (`GenericBox<Undef<number>>`, recursive `LinkedNode<Undef<number>>`,
+        //     `PairAlias<Undef<string>>`) and pass-through generic alias slice flattening (`Id<number[]>`)!
+        const tail_node: m3_esm.LinkedNode(?f64) = .{ .val = null };
+        const gc_a = try m3_esm.inspectGenericContainersUndefAlloc(
+            tracked_alloc,
+            .{ .val = null },
+            .{ .val = null, .next = &tail_node },
+            .{ .@"0" = null, .@"1" = 5 },
+        );
+        defer js.freeDecoded([]const u8, tracked_alloc, gc_a);
+        if (!std.mem.eql(
+            u8,
+            gc_a,
+            "box(undefined,no-opt)|nodes[undefined:next->undefined:end]|pair[undefined,number:5]",
+        )) {
+            return error.Unexpected;
+        }
+
+        const gc_b = try m3_esm.inspectGenericContainersUndefAlloc(
+            tracked_alloc,
+            .{ .val = 11, .opt = @as(?f64, null) },
+            .{ .val = 22 },
+            .{ .@"0" = "tag", .@"1" = 8 },
+        );
+        defer js.freeDecoded([]const u8, tracked_alloc, gc_b);
+        if (!std.mem.eql(
+            u8,
+            gc_b,
+            "box(number:11,opt=undefined)|nodes[number:22:end]|pair[string:tag,number:8]",
+        )) {
+            return error.Unexpected;
+        }
+
+        const sum_id = try m3_esm.sumRestGenericAlias(&.{ 10, 20, 12 });
+        if (sum_id != 42) return error.Unexpected;
+
+        const var_id = try m3_esm.readVariadicGenericAliasTupleAlloc(
+            tracked_alloc,
+            .{ .@"0" = "head", .@"1" = &.{ 3, 6, 9 } },
+        );
+        defer js.freeDecoded([]const u8, tracked_alloc, var_id);
+        if (!std.mem.eql(u8, var_id, "head:[3,6,9]")) return error.Unexpected;
+
         out = try std.fmt.allocPrint(out_alloc, "{s}|{s}|{s}|{s}", .{ rest_u, rest_n, nested_ver, cjs_ver });
     }
 

@@ -3263,25 +3263,88 @@ fn LowerCtx(comptime GraphType: type) type {
             }
         }
 
-        fn isGraphTypeSlice(self: *const Self, ty_id: u32, depth: usize) bool {
-            if (depth >= 16 or ty_id >= self.graph.types.len) return false;
+        const GraphSliceEnv = struct {
+            tp_ids: []const u32,
+            ir_args: []const *const TypeIr = &.{},
+            graph_args: []const u32 = &.{},
+            arg_env: ?*const GraphSliceEnv = null,
+        };
+
+        fn isGraphTypeSliceEnv(
+            self: *const Self,
+            ty_id: u32,
+            env: ?*const GraphSliceEnv,
+            depth: usize,
+        ) bool {
+            if (depth >= 24 or ty_id >= self.graph.types.len) return false;
             const tn = self.graph.types[ty_id];
             return switch (tn.kind) {
                 .array, .readonly_array => true,
-                .reference => |ref| blk: {
-                    if (ref.target_decl) |td_id| {
-                        if (td_id < self.graph.decls.len and self.graph.decls[td_id].kind == .type_alias_decl) {
-                            break :blk self.isGraphTypeSlice(self.graph.decls[td_id].kind.type_alias_decl, depth + 1);
+                .type_param => |tp_id| blk: {
+                    if (env) |e| {
+                        for (e.tp_ids, 0..) |cand_id, idx| {
+                            if (cand_id == tp_id) {
+                                if (e.ir_args.len > 0) {
+                                    if (idx < e.ir_args.len) {
+                                        break :blk self.isAlreadySliceTypeIr(e.ir_args[idx], depth + 1);
+                                    }
+                                } else if (idx < e.graph_args.len) {
+                                    break :blk self.isGraphTypeSliceEnv(e.graph_args[idx], e.arg_env, depth + 1);
+                                }
+                                if (tp_id < self.graph.type_params.len) {
+                                    if (self.graph.type_params[tp_id].default_type) |def_id| {
+                                        break :blk self.isGraphTypeSliceEnv(def_id, e, depth + 1);
+                                    }
+                                }
+                                break :blk false;
+                            }
                         }
                     }
+                    break :blk false;
+                },
+                .reference => |ref| blk: {
                     const ref_name = self.str(ref.target_name);
+                    if (env) |e| {
+                        for (e.tp_ids, 0..) |cand_id, idx| {
+                            if (cand_id < self.graph.type_params.len and
+                                std.mem.eql(u8, self.str(self.graph.type_params[cand_id].name), ref_name))
+                            {
+                                if (e.ir_args.len > 0) {
+                                    if (idx < e.ir_args.len) {
+                                        break :blk self.isAlreadySliceTypeIr(e.ir_args[idx], depth + 1);
+                                    }
+                                } else if (idx < e.graph_args.len) {
+                                    break :blk self.isGraphTypeSliceEnv(e.graph_args[idx], e.arg_env, depth + 1);
+                                }
+                                if (self.graph.type_params[cand_id].default_type) |def_id| {
+                                    break :blk self.isGraphTypeSliceEnv(def_id, e, depth + 1);
+                                }
+                                break :blk false;
+                            }
+                        }
+                    }
+                    if (ref.target_decl) |td_id| {
+                        if (td_id < self.graph.decls.len and self.graph.decls[td_id].kind == .type_alias_decl) {
+                            const alias_decl = self.graph.decls[td_id];
+                            const next_env = GraphSliceEnv{
+                                .tp_ids = alias_decl.type_params,
+                                .graph_args = ref.type_args,
+                                .arg_env = env,
+                            };
+                            break :blk self.isGraphTypeSliceEnv(
+                                alias_decl.kind.type_alias_decl,
+                                if (alias_decl.type_params.len > 0) &next_env else null,
+                                depth + 1,
+                            );
+                        }
+                    }
                     if ((ref.target_decl == null or self.isBundledLibDecl(ref.target_decl.?)) and
                         (std.mem.eql(u8, ref_name, "Array") or std.mem.eql(u8, ref_name, "ReadonlyArray")))
                     {
                         break :blk true;
                     }
                     if (tn.resolved_type) |rt| {
-                        if (rt != ty_id) break :blk self.isGraphTypeSlice(rt, depth + 1);
+                        if (rt != ty_id) break :blk self.isGraphTypeSliceEnv(rt, env, depth + 1);
                     }
                     break :blk false;
                 },
@@ -3290,14 +3353,22 @@ fn LowerCtx(comptime GraphType: type) type {
         }
 
         fn isAlreadySliceTypeIr(self: *const Self, ty: *const TypeIr, depth: usize) bool {
-            if (depth >= 16) return false;
+            if (depth >= 24) return false;
             return switch (ty.*) {
                 .slice, .typed_slice => true,
                 .decl_ref => |dr| blk: {
                     if (dr.indirect or dr.target_decl_id >= self.graph.decls.len) break :blk false;
                     const td = self.graph.decls[dr.target_decl_id];
                     if (td.kind == .type_alias_decl) {
-                        break :blk self.isGraphTypeSlice(td.kind.type_alias_decl, 0);
+                        const env = GraphSliceEnv{
+                            .tp_ids = td.type_params,
+                            .ir_args = dr.type_args,
+                        };
+                        break :blk self.isGraphTypeSliceEnv(
+                            td.kind.type_alias_decl,
+                            if (td.type_params.len > 0) &env else null,
+                            depth + 1,
+                        );
                     }
                     break :blk false;
                 },

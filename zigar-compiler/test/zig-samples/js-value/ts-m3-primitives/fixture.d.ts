@@ -61,9 +61,12 @@ declare module "./m3-esm.mjs" {
   export function inspectRestUndef(prefix: string, ...args: (number | undefined)[]): string;
   export function inspectRestNull(prefix: string, ...args: (number | null)[]): string;
 
+  export type Id<T> = T;
   export type Maybe<T> = T | null;
   export type Undef<T> = T | undefined;
   export type OptList<T> = (T | undefined)[];
+  export type PairAlias<T> = [T, number];
+  export type VariadicGenericAliasTuple = [string, ...Id<number[]>];
 
   export interface GenericAliasPayload {
     reqMaybe: Maybe<string>;
@@ -79,6 +82,11 @@ declare module "./m3-esm.mjs" {
     opt?: T;
   }
 
+  export interface LinkedNode<T> {
+    val: T;
+    next?: LinkedNode<T>;
+  }
+
   export let gMaybe: Maybe<number>;
   export let gUndefAlias: Undef<number>;
   export function inspectGenericAliasNullish(
@@ -86,6 +94,13 @@ declare module "./m3-esm.mjs" {
     box: GenericBox<Maybe<number>>,
     ...rest: OptList<number>
   ): string;
+  export function inspectGenericContainersUndef(
+    undefBox: GenericBox<Undef<number>>,
+    node: LinkedNode<Undef<number>>,
+    pair: PairAlias<Undef<string>>,
+  ): string;
+  export function sumRestGenericAlias(...nums: Id<number[]>): number;
+  export function readVariadicGenericAliasTuple(t: VariadicGenericAliasTuple): string;
 
   export function transformStringArray(items: ReadonlyArray<string>, extra: number[]): string[];
 
