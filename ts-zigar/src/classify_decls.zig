@@ -76,7 +76,7 @@ pub fn Classifier(comptime Graph: type) type {
             if (pid >= self.graph.properties.len) return false;
             const p = self.graph.properties[pid];
             if (p.has_getter or p.has_setter) return true;
-            if (p.modifiers.accessor_mod or p.modifiers.private_mod or p.modifiers.protected_mod) return true;
+            if (p.modifiers.method_mod or p.modifiers.accessor_mod or p.modifiers.private_mod or p.modifiers.protected_mod) return true;
             if (std.mem.eql(u8, self.str(p.name), "__zigar_private_brand")) return true;
             return false;
         }
@@ -210,7 +210,7 @@ pub fn Classifier(comptime Graph: type) type {
                         if (std.mem.eql(u8, self.str(p.name), "prototype")) continue;
                         // On anonymous `object_literal`, `extractObjectLiteralMembersAST` encodes method
                         // signatures as `function_type` (or intersection of `function_type`s) in `properties`!
-                        if (p.ty < self.graph.types.len and !p.modifiers.optional_mod and !p.has_getter and !p.has_setter) {
+                        if (p.ty < self.graph.types.len and (p.modifiers.method_mod or !p.modifiers.optional_mod) and !p.has_getter and !p.has_setter) {
                             const ptn = self.graph.types[p.ty];
                             if (ptn.kind == .function_type) {
                                 const sig_slice = try scratch.alloc(u32, 1);
@@ -492,6 +492,13 @@ pub fn Classifier(comptime Graph: type) type {
                             if (ref.target_decl) |td| {
                                 if (td != decl_id) return try self.classifyDecl(td);
                             }
+                            const rname = self.str(ref.target_name);
+                            if (std.mem.eql(u8, rname, "Array") or std.mem.eql(u8, rname, "ReadonlyArray") or
+                                std.mem.eql(u8, rname, "Iterable") or std.mem.eql(u8, rname, "IterableIterator") or
+                                std.mem.eql(u8, rname, "Set") or std.mem.eql(u8, rname, "ReadonlySet"))
+                            {
+                                return .{ .kind = .value_struct };
+                            }
                             if (tn.resolved_type) |rt| {
                                 if (rt < self.graph.types.len and self.graph.types[rt].kind == .object_literal) {
                                     return self.classifyObjectLiteralData(self.graph.types[rt].kind.object_literal);
@@ -537,6 +544,7 @@ test "Classifier distinguishes plain value_struct interfaces from classes, state
         "DerivedHandle", // 14
         "Widget", // 15
         "FactoryConfig", // 16
+        "LoggerT", // 17
     };
 
     const props = [_]ts.types.PropNode{
@@ -600,6 +608,18 @@ test "Classifier distinguishes plain value_struct interfaces from classes, state
             .modifiers = .{ .readonly_mod = true },
             .jsdoc = null,
         },
+        // 5: log(msg: string): CustomToken (method_mod = true on object_literal)
+        .{
+            .id = 5,
+            .name = 6,
+            .computed_symbol = null,
+            .ty = 7,
+            .setter_ty = null,
+            .has_getter = false,
+            .has_setter = false,
+            .modifiers = .{ .method_mod = true },
+            .jsdoc = null,
+        },
     };
 
     const sigs = [_]ts.types.SignatureNode{
@@ -654,6 +674,25 @@ test "Classifier distinguishes plain value_struct interfaces from classes, state
         .{
             .id = 6,
             .kind = .{ .reference = .{ .target_decl = 2, .target_name = 5, .module_specifier = null, .type_args = &.{} } },
+            .resolved_type = null,
+        },
+        // 7: function_type(sig 0)
+        .{
+            .id = 7,
+            .kind = .{ .function_type = 0 },
+            .resolved_type = null,
+        },
+        // 8: object_literal `{ port?: number; log(): CustomToken }`
+        .{
+            .id = 8,
+            .kind = .{
+                .object_literal = .{
+                    .properties = &.{ 0, 5 },
+                    .call_signatures = &.{},
+                    .construct_signatures = &.{},
+                    .index_signatures = &.{},
+                },
+            },
             .resolved_type = null,
         },
     };
@@ -934,6 +973,18 @@ test "Classifier distinguishes plain value_struct interfaces from classes, state
             .merged_with = &.{ 12, 13 },
             .kind = .{ .function_decl = &.{0} },
         },
+        // 14: type LoggerT = { port?: number; log(): CustomToken } -> .handle_wrapper (`!is_callable_handle`)
+        .{
+            .id = 14,
+            .name = 17,
+            .export_name = null,
+            .module = 0,
+            .type_params = &.{},
+            .modifiers = .{ .export_decl = true },
+            .jsdoc = null,
+            .merged_with = &.{},
+            .kind = .{ .type_alias_decl = 8 },
+        },
     };
 
     const graph = ts.types.DeclarationGraph{
@@ -988,4 +1039,9 @@ test "Classifier distinguishes plain value_struct interfaces from classes, state
     const c12 = try cls.classifyDecl(12);
     try std.testing.expectEqual(ObjectDeclKind.value_struct, c12.kind);
     try std.testing.expect(!c12.is_callable_handle);
+
+    const c14 = try cls.classifyDecl(14);
+    try std.testing.expectEqual(ObjectDeclKind.handle_wrapper, c14.kind);
+    try std.testing.expect(!c14.is_class);
+    try std.testing.expect(!c14.is_callable_handle);
 }

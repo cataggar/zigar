@@ -333,3 +333,34 @@ export class NumberStore extends StoreBase {
   }
 }
 
+export function makeLoggerT(level) {
+  return {
+    level: Number(level),
+    log(msg) {
+      return `[${this.level}] ${msg}`;
+    },
+  };
+}
+
+export function produceBadLoggerT() {
+  return { level: 1 };
+}
+
+export function echoNullOnlyBox(box) {
+  if (!('x' in box) || !('y' in box)) {
+    throw new TypeError('NullOnlyBox fields must be explicitly present');
+  }
+  if (box.x === undefined || box.y === undefined) {
+    throw new TypeError('NullOnlyBox fields must be null or value, never undefined');
+  }
+  return {
+    x: box.x === null ? null : `${box.x}!`,
+    y: box.y === null ? null : (box.y === 'alpha' ? 'beta' : 'alpha'),
+  };
+}
+
+export function produceNumericNullOnlyBox() {
+  return { x: 123, y: 'alpha' };
+}
+
+

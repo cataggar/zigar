@@ -398,6 +398,30 @@ pub fn exerciseFactoryMergedAndGenericExtends(out_alloc: std.mem.Allocator) ![]c
         try store.setCurrent(25);
         if ((try store.step()) != 26) return error.Unexpected;
         if ((try store.getCurrent()) != 26) return error.Unexpected;
+
+        // Object-literal type alias with method (`LoggerT = { level: number; log(msg: string): string }`)
+        // lowers to `.handle_wrapper`, preserves receiver `this.level`, and validates `required_methods`!
+        var logger = try m.makeLoggerT(2);
+        defer logger.deinit();
+        if ((try logger.level()) != 2) return error.Unexpected;
+        try logger.setLevel(5);
+        const logged = try logger.logAlloc(tracked_alloc, "boot");
+        defer js.freeDecoded([]const u8, tracked_alloc, logged);
+        if (!std.mem.eql(u8, logged, "[5] boot")) return error.Unexpected;
+        try std.testing.expectError(error.TypeError, m.produceBadLoggerT());
+
+        // `NullOnlyBox extends NullableUnionBox<null>` collapses `null | string` -> `?[]const u8` (`.null_only`)
+        // and `null | "alpha" | "beta"` -> `?enum { alpha, beta }` (`.null_only`), rejecting numbers (`no Any arm`)!
+        const n1 = try m.echoNullOnlyBoxAlloc(tracked_alloc, .{ .x = null, .y = null });
+        defer js.freeDecoded(m.NullOnlyBox, tracked_alloc, n1);
+        if (n1.x != null or n1.y != null) return error.Unexpected;
+
+        const n2 = try m.echoNullOnlyBoxAlloc(tracked_alloc, .{ .x = "ok", .y = .alpha });
+        defer js.freeDecoded(m.NullOnlyBox, tracked_alloc, n2);
+        if (!std.mem.eql(u8, n2.x orelse return error.Unexpected, "ok!")) return error.Unexpected;
+        if (n2.y != .beta) return error.Unexpected;
+
+        try std.testing.expectError(error.TypeError, m.produceNumericNullOnlyBoxAlloc(tracked_alloc));
     }
 
     try checkInvariants(handles_before, allocs_before);

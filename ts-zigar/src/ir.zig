@@ -148,6 +148,7 @@ pub const TupleElemIr = struct {
 pub const OptionalTypeIr = struct {
     child: *const TypeIr,
     nullish_kind: lower_types.NullishKind = .null_or_undefined,
+    is_pure_nullish: bool = false,
 };
 
 pub const VariantDiscriminantValueIr = union(enum) {
@@ -3008,7 +3009,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 .null_type => {
                     needs_runtime.* = true;
                     const inner = try self.makeType(.js_any);
-                    return self.makeType(.{ .optional = .{ .child = inner, .nullish_kind = .null_only } });
+                    return self.makeType(.{ .optional = .{ .child = inner, .nullish_kind = .null_only, .is_pure_nullish = true } });
                 },
                 .boolean_type => return self.makeType(.bool_type),
                 .number_type => return self.makeType(.f64_type),
@@ -3412,7 +3413,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             self.inline_anon_depth = 0;
                             defer self.inline_anon_depth = saved_depth;
 
-                            const sourced_props = try self.wrapUnsourcedProps(obj.properties);
+                            const split = try self.splitObjectLiteralPropsAndMethods(obj.properties);
                             const sourced_calls = try self.wrapUnsourcedSigs(obj.call_signatures);
                             const sourced_ctors = try self.wrapUnsourcedSigs(obj.construct_signatures);
 
@@ -3424,9 +3425,9 @@ fn LowerCtx(comptime GraphType: type) type {
                                 false,
                                 &.{},
                                 &.{},
-                                sourced_props,
+                                split.props,
                                 &.{},
-                                &.{},
+                                split.methods,
                                 sourced_calls,
                                 sourced_ctors,
                                 &.{},
@@ -3676,7 +3677,13 @@ fn LowerCtx(comptime GraphType: type) type {
                 .optional => |opt| {
                     const merged = opt.nullish_kind.merge(eff_kind);
                     if (merged == opt.nullish_kind) return inner;
-                    return self.makeType(.{ .optional = .{ .child = opt.child, .nullish_kind = merged } });
+                    return self.makeType(.{
+                        .optional = .{
+                            .child = opt.child,
+                            .nullish_kind = merged,
+                            .is_pure_nullish = opt.is_pure_nullish,
+                        },
+                    });
                 },
                 else => return self.makeType(.{ .optional = .{ .child = inner, .nullish_kind = eff_kind } }),
             }
@@ -4660,7 +4667,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     for (obj.properties) |pid| {
                         if (pid >= self.graph.properties.len) continue;
                         const p = self.graph.properties[pid];
-                        if (p.modifiers.private_mod or p.modifiers.protected_mod or p.modifiers.static_mod) continue;
+                        if (p.modifiers.method_mod or p.modifiers.private_mod or p.modifiers.protected_mod or p.modifiers.static_mod) continue;
                         try self.mergePropIntoList(out, .{
                             .name_sid = p.name,
                             .wire = self.str(p.name),
@@ -4897,6 +4904,29 @@ fn LowerCtx(comptime GraphType: type) type {
                     needs_runtime,
                 );
                 return self.makeType(.{ .anon_struct = fields });
+            }
+
+            if (ty_id < self.graph.types.len) {
+                if (self.graph.types[ty_id].resolved_type) |rt| {
+                    if (rt != ty_id and rt < self.graph.types.len and self.graph.types[rt].kind == .object_literal) {
+                        var safe_to_follow = true;
+                        for (parts) |pid| {
+                            if (pid < self.graph.types.len and self.graph.types[pid].kind == .reference) {
+                                if (self.graph.types[pid].kind.reference.target_decl) |td| {
+                                    if (self.lookupDeclLocation(td) == null and
+                                        (td >= self.graph.decls.len or self.graph.decls[td].kind != .type_alias_decl))
+                                    {
+                                        safe_to_follow = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (safe_to_follow) {
+                            return self.lowerType(rt, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                        }
+                    }
+                }
             }
 
             needs_runtime.* = true;
@@ -5195,7 +5225,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 .binary_view => |ba| ba == b.binary_view,
                 .self_type => |sa| std.mem.eql(u8, sa, b.self_type),
                 .type_param_ref => |ta| std.mem.eql(u8, ta, b.type_param_ref),
-                .optional => |oa| oa.nullish_kind == b.optional.nullish_kind and typeIrEql(oa.child, b.optional.child, depth + 1),
+                .optional => |oa| oa.nullish_kind == b.optional.nullish_kind and oa.is_pure_nullish == b.optional.is_pure_nullish and typeIrEql(oa.child, b.optional.child, depth + 1),
                 .pointer_const => |ia| typeIrEql(ia, b.pointer_const, depth + 1),
                 .slice => |sa| typeIrEql(sa, b.slice, depth + 1),
                 .promise => |pa| typeIrEql(pa, b.promise, depth + 1),
@@ -5420,7 +5450,9 @@ fn LowerCtx(comptime GraphType: type) type {
                     continue;
                 }
                 if (payload.* == .optional) {
+                    const was_pure_nullish = payload.optional.is_pure_nullish;
                     extra_nullish = extra_nullish.merge(payload.optional.nullish_kind);
+                    if (was_pure_nullish) continue;
                     payload = try self.makeType(payload.optional.child.*);
                     if (payload.* == .void_type or payload.* == .noreturn_type) continue;
                 }
@@ -5464,10 +5496,21 @@ fn LowerCtx(comptime GraphType: type) type {
             if (rem_lits.items.len == 0 and deduped_others.items.len == 1) {
                 return .{ .extra_nullish = extra_nullish, .body = .{ .single = deduped_others.items[0].ty } };
             }
+            if (deduped_others.items.len == 0 and rem_lits.items.len > 0 and rem_lits.items.len <= 64) {
+                const inline_en = try self.buildEnumMembersFromClosedLiterals(rem_lits.items);
+                return .{ .extra_nullish = extra_nullish, .body = .{ .single = try self.makeType(.{ .inline_enum = inline_en }) } };
+            }
             if (rem_lits.items.len == 0 and deduped_others.items.len == 0) {
                 if (extra_nullish == .null_only or extra_nullish == .null_or_undefined) {
                     needs_runtime.* = true;
-                    return .{ .extra_nullish = extra_nullish, .body = .{ .single = try self.makeType(.js_any) } };
+                    const pure_opt = try self.makeType(.{
+                        .optional = .{
+                            .child = try self.makeType(.js_any),
+                            .nullish_kind = extra_nullish,
+                            .is_pure_nullish = true,
+                        },
+                    });
+                    return .{ .extra_nullish = extra_nullish, .body = .{ .single = pure_opt } };
                 }
                 return .{ .extra_nullish = .none, .body = .{ .single = try self.makeType(.void_type) } };
             }
@@ -5601,7 +5644,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 if (nullish != .none) {
                     needs_runtime.* = true;
                     const jv = try self.makeType(.js_any);
-                    return self.makeType(.{ .optional = .{ .child = jv, .nullish_kind = nullish } });
+                    return self.makeType(.{ .optional = .{ .child = jv, .nullish_kind = nullish, .is_pure_nullish = true } });
                 }
                 return self.makeType(.void_type);
             }
@@ -6631,7 +6674,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         const obj = self.graph.types[oid].kind.object_literal;
                         if (obj.properties.len > 0 or obj.call_signatures.len > 0 or obj.construct_signatures.len > 0) {
                             const obj_cls = self.classifyObjectLiteral(obj);
-                            const sourced_props = try self.wrapUnsourcedProps(obj.properties);
+                            const split = try self.splitObjectLiteralPropsAndMethods(obj.properties);
                             const sourced_calls = try self.wrapUnsourcedSigs(obj.call_signatures);
                             const sourced_ctors = try self.wrapUnsourcedSigs(obj.construct_signatures);
                             const struct_ir = try self.lowerStructDecl(
@@ -6642,9 +6685,9 @@ fn LowerCtx(comptime GraphType: type) type {
                                 false,
                                 d.type_params,
                                 &.{},
-                                sourced_props,
+                                split.props,
                                 &.{},
-                                &.{},
+                                split.methods,
                                 sourced_calls,
                                 sourced_ctors,
                                 &.{},
@@ -6898,6 +6941,67 @@ fn LowerCtx(comptime GraphType: type) type {
                 res[idx] = .{ .pid = pid, .env = null };
             }
             return res;
+        }
+
+        const ObjectLiteralMemberSplit = struct {
+            props: []SourcedProp,
+            methods: []SourcedMethod,
+        };
+
+        fn collectMethodSigsFromType(
+            self: *const Self,
+            ty_id: u32,
+            out_sigs: *std.ArrayList(u32),
+            depth: usize,
+        ) error{OutOfMemory}!void {
+            if (depth > 8 or ty_id >= self.graph.types.len) return;
+            switch (self.graph.types[ty_id].kind) {
+                .function_type => |sid| {
+                    for (out_sigs.items) |existing| {
+                        if (existing == sid) return;
+                    }
+                    try out_sigs.append(self.scratch, sid);
+                },
+                .intersection, .union_type => |parts| {
+                    for (parts) |part_id| {
+                        try self.collectMethodSigsFromType(part_id, out_sigs, depth + 1);
+                    }
+                },
+                else => {},
+            }
+        }
+
+        fn splitObjectLiteralPropsAndMethods(self: *Self, prop_ids: []const u32) error{OutOfMemory}!ObjectLiteralMemberSplit {
+            var props: std.ArrayList(SourcedProp) = .empty;
+            var methods: std.ArrayList(SourcedMethod) = .empty;
+            for (prop_ids) |pid| {
+                if (pid < self.graph.properties.len) {
+                    const p = self.graph.properties[pid];
+                    if (p.modifiers.method_mod and !p.has_getter and !p.has_setter) {
+                        var sigs: std.ArrayList(u32) = .empty;
+                        try self.collectMethodSigsFromType(p.ty, &sigs, 0);
+                        if (sigs.items.len > 0) {
+                            try methods.append(self.scratch, .{
+                                .method = .{
+                                    .name = p.name,
+                                    .computed_symbol = p.computed_symbol,
+                                    .signatures = try sigs.toOwnedSlice(self.scratch),
+                                    .modifiers = p.modifiers,
+                                    .jsdoc = p.jsdoc,
+                                },
+                                .env = null,
+                            });
+                            continue;
+                        }
+                        sigs.deinit(self.scratch);
+                    }
+                }
+                try props.append(self.scratch, .{ .pid = pid, .env = null });
+            }
+            return .{
+                .props = try props.toOwnedSlice(self.scratch),
+                .methods = try methods.toOwnedSlice(self.scratch),
+            };
         }
 
         fn wrapUnsourcedSigs(self: *Self, sig_ids: []const u32) error{OutOfMemory}![]SourcedSig {

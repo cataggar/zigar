@@ -3217,6 +3217,18 @@ test "Issue #48 M3.2a Sema: plain options structs vs handle classes, divergent a
             \\  port: number;
             \\}
             \\
+            \\export type LoggerT = {
+            \\  level: number;
+            \\  log(msg: string): string;
+            \\};
+            \\export type PickedLogger = Pick<LoggerT, "level" | "log">;
+            \\
+            \\export interface NullableUnionBox<T> {
+            \\  x: T | string;
+            \\  y: T | "alpha" | "beta";
+            \\}
+            \\export interface NullOnlyBox extends NullableUnionBox<null> {}
+            \\
             \\export declare function connectWith(opts: RequestOptions, node?: LinkedNode): HttpClient;
             ,
         });
@@ -3375,6 +3387,28 @@ test "Issue #48 M3.2a Sema: plain options structs vs handle classes, divergent a
             \\    _ = svc_emit;
             \\    _ = svc_chan;
             \\    _ = svc_port;
+            \\
+            \\    // 10. Object-literal type aliases with methods (`LoggerT` & `PickedLogger`) lower to `.handle_wrapper`:
+            \\    try std.testing.expect(r.LoggerT.zigar_js.is_handle);
+            \\    try std.testing.expect(!@hasField(@TypeOf(r.LoggerT.zigar_js), "is_callable_handle"));
+            \\    const lt_log: *const fn (r.LoggerT, std.mem.Allocator, []const u8) r.zigar_js.CallError![]const u8 = &r.LoggerT.logAlloc;
+            \\    const lt_lvl: *const fn (r.LoggerT) r.zigar_js.CallError!f64 = &r.LoggerT.level;
+            \\    const lt_set_lvl: *const fn (r.LoggerT, f64) r.zigar_js.CallError!void = &r.LoggerT.setLevel;
+            \\    _ = lt_log;
+            \\    _ = lt_lvl;
+            \\    _ = lt_set_lvl;
+            \\    try std.testing.expect(r.PickedLogger.zigar_js.is_handle);
+            \\    const pl_log: *const fn (r.PickedLogger, std.mem.Allocator, []const u8) r.zigar_js.CallError![]const u8 = &r.PickedLogger.logAlloc;
+            \\    _ = pl_log;
+            \\
+            \\    // 11. Generic `extends` with `T = null` in `T | string` and `T | "alpha" | "beta"` collapses cleanly:
+            \\    try std.testing.expect(@FieldType(r.NullOnlyBox, "x") == ?[]const u8);
+            \\    try std.testing.expectEqual(.null_only, r.NullOnlyBox.zigar_js.fields[0].nullish);
+            \\    try std.testing.expect(@typeInfo(@typeInfo(@FieldType(r.NullOnlyBox, "y")).optional.child) == .@"enum");
+            \\    try std.testing.expectEqual(.null_only, r.NullOnlyBox.zigar_js.fields[1].nullish);
+            \\    const nb: r.NullOnlyBox = .{ .x = null, .y = .alpha };
+            \\    try std.testing.expect(nb.x == null);
+            \\    try std.testing.expectEqual(.alpha, nb.y.?);
             \\}
             ,
         });

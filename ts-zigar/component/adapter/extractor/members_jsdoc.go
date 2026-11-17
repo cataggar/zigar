@@ -159,7 +159,7 @@ func (b *graphBuilder) extractObjectLiteralMembersAST(tl *ast.TypeLiteralNode) z
 			SetterTy:       witTypes.None[uint32](),
 			HasGetter:      false,
 			HasSetter:      false,
-			Modifiers:      m.Modifiers,
+			Modifiers:      m.Modifiers | zigar_typescript_types.ModifierFlags_MethodMod,
 			Jsdoc:          m.Jsdoc,
 		})
 		props = append(props, propID)
@@ -431,6 +431,11 @@ func (b *graphBuilder) extractCheckerPropertySymbol(sym *ast.Symbol, containingT
 	}
 	if b.tc.IsReadonlySymbol(sym) {
 		mods |= zigar_typescript_types.ModifierFlags_ReadonlyMod
+	}
+	if sym.Flags()&ast.SymbolFlagsMethod != 0 ||
+		sym.CheckFlags()&ast.CheckFlagsSyntheticMethod != 0 ||
+		(firstDecl != nil && (firstDecl.Kind == ast.KindMethodSignature || firstDecl.Kind == ast.KindMethodDeclaration)) {
+		mods |= zigar_typescript_types.ModifierFlags_MethodMod
 	}
 
 	propTy := b.tc.GetTypeOfPropertyOfType(containingType, sym.Name())

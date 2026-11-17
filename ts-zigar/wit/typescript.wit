@@ -41,6 +41,7 @@ interface types {
         const-mod,
         override-mod,
         accessor-mod,
+        method-mod,
     }
 
     /// Severity category of a TypeScript compiler diagnostic.

@@ -153,3 +153,19 @@ export declare class NumberStore extends StoreBase<number> {
   step(): number;
 }
 
+export type LoggerT = {
+  level: number;
+  log(msg: string): string;
+};
+export function makeLoggerT(level: number): LoggerT;
+export function produceBadLoggerT(): LoggerT;
+
+export interface NullableUnionBox<T> {
+  x: T | string;
+  y: T | 'alpha' | 'beta';
+}
+export interface NullOnlyBox extends NullableUnionBox<null> {}
+export function echoNullOnlyBox(box: NullOnlyBox): NullOnlyBox;
+export function produceNumericNullOnlyBox(): NullOnlyBox;
+
+

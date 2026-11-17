@@ -112,13 +112,13 @@ test "typescript.wit parses, resolves, and generates valid Zig 0.17 AST for wasm
     }
 }
 
-test "types interface IR completeness: 14-flag u16 ModifierFlags, variants, and zero recursive types" {
+test "types interface IR completeness: 15-flag u16 ModifierFlags, variants, and zero recursive types" {
     try testing.expectEqualStrings("zigar:typescript/typescript-compiler@7.1.0", ts32.world_name);
     try testing.expect(!ts32.is_wasm64);
     try testing.expect(ts64.is_wasm64);
 
-    // 14 modifier flags -> 2-byte `packed struct(u16)` in Canonical ABI (1 flat `i32` slot)
-    try testing.expectEqual(@as(u32, 14), ts32.types.ModifierFlags.wit_flags_count);
+    // 15 modifier flags -> 2-byte `packed struct(u16)` in Canonical ABI (1 flat `i32` slot)
+    try testing.expectEqual(@as(u32, 15), ts32.types.ModifierFlags.wit_flags_count);
     try testing.expectEqual(@as(usize, 2), @sizeOf(ts32.types.ModifierFlags));
     const mod_layout = canon.layoutOf(ts32.types.ModifierFlags, .wasm32);
     try testing.expectEqual(@as(u32, 2), mod_layout.size);
