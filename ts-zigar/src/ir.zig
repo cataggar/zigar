@@ -5143,12 +5143,16 @@ fn LowerCtx(comptime GraphType: type) type {
             defer raw_lits.deinit(self.scratch);
             var other_arm_ids: std.ArrayList(u32) = .empty;
             defer other_arm_ids.deinit(self.scratch);
+            var first_bool_lit_arm: ?u32 = null;
 
             for (non_null_arms) |aid| {
                 var arm_lits: std.ArrayList(lower_unions.ClosedLiteralValue) = .empty;
                 defer arm_lits.deinit(self.scratch);
                 if (try self.tryCollectClosedLiteralsFromArm(aid, &arm_lits, false, 0) and arm_lits.items.len > 0) {
                     for (arm_lits.items) |clv| {
+                        if (clv == .boolean and first_bool_lit_arm == null) {
+                            first_bool_lit_arm = aid;
+                        }
                         try self.appendUniqueClosedLiteral(&raw_lits, clv);
                     }
                 } else {
@@ -5184,7 +5188,7 @@ fn LowerCtx(comptime GraphType: type) type {
 
             if (promote_bool_pair) {
                 try deduped_others.append(self.scratch, .{
-                    .ast_arm_id = non_null_arms[0],
+                    .ast_arm_id = first_bool_lit_arm orelse non_null_arms[0],
                     .ty = try self.makeType(.bool_type),
                 });
             }
@@ -5613,6 +5617,10 @@ fn LowerCtx(comptime GraphType: type) type {
                 else => {},
             }
             switch (lowered_payload.*) {
+                .bool_type => return "boolean",
+                .string_type => return "str",
+                .f64_type => return "num",
+                .i64_type => return "bigint",
                 .binary_view => |bvk| return bvk.zigTypeIdent(),
                 .slice => return "array",
                 .tuple => return "tuple",

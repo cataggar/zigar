@@ -55,6 +55,22 @@ export function echoMixedAndClosed(mixed, enc, ord, step, big, scalar) {
   return `${mixed}|${enc}|${ord}|${step}|${big}n|${scalarDesc}`;
 }
 
+export function badBigChoiceWrapReturn() {
+  return (1n << 64n) + 10n;
+}
+
+export function badMixedWrapReturn() {
+  return (1n << 64n) + 1n;
+}
+
+export function badBigDiscWrapReturn() {
+  return { k: (1n << 64n) + 1n, v: 'wrapped-mod-2^64' };
+}
+
+export function echoStrOrBoolPair(v) {
+  return typeof v === 'string' ? true : 'was-bool';
+}
+
 export function combineRuntimeFlags(a, b) {
   return a | b;
 }

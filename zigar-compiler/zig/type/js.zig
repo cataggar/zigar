@@ -286,7 +286,7 @@ pub fn coerceUnion(comptime U: type, val: anytype) U {
                 inline for (U.zigar_js.variants) |v| {
                     if (@hasField(@TypeOf(v), "is_unit_literal") and @hasField(@TypeOf(v), "bigint_value")) {
                         if (comptime @as(?i64, std.fmt.parseInt(i64, v.bigint_value, 0) catch null)) |iv| {
-                            if (val == iv) return @unionInit(U, v.tag, {});
+                            if (val == @as(comptime_int, iv)) return @unionInit(U, v.tag, {});
                         }
                     }
                 }
@@ -5457,20 +5457,9 @@ pub fn Js(comptime host: type) type {
 
         fn bigintRefMatchesLiteral(
             raw: Ref(module.Any),
-            allocator: std.mem.Allocator,
+            _: std.mem.Allocator,
             comptime lit: []const u8,
         ) module.CallError!bool {
-            if (comptime @as(?i64, std.fmt.parseInt(i64, lit, 0) catch null)) |expected_i64| {
-                if (fromJsRefAlloc(i64, allocator, raw)) |actual_i64| {
-                    return actual_i64 == expected_i64;
-                } else |err| switch (err) {
-                    error.OffJsThread, error.OutOfMemory, error.HostUnavailable => return err,
-                    else => {
-                        clearLastError();
-                        return false;
-                    },
-                }
-            }
             const expected_bi = try BigInt.fromString(lit);
             defer expected_bi.deinit();
             return try raw.tryEql(expected_bi);
@@ -6345,6 +6334,42 @@ pub fn Js(comptime host: type) type {
                         return @intFromFloat(n);
                     }
                     if ((try raw.tryTypeof()) != .bigint) return error.TypeError;
+                    if (comptime (it.bits <= 64)) {
+                        const bi: BigInt = .{ .handle = raw.handle };
+                        if (comptime (it.signedness == .signed)) {
+                            const v64 = bi.toI64() catch |err| return switch (err) {
+                                error.Overflow => error.TypeError,
+                                else => |e| e,
+                            };
+                            if (v64 < std.math.minInt(T) or v64 > std.math.maxInt(T)) return error.TypeError;
+                            return @intCast(v64);
+                        } else {
+                            const v64 = bi.toU64() catch |err| return switch (err) {
+                                error.Overflow => error.TypeError,
+                                else => |e| e,
+                            };
+                            if (v64 > std.math.maxInt(T)) return error.TypeError;
+                            return @intCast(v64);
+                        }
+                    }
+                    if (comptime (it.bits <= 128)) {
+                        const bi: BigInt = .{ .handle = raw.handle };
+                        if (comptime (it.signedness == .signed)) {
+                            const v128 = bi.toI128() catch |err| return switch (err) {
+                                error.Overflow => error.TypeError,
+                                else => |e| e,
+                            };
+                            if (v128 < std.math.minInt(T) or v128 > std.math.maxInt(T)) return error.TypeError;
+                            return @intCast(v128);
+                        } else {
+                            const v128 = bi.toU128() catch |err| return switch (err) {
+                                error.Overflow => error.TypeError,
+                                else => |e| e,
+                            };
+                            if (v128 > std.math.maxInt(T)) return error.TypeError;
+                            return @intCast(v128);
+                        }
+                    }
                     const HostFn = buildFnType(&.{Ref(module.Any)}, module.CallError!T);
                     return dispatchHostOpRawFlags(
                         .collection_op,
@@ -8642,6 +8667,18 @@ test "Js.String, Nullable(T), needsDecodeAllocator, and tuple/slice marshaling h
                         },
                         else => return .FAULT,
                     }
+                },
+                .bigint_to_words => {
+                    const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), u32, bool, usize) Error!u32);
+                    const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    const h = f.@"0".handle;
+                    if (h < 8 or entries[h & 0xFFFFF] != .bi) return .FAULT;
+                    const v: i128 = entries[h & 0xFFFFF].bi;
+                    const words_ptr: *[2]u64 = @ptrFromInt(f.@"3");
+                    const bits: u128 = @bitCast(v);
+                    words_ptr[0] = @truncate(bits);
+                    words_ptr[1] = @truncate(bits >> 64);
+                    f.retval = 0;
                 },
                 else => return .FAULT,
             }

@@ -2806,6 +2806,7 @@ test "Issue #47 (M3.1b): enums, closed/open literal unions, template literals, d
             \\export type FloatChoice = 0.5 | 1.5 | 2.5;
             \\export type BigChoice = 10n | 20n;
             \\export type CollapsedBool = true | false;
+            \\export type StrOrBoolPair = string | true | false;
             \\
             \\export type OpenEncoding = "utf8" | "hex" | (string & {});
             \\export type OpenPort = 80 | 443 | (number & {});
@@ -2967,6 +2968,10 @@ test "Issue #47 (M3.1b): enums, closed/open literal unions, template literals, d
             \\    try std.testing.expectEqualStrings("hello", hi_str.str);
             \\    const hi_ver = r.HeteroInput.from(ver);
             \\    try std.testing.expectEqualStrings("v26.1.0", hi_ver.sem_ver.raw);
+            \\    const sbp_s: r.StrOrBoolPair = .{ .str = "hello" };
+            \\    const sbp_b: r.StrOrBoolPair = .{ .boolean = true };
+            \\    try std.testing.expectEqualStrings("hello", sbp_s.str);
+            \\    try std.testing.expect(sbp_b.boolean);
             \\}
             ,
         });

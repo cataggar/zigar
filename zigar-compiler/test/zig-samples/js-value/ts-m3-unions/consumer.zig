@@ -89,6 +89,24 @@ pub fn exerciseEnumsAndClosedLiterals(out_alloc: std.mem.Allocator) ![]const u8 
         defer js.freeDecoded([]const u8, tracked_alloc, desc2);
         if (!std.mem.eql(u8, desc2, "1|hex|0|0.5|10n|1n")) return error.Unexpected;
 
+        // Out-of-range BigInts congruent mod 2^64 MUST be rejected even in ReleaseSmall / ReleaseFast!
+        try std.testing.expectError(error.TypeError, m.badBigChoiceWrapReturn());
+        try std.testing.expectError(error.TypeError, m.badMixedWrapReturn());
+        if (m.badBigDiscWrapReturnAlloc(tracked_alloc)) |bad_bd| {
+            js.freeDecoded(m.BigDiscUnion, tracked_alloc, bad_bd);
+            return error.Unexpected;
+        } else |err| {
+            if (err != error.TypeError) return err;
+        }
+
+        // `string | true | false` promotes `true | false` to `.boolean: bool` while keeping `.str: []const u8`
+        const sbp1 = try m.echoStrOrBoolPairAlloc(tracked_alloc, .{ .str = "hello" });
+        defer js.freeDecoded(m.StrOrBoolPair, tracked_alloc, sbp1);
+        if (std.meta.activeTag(sbp1) != .boolean or !sbp1.boolean) return error.Unexpected;
+        const sbp2 = try m.echoStrOrBoolPairAlloc(tracked_alloc, .{ .boolean = false });
+        defer js.freeDecoded(m.StrOrBoolPair, tracked_alloc, sbp2);
+        if (std.meta.activeTag(sbp2) != .str or !std.mem.eql(u8, sbp2.str, "was-bool")) return error.Unexpected;
+
         // Ambient unknown-value enum (`RuntimeFlags`) live handle lookup + roundtrip
         const f_read = try m.RuntimeFlags.read.get();
         defer f_read.deinit();

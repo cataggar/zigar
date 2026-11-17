@@ -4139,7 +4139,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                inline for (U.zigar_js.variants) |v| {
         \\                    if (@hasField(@TypeOf(v), "is_unit_literal") and @hasField(@TypeOf(v), "bigint_value")) {
         \\                        if (comptime @as(?i64, std.fmt.parseInt(i64, v.bigint_value, 0) catch null)) |iv| {
-        \\                            if (val == iv) return @unionInit(U, v.tag, {});
+        \\                            if (val == @as(comptime_int, iv)) return @unionInit(U, v.tag, {});
         \\                        }
         \\                    }
         \\                }

@@ -43,6 +43,10 @@ export type CompareOrder = -1 | 0 | 1;
 export type FloatStep = 0.5 | 1.5 | 2.5;
 export type BigChoice = 10n | 20n;
 export type MixedScalarUnion = "none" | 0 | false | 1n;
+export type StrOrBoolPair = string | true | false;
+export type BigDiscUnion =
+  | { k: 1n; v: string }
+  | { k: 2n; count: number };
 
 // 3. Open literal unions
 export type OpenMime = "application/json" | "text/plain" | (string & {});
@@ -107,6 +111,10 @@ export declare function echoMixedAndClosed(
   big: BigChoice,
   scalar: MixedScalarUnion,
 ): string;
+export declare function badBigChoiceWrapReturn(): BigChoice;
+export declare function badMixedWrapReturn(): MixedScalarUnion;
+export declare function badBigDiscWrapReturn(): BigDiscUnion;
+export declare function echoStrOrBoolPair(v: StrOrBoolPair): StrOrBoolPair;
 export declare function combineRuntimeFlags(a: RuntimeFlags, b: RuntimeFlags): number;
 
 export declare function inspectOpenLiterals(mime: OpenMime, port: OpenPort): [OpenMime, OpenPort];
