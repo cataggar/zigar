@@ -58,6 +58,8 @@ async function generateBindings(fixturePath, outDir) {
 
 function installGlobalFixtures() {
   globalThis.__m3GlobalLabel = 'seed-global';
+  globalThis.__m3GlobalUndef = 'seed-undef';
+  globalThis.__m3GlobalNull = 'seed-null';
   globalThis.__m3GlobalCompute = function __m3GlobalCompute(name, bonus = 10) {
     return [ `${globalThis.__m3GlobalLabel}:${name}:${arguments.length}`, bonus ];
   };
@@ -72,6 +74,8 @@ function installGlobalFixtures() {
 
 function cleanupGlobalFixtures() {
   delete globalThis.__m3GlobalLabel;
+  delete globalThis.__m3GlobalUndef;
+  delete globalThis.__m3GlobalNull;
   delete globalThis.__m3GlobalCompute;
   delete globalThis.__m3GlobalBox;
 }
@@ -167,6 +171,17 @@ describe('ts-zigar M3.1a Live Runtime Roundtrip: Primitives, Optionals, BigInt, 
         expect(out).to.equal('[2]boot#201|ns:4:hits=102|cjs:v2');
         expect(globalThis.__m3GlobalLabel).to.equal('zig-mutated-global');
         expect(globalThis.__m3GlobalBox.count).to.equal(58);
+      });
+
+      it('preserves exact JS null vs undefined vs omitted properties across interfaces, anon_structs, tuples, slices, rest args, and globals', function () {
+        const out = mod.exerciseNullishFidelity().string;
+        expect(out).to.equal(
+          'u:[number:5,undefined,number:9]|n:[number:5,null,number:9]|nested:undefined|null|cjs:undefined|null',
+        );
+        expect('__m3GlobalUndef' in globalThis).to.equal(true);
+        expect(globalThis.__m3GlobalUndef).to.equal(undefined);
+        expect('__m3GlobalNull' in globalThis).to.equal(true);
+        expect(globalThis.__m3GlobalNull).to.equal(null);
       });
     });
   }

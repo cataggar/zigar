@@ -509,15 +509,70 @@ const ModuleEmitCtx = struct {
         return false;
     }
 
-    fn freshPrivateRetTypeIdent(
+    fn freshPrivateTypeIdent(
         self: *ModuleEmitCtx,
-        type_params: []const ir.TypeParamIr,
+        sig: ir.SignatureIr,
     ) ![]u8 {
         while (true) {
             self.ret_type_counter += 1;
             const cand = try std.fmt.allocPrint(self.allocator, "__ZigarRet_{d}", .{self.ret_type_counter});
-            if (!self.isIdentTakenInCurrentScope(cand, type_params)) return cand;
+            var collides = self.isIdentTakenInCurrentScope(cand, sig.type_params);
+            if (!collides) {
+                if (sig.alloc_param_ident) |api| {
+                    if (std.mem.eql(u8, unquoteZigIdent(api), cand)) collides = true;
+                }
+            }
+            if (!collides) {
+                for (sig.params) |p| {
+                    if (std.mem.eql(u8, unquoteZigIdent(p.zig_ident), cand)) {
+                        collides = true;
+                        break;
+                    }
+                }
+            }
+            if (!collides) return cand;
             self.allocator.free(cand);
+        }
+    }
+
+    fn emitSharedNominalTypeExpr(
+        self: *ModuleEmitCtx,
+        ty: *const ir.TypeIr,
+        sig: ir.SignatureIr,
+    ) ![]u8 {
+        const type_ident = try self.freshPrivateTypeIdent(sig);
+        defer self.allocator.free(type_ident);
+
+        if (sig.type_params.len == 0) {
+            try self.out.print(self.allocator, "const {s} = ", .{type_ident});
+            try self.emitType(ty);
+            try self.out.appendSlice(self.allocator, ";\n");
+            return try self.allocator.dupe(u8, type_ident);
+        } else {
+            try self.out.print(self.allocator, "fn {s}(", .{type_ident});
+            for (sig.type_params, 0..) |tp, idx| {
+                if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
+                try self.out.print(self.allocator, "comptime {s}: type", .{tp.zig_ident});
+            }
+            try self.out.appendSlice(self.allocator, ") type {\n");
+            for (sig.type_params) |tp| {
+                if (!typeUsesTypeParam(ty, tp.zig_ident)) {
+                    try self.out.print(self.allocator, "_ = {s};\n", .{tp.zig_ident});
+                }
+            }
+            try self.out.appendSlice(self.allocator, "return ");
+            try self.emitType(ty);
+            try self.out.appendSlice(self.allocator, ";\n}\n");
+
+            var expr: std.ArrayList(u8) = .empty;
+            errdefer expr.deinit(self.allocator);
+            try expr.print(self.allocator, "{s}(", .{type_ident});
+            for (sig.type_params, 0..) |tp, idx| {
+                if (idx > 0) try expr.appendSlice(self.allocator, ", ");
+                try expr.appendSlice(self.allocator, tp.zig_ident);
+            }
+            try expr.append(self.allocator, ')');
+            return try expr.toOwnedSlice(self.allocator);
         }
     }
 
@@ -535,6 +590,114 @@ const ModuleEmitCtx = struct {
         const lit = try naming.formatStringLiteral(self.allocator, s);
         defer self.allocator.free(lit);
         try self.out.appendSlice(self.allocator, lit);
+    }
+
+    fn findDeclByZigPath(decls: []const ir.DeclIr, path: []const []const u8) ?*const ir.DeclIr {
+        if (path.len == 0) return null;
+        const head = unquoteZigIdent(path[0]);
+        for (decls) |*d| {
+            if (std.mem.eql(u8, unquoteZigIdent(d.zig_ident), head)) {
+                if (path.len == 1) return d;
+                return switch (d.kind) {
+                    .namespace_decl => |sub| findDeclByZigPath(sub, path[1..]),
+                    .struct_decl => |st| findDeclByZigPath(st.nested_decls, path[1..]),
+                    else => null,
+                };
+            }
+        }
+        return null;
+    }
+
+    fn resolveAliasType(self: *const ModuleEmitCtx, ty: *const ir.TypeIr, depth: usize) *const ir.TypeIr {
+        if (depth >= 16) return ty;
+        switch (ty.*) {
+            .decl_ref => |dref| {
+                if (dref.indirect or dref.type_args.len != 0) return ty;
+                if (dref.module_index >= self.pkg.modules.len) return ty;
+                const target_mod = &self.pkg.modules[dref.module_index];
+                if (findDeclByZigPath(target_mod.decls, dref.decl_zig_path)) |target_decl| {
+                    switch (target_decl.kind) {
+                        .type_alias => |ta| {
+                            if (ta.type_params.len == 0) {
+                                return self.resolveAliasType(ta.target, depth + 1);
+                            }
+                        },
+                        else => {},
+                    }
+                }
+                return ty;
+            },
+            else => return ty,
+        }
+    }
+
+    fn unwrapSliceElemType(self: *const ModuleEmitCtx, raw_ty: *const ir.TypeIr) *const ir.TypeIr {
+        const ty = self.resolveAliasType(raw_ty, 0);
+        return switch (ty.*) {
+            .slice => |elem_ty| elem_ty,
+            else => raw_ty,
+        };
+    }
+
+    fn typeNeedsNullishSpec(self: *const ModuleEmitCtx, raw_ty: *const ir.TypeIr, depth: usize) bool {
+        if (depth >= 16) return false;
+        const ty = self.resolveAliasType(raw_ty, 0);
+        return switch (ty.*) {
+            .optional => true,
+            .slice => |elem_ty| self.typeNeedsNullishSpec(elem_ty, depth + 1),
+            .pointer_const => |inner| self.typeNeedsNullishSpec(inner, depth + 1),
+            else => false,
+        };
+    }
+
+    fn emitNullishSpecImpl(
+        self: *ModuleEmitCtx,
+        raw_ty: *const ir.TypeIr,
+        is_optional_site: bool,
+        depth: usize,
+    ) error{OutOfMemory}!void {
+        if (depth >= 16) {
+            try self.out.appendSlice(self.allocator, if (is_optional_site) ".undefined_only" else ".none");
+            return;
+        }
+        const ty = self.resolveAliasType(raw_ty, 0);
+        switch (ty.*) {
+            .optional => |opt| {
+                const self_tag: []const u8 = if (is_optional_site)
+                    ".undefined_only"
+                else switch (opt.nullish_kind) {
+                    .undefined_only => ".undefined_only",
+                    .null_only, .null_or_undefined => ".null_only",
+                    .none => ".undefined_only",
+                };
+                if (self.typeNeedsNullishSpec(opt.child, depth + 1)) {
+                    try self.out.print(self.allocator, ".{{ .self = {s}, .child = ", .{self_tag});
+                    try self.emitNullishSpecImpl(opt.child, false, depth + 1);
+                    try self.out.appendSlice(self.allocator, " }");
+                } else {
+                    try self.out.appendSlice(self.allocator, self_tag);
+                }
+            },
+            .slice => |elem_ty| {
+                if (self.typeNeedsNullishSpec(elem_ty, depth + 1)) {
+                    try self.out.appendSlice(self.allocator, ".{ .self = .none, .elem = ");
+                    try self.emitNullishSpecImpl(elem_ty, false, depth + 1);
+                    try self.out.appendSlice(self.allocator, " }");
+                } else {
+                    try self.out.appendSlice(self.allocator, if (is_optional_site) ".undefined_only" else ".none");
+                }
+            },
+            .pointer_const => |inner| {
+                try self.emitNullishSpecImpl(inner, is_optional_site, depth + 1);
+            },
+            else => {
+                try self.out.appendSlice(self.allocator, if (is_optional_site) ".undefined_only" else ".none");
+            },
+        }
+    }
+
+    fn emitNullishSpec(self: *ModuleEmitCtx, ty: *const ir.TypeIr, is_optional_site: bool) error{OutOfMemory}!void {
+        try self.emitNullishSpecImpl(ty, is_optional_site, 0);
     }
 
     fn emitType(self: *ModuleEmitCtx, ty: *const ir.TypeIr) error{OutOfMemory}!void {
@@ -581,19 +744,15 @@ const ModuleEmitCtx = struct {
             },
             .tuple => |elems| {
                 var variadic_idx: ?usize = null;
-                var optional_mask: u64 = 0;
-                var null_only_mask: u64 = 0;
                 for (elems, 0..) |el, idx| {
-                    if (el.is_variadic) {
-                        if (variadic_idx == null) variadic_idx = idx;
-                    } else if (idx < 64) {
-                        if (el.is_optional) {
-                            optional_mask |= (@as(u64, 1) << @intCast(idx));
-                        } else if (el.nullish_kind == .null_only) {
-                            null_only_mask |= (@as(u64, 1) << @intCast(idx));
-                        }
+                    if (el.is_variadic and variadic_idx == null) {
+                        variadic_idx = idx;
                     }
                 }
+
+                const tup_frame = [_][]const u8{"zigar_js_tuple"};
+                try self.nested_decl_scopes.append(self.allocator, &tup_frame);
+                defer _ = self.nested_decl_scopes.pop();
 
                 try self.out.appendSlice(self.allocator, "struct { ");
                 for (elems, 0..) |el, idx| {
@@ -602,7 +761,7 @@ const ModuleEmitCtx = struct {
                     try self.emitType(el.ty);
                     if (el.is_variadic) {
                         try self.out.appendSlice(self.allocator, " = &.{}");
-                    } else if (el.ty.* == .optional) {
+                    } else if (el.is_optional and self.resolveAliasType(el.ty, 0).* == .optional) {
                         try self.out.appendSlice(self.allocator, " = null");
                     }
                 }
@@ -610,17 +769,28 @@ const ModuleEmitCtx = struct {
                 if (variadic_idx) |vi| {
                     try self.out.print(
                         self.allocator,
-                        "pub const zigar_js_tuple = .{{ .variadic_index = @as(?usize, {d}), .optional_mask = @as(u64, 0x{x}), .null_only_mask = @as(u64, 0x{x}) }};",
-                        .{ vi, optional_mask, null_only_mask },
+                        "pub const zigar_js_tuple = .{{ .variadic_index = @as(?usize, {d}), .fields = .{{ ",
+                        .{vi},
                     );
                 } else {
-                    try self.out.print(
+                    try self.out.appendSlice(
                         self.allocator,
-                        "pub const zigar_js_tuple = .{{ .variadic_index = @as(?usize, null), .optional_mask = @as(u64, 0x{x}), .null_only_mask = @as(u64, 0x{x}) }};",
-                        .{ optional_mask, null_only_mask },
+                        "pub const zigar_js_tuple = .{ .variadic_index = @as(?usize, null), .fields = .{ ",
                     );
                 }
-                try self.out.appendSlice(self.allocator, " }");
+                for (elems, 0..) |el, idx| {
+                    if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
+                    try self.out.print(self.allocator, ".{{ .is_optional = {s}, .nullish = ", .{
+                        if (el.is_optional) "true" else "false",
+                    });
+                    if (el.is_variadic) {
+                        try self.emitNullishSpec(self.unwrapSliceElemType(el.ty), false);
+                    } else {
+                        try self.emitNullishSpec(el.ty, el.is_optional);
+                    }
+                    try self.out.appendSlice(self.allocator, " }");
+                }
+                try self.out.appendSlice(self.allocator, " } }; }");
             },
             .fn_ptr => |fp| {
                 try self.out.appendSlice(self.allocator, "*const fn (");
@@ -632,17 +802,33 @@ const ModuleEmitCtx = struct {
                 try self.emitType(fp.return_type);
             },
             .anon_struct => |fields| {
+                const anon_frame = [_][]const u8{"zigar_js"};
+                try self.nested_decl_scopes.append(self.allocator, &anon_frame);
+                defer _ = self.nested_decl_scopes.pop();
+
                 try self.out.appendSlice(self.allocator, "struct {\n");
                 for (fields) |f| {
                     if (f.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
                     try self.out.print(self.allocator, "{s}: ", .{f.zig_ident});
                     try self.emitType(f.ty);
-                    if (f.ty.* == .optional) {
+                    if (f.is_optional and self.resolveAliasType(f.ty, 0).* == .optional) {
                         try self.out.appendSlice(self.allocator, " = null");
                     }
                     try self.out.appendSlice(self.allocator, ",\n");
                 }
-                try self.out.append(self.allocator, '}');
+                try self.out.appendSlice(self.allocator, "pub const zigar_js = .{\n.fields = .{\n");
+                for (fields) |f| {
+                    try self.out.appendSlice(self.allocator, ".{ .name = ");
+                    try self.emitStringLit(f.logical_name);
+                    try self.out.appendSlice(self.allocator, ", .js_name = ");
+                    try self.emitStringLit(f.wire_name);
+                    try self.out.print(self.allocator, ", .is_optional = {s}, .nullish = ", .{
+                        if (f.is_optional) "true" else "false",
+                    });
+                    try self.emitNullishSpec(f.ty, f.is_optional);
+                    try self.out.appendSlice(self.allocator, " },\n");
+                }
+                try self.out.appendSlice(self.allocator, "},\n};\n}");
             },
             .tagged_union => |vars| {
                 try self.out.appendSlice(self.allocator, "union(enum) {\n");
@@ -779,15 +965,6 @@ const ModuleEmitCtx = struct {
         try self.out.appendSlice(self.allocator, "@panic(\"ts-zigar host stub\");\n}\n");
     }
 
-    fn paramNullishEmitTag(p: ir.ParamIr) []const u8 {
-        if (p.is_optional) return "undefined_only";
-        return switch (p.nullish_kind) {
-            .none => "none",
-            .undefined_only => "undefined_only",
-            .null_only, .null_or_undefined => "null_only",
-        };
-    }
-
     fn emitCallableFunctionBody(
         self: *ModuleEmitCtx,
         d: ir.DeclIr,
@@ -808,7 +985,7 @@ const ModuleEmitCtx = struct {
         var first_trailing_opt: usize = fixed_len;
         while (first_trailing_opt > 0 and
             sig.params[first_trailing_opt - 1].is_optional and
-            sig.params[first_trailing_opt - 1].ty.* == .optional)
+            self.resolveAliasType(sig.params[first_trailing_opt - 1].ty, 0).* == .optional)
         {
             first_trailing_opt -= 1;
         }
@@ -833,27 +1010,31 @@ const ModuleEmitCtx = struct {
             }
         }
         for (sig.params[0..fixed_len], 0..) |p, pi| {
-            const nk = paramNullishEmitTag(p);
             if (pi >= first_trailing_opt) {
                 try self.out.print(
                     self.allocator,
-                    "if (__zigar_argc > {d}) try __zigar_js.pushArg(__zigar_args, {s}, .{s});\n",
-                    .{ pi, p.zig_ident, nk },
+                    "if (__zigar_argc > {d}) try __zigar_js.pushArg(__zigar_args, {s}, ",
+                    .{ pi, p.zig_ident },
                 );
             } else {
                 try self.out.print(
                     self.allocator,
-                    "try __zigar_js.pushArg(__zigar_args, {s}, .{s});\n",
-                    .{ p.zig_ident, nk },
+                    "try __zigar_js.pushArg(__zigar_args, {s}, ",
+                    .{p.zig_ident},
                 );
             }
+            try self.emitNullishSpec(p.ty, p.is_optional);
+            try self.out.appendSlice(self.allocator, ");\n");
         }
         if (has_rest) {
+            const rest_param = sig.params[fixed_len];
             try self.out.print(
                 self.allocator,
-                "try __zigar_js.pushRestArgs(__zigar_args, {s});\n",
-                .{sig.params[fixed_len].zig_ident},
+                "try __zigar_js.pushRestArgs(__zigar_args, {s}, ",
+                .{rest_param.zig_ident},
             );
+            try self.emitNullishSpec(self.unwrapSliceElemType(rest_param.ty), false);
+            try self.out.appendSlice(self.allocator, ");\n");
         }
 
         if (alloc_ident_opt) |alloc_param| {
@@ -889,44 +1070,28 @@ const ModuleEmitCtx = struct {
             self.ns_wire_path.items.len == 0 and
             (d.is_default_export or self.isExportEqualsRootDecl(d));
 
+        var param_type_exprs = try self.allocator.alloc(?[]u8, sig.params.len);
+        @memset(param_type_exprs, null);
+        defer {
+            for (param_type_exprs) |pte_opt| {
+                if (pte_opt) |buf| self.allocator.free(buf);
+            }
+            self.allocator.free(param_type_exprs);
+        }
+
+        if (d.alloc_companion_ident != null) {
+            for (sig.params, 0..) |p, pi| {
+                if (typeHasInlineNominal(p.ty)) {
+                    param_type_exprs[pi] = try self.emitSharedNominalTypeExpr(p.ty, sig);
+                }
+            }
+        }
+
         var ret_type_expr_opt: ?[]u8 = null;
         defer if (ret_type_expr_opt) |buf| self.allocator.free(buf);
 
         if (typeHasInlineNominal(sig.return_type)) {
-            const ret_ident = try self.freshPrivateRetTypeIdent(sig.type_params);
-            defer self.allocator.free(ret_ident);
-
-            if (sig.type_params.len == 0) {
-                try self.out.print(self.allocator, "const {s} = ", .{ret_ident});
-                try self.emitType(sig.return_type);
-                try self.out.appendSlice(self.allocator, ";\n");
-                ret_type_expr_opt = try self.allocator.dupe(u8, ret_ident);
-            } else {
-                try self.out.print(self.allocator, "fn {s}(", .{ret_ident});
-                for (sig.type_params, 0..) |tp, idx| {
-                    if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
-                    try self.out.print(self.allocator, "comptime {s}: type", .{tp.zig_ident});
-                }
-                try self.out.appendSlice(self.allocator, ") type {\n");
-                for (sig.type_params) |tp| {
-                    if (!typeUsesTypeParam(sig.return_type, tp.zig_ident)) {
-                        try self.out.print(self.allocator, "_ = {s};\n", .{tp.zig_ident});
-                    }
-                }
-                try self.out.appendSlice(self.allocator, "return ");
-                try self.emitType(sig.return_type);
-                try self.out.appendSlice(self.allocator, ";\n}\n");
-
-                var expr: std.ArrayList(u8) = .empty;
-                errdefer expr.deinit(self.allocator);
-                try expr.print(self.allocator, "{s}(", .{ret_ident});
-                for (sig.type_params, 0..) |tp, idx| {
-                    if (idx > 0) try expr.appendSlice(self.allocator, ", ");
-                    try expr.appendSlice(self.allocator, tp.zig_ident);
-                }
-                try expr.append(self.allocator, ')');
-                ret_type_expr_opt = try expr.toOwnedSlice(self.allocator);
-            }
+            ret_type_expr_opt = try self.emitSharedNominalTypeExpr(sig.return_type, sig);
         }
 
         if (d.jsdoc) |jd| {
@@ -940,10 +1105,14 @@ const ModuleEmitCtx = struct {
             try self.out.print(self.allocator, "comptime {s}: type", .{tp.zig_ident});
             param_count += 1;
         }
-        for (sig.params) |p| {
+        for (sig.params, 0..) |p, pi| {
             if (param_count > 0) try self.out.appendSlice(self.allocator, ", ");
             try self.out.print(self.allocator, "{s}: ", .{p.zig_ident});
-            try self.emitType(p.ty);
+            if (param_type_exprs[pi]) |ptexpr| {
+                try self.out.appendSlice(self.allocator, ptexpr);
+            } else {
+                try self.emitType(p.ty);
+            }
             param_count += 1;
         }
         try self.out.appendSlice(self.allocator, ") __zigar_js.CallError!");
@@ -981,9 +1150,13 @@ const ModuleEmitCtx = struct {
             if (ap_count > 0) try self.out.appendSlice(self.allocator, ", ");
             try self.out.print(self.allocator, "{s}: @import(\"std\").mem.Allocator", .{alloc_param});
             ap_count += 1;
-            for (sig.params) |p| {
+            for (sig.params, 0..) |p, pi| {
                 try self.out.print(self.allocator, ", {s}: ", .{p.zig_ident});
-                try self.emitType(p.ty);
+                if (param_type_exprs[pi]) |ptexpr| {
+                    try self.out.appendSlice(self.allocator, ptexpr);
+                } else {
+                    try self.emitType(p.ty);
+                }
             }
             try self.out.appendSlice(self.allocator, ") __zigar_js.CallError!");
             if (ret_type_expr_opt) |rtexpr| {
@@ -1049,7 +1222,7 @@ const ModuleEmitCtx = struct {
             if (f.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
             try self.out.print(self.allocator, "{s}: ", .{f.zig_ident});
             try self.emitType(f.ty);
-            if (f.ty.* == .optional) {
+            if (f.is_optional and self.resolveAliasType(f.ty, 0).* == .optional) {
                 try self.out.appendSlice(self.allocator, " = null");
             }
             try self.out.appendSlice(self.allocator, ",\n");
@@ -1069,6 +1242,8 @@ const ModuleEmitCtx = struct {
                     false,
                     if (push_owner_seg) wire_name else null,
                 );
+                try self.out.appendSlice(self.allocator, ", ");
+                try self.emitNullishSpec(sp.ty, false);
                 try self.out.appendSlice(self.allocator, ") = .{};\n");
             }
         }
@@ -1123,6 +1298,10 @@ const ModuleEmitCtx = struct {
             try self.emitStringLit(f.logical_name);
             try self.out.appendSlice(self.allocator, ", .js_name = ");
             try self.emitStringLit(f.wire_name);
+            try self.out.print(self.allocator, ", .is_optional = {s}, .nullish = ", .{
+                if (f.is_optional) "true" else "false",
+            });
+            try self.emitNullishSpec(f.ty, f.is_optional);
             try self.out.appendSlice(self.allocator, " },\n");
         }
         try self.out.appendSlice(self.allocator, "},\n.methods = .{\n");
@@ -1160,7 +1339,7 @@ const ModuleEmitCtx = struct {
                             false,
                             if (push_owner_seg) wire_name else null,
                         );
-                        try self.out.appendSlice(self.allocator, ") = .{};\n");
+                        try self.out.appendSlice(self.allocator, ", .none) = .{};\n");
                     },
                     .str => |s| {
                         try self.out.print(self.allocator, "pub const {s}: []const u8 = ", .{m.zig_ident});
@@ -1178,7 +1357,7 @@ const ModuleEmitCtx = struct {
                                 false,
                                 if (push_owner_seg) wire_name else null,
                             );
-                            try self.out.appendSlice(self.allocator, ") = .{};\n");
+                            try self.out.appendSlice(self.allocator, ", .none) = .{};\n");
                         }
                     },
                 }
@@ -1278,6 +1457,8 @@ const ModuleEmitCtx = struct {
                 try self.emitType(gty);
                 try self.out.appendSlice(self.allocator, ", ");
                 try self.emitCallTargetLiteral(d.is_global_scope, d.wire_name, false, null);
+                try self.out.appendSlice(self.allocator, ", ");
+                try self.emitNullishSpec(gty, false);
                 try self.out.appendSlice(self.allocator, ") = .{};\n");
             },
             .struct_decl => |st| {
@@ -2266,13 +2447,17 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    return try Args.init();
         \\}
         \\
-        \\pub fn toJsRefWithNullish(comptime T: type, value: T, comptime nk: NullishKind) CallError!Any {
+        \\pub fn toJsRefWithSpec(comptime T: type, value: T, comptime spec: anytype) CallError!Any {
         \\    if (!has_host) return error.HostUnavailable;
-        \\    return try raw_js.toJsRefWithNullish(T, value, nk);
+        \\    return try raw_js.toJsRefWithSpec(T, value, spec);
+        \\}
+        \\
+        \\pub fn toJsRefWithNullish(comptime T: type, value: T, comptime nk: NullishKind) CallError!Any {
+        \\    return toJsRefWithSpec(T, value, nk);
         \\}
         \\
         \\pub fn toJsRef(comptime T: type, value: T) CallError!Any {
-        \\    return toJsRefWithNullish(T, value, .null_or_undefined);
+        \\    return toJsRefWithSpec(T, value, .null_or_undefined);
         \\}
         \\
         \\pub fn fromJsRefAlloc(comptime T: type, allocator: std.mem.Allocator, value: anytype) CallError!T {
@@ -2355,19 +2540,19 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    }
         \\}
         \\
-        \\pub fn pushArg(args: Args, value: anytype, comptime nk: NullishKind) CallError!void {
+        \\pub fn pushArg(args: Args, value: anytype, comptime spec: anytype) CallError!void {
         \\    if (!has_host) return error.HostUnavailable;
-        \\    const encoded = try toJsRefWithNullish(@TypeOf(value), value, nk);
+        \\    const encoded = try toJsRefWithSpec(@TypeOf(value), value, spec);
         \\    defer encoded.deinit();
         \\    _ = try args.push(encoded);
         \\}
         \\
-        \\pub fn pushRestArgs(args: Args, slice_val: anytype) CallError!void {
+        \\pub fn pushRestArgs(args: Args, slice_val: anytype, comptime elem_spec: anytype) CallError!void {
         \\    if (!has_host) return error.HostUnavailable;
         \\    const SliceT = @TypeOf(slice_val);
         \\    const ElemT = @typeInfo(SliceT).pointer.child;
         \\    for (slice_val) |item| {
-        \\        const encoded = try toJsRefWithNullish(ElemT, item, .null_or_undefined);
+        \\        const encoded = try toJsRefWithSpec(ElemT, item, elem_spec);
         \\        defer encoded.deinit();
         \\        _ = try args.push(encoded);
         \\    }
@@ -2500,10 +2685,11 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    cur.deinit();
         \\}
         \\
-        \\pub fn GlobalTarget(comptime T: type, comptime target: CallTarget) type {
+        \\pub fn GlobalTarget(comptime T: type, comptime target: CallTarget, comptime spec: anytype) type {
         \\    return struct {
         \\        pub const ValueType = T;
         \\        pub const call_target: CallTarget = target;
+        \\        pub const nullish_spec = spec;
         \\
         \\        js_name: []const u8 = target.name,
         \\
@@ -2523,16 +2709,17 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\
         \\        pub fn set(_: @This(), value: T) CallError!void {
         \\            if (!has_host) return error.HostUnavailable;
-        \\            const encoded = try toJsRefWithNullish(T, value, .null_or_undefined);
+        \\            const encoded = try toJsRefWithSpec(T, value, spec);
         \\            defer encoded.deinit();
         \\            try setGlobalTargetRaw(target, encoded);
         \\        }
         \\    };
         \\}
         \\
-        \\pub fn Global(comptime T: type) type {
+        \\pub fn GlobalWithSpec(comptime T: type, comptime spec: anytype) type {
         \\    return struct {
         \\        pub const ValueType = T;
+        \\        pub const nullish_spec = spec;
         \\
         \\        js_name: []const u8,
         \\        module: ?[]const u8 = null,
@@ -2563,7 +2750,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\
         \\        pub fn set(self: @This(), value: T) CallError!void {
         \\            if (!has_host) return error.HostUnavailable;
-        \\            const encoded = try toJsRefWithNullish(T, value, .null_or_undefined);
+        \\            const encoded = try toJsRefWithSpec(T, value, spec);
         \\            defer encoded.deinit();
         \\            var cur: Any = if (self.module) |m|
         \\                .{ .handle = (try raw_js.importModuleDynamic(m)).handle }
@@ -2573,6 +2760,10 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\            try raw_js.trySetPropDynamic(cur, self.js_name, encoded);
         \\        }
         \\    };
+        \\}
+        \\
+        \\pub fn Global(comptime T: type) type {
+        \\    return GlobalWithSpec(T, .null_or_undefined);
         \\}
         \\
     );

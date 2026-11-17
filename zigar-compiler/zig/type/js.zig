@@ -4912,12 +4912,38 @@ pub fn Js(comptime host: type) type {
             }
         }
 
+        fn resolveNullishTag(comptime raw: anytype) module.NullishKind {
+            const RawT = @TypeOf(raw);
+            if (RawT == module.NullishKind) return raw;
+            return switch (@typeInfo(RawT)) {
+                .enum_literal, .@"enum" => @field(module.NullishKind, @tagName(raw)),
+                else => @compileError("Invalid nullish tag type: " ++ @typeName(RawT)),
+            };
+        }
+
+        fn specSelfNullish(comptime spec: anytype) module.NullishKind {
+            const SpecT = @TypeOf(spec);
+            if (SpecT == module.NullishKind) return spec;
+            return switch (@typeInfo(SpecT)) {
+                .enum_literal, .@"enum" => resolveNullishTag(spec),
+                .@"struct" => if (@hasField(SpecT, "self")) resolveNullishTag(spec.self) else .none,
+                else => .none,
+            };
+        }
+
         fn tupleFieldIsOptional(comptime T: type, comptime idx: usize) bool {
             const meta = T.zigar_js_tuple;
             if (@hasField(@TypeOf(meta), "variadic_index")) {
                 if (meta.variadic_index) |vi| {
                     if (idx == vi) return false;
                 }
+            }
+            if (@hasField(@TypeOf(meta), "fields")) {
+                if (idx < meta.fields.len) {
+                    const fm = meta.fields[idx];
+                    if (@hasField(@TypeOf(fm), "is_optional")) return fm.is_optional;
+                }
+                return false;
             }
             if (@hasField(@TypeOf(meta), "optional_mask") and idx < 64) {
                 return ((meta.optional_mask >> @intCast(idx)) & 1) != 0;
@@ -4943,12 +4969,30 @@ pub fn Js(comptime host: type) type {
                 if (@hasField(@TypeOf(meta), "fields")) {
                     inline for (meta.fields) |fm| {
                         if (std.mem.eql(u8, fm.name, field_name)) {
-                            return fm.js_name;
+                            if (@hasField(@TypeOf(fm), "js_name")) return fm.js_name;
+                            return field_name;
                         }
                     }
                 }
             }
             return field_name;
+        }
+
+        fn structFieldIsOptional(comptime T: type, comptime field_idx: usize) bool {
+            const st = @typeInfo(T).@"struct";
+            const field_name = st.field_names[field_idx];
+            if (@hasDecl(T, "zigar_js")) {
+                const meta = T.zigar_js;
+                if (@hasField(@TypeOf(meta), "fields")) {
+                    inline for (meta.fields) |fm| {
+                        if (std.mem.eql(u8, fm.name, field_name)) {
+                            if (@hasField(@TypeOf(fm), "is_optional")) return fm.is_optional;
+                            break;
+                        }
+                    }
+                }
+            }
+            return @typeInfo(st.field_types[field_idx]) == .optional and st.field_attrs[field_idx].default_value_ptr != null;
         }
 
         fn binaryIsKind(value: Ref(module.Any), kind: module.BinaryKind) module.Error!bool {
@@ -4962,10 +5006,10 @@ pub fn Js(comptime host: type) type {
             );
         }
 
-        pub fn toJsRefWithNullish(
+        pub fn toJsRefWithSpec(
             comptime T: type,
             value: T,
-            comptime nullish_kind: module.NullishKind,
+            comptime spec: anytype,
         ) module.CallError!Ref(module.Any) {
             if (T == void) return Ref(module.Any).@"undefined";
             if (T == bool) return Ref(module.Any).fromBool(value);
@@ -4974,18 +5018,26 @@ pub fn Js(comptime host: type) type {
                 return try r.tryClone();
             }
             if (comptime isNullableType(T)) {
+                const child_spec = comptime if (@typeInfo(@TypeOf(spec)) == .@"struct" and @hasField(@TypeOf(spec), "child"))
+                    spec.child
+                else
+                    module.NullishKind.none;
                 return switch (value) {
                     .@"undefined" => Ref(module.Any).@"undefined",
                     .@"null" => Ref(module.Any).@"null",
-                    .value => |v| toJsRefWithNullish(T.Value, v, .none),
+                    .value => |v| toJsRefWithSpec(T.Value, v, child_spec),
                 };
             }
             switch (@typeInfo(T)) {
                 .optional => |op| {
                     if (value) |v| {
-                        return toJsRefWithNullish(op.child, v, .none);
+                        const child_spec = comptime if (@typeInfo(@TypeOf(spec)) == .@"struct" and @hasField(@TypeOf(spec), "child"))
+                            spec.child
+                        else
+                            module.NullishKind.none;
+                        return toJsRefWithSpec(op.child, v, child_spec);
                     }
-                    return switch (nullish_kind) {
+                    return switch (comptime specSelfNullish(spec)) {
                         .null_only, .null_or_undefined => Ref(module.Any).@"null",
                         .none, .undefined_only => Ref(module.Any).@"undefined",
                     };
@@ -5006,10 +5058,14 @@ pub fn Js(comptime host: type) type {
                             const str = try String.fromSlice(value);
                             return str.toRef();
                         }
+                        const elem_spec = comptime if (@typeInfo(@TypeOf(spec)) == .@"struct" and @hasField(@TypeOf(spec), "elem"))
+                            spec.elem
+                        else
+                            module.NullishKind.none;
                         const js_arr = try Array(Ref(module.Any)).withCapacity(value.len);
                         errdefer js_arr.deinit();
                         for (value, 0..) |elem, idx| {
-                            const elem_ref = try toJsRefWithNullish(pt.child, elem, .none);
+                            const elem_ref = try toJsRefWithSpec(pt.child, elem, elem_spec);
                             defer elem_ref.deinit();
                             try js_arr.set(idx, elem_ref);
                         }
@@ -5023,7 +5079,7 @@ pub fn Js(comptime host: type) type {
                             const str = try String.fromSlice(value);
                             return str.toRef();
                         }
-                        return toJsRefWithNullish(pt.child, value.*, nullish_kind);
+                        return toJsRefWithSpec(pt.child, value.*, spec);
                     },
                     else => @compileError("Unsupported pointer type for JS conversion: " ++ @typeName(T)),
                 },
@@ -5046,8 +5102,13 @@ pub fn Js(comptime host: type) type {
                             }
                             inline for (st.field_names, 0..) |fname, fi| {
                                 if (fi < effective_len) {
-                                    const nk = comptime tupleFieldNullishKind(T, fi);
-                                    const elem_ref = try toJsRefWithNullish(st.field_types[fi], @field(value, fname), nk);
+                                    const fspec = comptime blk: {
+                                        if (@hasField(@TypeOf(meta), "fields") and fi < meta.fields.len and @hasField(@TypeOf(meta.fields[fi]), "nullish")) {
+                                            break :blk meta.fields[fi].nullish;
+                                        }
+                                        break :blk tupleFieldNullishKind(T, fi);
+                                    };
+                                    const elem_ref = try toJsRefWithSpec(st.field_types[fi], @field(value, fname), fspec);
                                     defer elem_ref.deinit();
                                     _ = try js_arr.push(elem_ref);
                                 }
@@ -5072,21 +5133,37 @@ pub fn Js(comptime host: type) type {
                                 const ftype = st.field_types[fi];
                                 if (comptime (fi < v_idx)) {
                                     if (fi < leading_len) {
-                                        const nk = comptime tupleFieldNullishKind(T, fi);
-                                        const elem_ref = try toJsRefWithNullish(ftype, @field(value, fname), nk);
+                                        const fspec = comptime blk: {
+                                            if (@hasField(@TypeOf(meta), "fields") and fi < meta.fields.len and @hasField(@TypeOf(meta.fields[fi]), "nullish")) {
+                                                break :blk meta.fields[fi].nullish;
+                                            }
+                                            break :blk tupleFieldNullishKind(T, fi);
+                                        };
+                                        const elem_ref = try toJsRefWithSpec(ftype, @field(value, fname), fspec);
                                         defer elem_ref.deinit();
                                         _ = try js_arr.push(elem_ref);
                                     }
                                 } else if (comptime (fi == v_idx)) {
                                     const RestElem = @typeInfo(ftype).pointer.child;
+                                    const rest_elem_spec = comptime blk: {
+                                        if (@hasField(@TypeOf(meta), "fields") and fi < meta.fields.len and @hasField(@TypeOf(meta.fields[fi]), "nullish")) {
+                                            break :blk meta.fields[fi].nullish;
+                                        }
+                                        break :blk module.NullishKind.none;
+                                    };
                                     for (rest_slice) |re| {
-                                        const elem_ref = try toJsRefWithNullish(RestElem, re, .none);
+                                        const elem_ref = try toJsRefWithSpec(RestElem, re, rest_elem_spec);
                                         defer elem_ref.deinit();
                                         _ = try js_arr.push(elem_ref);
                                     }
                                 } else {
-                                    const nk = comptime tupleFieldNullishKind(T, fi);
-                                    const elem_ref = try toJsRefWithNullish(ftype, @field(value, fname), nk);
+                                    const fspec = comptime blk: {
+                                        if (@hasField(@TypeOf(meta), "fields") and fi < meta.fields.len and @hasField(@TypeOf(meta.fields[fi]), "nullish")) {
+                                            break :blk meta.fields[fi].nullish;
+                                        }
+                                        break :blk tupleFieldNullishKind(T, fi);
+                                    };
+                                    const elem_ref = try toJsRefWithSpec(ftype, @field(value, fname), fspec);
                                     defer elem_ref.deinit();
                                     _ = try js_arr.push(elem_ref);
                                 }
@@ -5096,22 +5173,41 @@ pub fn Js(comptime host: type) type {
                     }
 
                     if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_enum") and T.zigar_js.is_enum and @hasField(T, "__zigar_value")) {
-                        return toJsRefWithNullish(@TypeOf(value.__zigar_value), value.__zigar_value, .none);
+                        return toJsRefWithSpec(@TypeOf(value.__zigar_value), value.__zigar_value, module.NullishKind.none);
                     }
 
                     const rec = try Record([]const u8, Ref(module.Any)).init();
                     errdefer rec.deinit();
                     inline for (st.field_names, 0..) |fname, fi| {
                         const ftype = st.field_types[fi];
+                        const fval = @field(value, fname);
                         const wire_key = comptime structFieldWireName(T, fname);
-                        if (@typeInfo(ftype) == .optional and st.field_attrs[fi].default_value_ptr != null) {
-                            if (@field(value, fname)) |present| {
-                                const prop_ref = try toJsRefWithNullish(@typeInfo(ftype).optional.child, present, .none);
+                        const is_opt = comptime structFieldIsOptional(T, fi);
+                        const field_spec = comptime blk: {
+                            if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "fields")) {
+                                for (T.zigar_js.fields) |fm| {
+                                    if (std.mem.eql(u8, fm.name, fname)) {
+                                        if (@hasField(@TypeOf(fm), "nullish")) break :blk fm.nullish;
+                                        break;
+                                    }
+                                }
+                            }
+                            break :blk module.NullishKind.null_or_undefined;
+                        };
+                        if (comptime (is_opt and isNullableType(ftype))) {
+                            if (fval != .@"undefined") {
+                                const prop_ref = try toJsRefWithSpec(ftype, fval, field_spec);
+                                defer prop_ref.deinit();
+                                try rec.set(wire_key, prop_ref);
+                            }
+                        } else if (comptime (is_opt and @typeInfo(ftype) == .optional)) {
+                            if (fval != null) {
+                                const prop_ref = try toJsRefWithSpec(ftype, fval, field_spec);
                                 defer prop_ref.deinit();
                                 try rec.set(wire_key, prop_ref);
                             }
                         } else {
-                            const prop_ref = try toJsRefWithNullish(ftype, @field(value, fname), .null_or_undefined);
+                            const prop_ref = try toJsRefWithSpec(ftype, fval, field_spec);
                             defer prop_ref.deinit();
                             try rec.set(wire_key, prop_ref);
                         }
@@ -5126,7 +5222,7 @@ pub fn Js(comptime host: type) type {
                                     return (try String.fromSlice(m.str_value)).toRef();
                                 }
                                 if (@hasField(@TypeOf(m), "num_value")) {
-                                    return toJsRefWithNullish(f64, m.num_value, .none);
+                                    return toJsRefWithSpec(f64, m.num_value, module.NullishKind.none);
                                 }
                             }
                         }
@@ -5135,15 +5231,23 @@ pub fn Js(comptime host: type) type {
                 },
                 .@"union" => {
                     return switch (value) {
-                        inline else => |payload| toJsRefWithNullish(@TypeOf(payload), payload, .none),
+                        inline else => |payload| toJsRefWithSpec(@TypeOf(payload), payload, module.NullishKind.none),
                     };
                 },
                 else => @compileError("Unsupported Zig type for JS conversion: " ++ @typeName(T)),
             }
         }
 
+        pub fn toJsRefWithNullish(
+            comptime T: type,
+            value: T,
+            comptime nullish_kind: module.NullishKind,
+        ) module.CallError!Ref(module.Any) {
+            return toJsRefWithSpec(T, value, nullish_kind);
+        }
+
         pub fn toJsRef(comptime T: type, value: T) module.CallError!Ref(module.Any) {
-            return toJsRefWithNullish(T, value, .none);
+            return toJsRefWithSpec(T, value, module.NullishKind.none);
         }
 
         pub fn fromJsRefAlloc(
@@ -5385,7 +5489,7 @@ pub fn Js(comptime host: type) type {
                     inline for (st.field_names, 0..) |fname, fi| {
                         const ftype = st.field_types[fi];
                         const wire_key = comptime structFieldWireName(T, fname);
-                        const prop_ref = try obj.tryGetDynamic(Ref(module.Any), wire_key);
+                        const prop_ref = try getProp(module.CallError!Ref(module.Any), obj, wire_key);
                         defer prop_ref.deinit();
                         @field(out, fname) = try fromJsRefAlloc(ftype, allocator, prop_ref);
                         field_init[fi] = true;
@@ -7079,24 +7183,34 @@ test "CallbackRegistry: FIFO reuse, permanent retirement at 0xFFF, multi-slab O(
 }
 
 test "Js.String, Nullable(T), needsDecodeAllocator, and tuple/slice marshaling helpers" {
+    const RecProp = struct {
+        key: []u8,
+        val: u32,
+    };
+
     const ValEntry = union(enum) {
         unused,
         str: []u8,
         num: f64,
         bi: i64,
         arr: std.ArrayList(u32),
+        rec: std.ArrayList(RecProp),
         buf: usize,
     };
 
     const MarshalingMockHost = struct {
-        var entries: [128]ValEntry = @splat(.unused);
-        var refcounts: [128]u32 = @splat(0);
+        var entries: [256]ValEntry = @splat(.unused);
+        var refcounts: [256]u32 = @splat(0);
 
         fn reset() void {
             for (&entries, 0..) |*e, idx| {
                 switch (e.*) {
                     .str => |s| std.testing.allocator.free(s),
                     .arr => |*a| a.deinit(std.testing.allocator),
+                    .rec => |*r| {
+                        for (r.items) |kv| std.testing.allocator.free(kv.key);
+                        r.deinit(std.testing.allocator);
+                    },
                     else => {},
                 }
                 e.* = .unused;
@@ -7135,6 +7249,13 @@ test "Js.String, Nullable(T), needsDecodeAllocator, and tuple/slice marshaling h
                         for (a.items) |child_h| releaseJsValue(child_h);
                         a.deinit(std.testing.allocator);
                     },
+                    .rec => |*r| {
+                        for (r.items) |kv| {
+                            std.testing.allocator.free(kv.key);
+                            releaseJsValue(kv.val);
+                        }
+                        r.deinit(std.testing.allocator);
+                    },
                     else => {},
                 }
                 entries[slot] = .unused;
@@ -7150,7 +7271,7 @@ test "Js.String, Nullable(T), needsDecodeAllocator, and tuple/slice marshaling h
                 .str => .string,
                 .num => .number,
                 .bi => .bigint,
-                .arr, .buf => .object,
+                .arr, .rec, .buf => .object,
                 .unused => .@"undefined",
             };
         }
@@ -7305,6 +7426,58 @@ test "Js.String, Nullable(T), needsDecodeAllocator, and tuple/slice marshaling h
                             arr_ptr.append(std.testing.allocator, cloneJsValue(f.@"1".handle)) catch return .FAULT;
                             f.retval = arr_ptr.items.len;
                         },
+                        .record_init => {
+                            const Frame = arg_struct.ArgStruct(fn () Error!J.Record([]const u8, J.Ref(Any)));
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            f.retval = .{ .handle = allocVal(.{ .rec = .empty }) };
+                        },
+                        .record_set => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), []const u8, J.Ref(Any)) Error!void);
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            var rec_ptr = &entries[f.@"0".handle & 0xFFFFF].rec;
+                            for (rec_ptr.items) |*kv| {
+                                if (std.mem.eql(u8, kv.key, f.@"1")) {
+                                    releaseJsValue(kv.val);
+                                    kv.val = cloneJsValue(f.@"2".handle);
+                                    f.retval = {};
+                                    return .SUCCESS;
+                                }
+                            }
+                            const k_copy = std.testing.allocator.dupe(u8, f.@"1") catch return .FAULT;
+                            rec_ptr.append(std.testing.allocator, .{ .key = k_copy, .val = cloneJsValue(f.@"2".handle) }) catch {
+                                std.testing.allocator.free(k_copy);
+                                return .FAULT;
+                            };
+                            f.retval = {};
+                        },
+                        .record_get => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), []const u8, usize) Error!J.Ref(Any));
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const rec_items = entries[f.@"0".handle & 0xFFFFF].rec.items;
+                            const missing_ptr: *u8 = @ptrFromInt(f.@"2");
+                            for (rec_items) |kv| {
+                                if (std.mem.eql(u8, kv.key, f.@"1")) {
+                                    missing_ptr.* = 0;
+                                    f.retval = .{ .handle = cloneJsValue(kv.val) };
+                                    return .SUCCESS;
+                                }
+                            }
+                            missing_ptr.* = 1;
+                            f.retval = .{ .handle = 0 };
+                        },
+                        .record_has => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), []const u8) Error!bool);
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const rec_items = entries[f.@"0".handle & 0xFFFFF].rec.items;
+                            var found = false;
+                            for (rec_items) |kv| {
+                                if (std.mem.eql(u8, kv.key, f.@"1")) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            f.retval = found;
+                        },
                         else => return .FAULT,
                     }
                 },
@@ -7426,6 +7599,158 @@ test "Js.String, Nullable(T), needsDecodeAllocator, and tuple/slice marshaling h
     try std.testing.expectError(error.TypeError, js.fromJsRefAlloc([]const u8, alloc, non_str));
     try std.testing.expect(!js.hasLastError());
     non_str.deinit();
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    // 6. Recursive NullishSpec: slices, required vs optional struct fields, Nullable(T), and >64-elem tuples
+    {
+        const s_null_arr = try js.toJsRefWithSpec([]const ?[]const u8, &.{ "hi", null }, .{ .self = .none, .elem = .null_only });
+        defer s_null_arr.deinit();
+        const js_sn = js.Array(js.Ref(js.Any)).fromRef(s_null_arr);
+        try expectEqual(@as(usize, 2), try js_sn.len());
+        const sn0 = try js_sn.get(0);
+        defer sn0.deinit();
+        try expect(try js.String.isString(sn0));
+        const sn1 = try js_sn.get(1);
+        defer sn1.deinit();
+        try expect(sn1.isNull());
+
+        const n_undef_arr = try js.toJsRefWithSpec([]const ?f64, &.{ 1.0, null }, .{ .self = .none, .elem = .undefined_only });
+        defer n_undef_arr.deinit();
+        const js_nu = js.Array(js.Ref(js.Any)).fromRef(n_undef_arr);
+        try expectEqual(@as(usize, 2), try js_nu.len());
+        const nu1 = try js_nu.get(1);
+        defer nu1.deinit();
+        try expect(nu1.isUndefined());
+
+        const Payload = struct {
+            req_null: ?f64,
+            req_undef: ?f64,
+            opt_num: ?f64 = null,
+            opt_tri: js.Nullable(f64) = .@"undefined",
+            items: ?[]const ?[]const u8 = null,
+
+            pub const zigar_js = .{
+                .fields = .{
+                    .{ .name = "req_null", .js_name = "reqNull", .is_optional = false, .nullish = .null_only },
+                    .{ .name = "req_undef", .js_name = "reqUndef", .is_optional = false, .nullish = .undefined_only },
+                    .{ .name = "opt_num", .js_name = "optNum", .is_optional = true, .nullish = .undefined_only },
+                    .{ .name = "opt_tri", .js_name = "optTri", .is_optional = true, .nullish = .null_only },
+                    .{
+                        .name = "items",
+                        .js_name = "items",
+                        .is_optional = true,
+                        .nullish = .{ .self = .undefined_only, .child = .{ .self = .none, .elem = .null_only } },
+                    },
+                },
+            };
+        };
+
+        // Case A: required null/undefined preserved, optional null/.undefined omitted
+        const p1_ref = try js.toJsRef(Payload, .{ .req_null = null, .req_undef = null });
+        defer p1_ref.deinit();
+        const p1_rec = js.Record([]const u8, js.Ref(js.Any)).fromRef(p1_ref);
+        try expect(try p1_rec.has("reqNull"));
+        try expect((try p1_rec.get("reqNull")).?.isNull());
+        try expect(try p1_rec.has("reqUndef"));
+        try expect((try p1_rec.get("reqUndef")).?.isUndefined());
+        try expect(!try p1_rec.has("optNum"));
+        try expect((try p1_rec.get("optNum")) == null);
+        try expect(!try p1_rec.has("optTri"));
+        try expect(!try p1_rec.has("items"));
+
+        // Case B: optional Nullable(f64) set to .null MUST be emitted as null; items present preserves element null
+        const p2_ref = try js.toJsRef(Payload, .{
+            .req_null = 5.0,
+            .req_undef = 6.0,
+            .opt_tri = .@"null",
+            .items = &.{ "ok", null },
+        });
+        defer p2_ref.deinit();
+        const p2_rec = js.Record([]const u8, js.Ref(js.Any)).fromRef(p2_ref);
+        try expect(try p2_rec.has("optTri"));
+        try expect((try p2_rec.get("optTri")).?.isNull());
+        try expect(try p2_rec.has("items"));
+        const p2_items_ref = (try p2_rec.get("items")).?;
+        defer p2_items_ref.deinit();
+        const p2_items = js.Array(js.Ref(js.Any)).fromRef(p2_items_ref);
+        try expectEqual(@as(usize, 2), try p2_items.len());
+        const p2_i1 = try p2_items.get(1);
+        defer p2_i1.deinit();
+        try expect(p2_i1.isNull());
+
+        // Case C: Tuple `.fields` metadata with undefined_only, null_only, optional, and variadic rest null_only
+        const SpecTuple = struct {
+            v: ?f64,
+            w: ?[]const u8,
+            opt: ?bool = null,
+            rest: []const ?f64 = &.{},
+            pub const zigar_js_tuple = .{
+                .variadic_index = @as(?usize, 3),
+                .fields = .{
+                    .{ .is_optional = false, .nullish = .undefined_only },
+                    .{ .is_optional = false, .nullish = .null_only },
+                    .{ .is_optional = true, .nullish = .undefined_only },
+                    .{ .is_optional = false, .nullish = .null_only },
+                },
+            };
+        };
+        const st_ref = try js.toJsRef(SpecTuple, .{
+            .v = null,
+            .w = null,
+            .opt = null,
+            .rest = &.{ 9.0, null },
+        });
+        defer st_ref.deinit();
+        const st_arr = js.Array(js.Ref(js.Any)).fromRef(st_ref);
+        try expectEqual(@as(usize, 5), try st_arr.len());
+        try expect((try st_arr.get(0)).isUndefined());
+        try expect((try st_arr.get(1)).isNull());
+        try expect((try st_arr.get(2)).isUndefined());
+        const st_3 = try st_arr.get(3);
+        defer st_3.deinit();
+        try expectEqual(@as(f64, 9.0), try js.fromJsRef(f64, st_3));
+        try expect((try st_arr.get(4)).isNull());
+
+        // Case D: 66-element tuple (>64 elements) exercises index 64 (.undefined_only) and index 65 (is_optional = true)
+        const Wide66 = struct {
+            @"0": bool = true, @"1": bool = true, @"2": bool = true, @"3": bool = true,
+            @"4": bool = true, @"5": bool = true, @"6": bool = true, @"7": bool = true,
+            @"8": bool = true, @"9": bool = true, @"10": bool = true, @"11": bool = true,
+            @"12": bool = true, @"13": bool = true, @"14": bool = true, @"15": bool = true,
+            @"16": bool = true, @"17": bool = true, @"18": bool = true, @"19": bool = true,
+            @"20": bool = true, @"21": bool = true, @"22": bool = true, @"23": bool = true,
+            @"24": bool = true, @"25": bool = true, @"26": bool = true, @"27": bool = true,
+            @"28": bool = true, @"29": bool = true, @"30": bool = true, @"31": bool = true,
+            @"32": bool = true, @"33": bool = true, @"34": bool = true, @"35": bool = true,
+            @"36": bool = true, @"37": bool = true, @"38": bool = true, @"39": bool = true,
+            @"40": bool = true, @"41": bool = true, @"42": bool = true, @"43": bool = true,
+            @"44": bool = true, @"45": bool = true, @"46": bool = true, @"47": bool = true,
+            @"48": bool = true, @"49": bool = true, @"50": bool = true, @"51": bool = true,
+            @"52": bool = true, @"53": bool = true, @"54": bool = true, @"55": bool = true,
+            @"56": bool = true, @"57": bool = true, @"58": bool = true, @"59": bool = true,
+            @"60": bool = true, @"61": bool = true, @"62": bool = true, @"63": bool = true,
+            @"64": ?f64,
+            @"65": ?f64 = null,
+            pub const zigar_js_tuple = blk: {
+                const Entry = struct { is_optional: bool, nullish: js.NullishKind };
+                const prefix: [64]Entry = @splat(.{ .is_optional = false, .nullish = .none });
+                const suffix = [_]Entry{
+                    .{ .is_optional = false, .nullish = .undefined_only },
+                    .{ .is_optional = true, .nullish = .undefined_only },
+                };
+                break :blk .{
+                    .variadic_index = @as(?usize, null),
+                    .fields = prefix ++ suffix,
+                };
+            };
+        };
+        const w66_ref = try js.toJsRef(Wide66, .{ .@"64" = null });
+        defer w66_ref.deinit();
+        const w66_arr = js.Array(js.Ref(js.Any)).fromRef(w66_ref);
+        // Element 65 (is_optional = true, null) trimmed -> length 65; element 64 (.undefined_only, null) -> undefined!
+        try expectEqual(@as(usize, 65), try w66_arr.len());
+        try expect((try w66_arr.get(64)).isUndefined());
+    }
     try expectEqual(@as(u32, 0), js.activeHandleCount());
 }
 

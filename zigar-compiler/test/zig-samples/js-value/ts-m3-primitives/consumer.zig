@@ -530,3 +530,140 @@ pub fn exerciseGlobalsNamespacesExports(out_alloc: std.mem.Allocator) ![]const u
 
     return out;
 }
+
+// 6. Adversarial Nullish Fidelity (PR #84 Findings 1 & 2):
+//    - Required `T | null` & `T | undefined` vs optional `opt?: T` on both `interface` and inline `anon_struct`
+//    - Variadic tuple `[v: number | undefined, w: string | null, ...rest: (number | null)[]]`
+//    - Slices `(string | null)[]`, `(number | undefined)[]`, and `items?: (string | null)[]`
+//    - Rest parameters `...args: (number | undefined)[]` vs `...args: (number | null)[]`
+//    - Module/namespace/global `.set(null)` on `gUndef: string | undefined` vs `gNull: string | null`
+pub fn exerciseNullishFidelity(out_alloc: std.mem.Allocator) ![]const u8 {
+    const handles_before = js.activeHandleCount();
+    const allocs_before = live_allocs.load(.acquire);
+
+    var out: []u8 = undefined;
+    {
+        // Comptime check on top-level ESM `export let` nullish specs + runtime `.getAlloc`
+        if (@TypeOf(m3_esm.g_undef).nullish_spec != .undefined_only) return error.Unexpected;
+        if (@TypeOf(m3_esm.g_null).nullish_spec != .null_only) return error.Unexpected;
+        const esm_u = try m3_esm.g_undef.getAlloc(tracked_alloc);
+        defer js.freeDecoded(?[]const u8, tracked_alloc, esm_u);
+        const esm_n = try m3_esm.g_null.getAlloc(tracked_alloc);
+        defer js.freeDecoded(?[]const u8, tracked_alloc, esm_n);
+        if (esm_u == null or !std.mem.eql(u8, esm_u.?, "esm-seed-undef")) return error.Unexpected;
+        if (esm_n == null or !std.mem.eql(u8, esm_n.?, "esm-seed-null")) return error.Unexpected;
+
+        // (1a) Interface required `T | null` + `T | undefined` vs omitted optionals (`'optNum' in p === false`)
+        const iface_nulls = try m3_esm.inspectInterfaceNullishAlloc(tracked_alloc, .{
+            .req_null = null,
+            .req_undef = null,
+        });
+        defer js.freeDecoded([]const u8, tracked_alloc, iface_nulls);
+        if (!std.mem.eql(u8, iface_nulls, "reqNull=null|reqUndef=undefined|no-optNum|no-optNull|no-items")) {
+            return error.Unexpected;
+        }
+
+        // Interface with `items?: (string | null)[]` populated (`items[1] === null`)
+        const iface_items = try m3_esm.inspectInterfaceNullishAlloc(tracked_alloc, .{
+            .req_null = 12,
+            .req_undef = 34,
+            .opt_num = 56,
+            .items = &.{ "keep", null },
+        });
+        defer js.freeDecoded([]const u8, tracked_alloc, iface_items);
+        if (!std.mem.eql(u8, iface_items, "reqNull=number:12|reqUndef=number:34|optNum=number:56|no-optNull|items=[string:keep,null]")) {
+            return error.Unexpected;
+        }
+
+        // (1b) Inline `{ ... }` (`anon_struct`) parameter & return, including `zigar_js` property collision
+        const inline1 = try m3_esm.inspectInlineNullishAlloc(tracked_alloc, .{
+            .req_null = null,
+            .req_undef = null,
+        });
+        defer js.freeDecoded(@TypeOf(inline1), tracked_alloc, inline1);
+        if (inline1.out_null == null or !std.mem.eql(u8, inline1.out_null.?, "was-null")) return error.Unexpected;
+        if (inline1.out_undef != null or inline1.opt_tag != null) return error.Unexpected;
+
+        const inline2 = try m3_esm.inspectInlineNullishAlloc(tracked_alloc, .{
+            .req_null = 5,
+            .req_undef = null,
+            .zigar_js_2 = "ok",
+        });
+        defer js.freeDecoded(@TypeOf(inline2), tracked_alloc, inline2);
+        if (inline2.out_null != null or inline2.out_undef != null) return error.Unexpected;
+        if (inline2.opt_tag == null or !std.mem.eql(u8, inline2.opt_tag.?, "hasOpt=false:zigar_js=ok")) {
+            return error.Unexpected;
+        }
+
+        // (2) Variadic tuple `[v: number | undefined, w: string | null, ...rest: (number | null)[]]`
+        const tup_out = try m3_esm.inspectNullishTupleAlloc(tracked_alloc, .{
+            .v = null,
+            .w = null,
+            .rest = &.{ 10, null, 30 },
+        });
+        defer js.freeDecoded(m3_esm.NullishVariadicTuple, tracked_alloc, tup_out);
+        if (tup_out.v == null or tup_out.v.? != 77) return error.Unexpected;
+        if (tup_out.w == null or !std.mem.eql(u8, tup_out.w.?, "from-null")) return error.Unexpected;
+        if (tup_out.rest.len != 3 or tup_out.rest[0] != null or tup_out.rest[1] != 0 or tup_out.rest[2] != null) {
+            return error.Unexpected;
+        }
+
+        // (3) Slices `(string | null)[]`, `(number | undefined)[]`, and `items?: (string | null)[]`
+        const sl_omitted = try m3_esm.inspectNullishSlicesAlloc(
+            tracked_alloc,
+            &.{ "a", null },
+            &.{ 1, null },
+            null,
+        );
+        defer js.freeDecoded([]const u8, tracked_alloc, sl_omitted);
+        if (!std.mem.eql(u8, sl_omitted, "sn=[string:a,null]|nu=[number:1,undefined]|argc=2:omitted")) {
+            return error.Unexpected;
+        }
+
+        const sl_present = try m3_esm.inspectNullishSlicesAlloc(
+            tracked_alloc,
+            &.{ null, "z" },
+            &.{ null, 9 },
+            &.{ "x", null },
+        );
+        defer js.freeDecoded([]const u8, tracked_alloc, sl_present);
+        if (!std.mem.eql(u8, sl_present, "sn=[null,string:z]|nu=[undefined,number:9]|argc=3:[string:x,null]")) {
+            return error.Unexpected;
+        }
+
+        // (4) Rest parameters `...args: (number | undefined)[]` vs `...args: (number | null)[]`
+        const rest_u = try m3_esm.inspectRestUndefAlloc(tracked_alloc, "u", &.{ 5, null, 9 });
+        defer js.freeDecoded([]const u8, tracked_alloc, rest_u);
+        const rest_n = try m3_esm.inspectRestNullAlloc(tracked_alloc, "n", &.{ 5, null, 9 });
+        defer js.freeDecoded([]const u8, tracked_alloc, rest_n);
+        if (!std.mem.eql(u8, rest_u, "u:[number:5,undefined,number:9]")) return error.Unexpected;
+        if (!std.mem.eql(u8, rest_n, "n:[number:5,null,number:9]")) return error.Unexpected;
+
+        // (5) Global/module/namespace setter `.set(null)` on `string | undefined` (`=== undefined`) vs `string | null` (`=== null`)
+        try m3_esm.Nested.g_undef.set("temp");
+        try m3_esm.Nested.g_null.set("temp");
+        try m3_esm.Nested.g_undef.set(null);
+        try m3_esm.Nested.g_null.set(null);
+        const nested_ver = try m3_esm.Nested.verifyNestedNullishGlobalsAlloc(tracked_alloc);
+        defer js.freeDecoded([]const u8, tracked_alloc, nested_ver);
+        if (!std.mem.eql(u8, nested_ver, "nested:undefined|null")) return error.Unexpected;
+
+        try m3_cjs.g_undef.set("temp");
+        try m3_cjs.g_null.set("temp");
+        try m3_cjs.g_undef.set(null);
+        try m3_cjs.g_null.set(null);
+        const cjs_ver = try m3_cjs.CjsTransform.verifyCjsNullishGlobalsAlloc(tracked_alloc);
+        defer js.freeDecoded([]const u8, tracked_alloc, cjs_ver);
+        if (!std.mem.eql(u8, cjs_ver, "cjs:undefined|null")) return error.Unexpected;
+
+        try fixture.m3_global_undef.set(null);
+        try fixture.m3_global_null.set(null);
+        if ((try fixture.m3_global_undef.getAlloc(tracked_alloc)) != null) return error.Unexpected;
+        if ((try fixture.m3_global_null.getAlloc(tracked_alloc)) != null) return error.Unexpected;
+
+        out = try std.fmt.allocPrint(out_alloc, "{s}|{s}|{s}|{s}", .{ rest_u, rest_n, nested_ver, cjs_ver });
+    }
+
+    try checkInvariants(handles_before, allocs_before);
+    return out;
+}

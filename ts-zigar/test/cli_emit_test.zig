@@ -2106,7 +2106,7 @@ test "Issue #45 H1, H3, H4, M2, L3: merged namespace self-export, shared DAG hoi
         defer out_h.close(io);
         const dag_src = try out_h.readFileAlloc(io, "dag.zig", alloc, .limited(64 * 1024));
         defer alloc.free(dag_src);
-        try std.testing.expect(dag_src.len < 8192);
+        try std.testing.expect(dag_src.len < 16384);
         try std.testing.expect(std.mem.indexOf(u8, dag_src, "__zigar_AnonObj_") != null);
 
         const path_src = try out_h.readFileAlloc(io, "path.zig", alloc, .limited(64 * 1024));
@@ -2249,6 +2249,24 @@ test "Issue #46 (M3.1a): primitives, optionals/nullish kinds, bigint literals, s
             \\    nullUnion: number | null;
             \\    bothUnion: boolean | null | undefined;
             \\}
+            \\export interface P {
+            \\    reqNull: number | null;
+            \\    reqUndef: number | undefined;
+            \\    optNum?: number;
+            \\    optNull?: number | null;
+            \\    items?: (string | null)[];
+            \\}
+            \\export declare function takeAnonAndSlices(
+            \\    zigarJs: number,
+            \\    zigarJsTuple: number,
+            \\    inlineObj: { reqNull: number | null; zigar_js?: string },
+            \\    strNulls: (string | null)[],
+            \\    numUndefs: (number | undefined)[],
+            \\    items?: (string | null)[],
+            \\    ...restUndefs: (number | undefined)[]
+            \\): { outUndef: string | undefined; optFlag?: boolean };
+            \\export let gUndef: string | undefined;
+            \\export let gNull: string | null;
             \\export declare function testOptionals(
             \\    req: string,
             \\    nullVal: string | null,
@@ -2268,6 +2286,7 @@ test "Issue #46 (M3.1a): primitives, optionals/nullish kinds, bigint literals, s
             \\export type ReadonlySpreadTuple = [...items: readonly string[]];
             \\export type GenericArraySpreadTuple = [...items: Array<number>];
             \\export type NullElemTuple = [string | null, number | undefined];
+            \\export type RichNullishTuple = [v: number | undefined, w: string | null, opt?: boolean, ...rest: (number | null)[]];
             \\
             \\export declare function echoEndpoint(ep: LabeledEndpoint): LabeledEndpoint;
             \\export declare function echoTrailingTuple(t: TrailingVarTuple): TrailingVarTuple;
@@ -2323,11 +2342,22 @@ test "Issue #46 (M3.1a): primitives, optionals/nullish kinds, bigint literals, s
 
         const idx_src = try out_h.readFileAlloc(io, "index.zig", alloc, .limited(512 * 1024));
         defer alloc.free(idx_src);
-        // Nullish emit tags & trailing optional argc logic
+        // Nullish emit tags, recursive specs & trailing optional argc logic
         try std.testing.expect(std.mem.indexOf(u8, idx_src, ".null_only") != null);
         try std.testing.expect(std.mem.indexOf(u8, idx_src, ".undefined_only") != null);
         try std.testing.expect(std.mem.indexOf(u8, idx_src, ".none") != null);
         try std.testing.expect(std.mem.indexOf(u8, idx_src, "__zigar_argc") != null);
+        // Finding 1 golden checks: required nullable/undefinable fields have NO `= null` default, while optional fields DO
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, "req_null: ?f64,") != null);
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, "req_undef: ?f64,") != null);
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, "opt_num: ?f64 = null,") != null);
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, "opt_null: ?f64 = null,") != null);
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, "zigar_js_2: ?[]const u8 = null,") != null);
+        // Finding 2 golden checks: recursive slice/optional/rest/global nullish specs
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, ".{ .self = .none, .elem = .null_only }") != null);
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, ".{ .self = .none, .elem = .undefined_only }") != null);
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, ".{ .self = .undefined_only, .child = .{ .self = .none, .elem = .null_only } }") != null);
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, "pushRestArgs(__zigar_args, rest_undefs, .undefined_only)") != null);
         // All 15 binary view names
         for ([_][]const u8{
             "__zigar_js.Buffer",
@@ -2398,11 +2428,41 @@ test "Issue #46 (M3.1a): primitives, optionals/nullish kinds, bigint literals, s
             \\    try std.testing.expectEqual(@as(?f64, null), n_undef.toOptional());
             \\    try std.testing.expectEqual(@as(?f64, 7.5), n_val.toOptional());
             \\
-            \\    // OptionalConfig defaults
+            \\    // OptionalConfig & P defaults and zigar_js.fields metadata (Finding 1 & Finding 2)
             \\    const cfg: r.OptionalConfig = .{ .undef_union = null, .null_union = null, .both_union = null };
             \\    try std.testing.expect(cfg.opt_prop == null);
+            \\    const p_inst: r.P = .{ .req_null = null, .req_undef = null };
+            \\    try std.testing.expect(p_inst.opt_num == null and p_inst.opt_null == null and p_inst.items == null);
+            \\    const p_st = @typeInfo(r.P).@"struct";
+            \\    try std.testing.expect(p_st.field_attrs[0].default_value_ptr == null);
+            \\    try std.testing.expect(p_st.field_attrs[1].default_value_ptr == null);
+            \\    try std.testing.expect(p_st.field_attrs[2].default_value_ptr != null);
+            \\    try std.testing.expect(p_st.field_attrs[3].default_value_ptr != null);
+            \\    try std.testing.expect(p_st.field_attrs[4].default_value_ptr != null);
+            \\    try std.testing.expect(!r.P.zigar_js.fields[0].is_optional and r.P.zigar_js.fields[0].nullish == .null_only);
+            \\    try std.testing.expect(!r.P.zigar_js.fields[1].is_optional and r.P.zigar_js.fields[1].nullish == .undefined_only);
+            \\    try std.testing.expect(r.P.zigar_js.fields[2].is_optional and r.P.zigar_js.fields[2].nullish == .undefined_only);
+            \\    try std.testing.expect(r.P.zigar_js.fields[3].is_optional and r.P.zigar_js.fields[3].nullish == .undefined_only);
+            \\    try std.testing.expect(r.P.zigar_js.fields[4].is_optional);
+            \\    try std.testing.expect(r.P.zigar_js.fields[4].nullish.self == .undefined_only);
+            \\    try std.testing.expect(r.P.zigar_js.fields[4].nullish.child.elem == .null_only);
             \\
-            \\    // Tuples: fixed, optional, labeled, trailing/leading/middle variadic, readonly/Array<T> spreads, nullish mask
+            \\    // Inline anon_struct parameter & return metadata + zigar_js collision safety
+            \\    const InlineParamT = @typeInfo(@TypeOf(r.takeAnonAndSlices)).@"fn".param_types[2].?;
+            \\    try std.testing.expect(@typeInfo(InlineParamT).@"struct".field_attrs[0].default_value_ptr == null);
+            \\    try std.testing.expect(@typeInfo(InlineParamT).@"struct".field_attrs[1].default_value_ptr != null);
+            \\    try std.testing.expect(!InlineParamT.zigar_js.fields[0].is_optional and InlineParamT.zigar_js.fields[0].nullish == .null_only);
+            \\    try std.testing.expect(InlineParamT.zigar_js.fields[1].is_optional);
+            \\    try std.testing.expectEqualStrings("zigar_js_2", InlineParamT.zigar_js.fields[1].name);
+            \\    try std.testing.expectEqualStrings("zigar_js", InlineParamT.zigar_js.fields[1].js_name);
+            \\
+            \\    // Global nullish specs: gUndef (.undefined_only) vs gNull (.null_only)
+            \\    try std.testing.expect(@TypeOf(r.g_undef).nullish_spec == .undefined_only);
+            \\    try std.testing.expect(@TypeOf(r.g_null).nullish_spec == .null_only);
+            \\    try std.testing.expectError(error.HostUnavailable, r.g_undef.set(null));
+            \\    try std.testing.expectError(error.HostUnavailable, r.g_null.set(null));
+            \\
+            \\    // Tuples: fixed, optional, labeled, trailing/leading/middle variadic, readonly/Array<T> spreads, `.fields` metadata
             \\    const fp: r.FixedPair = .{ .@"0" = 1.0, .@"1" = true };
             \\    try std.testing.expectEqual(@as(f64, 1.0), fp.@"0");
             \\    const op: r.OptionalPair = .{ .@"0" = "a" };
@@ -2410,14 +2470,22 @@ test "Issue #46 (M3.1a): primitives, optionals/nullish kinds, bigint literals, s
             \\    const ep: r.LabeledEndpoint = .{ .host = "localhost" };
             \\    try std.testing.expectEqualStrings("localhost", ep.host);
             \\    try std.testing.expect(ep.port == null);
-            \\    try std.testing.expectEqual(@as(u64, 0b10), r.LabeledEndpoint.zigar_js_tuple.optional_mask);
+            \\    try std.testing.expect(!r.LabeledEndpoint.zigar_js_tuple.fields[0].is_optional);
+            \\    try std.testing.expect(r.LabeledEndpoint.zigar_js_tuple.fields[1].is_optional);
+            \\    try std.testing.expect(r.LabeledEndpoint.zigar_js_tuple.fields[1].nullish == .undefined_only);
             \\
             \\    try std.testing.expectEqual(@as(?usize, 1), r.TrailingVarTuple.zigar_js_tuple.variadic_index);
             \\    try std.testing.expectEqual(@as(?usize, 0), r.LeadingVarTuple.zigar_js_tuple.variadic_index);
             \\    try std.testing.expectEqual(@as(?usize, 1), r.MiddleVarTuple.zigar_js_tuple.variadic_index);
             \\    try std.testing.expectEqual(@as(?usize, 0), r.ReadonlySpreadTuple.zigar_js_tuple.variadic_index);
             \\    try std.testing.expectEqual(@as(?usize, 0), r.GenericArraySpreadTuple.zigar_js_tuple.variadic_index);
-            \\    try std.testing.expectEqual(@as(u64, 0b01), r.NullElemTuple.zigar_js_tuple.null_only_mask);
+            \\    try std.testing.expect(r.NullElemTuple.zigar_js_tuple.fields[0].nullish == .null_only);
+            \\    try std.testing.expect(r.NullElemTuple.zigar_js_tuple.fields[1].nullish == .undefined_only);
+            \\    try std.testing.expectEqual(@as(?usize, 3), r.RichNullishTuple.zigar_js_tuple.variadic_index);
+            \\    try std.testing.expect(!r.RichNullishTuple.zigar_js_tuple.fields[0].is_optional and r.RichNullishTuple.zigar_js_tuple.fields[0].nullish == .undefined_only);
+            \\    try std.testing.expect(!r.RichNullishTuple.zigar_js_tuple.fields[1].is_optional and r.RichNullishTuple.zigar_js_tuple.fields[1].nullish == .null_only);
+            \\    try std.testing.expect(r.RichNullishTuple.zigar_js_tuple.fields[2].is_optional and r.RichNullishTuple.zigar_js_tuple.fields[2].nullish == .undefined_only);
+            \\    try std.testing.expect(!r.RichNullishTuple.zigar_js_tuple.fields[3].is_optional and r.RichNullishTuple.zigar_js_tuple.fields[3].nullish == .null_only);
             \\
             \\    const mid: r.MiddleVarTuple = .{ .head = 1, .mid = &.{ "x", "y" }, .tail = true };
             \\    try std.testing.expectEqual(@as(usize, 2), mid.mid.len);

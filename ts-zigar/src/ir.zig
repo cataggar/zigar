@@ -3365,6 +3365,8 @@ fn LowerCtx(comptime GraphType: type) type {
                 if (has_self_receiver) {
                     var fn_scope_fb = naming.ScopeNamer.initParam(self.scratch, enclosing_scope);
                     defer fn_scope_fb.deinit();
+                    try fn_scope_fb.reserve("zigar_js");
+                    try fn_scope_fb.reserve("zigar_js_tuple");
                     const sb = try fn_scope_fb.bindWithFallbackSuffix("self", .snake, "arg");
                     fallback_self_ident = try self.alloc.dupe(u8, sb.zig_ident);
                     sb.deinit(self.scratch);
@@ -3383,6 +3385,8 @@ fn LowerCtx(comptime GraphType: type) type {
             const sig = self.graph.signatures[sig_id];
             var fn_scope = naming.ScopeNamer.initParam(self.scratch, enclosing_scope);
             defer fn_scope.deinit();
+            try fn_scope.reserve("zigar_js");
+            try fn_scope.reserve("zigar_js_tuple");
 
             var self_param_ident: ?[]const u8 = null;
             if (has_self_receiver) {

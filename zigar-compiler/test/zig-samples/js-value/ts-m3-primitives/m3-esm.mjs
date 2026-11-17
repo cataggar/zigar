@@ -7,6 +7,8 @@ export const ULTRA_BIGINT = 999_999_999_999_999_999_999_999_999_999_999_999_999_
 export const UNIQUE_TOKEN = Symbol.for('zigar.m3.unique_token');
 export let moduleTag = 'initial-tag';
 export let moduleCount = 10;
+export let gUndef = 'esm-seed-undef';
+export let gNull = 'esm-seed-null';
 
 export function mutateEsmBindings(nextTag, delta) {
   moduleTag = nextTag;
@@ -87,6 +89,114 @@ export function consumeRawFromNullable(val) {
   return `is-value:${val}`;
 }
 
+function tagJsVal(v) {
+  if (v === null) return 'null';
+  if (v === undefined) return 'undefined';
+  return `${typeof v}:${String(v)}`;
+}
+
+export function inspectInterfaceNullish(p) {
+  if (typeof p !== 'object' || p === null) throw new TypeError('expected object');
+  if (!('reqNull' in p)) throw new TypeError('missing required property reqNull');
+  if (!('reqUndef' in p)) throw new TypeError('missing required property reqUndef');
+  if (p.reqNull === undefined) throw new TypeError('reqNull must never be undefined');
+  if (p.reqUndef === null) throw new TypeError('reqUndef must never be null');
+
+  const optNumPart = ('optNum' in p) ? `optNum=${tagJsVal(p.optNum)}` : 'no-optNum';
+  const optNullPart = ('optNull' in p) ? `optNull=${tagJsVal(p.optNull)}` : 'no-optNull';
+  let itemsPart = 'no-items';
+  if ('items' in p) {
+    if (!Array.isArray(p.items)) throw new TypeError('expected items array');
+    itemsPart = `items=[${p.items.map(tagJsVal).join(',')}]`;
+  }
+  return `reqNull=${tagJsVal(p.reqNull)}|reqUndef=${tagJsVal(p.reqUndef)}|${optNumPart}|${optNullPart}|${itemsPart}`;
+}
+
+export function inspectInlineNullish(p) {
+  if (typeof p !== 'object' || p === null) throw new TypeError('expected inline object');
+  if (!('reqNull' in p)) throw new TypeError('missing inline reqNull');
+  if (!('reqUndef' in p)) throw new TypeError('missing inline reqUndef');
+  if (p.reqNull !== null && typeof p.reqNull !== 'number') {
+    throw new TypeError(`unexpected inline reqNull: ${tagJsVal(p.reqNull)}`);
+  }
+  if (p.reqUndef !== undefined && typeof p.reqUndef !== 'number') {
+    throw new TypeError(`unexpected inline reqUndef: ${tagJsVal(p.reqUndef)}`);
+  }
+  const hasOpt = 'optNum' in p;
+  const hasCollisionProp = 'zigar_js' in p;
+  if (hasCollisionProp) {
+    return {
+      outNull: null,
+      outUndef: undefined,
+      optTag: `hasOpt=${hasOpt}:zigar_js=${p.zigar_js}`,
+    };
+  }
+  return {
+    outNull: p.reqNull === null ? 'was-null' : `num:${p.reqNull}`,
+    outUndef: p.reqUndef === undefined ? undefined : `num:${p.reqUndef}`,
+  };
+}
+
+export function inspectNullishTuple(t) {
+  if (!Array.isArray(t)) throw new TypeError('expected tuple array');
+  if (t.length < 2) throw new TypeError(`tuple too short: ${t.length}`);
+  if (!(0 in t)) throw new TypeError('tuple slot 0 must not be a sparse hole');
+  if (t[0] === null) throw new TypeError('tuple[0] (number | undefined) must be undefined, got null');
+  if (t[1] === undefined) throw new TypeError('tuple[1] (string | null) must be null, got undefined');
+  for (let i = 2; i < t.length; i++) {
+    if (t[i] === undefined) {
+      throw new TypeError(`tuple rest[${i - 2}] (number | null) must be null, got undefined`);
+    }
+  }
+  return [
+    t[0] === undefined ? 77 : undefined,
+    t[1] === null ? 'from-null' : null,
+    ...t.slice(2).map((x) => (x === null ? 0 : null)),
+  ];
+}
+
+export function inspectNullishSlices(strNulls, numUndefs, items) {
+  if (!Array.isArray(strNulls) || !Array.isArray(numUndefs)) {
+    throw new TypeError('expected genuine JS Arrays');
+  }
+  for (let i = 0; i < strNulls.length; i++) {
+    if (strNulls[i] === undefined) {
+      throw new TypeError(`strNulls[${i}] must be string or null, got undefined`);
+    }
+  }
+  for (let i = 0; i < numUndefs.length; i++) {
+    if (!(i in numUndefs)) throw new TypeError(`numUndefs[${i}] must not be sparse`);
+    if (numUndefs[i] === null) {
+      throw new TypeError(`numUndefs[${i}] must be number or undefined, got null`);
+    }
+  }
+  let itemsDesc = `argc=${arguments.length}:omitted`;
+  if (arguments.length >= 3) {
+    if (!Array.isArray(items)) throw new TypeError('expected items array when passed');
+    for (let i = 0; i < items.length; i++) {
+      if (items[i] === undefined) {
+        throw new TypeError(`items[${i}] must be string or null, got undefined`);
+      }
+    }
+    itemsDesc = `argc=${arguments.length}:[${items.map(tagJsVal).join(',')}]`;
+  }
+  return `sn=[${strNulls.map(tagJsVal).join(',')}]|nu=[${numUndefs.map(tagJsVal).join(',')}]|${itemsDesc}`;
+}
+
+export function inspectRestUndef(prefix, ...args) {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === null) throw new TypeError(`restUndef[${i}] must never be null`);
+  }
+  return `${prefix}:[${args.map(tagJsVal).join(',')}]`;
+}
+
+export function inspectRestNull(prefix, ...args) {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === undefined) throw new TypeError(`restNull[${i}] must never be undefined`);
+  }
+  return `${prefix}:[${args.map(tagJsVal).join(',')}]`;
+}
+
 export function transformStringArray(items, extra) {
   if (!Array.isArray(items) || !Array.isArray(extra)) {
     throw new TypeError('expected genuine JS Arrays');
@@ -163,6 +273,14 @@ export function mutateBinaryInPlace(buf, u8, i32, f64, i64, ab, sab, dv) {
 
 export const nested = {
   hits: 5,
+  gUndef: 'nested-initial-undef',
+  gNull: 'nested-initial-null',
+  verifyNestedNullishGlobals() {
+    if (!('gUndef' in nested) || !('gNull' in nested)) {
+      throw new TypeError('missing nested global properties');
+    }
+    return `nested:${tagJsVal(nested.gUndef)}|${tagJsVal(nested.gNull)}`;
+  },
   deep: {
     combine(a, b = 9) {
       nested.hits += 1;
