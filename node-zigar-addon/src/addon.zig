@@ -87,6 +87,7 @@ const ModuleHost = struct {
     env_closing: std.atomic.Value(bool) = .init(false),
     cleanup_hook_registered: bool = false,
     multithread_count: std.atomic.Value(usize) = .init(0),
+    ts_mutex: std.Io.Mutex = .init,
     redirection_mask: hooks.Syscall.Mask = .{},
     redirecting_other_libraries: bool = false,
     hooks_installed: bool = false,
@@ -314,6 +315,13 @@ const ModuleHost = struct {
     fn cleanupHost(arg: ?*anyopaque) callconv(.c) void {
         const self: *@This() = @ptrCast(@alignCast(arg orelse return));
         self.cleanup_hook_registered = false;
+        if (self.syscall_trap_installed) {
+            self.thread_syscall_trap_list_mutex.lockUncancelable(io);
+            defer self.thread_syscall_trap_list_mutex.unlock(io);
+            for (self.thread_syscall_trap_list.items) |ptr| ptr.* = false;
+        }
+        self.ts_mutex.lockUncancelable(io);
+        defer self.ts_mutex.unlock(io);
         self.env_closing.store(true, .release);
         const field_names = @typeInfo(@FieldType(ModuleHost, "ts")).@"struct".field_names;
         inline for (field_names) |field_name| {
@@ -490,6 +498,8 @@ const ModuleHost = struct {
 
     pub fn deinitializeThread(self: *@This()) !void {
         if (self.syscall_trap_installed) {
+            trapping_syscalls = false;
+            redirection_controller.uninstallSyscallTrap();
             self.thread_syscall_trap_list_mutex.lockUncancelable(io);
             defer self.thread_syscall_trap_list_mutex.unlock(io);
             const index = for (self.thread_syscall_trap_list.items, 0..) |ptr, i| {
@@ -1199,11 +1209,9 @@ const ModuleHost = struct {
             const status_value = try env.getValueUint32(status);
             return std.enums.fromInt(E, status_value) orelse .FAULT;
         } else {
-            if (self.env_closing.load(.acquire)) return error.Disabled;
-            const func = self.ts.handle_jscall.load(.acquire) orelse return error.Disabled;
             var futex: Futex = undefined;
             call.futex_handle = futex.init();
-            try napi.callThreadsafeFunction(func, @constCast(call), .nonblocking);
+            try self.callTsfn("handle_jscall", @constCast(call));
             return futex.wait();
         }
     }
@@ -1256,7 +1264,6 @@ const ModuleHost = struct {
             };
         } else {
             if (self.env_closing.load(.acquire)) return error.Disabled;
-            const func = self.ts.handle_syscall.load(.acquire) orelse return error.Disabled;
             var futex: Futex = undefined;
             call.futex_handle = futex.init();
             if (call.cmd == .write and call.u.write.fd == 2) {
@@ -1275,11 +1282,11 @@ const ModuleHost = struct {
                     } },
                     .futex_handle = 0,
                 };
-                try napi.callThreadsafeFunction(func, new_call, .nonblocking);
+                try self.callTsfn("handle_syscall", new_call);
                 call.u.write.written = call.u.write.len;
                 futex.timeout = 50000;
             } else {
-                try napi.callThreadsafeFunction(func, call, .nonblocking);
+                try self.callTsfn("handle_syscall", call);
             }
             return futex.wait();
         }
@@ -1734,6 +1741,14 @@ const ModuleHost = struct {
         ptr.* = mask;
     }
 
+    fn callTsfn(self: *@This(), comptime field_name: []const u8, data: ?*anyopaque) !void {
+        self.ts_mutex.lockUncancelable(io);
+        defer self.ts_mutex.unlock(io);
+        if (self.env_closing.load(.acquire)) return error.Disabled;
+        const func = @field(self.ts, field_name).load(.acquire) orelse return error.Disabled;
+        try napi.callThreadsafeFunction(func, data, .nonblocking);
+    }
+
     inline fn isOwnerJsThread(self: *const @This()) bool {
         return in_main_thread and std.Thread.getCurrentId() == self.owner_thread_id;
     }
@@ -1773,11 +1788,13 @@ const ModuleHost = struct {
 
     fn dispatchWorkerJsBridge(self: *@This(), req: *JsBridgeRequest) !E {
         if (!self.canBridgeWorkerJs()) return .PERM;
-        const func = self.ts.handle_js_bridge.load(.acquire) orelse return .PERM;
         var futex: Futex = undefined;
         req.worker_id = @intCast(@intFromPtr(&in_main_thread));
         req.futex_handle = futex.init();
-        try napi.callThreadsafeFunction(func, @ptrCast(req), .nonblocking);
+        self.callTsfn("handle_js_bridge", @ptrCast(req)) catch |err| switch (err) {
+            error.Disabled => return .PERM,
+            else => return err,
+        };
         return futex.wait();
     }
 
@@ -2279,9 +2296,7 @@ const ModuleHost = struct {
                 },
             );
         } else {
-            if (self.env_closing.load(.acquire)) return error.Disabled;
-            const func = self.ts.release_function.load(.acquire) orelse return error.Disabled;
-            try napi.callThreadsafeFunction(func, @ptrFromInt(fn_id), .nonblocking);
+            try self.callTsfn("release_function", @ptrFromInt(fn_id));
         }
     }
 
@@ -2302,6 +2317,8 @@ const ModuleHost = struct {
 
     fn enableMultithread(self: *@This()) !void {
         if (in_main_thread) {
+            self.ts_mutex.lockUncancelable(io);
+            defer self.ts_mutex.unlock(io);
             if (self.env_closing.load(.acquire)) return error.Disabled;
             const prev_count = self.multithread_count.fetchAdd(1, .monotonic);
             errdefer _ = self.multithread_count.fetchSub(1, .monotonic);
@@ -2328,23 +2345,29 @@ const ModuleHost = struct {
 
     fn disableMultithread(self: *@This()) !void {
         if (in_main_thread) {
-            const prev_count = self.multithread_count.fetchSub(1, .monotonic);
-            if (prev_count == 1) {
+            var became_zero = false;
+            {
+                self.ts_mutex.lockUncancelable(io);
+                defer self.ts_mutex.unlock(io);
+                const prev_count = self.multithread_count.fetchSub(1, .monotonic);
+                if (prev_count == 1) {
+                    became_zero = true;
+                    const field_names = @typeInfo(@FieldType(ModuleHost, "ts")).@"struct".field_names;
+                    inline for (field_names) |field_name| {
+                        if (@field(self.ts, field_name).swap(null, .acq_rel)) |ref| {
+                            napi.releaseThreadsafeFunction(ref, .abort) catch {};
+                        }
+                    }
+                }
+            }
+            if (became_zero) {
                 defer self.release();
                 if (!self.env_closing.load(.acquire)) {
                     self.clearWorkerJsErrorsOnEnv();
                 }
-                const field_names = @typeInfo(@FieldType(ModuleHost, "ts")).@"struct".field_names;
-                inline for (field_names) |field_name| {
-                    if (@field(self.ts, field_name).swap(null, .acq_rel)) |ref| {
-                        napi.releaseThreadsafeFunction(ref, .abort) catch {};
-                    }
-                }
             }
         } else {
-            if (self.env_closing.load(.acquire)) return error.Disabled;
-            const func = self.ts.disable_multithread.load(.acquire) orelse return error.Disabled;
-            try napi.callThreadsafeFunction(func, null, .nonblocking);
+            try self.callTsfn("disable_multithread", null);
         }
     }
 
