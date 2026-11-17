@@ -314,6 +314,43 @@ export function inspectGenericContainersUndef(undefBox, node, pair) {
   return `box(${tagJsVal(undefBox.val)},${boxOptPart})|nodes[${nodeParts.join('->')}]|pair[${tagJsVal(pair[0])},${tagJsVal(pair[1])}]`;
 }
 
+export function inspectDeepGenericRecursion(mutA, metaNode, polyNode, tree) {
+  // 1. Mutual recursion: MutA -> MutB -> MutA -> MutB (every level must receive `undefined`, never `null`!)
+  if (mutA.v !== undefined) throw new TypeError(`mutA.v expected undefined, got ${tagJsVal(mutA.v)}`);
+  if (!mutA.b || mutA.b.w !== undefined) throw new TypeError(`mutA.b.w expected undefined, got ${tagJsVal(mutA.b?.w)}`);
+  if (!mutA.b.a || mutA.b.a.v !== undefined) {
+    throw new TypeError(`second-level mutA.b.a.v expected undefined, got ${tagJsVal(mutA.b.a?.v)}`);
+  }
+  if (!mutA.b.a.b || mutA.b.a.b.w !== 99) {
+    throw new TypeError(`third-level mutA.b.a.b.w expected 99, got ${tagJsVal(mutA.b.a.b?.w)}`);
+  }
+
+  // 2. Inline anon_struct between recursive steps: MetaNode.val === undefined & MetaNode.meta.inner.val === undefined
+  if (metaNode.val !== undefined) throw new TypeError(`metaNode.val expected undefined, got ${tagJsVal(metaNode.val)}`);
+  if ('label' in metaNode.meta) throw new TypeError('metaNode.meta.label should be omitted when null');
+  if (!metaNode.meta.inner || metaNode.meta.inner.val !== undefined) {
+    throw new TypeError(`metaNode.meta.inner.val expected undefined, got ${tagJsVal(metaNode.meta.inner?.val)}`);
+  }
+
+  // 3. Polymorphic type-arg recursion: PolyNode<Undef<number>> has `val === undefined` and `same.val === undefined`,
+  //    while `alt` (`PolyNode<Maybe<number>>`) MUST have `alt.val === null` and `alt.same.val === null`!
+  if (polyNode.val !== undefined || polyNode.same?.val !== undefined) {
+    throw new TypeError(`polyNode/same expected undefined, got ${tagJsVal(polyNode.val)} / ${tagJsVal(polyNode.same?.val)}`);
+  }
+  if (!polyNode.alt || polyNode.alt.val !== null || !polyNode.alt.same || polyNode.alt.same.val !== null) {
+    throw new TypeError(`polyNode.alt/alt.same expected null, got ${tagJsVal(polyNode.alt?.val)} / ${tagJsVal(polyNode.alt?.same?.val)}`);
+  }
+
+  // 4. Recursive generic type alias `AliasTree<Undef<number>>` across multiple levels
+  function collectTree(n) {
+    if (n.v === null) throw new TypeError('AliasTree<Undef<number>>.v must never be null');
+    const kids = ('kids' in n) ? `[${n.kids.map(collectTree).join(',')}]` : '';
+    return `${tagJsVal(n.v)}${kids}`;
+  }
+
+  return `mut=ok|meta=ok|poly=undef+null|tree=${collectTree(tree)}`;
+}
+
 export function sumRestGenericAlias(...nums) {
   let acc = 0;
   for (const n of nums) {

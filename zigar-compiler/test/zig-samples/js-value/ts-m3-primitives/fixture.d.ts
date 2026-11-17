@@ -87,6 +87,35 @@ declare module "./m3-esm.mjs" {
     next?: LinkedNode<T>;
   }
 
+  export interface MutA<T> {
+    v: T;
+    b?: MutB<T>;
+  }
+
+  export interface MutB<T> {
+    w: T;
+    a?: MutA<T>;
+  }
+
+  export interface MetaNode<T> {
+    val: T;
+    meta: {
+      label?: string;
+      inner?: MetaNode<T>;
+    };
+  }
+
+  export interface PolyNode<T> {
+    val: T;
+    alt?: PolyNode<Maybe<number>>;
+    same?: PolyNode<T>;
+  }
+
+  export type AliasTree<T> = {
+    v: T;
+    kids?: AliasTree<T>[];
+  };
+
   export let gMaybe: Maybe<number>;
   export let gUndefAlias: Undef<number>;
   export function inspectGenericAliasNullish(
@@ -98,6 +127,12 @@ declare module "./m3-esm.mjs" {
     undefBox: GenericBox<Undef<number>>,
     node: LinkedNode<Undef<number>>,
     pair: PairAlias<Undef<string>>,
+  ): string;
+  export function inspectDeepGenericRecursion(
+    mutA: MutA<Undef<number>>,
+    metaNode: MetaNode<Undef<number>>,
+    polyNode: PolyNode<Undef<number>>,
+    tree: AliasTree<Undef<number>>,
   ): string;
   export function sumRestGenericAlias(...nums: Id<number[]>): number;
   export function readVariadicGenericAliasTuple(t: VariadicGenericAliasTuple): string;

@@ -759,6 +759,38 @@ pub fn exerciseNullishFidelity(out_alloc: std.mem.Allocator) ![]const u8 {
         defer js.freeDecoded([]const u8, tracked_alloc, var_id);
         if (!std.mem.eql(u8, var_id, "head:[3,6,9]")) return error.Unexpected;
 
+        // (8) Mutual generic recursion (`MutA<T> <-> MutB<T>`), inline `anon_struct` (`MetaNode<T>`),
+        //     polymorphic type-arg recursion (`PolyNode<Undef>` -> `alt?: PolyNode<Maybe>`),
+        //     and recursive generic type alias (`AliasTree<Undef<number>>`)!
+        const mut_b2: m3_esm.MutB(?f64) = .{ .w = 99 };
+        const mut_a2: m3_esm.MutA(?f64) = .{ .v = null, .b = mut_b2 };
+        const mut_b1: m3_esm.MutB(?f64) = .{ .w = null, .a = &mut_a2 };
+
+        const meta_inner: m3_esm.MetaNode(?f64) = .{ .val = null, .meta = .{} };
+        const poly_same: m3_esm.PolyNode(?f64) = .{ .val = null };
+        const poly_alt_same: m3_esm.PolyNode(?f64) = .{ .val = null };
+        const poly_alt: m3_esm.PolyNode(?f64) = .{ .val = null, .same = &poly_alt_same };
+
+        const tree_leaf1: m3_esm.AliasTree(?f64) = .{ .v = null };
+        const tree_leaf2: m3_esm.AliasTree(?f64) = .{ .v = 7 };
+        const tree_mid: m3_esm.AliasTree(?f64) = .{ .v = null, .kids = &.{ tree_leaf1, tree_leaf2 } };
+
+        const deep_rec = try m3_esm.inspectDeepGenericRecursionAlloc(
+            tracked_alloc,
+            .{ .v = null, .b = mut_b1 },
+            .{ .val = null, .meta = .{ .inner = &meta_inner } },
+            .{ .val = null, .alt = &poly_alt, .same = &poly_same },
+            .{ .v = null, .kids = &.{tree_mid} },
+        );
+        defer js.freeDecoded([]const u8, tracked_alloc, deep_rec);
+        if (!std.mem.eql(
+            u8,
+            deep_rec,
+            "mut=ok|meta=ok|poly=undef+null|tree=undefined[undefined[undefined,number:7]]",
+        )) {
+            return error.Unexpected;
+        }
+
         out = try std.fmt.allocPrint(out_alloc, "{s}|{s}|{s}|{s}", .{ rest_u, rest_n, nested_ver, cjs_ver });
     }
 

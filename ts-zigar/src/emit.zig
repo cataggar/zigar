@@ -614,13 +614,26 @@ const ModuleEmitCtx = struct {
         arg_env: ?*const TypeParamEnv,
     };
 
-    const VisitedStruct = struct {
-        mod_idx: u32,
-        decl_id: u32,
-        prev: ?*const VisitedStruct,
+    const VisitedDecl = struct {
+        key: []const u8,
+        prev: ?*const VisitedDecl,
     };
 
-    fn isStructVisited(visited: ?*const VisitedStruct, mod_idx: u32, decl_id: u32) bool {
+    fn isDeclKeyVisited(visited: ?*const VisitedDecl, key: []const u8) bool {
+        var cur = visited;
+        while (cur) |v| : (cur = v.prev) {
+            if (std.mem.eql(u8, v.key, key)) return true;
+        }
+        return false;
+    }
+
+    const FpVisited = struct {
+        mod_idx: u32,
+        decl_id: u32,
+        prev: ?*const FpVisited,
+    };
+
+    fn isFpVisited(visited: ?*const FpVisited, mod_idx: u32, decl_id: u32) bool {
         var cur = visited;
         while (cur) |v| : (cur = v.prev) {
             if (v.mod_idx == mod_idx and v.decl_id == decl_id) return true;
@@ -662,19 +675,184 @@ const ModuleEmitCtx = struct {
         return null;
     }
 
-    fn genericStructArgsNeedSpec(
+    fn appendNullishFingerprint(
         self: *const ModuleEmitCtx,
-        st: ir.StructDeclIr,
+        buf: *std.ArrayList(u8),
+        ty: *const ir.TypeIr,
+        env: ?*const TypeParamEnv,
+        fp_visited: ?*const FpVisited,
+        depth: usize,
+    ) error{OutOfMemory}!void {
+        if (depth >= 24) {
+            try buf.append(self.allocator, '_');
+            return;
+        }
+        switch (ty.*) {
+            .optional => |opt| {
+                const tag: []const u8 = switch (opt.nullish_kind) {
+                    .undefined_only, .none => "?u(",
+                    .null_only, .null_or_undefined => "?n(",
+                };
+                try buf.appendSlice(self.allocator, tag);
+                try self.appendNullishFingerprint(buf, opt.child, env, fp_visited, depth + 1);
+                try buf.append(self.allocator, ')');
+            },
+            .slice => |elem_ty| {
+                try buf.append(self.allocator, '[');
+                try self.appendNullishFingerprint(buf, elem_ty, env, fp_visited, depth + 1);
+                try buf.append(self.allocator, ']');
+            },
+            .pointer_const => |inner| {
+                try self.appendNullishFingerprint(buf, inner, env, fp_visited, depth + 1);
+            },
+            .anon_struct => |fields| {
+                try buf.append(self.allocator, '{');
+                for (fields) |f| {
+                    try buf.appendSlice(self.allocator, f.logical_name);
+                    try buf.append(self.allocator, if (f.is_optional) '?' else ':');
+                    try self.appendNullishFingerprint(buf, f.ty, env, fp_visited, depth + 1);
+                    try buf.append(self.allocator, ';');
+                }
+                try buf.append(self.allocator, '}');
+            },
+            .tuple => |elems| {
+                try buf.append(self.allocator, '(');
+                for (elems) |el| {
+                    if (el.is_variadic) {
+                        try buf.appendSlice(self.allocator, "...");
+                    } else if (el.is_optional) {
+                        try buf.append(self.allocator, '?');
+                    }
+                    try self.appendNullishFingerprint(buf, el.ty, env, fp_visited, depth + 1);
+                    try buf.append(self.allocator, ',');
+                }
+                try buf.append(self.allocator, ')');
+            },
+            .type_param_ref => |tp_ident| {
+                if (env) |e| {
+                    for (e.params, 0..) |tp, idx| {
+                        if (std.mem.eql(u8, tp.zig_ident, tp_ident)) {
+                            if (idx < e.args.len) {
+                                try self.appendNullishFingerprint(buf, e.args[idx], e.arg_env, fp_visited, depth + 1);
+                                return;
+                            }
+                            if (tp.default_type) |def_ty| {
+                                try self.appendNullishFingerprint(buf, def_ty, e, fp_visited, depth + 1);
+                                return;
+                            }
+                            break;
+                        }
+                    }
+                }
+                try buf.append(self.allocator, '@');
+                try buf.appendSlice(self.allocator, tp_ident);
+            },
+            .decl_ref => |dref| {
+                if (self.findTargetTypeAlias(dref)) |ta| {
+                    if (ta.type_params.len > 0 and isFpVisited(fp_visited, dref.module_index, dref.target_decl_id)) {
+                        try buf.print(self.allocator, "^a{d}:{d}", .{ dref.module_index, dref.target_decl_id });
+                        return;
+                    }
+                    const next_fp = FpVisited{
+                        .mod_idx = dref.module_index,
+                        .decl_id = dref.target_decl_id,
+                        .prev = fp_visited,
+                    };
+                    const next_env = TypeParamEnv{
+                        .params = ta.type_params,
+                        .args = dref.type_args,
+                        .arg_env = env,
+                    };
+                    try self.appendNullishFingerprint(
+                        buf,
+                        ta.target,
+                        if (ta.type_params.len > 0) &next_env else null,
+                        if (ta.type_params.len > 0) &next_fp else fp_visited,
+                        depth + 1,
+                    );
+                    return;
+                }
+                if (self.findTargetGenericStruct(dref)) |st| {
+                    if (isFpVisited(fp_visited, dref.module_index, dref.target_decl_id)) {
+                        try buf.print(self.allocator, "^s{d}:{d}", .{ dref.module_index, dref.target_decl_id });
+                        return;
+                    }
+                    const next_fp = FpVisited{
+                        .mod_idx = dref.module_index,
+                        .decl_id = dref.target_decl_id,
+                        .prev = fp_visited,
+                    };
+                    const self_env = TypeParamEnv{
+                        .params = st.type_params,
+                        .args = dref.type_args,
+                        .arg_env = env,
+                    };
+                    try buf.print(self.allocator, "s{d}:{d}<", .{ dref.module_index, dref.target_decl_id });
+                    for (st.type_params, 0..) |tp, idx| {
+                        if (idx > 0) try buf.append(self.allocator, ',');
+                        if (idx < dref.type_args.len) {
+                            try self.appendNullishFingerprint(buf, dref.type_args[idx], env, &next_fp, depth + 1);
+                        } else if (tp.default_type) |def_ty| {
+                            try self.appendNullishFingerprint(buf, def_ty, &self_env, &next_fp, depth + 1);
+                        } else {
+                            try buf.append(self.allocator, '_');
+                        }
+                    }
+                    try buf.append(self.allocator, '>');
+                    return;
+                }
+                try buf.append(self.allocator, '_');
+            },
+            else => try buf.append(self.allocator, '_'),
+        }
+    }
+
+    fn computeDeclSpecKey(
+        self: *const ModuleEmitCtx,
+        kind_prefix: []const u8,
+        dref: ir.DeclRefIr,
+        type_params: []const ir.TypeParamIr,
+        env: ?*const TypeParamEnv,
+    ) error{OutOfMemory}![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+        try buf.print(self.allocator, "{s}:{d}:{d}:", .{ kind_prefix, dref.module_index, dref.target_decl_id });
+        const self_env = TypeParamEnv{
+            .params = type_params,
+            .args = dref.type_args,
+            .arg_env = env,
+        };
+        for (type_params, 0..) |tp, idx| {
+            if (idx > 0) try buf.append(self.allocator, ',');
+            if (idx < dref.type_args.len) {
+                try self.appendNullishFingerprint(&buf, dref.type_args[idx], env, null, 0);
+            } else if (tp.default_type) |def_ty| {
+                try self.appendNullishFingerprint(&buf, def_ty, &self_env, null, 0);
+            } else {
+                try buf.append(self.allocator, '_');
+            }
+        }
+        return try buf.toOwnedSlice(self.allocator);
+    }
+
+    fn genericParamsArgsNeedSpec(
+        self: *const ModuleEmitCtx,
+        type_params: []const ir.TypeParamIr,
         dref: ir.DeclRefIr,
         env: ?*const TypeParamEnv,
-        visited: ?*const VisitedStruct,
+        visited: ?*const VisitedDecl,
         depth: usize,
-    ) bool {
-        for (st.type_params, 0..) |tp, idx| {
+    ) error{OutOfMemory}!bool {
+        const self_env = TypeParamEnv{
+            .params = type_params,
+            .args = dref.type_args,
+            .arg_env = env,
+        };
+        for (type_params, 0..) |tp, idx| {
             if (idx < dref.type_args.len) {
-                if (self.typeNeedsNullishSpecEnv(dref.type_args[idx], env, visited, depth + 1)) return true;
+                if (try self.typeNeedsNullishSpecEnv(dref.type_args[idx], env, visited, depth + 1)) return true;
             } else if (tp.default_type) |def_ty| {
-                if (self.typeNeedsNullishSpecEnv(def_ty, null, visited, depth + 1)) return true;
+                if (try self.typeNeedsNullishSpecEnv(def_ty, &self_env, visited, depth + 1)) return true;
             }
         }
         return false;
@@ -733,9 +911,9 @@ const ModuleEmitCtx = struct {
         self: *const ModuleEmitCtx,
         ty: *const ir.TypeIr,
         env: ?*const TypeParamEnv,
-        visited: ?*const VisitedStruct,
+        visited: ?*const VisitedDecl,
         depth: usize,
-    ) bool {
+    ) error{OutOfMemory}!bool {
         if (depth >= 24) return false;
         switch (ty.*) {
             .optional => return true,
@@ -744,14 +922,14 @@ const ModuleEmitCtx = struct {
             .anon_struct => |fields| {
                 if (env == null) return false;
                 for (fields) |f| {
-                    if (self.typeNeedsNullishSpecEnv(f.ty, env, visited, depth + 1)) return true;
+                    if (try self.typeNeedsNullishSpecEnv(f.ty, env, visited, depth + 1)) return true;
                 }
                 return false;
             },
             .tuple => |elems| {
                 if (env == null) return false;
                 for (elems) |el| {
-                    if (self.typeNeedsNullishSpecEnv(el.ty, env, visited, depth + 1)) return true;
+                    if (try self.typeNeedsNullishSpecEnv(el.ty, env, visited, depth + 1)) return true;
                 }
                 return false;
             },
@@ -773,6 +951,19 @@ const ModuleEmitCtx = struct {
             },
             .decl_ref => |dref| {
                 if (self.findTargetTypeAlias(dref)) |ta| {
+                    if (ta.type_params.len > 0 and (ta.target.* == .anon_struct or ta.target.* == .tuple)) {
+                        if (!try self.genericParamsArgsNeedSpec(ta.type_params, dref, env, visited, depth)) return false;
+                        const key = try self.computeDeclSpecKey("a", dref, ta.type_params, env);
+                        defer self.allocator.free(key);
+                        if (isDeclKeyVisited(visited, key)) return true;
+                        const next_visited = VisitedDecl{ .key = key, .prev = visited };
+                        const next_env = TypeParamEnv{
+                            .params = ta.type_params,
+                            .args = dref.type_args,
+                            .arg_env = env,
+                        };
+                        return try self.typeNeedsNullishSpecEnv(ta.target, &next_env, &next_visited, depth + 1);
+                    }
                     const next_env = TypeParamEnv{
                         .params = ta.type_params,
                         .args = dref.type_args,
@@ -786,20 +977,18 @@ const ModuleEmitCtx = struct {
                     );
                 }
                 if (self.findTargetGenericStruct(dref)) |st| {
-                    if (!self.genericStructArgsNeedSpec(st, dref, env, visited, depth)) return false;
-                    if (isStructVisited(visited, dref.module_index, dref.target_decl_id)) return true;
-                    const next_visited = VisitedStruct{
-                        .mod_idx = dref.module_index,
-                        .decl_id = dref.target_decl_id,
-                        .prev = visited,
-                    };
+                    if (!try self.genericParamsArgsNeedSpec(st.type_params, dref, env, visited, depth)) return false;
+                    const key = try self.computeDeclSpecKey("s", dref, st.type_params, env);
+                    defer self.allocator.free(key);
+                    if (isDeclKeyVisited(visited, key)) return true;
+                    const next_visited = VisitedDecl{ .key = key, .prev = visited };
                     const next_env = TypeParamEnv{
                         .params = st.type_params,
                         .args = dref.type_args,
                         .arg_env = env,
                     };
                     for (st.fields) |f| {
-                        if (self.typeNeedsNullishSpecEnv(f.ty, &next_env, &next_visited, depth + 1)) return true;
+                        if (try self.typeNeedsNullishSpecEnv(f.ty, &next_env, &next_visited, depth + 1)) return true;
                     }
                     return false;
                 }
@@ -809,23 +998,42 @@ const ModuleEmitCtx = struct {
         }
     }
 
+    fn emitRecurseSpec(self: *ModuleEmitCtx, key: []const u8, is_optional_site: bool) error{OutOfMemory}!void {
+        if (is_optional_site) {
+            try self.out.appendSlice(self.allocator, ".{ .self = .undefined_only, .child = .{ .recurse = ");
+            try self.emitStringLit(key);
+            try self.out.appendSlice(self.allocator, " } }");
+        } else {
+            try self.out.appendSlice(self.allocator, ".{ .recurse = ");
+            try self.emitStringLit(key);
+            try self.out.appendSlice(self.allocator, " }");
+        }
+    }
+
     fn emitFieldsNullishSpecList(
         self: *ModuleEmitCtx,
         fields: []const ir.FieldIr,
         env: *const TypeParamEnv,
-        visited: ?*const VisitedStruct,
+        visited: ?*const VisitedDecl,
+        spec_id: ?[]const u8,
         self_tag: []const u8,
         depth: usize,
     ) error{OutOfMemory}!void {
-        try self.out.print(self.allocator, ".{{ .self = {s}, .fields = .{{ ", .{self_tag});
+        try self.out.appendSlice(self.allocator, ".{ ");
+        if (spec_id) |id_str| {
+            try self.out.appendSlice(self.allocator, ".id = ");
+            try self.emitStringLit(id_str);
+            try self.out.appendSlice(self.allocator, ", ");
+        }
+        try self.out.print(self.allocator, ".self = {s}, .fields = .{{ ", .{self_tag});
         var emitted: usize = 0;
         for (fields) |f| {
-            if (!self.typeNeedsNullishSpecEnv(f.ty, env, visited, depth + 1)) continue;
+            if (!try self.typeNeedsNullishSpecEnv(f.ty, env, visited, depth + 1)) continue;
             if (emitted > 0) try self.out.appendSlice(self.allocator, ", ");
             try self.out.appendSlice(self.allocator, ".{ .name = ");
             try self.emitStringLit(f.logical_name);
             try self.out.appendSlice(self.allocator, ", .nullish = ");
-            try self.emitNullishSpecEnv(f.ty, env, visited, f.is_optional, depth + 1);
+            try self.emitNullishSpecEnv(f.ty, env, visited, null, f.is_optional, depth + 1);
             try self.out.appendSlice(self.allocator, " }");
             emitted += 1;
         }
@@ -836,7 +1044,8 @@ const ModuleEmitCtx = struct {
         self: *ModuleEmitCtx,
         ty: *const ir.TypeIr,
         env: ?*const TypeParamEnv,
-        visited: ?*const VisitedStruct,
+        visited: ?*const VisitedDecl,
+        pending_id: ?[]const u8,
         is_optional_site: bool,
         depth: usize,
     ) error{OutOfMemory}!void {
@@ -854,18 +1063,18 @@ const ModuleEmitCtx = struct {
                     .null_only, .null_or_undefined => ".null_only",
                     .none => ".undefined_only",
                 };
-                if (self.typeNeedsNullishSpecEnv(opt.child, env, visited, depth + 1)) {
+                if (try self.typeNeedsNullishSpecEnv(opt.child, env, visited, depth + 1)) {
                     try self.out.print(self.allocator, ".{{ .self = {s}, .child = ", .{self_tag});
-                    try self.emitNullishSpecEnv(opt.child, env, visited, false, depth + 1);
+                    try self.emitNullishSpecEnv(opt.child, env, visited, null, false, depth + 1);
                     try self.out.appendSlice(self.allocator, " }");
                 } else {
                     try self.out.appendSlice(self.allocator, self_tag);
                 }
             },
             .slice => |elem_ty| {
-                if (self.typeNeedsNullishSpecEnv(elem_ty, env, visited, depth + 1)) {
+                if (try self.typeNeedsNullishSpecEnv(elem_ty, env, visited, depth + 1)) {
                     try self.out.print(self.allocator, ".{{ .self = {s}, .elem = ", .{default_self_tag});
-                    try self.emitNullishSpecEnv(elem_ty, env, visited, false, depth + 1);
+                    try self.emitNullishSpecEnv(elem_ty, env, visited, null, false, depth + 1);
                     try self.out.appendSlice(self.allocator, " }");
                 } else {
                     try self.out.appendSlice(self.allocator, default_self_tag);
@@ -873,8 +1082,8 @@ const ModuleEmitCtx = struct {
             },
             .anon_struct => |fields| {
                 if (env) |e| {
-                    if (self.typeNeedsNullishSpecEnv(ty, e, visited, depth)) {
-                        try self.emitFieldsNullishSpecList(fields, e, visited, default_self_tag, depth);
+                    if (try self.typeNeedsNullishSpecEnv(ty, e, visited, depth)) {
+                        try self.emitFieldsNullishSpecList(fields, e, visited, pending_id, default_self_tag, depth);
                         return;
                     }
                 }
@@ -882,14 +1091,20 @@ const ModuleEmitCtx = struct {
             },
             .tuple => |elems| {
                 if (env) |e| {
-                    if (self.typeNeedsNullishSpecEnv(ty, e, visited, depth)) {
-                        try self.out.print(self.allocator, ".{{ .self = {s}, .tuple = .{{ ", .{default_self_tag});
+                    if (try self.typeNeedsNullishSpecEnv(ty, e, visited, depth)) {
+                        try self.out.appendSlice(self.allocator, ".{ ");
+                        if (pending_id) |id_str| {
+                            try self.out.appendSlice(self.allocator, ".id = ");
+                            try self.emitStringLit(id_str);
+                            try self.out.appendSlice(self.allocator, ", ");
+                        }
+                        try self.out.print(self.allocator, ".self = {s}, .tuple = .{{ ", .{default_self_tag});
                         for (elems, 0..) |el, idx| {
                             if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
                             if (el.is_variadic) {
                                 try self.emitSliceElemNullishSpecEnv(el.ty, e, visited, depth + 1);
                             } else {
-                                try self.emitNullishSpecEnv(el.ty, e, visited, el.is_optional, depth + 1);
+                                try self.emitNullishSpecEnv(el.ty, e, visited, null, el.is_optional, depth + 1);
                             }
                         }
                         try self.out.appendSlice(self.allocator, " } }");
@@ -899,18 +1114,18 @@ const ModuleEmitCtx = struct {
                 try self.out.appendSlice(self.allocator, default_self_tag);
             },
             .pointer_const => |inner| {
-                try self.emitNullishSpecEnv(inner, env, visited, is_optional_site, depth + 1);
+                try self.emitNullishSpecEnv(inner, env, visited, pending_id, is_optional_site, depth + 1);
             },
             .type_param_ref => |tp_ident| {
                 if (env) |e| {
                     for (e.params, 0..) |tp, idx| {
                         if (std.mem.eql(u8, tp.zig_ident, tp_ident)) {
                             if (idx < e.args.len) {
-                                try self.emitNullishSpecEnv(e.args[idx], e.arg_env, visited, is_optional_site, depth + 1);
+                                try self.emitNullishSpecEnv(e.args[idx], e.arg_env, visited, pending_id, is_optional_site, depth + 1);
                                 return;
                             }
                             if (tp.default_type) |def_ty| {
-                                try self.emitNullishSpecEnv(def_ty, e, visited, is_optional_site, depth + 1);
+                                try self.emitNullishSpecEnv(def_ty, e, visited, pending_id, is_optional_site, depth + 1);
                                 return;
                             }
                             break;
@@ -921,6 +1136,28 @@ const ModuleEmitCtx = struct {
             },
             .decl_ref => |dref| {
                 if (self.findTargetTypeAlias(dref)) |ta| {
+                    if (ta.type_params.len > 0 and (ta.target.* == .anon_struct or ta.target.* == .tuple)) {
+                        if (try self.genericParamsArgsNeedSpec(ta.type_params, dref, env, visited, depth)) {
+                            const key = try self.computeDeclSpecKey("a", dref, ta.type_params, env);
+                            defer self.allocator.free(key);
+                            if (isDeclKeyVisited(visited, key)) {
+                                try self.emitRecurseSpec(key, is_optional_site);
+                                return;
+                            }
+                            const next_visited = VisitedDecl{ .key = key, .prev = visited };
+                            const next_env = TypeParamEnv{
+                                .params = ta.type_params,
+                                .args = dref.type_args,
+                                .arg_env = env,
+                            };
+                            if (try self.typeNeedsNullishSpecEnv(ta.target, &next_env, &next_visited, depth + 1)) {
+                                try self.emitNullishSpecEnv(ta.target, &next_env, &next_visited, key, is_optional_site, depth + 1);
+                                return;
+                            }
+                        }
+                        try self.out.appendSlice(self.allocator, default_self_tag);
+                        return;
+                    }
                     const next_env = TypeParamEnv{
                         .params = ta.type_params,
                         .args = dref.type_args,
@@ -930,33 +1167,35 @@ const ModuleEmitCtx = struct {
                         ta.target,
                         if (ta.type_params.len > 0) &next_env else null,
                         visited,
+                        pending_id,
                         is_optional_site,
                         depth + 1,
                     );
                     return;
                 }
                 if (self.findTargetGenericStruct(dref)) |st| {
-                    if (self.genericStructArgsNeedSpec(st, dref, env, visited, depth)) {
-                        if (isStructVisited(visited, dref.module_index, dref.target_decl_id)) {
-                            if (is_optional_site) {
-                                try self.out.appendSlice(self.allocator, ".{ .self = .undefined_only, .child = .recurse }");
-                            } else {
-                                try self.out.appendSlice(self.allocator, ".recurse");
-                            }
+                    if (try self.genericParamsArgsNeedSpec(st.type_params, dref, env, visited, depth)) {
+                        const key = try self.computeDeclSpecKey("s", dref, st.type_params, env);
+                        defer self.allocator.free(key);
+                        if (isDeclKeyVisited(visited, key)) {
+                            try self.emitRecurseSpec(key, is_optional_site);
                             return;
                         }
-                        const next_visited = VisitedStruct{
-                            .mod_idx = dref.module_index,
-                            .decl_id = dref.target_decl_id,
-                            .prev = visited,
-                        };
+                        const next_visited = VisitedDecl{ .key = key, .prev = visited };
                         const next_env = TypeParamEnv{
                             .params = st.type_params,
                             .args = dref.type_args,
                             .arg_env = env,
                         };
-                        if (self.typeNeedsNullishSpecEnv(ty, env, visited, depth)) {
-                            try self.emitFieldsNullishSpecList(st.fields, &next_env, &next_visited, default_self_tag, depth);
+                        var has_field_spec = false;
+                        for (st.fields) |f| {
+                            if (try self.typeNeedsNullishSpecEnv(f.ty, &next_env, &next_visited, depth + 1)) {
+                                has_field_spec = true;
+                                break;
+                            }
+                        }
+                        if (has_field_spec) {
+                            try self.emitFieldsNullishSpecList(st.fields, &next_env, &next_visited, key, default_self_tag, depth);
                             return;
                         }
                     }
@@ -970,14 +1209,14 @@ const ModuleEmitCtx = struct {
     }
 
     fn emitNullishSpec(self: *ModuleEmitCtx, ty: *const ir.TypeIr, is_optional_site: bool) error{OutOfMemory}!void {
-        try self.emitNullishSpecEnv(ty, null, null, is_optional_site, 0);
+        try self.emitNullishSpecEnv(ty, null, null, null, is_optional_site, 0);
     }
 
     fn emitSliceElemNullishSpecEnv(
         self: *ModuleEmitCtx,
         ty: *const ir.TypeIr,
         env: ?*const TypeParamEnv,
-        visited: ?*const VisitedStruct,
+        visited: ?*const VisitedDecl,
         depth: usize,
     ) error{OutOfMemory}!void {
         if (depth >= 24) {
@@ -986,7 +1225,7 @@ const ModuleEmitCtx = struct {
         }
         switch (ty.*) {
             .slice => |elem_ty| {
-                try self.emitNullishSpecEnv(elem_ty, env, visited, false, depth + 1);
+                try self.emitNullishSpecEnv(elem_ty, env, visited, null, false, depth + 1);
             },
             .pointer_const => |inner| {
                 try self.emitSliceElemNullishSpecEnv(inner, env, visited, depth + 1);

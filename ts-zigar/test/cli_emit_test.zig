@@ -2529,3 +2529,122 @@ test "Issue #46 (M3.1a): primitives, optionals/nullish kinds, bigint literals, s
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
 }
 
+test "Issue #46 keyed generic container nullish overrides: mutual recursion, inline anon_struct, polymorphic args, recursive alias, and Id<T[]>" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue46-keyed-recurse", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const src_dir = try std.fmt.allocPrint(alloc, "{s}/src", .{sandbox});
+    defer alloc.free(src_dir);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+
+    try cwd.createDirPath(io, src_dir);
+    {
+        var d = try cwd.openDir(io, src_dir, .{});
+        defer d.close(io);
+        try d.writeFile(io, .{
+            .sub_path = "index.d.ts",
+            .data =
+            \\export type Id<T> = T;
+            \\export type Maybe<T> = T | null;
+            \\export type Undef<T> = T | undefined;
+            \\export type PairAlias<T> = [T, number];
+            \\export type AliasTree<T> = {
+            \\  v: T;
+            \\  kids?: AliasTree<T>[];
+            \\};
+            \\export type TupleTree<T> = [T, TupleTree<T>[]];
+            \\export interface MutA<T> {
+            \\  v: T;
+            \\  b?: MutB<T>;
+            \\}
+            \\export interface MutB<T> {
+            \\  w: T;
+            \\  a?: MutA<T>;
+            \\}
+            \\export interface MetaNode<T> {
+            \\  val: T;
+            \\  meta: {
+            \\    label?: string;
+            \\    inner?: MetaNode<T>;
+            \\  };
+            \\}
+            \\export interface PolyNode<T> {
+            \\  val: T;
+            \\  alt?: PolyNode<Maybe<number>>;
+            \\  same?: PolyNode<T>;
+            \\}
+            \\export declare function takeMut(a: MutA<Undef<number>>): void;
+            \\export declare function takeMeta(m: MetaNode<Undef<number>>): void;
+            \\export declare function takePoly(p: PolyNode<Undef<number>>): void;
+            \\export declare function takeTree(t: AliasTree<Undef<number>>): void;
+            \\export declare function takeTupleTree(t: TupleTree<Undef<number>>): void;
+            \\export declare function takePair(p: PairAlias<Undef<string>>): void;
+            \\export declare function takeIdRest(...nums: Id<number[]>): number;
+            \\export type IdTuple = [string, ...Id<number[]>];
+            ,
+        });
+    }
+
+    const index_dts = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{src_dir});
+    defer alloc.free(index_dts);
+
+    const cli_args = [_][]const u8{ "-t", index_dts, "-d", out_dir };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Issue #46 keyed recurse emit error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+
+    // Golden text assertions on emitted `index.zig`
+    {
+        var out_h = try cwd.openDir(io, out_dir, .{});
+        defer out_h.close(io);
+        const src = try out_h.readFileAlloc(io, "index.zig", alloc, .limited(128 * 1024));
+        defer alloc.free(src);
+
+        // 1. Keyed `.id = "s:..."` and `.{ .recurse = "s:..." }` emitted for `MutA` <-> `MutB`, `MetaNode`, and `PolyNode`!
+        try std.testing.expect(std.mem.indexOf(u8, src, ".id = \"s:0:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, ".{ .recurse = \"s:0:") != null);
+
+        // 2. Polymorphic recursion (`PolyNode<Undef<number>>` with `alt?: PolyNode<Maybe<number>>`)
+        //    emits BOTH `?u(_)` (for outer `Undef<number>`) AND `?n(_)` (for `alt`'s `Maybe<number>` -> `.null_only`), NOT premature `.recurse`!
+        try std.testing.expect(std.mem.indexOf(u8, src, ":?u(_)\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, ":?n(_)\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, ".{ .name = \"val\", .nullish = .null_only }") != null);
+
+        // 3. Recursive object-alias `AliasTree<Undef<number>>` (`.elem = .{ .recurse = "s:0:...`) and
+        //    recursive tuple-alias `TupleTree<Undef<number>>` (`.elem = .{ .recurse = "a:0:...`) with bounded output size!
+        try std.testing.expect(std.mem.indexOf(u8, src, ".elem = .{ .recurse = \"s:0:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, ".id = \"a:0:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, ".elem = .{ .recurse = \"a:0:") != null);
+        try std.testing.expect(src.len < 32768);
+
+        // 4. Generic tuple alias `PairAlias<Undef<string>>` emits `.tuple = .{ .undefined_only, .none }`!
+        try std.testing.expect(std.mem.indexOf(u8, src, ".tuple = .{ .undefined_only, .none }") != null);
+
+        // 5. `takeIdRest(...nums: Id<number[]>)` and `IdTuple = [string, ...Id<number[]>]` do NOT double-wrap `[]const []const`!
+        try std.testing.expect(std.mem.indexOf(u8, src, "[]const Id([]const f64)") == null);
+    }
+
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+}
+
