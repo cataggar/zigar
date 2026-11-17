@@ -5397,19 +5397,24 @@ pub fn Js(comptime host: type) type {
 
         fn resolveTargetCtorRef(comptime target: anytype) module.CallError!?Ref(module.Any) {
             const TargetT = @TypeOf(target);
-            const has_mod = comptime @hasField(TargetT, "module");
+            const mod_spec_opt: ?[]const u8 = comptime blk: {
+                if (!@hasField(TargetT, "module")) break :blk null;
+                const ModFieldT = @TypeOf(target.module);
+                if (@typeInfo(ModFieldT) == .optional) break :blk target.module;
+                break :blk target.module;
+            };
             const is_def = comptime (@hasField(TargetT, "is_default") and target.is_default);
             const from_def = comptime (@hasField(TargetT, "from_default") and target.from_default);
             const has_ns = comptime (@hasField(TargetT, "ns_path") and target.ns_path.len > 0);
 
-            if (comptime (is_def and has_mod and !has_ns)) {
-                return try importModuleDefaultAs(module.CallError!Ref(module.Any), target.module);
+            if (comptime (is_def and mod_spec_opt != null and !has_ns)) {
+                return try importModuleDefaultAs(module.CallError!Ref(module.Any), mod_spec_opt.?);
             }
 
-            var cur: Ref(module.Any) = if (comptime (from_def and has_mod))
-                try importModuleDefaultAs(module.CallError!Ref(module.Any), target.module)
-            else if (comptime has_mod)
-                .{ .handle = (try importModule(target.module)).handle }
+            var cur: Ref(module.Any) = if (comptime (from_def and mod_spec_opt != null))
+                try importModuleDefaultAs(module.CallError!Ref(module.Any), mod_spec_opt.?)
+            else if (comptime (mod_spec_opt != null))
+                .{ .handle = (try importModule(mod_spec_opt.?)).handle }
             else
                 Ref(module.Any).globalThis;
             errdefer cur.deinit();
@@ -5770,6 +5775,12 @@ pub fn Js(comptime host: type) type {
                         if (@hasField(@TypeOf(meta), "is_template_literal") and meta.is_template_literal) break :blk 25;
                         if (@hasField(@TypeOf(meta), "is_enum") and meta.is_enum) break :blk 98;
                         if (@hasField(@TypeOf(meta), "is_class") and meta.is_class) break :blk 70;
+                        if (@hasField(@TypeOf(meta), "is_handle") and meta.is_handle) {
+                            if (@hasField(@TypeOf(meta), "is_callable_handle") and meta.is_callable_handle) break :blk 71;
+                            if (@hasField(@TypeOf(meta), "required_methods") and meta.required_methods.len > 0) break :blk 72;
+                            if (@hasField(@TypeOf(meta), "required_props") and meta.required_props.len > 0) break :blk 79;
+                            break :blk 86;
+                        }
                     }
                     var has_constraint = false;
                     var has_required = false;
@@ -6082,6 +6093,12 @@ pub fn Js(comptime host: type) type {
 
                     if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_enum") and T.zigar_js.is_enum and @hasField(T, "__zigar_value")) {
                         return toJsRefWithSpecImpl(@TypeOf(value.__zigar_value), value.__zigar_value, module.NullishKind.none, .{});
+                    }
+
+                    if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_handle") and T.zigar_js.is_handle)) {
+                        const ref_fname = comptime if (@hasField(@TypeOf(T.zigar_js), "ref_field")) T.zigar_js.ref_field else "ref";
+                        const inner_ref = @field(value, ref_fname);
+                        return .{ .handle = (try (@as(Ref(module.Any), .{ .handle = inner_ref.handle })).tryClone()).handle };
                     }
 
                     const has_fields_override = comptime (@typeInfo(@TypeOf(spec)) == .@"struct" and @hasField(@TypeOf(spec), "fields"));
@@ -6540,6 +6557,62 @@ pub fn Js(comptime host: type) type {
 
                     if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_enum") and T.zigar_js.is_enum and @hasField(T, "__zigar_value")) {
                         return .{ .__zigar_value = try fromJsRefAlloc(@FieldType(T, "__zigar_value"), allocator, raw) };
+                    }
+
+                    if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_handle") and T.zigar_js.is_handle)) {
+                        if (raw.isNullOrUndefined()) return error.TypeError;
+                        const jt = try raw.tryTypeof();
+                        const is_callable_h = comptime (@hasField(@TypeOf(T.zigar_js), "is_callable_handle") and T.zigar_js.is_callable_handle);
+                        if (comptime is_callable_h) {
+                            if (jt != .function) return error.TypeError;
+                        } else {
+                            if (jt != .object and jt != .function) return error.TypeError;
+                        }
+
+                        const is_cls_h = comptime (@hasField(@TypeOf(T.zigar_js), "is_class") and T.zigar_js.is_class);
+                        if (comptime (is_cls_h and @hasField(@TypeOf(T.zigar_js), "ctor_target"))) {
+                            if (resolveTargetCtorRef(T.zigar_js.ctor_target)) |ctor_opt| {
+                                if (ctor_opt) |ctor| {
+                                    defer ctor.deinit();
+                                    if (!ctor.isNullOrUndefined() and (try ctor.tryTypeof()) == .function) {
+                                        if (!(try raw.tryInstanceof(ctor))) return error.TypeError;
+                                    }
+                                }
+                            } else |err| switch (err) {
+                                error.OffJsThread, error.OutOfMemory => return err,
+                                else => clearLastError(),
+                            }
+                        } else if (comptime !is_cls_h) {
+                            const req_methods = comptime if (@hasField(@TypeOf(T.zigar_js), "required_methods")) T.zigar_js.required_methods else &[_][]const u8{};
+                            const req_props = comptime if (@hasField(@TypeOf(T.zigar_js), "required_props")) T.zigar_js.required_props else &[_][]const u8{};
+                            const has_length_prop = comptime blk: {
+                                for (req_props) |rp| {
+                                    if (std.mem.eql(u8, rp, "length")) break :blk true;
+                                }
+                                break :blk false;
+                            };
+                            if (comptime (!is_callable_h and req_methods.len == 0 and !has_length_prop)) {
+                                if (jt == .object and (Array(Ref(module.Any)).isArray(raw) catch false)) {
+                                    return error.TypeError;
+                                }
+                            }
+                            inline for (req_methods) |m_name| {
+                                if (!(try raw.tryHas(m_name))) return error.TypeError;
+                                const m_ref = try getProp(module.CallError!Ref(module.Any), raw, m_name);
+                                defer m_ref.deinit();
+                                if (m_ref.isNullOrUndefined() or (try m_ref.tryTypeof()) != .function) {
+                                    return error.TypeError;
+                                }
+                            }
+                            inline for (req_props) |p_name| {
+                                if (!(try raw.tryHas(p_name))) return error.TypeError;
+                            }
+                        }
+
+                        const ref_fname = comptime if (@hasField(@TypeOf(T.zigar_js), "ref_field")) T.zigar_js.ref_field else "ref";
+                        var out_h: T = undefined;
+                        @field(out_h, ref_fname) = .{ .handle = (try raw.tryClone()).handle };
+                        return out_h;
                     }
 
                     if (raw.isNullOrUndefined()) return error.TypeError;
@@ -7644,6 +7717,258 @@ test "JsException lazy capture, Module exact Error!T preservation, Ref dispose/a
         try expectEqual(@as(u32, 0), LifecycleMockHost.active_callbacks);
     }
 }
+
+test "Js(#48): handle wrapper structs validate duck-typed methods/props without invoking getters, clone refs, and free cleanly" {
+    const HandleMockHost = struct {
+        var next_slot: u32 = 16;
+        var active_handles: u32 = 0;
+        var getter_reads_for_status: u32 = 0;
+
+        // Tag encoding in low 20 bits:
+        // 0x10 = class instance (`instanceof` = true)
+        // 0x20 = duck-typed stateful service (`has("ping")`, `typeof ping == function`, `has("status")`)
+        // 0x30 = callable function (`typeof == function`, `has("version")`)
+        // 0x40 = JS Array (`typeof == object`, `Array.isArray == true`)
+        // 0x50 = impostor object (`has("ping")` = true, but `typeof ping == string`!)
+        fn allocKind(kind_tag: u32) u32 {
+            active_handles += 1;
+            const gen = next_slot;
+            next_slot += 1;
+            return (gen << 20) | kind_tag;
+        }
+
+        fn kindOf(h: u32) u32 {
+            return h & 0xFFFFF;
+        }
+
+        pub fn releaseJsValue(h: u32) void {
+            if (h >= first_dynamic_slot) {
+                std.debug.assert(active_handles > 0);
+                active_handles -= 1;
+            }
+        }
+
+        pub fn cloneJsValue(h: u32) u32 {
+            if (h <= reserved_global_this_handle) return h;
+            return allocKind(kindOf(h));
+        }
+
+        pub fn getJsValueCount() u32 {
+            return active_handles;
+        }
+
+        pub fn typeofJsValue(h: u32) JsType {
+            if (h == reserved_undefined_handle) return .undefined;
+            if (h == reserved_null_handle) return .object;
+            return switch (kindOf(h)) {
+                0x30, 0x90, 0x91 => .function,
+                0x92 => .string,
+                else => .object,
+            };
+        }
+
+        pub fn instanceofJsValue(inst: u32, ctor: u32) bool {
+            return kindOf(inst) == 0x10 and kindOf(ctor) == 0x90;
+        }
+
+        pub fn tryControlLastJsError(_: u32) Error!u32 {
+            return no_captured_error_handle;
+        }
+
+        pub fn invokeJsHostOp(desc_ptr: *const anyopaque, arg_ptr: *anyopaque, _: usize) E {
+            const desc: *const HostOpDescriptor = @ptrCast(@alignCast(desc_ptr));
+            const key = if (desc.key_ptr) |p| p[0..desc.key_len] else "";
+            const op: HostOp = @enumFromInt(desc.op);
+            switch (op) {
+                .import_module => {
+                    const out_bytes: [*]u8 = @ptrCast(arg_ptr);
+                    const handle_out: *u32 = @ptrCast(@alignCast(out_bytes));
+                    handle_out.* = allocKind(0x80);
+                    out_bytes[4] = 0;
+                    return .SUCCESS;
+                },
+                .has_prop => {
+                    const Frame = arg_struct.ArgStruct(fn (Js(@This()).Ref(Any)) Error!bool);
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    const k = kindOf(frame.@"0".handle);
+                    frame.retval = switch (k) {
+                        0x20 => std.mem.eql(u8, key, "ping") or std.mem.eql(u8, key, "status"),
+                        0x30 => std.mem.eql(u8, key, "version"),
+                        0x50 => std.mem.eql(u8, key, "ping") or std.mem.eql(u8, key, "status"),
+                        else => false,
+                    };
+                    return .SUCCESS;
+                },
+                .get_prop => {
+                    const Frame = arg_struct.ArgStruct(fn (Js(@This()).Ref(Any)) Error!Js(@This()).Ref(Any));
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    const k = kindOf(frame.@"0".handle);
+                    if (std.mem.eql(u8, key, "status")) {
+                        getter_reads_for_status += 1;
+                    }
+                    if (k == 0x80 and std.mem.eql(u8, key, "MyClass")) {
+                        frame.retval = .{ .handle = allocKind(0x90) };
+                    } else if (k == 0x20 and std.mem.eql(u8, key, "ping")) {
+                        frame.retval = .{ .handle = allocKind(0x91) };
+                    } else if (k == 0x50 and std.mem.eql(u8, key, "ping")) {
+                        frame.retval = .{ .handle = allocKind(0x92) };
+                    } else if (hIsGlobal(frame.@"0".handle) and std.mem.eql(u8, key, "Array")) {
+                        frame.retval = .{ .handle = allocKind(0x91) };
+                    } else {
+                        frame.retval = .@"undefined";
+                    }
+                    return .SUCCESS;
+                },
+                .binary_info => {
+                    const Frame = arg_struct.ArgStruct(fn (Js(@This()).Ref(Any)) Error!bool);
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    frame.retval = (kindOf(frame.@"0".handle) == 0x40);
+                    return .SUCCESS;
+                },
+                else => return .FAULT,
+            }
+        }
+
+        fn hIsGlobal(h: u32) bool {
+            return h == reserved_global_this_handle;
+        }
+    };
+
+    const js = Js(HandleMockHost);
+
+    const ClassHandle = struct {
+        ref: js.Ref(js.Object),
+        pub fn deinit(self: @This()) void {
+            self.ref.deinit();
+        }
+        pub const zigar_js = .{
+            .js_name = "MyClass",
+            .is_handle = true,
+            .is_class = true,
+            .is_callable_handle = false,
+            .ref_field = "ref",
+            .ctor_target = .{
+                .module = @as(?[]const u8, "pkg"),
+                .ns_path = &[_][]const u8{},
+                .name = "MyClass",
+                .is_default = false,
+                .from_default = false,
+            },
+        };
+    };
+
+    const CallableHandle = struct {
+        __zigar_ref: js.Ref(js.Function),
+        pub fn deinit(self: @This()) void {
+            self.__zigar_ref.deinit();
+        }
+        pub const zigar_js = .{
+            .js_name = "CallableApi",
+            .is_handle = true,
+            .is_class = false,
+            .is_callable_handle = true,
+            .ref_field = "__zigar_ref",
+            .required_methods = &[_][]const u8{},
+            .required_props = &[_][]const u8{"version"},
+        };
+    };
+
+    const ServiceHandle = struct {
+        ref: js.Ref(js.Object),
+        pub fn deinit(self: @This()) void {
+            self.ref.deinit();
+        }
+        pub const zigar_js = .{
+            .js_name = "Service",
+            .is_handle = true,
+            .is_class = false,
+            .is_callable_handle = false,
+            .ref_field = "ref",
+            .required_methods = &[_][]const u8{"ping"},
+            .required_props = &[_][]const u8{"status"},
+        };
+    };
+
+    const UnconstrainedHandle = struct {
+        ref: js.Ref(js.Object),
+        pub fn deinit(self: @This()) void {
+            self.ref.deinit();
+        }
+        pub const zigar_js = .{
+            .js_name = "OptionalOnly",
+            .is_handle = true,
+            .is_class = false,
+            .is_callable_handle = false,
+            .ref_field = "ref",
+            .required_methods = &[_][]const u8{},
+            .required_props = &[_][]const u8{},
+        };
+    };
+
+    try expect(!js.needsDecodeAllocator(ClassHandle));
+    try expect(!js.needsDecodeAllocator(CallableHandle));
+    try expect(!js.needsDecodeAllocator(ServiceHandle));
+
+    // Verify union rank ordering: ClassHandle (70) < CallableHandle (71) < ServiceHandle (72) < UnconstrainedHandle (86)
+    const MixedUnion = union(enum) {
+        unconstrained: UnconstrainedHandle,
+        service: ServiceHandle,
+        callable: CallableHandle,
+        cls: ClassHandle,
+    };
+
+    // 1. ClassHandle matches `0x10` (`instanceof MyClass`) and clones handle cleanly
+    {
+        const raw_cls: js.Ref(js.Any) = .{ .handle = HandleMockHost.allocKind(0x10) };
+        defer raw_cls.deinit();
+        const u = try js.fromJsRefAlloc(MixedUnion, std.testing.allocator, raw_cls);
+        defer js.freeDecoded(MixedUnion, std.testing.allocator, u);
+        try expectEqual(std.meta.Tag(MixedUnion).cls, std.meta.activeTag(u));
+
+        const outbound = try js.toJsRef(ClassHandle, u.cls);
+        defer outbound.deinit();
+        try expectEqual(@as(u32, 0x10), HandleMockHost.kindOf(outbound.handle));
+    }
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    // 2. ServiceHandle matches `0x20` WITHOUT invoking `.status` getter (`getter_reads_for_status == 0`)!
+    {
+        HandleMockHost.getter_reads_for_status = 0;
+        const raw_svc: js.Ref(js.Any) = .{ .handle = HandleMockHost.allocKind(0x20) };
+        defer raw_svc.deinit();
+        const svc = try js.fromJsRef(ServiceHandle, raw_svc);
+        defer svc.deinit();
+        try expectEqual(@as(u32, 0), HandleMockHost.getter_reads_for_status);
+    }
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    // 3. Impostor object (`0x50`, `typeof ping == "string"`) is rejected by `ServiceHandle`
+    {
+        const raw_imp: js.Ref(js.Any) = .{ .handle = HandleMockHost.allocKind(0x50) };
+        defer raw_imp.deinit();
+        try std.testing.expectError(error.TypeError, js.fromJsRef(ServiceHandle, raw_imp));
+    }
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    // 4. CallableHandle matches `0x30` (`typeof == "function"` + `has("version")`) and rejects plain objects
+    {
+        const raw_fn: js.Ref(js.Any) = .{ .handle = HandleMockHost.allocKind(0x30) };
+        defer raw_fn.deinit();
+        const u = try js.fromJsRefAlloc(MixedUnion, std.testing.allocator, raw_fn);
+        defer js.freeDecoded(MixedUnion, std.testing.allocator, u);
+        try expectEqual(std.meta.Tag(MixedUnion).callable, std.meta.activeTag(u));
+    }
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    // 5. JS Array (`0x40`) is rejected by `UnconstrainedHandle` (`required_methods.len == 0`)
+    {
+        const raw_arr: js.Ref(js.Any) = .{ .handle = HandleMockHost.allocKind(0x40) };
+        defer raw_arr.deinit();
+        try std.testing.expectError(error.TypeError, js.fromJsRef(UnconstrainedHandle, raw_arr));
+    }
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+}
+
 
 test "Standard wrappers: ABI layout, Promise, binary views, collections, BigInt, Date, RegExp, and Iterators" {
     const WrapperMockHost = struct {

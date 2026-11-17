@@ -3,6 +3,8 @@ const cli = @import("cli.zig");
 const naming = @import("naming.zig");
 const lower_types = @import("lower_types.zig");
 const lower_unions = @import("lower_unions.zig");
+const classify_decls = @import("classify_decls.zig");
+const lower_objects = @import("lower_objects.zig");
 
 /// Lowering configuration for `lowerGraph`.
 pub const LowerOptions = struct {
@@ -87,9 +89,11 @@ pub const FieldIr = struct {
 
 pub const MethodIr = struct {
     zig_ident: []const u8,
+    alloc_companion_ident: ?[]const u8 = null,
     logical_name: []const u8,
     wire_name: []const u8,
     is_static: bool,
+    call_kind: lower_objects.MethodCallKind = .method,
     signature: SignatureIr,
     jsdoc: ?JsDocIr,
 };
@@ -218,6 +222,7 @@ pub const TypeIr = union(enum) {
     js_any,
     js_unknown,
     js_object,
+    js_function,
     js_symbol,
     js_bigint,
     js_string,
@@ -246,9 +251,25 @@ pub const StaticPropIr = struct {
     zig_ident: []const u8,
     logical_name: []const u8,
     wire_name: []const u8,
+    access_kind: lower_objects.StaticPropAccessKind = .read_write,
     ty: *const TypeIr,
+    setter_ty: ?*const TypeIr = null,
     literal: ?LiteralValueIr,
     jsdoc: ?JsDocIr,
+};
+
+pub const InstancePropIr = struct {
+    wire_name: []const u8,
+    is_optional: bool,
+    getter_ident: ?[]const u8 = null,
+    getter_alloc_ident: ?[]const u8 = null,
+    getter_alloc_param_ident: []const u8 = "allocator",
+    getter_ty: ?*const TypeIr = null,
+    setter_ident: ?[]const u8 = null,
+    setter_param_ident: []const u8 = "value",
+    setter_ty: ?*const TypeIr = null,
+    setter_is_optional: bool = false,
+    jsdoc: ?JsDocIr = null,
 };
 
 pub const ConstructorIr = struct {
@@ -258,13 +279,26 @@ pub const ConstructorIr = struct {
 };
 
 pub const StructDeclIr = struct {
+    repr: classify_decls.ObjectDeclKind = .value_struct,
     is_class: bool,
     is_abstract: bool,
+    is_callable_handle: bool = false,
     has_private_constructor: bool = false,
     has_non_public_members: bool = false,
     self_ident: []const u8,
+    ref_field_ident: []const u8 = "ref",
+    self_param_ident: []const u8 = "__zigar_self",
+    raw_param_ident: []const u8 = "__zigar_raw",
+    alloc_param_ident: []const u8 = "__zigar_alloc",
+    to_js_ref_ident: ?[]const u8 = null,
+    from_js_ref_ident: ?[]const u8 = null,
+    from_js_ref_alloc_ident: ?[]const u8 = null,
+    deinit_ident: ?[]const u8 = null,
+    required_methods: []const []const u8 = &.{},
+    required_props: []const []const u8 = &.{},
     type_params: []const TypeParamIr,
     fields: []const FieldIr,
+    instance_props: []const InstancePropIr = &.{},
     static_props: []const StaticPropIr,
     constructors: []const ConstructorIr,
     methods: []const MethodIr,
@@ -531,6 +565,8 @@ fn LowerCtx(comptime GraphType: type) type {
         decl_locations: std.AutoHashMapUnmanaged(u32, DeclLocation) = .empty,
         merged_ns_consumed: std.AutoHashMapUnmanaged(u32, void) = .empty,
         merged_iface_consumed: std.AutoHashMapUnmanaged(u32, void) = .empty,
+        merged_ctor_var_consumed: std.AutoHashMapUnmanaged(u32, void) = .empty,
+        decl_classifications: std.AutoHashMapUnmanaged(u32, classify_decls.DeclClassification) = .empty,
         merged_generic_ns_peer: std.AutoHashMapUnmanaged(u32, u32) = .empty,
         merged_generic_ns_set: std.AutoHashMapUnmanaged(u32, void) = .empty,
         pure_export_equals_ns: std.AutoHashMapUnmanaged(u32, void) = .empty,
@@ -549,6 +585,7 @@ fn LowerCtx(comptime GraphType: type) type {
         cur_mod_root_scope: ?*naming.ScopeNamer = null,
         cur_mod_anon_counter: u32 = 0,
         inline_anon_depth: u32 = 0,
+        in_handle_struct: bool = false,
 
         fn deinitScratch(self: *Self) void {
             for (self.candidates.items) |*c| {
@@ -565,6 +602,8 @@ fn LowerCtx(comptime GraphType: type) type {
             self.decl_locations.deinit(self.scratch);
             self.merged_ns_consumed.deinit(self.scratch);
             self.merged_iface_consumed.deinit(self.scratch);
+            self.merged_ctor_var_consumed.deinit(self.scratch);
+            self.decl_classifications.deinit(self.scratch);
             self.merged_generic_ns_peer.deinit(self.scratch);
             self.merged_generic_ns_set.deinit(self.scratch);
             self.pure_export_equals_ns.deinit(self.scratch);
@@ -580,6 +619,20 @@ fn LowerCtx(comptime GraphType: type) type {
         fn str(self: *const Self, id: u32) []const u8 {
             if (id < self.graph.strings.len) return self.graph.strings[id];
             return "";
+        }
+
+        fn classifyDecl(self: *Self, decl_id: u32) error{OutOfMemory}!classify_decls.DeclClassification {
+            if (self.decl_classifications.get(decl_id)) |cached| return cached;
+            var cls = classify_decls.Classifier(GraphType).init(self.scratch, &self.graph);
+            defer cls.state.deinit(self.scratch);
+            cls.memo = self.decl_classifications;
+            defer self.decl_classifications = cls.memo;
+            return try cls.classifyDecl(decl_id);
+        }
+
+        fn classifyObjectLiteral(self: *const Self, obj: anytype) classify_decls.DeclClassification {
+            var cls = classify_decls.Classifier(GraphType).init(self.scratch, &self.graph);
+            return cls.classifyObjectLiteralData(obj);
         }
 
         fn isPrimaryVfsPath(self: *const Self, fp: []const u8) bool {
@@ -1714,6 +1767,13 @@ fn LowerCtx(comptime GraphType: type) type {
                         try self.walkTypeRefs(isig.key_type, visited_types, visitor);
                         try self.walkTypeRefs(isig.value_type, visited_types, visitor);
                     }
+                    for (d.merged_with) |mid| {
+                        if (mid == decl_id or mid >= self.graph.decls.len) continue;
+                        const md = self.graph.decls[mid];
+                        if (md.module == d.module and md.kind == .variable_decl) {
+                            try self.walkTypeRefs(md.kind.variable_decl, visited_types, visitor);
+                        }
+                    }
                 },
                 .class_decl => |cls| {
                     if (cls.extends_clause) |hc| try self.walkHeritageRefs(hc, visited_types, visitor);
@@ -2180,6 +2240,17 @@ fn LowerCtx(comptime GraphType: type) type {
                             }
                         }
                     }
+                } else if (d.kind == .interface_decl and !self.merged_iface_consumed.contains(did)) {
+                    for (d.merged_with) |mid| {
+                        if (mid >= self.graph.decls.len or mid <= did) continue;
+                        if (self.graph.decls[mid].kind == .interface_decl) {
+                            for (decl_ids) |other| {
+                                if (other == mid) {
+                                    try self.merged_iface_consumed.put(self.scratch, mid, {});
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2195,6 +2266,16 @@ fn LowerCtx(comptime GraphType: type) type {
                 if (self.merged_iface_consumed.contains(did)) continue;
                 const d = self.graph.decls[did];
                 if (d.kind == .interface_decl or d.kind == .class_decl) {
+                    if (d.kind == .interface_decl and d.type_params.len == 0) {
+                        const icls = try self.classifyDecl(did);
+                        if (icls.companion_var_decl_id) |var_did| {
+                            for (decl_ids) |other| {
+                                if (other == var_did) {
+                                    try self.merged_ctor_var_consumed.put(self.scratch, var_did, {});
+                                }
+                            }
+                        }
+                    }
                     for (d.merged_with) |mid| {
                         if (mid >= self.graph.decls.len or mid == did) continue;
                         if (self.graph.decls[mid].kind == .namespace_decl) {
@@ -2217,6 +2298,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 if (did >= self.graph.decls.len) continue;
                 if (self.merged_ns_consumed.contains(did)) continue;
                 if (self.merged_iface_consumed.contains(did)) continue;
+                if (self.merged_ctor_var_consumed.contains(did)) continue;
                 if (prebound_names.get(did)) |existing| {
                     try scope.reserve(existing.logical_name);
                     if (prebound_overloads.get(did)) |ovs| {
@@ -2274,10 +2356,16 @@ fn LowerCtx(comptime GraphType: type) type {
                 };
                 try self.decl_locations.put(self.scratch, did, loc);
 
-                // Point consumed merged interfaces at the owning class location too!
+                // Point consumed merged interfaces and companion constructor vars at the owning decl location too!
                 if (d.kind == .class_decl) {
                     for (d.merged_with) |mid| {
                         if (self.merged_iface_consumed.contains(mid)) {
+                            try self.decl_locations.put(self.scratch, mid, loc);
+                        }
+                    }
+                } else if (d.kind == .interface_decl) {
+                    for (d.merged_with) |mid| {
+                        if (self.merged_ctor_var_consumed.contains(mid) or self.merged_iface_consumed.contains(mid)) {
                             try self.decl_locations.put(self.scratch, mid, loc);
                         }
                     }
@@ -2578,6 +2666,9 @@ fn LowerCtx(comptime GraphType: type) type {
                         const p = self.graph.properties[pid];
                         if (p.modifiers.private_mod or p.modifiers.protected_mod) continue;
                         if (!try self.isClosedTypeInner(p.ty, bound_tps, visiting)) break :blk false;
+                        if (p.setter_ty) |sty| {
+                            if (!try self.isClosedTypeInner(sty, bound_tps, visiting)) break :blk false;
+                        }
                     }
                     for (obj.call_signatures) |sid| {
                         if (!try self.isClosedSigInner(sid, bound_tps, visiting)) break :blk false;
@@ -2704,6 +2795,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 .js_any,
                 .js_unknown,
                 .js_object,
+                .js_function,
                 .js_symbol,
                 .js_bigint,
                 .js_string,
@@ -2929,6 +3021,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 .this_type => {
                     if (self_ident_opt) |sid| {
                         const self_t = try self.makeType(.{ .self_type = sid });
+                        if (self.in_handle_struct) return self_t;
                         return self.makeType(.{ .pointer_const = self_t });
                     }
                     needs_runtime.* = true;
@@ -3256,6 +3349,78 @@ fn LowerCtx(comptime GraphType: type) type {
                             }
                             return fp_ir;
                         }
+                    }
+                    const obj_cls = self.classifyObjectLiteral(obj);
+                    if (obj_cls.kind == .handle_wrapper) {
+                        const is_closed = no_free_vars or try self.isClosedTypeSubgraph(ty_id);
+                        if (can_hoist_in_mod and is_closed and self.cur_mod_root_scope != null) {
+                            const h = try self.allocFreshAnonHelperName("__zigar_AnonHandle", active_tps);
+                            const hloc = DeclLocation{
+                                .module_index = self.cur_mod_idx,
+                                .zig_path = h.path,
+                                .type_param_defaults = &.{},
+                            };
+                            try self.cur_mod_hoisted_locs.put(self.scratch, ty_id, hloc);
+
+                            const EmptyMethodStub = struct {
+                                name: u32,
+                                computed_symbol: ?u8 = null,
+                                signatures: []const u32,
+                                modifiers: packed struct {
+                                    optional_mod: bool = false,
+                                    static_mod: bool = false,
+                                    private_mod: bool = false,
+                                    protected_mod: bool = false,
+                                },
+                                jsdoc: @TypeOf(self.graph.decls[0].jsdoc),
+                            };
+                            const empty_methods: []const EmptyMethodStub = &.{};
+                            var empty_names: std.AutoHashMapUnmanaged(u32, naming.BoundName) = .empty;
+                            var empty_ovs: std.AutoHashMapUnmanaged(u32, []naming.BoundName) = .empty;
+                            var empty_active: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                            defer empty_active.deinit(self.scratch);
+
+                            const saved_depth = self.inline_anon_depth;
+                            self.inline_anon_depth = 0;
+                            defer self.inline_anon_depth = saved_depth;
+
+                            const struct_ir = try self.lowerStructDecl(
+                                self.cur_mod_idx,
+                                std.math.maxInt(u32),
+                                obj_cls,
+                                false,
+                                false,
+                                &.{},
+                                &.{},
+                                obj.properties,
+                                &.{},
+                                empty_methods,
+                                obj.call_signatures,
+                                obj.construct_signatures,
+                                &.{},
+                                self.cur_mod_root_scope.?,
+                                &empty_names,
+                                &empty_ovs,
+                                &.{},
+                                imports_used,
+                                needs_runtime,
+                                &empty_active,
+                            );
+                            try self.cur_mod_decls_out.?.append(self.alloc, .{
+                                .source_decl_id = null,
+                                .zig_ident = h.zig_ident,
+                                .logical_name = h.logical,
+                                .wire_name = h.logical,
+                                .is_exported = false,
+                                .is_js_exported = false,
+                                .is_default_export = false,
+                                .jsdoc = null,
+                                .kind = .{ .struct_decl = struct_ir },
+                            });
+                            return self.makeHoistedDeclRef(hloc);
+                        }
+                        needs_runtime.* = true;
+                        return self.makeType(if (obj_cls.is_callable_handle) .js_function else .js_object);
                     }
                     if (obj.properties.len > 0) {
                         const is_closed = no_free_vars or try self.isClosedTypeSubgraph(ty_id);
@@ -3674,34 +3839,45 @@ fn LowerCtx(comptime GraphType: type) type {
             };
         }
 
-        fn typeMayAllocateOnDecode(self: *const Self, ty: *const TypeIr) bool {
+        fn typeMayAllocateOnDecode(self: *Self, ty: *const TypeIr) error{OutOfMemory}!bool {
             return switch (ty.*) {
                 .string_type, .bytes_type, .typed_slice, .slice, .pointer_const, .type_param_ref, .template_pattern => true,
                 .inline_enum => false,
                 .open_literal_union => |olu| olu.base_kind == .str,
-                .optional => |opt| self.typeMayAllocateOnDecode(opt.child),
+                .optional => |opt| try self.typeMayAllocateOnDecode(opt.child),
                 .tuple => |elems| blk: {
                     for (elems) |el| {
-                        if (self.typeMayAllocateOnDecode(el.ty)) break :blk true;
+                        if (try self.typeMayAllocateOnDecode(el.ty)) break :blk true;
                     }
                     break :blk false;
                 },
                 .anon_struct => |fields| blk: {
                     for (fields) |f| {
-                        if (self.typeMayAllocateOnDecode(f.ty)) break :blk true;
+                        if (try self.typeMayAllocateOnDecode(f.ty)) break :blk true;
                     }
                     break :blk false;
                 },
                 .tagged_union => |tu| blk: {
                     for (tu.variants) |v| {
-                        if (self.typeMayAllocateOnDecode(v.payload)) break :blk true;
+                        if (try self.typeMayAllocateOnDecode(v.payload)) break :blk true;
                     }
                     break :blk false;
                 },
                 .decl_ref => |dr| blk: {
                     if (dr.indirect) break :blk true;
-                    if (dr.target_decl_id < self.graph.decls.len) {
-                        if (self.graph.decls[dr.target_decl_id].kind == .enum_decl) break :blk false;
+                    if (dr.target_decl_id == std.math.maxInt(u32)) {
+                        if (dr.decl_zig_path.len == 1 and
+                            (std.mem.startsWith(u8, dr.decl_zig_path[0], "__zigar_AnonHandle") or
+                                std.mem.startsWith(u8, dr.decl_zig_path[0], "__zigar_AnonFn")))
+                        {
+                            break :blk false;
+                        }
+                    } else if (dr.target_decl_id < self.graph.decls.len) {
+                        const td_kind = self.graph.decls[dr.target_decl_id].kind;
+                        if (td_kind == .enum_decl) break :blk false;
+                        if ((try self.classifyDecl(dr.target_decl_id)).kind == .handle_wrapper) {
+                            break :blk false;
+                        }
                     }
                     break :blk true;
                 },
@@ -4448,6 +4624,7 @@ fn LowerCtx(comptime GraphType: type) type {
             switch (tn.kind) {
                 .object_literal => |obj| {
                     if (obj.call_signatures.len > 0 or obj.construct_signatures.len > 0) return false;
+                    if (!allow_class_decl and self.classifyObjectLiteral(obj).kind == .handle_wrapper) return false;
                     for (obj.properties) |pid| {
                         if (pid >= self.graph.properties.len) continue;
                         const p = self.graph.properties[pid];
@@ -4495,6 +4672,9 @@ fn LowerCtx(comptime GraphType: type) type {
                         switch (d.kind) {
                             .interface_decl => |iface| {
                                 if (iface.call_signatures.len > 0 or iface.construct_signatures.len > 0) return false;
+                                if (!allow_class_decl and (try self.classifyDecl(td)).kind == .handle_wrapper) {
+                                    return false;
+                                }
                                 for (iface.extends_clauses) |hc| {
                                     _ = try self.collectObjectArmProps(hc.target_type, allow_class_decl, out, depth + 1);
                                 }
@@ -4974,6 +5154,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 .js_any,
                 .js_unknown,
                 .js_object,
+                .js_function,
                 .js_symbol,
                 .js_bigint,
                 .js_string,
@@ -5627,6 +5808,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 .fn_ptr => return "func",
                 .anon_struct => return "record",
                 .js_object => return "object",
+                .js_function => return "func",
                 .js_map => return "map",
                 .promise => return "promise",
                 else => {},
@@ -5681,6 +5863,7 @@ fn LowerCtx(comptime GraphType: type) type {
             if (decl_id >= self.graph.decls.len) return;
             if (self.merged_ns_consumed.contains(decl_id)) return;
             if (self.merged_iface_consumed.contains(decl_id)) return;
+            if (self.merged_ctor_var_consumed.contains(decl_id)) return;
             if (active_decls.contains(decl_id)) return;
             try active_decls.put(self.scratch, decl_id, {});
             defer _ = active_decls.remove(decl_id);
@@ -5691,14 +5874,29 @@ fn LowerCtx(comptime GraphType: type) type {
             const is_exported = !d.modifiers.private_mod and !d.modifiers.protected_mod;
             const suppress_js_export = self.merged_generic_ns_set.contains(decl_id) or
                 self.pure_export_equals_ns.contains(decl_id);
+
+            var companion_exported = false;
+            var companion_default = false;
+            var companion_global = false;
+            if (d.kind == .interface_decl) {
+                for (d.merged_with) |mid| {
+                    if (self.merged_ctor_var_consumed.contains(mid) and mid < self.graph.decls.len) {
+                        const vd = self.graph.decls[mid];
+                        if (vd.modifiers.export_decl) companion_exported = true;
+                        if (vd.modifiers.default_export) companion_default = true;
+                        if (self.global_aug_decls.contains(mid)) companion_global = true;
+                    }
+                }
+            }
+
             const is_js_exported = if (suppress_js_export)
                 false
             else if (is_top_level)
                 (is_exported and self.js_exported_decls.contains(decl_id))
             else
-                (is_exported and d.modifiers.export_decl);
-            const is_default_export = d.modifiers.default_export;
-            const is_global_scope = self.global_aug_decls.contains(decl_id);
+                (is_exported and (d.modifiers.export_decl or companion_exported));
+            const is_default_export = d.modifiers.default_export or companion_default;
+            const is_global_scope = self.global_aug_decls.contains(decl_id) or companion_global;
 
             switch (d.kind) {
                 .function_decl => |sigs| {
@@ -5754,7 +5952,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             }
                         }
                         var alloc_comp: ?[]const u8 = null;
-                        if (self.typeMayAllocateOnDecode(sig_ir.return_type)) {
+                        if (try self.typeMayAllocateOnDecode(sig_ir.return_type)) {
                             const raw_alloc_name = try std.fmt.allocPrint(self.scratch, "{s}Alloc", .{logical});
                             defer self.scratch.free(raw_alloc_name);
                             const ab = try scope.bind(raw_alloc_name, .camel);
@@ -5818,17 +6016,142 @@ fn LowerCtx(comptime GraphType: type) type {
                     }
                 },
                 .interface_decl => |iface| {
+                    const icls = try self.classifyDecl(decl_id);
+
+                    var combined_props: std.ArrayList(u32) = .empty;
+                    defer combined_props.deinit(self.scratch);
+
+                    var combined_methods: std.ArrayList(@TypeOf(iface.methods[0])) = .empty;
+                    defer combined_methods.deinit(self.scratch);
+                    for (iface.methods) |m| try combined_methods.append(self.scratch, m);
+
+                    var combined_call_sigs: std.ArrayList(u32) = .empty;
+                    defer combined_call_sigs.deinit(self.scratch);
+                    for (iface.call_signatures) |sid| try appendUniqueU32(&combined_call_sigs, self.scratch, sid);
+
+                    var combined_construct_sigs: std.ArrayList(u32) = .empty;
+                    defer combined_construct_sigs.deinit(self.scratch);
+                    for (iface.construct_signatures) |sid| try appendUniqueU32(&combined_construct_sigs, self.scratch, sid);
+
+                    var seen_methods: std.StringHashMapUnmanaged(void) = .empty;
+                    defer seen_methods.deinit(self.scratch);
+                    var derived_methods: std.StringHashMapUnmanaged(void) = .empty;
+                    defer derived_methods.deinit(self.scratch);
+
+                    for (iface.methods) |m| {
+                        if (m.modifiers.static_mod or m.modifiers.private_mod or m.modifiers.protected_mod or m.computed_symbol != null) continue;
+                        const mw = self.str(m.name);
+                        try seen_methods.put(self.scratch, mw, {});
+                        try derived_methods.put(self.scratch, mw, {});
+                    }
+                    for (iface.properties) |pid| {
+                        if (pid >= self.graph.properties.len) continue;
+                        const p = self.graph.properties[pid];
+                        if (p.modifiers.static_mod or p.modifiers.private_mod or p.modifiers.protected_mod or p.computed_symbol != null) continue;
+                        try seen_methods.put(self.scratch, self.str(p.name), {});
+                    }
+                    for (d.merged_with) |mid| {
+                        if (mid == decl_id or mid >= self.graph.decls.len) continue;
+                        const md = self.graph.decls[mid];
+                        if (md.kind != .interface_decl) continue;
+                        const miface = md.kind.interface_decl;
+                        for (miface.methods) |m| {
+                            try self.appendMethodIfMissing(&combined_methods, m);
+                            if (m.modifiers.static_mod or m.modifiers.private_mod or m.modifiers.protected_mod or m.computed_symbol != null) continue;
+                            const mw = self.str(m.name);
+                            try seen_methods.put(self.scratch, mw, {});
+                            try derived_methods.put(self.scratch, mw, {});
+                        }
+                        for (miface.properties) |pid| {
+                            if (pid >= self.graph.properties.len) continue;
+                            const p = self.graph.properties[pid];
+                            if (p.modifiers.static_mod or p.modifiers.private_mod or p.modifiers.protected_mod or p.computed_symbol != null) continue;
+                            try seen_methods.put(self.scratch, self.str(p.name), {});
+                        }
+                        for (miface.call_signatures) |sid| try appendUniqueU32(&combined_call_sigs, self.scratch, sid);
+                        for (miface.construct_signatures) |sid| try appendUniqueU32(&combined_construct_sigs, self.scratch, sid);
+                    }
+
+                    var visited_bases: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                    defer visited_bases.deinit(self.scratch);
+                    try visited_bases.put(self.scratch, decl_id, {});
+                    for (d.merged_with) |mid| {
+                        if (mid == decl_id or mid >= self.graph.decls.len) continue;
+                        if (self.graph.decls[mid].kind == .interface_decl) {
+                            try visited_bases.put(self.scratch, mid, {});
+                        }
+                    }
+
+                    try self.collectInheritedHeritageClauses(
+                        d.type_params,
+                        iface.extends_clauses,
+                        &combined_props,
+                        &combined_methods,
+                        &combined_call_sigs,
+                        &combined_construct_sigs,
+                        &seen_methods,
+                        &derived_methods,
+                        &visited_bases,
+                    );
+                    for (d.merged_with) |mid| {
+                        if (mid == decl_id or mid >= self.graph.decls.len) continue;
+                        const md = self.graph.decls[mid];
+                        if (md.kind != .interface_decl) continue;
+                        try self.collectInheritedHeritageClauses(
+                            d.type_params,
+                            md.kind.interface_decl.extends_clauses,
+                            &combined_props,
+                            &combined_methods,
+                            &combined_call_sigs,
+                            &combined_construct_sigs,
+                            &seen_methods,
+                            &derived_methods,
+                            &visited_bases,
+                        );
+                    }
+                    for (iface.properties) |pid| {
+                        try self.upsertPropByWireName(&combined_props, pid);
+                    }
+                    for (d.merged_with) |mid| {
+                        if (mid == decl_id or mid >= self.graph.decls.len) continue;
+                        const md = self.graph.decls[mid];
+                        if (md.kind != .interface_decl) continue;
+                        const miface = md.kind.interface_decl;
+                        for (miface.properties) |pid| try self.upsertPropByWireName(&combined_props, pid);
+                    }
+
+                    // Fold companion constructable `var` (`interface URL` + `declare var URL: URLConstructor`) when non-generic!
+                    var companion_ctors: std.ArrayList(u32) = .empty;
+                    defer companion_ctors.deinit(self.scratch);
+                    var companion_static_props: std.ArrayList(u32) = .empty;
+                    defer companion_static_props.deinit(self.scratch);
+                    if (icls.companion_var_decl_id) |var_did| {
+                        if (self.merged_ctor_var_consumed.contains(var_did)) {
+                            var tmp_cls = classify_decls.Classifier(GraphType).init(self.scratch, &self.graph);
+                            defer tmp_cls.deinit();
+                            try tmp_cls.collectCompanionVarCtorMembers(
+                                var_did,
+                                &companion_ctors,
+                                &companion_static_props,
+                                &combined_methods,
+                                self.scratch,
+                            );
+                        }
+                    }
+
                     const struct_ir = try self.lowerStructDecl(
                         final_mod_idx,
                         decl_id,
+                        icls,
                         false,
                         false,
                         d.type_params,
-                        &.{},
-                        iface.properties,
-                        iface.methods,
-                        iface.call_signatures,
-                        iface.construct_signatures,
+                        companion_ctors.items,
+                        combined_props.items,
+                        companion_static_props.items,
+                        combined_methods.items,
+                        combined_call_sigs.items,
+                        combined_construct_sigs.items,
                         d.merged_with,
                         scope,
                         prebound_names,
@@ -5846,14 +6169,15 @@ fn LowerCtx(comptime GraphType: type) type {
                         .is_exported = is_exported,
                         .is_js_exported = is_js_exported,
                         .is_default_export = is_default_export,
+                        .is_global_scope = is_global_scope,
                         .jsdoc = top_jsdoc,
                         .kind = .{ .struct_decl = struct_ir },
                     });
                 },
                 .class_decl => |cls| {
+                    const ccls = try self.classifyDecl(decl_id);
                     var combined_props: std.ArrayList(u32) = .empty;
                     defer combined_props.deinit(self.scratch);
-                    for (cls.properties) |pid| try appendUniqueU32(&combined_props, self.scratch, pid);
 
                     var combined_methods: std.ArrayList(@TypeOf(cls.methods[0])) = .empty;
                     defer combined_methods.deinit(self.scratch);
@@ -5861,40 +6185,109 @@ fn LowerCtx(comptime GraphType: type) type {
 
                     var combined_call_sigs: std.ArrayList(u32) = .empty;
                     defer combined_call_sigs.deinit(self.scratch);
+                    var ignored_construct_sigs: std.ArrayList(u32) = .empty;
+                    defer ignored_construct_sigs.deinit(self.scratch);
 
-                    // Fold consumed merged `interface_decl` members (including direct base-interface
-                    // methods when `interface EventEmitter<T> extends NodeJS.EventEmitter<T> {}`)!
+                    var seen_methods: std.StringHashMapUnmanaged(void) = .empty;
+                    defer seen_methods.deinit(self.scratch);
+                    var derived_methods: std.StringHashMapUnmanaged(void) = .empty;
+                    defer derived_methods.deinit(self.scratch);
+
+                    for (cls.methods) |m| {
+                        if (m.modifiers.static_mod or m.modifiers.private_mod or m.modifiers.protected_mod or m.computed_symbol != null) continue;
+                        const mw = self.str(m.name);
+                        try seen_methods.put(self.scratch, mw, {});
+                        try derived_methods.put(self.scratch, mw, {});
+                    }
+                    for (cls.properties) |pid| {
+                        if (pid >= self.graph.properties.len) continue;
+                        const p = self.graph.properties[pid];
+                        if (p.modifiers.static_mod or p.modifiers.private_mod or p.modifiers.protected_mod or p.computed_symbol != null) continue;
+                        try seen_methods.put(self.scratch, self.str(p.name), {});
+                    }
+
+                    // Fold consumed merged `interface_decl` members FIRST before walking `extends`.
                     for (d.merged_with) |mid| {
                         if (!self.merged_iface_consumed.contains(mid) or mid >= self.graph.decls.len) continue;
                         const mdecl = self.graph.decls[mid];
                         if (mdecl.kind != .interface_decl) continue;
                         const miface = mdecl.kind.interface_decl;
-                        for (miface.properties) |pid| try appendUniqueU32(&combined_props, self.scratch, pid);
-                        for (miface.methods) |m| try combined_methods.append(self.scratch, m);
+                        for (miface.methods) |m| {
+                            try combined_methods.append(self.scratch, m);
+                            if (m.modifiers.static_mod or m.modifiers.private_mod or m.modifiers.protected_mod or m.computed_symbol != null) continue;
+                            const mw = self.str(m.name);
+                            try seen_methods.put(self.scratch, mw, {});
+                            try derived_methods.put(self.scratch, mw, {});
+                        }
+                        for (miface.properties) |pid| {
+                            if (pid >= self.graph.properties.len) continue;
+                            const p = self.graph.properties[pid];
+                            if (p.modifiers.static_mod or p.modifiers.private_mod or p.modifiers.protected_mod or p.computed_symbol != null) continue;
+                            try seen_methods.put(self.scratch, self.str(p.name), {});
+                        }
                         for (miface.call_signatures) |sid| try appendUniqueU32(&combined_call_sigs, self.scratch, sid);
+                    }
 
-                        for (miface.extends_clauses) |hc| {
-                            const base_did = hc.target_decl orelse continue;
-                            if (base_did >= self.graph.decls.len) continue;
-                            const bd = self.graph.decls[base_did];
-                            if (bd.kind != .interface_decl) continue;
-                            // Inherit methods when non-generic or matching type-param arity (same `T` name).
-                            if (bd.type_params.len == 0 or bd.type_params.len == d.type_params.len) {
-                                for (bd.kind.interface_decl.methods) |bm| {
-                                    try combined_methods.append(self.scratch, bm);
-                                }
-                            }
+                    var visited_bases: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                    defer visited_bases.deinit(self.scratch);
+                    try visited_bases.put(self.scratch, decl_id, {});
+                    for (d.merged_with) |mid| {
+                        if (mid < self.graph.decls.len and self.graph.decls[mid].kind == .interface_decl) {
+                            try visited_bases.put(self.scratch, mid, {});
                         }
                     }
+
+                    if (cls.extends_clause) |hc| {
+                        try self.collectInheritedHeritageClause(
+                            d.type_params,
+                            hc,
+                            &combined_props,
+                            &combined_methods,
+                            &combined_call_sigs,
+                            &ignored_construct_sigs,
+                            &seen_methods,
+                            &derived_methods,
+                            &visited_bases,
+                        );
+                    }
+                    for (d.merged_with) |mid| {
+                        if (!self.merged_iface_consumed.contains(mid) or mid >= self.graph.decls.len) continue;
+                        const mdecl = self.graph.decls[mid];
+                        if (mdecl.kind != .interface_decl) continue;
+                        try self.collectInheritedHeritageClauses(
+                            d.type_params,
+                            mdecl.kind.interface_decl.extends_clauses,
+                            &combined_props,
+                            &combined_methods,
+                            &combined_call_sigs,
+                            &ignored_construct_sigs,
+                            &seen_methods,
+                            &derived_methods,
+                            &visited_bases,
+                        );
+                    }
+
+                    // Apply merged interface properties, then own `cls.properties` so derived overrides base!
+                    for (d.merged_with) |mid| {
+                        if (!self.merged_iface_consumed.contains(mid) or mid >= self.graph.decls.len) continue;
+                        const mdecl = self.graph.decls[mid];
+                        if (mdecl.kind != .interface_decl) continue;
+                        for (mdecl.kind.interface_decl.properties) |pid| {
+                            try self.upsertPropByWireName(&combined_props, pid);
+                        }
+                    }
+                    for (cls.properties) |pid| try self.upsertPropByWireName(&combined_props, pid);
 
                     const struct_ir = try self.lowerStructDecl(
                         final_mod_idx,
                         decl_id,
-                        true,
+                        ccls,
                         d.modifiers.abstract_mod,
+                        cls.extends_clause != null,
                         d.type_params,
                         cls.constructors,
                         combined_props.items,
+                        &.{},
                         combined_methods.items,
                         combined_call_sigs.items,
                         &.{},
@@ -5915,6 +6308,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         .is_exported = is_exported,
                         .is_js_exported = is_js_exported,
                         .is_default_export = is_default_export,
+                        .is_global_scope = is_global_scope,
                         .jsdoc = top_jsdoc,
                         .kind = .{ .struct_decl = struct_ir },
                     });
@@ -5990,6 +6384,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         .is_exported = is_exported,
                         .is_js_exported = is_js_exported,
                         .is_default_export = is_default_export,
+                        .is_global_scope = is_global_scope,
                         .jsdoc = top_jsdoc,
                         .kind = .{
                             .enum_decl = .{
@@ -6033,6 +6428,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                             .is_exported = is_exported,
                                             .is_js_exported = is_js_exported,
                                             .is_default_export = is_default_export,
+                                            .is_global_scope = is_global_scope,
                                             .jsdoc = top_jsdoc,
                                             .kind = .{ .open_literal_decl = olu },
                                         });
@@ -6049,6 +6445,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                             .is_exported = is_exported,
                                             .is_js_exported = is_js_exported,
                                             .is_default_export = is_default_export,
+                                            .is_global_scope = is_global_scope,
                                             .jsdoc = top_jsdoc,
                                             .kind = .{ .literal_enum_decl = enum_ir },
                                         });
@@ -6072,6 +6469,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                                     .is_exported = is_exported,
                                                     .is_js_exported = is_js_exported,
                                                     .is_default_export = is_default_export,
+                                                    .is_global_scope = is_global_scope,
                                                     .jsdoc = top_jsdoc,
                                                     .kind = .{ .literal_enum_decl = enum_ir },
                                                 });
@@ -6088,6 +6486,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                             .is_exported = is_exported,
                                             .is_js_exported = is_js_exported,
                                             .is_default_export = is_default_export,
+                                            .is_global_scope = is_global_scope,
                                             .jsdoc = top_jsdoc,
                                             .kind = .{ .template_pattern_decl = pat_ir },
                                         });
@@ -6109,6 +6508,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             .is_exported = is_exported,
                             .is_js_exported = is_js_exported,
                             .is_default_export = is_default_export,
+                            .is_global_scope = is_global_scope,
                             .jsdoc = top_jsdoc,
                             .kind = .{
                                 .union_decl = .{
@@ -6135,10 +6535,13 @@ fn LowerCtx(comptime GraphType: type) type {
                     if (resolved_obj_id) |oid| {
                         const obj = self.graph.types[oid].kind.object_literal;
                         if (obj.properties.len > 0 or obj.call_signatures.len > 0 or obj.construct_signatures.len > 0) {
+                            const obj_cls = self.classifyObjectLiteral(obj);
                             const EmptyMethodStub = struct {
                                 name: u32,
+                                computed_symbol: ?u8 = null,
                                 signatures: []const u32,
                                 modifiers: packed struct {
+                                    optional_mod: bool = false,
                                     static_mod: bool = false,
                                     private_mod: bool = false,
                                     protected_mod: bool = false,
@@ -6149,11 +6552,13 @@ fn LowerCtx(comptime GraphType: type) type {
                             const struct_ir = try self.lowerStructDecl(
                                 final_mod_idx,
                                 decl_id,
+                                obj_cls,
                                 false,
                                 false,
                                 d.type_params,
                                 &.{},
                                 obj.properties,
+                                &.{},
                                 empty_methods,
                                 obj.call_signatures,
                                 obj.construct_signatures,
@@ -6174,6 +6579,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                 .is_exported = is_exported,
                                 .is_js_exported = is_js_exported,
                                 .is_default_export = is_default_export,
+                                .is_global_scope = is_global_scope,
                                 .jsdoc = top_jsdoc,
                                 .kind = .{ .struct_decl = struct_ir },
                             });
@@ -6389,15 +6795,359 @@ fn LowerCtx(comptime GraphType: type) type {
             }
         }
 
+        fn propsShareIdentity(self: *const Self, a_id: u32, b_id: u32) bool {
+            if (a_id >= self.graph.properties.len or b_id >= self.graph.properties.len) return false;
+            const a = self.graph.properties[a_id];
+            const b = self.graph.properties[b_id];
+            if (a.modifiers.static_mod != b.modifiers.static_mod) return false;
+            if (a.computed_symbol != null or b.computed_symbol != null) {
+                if (a.computed_symbol == null or b.computed_symbol == null) return false;
+                return std.meta.eql(a.computed_symbol.?, b.computed_symbol.?);
+            }
+            return std.mem.eql(u8, self.str(a.name), self.str(b.name));
+        }
+
+        fn upsertPropByWireName(self: *Self, list: *std.ArrayList(u32), pid: u32) error{OutOfMemory}!void {
+            if (pid >= self.graph.properties.len) return;
+            for (list.items, 0..) |existing_id, idx| {
+                if (self.propsShareIdentity(existing_id, pid)) {
+                    list.items[idx] = pid;
+                    return;
+                }
+            }
+            try list.append(self.scratch, pid);
+        }
+
+        fn appendPropIfMissingWireName(self: *Self, list: *std.ArrayList(u32), pid: u32) error{OutOfMemory}!void {
+            if (pid >= self.graph.properties.len) return;
+            for (list.items) |existing_id| {
+                if (self.propsShareIdentity(existing_id, pid)) return;
+            }
+            try list.append(self.scratch, pid);
+        }
+
+        fn appendMethodIfMissing(self: *Self, list: anytype, m: anytype) error{OutOfMemory}!void {
+            const m_wire = self.str(m.name);
+            for (list.items) |existing| {
+                if (existing.modifiers.static_mod != m.modifiers.static_mod) continue;
+                if (existing.computed_symbol != null or m.computed_symbol != null) {
+                    if (existing.computed_symbol != null and m.computed_symbol != null and
+                        std.meta.eql(existing.computed_symbol.?, m.computed_symbol.?))
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                if (std.mem.eql(u8, self.str(existing.name), m_wire)) return;
+            }
+            try list.append(self.scratch, m);
+        }
+
+        fn sameTypeParamForwarding(
+            self: *const Self,
+            owner_tps: []const u32,
+            base_tps: []const u32,
+            hc_type_args: []const u32,
+        ) bool {
+            if (base_tps.len == 0) return true;
+            if (base_tps.len != owner_tps.len or hc_type_args.len != base_tps.len) return false;
+            for (0..base_tps.len) |i| {
+                const arg_tid = hc_type_args[i];
+                if (arg_tid >= self.graph.types.len or self.graph.types[arg_tid].kind != .type_param) return false;
+                const arg_tpid = self.graph.types[arg_tid].kind.type_param;
+                const base_tpid = base_tps[i];
+                const owner_tpid = owner_tps[i];
+                if (arg_tpid >= self.graph.type_params.len or
+                    base_tpid >= self.graph.type_params.len or
+                    owner_tpid >= self.graph.type_params.len) return false;
+                const arg_name = self.str(self.graph.type_params[arg_tpid].name);
+                if (!std.mem.eql(u8, arg_name, self.str(self.graph.type_params[base_tpid].name))) return false;
+                if (!std.mem.eql(u8, arg_name, self.str(self.graph.type_params[owner_tpid].name))) return false;
+            }
+            return true;
+        }
+
+        fn resolveHeritageTargetDecl(self: *const Self, hc: anytype) ?u32 {
+            if (hc.target_decl) |td| {
+                if (td < self.graph.decls.len) return td;
+            }
+            if (hc.target_type < self.graph.types.len) {
+                const tn = self.graph.types[hc.target_type];
+                if (tn.kind == .reference) {
+                    if (tn.kind.reference.target_decl) |td| {
+                        if (td < self.graph.decls.len) return td;
+                    }
+                }
+            }
+            return null;
+        }
+
+        fn collectInheritedHeritageClauses(
+            self: *Self,
+            owner_tps: []const u32,
+            extends_clauses: anytype,
+            out_props: *std.ArrayList(u32),
+            out_methods: anytype,
+            out_call_sigs: *std.ArrayList(u32),
+            out_construct_sigs: *std.ArrayList(u32),
+            seen_methods: *std.StringHashMapUnmanaged(void),
+            derived_methods: *std.StringHashMapUnmanaged(void),
+            visited_bases: *std.AutoHashMapUnmanaged(u32, void),
+        ) error{OutOfMemory}!void {
+            for (extends_clauses) |hc| {
+                try self.collectInheritedHeritageClause(
+                    owner_tps,
+                    hc,
+                    out_props,
+                    out_methods,
+                    out_call_sigs,
+                    out_construct_sigs,
+                    seen_methods,
+                    derived_methods,
+                    visited_bases,
+                );
+            }
+        }
+
+        fn collectInheritedHeritageClause(
+            self: *Self,
+            owner_tps: []const u32,
+            hc: anytype,
+            out_props: *std.ArrayList(u32),
+            out_methods: anytype,
+            out_call_sigs: *std.ArrayList(u32),
+            out_construct_sigs: *std.ArrayList(u32),
+            seen_methods: *std.StringHashMapUnmanaged(void),
+            derived_methods: *std.StringHashMapUnmanaged(void),
+            visited_bases: *std.AutoHashMapUnmanaged(u32, void),
+        ) error{OutOfMemory}!void {
+            const base_did = self.resolveHeritageTargetDecl(hc) orelse return;
+            if (self.isBundledLibDecl(base_did)) return;
+            if (visited_bases.contains(base_did)) return;
+            const bd = self.graph.decls[base_did];
+            if (bd.kind != .interface_decl and bd.kind != .class_decl) return;
+            if (!self.sameTypeParamForwarding(owner_tps, bd.type_params, hc.type_args)) return;
+
+            try visited_bases.put(self.scratch, base_did, {});
+            for (bd.merged_with) |mid| {
+                if (mid < self.graph.decls.len and self.graph.decls[mid].kind == .interface_decl) {
+                    try visited_bases.put(self.scratch, mid, {});
+                }
+            }
+
+            var bd_props: std.ArrayList(u32) = .empty;
+            defer bd_props.deinit(self.scratch);
+            var newly_seen_methods: std.ArrayList([]const u8) = .empty;
+            defer newly_seen_methods.deinit(self.scratch);
+
+            switch (bd.kind) {
+                .interface_decl => |biface| {
+                    for (biface.methods) |bm| {
+                        if (bm.modifiers.static_mod or bm.modifiers.private_mod or bm.modifiers.protected_mod or bm.computed_symbol != null) continue;
+                        const mw = self.str(bm.name);
+                        if (!seen_methods.contains(mw)) {
+                            try out_methods.append(self.scratch, bm);
+                            try newly_seen_methods.append(self.scratch, mw);
+                        }
+                    }
+                    for (biface.properties) |pid| {
+                        if (pid >= self.graph.properties.len) continue;
+                        const p = self.graph.properties[pid];
+                        if (p.modifiers.static_mod or p.modifiers.private_mod or p.modifiers.protected_mod or p.computed_symbol != null) continue;
+                        const pw = self.str(p.name);
+                        if (!derived_methods.contains(pw)) {
+                            try self.upsertPropByWireName(&bd_props, pid);
+                        }
+                        try newly_seen_methods.append(self.scratch, pw);
+                    }
+                    for (biface.call_signatures) |sid| try appendUniqueU32(out_call_sigs, self.scratch, sid);
+                    for (biface.construct_signatures) |sid| try appendUniqueU32(out_construct_sigs, self.scratch, sid);
+                },
+                .class_decl => |bcls| {
+                    for (bcls.methods) |bm| {
+                        if (bm.modifiers.static_mod or bm.modifiers.private_mod or bm.modifiers.protected_mod or bm.computed_symbol != null) continue;
+                        const mw = self.str(bm.name);
+                        if (!seen_methods.contains(mw)) {
+                            try out_methods.append(self.scratch, bm);
+                            try newly_seen_methods.append(self.scratch, mw);
+                        }
+                    }
+                    for (bcls.properties) |pid| {
+                        if (pid >= self.graph.properties.len) continue;
+                        const p = self.graph.properties[pid];
+                        if (p.modifiers.static_mod or p.modifiers.private_mod or p.modifiers.protected_mod or p.computed_symbol != null) continue;
+                        const pw = self.str(p.name);
+                        if (!derived_methods.contains(pw)) {
+                            try self.upsertPropByWireName(&bd_props, pid);
+                        }
+                        try newly_seen_methods.append(self.scratch, pw);
+                    }
+                },
+                else => unreachable,
+            }
+
+            // Also include same-symbol merged `interface_decl` members on `bd` at the same inheritance depth!
+            for (bd.merged_with) |mid| {
+                if (mid == base_did or mid >= self.graph.decls.len) continue;
+                const mdecl = self.graph.decls[mid];
+                if (mdecl.kind != .interface_decl) continue;
+                const miface = mdecl.kind.interface_decl;
+                for (miface.methods) |bm| {
+                    if (bm.modifiers.static_mod or bm.modifiers.private_mod or bm.modifiers.protected_mod or bm.computed_symbol != null) continue;
+                    const mw = self.str(bm.name);
+                    if (!seen_methods.contains(mw)) {
+                        try out_methods.append(self.scratch, bm);
+                        try newly_seen_methods.append(self.scratch, mw);
+                    }
+                }
+                for (miface.properties) |pid| {
+                    if (pid >= self.graph.properties.len) continue;
+                    const p = self.graph.properties[pid];
+                    if (p.modifiers.static_mod or p.modifiers.private_mod or p.modifiers.protected_mod or p.computed_symbol != null) continue;
+                    const pw = self.str(p.name);
+                    if (!derived_methods.contains(pw)) {
+                        try self.upsertPropByWireName(&bd_props, pid);
+                    }
+                    try newly_seen_methods.append(self.scratch, pw);
+                }
+                for (miface.call_signatures) |sid| try appendUniqueU32(out_call_sigs, self.scratch, sid);
+                if (bd.kind == .interface_decl) {
+                    for (miface.construct_signatures) |sid| try appendUniqueU32(out_construct_sigs, self.scratch, sid);
+                }
+            }
+
+            // Record `bd`'s instance members BEFORE recursing into `GrandBase` so `bd` overrides `GrandBase`.
+            var sub_derived_methods = try derived_methods.clone(self.scratch);
+            defer sub_derived_methods.deinit(self.scratch);
+            for (newly_seen_methods.items) |name| {
+                try seen_methods.put(self.scratch, name, {});
+            }
+            switch (bd.kind) {
+                .interface_decl => |biface| {
+                    for (biface.methods) |bm| {
+                        if (bm.modifiers.static_mod or bm.modifiers.private_mod or bm.modifiers.protected_mod or bm.computed_symbol != null) continue;
+                        try sub_derived_methods.put(self.scratch, self.str(bm.name), {});
+                    }
+                },
+                .class_decl => |bcls| {
+                    for (bcls.methods) |bm| {
+                        if (bm.modifiers.static_mod or bm.modifiers.private_mod or bm.modifiers.protected_mod or bm.computed_symbol != null) continue;
+                        try sub_derived_methods.put(self.scratch, self.str(bm.name), {});
+                    }
+                },
+                else => unreachable,
+            }
+            for (bd.merged_with) |mid| {
+                if (mid == base_did or mid >= self.graph.decls.len) continue;
+                const mdecl = self.graph.decls[mid];
+                if (mdecl.kind != .interface_decl) continue;
+                for (mdecl.kind.interface_decl.methods) |bm| {
+                    if (bm.modifiers.static_mod or bm.modifiers.private_mod or bm.modifiers.protected_mod or bm.computed_symbol != null) continue;
+                    try sub_derived_methods.put(self.scratch, self.str(bm.name), {});
+                }
+            }
+
+            // Recurse into ancestors FIRST so ancestor properties precede `bd_props`!
+            switch (bd.kind) {
+                .interface_decl => |biface| {
+                    try self.collectInheritedHeritageClauses(
+                        owner_tps,
+                        biface.extends_clauses,
+                        out_props,
+                        out_methods,
+                        out_call_sigs,
+                        out_construct_sigs,
+                        seen_methods,
+                        &sub_derived_methods,
+                        visited_bases,
+                    );
+                },
+                .class_decl => |bcls| {
+                    if (bcls.extends_clause) |bhc| {
+                        try self.collectInheritedHeritageClause(
+                            owner_tps,
+                            bhc,
+                            out_props,
+                            out_methods,
+                            out_call_sigs,
+                            out_construct_sigs,
+                            seen_methods,
+                            &sub_derived_methods,
+                            visited_bases,
+                        );
+                    }
+                },
+                else => unreachable,
+            }
+            for (bd.merged_with) |mid| {
+                if (mid == base_did or mid >= self.graph.decls.len) continue;
+                const mdecl = self.graph.decls[mid];
+                if (mdecl.kind != .interface_decl) continue;
+                try self.collectInheritedHeritageClauses(
+                    owner_tps,
+                    mdecl.kind.interface_decl.extends_clauses,
+                    out_props,
+                    out_methods,
+                    out_call_sigs,
+                    out_construct_sigs,
+                    seen_methods,
+                    &sub_derived_methods,
+                    visited_bases,
+                );
+            }
+
+            for (bd_props.items) |pid| {
+                try self.upsertPropByWireName(out_props, pid);
+            }
+        }
+
+        fn previewSigMayAllocateOnDecode(
+            self: *Self,
+            sig_id: u32,
+            enclosing_scope: *const naming.ScopeNamer,
+            outer_active_tps: []const ActiveTypeParam,
+            self_ident_opt: ?[]const u8,
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+        ) error{OutOfMemory}!bool {
+            if (sig_id >= self.graph.signatures.len) return false;
+            const sig = self.graph.signatures[sig_id];
+            if (sig.type_predicate != null) return false;
+            var tmp_scope = naming.ScopeNamer.initParam(self.scratch, enclosing_scope);
+            defer tmp_scope.deinit();
+            const tp_res = try self.lowerTypeParams(
+                sig.type_params,
+                &tmp_scope,
+                outer_active_tps,
+                self_ident_opt,
+                imports_used,
+                needs_runtime,
+            );
+            var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+            defer visited.deinit(self.scratch);
+            const ret_ty = try self.lowerType(
+                sig.return_type,
+                true,
+                tp_res.active,
+                self_ident_opt,
+                &visited,
+                imports_used,
+                needs_runtime,
+            );
+            return try self.typeMayAllocateOnDecode(ret_ty);
+        }
+
         fn lowerStructDecl(
             self: *Self,
             final_mod_idx: u32,
             owner_decl_id: u32,
-            is_class: bool,
+            explicit_cls: classify_decls.DeclClassification,
             is_abstract: bool,
+            has_explicit_extends: bool,
             raw_tps: []const u32,
             raw_ctors: []const u32,
             raw_prop_ids: []const u32,
+            companion_static_props: []const u32,
             raw_methods: anytype,
             call_sigs: []const u32,
             construct_sigs: []const u32,
@@ -6410,6 +7160,20 @@ fn LowerCtx(comptime GraphType: type) type {
             needs_runtime: *bool,
             active_decls: *std.AutoHashMapUnmanaged(u32, void),
         ) error{OutOfMemory}!StructDeclIr {
+            const repr = explicit_cls.kind;
+            const is_class = explicit_cls.is_class;
+            const is_callable_handle = explicit_cls.is_callable_handle;
+            const owner_is_class_decl = owner_decl_id < self.graph.decls.len and
+                self.graph.decls[owner_decl_id].kind == .class_decl;
+
+            const saved_in_handle = self.in_handle_struct;
+            self.in_handle_struct = (repr == .handle_wrapper);
+            defer self.in_handle_struct = saved_in_handle;
+
+            if (repr == .handle_wrapper or is_class) {
+                needs_runtime.* = true;
+            }
+
             const self_ident = try self.chooseStructSelfIdent(
                 raw_tps,
                 merged_ids,
@@ -6456,25 +7220,82 @@ fn LowerCtx(comptime GraphType: type) type {
                     break;
                 }
             }
+            for (raw_methods) |m| {
+                if (m.modifiers.private_mod or m.modifiers.protected_mod) {
+                    has_non_public_members = true;
+                    break;
+                }
+            }
 
             var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
             defer visited.deinit(self.scratch);
 
-            // Instance fields share `struct_scope` so fields, static props, constructors, methods,
-            // `Self`, and `zigar_js` can NEVER collide inside the same Zig struct!
-            const fields = try self.lowerFields(
-                raw_prop_ids,
-                true,
-                &struct_scope,
-                tp_res.active,
-                self_ident,
-                &visited,
-                imports_used,
-                needs_runtime,
-            );
+            if (repr == .value_struct) {
+                const fields = try self.lowerFields(
+                    raw_prop_ids,
+                    true,
+                    &struct_scope,
+                    tp_res.active,
+                    self_ident,
+                    &visited,
+                    imports_used,
+                    needs_runtime,
+                );
 
-            // Static properties (skipping `private`/`protected` static members — `M2`).
-            var static_props: std.ArrayList(StaticPropIr) = .empty;
+                var nested_decls: std.ArrayList(DeclIr) = .empty;
+                try self.lowerMergedStructNestedDecls(
+                    final_mod_idx,
+                    owner_decl_id,
+                    merged_ids,
+                    &struct_scope,
+                    prebound_names,
+                    prebound_overloads,
+                    tp_res.active,
+                    imports_used,
+                    needs_runtime,
+                    &nested_decls,
+                    active_decls,
+                );
+
+                const to_js_ref_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "toJsRef");
+                const from_js_ref_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "fromJsRef");
+                const from_js_ref_alloc_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "fromJsRefAlloc");
+                if (to_js_ref_ident != null or from_js_ref_ident != null or from_js_ref_alloc_ident != null) {
+                    needs_runtime.* = true;
+                }
+                const self_param_ident = try lower_objects.chooseNonShadowingParamIdent(&struct_scope, self.scratch, self.alloc, "self");
+                const raw_param_ident = try lower_objects.chooseNonShadowingParamIdent(&struct_scope, self.scratch, self.alloc, "raw");
+                const alloc_param_ident = try lower_objects.chooseNonShadowingParamIdent(&struct_scope, self.scratch, self.alloc, "allocator");
+
+                return .{
+                    .repr = .value_struct,
+                    .is_class = false,
+                    .is_abstract = false,
+                    .is_callable_handle = false,
+                    .has_private_constructor = false,
+                    .has_non_public_members = has_non_public_members,
+                    .self_ident = self_ident,
+                    .self_param_ident = self_param_ident,
+                    .raw_param_ident = raw_param_ident,
+                    .alloc_param_ident = alloc_param_ident,
+                    .to_js_ref_ident = to_js_ref_ident,
+                    .from_js_ref_ident = from_js_ref_ident,
+                    .from_js_ref_alloc_ident = from_js_ref_alloc_ident,
+                    .type_params = tp_res.ir,
+                    .fields = fields,
+                    .static_props = &.{},
+                    .constructors = &.{},
+                    .methods = &.{},
+                    .nested_decls = try nested_decls.toOwnedSlice(self.alloc),
+                };
+            }
+
+            // `.handle_wrapper`: pre-bind ALL struct-level declarations in `struct_scope` BEFORE
+            // calling `lowerSignature` so Zig 0.17 function parameters NEVER shadow struct members!
+
+            // 1. Static properties (`raw_prop_ids` with `static_mod` + `companion_static_props`).
+            var static_prop_ids: std.ArrayList(u32) = .empty;
+            defer static_prop_ids.deinit(self.scratch);
             for (raw_prop_ids) |pid| {
                 if (pid >= self.graph.properties.len) continue;
                 const p = self.graph.properties[pid];
@@ -6483,14 +7304,61 @@ fn LowerCtx(comptime GraphType: type) type {
                     continue;
                 }
                 if (!p.modifiers.static_mod) continue;
+                if (p.computed_symbol != null) continue;
+                try static_prop_ids.append(self.scratch, pid);
+            }
+            for (companion_static_props) |pid| {
+                if (pid >= self.graph.properties.len) continue;
+                const p = self.graph.properties[pid];
+                if (p.modifiers.private_mod or p.modifiers.protected_mod) continue;
+                if (p.computed_symbol != null) continue;
+                const pwire = self.str(p.name);
+                if (std.mem.eql(u8, pwire, "prototype")) continue;
+                var dup = false;
+                for (static_prop_ids.items) |epid| {
+                    if (std.mem.eql(u8, self.str(self.graph.properties[epid].name), pwire)) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) try static_prop_ids.append(self.scratch, pid);
+            }
+
+            var static_props: std.ArrayList(StaticPropIr) = .empty;
+            for (static_prop_ids.items) |pid| {
+                const p = self.graph.properties[pid];
                 const wire = self.str(p.name);
+                const access = lower_objects.analyzePropAccess(p);
+                if (!access.is_readable and !access.is_writable) continue;
+
                 const style: naming.NameStyle = if (isAllUpperOrUnderscore(wire)) .preserve else .snake;
                 const sb = try struct_scope.bind(wire, style);
+                defer sb.deinit(self.scratch);
+
                 visited.clearRetainingCapacity();
-                const sty = try self.lowerType(p.ty, false, tp_res.active, self_ident, &visited, imports_used, needs_runtime);
+                const primary_ty_id = if (!access.is_readable and access.is_writable) access.write_ty_id else access.read_ty_id;
+                var sty = try self.lowerType(primary_ty_id, false, tp_res.active, self_ident, &visited, imports_used, needs_runtime);
+                if (p.modifiers.optional_mod) {
+                    sty = try self.wrapOptional(sty);
+                }
+
+                var setter_ty_ir: ?*const TypeIr = null;
+                const access_kind: lower_objects.StaticPropAccessKind = if (!access.is_readable and access.is_writable)
+                    .write_only
+                else if (access.is_readable and !access.is_writable)
+                    .read_only
+                else if (access.has_divergent_setter) blk: {
+                    visited.clearRetainingCapacity();
+                    var wty = try self.lowerType(access.write_ty_id, false, tp_res.active, self_ident, &visited, imports_used, needs_runtime);
+                    if (p.modifiers.optional_mod) wty = try self.wrapOptional(wty);
+                    setter_ty_ir = wty;
+                    break :blk .divergent_read_write;
+                } else .read_write;
 
                 var lit_opt: ?LiteralValueIr = null;
-                if (p.ty < self.graph.types.len and self.graph.types[p.ty].kind == .literal) {
+                if (access.is_literal_const_candidate and !p.modifiers.optional_mod and
+                    p.ty < self.graph.types.len and self.graph.types[p.ty].kind == .literal)
+                {
                     lit_opt = switch (self.graph.types[p.ty].kind.literal) {
                         .str => |sid| .{ .str = try self.alloc.dupe(u8, self.str(sid)) },
                         .num => |n| .{ .num = n },
@@ -6506,14 +7374,20 @@ fn LowerCtx(comptime GraphType: type) type {
                     .logical_name = try self.alloc.dupe(u8, sb.logical_name),
                     .wire_name = try self.alloc.dupe(u8, sb.wire_name),
                     .ty = sty,
+                    .setter_ty = setter_ty_ir,
+                    .access_kind = access_kind,
                     .literal = lit_opt,
                     .jsdoc = try self.lowerJsDoc(p.jsdoc),
                 });
-                sb.deinit(self.scratch);
             }
 
-            // Constructors (`init`, `init_2`, ...): filter out `private`/`protected` ctors (`M2`)!
-            const cand_ctor_sigs = if (raw_ctors.len > 0) raw_ctors else construct_sigs;
+            // 2. Class / companion-var constructors (`init`, `init_2`, ...).
+            //    `abstract class` declarations cannot be constructed directly via `new` (`TS2511`),
+            //    even when they declare a `constructor(...)` signature for `super(...)` calls.
+            const cand_ctor_sigs: []const u32 = if (is_class and !is_abstract)
+                (if (raw_ctors.len > 0) raw_ctors else construct_sigs)
+            else
+                &.{};
             var public_ctor_sigs: std.ArrayList(u32) = .empty;
             defer public_ctor_sigs.deinit(self.scratch);
             var saw_non_public_ctor = false;
@@ -6528,36 +7402,59 @@ fn LowerCtx(comptime GraphType: type) type {
                 try public_ctor_sigs.append(self.scratch, sid);
             }
             const has_private_constructor = saw_non_public_ctor and (public_ctor_sigs.items.len == 0);
-            const all_ctor_sigs = public_ctor_sigs.items;
+            const synthesize_default_ctor = owner_is_class_decl and
+                !is_abstract and
+                !has_private_constructor and
+                cand_ctor_sigs.len == 0 and
+                !has_explicit_extends;
 
-            var ctors = try self.alloc.alloc(ConstructorIr, all_ctor_sigs.len);
-            var ctor_idents = try self.scratch.alloc([]const u8, all_ctor_sigs.len);
+            const ctor_count = if (synthesize_default_ctor) @as(usize, 1) else public_ctor_sigs.items.len;
+            var ctor_idents = try self.scratch.alloc([]const u8, ctor_count);
             defer self.scratch.free(ctor_idents);
-            for (all_ctor_sigs, 0..) |_, idx| {
+            for (0..ctor_count) |idx| {
                 const cb = try struct_scope.bind("init", .camel);
                 ctor_idents[idx] = try self.alloc.dupe(u8, cb.zig_ident);
                 cb.deinit(self.scratch);
             }
 
-            // Pre-bind all method names in `struct_scope` BEFORE lowering method parameter scopes so
-            // NO method parameter can shadow ANY sibling method name on the struct!
+            // 3. Explicit methods, call signatures, and standalone construct signatures (primary names).
             const BoundMethodSlot = struct {
                 zig_ident: []const u8,
                 logical_name: []const u8,
                 wire_name: []const u8,
+                alloc_companion_ident: ?[]const u8 = null,
                 is_static: bool,
+                call_kind: lower_objects.MethodCallKind,
                 sig_id: u32,
                 prop_jsdoc: ?JsDocIr,
             };
             var method_slots: std.ArrayList(BoundMethodSlot) = .empty;
             defer method_slots.deinit(self.scratch);
 
+            var required_methods: std.ArrayList([]const u8) = .empty;
+            var required_props: std.ArrayList([]const u8) = .empty;
+
             for (raw_methods) |m| {
                 if (m.modifiers.private_mod or m.modifiers.protected_mod) {
                     has_non_public_members = true;
                     continue;
                 }
+                if (m.computed_symbol != null) continue;
                 const m_wire = self.str(m.name);
+                if (!is_class and !m.modifiers.static_mod and !m.modifiers.optional_mod and
+                    required_methods.items.len < lower_objects.max_required_handle_checks)
+                {
+                    var seen_rm = false;
+                    for (required_methods.items) |existing_rm| {
+                        if (std.mem.eql(u8, existing_rm, m_wire)) {
+                            seen_rm = true;
+                            break;
+                        }
+                    }
+                    if (!seen_rm) {
+                        try required_methods.append(self.alloc, try self.alloc.dupe(u8, m_wire));
+                    }
+                }
                 const m_jsdoc = try self.lowerJsDoc(m.jsdoc);
                 for (m.signatures) |sid| {
                     const mb = try struct_scope.bind(m_wire, .camel);
@@ -6566,6 +7463,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         .logical_name = try self.alloc.dupe(u8, mb.logical_name),
                         .wire_name = try self.alloc.dupe(u8, mb.wire_name),
                         .is_static = m.modifiers.static_mod,
+                        .call_kind = .method,
                         .sig_id = sid,
                         .prop_jsdoc = m_jsdoc,
                     });
@@ -6579,21 +7477,230 @@ fn LowerCtx(comptime GraphType: type) type {
                     .logical_name = try self.alloc.dupe(u8, mb.logical_name),
                     .wire_name = try self.alloc.dupe(u8, "call"),
                     .is_static = false,
+                    .call_kind = .call_sig,
                     .sig_id = sid,
                     .prop_jsdoc = null,
                 });
                 mb.deinit(self.scratch);
             }
+            if (!is_class) {
+                for (construct_sigs) |sid| {
+                    const mb = try struct_scope.bind("construct", .camel);
+                    try method_slots.append(self.scratch, .{
+                        .zig_ident = try self.alloc.dupe(u8, mb.zig_ident),
+                        .logical_name = try self.alloc.dupe(u8, mb.logical_name),
+                        .wire_name = try self.alloc.dupe(u8, "construct"),
+                        .is_static = false,
+                        .call_kind = .construct_sig,
+                        .sig_id = sid,
+                        .prop_jsdoc = null,
+                    });
+                    mb.deinit(self.scratch);
+                }
+            }
 
-            // Now `struct_scope` knows EVERY declaration inside this struct — lower constructors & methods!
-            for (all_ctor_sigs, 0..) |sid, idx| {
-                var c_sig = try self.lowerSignature(sid, &struct_scope, false, tp_res.active, self_ident, imports_used, needs_runtime);
-                c_sig.return_type = try self.makeType(.{ .self_type = self_ident });
-                ctors[idx] = .{
-                    .zig_ident = ctor_idents[idx],
-                    .signature = c_sig,
-                    .jsdoc = c_sig.jsdoc,
+            // 4. Instance property getters / `*Alloc` getters / setters.
+            var instance_props: std.ArrayList(InstancePropIr) = .empty;
+            for (raw_prop_ids) |pid| {
+                if (pid >= self.graph.properties.len) continue;
+                const p = self.graph.properties[pid];
+                if (p.modifiers.private_mod or p.modifiers.protected_mod) continue;
+                if (p.modifiers.static_mod) continue;
+                if (p.computed_symbol != null) continue;
+
+                const wire = self.str(p.name);
+                const access = lower_objects.analyzePropAccess(p);
+                if (!access.is_readable and !access.is_writable) continue;
+
+                var getter_ident: ?[]const u8 = null;
+                var getter_alloc_ident: ?[]const u8 = null;
+                var getter_ty: ?*const TypeIr = null;
+                if (access.is_readable) {
+                    const gb = try struct_scope.bind(wire, .camel);
+                    getter_ident = try self.alloc.dupe(u8, gb.zig_ident);
+                    const getter_logical = try self.scratch.dupe(u8, gb.logical_name);
+                    defer self.scratch.free(getter_logical);
+                    gb.deinit(self.scratch);
+
+                    visited.clearRetainingCapacity();
+                    var gty = try self.lowerType(access.read_ty_id, false, tp_res.active, self_ident, &visited, imports_used, needs_runtime);
+                    if (p.modifiers.optional_mod) gty = try self.wrapOptional(gty);
+                    getter_ty = gty;
+
+                    if (try self.typeMayAllocateOnDecode(gty)) {
+                        const raw_ga = try std.fmt.allocPrint(self.scratch, "{s}Alloc", .{getter_logical});
+                        defer self.scratch.free(raw_ga);
+                        const gab = try struct_scope.bind(raw_ga, .camel);
+                        getter_alloc_ident = try self.alloc.dupe(u8, gab.zig_ident);
+                        gab.deinit(self.scratch);
+                    }
+
+                    if (!is_class and !p.modifiers.optional_mod and
+                        required_props.items.len < lower_objects.max_required_handle_checks)
+                    {
+                        const allows_undef = switch (gty.*) {
+                            .optional => |opt| opt.nullish_kind != .null_only,
+                            .js_any, .js_unknown, .js_value, .void_type => true,
+                            else => false,
+                        };
+                        if (!allows_undef) {
+                            var seen_rp = false;
+                            for (required_props.items) |existing_rp| {
+                                if (std.mem.eql(u8, existing_rp, wire)) {
+                                    seen_rp = true;
+                                    break;
+                                }
+                            }
+                            if (!seen_rp) {
+                                try required_props.append(self.alloc, try self.alloc.dupe(u8, wire));
+                            }
+                        }
+                    }
+                }
+
+                var setter_ident: ?[]const u8 = null;
+                var setter_ty: ?*const TypeIr = null;
+                if (access.is_writable) {
+                    const raw_setter = try lower_objects.buildSetterRawName(self.scratch, wire);
+                    defer self.scratch.free(raw_setter);
+                    const sb = try struct_scope.bind(raw_setter, .camel);
+                    setter_ident = try self.alloc.dupe(u8, sb.zig_ident);
+                    sb.deinit(self.scratch);
+
+                    if (access.has_divergent_setter) {
+                        visited.clearRetainingCapacity();
+                        var wty = try self.lowerType(access.write_ty_id, false, tp_res.active, self_ident, &visited, imports_used, needs_runtime);
+                        if (p.modifiers.optional_mod) wty = try self.wrapOptional(wty);
+                        setter_ty = wty;
+                    } else if (getter_ty) |gty| {
+                        setter_ty = gty;
+                    } else {
+                        visited.clearRetainingCapacity();
+                        var wty = try self.lowerType(access.write_ty_id, false, tp_res.active, self_ident, &visited, imports_used, needs_runtime);
+                        if (p.modifiers.optional_mod) wty = try self.wrapOptional(wty);
+                        setter_ty = wty;
+                    }
+                }
+
+                try instance_props.append(self.alloc, .{
+                    .wire_name = try self.alloc.dupe(u8, wire),
+                    .is_optional = p.modifiers.optional_mod,
+                    .getter_ident = getter_ident,
+                    .getter_alloc_ident = getter_alloc_ident,
+                    .getter_ty = getter_ty,
+                    .setter_ident = setter_ident,
+                    .setter_ty = setter_ty,
+                    .setter_is_optional = p.modifiers.optional_mod,
+                    .jsdoc = try self.lowerJsDoc(p.jsdoc),
+                });
+            }
+
+            // 5. Backing `ref` field (`ref` or `__zigar_ref` when `.ref()` exists) + lifecycle helpers!
+            const ref_field_ident = try lower_objects.bindBackingRefFieldIdent(&struct_scope, self.scratch, self.alloc);
+            const deinit_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "deinit");
+            const to_js_ref_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "toJsRef");
+            const from_js_ref_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "fromJsRef");
+
+            // 6. Method `*Alloc` companions (bound AFTER explicit methods/props/helpers, BEFORE `lowerSignature`).
+            for (method_slots.items) |*slot| {
+                if (try self.previewSigMayAllocateOnDecode(
+                    slot.sig_id,
+                    &struct_scope,
+                    tp_res.active,
+                    self_ident,
+                    imports_used,
+                    needs_runtime,
+                )) {
+                    const raw_alloc = try std.fmt.allocPrint(self.scratch, "{s}Alloc", .{slot.logical_name});
+                    defer self.scratch.free(raw_alloc);
+                    const ab = try struct_scope.bind(raw_alloc, .camel);
+                    slot.alloc_companion_ident = try self.alloc.dupe(u8, ab.zig_ident);
+                    ab.deinit(self.scratch);
+                }
+            }
+
+            // 7. Nested declarations (`merged_ns_consumed` & `merged_generic_ns_peer`) so any newly
+            // added sibling aliases are ALSO in `struct_scope` before parameter naming!
+            var nested_decls: std.ArrayList(DeclIr) = .empty;
+            try self.lowerMergedStructNestedDecls(
+                final_mod_idx,
+                owner_decl_id,
+                merged_ids,
+                &struct_scope,
+                prebound_names,
+                prebound_overloads,
+                tp_res.active,
+                imports_used,
+                needs_runtime,
+                &nested_decls,
+                active_decls,
+            );
+
+            // 8. Now `struct_scope` has EVERY declaration in this struct: lower constructors, methods,
+            // and non-shadowing helper/accessor parameter names!
+            const self_param_ident = try lower_objects.chooseNonShadowingParamIdent(
+                &struct_scope,
+                self.scratch,
+                self.alloc,
+                "self",
+            );
+            const raw_param_ident = try lower_objects.chooseNonShadowingParamIdent(
+                &struct_scope,
+                self.scratch,
+                self.alloc,
+                "raw",
+            );
+            for (instance_props.items) |*ip| {
+                if (ip.getter_alloc_ident != null) {
+                    ip.getter_alloc_param_ident = try lower_objects.chooseNonShadowingParamIdent(
+                        &struct_scope,
+                        self.scratch,
+                        self.alloc,
+                        "allocator",
+                    );
+                }
+                if (ip.setter_ident != null) {
+                    ip.setter_param_ident = try lower_objects.chooseNonShadowingParamIdent(
+                        &struct_scope,
+                        self.scratch,
+                        self.alloc,
+                        "value",
+                    );
+                }
+            }
+
+            var ctors = try self.alloc.alloc(ConstructorIr, ctor_count);
+            if (synthesize_default_ctor) {
+                const alloc_param = try lower_objects.chooseNonShadowingParamIdent(
+                    &struct_scope,
+                    self.scratch,
+                    self.alloc,
+                    "allocator",
+                );
+                ctors[0] = .{
+                    .zig_ident = ctor_idents[0],
+                    .signature = .{
+                        .self_param_ident = null,
+                        .alloc_param_ident = alloc_param,
+                        .type_params = &.{},
+                        .params = &.{},
+                        .return_type = try self.makeType(.{ .self_type = self_ident }),
+                        .has_type_predicate = false,
+                        .type_predicate_asserts = false,
+                        .jsdoc = null,
+                    },
+                    .jsdoc = null,
                 };
+            } else {
+                for (public_ctor_sigs.items, 0..) |sid, idx| {
+                    var c_sig = try self.lowerSignature(sid, &struct_scope, false, tp_res.active, self_ident, imports_used, needs_runtime);
+                    c_sig.return_type = try self.makeType(.{ .self_type = self_ident });
+                    ctors[idx] = .{
+                        .zig_ident = ctor_idents[idx],
+                        .signature = c_sig,
+                        .jsdoc = c_sig.jsdoc,
+                    };
+                }
             }
 
             var methods = try self.alloc.alloc(MethodIr, method_slots.items.len);
@@ -6611,13 +7718,54 @@ fn LowerCtx(comptime GraphType: type) type {
                     .zig_ident = slot.zig_ident,
                     .logical_name = slot.logical_name,
                     .wire_name = slot.wire_name,
+                    .alloc_companion_ident = slot.alloc_companion_ident,
                     .is_static = slot.is_static,
+                    .call_kind = slot.call_kind,
                     .signature = m_sig,
                     .jsdoc = m_sig.jsdoc orelse slot.prop_jsdoc,
                 };
             }
 
-            var nested_decls: std.ArrayList(DeclIr) = .empty;
+            return .{
+                .repr = .handle_wrapper,
+                .is_class = is_class,
+                .is_abstract = is_abstract,
+                .is_callable_handle = is_callable_handle,
+                .has_private_constructor = has_private_constructor,
+                .has_non_public_members = has_non_public_members,
+                .self_ident = self_ident,
+                .ref_field_ident = ref_field_ident,
+                .self_param_ident = self_param_ident,
+                .raw_param_ident = raw_param_ident,
+                .to_js_ref_ident = to_js_ref_ident,
+                .from_js_ref_ident = from_js_ref_ident,
+                .deinit_ident = deinit_ident,
+                .required_methods = try required_methods.toOwnedSlice(self.alloc),
+                .required_props = try required_props.toOwnedSlice(self.alloc),
+                .type_params = tp_res.ir,
+                .fields = &.{},
+                .instance_props = try instance_props.toOwnedSlice(self.alloc),
+                .static_props = try static_props.toOwnedSlice(self.alloc),
+                .constructors = ctors,
+                .methods = methods,
+                .nested_decls = try nested_decls.toOwnedSlice(self.alloc),
+            };
+        }
+
+        fn lowerMergedStructNestedDecls(
+            self: *Self,
+            final_mod_idx: u32,
+            owner_decl_id: u32,
+            merged_ids: []const u32,
+            struct_scope: *naming.ScopeNamer,
+            prebound_names: *const std.AutoHashMapUnmanaged(u32, naming.BoundName),
+            prebound_overloads: *const std.AutoHashMapUnmanaged(u32, []naming.BoundName),
+            active_tps: []const ActiveTypeParam,
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+            nested_decls: *std.ArrayList(DeclIr),
+            active_decls: *std.AutoHashMapUnmanaged(u32, void),
+        ) error{OutOfMemory}!void {
             for (merged_ids) |mid| {
                 if (self.merged_ns_consumed.contains(mid)) {
                     for (self.graph.decls[mid].kind.namespace_decl) |cid| {
@@ -6625,21 +7773,19 @@ fn LowerCtx(comptime GraphType: type) type {
                             final_mod_idx,
                             cid,
                             false,
-                            &struct_scope,
+                            struct_scope,
                             prebound_names,
                             prebound_overloads,
-                            tp_res.active,
+                            active_tps,
                             imports_used,
                             needs_runtime,
-                            &nested_decls,
+                            nested_decls,
                             active_decls,
                         );
                     }
                 }
             }
 
-            // If this generic struct/class has a sibling concrete merged namespace (`EventEmitter_2`),
-            // also expose non-colliding `re_export_decl` aliases inside `Foo(T)` so `EventEmitter(Map).Abortable` works!
             if (self.merged_generic_ns_peer.get(owner_decl_id)) |ns_peer_id| {
                 if (ns_peer_id < self.graph.decls.len and self.graph.decls[ns_peer_id].kind == .namespace_decl) {
                     for (self.graph.decls[ns_peer_id].kind.namespace_decl) |cid| {
@@ -6682,20 +7828,6 @@ fn LowerCtx(comptime GraphType: type) type {
                     }
                 }
             }
-
-            return .{
-                .is_class = is_class,
-                .is_abstract = is_abstract,
-                .has_private_constructor = has_private_constructor,
-                .has_non_public_members = has_non_public_members,
-                .self_ident = self_ident,
-                .type_params = tp_res.ir,
-                .fields = fields,
-                .static_props = try static_props.toOwnedSlice(self.alloc),
-                .constructors = ctors,
-                .methods = methods,
-                .nested_decls = try nested_decls.toOwnedSlice(self.alloc),
-            };
         }
 
         fn resolveFinalModFromSourceMod(self: *const Self, source_mod_id: u32) ?u32 {
@@ -7421,8 +8553,10 @@ fn dfsValueCycleDeclByPath(
 
     switch (d.kind) {
         .struct_decl => |*st| {
-            for (st.fields) |f| {
-                try dfsValueCycleTypeByPath(state_alloc, ir_alloc, @constCast(f.ty), decl_map, state);
+            if (st.repr == .value_struct) {
+                for (st.fields) |f| {
+                    try dfsValueCycleTypeByPath(state_alloc, ir_alloc, @constCast(f.ty), decl_map, state);
+                }
             }
             if (st.nested_decls.len > 0) {
                 const sub_prefix = try state_alloc.alloc([]const u8, prefix.len + 1);

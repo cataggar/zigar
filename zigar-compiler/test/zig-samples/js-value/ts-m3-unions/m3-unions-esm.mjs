@@ -156,9 +156,6 @@ export function describeHetero(payload) {
   if (Buffer.isBuffer(payload)) return `buf:${payload.length}:${payload[0]}`;
   if (payload instanceof Uint8Array) return `u8:${payload.length}:${payload[0]}`;
   if (payload instanceof MiniChannel) return `chan:${payload.ping()}`;
-  if (typeof payload === 'object' && payload !== null && 'label' in payload && !('host' in payload)) {
-    return `chan:pong:${payload.label}`;
-  }
   if (typeof payload === 'object' && payload !== null) {
     return `host:${payload.host}:${'port' in payload ? payload.port : 'omitted'}`;
   }
