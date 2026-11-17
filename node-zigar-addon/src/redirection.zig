@@ -437,8 +437,16 @@ pub fn Controller(comptime Host: type) type {
             return null;
         }
 
+        threadlocal var thread_trap_count: usize = 0;
+
         pub fn installSyscallTrap(ptr: *const bool) !void {
             if (syscall_user_dispatch) {
+                if (thread_trap_count > 0) {
+                    thread_trap_count += 1;
+                    return;
+                }
+                try installSignalHandler();
+                errdefer uninstallSignalHandler();
                 // enable syscall user dispatch, excluding the memory region where libc sits; the signal
                 // trampoline is also inside this range, allowing us to reenable trapping from within
                 // the signal handler (otherwise sigreturn() would trigger SIGSYS inside a SIGSYS)
@@ -452,11 +460,15 @@ pub fn Controller(comptime Host: type) type {
                 ) != 0) {
                     return error.SyscallUserDispatchFailure;
                 }
+                thread_trap_count = 1;
             }
         }
 
         pub fn uninstallSyscallTrap() void {
             if (syscall_user_dispatch) {
+                if (thread_trap_count == 0) return;
+                thread_trap_count -= 1;
+                if (thread_trap_count > 0) return;
                 _ = std.c.prctl(
                     c.PR_SET_SYSCALL_USER_DISPATCH,
                     c.PR_SYS_DISPATCH_OFF,
@@ -464,16 +476,23 @@ pub fn Controller(comptime Host: type) type {
                     @as(usize, 0),
                     @as(usize, 0),
                 );
+                uninstallSignalHandler();
             }
         }
 
-        var sig_handler_count = std.atomic.Value(usize).init(0);
+        var sig_handler_mutex: std.Io.Mutex = .init;
+        var sig_handler_count: usize = 0;
         var previous_signal_handler: ?std.c.Sigaction = null;
 
         pub fn installSignalHandler() !void {
             if (syscall_user_dispatch) {
+                sig_handler_mutex.lockUncancelable(io);
+                defer sig_handler_mutex.unlock(io);
                 // don't do anything if the trap is already set
-                if (sig_handler_count.fetchAdd(1, .monotonic) > 0) return;
+                if (sig_handler_count > 0) {
+                    sig_handler_count += 1;
+                    return;
+                }
                 const act: std.c.Sigaction = .{
                     .handler = .{ .sigaction = handleSigsysSignal },
                     .mask = std.mem.zeroes(std.c.sigset_t),
@@ -482,16 +501,22 @@ pub fn Controller(comptime Host: type) type {
                 var prev_act: std.c.Sigaction = undefined;
                 if (std.c.sigaction(std.c.SIG.SYS, &act, &prev_act) != 0) return error.SignalHandlingFailure;
                 errdefer _ = std.c.sigaction(std.c.SIG.SYS, &prev_act, null);
-                if (prev_act.flags != 0) {
+                const sa_restorer: @TypeOf(prev_act.flags) = 0x04000000;
+                if ((prev_act.flags & ~sa_restorer) != 0) {
                     return error.UnexpectedSignalHandlingStatus;
                 }
                 previous_signal_handler = prev_act;
+                sig_handler_count = 1;
             }
         }
 
         pub fn uninstallSignalHandler() void {
             if (syscall_user_dispatch) {
-                if (sig_handler_count.fetchSub(1, .monotonic) > 1) return;
+                sig_handler_mutex.lockUncancelable(io);
+                defer sig_handler_mutex.unlock(io);
+                if (sig_handler_count == 0) return;
+                sig_handler_count -= 1;
+                if (sig_handler_count > 0) return;
                 if (previous_signal_handler) |prev_act| {
                     _ = std.c.sigaction(std.c.SIG.SYS, &prev_act, null);
                 }
