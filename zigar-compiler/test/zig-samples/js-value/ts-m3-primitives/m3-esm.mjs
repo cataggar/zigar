@@ -1,0 +1,172 @@
+import { Buffer } from 'node:buffer';
+
+export const SMALL_BIGINT = -99_999_000_111n;
+export const HUGE_BIGINT = (1n << 100n) + 7n;
+export const ULTRA_BIGINT = 999_999_999_999_999_999_999_999_999_999_999_999_999_999n;
+
+export const UNIQUE_TOKEN = Symbol.for('zigar.m3.unique_token');
+export let moduleTag = 'initial-tag';
+export let moduleCount = 10;
+
+export function mutateEsmBindings(nextTag, delta) {
+  moduleTag = nextTag;
+  moduleCount += delta;
+}
+
+let voidAcc = 0;
+
+export default function defaultBanner(prefix, code = 200) {
+  return `[${arguments.length}]${prefix}#${code}`;
+}
+
+export function recordVoid(delta) {
+  voidAcc += delta;
+}
+
+export function getVoidAcc() {
+  return voidAcc;
+}
+
+export function alwaysThrow(reason) {
+  throw new TypeError(`never-error:${reason}`);
+}
+
+export function formatPrimitives(flag, score, id, label) {
+  if (typeof flag !== 'boolean') throw new TypeError('expected boolean');
+  if (typeof score !== 'number') throw new TypeError('expected number');
+  if (typeof id !== 'bigint') throw new TypeError('expected bigint');
+  if (typeof label !== 'string') throw new TypeError('expected string');
+  return `${flag}|${score.toFixed(2)}|${id.toString()}|${label}`;
+}
+
+export function addHugeBigInt(lhs, delta) {
+  if (typeof lhs !== 'bigint' || typeof delta !== 'bigint') {
+    throw new TypeError('expected bigint operands');
+  }
+  return lhs + delta;
+}
+
+export function borrowJsString(input) {
+  if (typeof input !== 'string') throw new TypeError('expected string');
+  return `${input}🚀`;
+}
+
+export function checkUniqueSymbol(sym) {
+  return typeof sym === 'symbol' && sym === UNIQUE_TOKEN;
+}
+
+export function roundtripIntrinsics(obj, anyVal, unkVal) {
+  if (typeof obj !== 'object' || obj === null) throw new TypeError('expected non-null object');
+  return [ obj, anyVal, unkVal ];
+}
+
+export function callWithDefaults(base, suffix = '!', repeat = 2) {
+  return `${arguments.length}:${base}${String(suffix).repeat(repeat)}`;
+}
+
+export function classifyNullishArgs(nullArm, undefArm, bothArm) {
+  const kindOf = (v) => (v === null ? 'null' : v === undefined ? 'undefined' : `str(${v})`);
+  return `${kindOf(nullArm)}|${kindOf(undefArm)}|${kindOf(bothArm)}`;
+}
+
+export function produceInboundOptional(mode) {
+  if (mode === 0) return null;
+  if (mode === 1) return undefined;
+  return 'present-value';
+}
+
+export function produceRawForNullable(mode) {
+  if (mode === 0) return undefined;
+  if (mode === 1) return null;
+  return 42.5;
+}
+
+export function consumeRawFromNullable(val) {
+  if (val === undefined) return 'is-undefined';
+  if (val === null) return 'is-null';
+  return `is-value:${val}`;
+}
+
+export function transformStringArray(items, extra) {
+  if (!Array.isArray(items) || !Array.isArray(extra)) {
+    throw new TypeError('expected genuine JS Arrays');
+  }
+  const sum = extra.reduce((acc, n) => acc + n, 0);
+  return [ ...items.map((s) => s.toUpperCase()), `sum=${sum}` ];
+}
+
+export function flipFixedPair(pair) {
+  if (!Array.isArray(pair) || pair.length !== 2) {
+    throw new TypeError(`expected 2-tuple array, got len=${pair?.length}`);
+  }
+  return [ pair[0] + 0.5, !pair[1] ];
+}
+
+export function normalizeEndpoint(ep, omitPortOut) {
+  if (!Array.isArray(ep)) throw new TypeError('expected endpoint array');
+  const host = `${ep[0]}:${ep.length}`;
+  if (omitPortOut) {
+    return [ host ];
+  }
+  return [ host, ep[1] === undefined ? 443 : ep[1] + 1 ];
+}
+
+export function routeSummary(route) {
+  if (!Array.isArray(route)) throw new TypeError('expected route array');
+  const [ host, port, ...tags ] = route;
+  return [ `${host}@${route.length}`, port === undefined ? 8080 : port, ...tags.map((t) => `#${t}`), 'ok' ];
+}
+
+export function evalLeadingFlags(input) {
+  if (!Array.isArray(input) || input.length < 1) throw new TypeError('expected leading variadic array');
+  const target = input[input.length - 1];
+  const flags = input.slice(0, -1).map((f) => !f);
+  return [ ...flags, `${target}:done` ];
+}
+
+export function evalMiddleSandwich(input) {
+  if (!Array.isArray(input) || input.length < 2) throw new TypeError('expected middle variadic array');
+  const head = input[0] * 2;
+  const tail = !input[input.length - 1];
+  const mid = input.slice(1, -1).map((s) => s.toUpperCase());
+  return [ head, ...mid, tail ];
+}
+
+export function malformedTupleReturn(kind) {
+  if (kind === 0) return { notAnArray: true };
+  if (kind === 1) return [];
+  if (kind === 2) return [ 'allocated-host-string', 9000, 'allocated-tag-one', 99999 ];
+  return [ 'ok', 80 ];
+}
+
+export function mutateBinaryInPlace(buf, u8, i32, f64, i64, ab, sab, dv) {
+  if (!Buffer.isBuffer(buf)) throw new TypeError('expected Buffer');
+  if (!(u8 instanceof Uint8Array)) throw new TypeError('expected Uint8Array');
+  if (!(i32 instanceof Int32Array)) throw new TypeError('expected Int32Array');
+  if (!(f64 instanceof Float64Array)) throw new TypeError('expected Float64Array');
+  if (!(i64 instanceof BigInt64Array)) throw new TypeError('expected BigInt64Array');
+  if (!(ab instanceof ArrayBuffer)) throw new TypeError('expected ArrayBuffer');
+  if (!(sab instanceof SharedArrayBuffer)) throw new TypeError('expected SharedArrayBuffer');
+  if (!(dv instanceof DataView)) throw new TypeError('expected DataView');
+
+  buf[0] = (buf[0] + 10) & 0xff;
+  u8[1] = 0xab;
+  i32[0] = i32[0] * 3;
+  f64[1] = f64[1] + 0.25;
+  i64[0] = i64[0] - 1000n;
+  new Uint8Array(ab)[2] = 0x77;
+  Atomics.add(new Int32Array(sab), 0, 50);
+  dv.setUint16(0, 0xbeef, true);
+
+  return Buffer.from([ buf[0], u8[1], new Uint8Array(ab)[2], dv.getUint8(0), dv.getUint8(1) ]);
+}
+
+export const nested = {
+  hits: 5,
+  deep: {
+    combine(a, b = 9) {
+      nested.hits += 1;
+      return `${a}:${b}:hits=${nested.hits}`;
+    },
+  },
+};

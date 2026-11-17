@@ -566,7 +566,7 @@ test "Regression Bug 2: export * and named re-exports emit alias constants prese
             \\    try std.testing.expectEqual(@as(f64, 10), n.radius);
             \\
             \\    // Passing `sub_star.Starry` to `r.take` must type-check identically!
-            \\    const take_fn: *const fn (sub_star.Starry, sub_star.Nebula, sub_star.Phase) sub_star.Starry = &r.take;
+            \\    const take_fn: *const fn (sub_star.Starry, sub_star.Nebula, sub_star.Phase) r.zigar_js.CallError!sub_star.Starry = &r.take;
             \\    _ = take_fn;
             \\}
             ,
@@ -693,7 +693,7 @@ test "Regression Bug 3: export import Foo = Bar.Baz emits full multi-segment nes
             \\    try std.testing.expect(&r.computeLeaf == &other.Bar.Deep.compute);
             \\    try std.testing.expect(r.LocalInner == r.LocalNs.Inner);
             \\
-            \\    const consume_fn: *const fn (other.Bar.Baz, other.Bar.Deep.Leaf, r.LocalNs.Inner) other.Bar.Baz = &r.consume;
+            \\    const consume_fn: *const fn (other.Bar.Baz, other.Bar.Deep.Leaf, r.LocalNs.Inner) r.zigar_js.CallError!other.Bar.Baz = &r.consume;
             \\    _ = consume_fn;
             \\}
             ,
@@ -1053,7 +1053,7 @@ test "Regression Round 2 Issue 2: non-entry imported modules preserve namespaces
             \\    try std.testing.expectEqualStrings("hello", nested_in.nested);
             \\    try std.testing.expect(payload.ok);
             \\
-            \\    const f_ptr: *const fn (leaf.Inner, leaf.LeafNs.Inner, foo_used.UsedNs.Payload) void = &r.f;
+            \\    const f_ptr: *const fn (leaf.Inner, leaf.LeafNs.Inner, foo_used.UsedNs.Payload) r.zigar_js.CallError!void = &r.f;
             \\    _ = f_ptr;
             \\}
             ,
@@ -1365,7 +1365,7 @@ test "Regression Round 3: @types/node reference-path ambient closure, mixed ES+a
             \\    try std.testing.expect(@hasDecl(r_mixed, "inline_mod"));
             \\    try std.testing.expect(@hasDecl(r_mixed, "empty_inline"));
             \\    try std.testing.expect(@hasDecl(r_mixed, "plugin"));
-            \\    const inline_fn: *const fn () r_mixed.A = &r_mixed.inline_mod.useInline;
+            \\    const inline_fn: *const fn () r_mixed.zigar_js.CallError!r_mixed.A = &r_mixed.inline_mod.useInline;
             \\    _ = inline_fn;
             \\    const p_opts: r_mixed.plugin.PluginOpts = .{ .enabled = true };
             \\    try std.testing.expect(p_opts.enabled);
@@ -2100,7 +2100,7 @@ test "Issue #45 H1, H3, H4, M2, L3: merged namespace self-export, shared DAG hoi
     }
     try std.testing.expect(res == .ok);
 
-    // Verify H3 size bound and hoisted helper emission on `dag.zig`!
+    // Verify H3 size bound and hoisted helper emission on `dag.zig`, plus `export =` `from_default` target on `node_path.zig`!
     {
         var out_h = try cwd.openDir(io, out_dir, .{});
         defer out_h.close(io);
@@ -2108,6 +2108,11 @@ test "Issue #45 H1, H3, H4, M2, L3: merged namespace self-export, shared DAG hoi
         defer alloc.free(dag_src);
         try std.testing.expect(dag_src.len < 8192);
         try std.testing.expect(std.mem.indexOf(u8, dag_src, "__zigar_AnonObj_") != null);
+
+        const path_src = try out_h.readFileAlloc(io, "path.zig", alloc, .limited(64 * 1024));
+        defer alloc.free(path_src);
+        try std.testing.expect(std.mem.indexOf(u8, path_src, ".name = \"join\", .from_default = true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, path_src, ".ns_path = &.{ \"path\"") == null);
     }
 
     const consumer_zig = try std.fmt.allocPrint(alloc, "{s}/consumer_issue45.zig", .{sandbox});
@@ -2179,6 +2184,271 @@ test "Issue #45 H1, H3, H4, M2, L3: merged namespace self-export, shared DAG hoi
             \\    try std.testing.expect(m2_l3.DynamicEnum.zigar_js.has_unknown_values);
             \\    _ = &m2_l3.DynamicEnum.alpha;
             \\    _ = &m2_l3.DynamicEnum.beta;
+            \\}
+            ,
+        });
+    }
+
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
+}
+
+test "Issue #46 (M3.1a): primitives, optionals/nullish kinds, bigint literals, symbols, all 15 binary views, and fixed/optional/labeled/variadic tuples" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue46-m3-primitives", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const src_dir = try std.fmt.allocPrint(alloc, "{s}/src", .{sandbox});
+    defer alloc.free(src_dir);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+
+    try cwd.createDirPath(io, src_dir);
+    {
+        var d = try cwd.openDir(io, src_dir, .{});
+        defer d.close(io);
+
+        try d.writeFile(io, .{
+            .sub_path = "index.d.ts",
+            .data =
+            \\declare module "node:buffer" {
+            \\    export class Buffer extends Uint8Array {}
+            \\}
+            \\import { Buffer } from "node:buffer";
+            \\
+            \\export declare const SMALL_BIGINT = -99_999_000_111n;
+            \\export declare const I128_BIGINT = 18_446_744_073_709_551_616n;
+            \\export declare const HUGE_BIGINT = 999_999_999_999_999_999_999_999_999_999_999_999_999_999n;
+            \\
+            \\export declare const UNIQUE_TOKEN: unique symbol;
+            \\export declare let globalCounter: number;
+            \\
+            \\export declare function noop(): void;
+            \\export declare function failAlways(reason: string): never;
+            \\export declare function scalars(flag: boolean, count: number, id: bigint, name: string): string;
+            \\export declare function boxedHandles(big: BigInt, str: String, sym: symbol, obj: object, rawAny: any, rawUnk: unknown): BigInt;
+            \\
+            \\export interface OptionalConfig {
+            \\    optProp?: string;
+            \\    undefUnion: number | undefined;
+            \\    nullUnion: number | null;
+            \\    bothUnion: boolean | null | undefined;
+            \\}
+            \\export declare function testOptionals(
+            \\    req: string,
+            \\    nullVal: string | null,
+            \\    bothVal: string | null | undefined,
+            \\    optA?: string,
+            \\    optB?: number,
+            \\): string | null;
+            \\
+            \\export declare function sumReadonly(nums: ReadonlyArray<number>, tags: string[]): string[];
+            \\
+            \\export type FixedPair = [number, boolean];
+            \\export type OptionalPair = [string, number?];
+            \\export type LabeledEndpoint = [host: string, port?: number];
+            \\export type TrailingVarTuple = [prefix: string, ...codes: number[]];
+            \\export type LeadingVarTuple = [...flags: boolean[], target: string];
+            \\export type MiddleVarTuple = [head: number, ...mid: string[], tail: boolean];
+            \\export type ReadonlySpreadTuple = [...items: readonly string[]];
+            \\export type GenericArraySpreadTuple = [...items: Array<number>];
+            \\export type NullElemTuple = [string | null, number | undefined];
+            \\
+            \\export declare function echoEndpoint(ep: LabeledEndpoint): LabeledEndpoint;
+            \\export declare function echoTrailingTuple(t: TrailingVarTuple): TrailingVarTuple;
+            \\export declare function echoLeadingTuple(t: LeadingVarTuple): LeadingVarTuple;
+            \\export declare function echoMiddleTuple(t: MiddleVarTuple): MiddleVarTuple;
+            \\export declare function inlineTupleReturn(label: string): [string, number?];
+            \\export declare function wrapGenericTuple<T>(item: T): [T, string];
+            \\
+            \\export interface AllBinaryViews {
+            \\    buf: Buffer;
+            \\    u8: Uint8Array;
+            \\    u8c: Uint8ClampedArray;
+            \\    i8: Int8Array;
+            \\    u16: Uint16Array;
+            \\    i16: Int16Array;
+            \\    u32: Uint32Array;
+            \\    i32: Int32Array;
+            \\    u64: BigUint64Array;
+            \\    i64: BigInt64Array;
+            \\    f32: Float32Array;
+            \\    f64: Float64Array;
+            \\    ab: ArrayBuffer;
+            \\    sab: SharedArrayBuffer;
+            \\    dv: DataView;
+            \\}
+            \\export declare function inspectBinary(views: AllBinaryViews): Uint8Array;
+            ,
+        });
+    }
+
+    const index_dts = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{src_dir});
+    defer alloc.free(index_dts);
+
+    const cli_args = [_][]const u8{ "-t", index_dts, "-d", out_dir };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Issue #46 pipeline error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+
+    // Golden source assertions on `index.zig` and `root.zig`
+    {
+        var out_h = try cwd.openDir(io, out_dir, .{});
+        defer out_h.close(io);
+        _ = try out_h.statFile(io, "__zigar_runtime.zig", .{});
+        const root_src = try out_h.readFileAlloc(io, "root.zig", alloc, .limited(256 * 1024));
+        defer alloc.free(root_src);
+        try std.testing.expect(std.mem.indexOf(u8, root_src, "pub const zigar_js = @import(\"__zigar_runtime.zig\");") != null);
+        try std.testing.expect(std.mem.indexOf(u8, root_src, "pub const scalarsAlloc = index.scalarsAlloc;") != null);
+
+        const idx_src = try out_h.readFileAlloc(io, "index.zig", alloc, .limited(512 * 1024));
+        defer alloc.free(idx_src);
+        // Nullish emit tags & trailing optional argc logic
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, ".null_only") != null);
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, ".undefined_only") != null);
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, ".none") != null);
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, "__zigar_argc") != null);
+        // All 15 binary view names
+        for ([_][]const u8{
+            "__zigar_js.Buffer",
+            "__zigar_js.Uint8Array",
+            "__zigar_js.Uint8ClampedArray",
+            "__zigar_js.Int8Array",
+            "__zigar_js.Uint16Array",
+            "__zigar_js.Int16Array",
+            "__zigar_js.Uint32Array",
+            "__zigar_js.Int32Array",
+            "__zigar_js.BigUint64Array",
+            "__zigar_js.BigInt64Array",
+            "__zigar_js.Float32Array",
+            "__zigar_js.Float64Array",
+            "__zigar_js.ArrayBuffer",
+            "__zigar_js.SharedArrayBuffer",
+            "__zigar_js.DataView",
+        }) |bv_needle| {
+            if (std.mem.indexOf(u8, idx_src, bv_needle) == null) {
+                std.debug.print("Missing binary view in index.zig: {s}\n", .{bv_needle});
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+
+    const consumer_zig = try std.fmt.allocPrint(alloc, "{s}/consumer_issue46.zig", .{sandbox});
+    defer alloc.free(consumer_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "consumer_issue46.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r = @import("out/root.zig");
+            \\const js = r.zigar_js;
+            \\
+            \\test "Issue #46 Sema & offline stub verification" {
+            \\    try std.testing.expect(!js.has_host);
+            \\
+            \\    // BigInt literals: i64, i128, and >i128 decimal text
+            \\    try std.testing.expectEqual(@as(i64, -99999000111), r.SMALL_BIGINT);
+            \\    try std.testing.expectEqual(@as(i128, 18446744073709551616), r.I128_BIGINT);
+            \\    try std.testing.expectEqualStrings("999999999999999999999999999999999999999999", r.HUGE_BIGINT);
+            \\
+            \\    // Unique symbol & global variable wrappers
+            \\    try std.testing.expect(@TypeOf(r.UNIQUE_TOKEN).ValueType == js.Symbol);
+            \\    try std.testing.expectEqualStrings("UNIQUE_TOKEN", r.UNIQUE_TOKEN.js_name);
+            \\    try std.testing.expect(@TypeOf(r.global_counter).ValueType == f64);
+            \\    try std.testing.expectError(error.HostUnavailable, r.global_counter.get());
+            \\    try std.testing.expectError(error.HostUnavailable, r.global_counter.set(10));
+            \\
+            \\    // Intrinsics & primitives + Alloc companions
+            \\    try std.testing.expectError(error.HostUnavailable, r.noop());
+            \\    try std.testing.expectError(error.HostUnavailable, r.failAlways("boom"));
+            \\    try std.testing.expectError(error.HostUnavailable, r.scalars(true, 3.5, 42, "hi"));
+            \\    try std.testing.expectError(error.HostUnavailable, r.scalarsAlloc(std.testing.allocator, true, 3.5, 42, "hi"));
+            \\    const boxed_fn: *const fn (js.BigInt, js.String, js.Symbol, js.Object, js.Any, js.Unknown) js.CallError!js.BigInt = &r.boxedHandles;
+            \\    _ = boxed_fn;
+            \\
+            \\    // Nullable(T) helper
+            \\    const N = js.Nullable(f64);
+            \\    const n_undef: N = .undefined;
+            \\    const n_null: N = .null;
+            \\    const n_val: N = .{ .value = 7.5 };
+            \\    try std.testing.expect(n_undef.isUndefined());
+            \\    try std.testing.expect(n_null.isNull());
+            \\    try std.testing.expectEqual(@as(?f64, null), n_undef.toOptional());
+            \\    try std.testing.expectEqual(@as(?f64, 7.5), n_val.toOptional());
+            \\
+            \\    // OptionalConfig defaults
+            \\    const cfg: r.OptionalConfig = .{ .undef_union = null, .null_union = null, .both_union = null };
+            \\    try std.testing.expect(cfg.opt_prop == null);
+            \\
+            \\    // Tuples: fixed, optional, labeled, trailing/leading/middle variadic, readonly/Array<T> spreads, nullish mask
+            \\    const fp: r.FixedPair = .{ .@"0" = 1.0, .@"1" = true };
+            \\    try std.testing.expectEqual(@as(f64, 1.0), fp.@"0");
+            \\    const op: r.OptionalPair = .{ .@"0" = "a" };
+            \\    try std.testing.expect(op.@"1" == null);
+            \\    const ep: r.LabeledEndpoint = .{ .host = "localhost" };
+            \\    try std.testing.expectEqualStrings("localhost", ep.host);
+            \\    try std.testing.expect(ep.port == null);
+            \\    try std.testing.expectEqual(@as(u64, 0b10), r.LabeledEndpoint.zigar_js_tuple.optional_mask);
+            \\
+            \\    try std.testing.expectEqual(@as(?usize, 1), r.TrailingVarTuple.zigar_js_tuple.variadic_index);
+            \\    try std.testing.expectEqual(@as(?usize, 0), r.LeadingVarTuple.zigar_js_tuple.variadic_index);
+            \\    try std.testing.expectEqual(@as(?usize, 1), r.MiddleVarTuple.zigar_js_tuple.variadic_index);
+            \\    try std.testing.expectEqual(@as(?usize, 0), r.ReadonlySpreadTuple.zigar_js_tuple.variadic_index);
+            \\    try std.testing.expectEqual(@as(?usize, 0), r.GenericArraySpreadTuple.zigar_js_tuple.variadic_index);
+            \\    try std.testing.expectEqual(@as(u64, 0b01), r.NullElemTuple.zigar_js_tuple.null_only_mask);
+            \\
+            \\    const mid: r.MiddleVarTuple = .{ .head = 1, .mid = &.{ "x", "y" }, .tail = true };
+            \\    try std.testing.expectEqual(@as(usize, 2), mid.mid.len);
+            \\    try std.testing.expect(@hasDecl(r, "echoEndpointAlloc"));
+            \\    try std.testing.expect(@hasDecl(r, "echoTrailingTupleAlloc"));
+            \\    try std.testing.expect(@hasDecl(r, "echoLeadingTupleAlloc"));
+            \\    try std.testing.expect(@hasDecl(r, "echoMiddleTupleAlloc"));
+            \\    try std.testing.expectError(error.HostUnavailable, r.inlineTupleReturn("x"));
+            \\    try std.testing.expectError(error.HostUnavailable, r.inlineTupleReturnAlloc(std.testing.allocator, "x"));
+            \\    try std.testing.expectError(error.HostUnavailable, r.wrapGenericTuple(f64, 1.5));
+            \\    try std.testing.expectError(error.HostUnavailable, r.wrapGenericTupleAlloc(f64, std.testing.allocator, 1.5));
+            \\
+            \\    // All 15 binary views
+            \\    const views: r.AllBinaryViews = .{
+            \\        .buf = .{},
+            \\        .u8 = .{},
+            \\        .u8c = .{},
+            \\        .i8 = .{},
+            \\        .u16 = .{},
+            \\        .i16 = .{},
+            \\        .u32 = .{},
+            \\        .i32 = .{},
+            \\        .u64 = .{},
+            \\        .i64 = .{},
+            \\        .f32 = .{},
+            \\        .f64 = .{},
+            \\        .ab = .{},
+            \\        .sab = .{},
+            \\        .dv = .{},
+            \\    };
+            \\    try std.testing.expectError(error.HostUnavailable, r.inspectBinary(views));
             \\}
             ,
         });

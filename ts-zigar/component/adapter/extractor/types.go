@@ -672,6 +672,45 @@ func (b *graphBuilder) extractLiteralExprTypeKind(lit *ast.Node) zigar_typescrip
 	return zigar_typescript_types.MakeTypeKindAnyType()
 }
 
+func (b *graphBuilder) unwrapVariadicTupleElemAST(node *ast.Node) *ast.Node {
+	if node == nil {
+		return nil
+	}
+	cur := ast.SkipTypeParentheses(node)
+	if cur == nil {
+		return node
+	}
+	switch cur.Kind {
+	case ast.KindArrayType:
+		if at := cur.AsArrayTypeNode(); at != nil && at.ElementType != nil {
+			return at.ElementType
+		}
+	case ast.KindTypeOperator:
+		if to := cur.AsTypeOperatorNode(); to != nil && to.Operator == ast.KindReadonlyKeyword && to.Type != nil {
+			inner := ast.SkipTypeParentheses(to.Type)
+			if inner != nil && inner.Kind == ast.KindArrayType {
+				if at := inner.AsArrayTypeNode(); at != nil && at.ElementType != nil {
+					return at.ElementType
+				}
+			}
+		}
+	case ast.KindTypeReference:
+		tr := cur.AsTypeReferenceNode()
+		if tr != nil && tr.TypeName != nil && tr.TypeArguments != nil && len(tr.TypeArguments.Nodes) == 1 {
+			rawName := entityNameToString(tr.TypeName)
+			if rawName == "Array" || rawName == "ReadonlyArray" || rawName == "globalThis.Array" || rawName == "globalThis.ReadonlyArray" {
+				sym := b.tc.GetSymbolAtLocation(tr.TypeName)
+				sym = b.resolveAliasSymbol(sym)
+				sym = b.canonicalSymbol(sym)
+				if sym == nil || (!b.hasExtractableDecl(sym) && sym.Flags()&ast.SymbolFlagsTypeParameter == 0) {
+					return tr.TypeArguments.Nodes[0]
+				}
+			}
+		}
+	}
+	return node
+}
+
 func (b *graphBuilder) extractTupleElementsAST(tt *ast.TupleTypeNode) []zigar_typescript_types.TupleElement {
 	if tt == nil || tt.Elements == nil {
 		return []zigar_typescript_types.TupleElement{}
@@ -693,8 +732,8 @@ func (b *graphBuilder) extractTupleElementsAST(tt *ast.TupleTypeNode) []zigar_ty
 			}
 			elemTyNode := ntm.Type
 			variadic := ntm.DotDotDotToken != nil
-			if variadic && elemTyNode != nil && elemTyNode.Kind == ast.KindArrayType {
-				elemTyNode = elemTyNode.AsArrayTypeNode().ElementType
+			if variadic {
+				elemTyNode = b.unwrapVariadicTupleElemAST(elemTyNode)
 			}
 			elems = append(elems, zigar_typescript_types.TupleElement{
 				Label:    labelOpt,
@@ -714,10 +753,7 @@ func (b *graphBuilder) extractTupleElementsAST(tt *ast.TupleTypeNode) []zigar_ty
 
 		case ast.KindRestType:
 			rt := el.AsRestTypeNode()
-			inner := rt.Type
-			if inner != nil && inner.Kind == ast.KindArrayType {
-				inner = inner.AsArrayTypeNode().ElementType
-			}
+			inner := b.unwrapVariadicTupleElemAST(rt.Type)
 			elems = append(elems, zigar_typescript_types.TupleElement{
 				Label:    witTypes.None[uint32](),
 				Ty:       b.extractTypeNode(inner),
@@ -1088,6 +1124,9 @@ func (b *graphBuilder) buildCheckerObjectTypeKind(t *checker.Type, expandAlias b
 				labelOpt = witTypes.Some(b.intern(ld.Name().Text()))
 			}
 			ef := info.TupleElementFlags()
+			if ef&checker.ElementFlagsVariadic != 0 && ef&checker.ElementFlagsRest == 0 && argTy != nil && b.tc.IsArrayType(argTy) {
+				argTy = b.tc.GetElementTypeOfArrayType(argTy)
+			}
 			elems = append(elems, zigar_typescript_types.TupleElement{
 				Label:    labelOpt,
 				Ty:       b.extractCheckerType(argTy),

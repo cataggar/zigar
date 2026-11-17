@@ -7,6 +7,7 @@ pub const typescript_wasm64 = @import("generated_ts_wasm64");
 pub const host = @import("host.zig");
 pub const cli = @import("cli.zig");
 pub const naming = @import("naming.zig");
+pub const lower_types = @import("lower_types.zig");
 pub const ir = @import("ir.zig");
 pub const emit = @import("emit.zig");
 pub const driver = @import("driver.zig");
@@ -24,6 +25,7 @@ test {
     _ = host;
     _ = cli;
     _ = naming;
+    _ = lower_types;
     _ = ir;
     _ = emit;
     _ = driver;
