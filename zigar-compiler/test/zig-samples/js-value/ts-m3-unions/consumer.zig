@@ -329,6 +329,63 @@ pub fn exerciseHeteroRecursiveAndGenericUnions(out_alloc: std.mem.Allocator) ![]
         if (std.meta.activeTag(env2.@"1") != .val or !std.mem.eql(u8, env2.@"1".val.item.?, "recovered")) {
             return out_alloc.dupe(u8, "fail:env2_1");
         }
+
+        // Promises/A+ thenables (`Promise(T)` / `PromiseLike<T>`) & union disambiguation:
+        // mode 0: plain object `{ immediate: 42 }` -> `.record`
+        const soa0 = try m.produceSyncOrAsyncAlloc(tracked_alloc, 0);
+        defer js.freeDecoded(m.SyncOrAsync, tracked_alloc, soa0);
+        if (std.meta.activeTag(soa0) != .record or soa0.record.immediate != 42) return out_alloc.dupe(u8, "fail:soa0");
+        const soa0_desc = try m.inspectSyncOrAsyncAlloc(tracked_alloc, soa0);
+        defer tracked_alloc.free(soa0_desc);
+        if (!std.mem.eql(u8, soa0_desc, "sync:42")) return std.fmt.allocPrint(out_alloc, "fail:soa0_desc:{s}", .{soa0_desc});
+
+        // mode 1: custom object thenable (`!(v instanceof Promise)`) -> `.promise_like`
+        const soa1 = try m.produceSyncOrAsyncAlloc(tracked_alloc, 1);
+        defer js.freeDecoded(m.SyncOrAsync, tracked_alloc, soa1);
+        if (std.meta.activeTag(soa1) != .promise_like) return std.fmt.allocPrint(out_alloc, "fail:soa1:{s}", .{@tagName(std.meta.activeTag(soa1))});
+        const soa1_desc = try m.inspectSyncOrAsyncAlloc(tracked_alloc, soa1);
+        defer tracked_alloc.free(soa1_desc);
+        if (!std.mem.eql(u8, soa1_desc, "thenable:object:false")) return std.fmt.allocPrint(out_alloc, "fail:soa1_desc:{s}", .{soa1_desc});
+
+        // mode 2: function-typed thenable -> `.promise_like` (higher priority than `.func`)
+        const soa2 = try m.produceSyncOrAsyncAlloc(tracked_alloc, 2);
+        defer js.freeDecoded(m.SyncOrAsync, tracked_alloc, soa2);
+        if (std.meta.activeTag(soa2) != .promise_like) return std.fmt.allocPrint(out_alloc, "fail:soa2:{s}", .{@tagName(std.meta.activeTag(soa2))});
+        const soa2_desc = try m.inspectSyncOrAsyncAlloc(tracked_alloc, soa2);
+        defer tracked_alloc.free(soa2_desc);
+        if (!std.mem.eql(u8, soa2_desc, "thenable:function:false")) return std.fmt.allocPrint(out_alloc, "fail:soa2_desc:{s}", .{soa2_desc});
+
+        // mode 3: plain function (no `.then`) -> `.object`
+        const soa3 = try m.produceSyncOrAsyncAlloc(tracked_alloc, 3);
+        defer js.freeDecoded(m.SyncOrAsync, tracked_alloc, soa3);
+        if (std.meta.activeTag(soa3) != .object) return std.fmt.allocPrint(out_alloc, "fail:soa3:{s}", .{@tagName(std.meta.activeTag(soa3))});
+        const soa3_desc = try m.inspectSyncOrAsyncAlloc(tracked_alloc, soa3);
+        defer tracked_alloc.free(soa3_desc);
+        if (!std.mem.eql(u8, soa3_desc, "func:plain-fn")) return std.fmt.allocPrint(out_alloc, "fail:soa3_desc:{s}", .{soa3_desc});
+
+        // mode 4: cross-realm Promise (`vm.runInNewContext`, `!(v instanceof Promise)`) -> `.promise_like`
+        const soa4 = try m.produceSyncOrAsyncAlloc(tracked_alloc, 4);
+        defer js.freeDecoded(m.SyncOrAsync, tracked_alloc, soa4);
+        if (std.meta.activeTag(soa4) != .promise_like) return std.fmt.allocPrint(out_alloc, "fail:soa4:{s}", .{@tagName(std.meta.activeTag(soa4))});
+        const soa4_desc = try m.inspectSyncOrAsyncAlloc(tracked_alloc, soa4);
+        defer tracked_alloc.free(soa4_desc);
+        if (!std.mem.eql(u8, soa4_desc, "thenable:object:false")) return std.fmt.allocPrint(out_alloc, "fail:soa4_desc:{s}", .{soa4_desc});
+
+        // mode 5: native Promise.resolve(99) -> `.promise_like`
+        const soa5 = try m.produceSyncOrAsyncAlloc(tracked_alloc, 5);
+        defer js.freeDecoded(m.SyncOrAsync, tracked_alloc, soa5);
+        if (std.meta.activeTag(soa5) != .promise_like) return std.fmt.allocPrint(out_alloc, "fail:soa5:{s}", .{@tagName(std.meta.activeTag(soa5))});
+        const soa5_desc = try m.inspectSyncOrAsyncAlloc(tracked_alloc, soa5);
+        defer tracked_alloc.free(soa5_desc);
+        if (!std.mem.eql(u8, soa5_desc, "thenable:object:true")) return std.fmt.allocPrint(out_alloc, "fail:soa5_desc:{s}", .{soa5_desc});
+
+        // `{ then: "not-a-function" }` MUST be rejected for `PromiseLike<number>` without leaking handles
+        if (m.badPromiseLikeReturn()) |bad_p| {
+            bad_p.deinit();
+            return out_alloc.dupe(u8, "fail:bad_promise_accepted");
+        } else |err| {
+            if (err != error.TypeError) return out_alloc.dupe(u8, "fail:bad_promise_wrong_err");
+        }
     }
 
     try checkInvariants(handles_before, allocs_before);

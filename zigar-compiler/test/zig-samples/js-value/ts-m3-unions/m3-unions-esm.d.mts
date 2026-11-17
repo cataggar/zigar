@@ -101,6 +101,11 @@ export type GenericEnvelope<T> =
   | { tag: "val"; item: T }
   | { tag: "empty"; reason: string | null };
 
+export type SyncOrAsync =
+  | { immediate: number }
+  | object
+  | PromiseLike<number>;
+
 export declare function stepStatus(status: HttpStatus, level: LogLevel, big: LargeOffset): [HttpStatus, LogLevel, LargeOffset];
 export declare function badStatusReturn(mode: number): HttpStatus;
 export declare function echoMixedAndClosed(
@@ -130,3 +135,6 @@ export declare function produceImpostorChannel(): HeteroPayload;
 export declare function describeHetero(payload: HeteroPayload): string;
 export declare function transformJson(val: JsonValue): JsonValue;
 export declare function unwrapEnvelope(env: GenericEnvelope<number | undefined>): [string, GenericEnvelope<string | null>];
+export declare function produceSyncOrAsync(mode: number): SyncOrAsync;
+export declare function inspectSyncOrAsync(val: SyncOrAsync): string;
+export declare function badPromiseLikeReturn(): PromiseLike<number>;

@@ -3169,7 +3169,6 @@ pub fn Js(comptime host: type) type {
                 const Self = @This();
                 pub const Payload = T;
                 pub const is_js_promise = true;
-                pub const js_builtin_ctor = "Promise";
                 pub const internal_type: util.InternalType = .js_value;
 
                 handle: u32,
@@ -5743,6 +5742,7 @@ pub fn Js(comptime host: type) type {
                 }
                 if (@hasDecl(FieldT, "is_js_array") and FieldT.is_js_array) return 56;
                 if (FieldT == String) return 60;
+                if (@hasDecl(FieldT, "is_js_promise") and FieldT.is_js_promise) return 65;
                 if (@hasDecl(FieldT, "js_builtin_ctor")) return 65;
                 if (@hasDecl(FieldT, "is_js_record") and FieldT.is_js_record) return 90;
                 if (@hasDecl(FieldT, "Target")) {
@@ -6269,6 +6269,17 @@ pub fn Js(comptime host: type) type {
                     const jt = try raw.tryTypeof();
                     if (jt != .object) return error.TypeError;
                     if (Array(Ref(module.Any)).isArray(raw) catch false) return error.TypeError;
+                    return .{ .handle = (try raw.tryClone()).handle };
+                }
+                if (@hasDecl(T, "is_js_promise") and T.is_js_promise) {
+                    if (raw.isNullOrUndefined()) return error.TypeError;
+                    const jt = try raw.tryTypeof();
+                    if (jt != .object and jt != .function) return error.TypeError;
+                    const then_ref = try getProp(module.CallError!Ref(module.Any), raw, "then");
+                    defer then_ref.deinit();
+                    if (then_ref.isNullOrUndefined() or (try then_ref.tryTypeof()) != .function) {
+                        return error.TypeError;
+                    }
                     return .{ .handle = (try raw.tryClone()).handle };
                 }
                 if (@hasDecl(T, "js_builtin_ctor")) {

@@ -1,5 +1,10 @@
 import { Buffer } from 'node:buffer';
+import vm from 'node:vm';
 import MiniChannel from './m3-unions-cjs.cjs';
+
+function crossRealmPromise(v) {
+  return vm.runInNewContext(`Promise.resolve(${Number(v)})`);
+}
 
 export const HttpStatus = {
   Ok: 200,
@@ -183,4 +188,39 @@ export function unwrapEnvelope(env) {
   }
   const rKind = env.reason === null ? 'null' : env.reason === undefined ? 'undefined' : `str:${env.reason}`;
   return [ `empty:${rKind}`, { tag: 'val', item: 'recovered' } ];
+}
+
+export function produceSyncOrAsync(mode) {
+  switch (mode) {
+    case 0:
+      return { immediate: 42 };
+    case 1:
+      // Custom Promises/A+ object thenable (NOT `instanceof Promise`)
+      return { then(resolve) { resolve(77); } };
+    case 2:
+      // Function-typed Promises/A+ thenable
+      return Object.assign(() => 'fn-thenable', { then(resolve) { resolve(88); } });
+    case 3:
+      // Plain function (no `.then`)
+      return () => 'plain-fn';
+    case 4:
+      // Cross-realm Promise (`!(p instanceof globalThis.Promise)`)
+      return crossRealmPromise(66);
+    default:
+      return Promise.resolve(99);
+  }
+}
+
+export function inspectSyncOrAsync(val) {
+  if ((typeof val === 'object' || typeof val === 'function') && val !== null && typeof val.then === 'function') {
+    return `thenable:${typeof val}:${val instanceof Promise}`;
+  }
+  if (typeof val === 'function') {
+    return `func:${val()}`;
+  }
+  return `sync:${val.immediate}`;
+}
+
+export function badPromiseLikeReturn() {
+  return { then: 'not-a-function' };
 }
