@@ -540,6 +540,30 @@ fn isCallbackWrapper(comptime T: type) bool {
     };
 }
 
+fn isGeneratedHandleStruct(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct" => @hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_handle") and T.zigar_js.is_handle,
+        else => false,
+    };
+}
+
+fn generatedHandleRefFieldName(comptime T: type) []const u8 {
+    if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "ref_field")) {
+        return T.zigar_js.ref_field;
+    }
+    return "ref";
+}
+
+fn isTemplateLiteralStruct(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct" => @hasDecl(T, "zigar_js") and
+            @hasField(@TypeOf(T.zigar_js), "is_template_literal") and
+            T.zigar_js.is_template_literal and
+            @hasField(T, "raw"),
+        else => false,
+    };
+}
+
 fn extractHandle(value: anytype) u32 {
     const V = @TypeOf(value);
     if (V == @TypeOf(null)) return reserved_null_handle;
@@ -554,10 +578,16 @@ fn extractHandle(value: anytype) u32 {
     if (comptime util.getInternalType(V) == .js_value) {
         return value.handle;
     }
+    if (comptime isGeneratedHandleStruct(V)) {
+        return @field(value, generatedHandleRefFieldName(V)).handle;
+    }
     switch (@typeInfo(V)) {
         .pointer => |pt| {
             if (pt.size == .one and comptime util.getInternalType(pt.child) == .js_value) {
                 return value.*.handle;
+            }
+            if (pt.size == .one and comptime isGeneratedHandleStruct(pt.child)) {
+                return @field(value.*, generatedHandleRefFieldName(pt.child)).handle;
             }
         },
         else => {},
@@ -851,34 +881,52 @@ pub fn Js(comptime host: type) type {
             };
         }
 
-        fn DynamicKeyArgType(comptime K: type) type {
-            if (K == []const u8 or K == []u8 or comptime isStringLiteralPtr(K)) {
+        pub fn DynamicKeyArgType(comptime K: type) type {
+            if (K == []const u8 or K == []u8 or isStringLiteralPtr(K) or isTemplateLiteralStruct(K)) {
                 return []const u8;
             }
-            if (comptime util.getInternalType(K) == .js_value) {
+            if (util.getInternalType(K) == .js_value or isGeneratedHandleStruct(K)) {
                 return Ref(module.Any);
             }
             switch (@typeInfo(K)) {
+                .float, .comptime_float, .int, .comptime_int => return f64,
+                .@"enum" => {
+                    if (@hasDecl(K, "toSlice")) return []const u8;
+                    if (@hasDecl(K, "toInt")) return f64;
+                },
                 .pointer => |pt| {
                     if (pt.size == .slice and pt.child == u8) return []const u8;
                     if (pt.size == .many and pt.sentinel_ptr != null and pt.child == u8) return []const u8;
-                    if (pt.size == .one and comptime util.getInternalType(pt.child) == .js_value) return Ref(module.Any);
+                    if (pt.size == .one and (util.getInternalType(pt.child) == .js_value or isGeneratedHandleStruct(pt.child))) return Ref(module.Any);
+                    if (pt.size == .one and isTemplateLiteralStruct(pt.child)) return []const u8;
                 },
                 else => {},
             }
-            @compileError("Dynamic JS property key must be `[]const u8` or `zigar.js.Ref(...)`, received " ++ @typeName(K));
+            @compileError("Dynamic JS property key must be `[]const u8`, numeric, template literal, or `zigar.js.Ref(...)`, received " ++ @typeName(K));
         }
 
-        fn coerceDynamicKey(key: anytype) DynamicKeyArgType(@TypeOf(key)) {
+        pub fn coerceDynamicKey(key: anytype) DynamicKeyArgType(@TypeOf(key)) {
             const K = @TypeOf(key);
             const OutT = DynamicKeyArgType(K);
             if (OutT == []const u8) {
+                if (@typeInfo(K) == .@"enum") return key.toSlice();
                 if (comptime isStringLiteralPtr(K)) return key[0..];
+                if (comptime isTemplateLiteralStruct(K)) return key.raw;
                 switch (@typeInfo(K)) {
-                    .pointer => |pt| if (pt.size == .many and pt.sentinel_ptr != null) return std.mem.span(key),
+                    .pointer => |pt| {
+                        if (pt.size == .many and pt.sentinel_ptr != null) return std.mem.span(key);
+                        if (pt.size == .one and comptime isTemplateLiteralStruct(pt.child)) return key.*.raw;
+                    },
                     else => {},
                 }
                 return key;
+            }
+            if (OutT == f64) {
+                return switch (@typeInfo(K)) {
+                    .@"enum" => @as(f64, @floatFromInt(key.toInt())),
+                    .int => @as(f64, @floatFromInt(key)),
+                    else => @as(f64, key),
+                };
             }
             return .{ .handle = extractHandle(key) };
         }
@@ -6560,54 +6608,7 @@ pub fn Js(comptime host: type) type {
                     }
 
                     if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_handle") and T.zigar_js.is_handle)) {
-                        if (raw.isNullOrUndefined()) return error.TypeError;
-                        const jt = try raw.tryTypeof();
-                        const is_callable_h = comptime (@hasField(@TypeOf(T.zigar_js), "is_callable_handle") and T.zigar_js.is_callable_handle);
-                        if (comptime is_callable_h) {
-                            if (jt != .function) return error.TypeError;
-                        } else {
-                            if (jt != .object and jt != .function) return error.TypeError;
-                        }
-
-                        const is_cls_h = comptime (@hasField(@TypeOf(T.zigar_js), "is_class") and T.zigar_js.is_class);
-                        if (comptime (is_cls_h and @hasField(@TypeOf(T.zigar_js), "ctor_target"))) {
-                            if (resolveTargetCtorRef(T.zigar_js.ctor_target)) |ctor_opt| {
-                                if (ctor_opt) |ctor| {
-                                    defer ctor.deinit();
-                                    if (!ctor.isNullOrUndefined() and (try ctor.tryTypeof()) == .function) {
-                                        if (!(try raw.tryInstanceof(ctor))) return error.TypeError;
-                                    }
-                                }
-                            } else |err| switch (err) {
-                                error.OffJsThread, error.OutOfMemory => return err,
-                                else => clearLastError(),
-                            }
-                        } else if (comptime !is_cls_h) {
-                            const req_methods = comptime if (@hasField(@TypeOf(T.zigar_js), "required_methods")) T.zigar_js.required_methods else &[_][]const u8{};
-                            const req_props = comptime if (@hasField(@TypeOf(T.zigar_js), "required_props")) T.zigar_js.required_props else &[_][]const u8{};
-                            const has_length_prop = comptime blk: {
-                                for (req_props) |rp| {
-                                    if (std.mem.eql(u8, rp, "length")) break :blk true;
-                                }
-                                break :blk false;
-                            };
-                            if (comptime (!is_callable_h and req_methods.len == 0 and !has_length_prop)) {
-                                if (jt == .object and (Array(Ref(module.Any)).isArray(raw) catch false)) {
-                                    return error.TypeError;
-                                }
-                            }
-                            inline for (req_methods) |m_name| {
-                                if (!(try raw.tryHas(m_name))) return error.TypeError;
-                                const m_ref = try getProp(module.CallError!Ref(module.Any), raw, m_name);
-                                defer m_ref.deinit();
-                                if (m_ref.isNullOrUndefined() or (try m_ref.tryTypeof()) != .function) {
-                                    return error.TypeError;
-                                }
-                            }
-                            inline for (req_props) |p_name| {
-                                if (!(try raw.tryHas(p_name))) return error.TypeError;
-                            }
-                        }
+                        if (!(try matchesHandleTypeImpl(T, raw, false, 0))) return error.TypeError;
 
                         const ref_fname = comptime if (@hasField(@TypeOf(T.zigar_js), "ref_field")) T.zigar_js.ref_field else "ref";
                         var out_h: T = undefined;
@@ -6809,6 +6810,279 @@ pub fn Js(comptime host: type) type {
             var stack_buf: [512]u8 = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
             return fromJsRefAlloc(T, fba.allocator(), value);
+        }
+
+        fn matchesHandleTypeImpl(
+            comptime T: type,
+            raw: Ref(module.Any),
+            comptime require_live_ctor: bool,
+            comptime depth: usize,
+        ) module.CallError!bool {
+            if (depth >= 32) return true;
+            if (raw.isNullOrUndefined()) return false;
+            const jt = try raw.tryTypeof();
+            const is_callable_h = comptime (@hasField(@TypeOf(T.zigar_js), "is_callable_handle") and T.zigar_js.is_callable_handle);
+            if (comptime is_callable_h) {
+                if (jt != .function) return false;
+            } else {
+                if (jt != .object and jt != .function) return false;
+            }
+
+            const is_cls_h = comptime (@hasField(@TypeOf(T.zigar_js), "is_class") and T.zigar_js.is_class);
+            if (comptime is_cls_h) {
+                if (comptime !@hasField(@TypeOf(T.zigar_js), "ctor_target")) {
+                    return !require_live_ctor;
+                }
+                if (resolveTargetCtorRef(T.zigar_js.ctor_target)) |ctor_opt| {
+                    if (ctor_opt) |ctor| {
+                        defer ctor.deinit();
+                        if (!ctor.isNullOrUndefined() and (try ctor.tryTypeof()) == .function) {
+                            return try raw.tryInstanceof(ctor);
+                        }
+                    }
+                    return !require_live_ctor;
+                } else |err| switch (err) {
+                    error.OffJsThread, error.OutOfMemory => return err,
+                    else => {
+                        clearLastError();
+                        return !require_live_ctor;
+                    },
+                }
+            } else {
+                const has_bases = comptime (@hasField(@TypeOf(T.zigar_js), "bases") and T.zigar_js.bases.len > 0);
+                if (comptime has_bases) {
+                    inline for (T.zigar_js.bases) |BaseT| {
+                        if (comptime isGeneratedHandleStruct(BaseT)) {
+                            if (!(try matchesHandleTypeImpl(BaseT, raw, require_live_ctor, depth + 1))) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+
+                const req_methods = comptime if (@hasField(@TypeOf(T.zigar_js), "required_methods")) T.zigar_js.required_methods else &[_][]const u8{};
+                const req_props = comptime if (@hasField(@TypeOf(T.zigar_js), "required_props")) T.zigar_js.required_props else &[_][]const u8{};
+                const has_length_prop = comptime blk: {
+                    for (req_props) |rp| {
+                        if (std.mem.eql(u8, rp, "length")) break :blk true;
+                    }
+                    break :blk false;
+                };
+                if (comptime (!is_callable_h and !has_bases and req_methods.len == 0 and !has_length_prop)) {
+                    if (jt == .object and (Array(Ref(module.Any)).isArray(raw) catch false)) {
+                        return false;
+                    }
+                }
+                inline for (req_methods) |m_name| {
+                    if (!(try raw.tryHas(m_name))) return false;
+                    const m_ref = try getProp(module.CallError!Ref(module.Any), raw, m_name);
+                    defer m_ref.deinit();
+                    if (m_ref.isNullOrUndefined() or (try m_ref.tryTypeof()) != .function) {
+                        return false;
+                    }
+                }
+                inline for (req_props) |p_name| {
+                    if (!(try raw.tryHas(p_name))) return false;
+                }
+                return true;
+            }
+        }
+
+        pub fn isAssignableType(comptime Derived: type, comptime Base: type) bool {
+            return isAssignableTypeDepth(Derived, Base, 0);
+        }
+
+        fn isAssignableTypeDepth(comptime Derived: type, comptime Base: type, comptime depth: usize) bool {
+            @setEvalBranchQuota(10_000);
+            if (Derived == Base) return true;
+            if (depth >= 32) return false;
+            if (@typeInfo(Derived) != .@"struct") return false;
+            if (!@hasDecl(Derived, "zigar_js")) return false;
+            if (!@hasField(@TypeOf(Derived.zigar_js), "bases")) return false;
+            inline for (Derived.zigar_js.bases) |DirectBase| {
+                if (isAssignableTypeDepth(DirectBase, Base, depth + 1)) return true;
+            }
+            return false;
+        }
+
+        fn structWireNameForField(comptime T: type, comptime zig_field_name: []const u8) []const u8 {
+            if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "fields")) {
+                for (T.zigar_js.fields) |fm| {
+                    const fm_zig = if (@hasField(@TypeOf(fm), "zig_name")) fm.zig_name else fm.name;
+                    if (std.mem.eql(u8, fm_zig, zig_field_name)) return fm.name;
+                }
+            }
+            return zig_field_name;
+        }
+
+        fn findStructFieldByWireName(comptime T: type, comptime wire_name: []const u8) ?[]const u8 {
+            if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "fields")) {
+                for (T.zigar_js.fields) |fm| {
+                    if (std.mem.eql(u8, fm.name, wire_name)) {
+                        return if (@hasField(@TypeOf(fm), "zig_name")) fm.zig_name else fm.name;
+                    }
+                }
+            }
+            if (@hasField(T, wire_name)) return wire_name;
+            return null;
+        }
+
+        fn projectFieldValue(comptime DstT: type, src_val: anytype) DstT {
+            const SrcT = @TypeOf(src_val);
+            if (SrcT == DstT) return src_val;
+            if (@typeInfo(DstT) == .optional and @typeInfo(SrcT) == .optional) {
+                const ChildT = @typeInfo(DstT).optional.child;
+                return if (src_val) |sv| projectFieldValue(ChildT, sv) else null;
+            }
+            if (@typeInfo(DstT) == .optional) {
+                const ChildT = @typeInfo(DstT).optional.child;
+                return projectFieldValue(ChildT, src_val);
+            }
+            if (@typeInfo(DstT) == .@"enum" and @typeInfo(SrcT) == .@"enum") {
+                return switch (src_val) {
+                    inline else => |tag| @field(DstT, @tagName(tag)),
+                };
+            }
+            if (@typeInfo(DstT) == .@"union") {
+                if (@typeInfo(SrcT) == .@"union" and @typeInfo(SrcT).@"union".tag_type != null and @typeInfo(DstT).@"union".tag_type != null) {
+                    return switch (src_val) {
+                        inline else => |payload, tag| @unionInit(
+                            DstT,
+                            @tagName(tag),
+                            projectFieldValue(@FieldType(DstT, @tagName(tag)), payload),
+                        ),
+                    };
+                }
+                return module.coerceUnion(DstT, src_val);
+            }
+            if (@typeInfo(DstT) == .@"struct" and @typeInfo(SrcT) == .@"struct") {
+                if (comptime (util.getInternalType(SrcT) == .js_value and util.getInternalType(DstT) == .js_value)) {
+                    return .{ .handle = src_val.handle };
+                }
+                if (comptime (isGeneratedHandleStruct(SrcT) and isGeneratedHandleStruct(DstT))) {
+                    const src_rf = comptime generatedHandleRefFieldName(SrcT);
+                    const dst_rf = comptime generatedHandleRefFieldName(DstT);
+                    var out_h: DstT = undefined;
+                    @field(out_h, dst_rf) = .{ .handle = @field(src_val, src_rf).handle };
+                    return out_h;
+                }
+                var out_s: DstT = undefined;
+                const dst_info = @typeInfo(DstT).@"struct";
+                inline for (dst_info.field_names, 0..) |df_name, dfi| {
+                    const FieldT = dst_info.field_types[dfi];
+                    const wire = comptime structWireNameForField(DstT, df_name);
+                    if (comptime findStructFieldByWireName(SrcT, wire)) |src_fname| {
+                        @field(out_s, df_name) = projectFieldValue(FieldT, @field(src_val, src_fname));
+                    } else if (dst_info.field_attrs[dfi].default_value_ptr) |opaque_ptr| {
+                        const def_ptr: *const FieldT = @ptrCast(@alignCast(opaque_ptr));
+                        @field(out_s, df_name) = def_ptr.*;
+                    } else if (@typeInfo(FieldT) == .optional) {
+                        @field(out_s, df_name) = null;
+                    } else {
+                        @compileError("Cannot project missing required base field '" ++ df_name ++ "' from " ++ @typeName(SrcT) ++ " to " ++ @typeName(DstT));
+                    }
+                }
+                return out_s;
+            }
+            return src_val;
+        }
+
+        pub fn upcastValue(comptime SelfT: type, self: SelfT, comptime Base: type) Base {
+            comptime {
+                if (!isAssignableType(SelfT, Base)) {
+                    @compileError(@typeName(SelfT) ++ " does not inherit from or implement " ++ @typeName(Base));
+                }
+            }
+            return projectFieldValue(Base, self);
+        }
+
+        pub fn cloneHandle(comptime SelfT: type, self: SelfT) module.CallError!SelfT {
+            comptime {
+                if (!isGeneratedHandleStruct(SelfT)) {
+                    @compileError("cloneHandle requires a JS handle wrapper struct, received " ++ @typeName(SelfT));
+                }
+            }
+            const rf = comptime generatedHandleRefFieldName(SelfT);
+            const cloned = try @field(self, rf).tryClone();
+            var out: SelfT = undefined;
+            @field(out, rf) = .{ .handle = cloned.handle };
+            return out;
+        }
+
+        pub fn downcastHandle(comptime Sub: type, self_ref: anytype) module.CallError!?Sub {
+            comptime {
+                if (!isGeneratedHandleStruct(Sub)) {
+                    @compileError("tryAs target " ++ @typeName(Sub) ++ " must be a JS handle wrapper struct");
+                }
+            }
+            const raw: Ref(module.Any) = .{ .handle = extractHandle(self_ref) };
+            if (!(try matchesHandleTypeImpl(Sub, raw, true, 0))) {
+                return null;
+            }
+            const cloned = try raw.tryClone();
+            const sub_rf = comptime generatedHandleRefFieldName(Sub);
+            var out: Sub = undefined;
+            @field(out, sub_rf) = .{ .handle = cloned.handle };
+            return out;
+        }
+
+        pub fn initEmptyHandle(comptime SelfT: type) module.CallError!SelfT {
+            comptime {
+                if (!isGeneratedHandleStruct(SelfT)) {
+                    @compileError("initEmptyHandle requires a JS handle wrapper struct, received " ++ @typeName(SelfT));
+                }
+            }
+            const rec = try Record([]const u8, Ref(module.Any)).init();
+            const rf = comptime generatedHandleRefFieldName(SelfT);
+            var out: SelfT = undefined;
+            @field(out, rf) = .{ .handle = rec.handle };
+            return out;
+        }
+
+        pub fn getIndexedProp(
+            comptime T: type,
+            self_ref: anytype,
+            key: anytype,
+            comptime strict_undefined_missing: bool,
+        ) module.CallError!T {
+            const recv: Ref(module.Any) = .{ .handle = extractHandle(self_ref) };
+            const raw = try getPropDynamic(module.CallError!Ref(module.Any), recv, key);
+            defer raw.deinit();
+            if (comptime (strict_undefined_missing and @typeInfo(T) == .optional)) {
+                if (raw.isUndefined()) return null;
+                return try fromJsRef(@typeInfo(T).optional.child, raw);
+            }
+            return try fromJsRef(T, raw);
+        }
+
+        pub fn getIndexedPropAlloc(
+            comptime T: type,
+            allocator: std.mem.Allocator,
+            self_ref: anytype,
+            key: anytype,
+            comptime strict_undefined_missing: bool,
+        ) module.CallError!T {
+            const recv: Ref(module.Any) = .{ .handle = extractHandle(self_ref) };
+            const raw = try getPropDynamic(module.CallError!Ref(module.Any), recv, key);
+            defer raw.deinit();
+            if (comptime (strict_undefined_missing and @typeInfo(T) == .optional)) {
+                if (raw.isUndefined()) return null;
+                return try fromJsRefAlloc(@typeInfo(T).optional.child, allocator, raw);
+            }
+            return try fromJsRefAlloc(T, allocator, raw);
+        }
+
+        pub fn setIndexedProp(
+            comptime T: type,
+            self_ref: anytype,
+            key: anytype,
+            value: T,
+            comptime spec: anytype,
+        ) module.CallError!void {
+            const recv: Ref(module.Any) = .{ .handle = extractHandle(self_ref) };
+            const encoded = try toJsRefWithSpec(T, value, spec);
+            defer encoded.deinit();
+            try trySetPropDynamic(recv, key, encoded);
         }
     };
 }
@@ -7965,6 +8239,156 @@ test "Js(#48): handle wrapper structs validate duck-typed methods/props without 
         const raw_arr: js.Ref(js.Any) = .{ .handle = HandleMockHost.allocKind(0x40) };
         defer raw_arr.deinit();
         try std.testing.expectError(error.TypeError, js.fromJsRef(UnconstrainedHandle, raw_arr));
+    }
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    // 6. Issue #49: comptime `.bases` assignability, non-owning `upcastValue`, `cloneHandle`,
+    //    runtime `downcastHandle` (`tryAs`), value-struct projection, and numeric/template dynamic keys
+    {
+        const GrandBaseHandle = struct {
+            ref: js.Ref(js.Object),
+            pub const zigar_js = .{
+                .js_name = "EventEmitter",
+                .is_handle = true,
+                .is_class = true,
+                .ref_field = "ref",
+            };
+        };
+        const MidBaseHandle = struct {
+            ref: js.Ref(js.Object),
+            pub const zigar_js = .{
+                .js_name = "Stream",
+                .is_handle = true,
+                .is_class = true,
+                .ref_field = "ref",
+                .bases = .{GrandBaseHandle},
+            };
+        };
+        const MixinHandle = struct {
+            __zigar_ref: js.Ref(js.Object),
+            pub const zigar_js = .{
+                .js_name = "ServiceMixin",
+                .is_handle = true,
+                .is_class = false,
+                .ref_field = "__zigar_ref",
+                .required_methods = &[_][]const u8{"ping"},
+                .required_props = &[_][]const u8{"status"},
+            };
+        };
+        const DerivedHandle = struct {
+            ref: js.Ref(js.Object),
+            pub const zigar_js = .{
+                .js_name = "ServerResponse",
+                .is_handle = true,
+                .is_class = true,
+                .ref_field = "ref",
+                .bases = .{ MidBaseHandle, MixinHandle },
+                .ctor_target = .{
+                    .module = @as(?[]const u8, "pkg"),
+                    .ns_path = &[_][]const u8{},
+                    .name = "MyClass",
+                    .is_default = false,
+                    .from_default = false,
+                },
+            };
+        };
+        const IntersectionHandle = struct {
+            ref: js.Ref(js.Object),
+            pub const zigar_js = .{
+                .js_name = "ClassAndService",
+                .is_handle = true,
+                .is_class = false,
+                .ref_field = "ref",
+                .bases = .{ ClassHandle, ServiceHandle },
+                .required_methods = &[_][]const u8{},
+                .required_props = &[_][]const u8{},
+            };
+        };
+        const UnrelatedHandle = struct {
+            ref: js.Ref(js.Object),
+            pub const zigar_js = .{
+                .js_name = "Unrelated",
+                .is_handle = true,
+                .is_class = true,
+                .ref_field = "ref",
+            };
+        };
+
+        try expect(comptime js.isAssignableType(DerivedHandle, DerivedHandle));
+        try expect(comptime js.isAssignableType(DerivedHandle, MidBaseHandle));
+        try expect(comptime js.isAssignableType(DerivedHandle, GrandBaseHandle));
+        try expect(comptime js.isAssignableType(DerivedHandle, MixinHandle));
+        try expect(comptime !js.isAssignableType(DerivedHandle, UnrelatedHandle));
+
+        const raw_inst: js.Ref(js.Object) = .{ .handle = HandleMockHost.allocKind(0x10) };
+        const derived: DerivedHandle = .{ .ref = raw_inst };
+        defer derived.ref.deinit();
+
+        const as_grand = js.upcastValue(DerivedHandle, derived, GrandBaseHandle);
+        const as_mixin = js.upcastValue(DerivedHandle, derived, MixinHandle);
+        try expectEqual(derived.ref.handle, as_grand.ref.handle);
+        try expectEqual(derived.ref.handle, as_mixin.__zigar_ref.handle);
+        // Zero-cost non-owning upcast: active handle count remains 1!
+        try expectEqual(@as(u32, 1), js.activeHandleCount());
+
+        const cloned_derived = try js.cloneHandle(DerivedHandle, derived);
+        try expectEqual(@as(u32, 2), js.activeHandleCount());
+        cloned_derived.ref.deinit();
+        try expectEqual(@as(u32, 1), js.activeHandleCount());
+
+        // `downcastHandle` (`tryAs`) clones an owned handle on match (`0x10` -> `ClassHandle`), returns `null` (0 new handles) on mismatch
+        const down_ok = try js.downcastHandle(ClassHandle, as_grand.ref);
+        try expect(down_ok != null);
+        try expect(derived.ref.handle != down_ok.?.ref.handle);
+        try expectEqual(@as(u32, 2), js.activeHandleCount());
+        down_ok.?.ref.deinit();
+        try expectEqual(@as(u32, 1), js.activeHandleCount());
+
+        const down_miss = try js.downcastHandle(ServiceHandle, as_grand.ref);
+        try expect(down_miss == null);
+        const down_inter_miss = try js.downcastHandle(IntersectionHandle, as_grand.ref);
+        try expect(down_inter_miss == null);
+
+        // Value-struct `.as(BaseOpts)` field projection (including optional widening & wire-name matching)
+        const BaseOpts = struct {
+            host: []const u8,
+            port: ?f64 = null,
+            pub const zigar_js = .{
+                .fields = .{
+                    .{ .name = "host", .zig_name = "host" },
+                    .{ .name = "port", .zig_name = "port" },
+                },
+            };
+        };
+        const SubOpts = struct {
+            host_name: []const u8,
+            port: f64,
+            tls: bool,
+            pub const zigar_js = .{
+                .bases = .{BaseOpts},
+                .fields = .{
+                    .{ .name = "host", .zig_name = "host_name" },
+                    .{ .name = "port", .zig_name = "port" },
+                    .{ .name = "tls", .zig_name = "tls" },
+                },
+            };
+        };
+        const sub_opts: SubOpts = .{ .host_name = "localhost", .port = 8080, .tls = true };
+        const base_opts = js.upcastValue(SubOpts, sub_opts, BaseOpts);
+        try std.testing.expectEqualStrings("localhost", base_opts.host);
+        try expectEqual(@as(?f64, 8080), base_opts.port);
+
+        // Numeric and template-literal dynamic keys normalize cleanly
+        const TplKey = struct {
+            raw: []const u8,
+            pub const zigar_js = .{ .is_template_literal = true };
+        };
+        try expectEqual(f64, js.DynamicKeyArgType(usize));
+        try expectEqual(f64, js.DynamicKeyArgType(comptime_int));
+        try expectEqual(f64, js.DynamicKeyArgType(f64));
+        try expectEqual([]const u8, js.DynamicKeyArgType(TplKey));
+        try expectEqual(@as(f64, 7.0), js.coerceDynamicKey(@as(usize, 7)));
+        try std.testing.expectEqualStrings("x-test", js.coerceDynamicKey(TplKey{ .raw = "x-test" }));
     }
     try expectEqual(@as(u32, 0), js.activeHandleCount());
 }

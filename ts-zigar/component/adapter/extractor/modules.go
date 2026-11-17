@@ -310,6 +310,14 @@ func (b *graphBuilder) extractModule(modID uint32) {
 				ambName := stmt.Name().Text()
 				// Extract any nested `global { ... }` augmentations inside ambient modules (e.g. `@types/node` events.d.ts).
 				b.extractNestedGlobalBlocks(sf, modID, stmt.Body(), appendGlobal)
+				if targetSF := b.resolveAugmentedModuleSourceFile(sf, stmt); targetSF != nil {
+					// External module augmentation (`declare module "./base" { ... }`):
+					// enqueue the augmented target module instead of creating a duplicate AmbientModuleNode.
+					if b.sourceFileMatchesFilter(targetSF, ambName) {
+						b.ensureModule(targetSF, true)
+					}
+					continue
+				}
 				if b.matchesModuleFilter(ambName) {
 					if _, exists := ambientBlocks[ambName]; !exists {
 						ambientOrder = append(ambientOrder, ambName)
@@ -564,12 +572,54 @@ func (b *graphBuilder) extractAmbientModuleDecls(
 	return out, defaultExport, exportEquals
 }
 
+func (b *graphBuilder) resolveAugmentedModuleSourceFile(sf *ast.SourceFile, modDecl *ast.Node) *ast.SourceFile {
+	if sf == nil || modDecl == nil || !ast.IsExternalModule(sf) {
+		return nil
+	}
+	if modDecl.Kind != ast.KindModuleDeclaration || !ast.IsAmbientModule(modDecl) || modDecl.Name() == nil {
+		return nil
+	}
+	if targetSF := b.resolveModuleSpecifierNode(sf, modDecl.Name()); targetSF != nil && targetSF != sf && b.isExtractableSourceFile(targetSF) {
+		return targetSF
+	}
+	if sym := b.canonicalSymbol(b.tc.GetSymbolOfNode(modDecl)); sym != nil {
+		for _, d := range sym.Declarations() {
+			if d != nil && d.Kind == ast.KindSourceFile {
+				targetSF := d.AsSourceFile()
+				if targetSF != nil && targetSF != sf && b.isExtractableSourceFile(targetSF) {
+					return targetSF
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (b *graphBuilder) nodeEffectiveOwnerSourceFile(d *ast.Node) *ast.SourceFile {
+	if d == nil {
+		return nil
+	}
+	sf := ast.GetSourceFileOfNode(d)
+	if sf == nil || !ast.IsExternalModule(sf) {
+		return sf
+	}
+	augMod := ast.FindAncestor(d.Parent, func(n *ast.Node) bool {
+		return n.Kind == ast.KindModuleDeclaration && ast.IsAmbientModule(n) && n.Name() != nil
+	})
+	if augMod != nil {
+		if targetSF := b.resolveAugmentedModuleSourceFile(sf, augMod); targetSF != nil {
+			return targetSF
+		}
+	}
+	return sf
+}
+
 func (b *graphBuilder) isSymbolDeclaredInFile(sym *ast.Symbol, sf *ast.SourceFile) bool {
 	if sym == nil || sf == nil {
 		return false
 	}
 	for _, d := range sym.Declarations() {
-		if d != nil && ast.GetSourceFileOfNode(d) == sf {
+		if d != nil && b.nodeEffectiveOwnerSourceFile(d) == sf {
 			return true
 		}
 	}

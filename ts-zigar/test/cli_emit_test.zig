@@ -3502,5 +3502,457 @@ test "Issue #48 M3.2a Sema: plain options structs vs handle classes, divergent a
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
 }
 
+test "Issue #49 M3.2b Sema: multi-level inheritance, diamond overloads, A & B intersections, index signatures, and merged declarations" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    const cwd = std.Io.Dir.cwd();
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue49-heritage", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const src_dir = try std.fmt.allocPrint(alloc, "{s}/src", .{sandbox});
+    defer alloc.free(src_dir);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+
+    try cwd.createDirPath(io, src_dir);
+    {
+        var sd = try cwd.openDir(io, src_dir, .{});
+        defer sd.close(io);
+        try sd.writeFile(io, .{
+            .sub_path = "m3_heritage_base.d.ts",
+            .data =
+            \\export declare class EventEmitter {
+            \\  constructor(maxListeners?: number);
+            \\  on(ev: string, listener: (arg: string) => void): this;
+            \\  emit(ev: string): boolean;
+            \\  emit(ev: string, code: number): boolean;
+            \\  listenerCount(ev: string): number;
+            \\}
+            \\
+            \\export declare class Stream extends EventEmitter {
+            \\  pipeTo(dest: string): boolean;
+            \\}
+            ,
+        });
+        try sd.writeFile(io, .{
+            .sub_path = "m3_heritage_cjs.d.ts",
+            .data =
+            \\declare function $(selector: string): $.Selection;
+            \\declare function $(selector: string, root: string): $.Selection;
+            \\declare namespace $ {
+            \\  export interface Selection {
+            \\    readonly length: number;
+            \\    text(): string;
+            \\  }
+            \\  export const version: string;
+            \\  export function ajax(url: string): string;
+            \\}
+            \\export = $;
+            ,
+        });
+        try sd.writeFile(io, .{
+            .sub_path = "m3_heritage.d.ts",
+            .data =
+            \\import { EventEmitter, Stream } from "./m3_heritage_base";
+            \\import $ = require("./m3_heritage_cjs");
+            \\export { EventEmitter, Stream, $ };
+            \\
+            \\declare module "./m3_heritage_base" {
+            \\  interface EventEmitter {
+            \\    augmentedTag(): string;
+            \\  }
+            \\  namespace EventEmitter {
+            \\    export const specRevision: number;
+            \\  }
+            \\}
+            \\
+            \\export declare class Writable extends Stream {
+            \\  readonly writableEnded: boolean;
+            \\  write(chunk: string): boolean;
+            \\  write(chunk: Uint8Array): boolean;
+            \\  end(): void;
+            \\}
+            \\
+            \\export declare class OutgoingMessage extends Writable {
+            \\  readonly headersSent: boolean;
+            \\  setHeader(name: string, value: string): void;
+            \\  getHeader(name: string): string | undefined;
+            \\}
+            \\
+            \\export interface Flushable {
+            \\  flushHeaders(): void;
+            \\}
+            \\
+            \\export declare class ServerResponse extends OutgoingMessage implements Flushable {
+            \\  statusCode: number;
+            \\  writeHead(statusCode: number, statusMessage?: string): this;
+            \\  flushHeaders(): void;
+            \\}
+            \\
+            \\export interface SharedCore {
+            \\  readonly id: string;
+            \\  close(): void;
+            \\}
+            \\export interface TextChannel extends SharedCore {
+            \\  send(text: string): number;
+            \\}
+            \\export interface BinaryChannel extends SharedCore {
+            \\  send(bytes: Uint8Array): number;
+            \\}
+            \\export interface DuplexChannel extends TextChannel, BinaryChannel {
+            \\  drain(): boolean;
+            \\}
+            \\
+            \\export interface HostConfig {
+            \\  host: string;
+            \\  port?: number;
+            \\}
+            \\export interface TlsConfig {
+            \\  cert: string;
+            \\  alpn?: "h2" | "http/1.1";
+            \\}
+            \\export interface ServerConfig extends HostConfig, TlsConfig {
+            \\  keepAlive?: boolean;
+            \\}
+            \\export type CombinedConfig = HostConfig & TlsConfig & { retries?: number };
+            \\
+            \\export type TrackedWritable = Writable & {
+            \\  readonly bytesWritten: number;
+            \\  resetCounters(): void;
+            \\};
+            \\export type HybridRouter = ((path: string) => boolean) & {
+            \\  mountPath: string;
+            \\  reload(): void;
+            \\};
+            \\export type EmptyResult = string & number;
+            \\export type UserId = string & { readonly __brand: "UserId" };
+            \\export type PortNum = number & { readonly __portBrand: unique symbol };
+            \\export type TaggedOutcome = (
+            \\  | { kind: "ok"; value: number }
+            \\  | { kind: "err"; message: string }
+            \\) & { requestId: string };
+            \\
+            \\export interface HeaderBag {
+            \\  [key: string]: string;
+            \\}
+            \\export interface DualTable {
+            \\  readonly [index: number]: string;
+            \\  [key: string]: string | number;
+            \\}
+            \\export type DataKey = `data-${string}`;
+            \\export interface DataAttrMap {
+            \\  [key: DataKey]: string;
+            \\}
+            \\export enum HttpVerb {
+            \\  Get = "GET",
+            \\  Post = "POST",
+            \\}
+            \\export interface VerbTable {
+            \\  [verb: HttpVerb]: number;
+            \\}
+            \\export interface InlineEnumDict {
+            \\  [key: string]: "on" | "off";
+            \\}
+            \\export interface CollidingDict {
+            \\  get(slot: number): boolean;
+            \\  set(slot: number, active: boolean): void;
+            \\  init(seed: string): void;
+            \\  [key: string]: any;
+            \\}
+            \\
+            \\export interface MergedRegistry {
+            \\  readonly name: string;
+            \\  has(key: string): boolean;
+            \\}
+            \\export interface MergedRegistry {
+            \\  count: number;
+            \\  clear(): void;
+            \\  [extra: string]: any;
+            \\}
+            \\
+            \\export declare class RichService {
+            \\  constructor(endpoint: string);
+            \\  connect(): boolean;
+            \\}
+            \\export interface RichService {
+            \\  mixinPing(): string;
+            \\}
+            \\export declare namespace RichService {
+            \\  export interface Options {
+            \\    timeoutMs?: number;
+            \\  }
+            \\  export const defaultTimeout: number;
+            \\  export function fromOptions(opts: Options): RichService;
+            \\}
+            \\
+            \\export declare function formatMetric(name: string, val: number): string;
+            \\export declare namespace formatMetric {
+            \\  export const prefix: string;
+            \\  export function reset(): void;
+            \\}
+            \\
+            \\export declare function _(items: readonly string[]): number;
+            \\export declare namespace _ {
+            \\  export const VERSION: string;
+            \\  export function uniq(items: readonly string[]): string[];
+            \\}
+            \\
+            \\export enum LogLevel {
+            \\  Info = 0,
+            \\  Warn = 1,
+            \\  Error = 2,
+            \\}
+            \\export declare namespace LogLevel {
+            \\  export function parse(label: string): LogLevel;
+            \\  export const defaultLevel: LogLevel;
+            \\}
+            \\
+            \\export declare namespace Telemetry {
+            \\  export const serviceName: string;
+            \\  export function flush(): void;
+            \\}
+            \\export declare namespace Telemetry {
+            \\  export const sampleRate: number;
+            \\  export function record(metric: string): void;
+            \\}
+            ,
+        });
+    }
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const dts_path = try std.fmt.allocPrint(alloc, "{s}/m3_heritage.d.ts", .{src_dir});
+    defer alloc.free(dts_path);
+    const cli_args = [_][]const u8{ "-t", dts_path, "-d", out_dir };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Issue #49 pipeline error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+
+    const consumer_zig = try std.fmt.allocPrint(alloc, "{s}/consumer_issue49.zig", .{sandbox});
+    defer alloc.free(consumer_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "consumer_issue49.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r = @import("out/root.zig");
+            \\const h = r.m3_heritage;
+            \\const cjs = @import("out/m3_heritage_cjs.zig");
+            \\
+            \\test "Issue #49 multi-level inheritance, diamond overloads, intersections, indexers, and merged decls" {
+            \\    // 1. 5-level class hierarchy + inherited constructors + external module augmentation on EventEmitter!
+            \\    const sr_ctor: *const fn (?f64) r.zigar_js.CallError!h.ServerResponse = &h.ServerResponse.init;
+            \\    const sr_wh: *const fn (h.ServerResponse, f64, ?[]const u8) r.zigar_js.CallError!h.ServerResponse = &h.ServerResponse.writeHead;
+            \\    const sr_sh: *const fn (h.ServerResponse, []const u8, []const u8) r.zigar_js.CallError!void = &h.ServerResponse.setHeader;
+            \\    const sr_w1: *const fn (h.ServerResponse, []const u8) r.zigar_js.CallError!bool = &h.ServerResponse.write;
+            \\    const sr_w2: *const fn (h.ServerResponse, r.zigar_js.Uint8Array) r.zigar_js.CallError!bool = &h.ServerResponse.write_2;
+            \\    const sr_pipe: *const fn (h.ServerResponse, []const u8) r.zigar_js.CallError!bool = &h.ServerResponse.pipeTo;
+            \\    const sr_emit1: *const fn (h.ServerResponse, []const u8) r.zigar_js.CallError!bool = &h.ServerResponse.emit;
+            \\    const sr_emit2: *const fn (h.ServerResponse, []const u8, f64) r.zigar_js.CallError!bool = &h.ServerResponse.emit_2;
+            \\    const sr_aug: *const fn (h.ServerResponse, std.mem.Allocator) r.zigar_js.CallError![]const u8 = &h.ServerResponse.augmentedTagAlloc;
+            \\    _ = sr_ctor;
+            \\    _ = sr_wh;
+            \\    _ = sr_sh;
+            \\    _ = sr_w1;
+            \\    _ = sr_w2;
+            \\    _ = sr_pipe;
+            \\    _ = sr_emit1;
+            \\    _ = sr_emit2;
+            \\    _ = sr_aug;
+            \\    try std.testing.expectError(error.HostUnavailable, h.EventEmitter.spec_revision.get());
+            \\
+            \\    // Comptime `.bases` assignability across all 5 levels + `implements Flushable` + negative check!
+            \\    try std.testing.expect(comptime r.zigar_js.isAssignableType(h.ServerResponse, h.OutgoingMessage));
+            \\    try std.testing.expect(comptime r.zigar_js.isAssignableType(h.ServerResponse, h.Writable));
+            \\    try std.testing.expect(comptime r.zigar_js.isAssignableType(h.ServerResponse, h.Stream));
+            \\    try std.testing.expect(comptime r.zigar_js.isAssignableType(h.ServerResponse, h.EventEmitter));
+            \\    try std.testing.expect(comptime r.zigar_js.isAssignableType(h.ServerResponse, h.Flushable));
+            \\    try std.testing.expect(comptime !r.zigar_js.isAssignableType(h.ServerResponse, h.DuplexChannel));
+            \\
+            \\    const CastProbe = struct {
+            \\        fn verifyCasts(sr: h.ServerResponse, ee: h.EventEmitter) !void {
+            \\            const as_ee: h.EventEmitter = sr.as(h.EventEmitter);
+            \\            const as_fl: h.Flushable = sr.as(h.Flushable);
+            \\            _ = as_fl;
+            \\            const owned_ee = try as_ee.clone();
+            \\            defer owned_ee.deinit();
+            \\            if (try ee.tryAs(h.ServerResponse)) |down_sr| {
+            \\                _ = try down_sr.statusCode();
+            \\            }
+            \\        }
+            \\    };
+            \\    _ = &CastProbe.verifyCasts;
+            \\
+            \\    // 2. Diamond multi-interface inheritance preserves BOTH `send(string)` and `send(Uint8Array)` overloads
+            \\    //    while deduplicating `SharedCore.id` and `SharedCore.close`!
+            \\    const dc_s1: *const fn (h.DuplexChannel, []const u8) r.zigar_js.CallError!f64 = &h.DuplexChannel.send;
+            \\    const dc_s2: *const fn (h.DuplexChannel, r.zigar_js.Uint8Array) r.zigar_js.CallError!f64 = &h.DuplexChannel.send_2;
+            \\    const dc_close: *const fn (h.DuplexChannel) r.zigar_js.CallError!void = &h.DuplexChannel.close;
+            \\    _ = dc_s1;
+            \\    _ = dc_s2;
+            \\    _ = dc_close;
+            \\    try std.testing.expect(!@hasDecl(h.DuplexChannel, "close_2"));
+            \\    try std.testing.expect(comptime r.zigar_js.isAssignableType(h.DuplexChannel, h.SharedCore));
+            \\
+            \\    // 3. Value-struct inheritance & `A & B` value intersection + `.as(Base)` runtime field projection!
+            \\    const sc: h.ServerConfig = .{ .host = "0.0.0.0", .port = 443, .cert = "pem-data", .alpn = .h2, .keep_alive = true };
+            \\    const sc_host = sc.as(h.HostConfig);
+            \\    const sc_tls = sc.as(h.TlsConfig);
+            \\    try std.testing.expectEqualStrings("0.0.0.0", sc_host.host);
+            \\    try std.testing.expectEqual(@as(?f64, 443), sc_host.port);
+            \\    try std.testing.expectEqualStrings("pem-data", sc_tls.cert);
+            \\    try std.testing.expectEqual(.h2, sc_tls.alpn.?);
+            \\
+            \\    const cc: h.CombinedConfig = .{ .host = "127.0.0.1", .cert = "local-pem", .retries = 3 };
+            \\    const cc_host = cc.as(h.HostConfig);
+            \\    const cc_tls = cc.as(h.TlsConfig);
+            \\    try std.testing.expectEqualStrings("127.0.0.1", cc_host.host);
+            \\    try std.testing.expectEqual(@as(?f64, null), cc_host.port);
+            \\    try std.testing.expectEqualStrings("local-pem", cc_tls.cert);
+            \\    try std.testing.expectEqual(@as(?f64, 3), cc.retries);
+            \\
+            \\    // 4. Handle `A & B` intersection (`TrackedWritable`) & callable hybrid intersection (`HybridRouter`):
+            \\    try std.testing.expect(h.TrackedWritable.zigar_js.is_handle);
+            \\    try std.testing.expect(comptime r.zigar_js.isAssignableType(h.TrackedWritable, h.Writable));
+            \\    try std.testing.expect(comptime r.zigar_js.isAssignableType(h.TrackedWritable, h.EventEmitter));
+            \\    _ = &h.TrackedWritable.bytesWritten;
+            \\    _ = &h.TrackedWritable.resetCounters;
+            \\    _ = &h.TrackedWritable.write;
+            \\
+            \\    try std.testing.expect(h.HybridRouter.zigar_js.is_handle);
+            \\    try std.testing.expect(h.HybridRouter.zigar_js.is_callable_handle);
+            \\    const hr_call: *const fn (h.HybridRouter, []const u8) r.zigar_js.CallError!bool = &h.HybridRouter.call;
+            \\    const hr_mp: *const fn (h.HybridRouter, std.mem.Allocator) r.zigar_js.CallError![]const u8 = &h.HybridRouter.mountPathAlloc;
+            \\    const hr_reload: *const fn (h.HybridRouter) r.zigar_js.CallError!void = &h.HybridRouter.reload;
+            \\    _ = hr_call;
+            \\    _ = hr_mp;
+            \\    _ = hr_reload;
+            \\
+            \\    // 5. Index signatures: HeaderBag (`init`, `getAlloc`, `set`), DualTable (readonly numeric + RW string),
+            \\    //    DataAttrMap (template key), VerbTable (enum key), InlineEnumDict (shared nominal value), CollidingDict!
+            \\    try std.testing.expect(h.HeaderBag.zigar_js.is_handle);
+            \\    try std.testing.expectError(error.HostUnavailable, h.HeaderBag.init());
+            \\    const hb_get: *const fn (h.HeaderBag, std.mem.Allocator, []const u8) r.zigar_js.CallError!?[]const u8 = &h.HeaderBag.getAlloc;
+            \\    const hb_set: *const fn (h.HeaderBag, []const u8, []const u8) r.zigar_js.CallError!void = &h.HeaderBag.set;
+            \\    _ = hb_get;
+            \\    _ = hb_set;
+            \\
+            \\    try std.testing.expect(@hasDecl(h.DualTable, "getIndexAlloc"));
+            \\    try std.testing.expect(!@hasDecl(h.DualTable, "setIndex"));
+            \\    try std.testing.expect(@hasDecl(h.DualTable, "getAlloc"));
+            \\    try std.testing.expect(@hasDecl(h.DualTable, "set"));
+            \\
+            \\    const dam_get: *const fn (h.DataAttrMap, std.mem.Allocator, h.DataKey) r.zigar_js.CallError!?[]const u8 = &h.DataAttrMap.getAlloc;
+            \\    const dam_set: *const fn (h.DataAttrMap, h.DataKey, []const u8) r.zigar_js.CallError!void = &h.DataAttrMap.set;
+            \\    _ = dam_get;
+            \\    _ = dam_set;
+            \\
+            \\    const vt_get: *const fn (h.VerbTable, h.HttpVerb) r.zigar_js.CallError!?f64 = &h.VerbTable.get;
+            \\    const vt_set: *const fn (h.VerbTable, h.HttpVerb, f64) r.zigar_js.CallError!void = &h.VerbTable.set;
+            \\    _ = vt_get;
+            \\    _ = vt_set;
+            \\
+            \\    const DictNominalCheck = struct {
+            \\        fn roundtrip(d: h.InlineEnumDict) !void {
+            \\            if (try d.get("feature")) |state| {
+            \\                try d.set("feature", state);
+            \\            }
+            \\        }
+            \\    };
+            \\    _ = &DictNominalCheck.roundtrip;
+            \\
+            \\    // CollidingDict keeps named methods `get`, `set`, `init` intact and disambiguates indexers!
+            \\    const cd_m_get: *const fn (h.CollidingDict, f64) r.zigar_js.CallError!bool = &h.CollidingDict.get;
+            \\    const cd_m_set: *const fn (h.CollidingDict, f64, bool) r.zigar_js.CallError!void = &h.CollidingDict.set;
+            \\    const cd_m_init: *const fn (h.CollidingDict, []const u8) r.zigar_js.CallError!void = &h.CollidingDict.init;
+            \\    _ = cd_m_get;
+            \\    _ = cd_m_set;
+            \\    _ = cd_m_init;
+            \\    try std.testing.expect(@hasDecl(h.CollidingDict, "getEntry"));
+            \\    try std.testing.expect(@hasDecl(h.CollidingDict, "setEntry"));
+            \\
+            \\    // 6. Declaration merging across all combinations + CJS `export = $`!
+            \\    _ = &h.MergedRegistry.nameAlloc;
+            \\    _ = &h.MergedRegistry.has;
+            \\    _ = &h.MergedRegistry.count;
+            \\    _ = &h.MergedRegistry.clear;
+            \\    _ = &h.MergedRegistry.get;
+            \\    _ = &h.MergedRegistry.set;
+            \\
+            \\    _ = &h.RichService.init;
+            \\    _ = &h.RichService.connect;
+            \\    _ = &h.RichService.mixinPingAlloc;
+            \\    const rs_opts: h.RichService.Options = .{ .timeout_ms = 500 };
+            \\    try std.testing.expectEqual(@as(?f64, 500), rs_opts.timeout_ms);
+            \\    try std.testing.expectError(error.HostUnavailable, h.RichService.default_timeout.get());
+            \\    _ = &h.RichService.fromOptions;
+            \\
+            \\    _ = &h.formatMetricAlloc;
+            \\    try std.testing.expectError(error.HostUnavailable, h.FormatMetric.prefix.getAlloc(std.testing.allocator));
+            \\    _ = &h.FormatMetric.reset;
+            \\
+            \\    // Symbol-colliding `_` (`function _` + `namespace _`) and CJS `export = $` (`function $` + `namespace $`):
+            \\    _ = &h.@"_".call;
+            \\    try std.testing.expectError(error.HostUnavailable, h.@"_".VERSION.getAlloc(std.testing.allocator));
+            \\    _ = &h.@"_".uniqAlloc;
+            \\
+            \\    try std.testing.expectEqualStrings("$", cjs.zigar_js.export_equals);
+            \\    _ = &@field(cjs, cjs.zigar_js.export_equals).call;
+            \\    _ = &cjs.@"$".call;
+            \\    _ = &cjs.@"$".call_2;
+            \\    try std.testing.expectError(error.HostUnavailable, cjs.version.getAlloc(std.testing.allocator));
+            \\    _ = &cjs.ajaxAlloc;
+            \\    try std.testing.expect(cjs.Selection.zigar_js.is_handle);
+            \\    _ = &h.@"$".call;
+            \\    _ = &h.@"$".call_2;
+            \\    try std.testing.expectError(error.HostUnavailable, h.@"$".version.getAlloc(std.testing.allocator));
+            \\    _ = &h.@"$".ajaxAlloc;
+            \\    try std.testing.expect(h.@"$".Selection.zigar_js.is_handle);
+            \\
+            \\    // Merged `enum LogLevel` + `namespace LogLevel`:
+            \\    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(h.LogLevel.warn));
+            \\    _ = &h.LogLevel.parse;
+            \\    try std.testing.expectError(error.HostUnavailable, h.LogLevel.default_level.get());
+            \\
+            \\    // Multi-block `namespace Telemetry`:
+            \\    try std.testing.expectError(error.HostUnavailable, h.Telemetry.service_name.getAlloc(std.testing.allocator));
+            \\    try std.testing.expectError(error.HostUnavailable, h.Telemetry.sample_rate.get());
+            \\    _ = &h.Telemetry.flush;
+            \\    _ = &h.Telemetry.record;
+            \\
+            \\    // Intersection normalizations: uninhabited `noreturn`, branded scalars, distributed tagged union:
+            \\    try std.testing.expect(h.EmptyResult == noreturn);
+            \\    try std.testing.expect(h.UserId == []const u8);
+            \\    try std.testing.expect(h.PortNum == f64);
+            \\    const out_ok: h.TaggedOutcome = .{ .ok = .{ .value = 42, .request_id = "req-1" } };
+            \\    const out_err: h.TaggedOutcome = .{ .err = .{ .message = "boom", .request_id = "req-2" } };
+            \\    try std.testing.expectEqualStrings("req-1", out_ok.ok.request_id);
+            \\    try std.testing.expectEqualStrings("req-2", out_err.err.request_id);
+            \\}
+            ,
+        });
+    }
+
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
+}
+
 
 

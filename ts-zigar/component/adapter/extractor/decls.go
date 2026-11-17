@@ -812,7 +812,7 @@ func (b *graphBuilder) symbolOwnerModule(nodes []*ast.Node, fallbackMod uint32) 
 		if d == nil {
 			continue
 		}
-		if sf := ast.GetSourceFileOfNode(d); sf != nil && b.isExtractableSourceFile(sf) {
+		if sf := b.nodeEffectiveOwnerSourceFile(d); sf != nil && b.isExtractableSourceFile(sf) {
 			return b.ensureModule(sf, false)
 		}
 	}
