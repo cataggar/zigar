@@ -608,59 +608,139 @@ const ModuleEmitCtx = struct {
         return null;
     }
 
-    fn resolveAliasType(self: *const ModuleEmitCtx, ty: *const ir.TypeIr, depth: usize) *const ir.TypeIr {
-        if (depth >= 16) return ty;
+    const TypeParamEnv = struct {
+        params: []const ir.TypeParamIr,
+        args: []const *const ir.TypeIr,
+        arg_env: ?*const TypeParamEnv,
+    };
+
+    const TargetTypeAlias = struct {
+        type_params: []const ir.TypeParamIr,
+        target: *const ir.TypeIr,
+    };
+
+    fn findTargetTypeAlias(self: *const ModuleEmitCtx, dref: ir.DeclRefIr) ?TargetTypeAlias {
+        if (dref.indirect) return null;
+        if (dref.module_index >= self.pkg.modules.len) return null;
+        const target_mod = &self.pkg.modules[dref.module_index];
+        if (findDeclByZigPath(target_mod.decls, dref.decl_zig_path)) |target_decl| {
+            switch (target_decl.kind) {
+                .type_alias => |ta| return .{
+                    .type_params = ta.type_params,
+                    .target = ta.target,
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn isResolvedOptionalEnv(
+        self: *const ModuleEmitCtx,
+        ty: *const ir.TypeIr,
+        env: ?*const TypeParamEnv,
+        depth: usize,
+    ) bool {
+        if (depth >= 24) return false;
         switch (ty.*) {
-            .decl_ref => |dref| {
-                if (dref.indirect or dref.type_args.len != 0) return ty;
-                if (dref.module_index >= self.pkg.modules.len) return ty;
-                const target_mod = &self.pkg.modules[dref.module_index];
-                if (findDeclByZigPath(target_mod.decls, dref.decl_zig_path)) |target_decl| {
-                    switch (target_decl.kind) {
-                        .type_alias => |ta| {
-                            if (ta.type_params.len == 0) {
-                                return self.resolveAliasType(ta.target, depth + 1);
+            .optional => return true,
+            .pointer_const => |inner| return self.isResolvedOptionalEnv(inner, env, depth + 1),
+            .type_param_ref => |tp_ident| {
+                if (env) |e| {
+                    for (e.params, 0..) |tp, idx| {
+                        if (std.mem.eql(u8, tp.zig_ident, tp_ident)) {
+                            if (idx < e.args.len) {
+                                return self.isResolvedOptionalEnv(e.args[idx], e.arg_env, depth + 1);
                             }
-                        },
-                        else => {},
+                            if (tp.default_type) |def_ty| {
+                                return self.isResolvedOptionalEnv(def_ty, e, depth + 1);
+                            }
+                            return false;
+                        }
                     }
                 }
-                return ty;
+                return false;
             },
-            else => return ty,
+            .decl_ref => |dref| {
+                if (self.findTargetTypeAlias(dref)) |ta| {
+                    const next_env = TypeParamEnv{
+                        .params = ta.type_params,
+                        .args = dref.type_args,
+                        .arg_env = env,
+                    };
+                    return self.isResolvedOptionalEnv(
+                        ta.target,
+                        if (ta.type_params.len > 0) &next_env else null,
+                        depth + 1,
+                    );
+                }
+                return false;
+            },
+            else => return false,
         }
     }
 
-    fn unwrapSliceElemType(self: *const ModuleEmitCtx, raw_ty: *const ir.TypeIr) *const ir.TypeIr {
-        const ty = self.resolveAliasType(raw_ty, 0);
-        return switch (ty.*) {
-            .slice => |elem_ty| elem_ty,
-            else => raw_ty,
-        };
+    fn isResolvedOptional(self: *const ModuleEmitCtx, ty: *const ir.TypeIr) bool {
+        return self.isResolvedOptionalEnv(ty, null, 0);
     }
 
-    fn typeNeedsNullishSpec(self: *const ModuleEmitCtx, raw_ty: *const ir.TypeIr, depth: usize) bool {
-        if (depth >= 16) return false;
-        const ty = self.resolveAliasType(raw_ty, 0);
-        return switch (ty.*) {
-            .optional => true,
-            .slice => |elem_ty| self.typeNeedsNullishSpec(elem_ty, depth + 1),
-            .pointer_const => |inner| self.typeNeedsNullishSpec(inner, depth + 1),
-            else => false,
-        };
+    fn typeNeedsNullishSpecEnv(
+        self: *const ModuleEmitCtx,
+        ty: *const ir.TypeIr,
+        env: ?*const TypeParamEnv,
+        depth: usize,
+    ) bool {
+        if (depth >= 24) return false;
+        switch (ty.*) {
+            .optional => return true,
+            .slice => |elem_ty| return self.typeNeedsNullishSpecEnv(elem_ty, env, depth + 1),
+            .pointer_const => |inner| return self.typeNeedsNullishSpecEnv(inner, env, depth + 1),
+            .type_param_ref => |tp_ident| {
+                if (env) |e| {
+                    for (e.params, 0..) |tp, idx| {
+                        if (std.mem.eql(u8, tp.zig_ident, tp_ident)) {
+                            if (idx < e.args.len) {
+                                return self.typeNeedsNullishSpecEnv(e.args[idx], e.arg_env, depth + 1);
+                            }
+                            if (tp.default_type) |def_ty| {
+                                return self.typeNeedsNullishSpecEnv(def_ty, e, depth + 1);
+                            }
+                            return false;
+                        }
+                    }
+                }
+                return false;
+            },
+            .decl_ref => |dref| {
+                if (self.findTargetTypeAlias(dref)) |ta| {
+                    const next_env = TypeParamEnv{
+                        .params = ta.type_params,
+                        .args = dref.type_args,
+                        .arg_env = env,
+                    };
+                    return self.typeNeedsNullishSpecEnv(
+                        ta.target,
+                        if (ta.type_params.len > 0) &next_env else null,
+                        depth + 1,
+                    );
+                }
+                return false;
+            },
+            else => return false,
+        }
     }
 
-    fn emitNullishSpecImpl(
+    fn emitNullishSpecEnv(
         self: *ModuleEmitCtx,
-        raw_ty: *const ir.TypeIr,
+        ty: *const ir.TypeIr,
+        env: ?*const TypeParamEnv,
         is_optional_site: bool,
         depth: usize,
     ) error{OutOfMemory}!void {
-        if (depth >= 16) {
+        if (depth >= 24) {
             try self.out.appendSlice(self.allocator, if (is_optional_site) ".undefined_only" else ".none");
             return;
         }
-        const ty = self.resolveAliasType(raw_ty, 0);
         switch (ty.*) {
             .optional => |opt| {
                 const self_tag: []const u8 = if (is_optional_site)
@@ -670,25 +750,60 @@ const ModuleEmitCtx = struct {
                     .null_only, .null_or_undefined => ".null_only",
                     .none => ".undefined_only",
                 };
-                if (self.typeNeedsNullishSpec(opt.child, depth + 1)) {
+                if (self.typeNeedsNullishSpecEnv(opt.child, env, depth + 1)) {
                     try self.out.print(self.allocator, ".{{ .self = {s}, .child = ", .{self_tag});
-                    try self.emitNullishSpecImpl(opt.child, false, depth + 1);
+                    try self.emitNullishSpecEnv(opt.child, env, false, depth + 1);
                     try self.out.appendSlice(self.allocator, " }");
                 } else {
                     try self.out.appendSlice(self.allocator, self_tag);
                 }
             },
             .slice => |elem_ty| {
-                if (self.typeNeedsNullishSpec(elem_ty, depth + 1)) {
+                if (self.typeNeedsNullishSpecEnv(elem_ty, env, depth + 1)) {
                     try self.out.appendSlice(self.allocator, ".{ .self = .none, .elem = ");
-                    try self.emitNullishSpecImpl(elem_ty, false, depth + 1);
+                    try self.emitNullishSpecEnv(elem_ty, env, false, depth + 1);
                     try self.out.appendSlice(self.allocator, " }");
                 } else {
                     try self.out.appendSlice(self.allocator, if (is_optional_site) ".undefined_only" else ".none");
                 }
             },
             .pointer_const => |inner| {
-                try self.emitNullishSpecImpl(inner, is_optional_site, depth + 1);
+                try self.emitNullishSpecEnv(inner, env, is_optional_site, depth + 1);
+            },
+            .type_param_ref => |tp_ident| {
+                if (env) |e| {
+                    for (e.params, 0..) |tp, idx| {
+                        if (std.mem.eql(u8, tp.zig_ident, tp_ident)) {
+                            if (idx < e.args.len) {
+                                try self.emitNullishSpecEnv(e.args[idx], e.arg_env, is_optional_site, depth + 1);
+                                return;
+                            }
+                            if (tp.default_type) |def_ty| {
+                                try self.emitNullishSpecEnv(def_ty, e, is_optional_site, depth + 1);
+                                return;
+                            }
+                            break;
+                        }
+                    }
+                }
+                try self.out.appendSlice(self.allocator, if (is_optional_site) ".undefined_only" else ".none");
+            },
+            .decl_ref => |dref| {
+                if (self.findTargetTypeAlias(dref)) |ta| {
+                    const next_env = TypeParamEnv{
+                        .params = ta.type_params,
+                        .args = dref.type_args,
+                        .arg_env = env,
+                    };
+                    try self.emitNullishSpecEnv(
+                        ta.target,
+                        if (ta.type_params.len > 0) &next_env else null,
+                        is_optional_site,
+                        depth + 1,
+                    );
+                    return;
+                }
+                try self.out.appendSlice(self.allocator, if (is_optional_site) ".undefined_only" else ".none");
             },
             else => {
                 try self.out.appendSlice(self.allocator, if (is_optional_site) ".undefined_only" else ".none");
@@ -697,7 +812,68 @@ const ModuleEmitCtx = struct {
     }
 
     fn emitNullishSpec(self: *ModuleEmitCtx, ty: *const ir.TypeIr, is_optional_site: bool) error{OutOfMemory}!void {
-        try self.emitNullishSpecImpl(ty, is_optional_site, 0);
+        try self.emitNullishSpecEnv(ty, null, is_optional_site, 0);
+    }
+
+    fn emitSliceElemNullishSpecEnv(
+        self: *ModuleEmitCtx,
+        ty: *const ir.TypeIr,
+        env: ?*const TypeParamEnv,
+        depth: usize,
+    ) error{OutOfMemory}!void {
+        if (depth >= 24) {
+            try self.out.appendSlice(self.allocator, ".none");
+            return;
+        }
+        switch (ty.*) {
+            .slice => |elem_ty| {
+                try self.emitNullishSpecEnv(elem_ty, env, false, depth + 1);
+            },
+            .pointer_const => |inner| {
+                try self.emitSliceElemNullishSpecEnv(inner, env, depth + 1);
+            },
+            .type_param_ref => |tp_ident| {
+                if (env) |e| {
+                    for (e.params, 0..) |tp, idx| {
+                        if (std.mem.eql(u8, tp.zig_ident, tp_ident)) {
+                            if (idx < e.args.len) {
+                                try self.emitSliceElemNullishSpecEnv(e.args[idx], e.arg_env, depth + 1);
+                                return;
+                            }
+                            if (tp.default_type) |def_ty| {
+                                try self.emitSliceElemNullishSpecEnv(def_ty, e, depth + 1);
+                                return;
+                            }
+                            break;
+                        }
+                    }
+                }
+                try self.out.appendSlice(self.allocator, ".none");
+            },
+            .decl_ref => |dref| {
+                if (self.findTargetTypeAlias(dref)) |ta| {
+                    const next_env = TypeParamEnv{
+                        .params = ta.type_params,
+                        .args = dref.type_args,
+                        .arg_env = env,
+                    };
+                    try self.emitSliceElemNullishSpecEnv(
+                        ta.target,
+                        if (ta.type_params.len > 0) &next_env else null,
+                        depth + 1,
+                    );
+                    return;
+                }
+                try self.out.appendSlice(self.allocator, ".none");
+            },
+            else => {
+                try self.out.appendSlice(self.allocator, ".none");
+            },
+        }
+    }
+
+    fn emitSliceElemNullishSpec(self: *ModuleEmitCtx, ty: *const ir.TypeIr) error{OutOfMemory}!void {
+        try self.emitSliceElemNullishSpecEnv(ty, null, 0);
     }
 
     fn emitType(self: *ModuleEmitCtx, ty: *const ir.TypeIr) error{OutOfMemory}!void {
@@ -761,7 +937,7 @@ const ModuleEmitCtx = struct {
                     try self.emitType(el.ty);
                     if (el.is_variadic) {
                         try self.out.appendSlice(self.allocator, " = &.{}");
-                    } else if (el.is_optional and self.resolveAliasType(el.ty, 0).* == .optional) {
+                    } else if (el.is_optional and self.isResolvedOptional(el.ty)) {
                         try self.out.appendSlice(self.allocator, " = null");
                     }
                 }
@@ -784,7 +960,7 @@ const ModuleEmitCtx = struct {
                         if (el.is_optional) "true" else "false",
                     });
                     if (el.is_variadic) {
-                        try self.emitNullishSpec(self.unwrapSliceElemType(el.ty), false);
+                        try self.emitSliceElemNullishSpec(el.ty);
                     } else {
                         try self.emitNullishSpec(el.ty, el.is_optional);
                     }
@@ -811,7 +987,7 @@ const ModuleEmitCtx = struct {
                     if (f.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
                     try self.out.print(self.allocator, "{s}: ", .{f.zig_ident});
                     try self.emitType(f.ty);
-                    if (f.is_optional and self.resolveAliasType(f.ty, 0).* == .optional) {
+                    if (f.is_optional and self.isResolvedOptional(f.ty)) {
                         try self.out.appendSlice(self.allocator, " = null");
                     }
                     try self.out.appendSlice(self.allocator, ",\n");
@@ -985,7 +1161,7 @@ const ModuleEmitCtx = struct {
         var first_trailing_opt: usize = fixed_len;
         while (first_trailing_opt > 0 and
             sig.params[first_trailing_opt - 1].is_optional and
-            self.resolveAliasType(sig.params[first_trailing_opt - 1].ty, 0).* == .optional)
+            self.isResolvedOptional(sig.params[first_trailing_opt - 1].ty))
         {
             first_trailing_opt -= 1;
         }
@@ -1033,7 +1209,7 @@ const ModuleEmitCtx = struct {
                 "try __zigar_js.pushRestArgs(__zigar_args, {s}, ",
                 .{rest_param.zig_ident},
             );
-            try self.emitNullishSpec(self.unwrapSliceElemType(rest_param.ty), false);
+            try self.emitSliceElemNullishSpec(rest_param.ty);
             try self.out.appendSlice(self.allocator, ");\n");
         }
 
@@ -1222,7 +1398,7 @@ const ModuleEmitCtx = struct {
             if (f.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
             try self.out.print(self.allocator, "{s}: ", .{f.zig_ident});
             try self.emitType(f.ty);
-            if (f.is_optional and self.resolveAliasType(f.ty, 0).* == .optional) {
+            if (f.is_optional and self.isResolvedOptional(f.ty)) {
                 try self.out.appendSlice(self.allocator, " = null");
             }
             try self.out.appendSlice(self.allocator, ",\n");

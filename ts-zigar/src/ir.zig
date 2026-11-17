@@ -2869,7 +2869,9 @@ fn LowerCtx(comptime GraphType: type) type {
 
                         var elem_ty = try self.lowerType(el.ty, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                         if (el.variadic) {
-                            elem_ty = try self.makeType(.{ .slice = elem_ty });
+                            if (!self.isAlreadySliceTypeIr(elem_ty, 0)) {
+                                elem_ty = try self.makeType(.{ .slice = elem_ty });
+                            }
                         } else if (el.optional) {
                             elem_ty = try self.wrapOptionalWithNullish(elem_ty, .undefined_only);
                         }
@@ -3261,6 +3263,48 @@ fn LowerCtx(comptime GraphType: type) type {
             }
         }
 
+        fn isGraphTypeSlice(self: *const Self, ty_id: u32, depth: usize) bool {
+            if (depth >= 16 or ty_id >= self.graph.types.len) return false;
+            const tn = self.graph.types[ty_id];
+            return switch (tn.kind) {
+                .array, .readonly_array => true,
+                .reference => |ref| blk: {
+                    if (ref.target_decl) |td_id| {
+                        if (td_id < self.graph.decls.len and self.graph.decls[td_id].kind == .type_alias_decl) {
+                            break :blk self.isGraphTypeSlice(self.graph.decls[td_id].kind.type_alias_decl, depth + 1);
+                        }
+                    }
+                    const ref_name = self.str(ref.target_name);
+                    if ((ref.target_decl == null or self.isBundledLibDecl(ref.target_decl.?)) and
+                        (std.mem.eql(u8, ref_name, "Array") or std.mem.eql(u8, ref_name, "ReadonlyArray")))
+                    {
+                        break :blk true;
+                    }
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) break :blk self.isGraphTypeSlice(rt, depth + 1);
+                    }
+                    break :blk false;
+                },
+                else => false,
+            };
+        }
+
+        fn isAlreadySliceTypeIr(self: *const Self, ty: *const TypeIr, depth: usize) bool {
+            if (depth >= 16) return false;
+            return switch (ty.*) {
+                .slice, .typed_slice => true,
+                .decl_ref => |dr| blk: {
+                    if (dr.indirect or dr.target_decl_id >= self.graph.decls.len) break :blk false;
+                    const td = self.graph.decls[dr.target_decl_id];
+                    if (td.kind == .type_alias_decl) {
+                        break :blk self.isGraphTypeSlice(td.kind.type_alias_decl, 0);
+                    }
+                    break :blk false;
+                },
+                else => false,
+            };
+        }
+
         fn wrapOptionalWithNullish(self: *Self, inner: *TypeIr, kind: lower_types.NullishKind) !*TypeIr {
             const eff_kind: lower_types.NullishKind = if (kind == .none) .null_or_undefined else kind;
             switch (inner.*) {
@@ -3419,7 +3463,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 visited.clearRetainingCapacity();
                 var pt = try self.lowerType(p.ty, false, tp_res.active, self_ident_opt, &visited, imports_used, needs_runtime);
                 if (p.rest) {
-                    if (pt.* != .slice) pt = try self.makeType(.{ .slice = pt });
+                    if (!self.isAlreadySliceTypeIr(pt, 0)) pt = try self.makeType(.{ .slice = pt });
                 } else if (p.optional) {
                     pt = try self.wrapOptional(pt);
                 }

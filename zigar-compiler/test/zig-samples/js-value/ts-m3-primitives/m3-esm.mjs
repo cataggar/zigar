@@ -9,6 +9,8 @@ export let moduleTag = 'initial-tag';
 export let moduleCount = 10;
 export let gUndef = 'esm-seed-undef';
 export let gNull = 'esm-seed-null';
+export let gMaybe = null;
+export let gUndefAlias = undefined;
 
 export function mutateEsmBindings(nextTag, delta) {
   moduleTag = nextTag;
@@ -242,6 +244,47 @@ export function evalMiddleSandwich(input) {
   return [ head, ...mid, tail ];
 }
 
+export function inspectGenericAliasNullish(p, box, ...rest) {
+  if (nested.gMaybe !== null) {
+    throw new TypeError(`expected nested.gMaybe === null, got ${tagJsVal(nested.gMaybe)}`);
+  }
+  if (nested.gUndefAlias !== undefined) {
+    throw new TypeError(`expected nested.gUndefAlias === undefined, got ${tagJsVal(nested.gUndefAlias)}`);
+  }
+  if (!('reqMaybe' in p) || p.reqMaybe === undefined) {
+    throw new TypeError(`expected reqMaybe null/string, got ${tagJsVal(p.reqMaybe)}`);
+  }
+  if (!('reqUndef' in p) || p.reqUndef === null) {
+    throw new TypeError(`expected reqUndef undefined/string, got ${tagJsVal(p.reqUndef)}`);
+  }
+  const optMaybePart = ('optMaybe' in p) ? `optMaybe=${tagJsVal(p.optMaybe)}` : 'no-optMaybe';
+  const optUndefPart = ('optUndef' in p) ? `optUndef=${tagJsVal(p.optUndef)}` : 'no-optUndef';
+  if (!Array.isArray(p.maybeItems) || p.maybeItems.some((x) => x === undefined)) {
+    throw new TypeError('maybeItems must contain string or null, never undefined');
+  }
+  if (!Array.isArray(p.pair) || p.pair.length !== 2 || p.pair[0] === undefined || p.pair[1] === null) {
+    throw new TypeError(`invalid generic alias tuple: [${p.pair.map(tagJsVal).join(',')}]`);
+  }
+  if (!('val' in box) || box.val === undefined) {
+    throw new TypeError(`expected box.val null/number, got ${tagJsVal(box.val)}`);
+  }
+  const boxOptPart = ('opt' in box) ? `boxOpt=${tagJsVal(box.opt)}` : 'no-boxOpt';
+  if (rest.some((x) => x === null)) {
+    throw new TypeError('OptList<number> rest must contain number or undefined, never null');
+  }
+  return [
+    `reqMaybe=${tagJsVal(p.reqMaybe)}`,
+    `reqUndef=${tagJsVal(p.reqUndef)}`,
+    optMaybePart,
+    optUndefPart,
+    `items=[${p.maybeItems.map(tagJsVal).join(',')}]`,
+    `pair=[${p.pair.map(tagJsVal).join(',')}]`,
+    `boxVal=${tagJsVal(box.val)}`,
+    boxOptPart,
+    `rest=[${rest.map(tagJsVal).join(',')}]`,
+  ].join('|');
+}
+
 export function malformedTupleReturn(kind) {
   if (kind === 0) return { notAnArray: true };
   if (kind === 1) return [];
@@ -275,6 +318,8 @@ export const nested = {
   hits: 5,
   gUndef: 'nested-initial-undef',
   gNull: 'nested-initial-null',
+  gMaybe: 100,
+  gUndefAlias: 200,
   verifyNestedNullishGlobals() {
     if (!('gUndef' in nested) || !('gNull' in nested)) {
       throw new TypeError('missing nested global properties');

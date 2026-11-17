@@ -61,6 +61,32 @@ declare module "./m3-esm.mjs" {
   export function inspectRestUndef(prefix: string, ...args: (number | undefined)[]): string;
   export function inspectRestNull(prefix: string, ...args: (number | null)[]): string;
 
+  export type Maybe<T> = T | null;
+  export type Undef<T> = T | undefined;
+  export type OptList<T> = (T | undefined)[];
+
+  export interface GenericAliasPayload {
+    reqMaybe: Maybe<string>;
+    reqUndef: Undef<string>;
+    optMaybe?: Maybe<number>;
+    optUndef?: Undef<number>;
+    maybeItems: Maybe<string>[];
+    pair: [Maybe<string>, Undef<number>];
+  }
+
+  export interface GenericBox<T> {
+    val: T;
+    opt?: T;
+  }
+
+  export let gMaybe: Maybe<number>;
+  export let gUndefAlias: Undef<number>;
+  export function inspectGenericAliasNullish(
+    p: GenericAliasPayload,
+    box: GenericBox<Maybe<number>>,
+    ...rest: OptList<number>
+  ): string;
+
   export function transformStringArray(items: ReadonlyArray<string>, extra: number[]): string[];
 
   export type FixedPair = [number, boolean];
@@ -91,6 +117,8 @@ declare module "./m3-esm.mjs" {
     export let hits: number;
     export let gUndef: string | undefined;
     export let gNull: string | null;
+    export let gMaybe: Maybe<number>;
+    export let gUndefAlias: Undef<number>;
     export function verifyNestedNullishGlobals(): string;
     export namespace deep {
       export function combine(a: string, b?: number): string;

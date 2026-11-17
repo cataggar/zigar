@@ -661,6 +661,61 @@ pub fn exerciseNullishFidelity(out_alloc: std.mem.Allocator) ![]const u8 {
         if ((try fixture.m3_global_undef.getAlloc(tracked_alloc)) != null) return error.Unexpected;
         if ((try fixture.m3_global_null.getAlloc(tracked_alloc)) != null) return error.Unexpected;
 
+        // (6) Generic nullable/undefined aliases (`Maybe<T>`, `Undef<T>`, `OptList<T>`, `GenericBox<Maybe<number>>`)
+        if (@TypeOf(m3_esm.g_maybe).nullish_spec != .null_only) return error.Unexpected;
+        if (@TypeOf(m3_esm.g_undef_alias).nullish_spec != .undefined_only) return error.Unexpected;
+        if ((try m3_esm.g_maybe.get()) != null) return error.Unexpected;
+        if ((try m3_esm.g_undef_alias.get()) != null) return error.Unexpected;
+        try m3_esm.Nested.g_maybe.set(null);
+        try m3_esm.Nested.g_undef_alias.set(null);
+        if ((try m3_esm.Nested.g_maybe.get()) != null) return error.Unexpected;
+        if ((try m3_esm.Nested.g_undef_alias.get()) != null) return error.Unexpected;
+
+        // Case A: omitted optional fields (`opt_maybe = null`, `box.opt = null`)
+        const gen_a = try m3_esm.inspectGenericAliasNullishAlloc(
+            tracked_alloc,
+            .{
+                .req_maybe = null,
+                .req_undef = null,
+                .maybe_items = &.{ "ok", null },
+                .pair = .{ .@"0" = null, .@"1" = null },
+            },
+            .{ .val = null },
+            &.{ 7, null },
+        );
+        defer js.freeDecoded([]const u8, tracked_alloc, gen_a);
+        if (!std.mem.eql(
+            u8,
+            gen_a,
+            "reqMaybe=null|reqUndef=undefined|no-optMaybe|no-optUndef|items=[string:ok,null]|pair=[null,undefined]|boxVal=null|no-boxOpt|rest=[number:7,undefined]",
+        )) {
+            return error.Unexpected;
+        }
+
+        // Case B: present outer optional with inner `null` (`opt_maybe = @as(?f64, null)` -> `optMaybe === null`,
+        // `opt_undef = @as(?f64, null)` -> `optUndef === undefined`, `box.opt = @as(?f64, null)` -> `boxOpt === null`)!
+        const gen_b = try m3_esm.inspectGenericAliasNullishAlloc(
+            tracked_alloc,
+            .{
+                .req_maybe = "present",
+                .req_undef = "here",
+                .opt_maybe = @as(?f64, null),
+                .opt_undef = @as(?f64, null),
+                .maybe_items = &.{null},
+                .pair = .{ .@"0" = "p", .@"1" = 3 },
+            },
+            .{ .val = 9, .opt = @as(?f64, null) },
+            &.{null},
+        );
+        defer js.freeDecoded([]const u8, tracked_alloc, gen_b);
+        if (!std.mem.eql(
+            u8,
+            gen_b,
+            "reqMaybe=string:present|reqUndef=string:here|optMaybe=null|optUndef=undefined|items=[null]|pair=[string:p,number:3]|boxVal=number:9|boxOpt=null|rest=[undefined]",
+        )) {
+            return error.Unexpected;
+        }
+
         out = try std.fmt.allocPrint(out_alloc, "{s}|{s}|{s}|{s}", .{ rest_u, rest_n, nested_ver, cjs_ver });
     }
 

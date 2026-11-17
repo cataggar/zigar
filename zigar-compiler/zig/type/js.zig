@@ -5038,8 +5038,8 @@ pub fn Js(comptime host: type) type {
                         return toJsRefWithSpec(op.child, v, child_spec);
                     }
                     return switch (comptime specSelfNullish(spec)) {
-                        .null_only, .null_or_undefined => Ref(module.Any).@"null",
-                        .none, .undefined_only => Ref(module.Any).@"undefined",
+                        .undefined_only => Ref(module.Any).@"undefined",
+                        .none, .null_only, .null_or_undefined => Ref(module.Any).@"null",
                     };
                 },
                 .int, .float => {
