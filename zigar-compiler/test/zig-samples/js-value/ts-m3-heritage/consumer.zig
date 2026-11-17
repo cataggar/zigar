@@ -169,7 +169,7 @@ pub fn exerciseDiamondInterfacesAndValueStructProjection(out_alloc: std.mem.Allo
         if (!try dc.open(1)) return error.Unexpected;
         if (try dc.open(0)) return error.Unexpected;
 
-        const opened_path = try dc.open2Alloc(tracked_alloc, "/ws");
+        const opened_path = try dc.openAlloc(tracked_alloc, "/ws");
         defer js.freeDecoded([]const u8, tracked_alloc, opened_path);
         if (!std.mem.eql(u8, opened_path, "opened:/ws@ch-1")) return error.Unexpected;
 
@@ -177,7 +177,8 @@ pub fn exerciseDiamondInterfacesAndValueStructProjection(out_alloc: std.mem.Allo
         defer js.freeDecoded([]const u8, tracked_alloc, q_str);
         if (!std.mem.eql(u8, q_str, "net:route")) return error.Unexpected;
 
-        if ((try dc.query_2(5)) != 50) return error.Unexpected;
+        if ((try dc.query(5)) != 50) return error.Unexpected;
+        if ((try dc.queryNumber(5)) != 50) return error.Unexpected;
         if ((try dc.ping()) != 204) return error.Unexpected;
 
         // Optionality tightening (`BaseNode.tag?: string` -> `DiamondChannel.tag: string`)
@@ -492,7 +493,7 @@ pub fn exerciseDeclarationMergingAndAugmentations(out_alloc: std.mem.Allocator) 
         defer js.freeDecoded([]const u8, tracked_alloc, t1);
         if (!std.mem.eql(u8, t1, ".btn")) return error.Unexpected;
 
-        const sel2 = try cjs_mod.@"$".call_2("li", "ul");
+        const sel2 = try cjs_mod.@"$".callWithRoot("li", "ul");
         defer sel2.deinit();
         if ((try sel2.length()) != 2) return error.Unexpected;
         const t2 = try sel2.textAlloc(tracked_alloc);
@@ -511,7 +512,7 @@ pub fn exerciseDeclarationMergingAndAugmentations(out_alloc: std.mem.Allocator) 
         try def_mod.Default.version.set("2.0");
         defer def_mod.Default.version.set("1.0") catch {};
 
-        const d2 = try def_mod.Default.call2Alloc(tracked_alloc, "y", 3);
+        const d2 = try def_mod.Default.callWithCountAlloc(tracked_alloc, "y", 3);
         defer js.freeDecoded([]const u8, tracked_alloc, d2);
         if (!std.mem.eql(u8, d2, "def[2.0]:yx3#2")) return error.Unexpected;
 

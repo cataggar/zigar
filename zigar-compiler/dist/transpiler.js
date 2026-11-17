@@ -7010,6 +7010,16 @@ var allocatorMethods = mixin({
         if (align !== 1 << (31 - lz)) {
           throw new Error(`Invalid alignment: ${align}`);
         }
+        const byteLen = Number(len);
+        if (byteLen === 0) {
+          // Zig 0.17 Allocator.VTable.alloc asserts n > 0; zero-length slices carry a
+          // non-null aligned dangling pointer and skip vtable.alloc / vtable.free.
+          const is64 = Boolean(thisEnv.memory64 || "32" == 64);
+          const address = is64 ? BigInt(align) : align;
+          const dv = new DataView(new ArrayBuffer(0));
+          defineProperty(dv, ZIG, { value: { address, len: 0, align }, writable: true, configurable: true, enumerable: false });
+          return dv;
+        }
         const ptrAlign = 31 - lz;
         const { vtable: { alloc }, ptr } = this;
         const slicePtr = alloc(ptr, len, ptrAlign, 0);
@@ -7049,9 +7059,11 @@ var allocatorMethods = mixin({
         if (isInvalidUsize(address)) {
           throw new PreviouslyFreed(arg);
         }
-        const { vtable: { free }, ptr } = this;
-        const ptrAlign = 31 - Math.clz32(align);        
-        free(ptr, dv, ptrAlign, 0);
+        if (dv.byteLength > 0) {
+          const { vtable: { free }, ptr } = this;
+          const ptrAlign = 31 - Math.clz32(align);        
+          free(ptr, dv, ptrAlign, 0);
+        }
         thisEnv.releaseZigView(dv);
       }
     };
@@ -9848,6 +9860,7 @@ var jsHostOp = mixin({
       is64,
       sync: !(flags & 1),
       once: Boolean(flags & 2),
+      passThis: Boolean(flags & 4),
     };
     this.zigCallbackTemplateCache.set(descriptorAddr, template);
     return template;
@@ -9899,8 +9912,10 @@ var jsHostOp = mixin({
       slotDV[ZIG] = { address: slotAddr, len: 0 };
       caller[MEMORY] = slotDV;
       const state = { id, released: false, handle: 0, handleReleased: false };
+      const thisEnv = this;
       const unwrapString = template.unwrapString;
       const isOnce = template.once;
+      const passThis = template.passThis;
       const unwrapResult = (res) => {
         if (unwrapString && res && typeof(res) === 'object' && MEMORY in res) {
           if (typeof(res.string) === 'string') {
@@ -9914,23 +9929,23 @@ var jsHostOp = mixin({
         return res;
       };
       const finishOnceCleanup = () => {
-        if (this.zigCallbackMap.get(id) === state) {
-          this.cancelZigCallbackSlot(template.cancelThunk, slotAddr, zeroAddr);
-          this.releaseZigCallback(id);
+        if (thisEnv.zigCallbackMap.get(id) === state) {
+          thisEnv.cancelZigCallbackSlot(template.cancelThunk, slotAddr, zeroAddr);
+          thisEnv.releaseZigCallback(id);
         }
       };
-      const wrapper = (...args) => {
+      const wrapper = function(...args) {
         if (state.released) {
           throw new Error('Zig callback has already been released');
         }
         if (isOnce) {
           state.released = true;
         }
-        const savedOuterPending = this.savePendingHostError();
+        const savedOuterPending = thisEnv.savePendingHostError();
         let asyncResult = false;
         try {
-          const res = caller(...args);
-          const pending = this.consumePendingHostError();
+          const res = passThis ? caller(this, ...args) : caller(...args);
+          const pending = thisEnv.consumePendingHostError();
           if (pending) {
             throw pending.error;
           }
@@ -9947,7 +9962,7 @@ var jsHostOp = mixin({
           return unwrapResult(res);
         } finally {
           if (savedOuterPending) {
-            this.restorePendingHostError(savedOuterPending);
+            thisEnv.restorePendingHostError(savedOuterPending);
           }
           if (isOnce && !asyncResult) {
             finishOnceCleanup();

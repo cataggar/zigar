@@ -1860,6 +1860,37 @@ describe('Feature: js-host-op', function() {
     // Subsequent releaseZigCallback(2) (e.g. if Zig defer deinit ran) is a safe no-op with zero double-release!
     expect(() => env.releaseZigCallback(2)).to.not.throw();
     expect(() => badOnceFn(14)).to.throw(/already been released/);
+
+    // 4. `passThis` callback (`flags = 4`) forwards JS `this` receiver as leading argument to caller
+    s.makeArgStruct(503n, s.i32, [ s.i32, s.i32 ]);
+    const thisDescOff = 0x560;
+    const thisDescDV = harness.viewAt(thisDescOff, 16 + 3 * ptrSize);
+    thisDescDV.setBigUint64(0, 503n, true);
+    thisDescDV.setUint32(8, 4, true); // CallbackFlags.pass_this = 1 << 2
+    thisDescDV.setUint32(12, 0, true);
+    if (harness.is64) {
+      thisDescDV.setBigUint64(16, 0x9200n, true);
+      thisDescDV.setBigUint64(24, 0n, true);
+      thisDescDV.setBigUint64(32, 0n, true);
+    } else {
+      thisDescDV.setUint32(16, 0x9200, true);
+      thisDescDV.setUint32(20, 0, true);
+      thisDescDV.setUint32(24, 0, true);
+    }
+    if (process.env.TARGET === 'wasm') {
+      env.createOutboundCaller = () => (recv, delta) => recv + delta;
+    } else {
+      env.invokeThunk = (_thunk, _fnHolder, argsHolder) => {
+        argsHolder.retval = argsHolder[0] + argsHolder[1];
+        return argsHolder.retval;
+      };
+    }
+    const thisCbHandle = env.createZigCallback(harness.addrOf(thisDescOff), 3);
+    const thisCbFn = env.getJsValue(thisCbHandle);
+    expect(thisCbFn.call(100, 23)).to.equal(123);
+    env.releaseZigCallback(3);
+    expect(env.getActiveZigCallbackCount()).to.equal(0);
+    expect(env.getJsValueCount()).to.equal(0);
   });
 
   it('should execute O(1) bulk binary operations, BigInt 64/128-bit conversions with overflow detection, and sync/async iterator ops', function() {

@@ -13,6 +13,8 @@ pub const classify_decls = @import("classify_decls.zig");
 pub const lower_objects = @import("lower_objects.zig");
 pub const lower_heritage = @import("lower_heritage.zig");
 pub const merge_decls = @import("merge_decls.zig");
+pub const lower_functions = @import("lower_functions.zig");
+pub const overloads = @import("overloads.zig");
 pub const ir = @import("ir.zig");
 pub const emit = @import("emit.zig");
 pub const driver = @import("driver.zig");
@@ -36,6 +38,8 @@ test {
     _ = lower_objects;
     _ = lower_heritage;
     _ = merge_decls;
+    _ = lower_functions;
+    _ = overloads;
     _ = ir;
     _ = emit;
     _ = driver;

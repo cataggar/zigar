@@ -489,7 +489,9 @@ pub const JsModuleNode = struct {
 pub const CallbackFlags = packed struct(u32) {
     async_call: bool = false,
     once: bool = false,
-    _: u30 = 0,
+    pass_this: bool = false,
+    ref_codec: bool = false,
+    _: u28 = 0,
 };
 
 pub const LastErrorOp = enum(u32) {
@@ -2020,13 +2022,145 @@ pub fn Js(comptime host: type) type {
             return CallbackWithOptions(JsFnSig, .{ .async_call = true });
         }
 
+        fn typeUsesTsZigarCallbackCodec(comptime T: type, comptime depth: usize) bool {
+            if (depth >= 16 or T == void) return false;
+            if (comptime util.getInternalType(T) == .js_value) return false;
+            if (comptime isNullableType(T)) return true;
+            return switch (@typeInfo(T)) {
+                .optional => true,
+                .@"struct" => |st| blk: {
+                    if (isTupleStructType(T) or @hasDecl(T, "zigar_js")) break :blk true;
+                    for (st.field_types) |ft| {
+                        if (typeUsesTsZigarCallbackCodec(ft, depth + 1)) break :blk true;
+                    }
+                    break :blk false;
+                },
+                .@"union" => |un| blk: {
+                    if (@hasDecl(T, "zigar_js")) break :blk true;
+                    for (un.field_types) |ft| {
+                        if (typeUsesTsZigarCallbackCodec(ft, depth + 1)) break :blk true;
+                    }
+                    break :blk false;
+                },
+                .@"enum" => @hasDecl(T, "zigar_js"),
+                .pointer => |pt| switch (pt.size) {
+                    .slice, .one => if (pt.child == u8) false else typeUsesTsZigarCallbackCodec(pt.child, depth + 1),
+                    else => false,
+                },
+                .array => |ar| typeUsesTsZigarCallbackCodec(ar.child, depth + 1),
+                .error_union => |eu| typeUsesTsZigarCallbackCodec(eu.payload, depth + 1),
+                else => false,
+            };
+        }
+
+        fn valueContainsHandle(comptime T: type, value: T, target_handle: u32) bool {
+            if (target_handle < 8) return false;
+            if (comptime util.getInternalType(T) == .js_value) {
+                return extractHandle(value) == target_handle;
+            }
+            return switch (@typeInfo(T)) {
+                .optional => if (value) |v| valueContainsHandle(@TypeOf(v), v, target_handle) else false,
+                .@"union" => if (comptime isNullableType(T)) switch (value) {
+                    .value => |v| valueContainsHandle(T.Value, v, target_handle),
+                    else => false,
+                } else switch (value) {
+                    inline else => |payload| valueContainsHandle(@TypeOf(payload), payload, target_handle),
+                },
+                .@"struct" => |st| blk: {
+                    inline for (st.field_names, 0..) |fname, fi| {
+                        if (valueContainsHandle(st.field_types[fi], @field(value, fname), target_handle)) break :blk true;
+                    }
+                    break :blk false;
+                },
+                .pointer => |pt| switch (pt.size) {
+                    .slice => blk: {
+                        if (pt.child == u8) break :blk false;
+                        for (value) |elem| {
+                            if (valueContainsHandle(pt.child, elem, target_handle)) break :blk true;
+                        }
+                        break :blk false;
+                    },
+                    .one => if (@typeInfo(pt.child) != .@"fn") valueContainsHandle(pt.child, value.*, target_handle) else false,
+                    else => false,
+                },
+                else => false,
+            };
+        }
+
+        fn releaseReturnedHandlesIfNotAliased(comptime T: type, value: T, alias_ctx: anytype) void {
+            if (comptime util.getInternalType(T) == .js_value) {
+                const h = extractHandle(value);
+                if (h >= 8 and !alias_ctx.contains(h)) {
+                    (Ref(module.Any){ .handle = h }).deinit();
+                }
+                return;
+            }
+            switch (@typeInfo(T)) {
+                .optional => if (value) |v| releaseReturnedHandlesIfNotAliased(@TypeOf(v), v, alias_ctx),
+                .@"union" => if (comptime isNullableType(T)) switch (value) {
+                    .value => |v| releaseReturnedHandlesIfNotAliased(T.Value, v, alias_ctx),
+                    else => {},
+                } else switch (value) {
+                    inline else => |payload| releaseReturnedHandlesIfNotAliased(@TypeOf(payload), payload, alias_ctx),
+                },
+                .@"struct" => |st| {
+                    inline for (st.field_names, 0..) |fname, fi| {
+                        releaseReturnedHandlesIfNotAliased(st.field_types[fi], @field(value, fname), alias_ctx);
+                    }
+                },
+                .pointer => |pt| switch (pt.size) {
+                    .slice => if (pt.child != u8) {
+                        for (value) |elem| releaseReturnedHandlesIfNotAliased(pt.child, elem, alias_ctx);
+                    },
+                    .one => if (@typeInfo(pt.child) != .@"fn") releaseReturnedHandlesIfNotAliased(pt.child, value.*, alias_ctx),
+                    else => {},
+                },
+                else => {},
+            }
+        }
+
+        fn sigUsesTsZigarCallbackCodec(comptime JsFnSig: type, comptime cb_flags: module.CallbackFlags) bool {
+            if (cb_flags.ref_codec) return true;
+            const fi = @typeInfo(JsFnSig).@"fn";
+            for (fi.param_types) |maybe_pt| {
+                if (maybe_pt) |pt| {
+                    if (typeUsesTsZigarCallbackCodec(pt, 0)) return true;
+                }
+            }
+            if (fi.return_type) |rt| {
+                if (typeUsesTsZigarCallbackCodec(rt, 0)) return true;
+            }
+            return false;
+        }
+
         pub fn CallbackWithOptions(comptime JsFnSig: type, comptime cb_flags: module.CallbackFlags) type {
             const fn_info = switch (@typeInfo(JsFnSig)) {
                 .@"fn" => |fi| fi,
                 else => @compileError("Expected a Zig function signature `fn (...) ...`, received " ++ @typeName(JsFnSig)),
             };
-            const Args = arg_struct.ArgStruct(JsFnSig);
             const RT = fn_info.return_type orelse void;
+            const UnwrappedRT = switch (@typeInfo(RT)) {
+                .error_union => |eu| eu.payload,
+                else => RT,
+            };
+            const use_ref_codec = comptime sigUsesTsZigarCallbackCodec(JsFnSig, cb_flags);
+            const WirePayload = if (UnwrappedRT == void) void else Ref(module.Any);
+            const WireRT = comptime blk: {
+                if (!use_ref_codec) break :blk RT;
+                break :blk switch (@typeInfo(RT)) {
+                    .error_union => |eu| if (@typeInfo(eu.error_set).error_set.error_names == null)
+                        WirePayload
+                    else
+                        (eu.error_set || module.CallError)!WirePayload,
+                    else => WirePayload,
+                };
+            };
+            const WireFnSig = comptime blk: {
+                if (!use_ref_codec) break :blk JsFnSig;
+                const wire_params: [fn_info.param_types.len]type = @splat(Ref(module.Any));
+                break :blk buildFnType(&wire_params, WireRT);
+            };
+            const Args = arg_struct.ArgStruct(WireFnSig);
 
             return struct {
                 const Self = @This();
@@ -2049,6 +2183,8 @@ pub fn Js(comptime host: type) type {
                     .flags = @bitCast(module.CallbackFlags{
                         .async_call = cb_flags.async_call,
                         .once = true,
+                        .pass_this = cb_flags.pass_this,
+                        .ref_codec = cb_flags.ref_codec,
                     }),
                 };
 
@@ -2092,6 +2228,110 @@ pub fn Js(comptime host: type) type {
                     return target_desc;
                 }
 
+                fn invokeWithFrame(
+                    comptime CallFnT: type,
+                    callee: anytype,
+                    prefix_args: anytype,
+                    frame: *Args,
+                ) anyerror!void {
+                    const c_info = @typeInfo(CallFnT).@"fn";
+                    const prefix_len = prefix_args.len;
+                    const CRet = c_info.return_type orelse void;
+                    if (comptime use_ref_codec) {
+                        defer {
+                            inline for (0..fn_info.param_types.len) |i| {
+                                const field_name = std.fmt.comptimePrint("{d}", .{i});
+                                const wire_ref: Ref(module.Any) = @field(frame, field_name);
+                                wire_ref.deinit();
+                            }
+                        }
+                        var cb_arena = std.heap.ArenaAllocator.init(CallbackRegistry.backingAllocator());
+                        defer cb_arena.deinit();
+                        const cb_alloc = cb_arena.allocator();
+
+                        var call_args: std.meta.ArgsTuple(CallFnT) = undefined;
+                        inline for (0..prefix_len) |pi| {
+                            call_args[pi] = prefix_args[pi];
+                        }
+                        var decoded_mask: [fn_info.param_types.len]bool = @splat(false);
+                        defer {
+                            inline for (0..fn_info.param_types.len) |i| {
+                                if (decoded_mask[i]) {
+                                    const TargetParamT = c_info.param_types[prefix_len + i].?;
+                                    freeDecoded(TargetParamT, cb_alloc, call_args[prefix_len + i]);
+                                }
+                            }
+                        }
+                        const wire_has_err_union = comptime (@typeInfo(WireRT) == .error_union);
+                        inline for (0..fn_info.param_types.len) |i| {
+                            const field_name = std.fmt.comptimePrint("{d}", .{i});
+                            const raw_ref: Ref(module.Any) = @field(frame, field_name);
+                            const TargetParamT = c_info.param_types[prefix_len + i].?;
+                            if (fromJsRefAlloc(TargetParamT, cb_alloc, raw_ref)) |dec_v| {
+                                call_args[prefix_len + i] = dec_v;
+                                decoded_mask[i] = true;
+                            } else |dec_err| {
+                                if (comptime wire_has_err_union) {
+                                    frame.retval = dec_err;
+                                    return;
+                                }
+                                return dec_err;
+                            }
+                        }
+                        const val = if (comptime (@typeInfo(CRet) == .error_union)) blk_call: {
+                            if (@call(.auto, callee, call_args)) |ok_v| {
+                                break :blk_call ok_v;
+                            } else |call_err| {
+                                if (comptime wire_has_err_union) {
+                                    const WireErrSet = @typeInfo(WireRT).error_union.error_set;
+                                    if (comptime (@typeInfo(@typeInfo(CRet).error_union.error_set).error_set.error_names != null)) {
+                                        frame.retval = @as(WireErrSet, call_err);
+                                        return;
+                                    }
+                                }
+                                return call_err;
+                            }
+                        } else @call(.auto, callee, call_args);
+                        if (comptime (UnwrappedRT != void)) {
+                            const AliasCheck = struct {
+                                args_ptr: *const std.meta.ArgsTuple(CallFnT),
+                                fn contains(self_chk: @This(), h: u32) bool {
+                                    inline for (0..fn_info.param_types.len) |i| {
+                                        const TargetParamT = c_info.param_types[prefix_len + i].?;
+                                        if (valueContainsHandle(TargetParamT, self_chk.args_ptr[prefix_len + i], h)) return true;
+                                    }
+                                    return false;
+                                }
+                            };
+                            defer releaseReturnedHandlesIfNotAliased(@TypeOf(val), val, AliasCheck{ .args_ptr = &call_args });
+                            const enc_ref = toJsRef(@TypeOf(val), val) catch |enc_err| {
+                                if (comptime wire_has_err_union) {
+                                    frame.retval = enc_err;
+                                    return;
+                                }
+                                return enc_err;
+                            };
+                            frame.retval = enc_ref;
+                        } else if (comptime wire_has_err_union) {
+                            frame.retval = {};
+                        }
+                    } else {
+                        var call_args: std.meta.ArgsTuple(CallFnT) = undefined;
+                        inline for (0..prefix_len) |pi| {
+                            call_args[pi] = prefix_args[pi];
+                        }
+                        inline for (0..fn_info.param_types.len) |i| {
+                            const field_name = std.fmt.comptimePrint("{d}", .{i});
+                            call_args[prefix_len + i] = @field(frame, field_name);
+                        }
+                        if (@typeInfo(CRet) == .error_union and @typeInfo(RT) != .error_union) {
+                            frame.retval = try @call(.auto, callee, call_args);
+                        } else {
+                            frame.retval = @call(.auto, callee, call_args);
+                        }
+                    }
+                }
+
                 fn makeInvoker(comptime CtxPtrT: type, comptime handler: anytype) CallbackRegistry.InvokerFn {
                     const HandlerT = @TypeOf(handler);
                     const h_info = @typeInfo(HandlerT).@"fn";
@@ -2105,18 +2345,7 @@ pub fn Js(comptime host: type) type {
                         fn invoke(raw_ctx: *anyopaque, raw_arg: *anyopaque) anyerror!void {
                             const typed_ctx: CtxPtrT = @ptrCast(@alignCast(raw_ctx));
                             const frame: *Args = @ptrCast(@alignCast(raw_arg));
-                            var call_args: std.meta.ArgsTuple(HandlerT) = undefined;
-                            call_args[0] = typed_ctx;
-                            inline for (0..fn_info.param_types.len) |i| {
-                                const field_name = std.fmt.comptimePrint("{d}", .{i});
-                                call_args[i + 1] = @field(frame, field_name);
-                            }
-                            const HRet = h_info.return_type orelse void;
-                            if (@typeInfo(HRet) == .error_union and @typeInfo(RT) != .error_union) {
-                                frame.retval = try @call(.auto, handler, call_args);
-                            } else {
-                                frame.retval = @call(.auto, handler, call_args);
-                            }
+                            return invokeWithFrame(HandlerT, handler, .{typed_ctx}, frame);
                         }
                     };
                     return &Wrapper.invoke;
@@ -2195,22 +2424,11 @@ pub fn Js(comptime host: type) type {
                         fn invoke(raw_ptr: *anyopaque, raw_arg: *anyopaque) anyerror!void {
                             const box: *HeapBox = @ptrCast(@alignCast(raw_ptr));
                             const frame: *Args = @ptrCast(@alignCast(raw_arg));
-                            var call_args: std.meta.ArgsTuple(HandlerT) = undefined;
                             const FirstParamT = h_info.param_types[0].?;
                             if (comptime FirstParamT == Ctx) {
-                                call_args[0] = box.ctx;
+                                return invokeWithFrame(HandlerT, handler, .{box.ctx}, frame);
                             } else {
-                                call_args[0] = &box.ctx;
-                            }
-                            inline for (0..fn_info.param_types.len) |i| {
-                                const field_name = std.fmt.comptimePrint("{d}", .{i});
-                                call_args[i + 1] = @field(frame, field_name);
-                            }
-                            const HRet = h_info.return_type orelse void;
-                            if (@typeInfo(HRet) == .error_union and @typeInfo(RT) != .error_union) {
-                                frame.retval = try @call(.auto, handler, call_args);
-                            } else {
-                                frame.retval = @call(.auto, handler, call_args);
+                                return invokeWithFrame(HandlerT, handler, .{&box.ctx}, frame);
                             }
                         }
                     };
@@ -2273,26 +2491,89 @@ pub fn Js(comptime host: type) type {
                     }
                     const Stateless = struct {
                         var dummy: u8 = 0;
-                        fn forward(_: *u8, raw_arg: *Args) anyerror!void {
-                            var call_args: std.meta.ArgsTuple(PlainFnT) = undefined;
-                            inline for (0..fn_info.param_types.len) |i| {
-                                const field_name = std.fmt.comptimePrint("{d}", .{i});
-                                call_args[i] = @field(raw_arg, field_name);
-                            }
-                            const PRet = p_info.return_type orelse void;
-                            if (@typeInfo(PRet) == .error_union and @typeInfo(RT) != .error_union) {
-                                raw_arg.retval = try @call(.auto, plain_fn, call_args);
-                            } else {
-                                raw_arg.retval = @call(.auto, plain_fn, call_args);
-                            }
-                        }
-                        fn invoke(raw_ctx: *anyopaque, raw_arg: *anyopaque) anyerror!void {
-                            const typed_ctx: *u8 = @ptrCast(raw_ctx);
+                        fn invoke(_: *anyopaque, raw_arg: *anyopaque) anyerror!void {
                             const frame: *Args = @ptrCast(@alignCast(raw_arg));
-                            return forward(typed_ctx, frame);
+                            return invokeWithFrame(PlainFnT, plain_fn, .{}, frame);
                         }
                     };
                     return registerSlot(@ptrCast(&Stateless.dummy), &Stateless.invoke, null, is_once);
+                }
+
+                fn tryInitFnPtrMode(fn_ptr: anytype, is_once: bool) module.CallError!Self {
+                    const PtrT = @TypeOf(fn_ptr);
+                    const PlainFnT = switch (@typeInfo(PtrT)) {
+                        .pointer => |pt| if (pt.size == .one and @typeInfo(pt.child) == .@"fn") pt.child else @compileError("Expected `*const fn (...) ...`, received " ++ @typeName(PtrT)),
+                        else => @compileError("Expected `*const fn (...) ...`, received " ++ @typeName(PtrT)),
+                    };
+                    const p_info = @typeInfo(PlainFnT).@"fn";
+                    if (p_info.param_types.len != fn_info.param_types.len) {
+                        @compileError("Stateless callback pointer parameter count mismatch");
+                    }
+                    const Box = struct {
+                        alloc: std.mem.Allocator,
+                        f: *const PlainFnT,
+
+                        fn destroy(raw_ptr: *anyopaque) void {
+                            const b: *@This() = @ptrCast(@alignCast(raw_ptr));
+                            const a = b.alloc;
+                            a.destroy(b);
+                        }
+                        fn invoke(raw_ptr: *anyopaque, raw_arg: *anyopaque) anyerror!void {
+                            const b: *@This() = @ptrCast(@alignCast(raw_ptr));
+                            const frame: *Args = @ptrCast(@alignCast(raw_arg));
+                            return invokeWithFrame(PlainFnT, b.f, .{}, frame);
+                        }
+                    };
+                    const alloc = CallbackRegistry.backingAllocator();
+                    const box = try alloc.create(Box);
+                    box.* = .{ .alloc = alloc, .f = fn_ptr };
+                    if (!isJsThread()) {
+                        alloc.destroy(box);
+                        return error.OffJsThread;
+                    }
+                    if (!@hasDecl(host, "createZigCallback")) {
+                        alloc.destroy(box);
+                        return error.HostUnavailable;
+                    }
+                    const effective_once = is_once or cb_flags.once;
+                    const desc = ensureDescriptor(effective_once);
+                    const slot_id = CallbackRegistry.allocate(@ptrCast(box), &Box.invoke, &Box.destroy, effective_once, desc.signature) catch |err| {
+                        alloc.destroy(box);
+                        return err;
+                    };
+                    const handle = host.createZigCallback(desc, slot_id) catch |err| {
+                        _ = CallbackRegistry.release(slot_id);
+                        return err;
+                    };
+                    CallbackRegistry.setHandle(slot_id, handle);
+                    return .{
+                        .id = slot_id,
+                        .func = .{ .handle = handle },
+                    };
+                }
+
+                pub fn tryInitFnPtr(fn_ptr: anytype) module.CallError!Self {
+                    return tryInitFnPtrMode(fn_ptr, false);
+                }
+
+                pub fn initFnPtr(fn_ptr: anytype) Self {
+                    return tryInitFnPtr(fn_ptr) catch |err| switch (err) {
+                        error.OffJsThread => @panic("JsValue operations require the JS thread"),
+                        error.HostUnavailable => @panic("JsValue host imports unavailable"),
+                        else => @panic("Failed to initialize Zig JS callback pointer"),
+                    };
+                }
+
+                pub fn tryOnceFnPtr(fn_ptr: anytype) module.CallError!Self {
+                    return tryInitFnPtrMode(fn_ptr, true);
+                }
+
+                pub fn onceFnPtr(fn_ptr: anytype) Self {
+                    return tryOnceFnPtr(fn_ptr) catch |err| switch (err) {
+                        error.OffJsThread => @panic("JsValue operations require the JS thread"),
+                        error.HostUnavailable => @panic("JsValue host imports unavailable"),
+                        else => @panic("Failed to initialize one-shot Zig JS callback pointer"),
+                    };
                 }
 
                 pub fn tryInitFn(comptime plain_fn: anytype) module.CallError!Self {
@@ -2422,6 +2703,10 @@ pub fn Js(comptime host: type) type {
 
         pub fn Closure(comptime Ctx: type, comptime FnOrSig: anytype) type {
             return ClosureWithOptions(Ctx, FnOrSig, .{});
+        }
+
+        pub fn ClosureWithThis(comptime Ctx: type, comptime FnOrSig: anytype) type {
+            return ClosureWithOptions(Ctx, FnOrSig, .{ .pass_this = true, .ref_codec = true });
         }
 
         pub fn AsyncClosure(comptime Ctx: type, comptime FnOrSig: anytype) type {
@@ -5978,6 +6263,24 @@ pub fn Js(comptime host: type) type {
                         .none, .null_only, .null_or_undefined => Ref(module.Any).@"null",
                     };
                 },
+                .comptime_int => {
+                    if (comptime (value >= -9007199254740991 and value <= 9007199254740991)) {
+                        return toJsRefWithSpecImpl(f64, @as(f64, @floatFromInt(value)), module.NullishKind.none, .{});
+                    }
+                    if (comptime (value >= std.math.minInt(i64) and value <= std.math.maxInt(i64))) {
+                        return toJsRefWithSpecImpl(i64, @as(i64, value), module.NullishKind.none, .{});
+                    }
+                    return toJsRefWithSpecImpl(i128, @as(i128, value), module.NullishKind.none, .{});
+                },
+                .comptime_float => {
+                    return toJsRefWithSpecImpl(f64, @as(f64, value), module.NullishKind.none, .{});
+                },
+                .null => {
+                    return switch (comptime specSelfNullish(spec)) {
+                        .undefined_only => Ref(module.Any).@"undefined",
+                        .none, .null_only, .null_or_undefined => Ref(module.Any).@"null",
+                    };
+                },
                 .int => |it| {
                     if (comptime (it.bits <= 32)) {
                         return toJsRefWithSpecImpl(f64, @floatFromInt(value), module.NullishKind.none, .{});
@@ -6141,6 +6444,10 @@ pub fn Js(comptime host: type) type {
 
                     if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_enum") and T.zigar_js.is_enum and @hasField(T, "__zigar_value")) {
                         return toJsRefWithSpecImpl(@TypeOf(value.__zigar_value), value.__zigar_value, module.NullishKind.none, .{});
+                    }
+
+                    if (comptime (@hasDecl(T, "is_zig_callback") and T.is_zig_callback)) {
+                        return .{ .handle = (try (@as(Ref(module.Any), .{ .handle = value.func.handle })).tryClone()).handle };
                     }
 
                     if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_handle") and T.zigar_js.is_handle)) {
@@ -9126,11 +9433,14 @@ test "Js.String, Nullable(T), needsDecodeAllocator, and tuple/slice marshaling h
         arr: std.ArrayList(u32),
         rec: std.ArrayList(RecProp),
         buf: usize,
+        cb_fn: u32,
     };
 
     const MarshalingMockHost = struct {
+        pub const default_allocator = std.testing.allocator;
         var entries: [256]ValEntry = @splat(.unused);
         var refcounts: [256]u32 = @splat(0);
+        var cb_handles: [64]struct { cid: u32 = 0, handle: u32 = 0 } = @splat(.{});
 
         fn reset() void {
             for (&entries, 0..) |*e, idx| {
@@ -9202,8 +9512,31 @@ test "Js.String, Nullable(T), needsDecodeAllocator, and tuple/slice marshaling h
                 .num => .number,
                 .bi => .bigint,
                 .arr, .rec, .buf => .object,
+                .cb_fn => .function,
                 .unused => .@"undefined",
             };
+        }
+
+        pub fn createZigCallback(_: *const anyopaque, callback_id: u32) CallError!u32 {
+            const h = allocVal(.{ .cb_fn = callback_id });
+            for (&cb_handles) |*slot| {
+                if (slot.cid == 0) {
+                    slot.* = .{ .cid = callback_id, .handle = h };
+                    break;
+                }
+            }
+            return h;
+        }
+
+        pub fn releaseZigCallback(callback_id: u32) void {
+            for (&cb_handles) |*slot| {
+                if (slot.cid == callback_id) {
+                    const h = slot.handle;
+                    slot.* = .{};
+                    releaseJsValue(h);
+                    break;
+                }
+            }
         }
 
         pub fn instanceofJsValue(_: u32, _: u32) bool {
@@ -9941,6 +10274,102 @@ test "Js.String, Nullable(T), needsDecodeAllocator, and tuple/slice marshaling h
         try expectEqual(std.meta.activeTag(h_to), .opts);
         try std.testing.expectEqualStrings("example.com", h_to.opts.host);
         js.freeDecoded(HeteroTarget, alloc, h_to);
+
+        // 8. M3.3a: Callback `ref_codec`, `pass_this` flag, runtime `tryInitFnPtr`, and `toJsRef` on `Closure`
+        const MockHandle = struct {
+            ref: js.Ref(js.Object),
+            pub const zigar_js = .{ .is_handle = true };
+        };
+        const CbState = struct {
+            seen_len: usize = 0,
+            had_opt: bool = false,
+
+            fn onData(self: *@This(), h: MockHandle, opt_tag: ?[]const u8) !MockHandle {
+                _ = h;
+                if (opt_tag) |t| {
+                    self.seen_len += t.len;
+                    self.had_opt = true;
+                } else {
+                    self.had_opt = false;
+                }
+                const out_rec = try js.Record([]const u8, js.Ref(js.Any)).init();
+                return .{ .ref = .{ .handle = out_rec.handle } };
+            }
+        };
+        var cb_state: CbState = .{};
+        var typed_cl = try js.ClosureWithThis(*CbState, fn (*CbState, MockHandle, ?[]const u8) anyerror!MockHandle).tryInit(&cb_state, CbState.onData);
+        defer typed_cl.deinit();
+
+        // `toJsRef` on Closure clones its underlying Function handle cleanly
+        const cl_ref = try js.toJsRef(@TypeOf(typed_cl), typed_cl);
+        cl_ref.deinit();
+        const cl_ptr_ref = try js.toJsRef(*const @TypeOf(typed_cl), &typed_cl);
+        cl_ptr_ref.deinit();
+
+        // Invoke underlying trampoline directly with a handle + omitted optional (`undefined`) and verify 0 handle leaks!
+        const CbBackend = js.CallbackWithOptions(fn (MockHandle, ?[]const u8) MockHandle, .{ .pass_this = true, .ref_codec = true });
+        try expectEqual(@as(u32, 4 | 8), @as(u32, @bitCast(js.CallbackFlags{ .pass_this = true, .ref_codec = true })));
+        var backend_cb = try CbBackend.tryInit(&cb_state, CbState.onData);
+        defer backend_cb.deinit();
+
+        const WireArgs = arg_struct.ArgStruct(fn (js.Ref(js.Any), js.Ref(js.Any)) js.Ref(js.Any));
+        const in_obj = try js.Record([]const u8, js.Ref(js.Any)).init();
+        var wire_frame: WireArgs = .{
+            .retval = js.Ref(js.Any).@"undefined",
+            .@"0" = try (@as(js.Ref(js.Any), .{ .handle = in_obj.handle })).tryClone(),
+            .@"1" = js.Ref(js.Any).@"undefined",
+        };
+        const resolved_slot = js.CallbackRegistry.resolve(backend_cb.id).?;
+        try resolved_slot.entry.invoker.?(resolved_slot.entry.ctx_ptr, @ptrCast(&wire_frame));
+        try expect(!cb_state.had_opt);
+        wire_frame.retval.deinit();
+
+        const tag_str = try js.String.fromSlice("chunk-42");
+        wire_frame = .{
+            .retval = js.Ref(js.Any).@"undefined",
+            .@"0" = .{ .handle = in_obj.handle },
+            .@"1" = tag_str.toRef(),
+        };
+        try resolved_slot.entry.invoker.?(resolved_slot.entry.ctx_ptr, @ptrCast(&wire_frame));
+        try expect(cb_state.had_opt);
+        try expectEqual(@as(usize, 8), cb_state.seen_len);
+        wire_frame.retval.deinit();
+
+        // Runtime `*const fn` pointer callback via `tryInitFnPtr` + passthrough aliased handle return!
+        const RtFns = struct {
+            fn mulTwo(x: f64) f64 {
+                return x * 2.0;
+            }
+            fn echoHandle(h: MockHandle) MockHandle {
+                return h;
+            }
+        };
+        var rt_fn_ptr: *const fn (f64) f64 = &RtFns.mulTwo;
+        _ = &rt_fn_ptr;
+        var ptr_cb = try js.CallbackWithOptions(fn (f64) f64, .{ .ref_codec = true }).tryInitFnPtr(rt_fn_ptr);
+        const PtrWireArgs = arg_struct.ArgStruct(fn (js.Ref(js.Any)) js.Ref(js.Any));
+        const num_in = try js.toJsRef(f64, 21.0);
+        var ptr_frame: PtrWireArgs = .{
+            .retval = js.Ref(js.Any).@"undefined",
+            .@"0" = num_in,
+        };
+        const ptr_slot = js.CallbackRegistry.resolve(ptr_cb.id).?;
+        try ptr_slot.entry.invoker.?(ptr_slot.entry.ctx_ptr, @ptrCast(&ptr_frame));
+        try expectEqual(@as(f64, 42.0), try js.fromJsRef(f64, ptr_frame.retval));
+        ptr_frame.retval.deinit();
+        ptr_cb.deinit();
+
+        var echo_cb = try js.CallbackWithOptions(fn (MockHandle) MockHandle, .{ .ref_codec = true }).tryInitFn(RtFns.echoHandle);
+        const echo_in = try js.Record([]const u8, js.Ref(js.Any)).init();
+        var echo_frame: PtrWireArgs = .{
+            .retval = js.Ref(js.Any).@"undefined",
+            .@"0" = .{ .handle = echo_in.handle },
+        };
+        const echo_slot = js.CallbackRegistry.resolve(echo_cb.id).?;
+        try echo_slot.entry.invoker.?(echo_slot.entry.ctx_ptr, @ptrCast(&echo_frame));
+        try expect(!echo_frame.retval.isUndefined());
+        echo_frame.retval.deinit();
+        echo_cb.deinit();
     }
     try expectEqual(@as(u32, 0), js.activeHandleCount());
 }
