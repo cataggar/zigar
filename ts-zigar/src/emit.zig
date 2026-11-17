@@ -607,8 +607,9 @@ const ModuleEmitCtx = struct {
             if (std.mem.eql(u8, unquoteZigIdent(d.zig_ident), head)) {
                 if (path.len == 1) return d;
                 return switch (d.kind) {
-                    .namespace_decl => |sub| findDeclByZigPath(sub, path[1..]),
+                    .namespace_decl => |sub| findDeclByZigPath(sub.children, path[1..]),
                     .struct_decl => |st| findDeclByZigPath(st.nested_decls, path[1..]),
+                    .enum_decl => |en| findDeclByZigPath(en.nested_decls, path[1..]),
                     else => null,
                 };
             }
@@ -1603,7 +1604,7 @@ const ModuleEmitCtx = struct {
                 try self.out.appendSlice(self.allocator, "},\n};\n}");
             },
             .inline_enum => |en| {
-                try self.emitClosedEnumBody(null, false, en.backing, en.members);
+                try self.emitClosedEnumBody(null, false, false, en.backing, en.members, &.{});
             },
             .open_literal_union => |olu| {
                 try self.emitOpenLiteralBody(null, olu);
@@ -1802,7 +1803,7 @@ const ModuleEmitCtx = struct {
     ) !void {
         const is_default_call = !d.is_global_scope and
             self.ns_wire_path.items.len == 0 and
-            (d.is_default_export or self.isExportEqualsRootDecl(d));
+            (d.is_default_export or self.isExportEqualsRootDecl(d) or std.mem.eql(u8, d.wire_name, "default"));
 
         var param_type_exprs = try self.allocator.alloc(?[]u8, sig.params.len);
         @memset(param_type_exprs, null);
@@ -2360,6 +2361,163 @@ const ModuleEmitCtx = struct {
         }
     }
 
+    fn emitStructIndexAccessor(
+        self: *ModuleEmitCtx,
+        st: ir.StructDeclIr,
+        ia: ir.IndexAccessorIr,
+    ) error{OutOfMemory}!void {
+        const synth_params = [_]ir.ParamIr{
+            .{
+                .zig_ident = ia.key_param_ident,
+                .logical_name = ia.key_param_ident,
+                .wire_name = ia.key_param_ident,
+                .ty = ia.key_ty,
+                .is_optional = false,
+                .is_rest = false,
+            },
+            .{
+                .zig_ident = ia.setter_val_param_ident,
+                .logical_name = ia.setter_val_param_ident,
+                .wire_name = ia.setter_val_param_ident,
+                .ty = ia.setter_ty,
+                .is_optional = false,
+                .is_rest = false,
+            },
+        };
+        const synth_sig = ir.SignatureIr{
+            .type_params = &.{},
+            .self_param_ident = st.self_param_ident,
+            .alloc_param_ident = ia.getter_alloc_param_ident,
+            .params = &synth_params,
+            .return_type = ia.getter_ty,
+            .has_type_predicate = false,
+            .type_predicate_asserts = false,
+            .jsdoc = null,
+        };
+
+        var shared_key_expr_opt: ?[]u8 = null;
+        defer if (shared_key_expr_opt) |buf| self.allocator.free(buf);
+        if (typeHasInlineNominal(ia.key_ty)) {
+            shared_key_expr_opt = try self.emitSharedNominalTypeExpr(ia.key_ty, synth_sig);
+        }
+
+        var shared_set_expr_opt: ?[]u8 = null;
+        defer if (shared_set_expr_opt) |buf| self.allocator.free(buf);
+        var shared_get_expr_opt: ?[]u8 = null;
+        defer if (shared_get_expr_opt) |buf| self.allocator.free(buf);
+
+        const getter_wraps_setter = ia.getter_ty.* == .optional and ia.getter_ty.optional.child == ia.setter_ty;
+        if (typeHasInlineNominal(ia.setter_ty)) {
+            shared_set_expr_opt = try self.emitSharedNominalTypeExpr(ia.setter_ty, synth_sig);
+        } else if (typeHasInlineNominal(ia.getter_ty)) {
+            shared_get_expr_opt = try self.emitSharedNominalTypeExpr(ia.getter_ty, synth_sig);
+        }
+
+        try self.out.print(
+            self.allocator,
+            "pub fn {s}({s}: {s}, {s}: ",
+            .{ ia.getter_ident, st.self_param_ident, st.self_ident, ia.key_param_ident },
+        );
+        if (shared_key_expr_opt) |kexpr| {
+            try self.out.appendSlice(self.allocator, kexpr);
+        } else {
+            try self.emitType(ia.key_ty);
+        }
+        try self.out.appendSlice(self.allocator, ") __zigar_js.CallError!");
+        if (shared_set_expr_opt) |sexpr| {
+            if (getter_wraps_setter) try self.out.append(self.allocator, '?');
+            try self.out.appendSlice(self.allocator, sexpr);
+        } else if (shared_get_expr_opt) |gexpr| {
+            try self.out.appendSlice(self.allocator, gexpr);
+        } else {
+            try self.emitType(ia.getter_ty);
+        }
+        try self.out.appendSlice(self.allocator, " {\n");
+
+        const strict_lit = if (ia.strict_undefined_missing) "true" else "false";
+        if (ia.getter_alloc_ident) |alloc_id| {
+            try self.out.print(
+                self.allocator,
+                "return @This().{s}({s}, try __zigar_js.defaultAllocator(), {s});\n}}\n",
+                .{ alloc_id, st.self_param_ident, ia.key_param_ident },
+            );
+            try self.out.print(
+                self.allocator,
+                "pub fn {s}({s}: {s}, {s}: @import(\"std\").mem.Allocator, {s}: ",
+                .{ alloc_id, st.self_param_ident, st.self_ident, ia.getter_alloc_param_ident, ia.key_param_ident },
+            );
+            if (shared_key_expr_opt) |kexpr| {
+                try self.out.appendSlice(self.allocator, kexpr);
+            } else {
+                try self.emitType(ia.key_ty);
+            }
+            try self.out.appendSlice(self.allocator, ") __zigar_js.CallError!");
+            if (shared_set_expr_opt) |sexpr| {
+                if (getter_wraps_setter) try self.out.append(self.allocator, '?');
+                try self.out.appendSlice(self.allocator, sexpr);
+            } else if (shared_get_expr_opt) |gexpr| {
+                try self.out.appendSlice(self.allocator, gexpr);
+            } else {
+                try self.emitType(ia.getter_ty);
+            }
+            try self.out.appendSlice(self.allocator, " {\nreturn __zigar_js.getIndexedPropAlloc(");
+            if (shared_set_expr_opt) |sexpr| {
+                if (getter_wraps_setter) try self.out.append(self.allocator, '?');
+                try self.out.appendSlice(self.allocator, sexpr);
+            } else if (shared_get_expr_opt) |gexpr| {
+                try self.out.appendSlice(self.allocator, gexpr);
+            } else {
+                try self.emitType(ia.getter_ty);
+            }
+            try self.out.print(
+                self.allocator,
+                ", {s}, {s}.{s}, {s}, {s});\n}}\n",
+                .{ ia.getter_alloc_param_ident, st.self_param_ident, st.ref_field_ident, ia.key_param_ident, strict_lit },
+            );
+        } else {
+            try self.out.appendSlice(self.allocator, "return __zigar_js.getIndexedProp(");
+            if (shared_set_expr_opt) |sexpr| {
+                if (getter_wraps_setter) try self.out.append(self.allocator, '?');
+                try self.out.appendSlice(self.allocator, sexpr);
+            } else if (shared_get_expr_opt) |gexpr| {
+                try self.out.appendSlice(self.allocator, gexpr);
+            } else {
+                try self.emitType(ia.getter_ty);
+            }
+            try self.out.print(
+                self.allocator,
+                ", {s}.{s}, {s}, {s});\n}}\n",
+                .{ st.self_param_ident, st.ref_field_ident, ia.key_param_ident, strict_lit },
+            );
+        }
+
+        if (ia.setter_ident) |setter_id| {
+            try self.out.print(
+                self.allocator,
+                "pub fn {s}({s}: {s}, {s}: ",
+                .{ setter_id, st.self_param_ident, st.self_ident, ia.setter_key_param_ident },
+            );
+            if (shared_key_expr_opt) |kexpr| {
+                try self.out.appendSlice(self.allocator, kexpr);
+            } else {
+                try self.emitType(ia.key_ty);
+            }
+            try self.out.print(self.allocator, ", {s}: ", .{ia.setter_val_param_ident});
+            if (shared_set_expr_opt) |sexpr| {
+                try self.out.appendSlice(self.allocator, sexpr);
+            } else {
+                try self.emitType(ia.setter_ty);
+            }
+            try self.out.print(
+                self.allocator,
+                ") __zigar_js.CallError!void {{\nreturn __zigar_js.setIndexedProp(@TypeOf({s}), {s}.{s}, {s}, {s}, ",
+                .{ ia.setter_val_param_ident, st.self_param_ident, st.ref_field_ident, ia.setter_key_param_ident, ia.setter_val_param_ident },
+            );
+            try self.emitNullishSpec(ia.setter_ty, false);
+            try self.out.appendSlice(self.allocator, ");\n}\n");
+        }
+    }
+
     fn emitStructBody(
         self: *ModuleEmitCtx,
         wire_name: []const u8,
@@ -2382,6 +2540,9 @@ const ModuleEmitCtx = struct {
         for (st.constructors) |ctor| {
             try frame_list.append(self.allocator, ctor.zig_ident);
         }
+        if (st.empty_init_ident) |eii| {
+            try frame_list.append(self.allocator, eii);
+        }
         for (st.methods) |m| {
             try frame_list.append(self.allocator, m.zig_ident);
             if (m.alloc_companion_ident) |aci| {
@@ -2393,10 +2554,24 @@ const ModuleEmitCtx = struct {
             if (ip.getter_alloc_ident) |gai| try frame_list.append(self.allocator, gai);
             if (ip.setter_ident) |si| try frame_list.append(self.allocator, si);
         }
+        for (st.index_accessors) |ia| {
+            try frame_list.append(self.allocator, ia.getter_ident);
+            if (ia.getter_alloc_ident) |gai| try frame_list.append(self.allocator, gai);
+            if (ia.setter_ident) |si| try frame_list.append(self.allocator, si);
+        }
         if (st.deinit_ident) |di| try frame_list.append(self.allocator, di);
+        if (st.clone_ident) |ci| try frame_list.append(self.allocator, ci);
+        if (st.as_ident) |ai| try frame_list.append(self.allocator, ai);
+        if (st.try_as_ident) |tai| try frame_list.append(self.allocator, tai);
         if (st.to_js_ref_ident) |ti| try frame_list.append(self.allocator, ti);
         if (st.from_js_ref_ident) |fi_id| try frame_list.append(self.allocator, fi_id);
         if (st.from_js_ref_alloc_ident) |fai_id| try frame_list.append(self.allocator, fai_id);
+        for (st.merged_call_fns) |cf| {
+            try frame_list.append(self.allocator, cf.zig_ident);
+            if (cf.alloc_companion_ident) |aci| {
+                try frame_list.append(self.allocator, aci);
+            }
+        }
         for (st.nested_decls) |nd| {
             try frame_list.append(self.allocator, nd.zig_ident);
             if (nd.alloc_companion_ident) |aci| {
@@ -2478,6 +2653,13 @@ const ModuleEmitCtx = struct {
         for (st.constructors) |ctor| {
             try self.emitStructConstructor(wire_name, is_global_scope, is_default_export, ctor);
         }
+        if (st.empty_init_ident) |eii| {
+            try self.out.print(
+                self.allocator,
+                "pub fn {s}() __zigar_js.CallError!{s} {{\nreturn __zigar_js.initEmptyHandle({s});\n}}\n",
+                .{ eii, st.self_ident, st.self_ident },
+            );
+        }
 
         for (st.methods) |m| {
             try self.emitStructMethod(wire_name, is_global_scope, push_owner_seg, st, m);
@@ -2487,12 +2669,37 @@ const ModuleEmitCtx = struct {
             try self.emitStructInstanceProp(st, ip);
         }
 
+        for (st.index_accessors) |ia| {
+            try self.emitStructIndexAccessor(st, ia);
+        }
+
         if (st.repr == .handle_wrapper) {
             if (st.deinit_ident) |di| {
                 try self.out.print(
                     self.allocator,
                     "pub fn {s}({s}: {s}) void {{\n{s}.{s}.deinit();\n}}\n",
                     .{ di, st.self_param_ident, st.self_ident, st.self_param_ident, st.ref_field_ident },
+                );
+            }
+            if (st.clone_ident) |ci| {
+                try self.out.print(
+                    self.allocator,
+                    "pub fn {s}({s}: {s}) __zigar_js.CallError!{s} {{\nreturn __zigar_js.cloneHandle({s}, {s});\n}}\n",
+                    .{ ci, st.self_param_ident, st.self_ident, st.self_ident, st.self_ident, st.self_param_ident },
+                );
+            }
+            if (st.as_ident) |ai| {
+                try self.out.print(
+                    self.allocator,
+                    "pub fn {s}({s}: {s}, comptime {s}: type) {s} {{\nreturn __zigar_js.upcastValue({s}, {s}, {s});\n}}\n",
+                    .{ ai, st.self_param_ident, st.self_ident, st.base_type_param_ident, st.base_type_param_ident, st.self_ident, st.self_param_ident, st.base_type_param_ident },
+                );
+            }
+            if (st.try_as_ident) |tai| {
+                try self.out.print(
+                    self.allocator,
+                    "pub fn {s}({s}: {s}, comptime {s}: type) __zigar_js.CallError!?{s} {{\nreturn __zigar_js.downcastHandle({s}, {s}.{s});\n}}\n",
+                    .{ tai, st.self_param_ident, st.self_ident, st.sub_type_param_ident, st.sub_type_param_ident, st.sub_type_param_ident, st.self_param_ident, st.ref_field_ident },
                 );
             }
             if (st.to_js_ref_ident) |ti| {
@@ -2510,6 +2717,13 @@ const ModuleEmitCtx = struct {
                 );
             }
         } else {
+            if (st.as_ident) |ai| {
+                try self.out.print(
+                    self.allocator,
+                    "pub fn {s}({s}: {s}, comptime {s}: type) {s} {{\nreturn __zigar_js.upcastValue({s}, {s}, {s});\n}}\n",
+                    .{ ai, st.self_param_ident, st.self_ident, st.base_type_param_ident, st.base_type_param_ident, st.self_ident, st.self_param_ident, st.base_type_param_ident },
+                );
+            }
             if (st.to_js_ref_ident) |ti| {
                 try self.out.print(
                     self.allocator,
@@ -2533,6 +2747,10 @@ const ModuleEmitCtx = struct {
             }
         }
 
+        for (st.merged_call_fns) |cf| {
+            try self.emitDecl(cf);
+        }
+
         {
             if (push_owner_seg) {
                 try self.ns_wire_path.append(self.allocator, wire_name);
@@ -2553,6 +2771,14 @@ const ModuleEmitCtx = struct {
             for (st.type_params, 0..) |tp, idx| {
                 if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
                 try self.out.appendSlice(self.allocator, tp.zig_ident);
+            }
+            try self.out.appendSlice(self.allocator, " }");
+        }
+        if (st.bases.len > 0) {
+            try self.out.appendSlice(self.allocator, ",\n.bases = .{ ");
+            for (st.bases, 0..) |bty, idx| {
+                if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
+                try self.emitType(bty);
             }
             try self.out.appendSlice(self.allocator, " }");
         }
@@ -2641,10 +2867,31 @@ const ModuleEmitCtx = struct {
     fn emitClosedEnumBody(
         self: *ModuleEmitCtx,
         wire_name: ?[]const u8,
+        push_owner_seg: bool,
         is_const: bool,
         backing: lower_unions.EnumBackingKind,
         members: []const ir.EnumMemberIr,
+        nested_decls: []const ir.DeclIr,
     ) error{OutOfMemory}!void {
+        var frame_list: std.ArrayList([]const u8) = .empty;
+        defer frame_list.deinit(self.allocator);
+        if (nested_decls.len > 0) {
+            try frame_list.append(self.allocator, "zigar_js");
+            for (members) |m| try frame_list.append(self.allocator, m.zig_ident);
+            try frame_list.append(self.allocator, "toSlice");
+            try frame_list.append(self.allocator, "fromSlice");
+            try frame_list.append(self.allocator, "toInt");
+            try frame_list.append(self.allocator, "fromInt");
+            for (nested_decls) |nd| {
+                try frame_list.append(self.allocator, nd.zig_ident);
+                if (nd.alloc_companion_ident) |aci| try frame_list.append(self.allocator, aci);
+            }
+            try self.nested_decl_scopes.append(self.allocator, frame_list.items);
+        }
+        defer if (nested_decls.len > 0) {
+            _ = self.nested_decl_scopes.pop();
+        };
+
         switch (backing) {
             .none => try self.out.appendSlice(self.allocator, "enum {\n"),
             .i32 => try self.out.appendSlice(self.allocator, "enum(i32) {\n"),
@@ -2722,6 +2969,19 @@ const ModuleEmitCtx = struct {
             }
         }
 
+        if (nested_decls.len > 0) {
+            const push_seg = push_owner_seg and wire_name != null;
+            if (push_seg) {
+                try self.ns_wire_path.append(self.allocator, wire_name.?);
+            }
+            defer if (push_seg) {
+                _ = self.ns_wire_path.pop();
+            };
+            for (nested_decls) |nd| {
+                try self.emitDecl(nd);
+            }
+        }
+
         try self.out.appendSlice(self.allocator, "pub const zigar_js = .{\n");
         if (wire_name) |wn| {
             try self.out.appendSlice(self.allocator, ".js_name = ");
@@ -2755,8 +3015,26 @@ const ModuleEmitCtx = struct {
         has_unknown_values: bool,
         backing: lower_unions.EnumBackingKind,
         members: []const ir.EnumMemberIr,
+        nested_decls: []const ir.DeclIr,
     ) error{OutOfMemory}!void {
         if (has_unknown_values) {
+            var frame_list: std.ArrayList([]const u8) = .empty;
+            defer frame_list.deinit(self.allocator);
+            if (nested_decls.len > 0) {
+                try frame_list.append(self.allocator, "zigar_js");
+                try frame_list.append(self.allocator, "__zigar_value");
+                try frame_list.append(self.allocator, "deinit");
+                for (members) |m| try frame_list.append(self.allocator, m.zig_ident);
+                for (nested_decls) |nd| {
+                    try frame_list.append(self.allocator, nd.zig_ident);
+                    if (nd.alloc_companion_ident) |aci| try frame_list.append(self.allocator, aci);
+                }
+                try self.nested_decl_scopes.append(self.allocator, frame_list.items);
+            }
+            defer if (nested_decls.len > 0) {
+                _ = self.nested_decl_scopes.pop();
+            };
+
             try self.out.appendSlice(self.allocator, "struct {\n__zigar_value: __zigar_js.Any = .{ .handle = 0 },\n");
             for (members) |m| {
                 if (m.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
@@ -2771,6 +3049,17 @@ const ModuleEmitCtx = struct {
             }
             if (!enumMembersHaveLogicalName(members, "deinit")) {
                 try self.out.appendSlice(self.allocator, "pub fn deinit(__zigar_self: @This()) void {\n__zigar_self.__zigar_value.deinit();\n}\n");
+            }
+            if (nested_decls.len > 0) {
+                if (push_owner_seg) {
+                    try self.ns_wire_path.append(self.allocator, wire_name);
+                }
+                defer if (push_owner_seg) {
+                    _ = self.ns_wire_path.pop();
+                };
+                for (nested_decls) |nd| {
+                    try self.emitDecl(nd);
+                }
             }
             try self.out.appendSlice(self.allocator, "pub const zigar_js = .{\n.js_name = ");
             try self.emitStringLit(wire_name);
@@ -2793,7 +3082,7 @@ const ModuleEmitCtx = struct {
             return;
         }
 
-        try self.emitClosedEnumBody(wire_name, is_const, backing, members);
+        try self.emitClosedEnumBody(wire_name, push_owner_seg, is_const, backing, members, nested_decls);
     }
 
     fn emitOpenLiteralBody(
@@ -3058,10 +3347,17 @@ const ModuleEmitCtx = struct {
             },
             .struct_decl => |st| {
                 const push_owner = true;
+                var has_default_merged_call = false;
+                for (st.merged_call_fns) |cf| {
+                    if (cf.is_default_export) {
+                        has_default_merged_call = true;
+                        break;
+                    }
+                }
                 const is_default_cls = !d.is_global_scope and
                     self.ns_wire_path.items.len == 0 and
-                    (d.is_default_export or self.isExportEqualsRootDecl(d));
-                const set_def_owner = is_default_cls and d.is_default_export and self.mod.export_equals_wire_name == null;
+                    (d.is_default_export or has_default_merged_call or self.isExportEqualsRootDecl(d));
+                const set_def_owner = is_default_cls and (d.is_default_export or has_default_merged_call) and self.mod.export_equals_wire_name == null;
                 const prev_def_owner = self.active_default_owner_wire;
                 if (set_def_owner) self.active_default_owner_wire = d.wire_name;
                 defer if (set_def_owner) {
@@ -3085,12 +3381,12 @@ const ModuleEmitCtx = struct {
             .enum_decl => |en| {
                 const push_owner = true;
                 try self.out.print(self.allocator, "{s}const {s} = ", .{ pub_kw, d.zig_ident });
-                try self.emitEnumBody(d.wire_name, d.is_global_scope, push_owner, en.is_const, en.has_unknown_values, en.backing, en.members);
+                try self.emitEnumBody(d.wire_name, d.is_global_scope, push_owner, en.is_const, en.has_unknown_values, en.backing, en.members, en.nested_decls);
                 try self.out.appendSlice(self.allocator, ";\n");
             },
             .literal_enum_decl => |en| {
                 try self.out.print(self.allocator, "{s}const {s} = ", .{ pub_kw, d.zig_ident });
-                try self.emitClosedEnumBody(d.wire_name, false, en.backing, en.members);
+                try self.emitClosedEnumBody(d.wire_name, false, false, en.backing, en.members, &.{});
                 try self.out.appendSlice(self.allocator, ";\n");
             },
             .open_literal_decl => |olu| {
@@ -3141,15 +3437,46 @@ const ModuleEmitCtx = struct {
                     try self.out.appendSlice(self.allocator, ";\n}\n");
                 }
             },
-            .namespace_decl => |children| {
+            .namespace_decl => |ns| {
+                var has_default_merged_call = false;
+                for (ns.merged_call_fns) |cf| {
+                    if (cf.is_default_export) {
+                        has_default_merged_call = true;
+                        break;
+                    }
+                }
+                const set_def_owner = !d.is_global_scope and
+                    self.ns_wire_path.items.len == 0 and
+                    (d.is_default_export or has_default_merged_call) and
+                    self.mod.export_equals_wire_name == null;
+                const prev_def_owner = self.active_default_owner_wire;
+                if (set_def_owner) self.active_default_owner_wire = d.wire_name;
+                defer if (set_def_owner) {
+                    self.active_default_owner_wire = prev_def_owner;
+                };
+
                 var extra_allocs: usize = 0;
-                for (children) |cd| {
+                for (ns.merged_call_fns) |cf| {
+                    if (cf.alloc_companion_ident != null) extra_allocs += 1;
+                }
+                for (ns.children) |cd| {
                     if (cd.alloc_companion_ident != null) extra_allocs += 1;
                 }
-                const frame = try self.allocator.alloc([]const u8, children.len + extra_allocs + 1);
+                const frame = try self.allocator.alloc(
+                    []const u8,
+                    ns.merged_call_fns.len + ns.children.len + extra_allocs + 1,
+                );
                 defer self.allocator.free(frame);
                 var fi: usize = 0;
-                for (children) |cd| {
+                for (ns.merged_call_fns) |cf| {
+                    frame[fi] = cf.zig_ident;
+                    fi += 1;
+                    if (cf.alloc_companion_ident) |aci| {
+                        frame[fi] = aci;
+                        fi += 1;
+                    }
+                }
+                for (ns.children) |cd| {
                     frame[fi] = cd.zig_ident;
                     fi += 1;
                     if (cd.alloc_companion_ident) |aci| {
@@ -3161,12 +3488,16 @@ const ModuleEmitCtx = struct {
                 try self.nested_decl_scopes.append(self.allocator, frame);
                 defer _ = self.nested_decl_scopes.pop();
 
-                try self.ns_wire_path.append(self.allocator, d.wire_name);
-                defer _ = self.ns_wire_path.pop();
-
                 try self.out.print(self.allocator, "{s}const {s} = struct {{\n", .{ pub_kw, d.zig_ident });
-                for (children) |cd| {
-                    try self.emitDecl(cd);
+                for (ns.merged_call_fns) |cf| {
+                    try self.emitDecl(cf);
+                }
+                {
+                    try self.ns_wire_path.append(self.allocator, d.wire_name);
+                    defer _ = self.ns_wire_path.pop();
+                    for (ns.children) |cd| {
+                        try self.emitDecl(cd);
+                    }
                 }
                 try self.out.appendSlice(self.allocator, "pub const zigar_js = .{ .js_name = ");
                 try self.emitStringLit(d.wire_name);
@@ -4591,6 +4922,230 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    const encoded = try toJsRefWithSpec(T, value, spec);
         \\    defer encoded.deinit();
         \\    try raw_js.trySetProp(recv, prop_name, encoded);
+        \\}
+        \\
+        \\fn isGeneratedHandleStruct(comptime T: type) bool {
+        \\    return switch (@typeInfo(T)) {
+        \\        .@"struct" => @hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_handle") and T.zigar_js.is_handle,
+        \\        else => false,
+        \\    };
+        \\}
+        \\
+        \\fn generatedHandleRefFieldName(comptime T: type) []const u8 {
+        \\    if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "ref_field")) {
+        \\        return T.zigar_js.ref_field;
+        \\    }
+        \\    return "ref";
+        \\}
+        \\
+        \\fn isTemplateLiteralStruct(comptime T: type) bool {
+        \\    return switch (@typeInfo(T)) {
+        \\        .@"struct" => @hasDecl(T, "zigar_js") and
+        \\            @hasField(@TypeOf(T.zigar_js), "is_template_literal") and
+        \\            T.zigar_js.is_template_literal and
+        \\            @hasField(T, "raw"),
+        \\        else => false,
+        \\    };
+        \\}
+        \\
+        \\fn isJsValueStruct(comptime T: type) bool {
+        \\    if (@typeInfo(T) != .@"struct") return false;
+        \\    if (@hasDecl(T, "is_js_value") and T.is_js_value) return true;
+        \\    if (@hasDecl(T, "internal_type") and @typeInfo(@TypeOf(T.internal_type)) == .@"enum" and std.mem.eql(u8, @tagName(T.internal_type), "js_value")) return true;
+        \\    return false;
+        \\}
+        \\
+        \\fn assertValidDynamicKeyType(comptime K: type) void {
+        \\    if (K == []const u8 or K == []u8 or isStringSliceCoercible(K) or isTemplateLiteralStruct(K)) return;
+        \\    if (isJsValueStruct(K) or isGeneratedHandleStruct(K)) return;
+        \\    switch (@typeInfo(K)) {
+        \\        .float, .comptime_float, .int, .comptime_int => return,
+        \\        .@"enum" => {
+        \\            if (@hasDecl(K, "toSlice") or @hasDecl(K, "toInt")) return;
+        \\        },
+        \\        .pointer => |pt| {
+        \\            if (pt.size == .slice and pt.child == u8) return;
+        \\            if (pt.size == .many and pt.sentinel_ptr != null and pt.child == u8) return;
+        \\            if (pt.size == .one and (isJsValueStruct(pt.child) or isGeneratedHandleStruct(pt.child) or isTemplateLiteralStruct(pt.child))) return;
+        \\        },
+        \\        else => {},
+        \\    }
+        \\    @compileError("Dynamic JS property key must be `[]const u8`, numeric, template literal, or JS handle, received " ++ @typeName(K));
+        \\}
+        \\
+        \\pub fn getIndexedProp(
+        \\    comptime T: type,
+        \\    self_ref: anytype,
+        \\    key: anytype,
+        \\    comptime strict_undefined_missing: bool,
+        \\) CallError!T {
+        \\    comptime assertValidDynamicKeyType(@TypeOf(key));
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    return try raw_js.getIndexedProp(T, self_ref, key, strict_undefined_missing);
+        \\}
+        \\
+        \\pub fn getIndexedPropAlloc(
+        \\    comptime T: type,
+        \\    allocator: std.mem.Allocator,
+        \\    self_ref: anytype,
+        \\    key: anytype,
+        \\    comptime strict_undefined_missing: bool,
+        \\) CallError!T {
+        \\    comptime assertValidDynamicKeyType(@TypeOf(key));
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    return try raw_js.getIndexedPropAlloc(T, allocator, self_ref, key, strict_undefined_missing);
+        \\}
+        \\
+        \\pub fn setIndexedProp(
+        \\    comptime T: type,
+        \\    self_ref: anytype,
+        \\    key: anytype,
+        \\    value: T,
+        \\    comptime spec: anytype,
+        \\) CallError!void {
+        \\    comptime assertValidDynamicKeyType(@TypeOf(key));
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    try raw_js.setIndexedProp(T, self_ref, key, value, spec);
+        \\}
+        \\
+        \\pub fn initEmptyHandle(comptime SelfT: type) CallError!SelfT {
+        \\    comptime {
+        \\        if (!isGeneratedHandleStruct(SelfT)) {
+        \\            @compileError("initEmptyHandle requires a JS handle wrapper struct, received " ++ @typeName(SelfT));
+        \\        }
+        \\    }
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    return try raw_js.initEmptyHandle(SelfT);
+        \\}
+        \\
+        \\pub fn isAssignableType(comptime Derived: type, comptime Base: type) bool {
+        \\    if (has_host) return raw_js.isAssignableType(Derived, Base);
+        \\    return isAssignableTypeDepth(Derived, Base, 0);
+        \\}
+        \\
+        \\fn isAssignableTypeDepth(comptime Derived: type, comptime Base: type, comptime depth: usize) bool {
+        \\    @setEvalBranchQuota(10_000);
+        \\    if (Derived == Base) return true;
+        \\    if (depth >= 32) return false;
+        \\    if (@typeInfo(Derived) != .@"struct") return false;
+        \\    if (!@hasDecl(Derived, "zigar_js")) return false;
+        \\    if (!@hasField(@TypeOf(Derived.zigar_js), "bases")) return false;
+        \\    inline for (Derived.zigar_js.bases) |DirectBase| {
+        \\        if (isAssignableTypeDepth(DirectBase, Base, depth + 1)) return true;
+        \\    }
+        \\    return false;
+        \\}
+        \\
+        \\fn structWireNameForField(comptime T: type, comptime zig_field_name: []const u8) []const u8 {
+        \\    if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "fields")) {
+        \\        for (T.zigar_js.fields) |fm| {
+        \\            const fm_zig = if (@hasField(@TypeOf(fm), "zig_name")) fm.zig_name else fm.name;
+        \\            if (std.mem.eql(u8, fm_zig, zig_field_name)) return fm.name;
+        \\        }
+        \\    }
+        \\    return zig_field_name;
+        \\}
+        \\
+        \\fn findStructFieldByWireName(comptime T: type, comptime wire_name: []const u8) ?[]const u8 {
+        \\    if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "fields")) {
+        \\        for (T.zigar_js.fields) |fm| {
+        \\            if (std.mem.eql(u8, fm.name, wire_name)) {
+        \\                return if (@hasField(@TypeOf(fm), "zig_name")) fm.zig_name else fm.name;
+        \\            }
+        \\        }
+        \\    }
+        \\    if (@hasField(T, wire_name)) return wire_name;
+        \\    return null;
+        \\}
+        \\
+        \\fn projectFieldValue(comptime DstT: type, src_val: anytype) DstT {
+        \\    const SrcT = @TypeOf(src_val);
+        \\    if (SrcT == DstT) return src_val;
+        \\    if (@typeInfo(DstT) == .optional and @typeInfo(SrcT) == .optional) {
+        \\        const ChildT = @typeInfo(DstT).optional.child;
+        \\        return if (src_val) |sv| projectFieldValue(ChildT, sv) else null;
+        \\    }
+        \\    if (@typeInfo(DstT) == .optional) {
+        \\        const ChildT = @typeInfo(DstT).optional.child;
+        \\        return projectFieldValue(ChildT, src_val);
+        \\    }
+        \\    if (@typeInfo(DstT) == .@"enum" and @typeInfo(SrcT) == .@"enum") {
+        \\        return switch (src_val) {
+        \\            inline else => |tag| @field(DstT, @tagName(tag)),
+        \\        };
+        \\    }
+        \\    if (@typeInfo(DstT) == .@"union") {
+        \\        if (@typeInfo(SrcT) == .@"union" and @typeInfo(SrcT).@"union".tag_type != null and @typeInfo(DstT).@"union".tag_type != null) {
+        \\            return switch (src_val) {
+        \\                inline else => |payload, tag| @unionInit(
+        \\                    DstT,
+        \\                    @tagName(tag),
+        \\                    projectFieldValue(@FieldType(DstT, @tagName(tag)), payload),
+        \\                ),
+        \\            };
+        \\        }
+        \\        return coerceUnion(DstT, src_val);
+        \\    }
+        \\    if (@typeInfo(DstT) == .@"struct" and @typeInfo(SrcT) == .@"struct") {
+        \\        if (comptime (isJsValueStruct(SrcT) and isJsValueStruct(DstT))) {
+        \\            return .{ .handle = src_val.handle };
+        \\        }
+        \\        if (comptime (isGeneratedHandleStruct(SrcT) and isGeneratedHandleStruct(DstT))) {
+        \\            const src_rf = comptime generatedHandleRefFieldName(SrcT);
+        \\            const dst_rf = comptime generatedHandleRefFieldName(DstT);
+        \\            var out_h: DstT = undefined;
+        \\            @field(out_h, dst_rf) = .{ .handle = @field(src_val, src_rf).handle };
+        \\            return out_h;
+        \\        }
+        \\        var out_s: DstT = undefined;
+        \\        const dst_info = @typeInfo(DstT).@"struct";
+        \\        inline for (dst_info.field_names, 0..) |df_name, dfi| {
+        \\            const FieldT = dst_info.field_types[dfi];
+        \\            const wire = comptime structWireNameForField(DstT, df_name);
+        \\            if (comptime findStructFieldByWireName(SrcT, wire)) |src_fname| {
+        \\                @field(out_s, df_name) = projectFieldValue(FieldT, @field(src_val, src_fname));
+        \\            } else if (dst_info.field_attrs[dfi].default_value_ptr) |opaque_ptr| {
+        \\                const def_ptr: *const FieldT = @ptrCast(@alignCast(opaque_ptr));
+        \\                @field(out_s, df_name) = def_ptr.*;
+        \\            } else if (@typeInfo(FieldT) == .optional) {
+        \\                @field(out_s, df_name) = null;
+        \\            } else {
+        \\                @compileError("Cannot project missing required base field '" ++ df_name ++ "' from " ++ @typeName(SrcT) ++ " to " ++ @typeName(DstT));
+        \\            }
+        \\        }
+        \\        return out_s;
+        \\    }
+        \\    return src_val;
+        \\}
+        \\
+        \\pub fn upcastValue(comptime SelfT: type, self: SelfT, comptime Base: type) Base {
+        \\    if (has_host) return raw_js.upcastValue(SelfT, self, Base);
+        \\    comptime {
+        \\        if (!isAssignableType(SelfT, Base)) {
+        \\            @compileError(@typeName(SelfT) ++ " does not inherit from or implement " ++ @typeName(Base));
+        \\        }
+        \\    }
+        \\    return projectFieldValue(Base, self);
+        \\}
+        \\
+        \\pub fn cloneHandle(comptime SelfT: type, self: SelfT) CallError!SelfT {
+        \\    comptime {
+        \\        if (!isGeneratedHandleStruct(SelfT)) {
+        \\            @compileError("cloneHandle requires a JS handle wrapper struct, received " ++ @typeName(SelfT));
+        \\        }
+        \\    }
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    return try raw_js.cloneHandle(SelfT, self);
+        \\}
+        \\
+        \\pub fn downcastHandle(comptime Sub: type, self_ref: anytype) CallError!?Sub {
+        \\    comptime {
+        \\        if (!isGeneratedHandleStruct(Sub)) {
+        \\            @compileError("tryAs target " ++ @typeName(Sub) ++ " must be a JS handle wrapper struct");
+        \\        }
+        \\    }
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    return try raw_js.downcastHandle(Sub, self_ref);
         \\}
         \\
         \\pub fn GlobalWithSpec(comptime T: type, comptime spec: anytype) type {

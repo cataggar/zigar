@@ -5,6 +5,8 @@ const lower_types = @import("lower_types.zig");
 const lower_unions = @import("lower_unions.zig");
 const classify_decls = @import("classify_decls.zig");
 const lower_objects = @import("lower_objects.zig");
+const lower_heritage = @import("lower_heritage.zig");
+const merge_decls = @import("merge_decls.zig");
 
 /// Lowering configuration for `lowerGraph`.
 pub const LowerOptions = struct {
@@ -279,6 +281,25 @@ pub const ConstructorIr = struct {
     jsdoc: ?JsDocIr,
 };
 
+pub const IndexAccessorIr = struct {
+    getter_ident: []const u8,
+    getter_alloc_ident: ?[]const u8 = null,
+    getter_alloc_param_ident: []const u8 = "allocator",
+    key_param_ident: []const u8 = "key",
+    key_ty: *const TypeIr,
+    getter_ty: *const TypeIr,
+    strict_undefined_missing: bool = true,
+    setter_ident: ?[]const u8 = null,
+    setter_key_param_ident: []const u8 = "key",
+    setter_val_param_ident: []const u8 = "value",
+    setter_ty: *const TypeIr,
+};
+
+pub const NamespaceDeclIr = struct {
+    merged_call_fns: []const DeclIr = &.{},
+    children: []const DeclIr,
+};
+
 pub const StructDeclIr = struct {
     repr: classify_decls.ObjectDeclKind = .value_struct,
     is_class: bool,
@@ -291,18 +312,27 @@ pub const StructDeclIr = struct {
     self_param_ident: []const u8 = "__zigar_self",
     raw_param_ident: []const u8 = "__zigar_raw",
     alloc_param_ident: []const u8 = "__zigar_alloc",
+    base_type_param_ident: []const u8 = "Base",
+    sub_type_param_ident: []const u8 = "Sub",
     to_js_ref_ident: ?[]const u8 = null,
     from_js_ref_ident: ?[]const u8 = null,
     from_js_ref_alloc_ident: ?[]const u8 = null,
     deinit_ident: ?[]const u8 = null,
+    as_ident: ?[]const u8 = null,
+    try_as_ident: ?[]const u8 = null,
+    clone_ident: ?[]const u8 = null,
+    empty_init_ident: ?[]const u8 = null,
     required_methods: []const []const u8 = &.{},
     required_props: []const []const u8 = &.{},
+    bases: []const *const TypeIr = &.{},
     type_params: []const TypeParamIr,
     fields: []const FieldIr,
     instance_props: []const InstancePropIr = &.{},
+    index_accessors: []const IndexAccessorIr = &.{},
     static_props: []const StaticPropIr,
     constructors: []const ConstructorIr,
     methods: []const MethodIr,
+    merged_call_fns: []const DeclIr = &.{},
     nested_decls: []const DeclIr,
 };
 
@@ -325,6 +355,7 @@ pub const DeclKindIr = union(enum) {
         has_unknown_values: bool = false,
         backing: lower_unions.EnumBackingKind = .none,
         members: []const EnumMemberIr,
+        nested_decls: []const DeclIr = &.{},
     },
     literal_enum_decl: InlineEnumIr,
     open_literal_decl: OpenLiteralUnionIr,
@@ -334,7 +365,7 @@ pub const DeclKindIr = union(enum) {
         type_params: []const TypeParamIr,
         target: *const TypeIr,
     },
-    namespace_decl: []const DeclIr,
+    namespace_decl: NamespaceDeclIr,
     re_export_decl: struct {
         target_module_index: u32,
         target_zig_path: []const []const u8,
@@ -541,6 +572,7 @@ fn LowerCtx(comptime GraphType: type) type {
         const DeclKindType = @FieldType(DeclNodeType, "kind");
         const IfaceDataType = @FieldType(DeclKindType, "interface_decl");
         const MethodNodeType = std.meta.Elem(@FieldType(IfaceDataType, "methods"));
+        const IndexSigNodeType = std.meta.Elem(@FieldType(IfaceDataType, "index_signatures"));
 
         const HeritageBinding = struct {
             ts_name: []const u8,
@@ -565,6 +597,18 @@ fn LowerCtx(comptime GraphType: type) type {
 
         const SourcedSig = struct {
             sid: u32,
+            env: ?*const HeritageEnv = null,
+        };
+
+        const SourcedIndexSig = struct {
+            sig: IndexSigNodeType,
+            env: ?*const HeritageEnv = null,
+        };
+
+        const SourcedBaseClause = struct {
+            target_decl: ?u32 = null,
+            target_type: u32,
+            type_args: []const u32 = &.{},
             env: ?*const HeritageEnv = null,
         };
 
@@ -599,6 +643,7 @@ fn LowerCtx(comptime GraphType: type) type {
         merged_ns_consumed: std.AutoHashMapUnmanaged(u32, void) = .empty,
         merged_iface_consumed: std.AutoHashMapUnmanaged(u32, void) = .empty,
         merged_ctor_var_consumed: std.AutoHashMapUnmanaged(u32, void) = .empty,
+        merged_fn_consumed: std.AutoHashMapUnmanaged(u32, void) = .empty,
         decl_classifications: std.AutoHashMapUnmanaged(u32, classify_decls.DeclClassification) = .empty,
         merged_generic_ns_peer: std.AutoHashMapUnmanaged(u32, u32) = .empty,
         merged_generic_ns_set: std.AutoHashMapUnmanaged(u32, void) = .empty,
@@ -636,6 +681,7 @@ fn LowerCtx(comptime GraphType: type) type {
             self.merged_ns_consumed.deinit(self.scratch);
             self.merged_iface_consumed.deinit(self.scratch);
             self.merged_ctor_var_consumed.deinit(self.scratch);
+            self.merged_fn_consumed.deinit(self.scratch);
             self.decl_classifications.deinit(self.scratch);
             self.merged_generic_ns_peer.deinit(self.scratch);
             self.merged_generic_ns_set.deinit(self.scratch);
@@ -1813,12 +1859,48 @@ fn LowerCtx(comptime GraphType: type) type {
                         const md = self.graph.decls[mid];
                         if (md.module == d.module and md.kind == .variable_decl) {
                             try self.walkTypeRefs(md.kind.variable_decl, visited_types, visitor);
+                        } else if (md.kind == .interface_decl) {
+                            const miface = md.kind.interface_decl;
+                            for (miface.extends_clauses) |hc| try self.walkHeritageRefs(hc, visited_types, visitor);
+                            try self.walkPropsRefs(miface.properties, visited_types, visitor);
+                            for (miface.methods) |m| {
+                                for (m.signatures) |sid| try self.walkSigRefs(sid, visited_types, visitor);
+                            }
+                            for (miface.call_signatures) |sid| try self.walkSigRefs(sid, visited_types, visitor);
+                            for (miface.construct_signatures) |sid| try self.walkSigRefs(sid, visited_types, visitor);
+                            for (miface.index_signatures) |isig| {
+                                try self.walkTypeRefs(isig.key_type, visited_types, visitor);
+                                try self.walkTypeRefs(isig.value_type, visited_types, visitor);
+                            }
+                        } else if (md.module == d.module and md.kind == .function_decl) {
+                            for (md.kind.function_decl) |sid| try self.walkSigRefs(sid, visited_types, visitor);
+                        } else if (md.module == d.module and md.kind == .namespace_decl) {
+                            for (md.kind.namespace_decl) |cid| try visitor.onDeclRef(self, cid);
                         }
                     }
                 },
                 .class_decl => |cls| {
                     if (cls.extends_clause) |hc| try self.walkHeritageRefs(hc, visited_types, visitor);
                     for (cls.implements_clauses) |hc| try self.walkHeritageRefs(hc, visited_types, visitor);
+                    for (d.merged_with) |mid| {
+                        if (mid == decl_id or mid >= self.graph.decls.len) continue;
+                        const md = self.graph.decls[mid];
+                        if (md.kind == .interface_decl) {
+                            const miface = md.kind.interface_decl;
+                            for (miface.extends_clauses) |hc| try self.walkHeritageRefs(hc, visited_types, visitor);
+                            try self.walkPropsRefs(miface.properties, visited_types, visitor);
+                            for (miface.methods) |m| {
+                                for (m.signatures) |sid| try self.walkSigRefs(sid, visited_types, visitor);
+                            }
+                            for (miface.call_signatures) |sid| try self.walkSigRefs(sid, visited_types, visitor);
+                            for (miface.index_signatures) |isig| {
+                                try self.walkTypeRefs(isig.key_type, visited_types, visitor);
+                                try self.walkTypeRefs(isig.value_type, visited_types, visitor);
+                            }
+                        } else if (md.module == d.module and md.kind == .namespace_decl) {
+                            for (md.kind.namespace_decl) |cid| try visitor.onDeclRef(self, cid);
+                        }
+                    }
                     for (cls.constructors) |sid| {
                         if (sid < self.graph.signatures.len) {
                             const csig = self.graph.signatures[sid];
@@ -2221,6 +2303,8 @@ fn LowerCtx(comptime GraphType: type) type {
         }
 
         fn declNameStyle(self: *const Self, d: anytype) naming.NameStyle {
+            const wire = if (d.export_name) |esid| self.str(esid) else self.str(d.name);
+            if (isPureDollarOrUnderscoreIdent(wire)) return .preserve;
             return switch (d.kind) {
                 .function_decl => .camel,
                 .interface_decl, .class_decl, .enum_decl, .type_alias_decl, .namespace_decl => .pascal,
@@ -2295,17 +2379,23 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
             }
 
-            // 2. Detect interface/class + namespace declaration merging in the same scope:
+            // 2. Detect interface/class/enum/namespace + namespace/function declaration merging in the same scope:
             //    - When `d.type_params.len == 0` (`const Foo = struct { ... }`), consume the merged
             //      `namespace_decl` directly into `Foo`'s nested declarations!
             //    - When `d.type_params.len > 0` (`fn Foo(comptime T: type) type`), Zig 0.17 does NOT
             //      allow `Foo.Bar` field access on a generic type constructor function! Keep the
             //      merged `namespace_decl` as a concrete module/scope sibling (`Foo_2`, marked in
             //      `merged_generic_ns_set`) AND also alias its children inside `Foo(T)`!
+            //    - Multi-block `namespace Foo` + `namespace Foo` with identical wire names merge
+            //      into the primary `namespace_decl`.
+            //    - `enum Color` + `namespace Color` folds the namespace children into `Color`.
+            //    - `function $` + `namespace $` / `interface $` where `.camel(wire)` == `.pascal(wire)`
+            //      consumes the colliding top-level `function_decl` into the struct's static `call(...)`.
             for (decl_ids) |did| {
                 if (did >= self.graph.decls.len) continue;
                 if (self.merged_iface_consumed.contains(did)) continue;
                 const d = self.graph.decls[did];
+                const d_wire = if (d.export_name) |esid| self.str(esid) else self.str(d.name);
                 if (d.kind == .interface_decl or d.kind == .class_decl) {
                     if (d.kind == .interface_decl and d.type_params.len == 0) {
                         const icls = try self.classifyDecl(did);
@@ -2316,10 +2406,26 @@ fn LowerCtx(comptime GraphType: type) type {
                                 }
                             }
                         }
+                        if (try merge_decls.fnAndNamespaceIdentCollide(self.scratch, d_wire)) {
+                            for (d.merged_with) |mid| {
+                                if (mid >= self.graph.decls.len or mid == did) continue;
+                                const md = self.graph.decls[mid];
+                                const m_wire = if (md.export_name) |esid| self.str(esid) else self.str(md.name);
+                                if (md.kind == .function_decl and merge_decls.sameWireName(d_wire, m_wire)) {
+                                    for (decl_ids) |other| {
+                                        if (other == mid) {
+                                            try self.merged_fn_consumed.put(self.scratch, mid, {});
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     for (d.merged_with) |mid| {
                         if (mid >= self.graph.decls.len or mid == did) continue;
-                        if (self.graph.decls[mid].kind == .namespace_decl) {
+                        const md = self.graph.decls[mid];
+                        const m_wire = if (md.export_name) |esid| self.str(esid) else self.str(md.name);
+                        if (md.kind == .namespace_decl and merge_decls.sameWireName(d_wire, m_wire)) {
                             for (decl_ids) |other| {
                                 if (other == mid) {
                                     if (d.type_params.len == 0) {
@@ -2332,6 +2438,49 @@ fn LowerCtx(comptime GraphType: type) type {
                             }
                         }
                     }
+                } else if (d.kind == .enum_decl) {
+                    for (d.merged_with) |mid| {
+                        if (mid >= self.graph.decls.len or mid == did) continue;
+                        const md = self.graph.decls[mid];
+                        const m_wire = if (md.export_name) |esid| self.str(esid) else self.str(md.name);
+                        if (md.kind == .namespace_decl and merge_decls.sameWireName(d_wire, m_wire)) {
+                            for (decl_ids) |other| {
+                                if (other == mid) {
+                                    try self.merged_ns_consumed.put(self.scratch, mid, {});
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2b. Multi-block `namespace Foo` + `namespace Foo` and `namespace $` + `function $`
+            //     (after interface/class/enum have claimed their merged namespaces).
+            for (decl_ids) |did| {
+                if (did >= self.graph.decls.len) continue;
+                if (self.merged_ns_consumed.contains(did)) continue;
+                const d = self.graph.decls[did];
+                if (d.kind != .namespace_decl) continue;
+                const d_wire = if (d.export_name) |esid| self.str(esid) else self.str(d.name);
+                const fn_collides = try merge_decls.fnAndNamespaceIdentCollide(self.scratch, d_wire);
+                for (d.merged_with) |mid| {
+                    if (mid >= self.graph.decls.len or mid == did) continue;
+                    const md = self.graph.decls[mid];
+                    const m_wire = if (md.export_name) |esid| self.str(esid) else self.str(md.name);
+                    if (!merge_decls.sameWireName(d_wire, m_wire)) continue;
+                    if (md.kind == .namespace_decl and mid > did and !self.merged_generic_ns_set.contains(mid)) {
+                        for (decl_ids) |other| {
+                            if (other == mid) {
+                                try self.merged_ns_consumed.put(self.scratch, mid, {});
+                            }
+                        }
+                    } else if (md.kind == .function_decl and fn_collides) {
+                        for (decl_ids) |other| {
+                            if (other == mid) {
+                                try self.merged_fn_consumed.put(self.scratch, mid, {});
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2340,6 +2489,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 if (self.merged_ns_consumed.contains(did)) continue;
                 if (self.merged_iface_consumed.contains(did)) continue;
                 if (self.merged_ctor_var_consumed.contains(did)) continue;
+                if (self.merged_fn_consumed.contains(did)) continue;
                 if (prebound_names.get(did)) |existing| {
                     try scope.reserve(existing.logical_name);
                     if (prebound_overloads.get(did)) |ovs| {
@@ -2397,16 +2547,30 @@ fn LowerCtx(comptime GraphType: type) type {
                 };
                 try self.decl_locations.put(self.scratch, did, loc);
 
-                // Point consumed merged interfaces and companion constructor vars at the owning decl location too!
+                // Point consumed merged interfaces, namespaces, functions, and companion constructor vars at the owning decl location too!
                 if (d.kind == .class_decl) {
                     for (d.merged_with) |mid| {
-                        if (self.merged_iface_consumed.contains(mid)) {
+                        if (self.merged_iface_consumed.contains(mid) or self.merged_ns_consumed.contains(mid)) {
                             try self.decl_locations.put(self.scratch, mid, loc);
                         }
                     }
                 } else if (d.kind == .interface_decl) {
                     for (d.merged_with) |mid| {
-                        if (self.merged_ctor_var_consumed.contains(mid) or self.merged_iface_consumed.contains(mid)) {
+                        if (self.merged_ctor_var_consumed.contains(mid) or
+                            self.merged_iface_consumed.contains(mid) or
+                            self.merged_ns_consumed.contains(mid) or
+                            self.merged_fn_consumed.contains(mid))
+                        {
+                            try self.decl_locations.put(self.scratch, mid, loc);
+                        }
+                    }
+                } else if (d.kind == .enum_decl or d.kind == .namespace_decl) {
+                    for (d.merged_with) |mid| {
+                        if (mid >= self.graph.decls.len) continue;
+                        const md = self.graph.decls[mid];
+                        const m_wire = if (md.export_name) |esid| self.str(esid) else self.str(md.name);
+                        if (!merge_decls.sameWireName(wire, m_wire)) continue;
+                        if (self.merged_ns_consumed.contains(mid) or self.merged_fn_consumed.contains(mid)) {
                             try self.decl_locations.put(self.scratch, mid, loc);
                         }
                     }
@@ -2428,6 +2592,57 @@ fn LowerCtx(comptime GraphType: type) type {
                                 prebound_overloads,
                                 visited_ns,
                             );
+                            for (d.merged_with) |mid| {
+                                if (mid == did or mid >= self.graph.decls.len) continue;
+                                const md = self.graph.decls[mid];
+                                const m_wire = if (md.export_name) |esid| self.str(esid) else self.str(md.name);
+                                if (!merge_decls.sameWireName(wire, m_wire)) continue;
+                                if (self.merged_ns_consumed.contains(mid) and !visited_ns.contains(mid)) {
+                                    try visited_ns.put(self.scratch, mid, {});
+                                    try self.prebindScopeDeclsInner(
+                                        final_mod_idx,
+                                        md.kind.namespace_decl,
+                                        &nested_scope,
+                                        full_path,
+                                        prebound_names,
+                                        prebound_overloads,
+                                        visited_ns,
+                                    );
+                                }
+                            }
+                        }
+                    },
+                    .enum_decl => |en| {
+                        var nested_scope = naming.ScopeNamer.initContainer(self.scratch, scope);
+                        defer nested_scope.deinit();
+                        try nested_scope.reserve("zigar_js");
+                        try nested_scope.reserve("__zigar_value");
+                        try nested_scope.reserve("deinit");
+                        try nested_scope.reserve("toSlice");
+                        try nested_scope.reserve("fromSlice");
+                        try nested_scope.reserve("toInt");
+                        try nested_scope.reserve("fromInt");
+                        for (en.members) |em| {
+                            const emb = try nested_scope.bind(self.str(em.name), .snake);
+                            emb.deinit(self.scratch);
+                        }
+                        for (d.merged_with) |mid| {
+                            if (mid == did or mid >= self.graph.decls.len) continue;
+                            const md = self.graph.decls[mid];
+                            const m_wire = if (md.export_name) |esid| self.str(esid) else self.str(md.name);
+                            if (!merge_decls.sameWireName(wire, m_wire)) continue;
+                            if (self.merged_ns_consumed.contains(mid) and !visited_ns.contains(mid)) {
+                                try visited_ns.put(self.scratch, mid, {});
+                                try self.prebindScopeDeclsInner(
+                                    final_mod_idx,
+                                    md.kind.namespace_decl,
+                                    &nested_scope,
+                                    full_path,
+                                    prebound_names,
+                                    prebound_overloads,
+                                    visited_ns,
+                                );
+                            }
                         }
                     },
                     .interface_decl, .class_decl => {
@@ -2607,6 +2822,16 @@ fn LowerCtx(comptime GraphType: type) type {
                     .type_predicate => |tp| {
                         if (tp.target_type) |tt| bump(counts, tt);
                     },
+                    .object_literal => |obj| {
+                        for (obj.index_signatures) |isig| {
+                            bump(counts, isig.key_type);
+                            bump(counts, isig.value_type);
+                            if (!isig.is_readonly) {
+                                bump(counts, isig.key_type);
+                                bump(counts, isig.value_type);
+                            }
+                        }
+                    },
                     else => {},
                 }
             }
@@ -2631,6 +2856,26 @@ fn LowerCtx(comptime GraphType: type) type {
             for (self.graph.decls) |d| {
                 switch (d.kind) {
                     .variable_decl, .type_alias_decl => |ty| bump(counts, ty),
+                    .interface_decl => |iface| {
+                        for (iface.index_signatures) |isig| {
+                            bump(counts, isig.key_type);
+                            bump(counts, isig.value_type);
+                            if (!isig.is_readonly) {
+                                bump(counts, isig.key_type);
+                                bump(counts, isig.value_type);
+                            }
+                        }
+                    },
+                    .class_decl => |cls| {
+                        for (cls.index_signatures) |isig| {
+                            bump(counts, isig.key_type);
+                            bump(counts, isig.value_type);
+                            if (!isig.is_readonly) {
+                                bump(counts, isig.key_type);
+                                bump(counts, isig.value_type);
+                            }
+                        }
+                    },
                     else => {},
                 }
             }
@@ -2719,6 +2964,10 @@ fn LowerCtx(comptime GraphType: type) type {
                     }
                     for (obj.construct_signatures) |sid| {
                         if (!try self.isClosedSigInner(sid, bound_tps, visiting)) break :blk false;
+                    }
+                    for (obj.index_signatures) |isig| {
+                        if (!try self.isClosedTypeInner(isig.key_type, bound_tps, visiting)) break :blk false;
+                        if (!try self.isClosedTypeInner(isig.value_type, bound_tps, visiting)) break :blk false;
                     }
                     break :blk true;
                 },
@@ -3364,7 +3613,9 @@ fn LowerCtx(comptime GraphType: type) type {
                     return self.makeType(.js_value);
                 },
                 .object_literal => |obj| {
-                    if (obj.properties.len == 0 and obj.call_signatures.len == 1) {
+                    if (obj.properties.len == 0 and obj.call_signatures.len == 1 and
+                        obj.construct_signatures.len == 0 and obj.index_signatures.len == 0)
+                    {
                         const sid = obj.call_signatures[0];
                         if (sid < self.graph.signatures.len and self.graph.signatures[sid].type_params.len == 0) {
                             const sig = self.graph.signatures[sid];
@@ -3401,7 +3652,10 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                     }
                     const obj_cls = self.classifyObjectLiteral(obj);
-                    if (obj_cls.kind == .handle_wrapper) {
+                    const has_non_index_members = obj.properties.len > 0 or
+                        obj.call_signatures.len > 0 or
+                        obj.construct_signatures.len > 0;
+                    if (obj_cls.kind == .handle_wrapper and has_non_index_members) {
                         const is_closed = no_free_vars or try self.isClosedTypeSubgraph(ty_id);
                         if (can_hoist_in_mod and is_closed and self.cur_mod_root_scope != null) {
                             const h = try self.allocFreshAnonHelperName("__zigar_AnonHandle", active_tps);
@@ -3424,6 +3678,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             const split = try self.splitObjectLiteralPropsAndMethods(obj.properties);
                             const sourced_calls = try self.wrapUnsourcedSigs(obj.call_signatures);
                             const sourced_ctors = try self.wrapUnsourcedSigs(obj.construct_signatures);
+                            const sourced_index_sigs = try self.wrapUnsourcedIndexSigs(obj.index_signatures);
 
                             const struct_ir = try self.lowerStructDecl(
                                 self.cur_mod_idx,
@@ -3433,11 +3688,14 @@ fn LowerCtx(comptime GraphType: type) type {
                                 false,
                                 &.{},
                                 &.{},
+                                &.{},
                                 split.props,
                                 &.{},
                                 split.methods,
                                 sourced_calls,
                                 sourced_ctors,
+                                sourced_index_sigs,
+                                &.{},
                                 &.{},
                                 self.cur_mod_root_scope.?,
                                 &empty_names,
@@ -4161,6 +4419,14 @@ fn LowerCtx(comptime GraphType: type) type {
             }
         }
 
+        const BrandedPrimitiveKind = enum {
+            str,
+            num,
+            bigint,
+            boolean,
+            symbol,
+        };
+
         fn detectOpenPrimitiveIntersection(self: *const Self, parts: []const u32) ?lower_unions.OpenPrimitiveKind {
             if (parts.len < 2) return null;
             var prim_opt: ?lower_unions.OpenPrimitiveKind = null;
@@ -4191,6 +4457,101 @@ fn LowerCtx(comptime GraphType: type) type {
             }
             if (saw_empty_obj) return prim_opt;
             return null;
+        }
+
+        /// Detects inhabited branded scalar intersections such as
+        /// `string & { readonly __brand: "UserId" }`, `number & Brand<"Port">`, or
+        /// `NonNegative & { readonly __port: true }`, which at JS runtime are always
+        /// the underlying primitive scalar (`[]const u8`, `f64`, `i64`, `bool`, `Symbol`).
+        fn detectBrandedPrimitiveIntersection(
+            self: *const Self,
+            parts: []const u32,
+            depth: usize,
+        ) ?BrandedPrimitiveKind {
+            if (parts.len < 2 or depth > 8) return null;
+            var prim_opt: ?BrandedPrimitiveKind = null;
+            var saw_brand_obj = false;
+            for (parts) |pid| {
+                if (!self.classifyBrandedPrimitiveArm(pid, &prim_opt, &saw_brand_obj, depth)) return null;
+            }
+            if (saw_brand_obj) return prim_opt;
+            return null;
+        }
+
+        fn classifyBrandedPrimitiveArm(
+            self: *const Self,
+            arm_id: u32,
+            prim_opt: *?BrandedPrimitiveKind,
+            saw_brand_obj: *bool,
+            depth: usize,
+        ) bool {
+            if (arm_id >= self.graph.types.len or depth > 8) return false;
+            const tn = self.graph.types[arm_id];
+            switch (tn.kind) {
+                .string_type, .template_literal => {
+                    if (prim_opt.* != null and prim_opt.*.? != .str) return false;
+                    prim_opt.* = .str;
+                    return true;
+                },
+                .number_type => {
+                    if (prim_opt.* != null and prim_opt.*.? != .num) return false;
+                    prim_opt.* = .num;
+                    return true;
+                },
+                .bigint_type => {
+                    if (prim_opt.* != null and prim_opt.*.? != .bigint) return false;
+                    prim_opt.* = .bigint;
+                    return true;
+                },
+                .boolean_type => {
+                    if (prim_opt.* != null and prim_opt.*.? != .boolean) return false;
+                    prim_opt.* = .boolean;
+                    return true;
+                },
+                .symbol_type, .unique_symbol => {
+                    if (prim_opt.* != null and prim_opt.*.? != .symbol) return false;
+                    prim_opt.* = .symbol;
+                    return true;
+                },
+                .literal => |lit| {
+                    const lk: BrandedPrimitiveKind = switch (lit) {
+                        .str => .str,
+                        .num => .num,
+                        .bigint_literal => .bigint,
+                        .boolean => .boolean,
+                    };
+                    if (prim_opt.* != null and prim_opt.*.? != lk) return false;
+                    prim_opt.* = lk;
+                    return true;
+                },
+                .intersection => |sub_parts| {
+                    if (sub_parts.len == 0) return false;
+                    for (sub_parts) |spid| {
+                        if (!self.classifyBrandedPrimitiveArm(spid, prim_opt, saw_brand_obj, depth + 1)) return false;
+                    }
+                    return true;
+                },
+                .object_literal, .mapped => {
+                    saw_brand_obj.* = true;
+                    return true;
+                },
+                .reference => |ref| {
+                    if (ref.target_decl) |td| {
+                        if (td < self.graph.decls.len) {
+                            const d = self.graph.decls[td];
+                            if (d.kind == .type_alias_decl and d.type_params.len == 0 and ref.type_args.len == 0) {
+                                return self.classifyBrandedPrimitiveArm(d.kind.type_alias_decl, prim_opt, saw_brand_obj, depth + 1);
+                            }
+                            if (d.kind == .interface_decl or d.kind == .type_alias_decl) {
+                                saw_brand_obj.* = true;
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                },
+                else => return false,
+            }
         }
 
         fn classifyOpenSlotType(self: *const Self, ty_id: u32, depth: usize) ?lower_unions.TemplatePlaceholderKind {
@@ -4844,6 +5205,18 @@ fn LowerCtx(comptime GraphType: type) type {
                     .bigint => self.makeType(.i64_type),
                 };
             }
+            if (self.detectBrandedPrimitiveIntersection(parts, 0)) |bpk| {
+                return switch (bpk) {
+                    .str => self.makeType(.string_type),
+                    .num => self.makeType(.f64_type),
+                    .bigint => self.makeType(.i64_type),
+                    .boolean => self.makeType(.bool_type),
+                    .symbol => blk: {
+                        needs_runtime.* = true;
+                        break :blk self.makeType(.js_symbol);
+                    },
+                };
+            }
 
             var merged_props: std.ArrayList(RawObjectPropItem) = .empty;
             defer merged_props.deinit(self.scratch);
@@ -4924,15 +5297,19 @@ fn LowerCtx(comptime GraphType: type) type {
                 defer inter_calls.deinit(self.scratch);
                 var inter_ctors: std.ArrayList(SourcedSig) = .empty;
                 defer inter_ctors.deinit(self.scratch);
+                var inter_index_sigs: std.ArrayList(SourcedIndexSig) = .empty;
+                defer inter_index_sigs.deinit(self.scratch);
 
-                if (try self.collectHandleIntersectionMembers(
+                if (try self.collectObjectIntersectionMembers(
                     ty_id,
                     &inter_props,
                     &inter_methods,
                     &inter_calls,
                     &inter_ctors,
+                    &inter_index_sigs,
                 ) and (inter_props.items.len > 0 or inter_methods.items.len > 0 or
-                    inter_calls.items.len > 0 or inter_ctors.items.len > 0))
+                    inter_calls.items.len > 0 or inter_ctors.items.len > 0 or
+                    inter_index_sigs.items.len > 0))
                 {
                     const is_closed = no_free_vars or try self.isClosedTypeSubgraph(ty_id);
                     if (can_hoist_in_mod and is_closed and self.cur_mod_root_scope != null) {
@@ -4953,6 +5330,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         self.inline_anon_depth = 0;
                         defer self.inline_anon_depth = saved_depth;
 
+                        const sourced_bases = try self.wrapUnsourcedBases(parts);
                         const struct_ir = try self.lowerStructDecl(
                             self.cur_mod_idx,
                             std.math.maxInt(u32),
@@ -4961,11 +5339,14 @@ fn LowerCtx(comptime GraphType: type) type {
                             false,
                             &.{},
                             &.{},
+                            &.{},
                             inter_props.items,
                             &.{},
                             inter_methods.items,
                             inter_calls.items,
                             inter_ctors.items,
+                            inter_index_sigs.items,
+                            sourced_bases,
                             &.{},
                             self.cur_mod_root_scope.?,
                             &empty_names,
@@ -5997,6 +6378,15 @@ fn LowerCtx(comptime GraphType: type) type {
                             .bigint => "bigint",
                         };
                     }
+                    if (self.detectBrandedPrimitiveIntersection(parts, 0)) |bpk| {
+                        return switch (bpk) {
+                            .str => "str",
+                            .num => "num",
+                            .bigint => "bigint",
+                            .boolean => "boolean",
+                            .symbol => "symbol",
+                        };
+                    }
                 },
                 .object_literal => |obj| {
                     for (obj.properties) |pid| {
@@ -6084,6 +6474,7 @@ fn LowerCtx(comptime GraphType: type) type {
             if (self.merged_ns_consumed.contains(decl_id)) return;
             if (self.merged_iface_consumed.contains(decl_id)) return;
             if (self.merged_ctor_var_consumed.contains(decl_id)) return;
+            if (self.merged_fn_consumed.contains(decl_id)) return;
             if (active_decls.contains(decl_id)) return;
             try active_decls.put(self.scratch, decl_id, {});
             defer _ = active_decls.remove(decl_id);
@@ -6098,24 +6489,30 @@ fn LowerCtx(comptime GraphType: type) type {
             var companion_exported = false;
             var companion_default = false;
             var companion_global = false;
-            if (d.kind == .interface_decl) {
-                for (d.merged_with) |mid| {
-                    if (self.merged_ctor_var_consumed.contains(mid) and mid < self.graph.decls.len) {
-                        const vd = self.graph.decls[mid];
-                        if (vd.modifiers.export_decl) companion_exported = true;
-                        if (vd.modifiers.default_export) companion_default = true;
-                        if (self.global_aug_decls.contains(mid)) companion_global = true;
-                    }
+            for (d.merged_with) |mid| {
+                if (mid == decl_id or mid >= self.graph.decls.len) continue;
+                const vd = self.graph.decls[mid];
+                const v_wire = if (vd.export_name) |esid| self.str(esid) else self.str(vd.name);
+                if (!merge_decls.sameWireName(bound.wire_name, v_wire)) continue;
+                if (self.merged_ctor_var_consumed.contains(mid) or
+                    self.merged_iface_consumed.contains(mid) or
+                    self.merged_ns_consumed.contains(mid) or
+                    self.merged_fn_consumed.contains(mid))
+                {
+                    if (vd.modifiers.export_decl or self.js_exported_decls.contains(mid)) companion_exported = true;
+                    if (vd.modifiers.default_export) companion_default = true;
+                    if (self.global_aug_decls.contains(mid)) companion_global = true;
                 }
             }
 
             const is_js_exported = if (suppress_js_export)
                 false
             else if (is_top_level)
-                (is_exported and self.js_exported_decls.contains(decl_id))
+                (is_exported and (self.js_exported_decls.contains(decl_id) or companion_exported))
             else
                 (is_exported and (d.modifiers.export_decl or companion_exported));
-            const is_default_export = d.modifiers.default_export or companion_default;
+            const is_default_export = d.modifiers.default_export or companion_default or
+                (is_top_level and is_js_exported and std.mem.eql(u8, bound.wire_name, "default"));
             const is_global_scope = self.global_aug_decls.contains(decl_id) or companion_global;
 
             switch (d.kind) {
@@ -6253,6 +6650,14 @@ fn LowerCtx(comptime GraphType: type) type {
                     defer combined_construct_sigs.deinit(self.scratch);
                     for (iface.construct_signatures) |sid| try appendUniqueSourcedSig(&combined_construct_sigs, self.scratch, .{ .sid = sid });
 
+                    var combined_index_sigs: std.ArrayList(SourcedIndexSig) = .empty;
+                    defer combined_index_sigs.deinit(self.scratch);
+                    for (iface.index_signatures) |isig| try combined_index_sigs.append(self.scratch, .{ .sig = isig });
+
+                    var sourced_bases: std.ArrayList(SourcedBaseClause) = .empty;
+                    defer sourced_bases.deinit(self.scratch);
+                    for (iface.extends_clauses) |hc| try sourced_bases.append(self.scratch, .{ .target_type = hc.target_type });
+
                     var seen_methods: std.StringHashMapUnmanaged(void) = .empty;
                     defer seen_methods.deinit(self.scratch);
                     var derived_methods: std.StringHashMapUnmanaged(void) = .empty;
@@ -6274,9 +6679,11 @@ fn LowerCtx(comptime GraphType: type) type {
                         if (mid == decl_id or mid >= self.graph.decls.len) continue;
                         const md = self.graph.decls[mid];
                         if (md.kind != .interface_decl) continue;
+                        const m_wire = if (md.export_name) |esid| self.str(esid) else self.str(md.name);
+                        if (!merge_decls.sameWireName(bound.wire_name, m_wire)) continue;
                         const miface = md.kind.interface_decl;
                         for (miface.methods) |m| {
-                            try self.appendMethodIfMissing(&combined_methods, .{ .method = m });
+                            try self.appendMethodDedupOverloads(&combined_methods, .{ .method = m });
                             if (m.modifiers.static_mod or m.modifiers.private_mod or m.modifiers.protected_mod or m.computed_symbol != null) continue;
                             const mw = self.str(m.name);
                             try seen_methods.put(self.scratch, mw, {});
@@ -6290,6 +6697,8 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                         for (miface.call_signatures) |sid| try appendUniqueSourcedSig(&combined_call_sigs, self.scratch, .{ .sid = sid });
                         for (miface.construct_signatures) |sid| try appendUniqueSourcedSig(&combined_construct_sigs, self.scratch, .{ .sid = sid });
+                        for (miface.index_signatures) |isig| try combined_index_sigs.append(self.scratch, .{ .sig = isig });
+                        for (miface.extends_clauses) |hc| try sourced_bases.append(self.scratch, .{ .target_type = hc.target_type });
                     }
 
                     var visited_bases: std.AutoHashMapUnmanaged(u32, void) = .empty;
@@ -6297,7 +6706,9 @@ fn LowerCtx(comptime GraphType: type) type {
                     try visited_bases.put(self.scratch, decl_id, {});
                     for (d.merged_with) |mid| {
                         if (mid == decl_id or mid >= self.graph.decls.len) continue;
-                        if (self.graph.decls[mid].kind == .interface_decl) {
+                        const md = self.graph.decls[mid];
+                        const m_wire = if (md.export_name) |esid| self.str(esid) else self.str(md.name);
+                        if (md.kind == .interface_decl and merge_decls.sameWireName(bound.wire_name, m_wire)) {
                             try visited_bases.put(self.scratch, mid, {});
                         }
                     }
@@ -6309,6 +6720,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         &combined_methods,
                         &combined_call_sigs,
                         &combined_construct_sigs,
+                        &combined_index_sigs,
                         &seen_methods,
                         &derived_methods,
                         &visited_bases,
@@ -6317,6 +6729,8 @@ fn LowerCtx(comptime GraphType: type) type {
                         if (mid == decl_id or mid >= self.graph.decls.len) continue;
                         const md = self.graph.decls[mid];
                         if (md.kind != .interface_decl) continue;
+                        const m_wire = if (md.export_name) |esid| self.str(esid) else self.str(md.name);
+                        if (!merge_decls.sameWireName(bound.wire_name, m_wire)) continue;
                         try self.collectInheritedHeritageClauses(
                             null,
                             md.kind.interface_decl.extends_clauses,
@@ -6324,6 +6738,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             &combined_methods,
                             &combined_call_sigs,
                             &combined_construct_sigs,
+                            &combined_index_sigs,
                             &seen_methods,
                             &derived_methods,
                             &visited_bases,
@@ -6336,6 +6751,8 @@ fn LowerCtx(comptime GraphType: type) type {
                         if (mid == decl_id or mid >= self.graph.decls.len) continue;
                         const md = self.graph.decls[mid];
                         if (md.kind != .interface_decl) continue;
+                        const m_wire = if (md.export_name) |esid| self.str(esid) else self.str(md.name);
+                        if (!merge_decls.sameWireName(bound.wire_name, m_wire)) continue;
                         const miface = md.kind.interface_decl;
                         for (miface.properties) |pid| try self.upsertPropByWireName(&combined_props, .{ .pid = pid });
                     }
@@ -6359,7 +6776,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                 self.scratch,
                             );
                             for (companion_static_methods.items) |cm| {
-                                try combined_methods.append(self.scratch, .{ .method = cm });
+                                try self.appendMethodDedupOverloads(&combined_methods, .{ .method = cm });
                             }
                         }
                     }
@@ -6372,11 +6789,14 @@ fn LowerCtx(comptime GraphType: type) type {
                         false,
                         d.type_params,
                         companion_ctors.items,
+                        &.{},
                         combined_props.items,
                         companion_static_props.items,
                         combined_methods.items,
                         combined_call_sigs.items,
                         combined_construct_sigs.items,
+                        combined_index_sigs.items,
+                        sourced_bases.items,
                         d.merged_with,
                         scope,
                         prebound_names,
@@ -6412,6 +6832,14 @@ fn LowerCtx(comptime GraphType: type) type {
                     defer combined_call_sigs.deinit(self.scratch);
                     var ignored_construct_sigs: std.ArrayList(SourcedSig) = .empty;
                     defer ignored_construct_sigs.deinit(self.scratch);
+                    var combined_index_sigs: std.ArrayList(SourcedIndexSig) = .empty;
+                    defer combined_index_sigs.deinit(self.scratch);
+                    for (cls.index_signatures) |isig| try combined_index_sigs.append(self.scratch, .{ .sig = isig });
+
+                    var sourced_bases: std.ArrayList(SourcedBaseClause) = .empty;
+                    defer sourced_bases.deinit(self.scratch);
+                    if (cls.extends_clause) |hc| try sourced_bases.append(self.scratch, .{ .target_type = hc.target_type });
+                    for (cls.implements_clauses) |hc| try sourced_bases.append(self.scratch, .{ .target_type = hc.target_type });
 
                     var seen_methods: std.StringHashMapUnmanaged(void) = .empty;
                     defer seen_methods.deinit(self.scratch);
@@ -6436,9 +6864,11 @@ fn LowerCtx(comptime GraphType: type) type {
                         if (!self.merged_iface_consumed.contains(mid) or mid >= self.graph.decls.len) continue;
                         const mdecl = self.graph.decls[mid];
                         if (mdecl.kind != .interface_decl) continue;
+                        const m_wire = if (mdecl.export_name) |esid| self.str(esid) else self.str(mdecl.name);
+                        if (!merge_decls.sameWireName(bound.wire_name, m_wire)) continue;
                         const miface = mdecl.kind.interface_decl;
                         for (miface.methods) |m| {
-                            try combined_methods.append(self.scratch, .{ .method = m });
+                            try self.appendMethodDedupOverloads(&combined_methods, .{ .method = m });
                             if (m.modifiers.static_mod or m.modifiers.private_mod or m.modifiers.protected_mod or m.computed_symbol != null) continue;
                             const mw = self.str(m.name);
                             try seen_methods.put(self.scratch, mw, {});
@@ -6451,6 +6881,8 @@ fn LowerCtx(comptime GraphType: type) type {
                             try seen_methods.put(self.scratch, self.str(p.name), {});
                         }
                         for (miface.call_signatures) |sid| try appendUniqueSourcedSig(&combined_call_sigs, self.scratch, .{ .sid = sid });
+                        for (miface.index_signatures) |isig| try combined_index_sigs.append(self.scratch, .{ .sig = isig });
+                        for (miface.extends_clauses) |hc| try sourced_bases.append(self.scratch, .{ .target_type = hc.target_type });
                     }
 
                     var visited_bases: std.AutoHashMapUnmanaged(u32, void) = .empty;
@@ -6458,7 +6890,11 @@ fn LowerCtx(comptime GraphType: type) type {
                     try visited_bases.put(self.scratch, decl_id, {});
                     for (d.merged_with) |mid| {
                         if (mid < self.graph.decls.len and self.graph.decls[mid].kind == .interface_decl) {
-                            try visited_bases.put(self.scratch, mid, {});
+                            const md = self.graph.decls[mid];
+                            const m_wire = if (md.export_name) |esid| self.str(esid) else self.str(md.name);
+                            if (merge_decls.sameWireName(bound.wire_name, m_wire)) {
+                                try visited_bases.put(self.scratch, mid, {});
+                            }
                         }
                     }
 
@@ -6470,6 +6906,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             &combined_methods,
                             &combined_call_sigs,
                             &ignored_construct_sigs,
+                            &combined_index_sigs,
                             &seen_methods,
                             &derived_methods,
                             &visited_bases,
@@ -6479,6 +6916,8 @@ fn LowerCtx(comptime GraphType: type) type {
                         if (!self.merged_iface_consumed.contains(mid) or mid >= self.graph.decls.len) continue;
                         const mdecl = self.graph.decls[mid];
                         if (mdecl.kind != .interface_decl) continue;
+                        const m_wire = if (mdecl.export_name) |esid| self.str(esid) else self.str(mdecl.name);
+                        if (!merge_decls.sameWireName(bound.wire_name, m_wire)) continue;
                         try self.collectInheritedHeritageClauses(
                             null,
                             mdecl.kind.interface_decl.extends_clauses,
@@ -6486,6 +6925,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             &combined_methods,
                             &combined_call_sigs,
                             &ignored_construct_sigs,
+                            &combined_index_sigs,
                             &seen_methods,
                             &derived_methods,
                             &visited_bases,
@@ -6497,25 +6937,50 @@ fn LowerCtx(comptime GraphType: type) type {
                         if (!self.merged_iface_consumed.contains(mid) or mid >= self.graph.decls.len) continue;
                         const mdecl = self.graph.decls[mid];
                         if (mdecl.kind != .interface_decl) continue;
+                        const m_wire = if (mdecl.export_name) |esid| self.str(esid) else self.str(mdecl.name);
+                        if (!merge_decls.sameWireName(bound.wire_name, m_wire)) continue;
                         for (mdecl.kind.interface_decl.properties) |pid| {
                             try self.upsertPropByWireName(&combined_props, .{ .pid = pid });
                         }
                     }
                     for (cls.properties) |pid| try self.upsertPropByWireName(&combined_props, .{ .pid = pid });
 
+                    var inherited_ctors: []const SourcedSig = &.{};
+                    var allow_default_ctor = (cls.extends_clause == null);
+                    if (!d.modifiers.abstract_mod and cls.constructors.len == 0) {
+                        if (cls.extends_clause) |hc| {
+                            const ctor_res = try self.collectInheritedClassCtors(hc);
+                            switch (ctor_res) {
+                                .inherited_sigs => |sigs| {
+                                    inherited_ctors = sigs;
+                                    allow_default_ctor = false;
+                                },
+                                .default_zero_arg => {
+                                    allow_default_ctor = true;
+                                },
+                                .unknown_external_base => {
+                                    allow_default_ctor = false;
+                                },
+                            }
+                        }
+                    }
+
                     const struct_ir = try self.lowerStructDecl(
                         final_mod_idx,
                         decl_id,
                         ccls,
                         d.modifiers.abstract_mod,
-                        cls.extends_clause != null,
+                        allow_default_ctor,
                         d.type_params,
                         cls.constructors,
+                        inherited_ctors,
                         combined_props.items,
                         &.{},
                         combined_methods.items,
                         combined_call_sigs.items,
                         &.{},
+                        combined_index_sigs.items,
+                        sourced_bases.items,
                         d.merged_with,
                         scope,
                         prebound_names,
@@ -6539,7 +7004,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     });
                 },
                 .enum_decl => |en| {
-                    var member_scope = naming.ScopeNamer.initContainer(self.scratch, null);
+                    var member_scope = naming.ScopeNamer.initContainer(self.scratch, scope);
                     defer member_scope.deinit();
                     try member_scope.reserve("zigar_js");
                     try member_scope.reserve("__zigar_value");
@@ -6601,6 +7066,42 @@ fn LowerCtx(comptime GraphType: type) type {
                         needs_runtime.* = true;
                     }
 
+                    try member_scope.reserve("deinit");
+                    try member_scope.reserve("toSlice");
+                    try member_scope.reserve("fromSlice");
+                    try member_scope.reserve("toInt");
+                    try member_scope.reserve("fromInt");
+
+                    var enum_nested_decls: std.ArrayList(DeclIr) = .empty;
+                    const enum_ns_children = try self.collectConsumedMergedNamespaceChildren(
+                        decl_id,
+                        bound.wire_name,
+                        d.merged_with,
+                        &.{},
+                    );
+                    for (enum_ns_children) |cid| {
+                        if (prebound_names.get(cid)) |cb| try member_scope.reserve(cb.logical_name);
+                        if (prebound_overloads.get(cid)) |ovs| {
+                            for (ovs) |ov| try member_scope.reserve(ov.logical_name);
+                        }
+                    }
+                    for (enum_ns_children) |cid| {
+                        try self.lowerDeclIntoListInner(
+                            final_mod_idx,
+                            cid,
+                            false,
+                            &member_scope,
+                            prebound_names,
+                            prebound_overloads,
+                            outer_active_tps,
+                            imports_used,
+                            needs_runtime,
+                            &enum_nested_decls,
+                            active_decls,
+                        );
+                    }
+                    try deduplicateDeclIrsInPlace(self.scratch, &enum_nested_decls);
+
                     try out_list.append(self.alloc, .{
                         .source_decl_id = decl_id,
                         .zig_ident = bound.zig_ident,
@@ -6617,6 +7118,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                 .has_unknown_values = has_unknown,
                                 .backing = backing,
                                 .members = members,
+                                .nested_decls = try enum_nested_decls.toOwnedSlice(self.alloc),
                             },
                         },
                     });
@@ -6759,11 +7261,14 @@ fn LowerCtx(comptime GraphType: type) type {
 
                     if (resolved_obj_id) |oid| {
                         const obj = self.graph.types[oid].kind.object_literal;
-                        if (obj.properties.len > 0 or obj.call_signatures.len > 0 or obj.construct_signatures.len > 0) {
+                        if (obj.properties.len > 0 or obj.call_signatures.len > 0 or
+                            obj.construct_signatures.len > 0 or obj.index_signatures.len > 0)
+                        {
                             const obj_cls = self.classifyObjectLiteral(obj);
                             const split = try self.splitObjectLiteralPropsAndMethods(obj.properties);
                             const sourced_calls = try self.wrapUnsourcedSigs(obj.call_signatures);
                             const sourced_ctors = try self.wrapUnsourcedSigs(obj.construct_signatures);
+                            const sourced_index_sigs = try self.wrapUnsourcedIndexSigs(obj.index_signatures);
                             const struct_ir = try self.lowerStructDecl(
                                 final_mod_idx,
                                 decl_id,
@@ -6772,11 +7277,14 @@ fn LowerCtx(comptime GraphType: type) type {
                                 false,
                                 d.type_params,
                                 &.{},
+                                &.{},
                                 split.props,
                                 &.{},
                                 split.methods,
                                 sourced_calls,
                                 sourced_ctors,
+                                sourced_index_sigs,
+                                &.{},
                                 &.{},
                                 scope,
                                 prebound_names,
@@ -6802,65 +7310,73 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                     }
 
-                    // 3b. Handle-bearing intersection type alias (`type Inter = { a: number } & { run(): void }`,
-                    //     `type Both = LoggerT & { extra: number }`) -> merged `.handle_wrapper` `struct`!
+                    // 3b. Object intersection type alias (`type MergedOpts = OptsA & OptsB`,
+                    //     `type Inter = { a: number } & { run(): void }`,
+                    //     `type Both = LoggerT & { extra: number }`) -> merged `struct` with `.bases`!
                     if (ty_id < self.graph.types.len and self.graph.types[ty_id].kind == .intersection) {
+                        const inter_parts = self.graph.types[ty_id].kind.intersection;
                         const inter_cls = try self.classifyDecl(decl_id);
-                        if (inter_cls.kind == .handle_wrapper) {
-                            var inter_props: std.ArrayList(SourcedProp) = .empty;
-                            defer inter_props.deinit(self.scratch);
-                            var inter_methods: std.ArrayList(SourcedMethod) = .empty;
-                            defer inter_methods.deinit(self.scratch);
-                            var inter_calls: std.ArrayList(SourcedSig) = .empty;
-                            defer inter_calls.deinit(self.scratch);
-                            var inter_ctors: std.ArrayList(SourcedSig) = .empty;
-                            defer inter_ctors.deinit(self.scratch);
+                        var inter_props: std.ArrayList(SourcedProp) = .empty;
+                        defer inter_props.deinit(self.scratch);
+                        var inter_methods: std.ArrayList(SourcedMethod) = .empty;
+                        defer inter_methods.deinit(self.scratch);
+                        var inter_calls: std.ArrayList(SourcedSig) = .empty;
+                        defer inter_calls.deinit(self.scratch);
+                        var inter_ctors: std.ArrayList(SourcedSig) = .empty;
+                        defer inter_ctors.deinit(self.scratch);
+                        var inter_index_sigs: std.ArrayList(SourcedIndexSig) = .empty;
+                        defer inter_index_sigs.deinit(self.scratch);
 
-                            if (try self.collectHandleIntersectionMembers(
-                                ty_id,
-                                &inter_props,
-                                &inter_methods,
-                                &inter_calls,
-                                &inter_ctors,
-                            ) and (inter_props.items.len > 0 or inter_methods.items.len > 0 or
-                                inter_calls.items.len > 0 or inter_ctors.items.len > 0))
-                            {
-                                const struct_ir = try self.lowerStructDecl(
-                                    final_mod_idx,
-                                    decl_id,
-                                    inter_cls,
-                                    false,
-                                    false,
-                                    d.type_params,
-                                    &.{},
-                                    inter_props.items,
-                                    &.{},
-                                    inter_methods.items,
-                                    inter_calls.items,
-                                    inter_ctors.items,
-                                    &.{},
-                                    scope,
-                                    prebound_names,
-                                    prebound_overloads,
-                                    outer_active_tps,
-                                    imports_used,
-                                    needs_runtime,
-                                    active_decls,
-                                );
-                                try out_list.append(self.alloc, .{
-                                    .source_decl_id = decl_id,
-                                    .zig_ident = bound.zig_ident,
-                                    .logical_name = bound.logical_name,
-                                    .wire_name = bound.wire_name,
-                                    .is_exported = is_exported,
-                                    .is_js_exported = is_js_exported,
-                                    .is_default_export = is_default_export,
-                                    .is_global_scope = is_global_scope,
-                                    .jsdoc = top_jsdoc,
-                                    .kind = .{ .struct_decl = struct_ir },
-                                });
-                                return;
-                            }
+                        if (try self.collectObjectIntersectionMembers(
+                            ty_id,
+                            &inter_props,
+                            &inter_methods,
+                            &inter_calls,
+                            &inter_ctors,
+                            &inter_index_sigs,
+                        ) and (inter_props.items.len > 0 or inter_methods.items.len > 0 or
+                            inter_calls.items.len > 0 or inter_ctors.items.len > 0 or
+                            inter_index_sigs.items.len > 0))
+                        {
+                            const sourced_bases = try self.wrapUnsourcedBases(inter_parts);
+                            const struct_ir = try self.lowerStructDecl(
+                                final_mod_idx,
+                                decl_id,
+                                inter_cls,
+                                false,
+                                false,
+                                d.type_params,
+                                &.{},
+                                &.{},
+                                inter_props.items,
+                                &.{},
+                                inter_methods.items,
+                                inter_calls.items,
+                                inter_ctors.items,
+                                inter_index_sigs.items,
+                                sourced_bases,
+                                &.{},
+                                scope,
+                                prebound_names,
+                                prebound_overloads,
+                                outer_active_tps,
+                                imports_used,
+                                needs_runtime,
+                                active_decls,
+                            );
+                            try out_list.append(self.alloc, .{
+                                .source_decl_id = decl_id,
+                                .zig_ident = bound.zig_ident,
+                                .logical_name = bound.logical_name,
+                                .wire_name = bound.wire_name,
+                                .is_exported = is_exported,
+                                .is_js_exported = is_js_exported,
+                                .is_default_export = is_default_export,
+                                .is_global_scope = is_global_scope,
+                                .jsdoc = top_jsdoc,
+                                .kind = .{ .struct_decl = struct_ir },
+                            });
+                            return;
                         }
                     }
 
@@ -6882,18 +7398,35 @@ fn LowerCtx(comptime GraphType: type) type {
                     });
                 },
                 .namespace_decl => |children| {
+                    const merged_children = try self.collectConsumedMergedNamespaceChildren(
+                        decl_id,
+                        bound.wire_name,
+                        d.merged_with,
+                        children,
+                    );
                     var ns_scope = naming.ScopeNamer.initContainer(self.scratch, scope);
                     defer ns_scope.deinit();
                     try ns_scope.reserve("zigar_js");
-                    for (children) |cid| {
+                    for (merged_children) |cid| {
                         if (prebound_names.get(cid)) |cb| try ns_scope.reserve(cb.logical_name);
                         if (prebound_overloads.get(cid)) |ovs| {
                             for (ovs) |ov| try ns_scope.reserve(ov.logical_name);
                         }
                     }
 
+                    const merged_call_slots = try self.prebindMergedCallFnSlots(
+                        decl_id,
+                        bound.wire_name,
+                        d.merged_with,
+                        true,
+                        &ns_scope,
+                        outer_active_tps,
+                        imports_used,
+                        needs_runtime,
+                    );
+
                     var child_irs: std.ArrayList(DeclIr) = .empty;
-                    for (children) |cid| {
+                    for (merged_children) |cid| {
                         try self.lowerDeclIntoListInner(
                             final_mod_idx,
                             cid,
@@ -6909,6 +7442,14 @@ fn LowerCtx(comptime GraphType: type) type {
                         );
                     }
                     try deduplicateDeclIrsInPlace(self.scratch, &child_irs);
+                    const merged_call_fns = try self.finishMergedCallFns(
+                        bound.wire_name,
+                        merged_call_slots,
+                        &ns_scope,
+                        outer_active_tps,
+                        imports_used,
+                        needs_runtime,
+                    );
                     try out_list.append(self.alloc, .{
                         .source_decl_id = decl_id,
                         .zig_ident = bound.zig_ident,
@@ -6919,7 +7460,12 @@ fn LowerCtx(comptime GraphType: type) type {
                         .is_default_export = is_default_export,
                         .is_global_scope = is_global_scope,
                         .jsdoc = top_jsdoc,
-                        .kind = .{ .namespace_decl = try child_irs.toOwnedSlice(self.alloc) },
+                        .kind = .{
+                            .namespace_decl = .{
+                                .merged_call_fns = merged_call_fns,
+                                .children = try child_irs.toOwnedSlice(self.alloc),
+                            },
+                        },
                     });
                 },
                 .re_export_decl => |re| {
@@ -7169,6 +7715,22 @@ fn LowerCtx(comptime GraphType: type) type {
             return res;
         }
 
+        fn wrapUnsourcedIndexSigs(self: *Self, index_sigs: []const IndexSigNodeType) error{OutOfMemory}![]SourcedIndexSig {
+            const res = try self.scratch.alloc(SourcedIndexSig, index_sigs.len);
+            for (index_sigs, 0..) |isig, idx| {
+                res[idx] = .{ .sig = isig, .env = null };
+            }
+            return res;
+        }
+
+        fn wrapUnsourcedBases(self: *Self, part_ty_ids: []const u32) error{OutOfMemory}![]SourcedBaseClause {
+            const res = try self.scratch.alloc(SourcedBaseClause, part_ty_ids.len);
+            for (part_ty_ids, 0..) |tid, idx| {
+                res[idx] = .{ .target_type = tid, .env = null };
+            }
+            return res;
+        }
+
         fn appendUniqueSourcedSig(
             list: *std.ArrayList(SourcedSig),
             scratch: std.mem.Allocator,
@@ -7207,23 +7769,132 @@ fn LowerCtx(comptime GraphType: type) type {
             try list.append(self.scratch, sp);
         }
 
-        fn appendMethodIfMissing(self: *Self, list: *std.ArrayList(SourcedMethod), sm: SourcedMethod) error{OutOfMemory}!void {
-            const m = sm.method;
-            const m_wire = self.str(m.name);
-            for (list.items) |existing_sm| {
-                const existing = existing_sm.method;
-                if (existing.modifiers.static_mod != m.modifiers.static_mod) continue;
-                if (existing.computed_symbol != null or m.computed_symbol != null) {
-                    if (existing.computed_symbol != null and m.computed_symbol != null and
-                        std.meta.eql(existing.computed_symbol.?, m.computed_symbol.?))
-                    {
-                        return;
+        fn graphTypesEquivalent(
+            self: *const Self,
+            ty_a: u32,
+            env_a: ?*const HeritageEnv,
+            ty_b: u32,
+            env_b: ?*const HeritageEnv,
+            depth: usize,
+        ) bool {
+            if (depth > 8) return ty_a == ty_b and env_a == env_b;
+            const ra = self.resolvePropGraphTypeForLiteralConstraint(ty_a, env_a, 0);
+            const rb = self.resolvePropGraphTypeForLiteralConstraint(ty_b, env_b, 0);
+            if (ra >= self.graph.types.len or rb >= self.graph.types.len) return ra == rb;
+            if (ra == rb and env_a == env_b) return true;
+
+            const ka = self.graph.types[ra].kind;
+            const kb = self.graph.types[rb].kind;
+            if (std.meta.activeTag(ka) != std.meta.activeTag(kb)) return false;
+
+            return switch (ka) {
+                .any_type,
+                .unknown_type,
+                .never_type,
+                .void_type,
+                .undefined_type,
+                .null_type,
+                .boolean_type,
+                .number_type,
+                .bigint_type,
+                .string_type,
+                .symbol_type,
+                .object_type,
+                .this_type,
+                => true,
+                .literal => |la| switch (la) {
+                    .str => |sa| std.mem.eql(u8, self.str(sa), self.str(kb.literal.str)),
+                    .num => |na| na == kb.literal.num,
+                    .boolean => |ba| ba == kb.literal.boolean,
+                    .bigint_literal => |ba| std.mem.eql(u8, self.str(ba), self.str(kb.literal.bigint_literal)),
+                },
+                .array, .readonly_array => |ea| self.graphTypesEquivalent(
+                    ea,
+                    env_a,
+                    if (kb == .array) kb.array else kb.readonly_array,
+                    env_b,
+                    depth + 1,
+                ),
+                .reference => |ref_a| blk: {
+                    const ref_b = kb.reference;
+                    if (ref_a.target_decl != ref_b.target_decl) break :blk false;
+                    if (!std.mem.eql(u8, self.str(ref_a.target_name), self.str(ref_b.target_name))) break :blk false;
+                    if (ref_a.type_args.len != ref_b.type_args.len) break :blk false;
+                    for (ref_a.type_args, ref_b.type_args) |ta, tb| {
+                        if (!self.graphTypesEquivalent(ta, env_a, tb, env_b, depth + 1)) break :blk false;
                     }
-                    continue;
-                }
-                if (std.mem.eql(u8, self.str(existing.name), m_wire)) return;
+                    break :blk true;
+                },
+                else => ra == rb and env_a == env_b,
+            };
+        }
+
+        fn signaturesEquivalentInGraph(
+            self: *const Self,
+            sid_a: u32,
+            env_a: ?*const HeritageEnv,
+            sid_b: u32,
+            env_b: ?*const HeritageEnv,
+        ) bool {
+            if (sid_a == sid_b and env_a == env_b) return true;
+            if (sid_a >= self.graph.signatures.len or sid_b >= self.graph.signatures.len) return false;
+            const sa = self.graph.signatures[sid_a];
+            const sb = self.graph.signatures[sid_b];
+            if (sa.type_params.len != sb.type_params.len) return false;
+            if (sa.params.len != sb.params.len) return false;
+            if ((sa.type_predicate != null) != (sb.type_predicate != null)) return false;
+            for (sa.params, sb.params) |pa, pb| {
+                if (pa.optional != pb.optional or pa.rest != pb.rest) return false;
+                if (!self.graphTypesEquivalent(pa.ty, env_a, pb.ty, env_b, 0)) return false;
             }
-            try list.append(self.scratch, sm);
+            return self.graphTypesEquivalent(sa.return_type, env_a, sb.return_type, env_b, 0);
+        }
+
+        fn methodsShareSlotName(self: *const Self, a: MethodNodeType, b: MethodNodeType) bool {
+            if (a.modifiers.static_mod != b.modifiers.static_mod) return false;
+            if (a.computed_symbol != null or b.computed_symbol != null) {
+                return a.computed_symbol != null and b.computed_symbol != null and
+                    std.meta.eql(a.computed_symbol.?, b.computed_symbol.?);
+            }
+            return std.mem.eql(u8, self.str(a.name), self.str(b.name));
+        }
+
+        fn appendMethodDedupOverloads(self: *Self, list: *std.ArrayList(SourcedMethod), sm: SourcedMethod) error{OutOfMemory}!void {
+            const m = sm.method;
+            if (m.signatures.len == 0) {
+                for (list.items) |existing_sm| {
+                    if (self.methodsShareSlotName(existing_sm.method, m)) return;
+                }
+                try list.append(self.scratch, sm);
+                return;
+            }
+
+            var kept_sigs: std.ArrayList(u32) = .empty;
+            for (m.signatures) |sid| {
+                var is_dup = false;
+                outer: for (list.items) |existing_sm| {
+                    if (!self.methodsShareSlotName(existing_sm.method, m)) continue;
+                    for (existing_sm.method.signatures) |esid| {
+                        if (self.signaturesEquivalentInGraph(esid, existing_sm.env, sid, sm.env)) {
+                            is_dup = true;
+                            break :outer;
+                        }
+                    }
+                }
+                if (!is_dup) {
+                    try kept_sigs.append(self.scratch, sid);
+                }
+            }
+            if (kept_sigs.items.len == 0) {
+                kept_sigs.deinit(self.scratch);
+                return;
+            }
+            var filtered_method = m;
+            filtered_method.signatures = try kept_sigs.toOwnedSlice(self.scratch);
+            try list.append(self.scratch, .{
+                .method = filtered_method,
+                .env = sm.env,
+            });
         }
 
         fn buildHeritageEnv(
@@ -7377,6 +8048,49 @@ fn LowerCtx(comptime GraphType: type) type {
             return null;
         }
 
+        const InheritedCtorLookup = union(enum) {
+            inherited_sigs: []SourcedSig,
+            default_zero_arg,
+            unknown_external_base,
+        };
+
+        fn collectInheritedClassCtors(
+            self: *Self,
+            initial_hc: anytype,
+        ) error{OutOfMemory}!InheritedCtorLookup {
+            var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+            defer visited.deinit(self.scratch);
+
+            var cur_hc = initial_hc;
+            var cur_env: ?*const HeritageEnv = null;
+            var depth: usize = 0;
+            while (depth < 32) : (depth += 1) {
+                const base_did = self.resolveHeritageTargetDecl(cur_hc) orelse return .unknown_external_base;
+                if (self.isBundledLibDecl(base_did)) return .unknown_external_base;
+                if (visited.contains(base_did)) return .unknown_external_base;
+                try visited.put(self.scratch, base_did, {});
+
+                const bd = self.graph.decls[base_did];
+                if (bd.kind != .class_decl) return .unknown_external_base;
+                const child_env = try self.buildHeritageEnv(cur_env, bd.type_params, cur_hc.type_args);
+                const bcls = bd.kind.class_decl;
+                if (bcls.constructors.len > 0) {
+                    const out = try self.scratch.alloc(SourcedSig, bcls.constructors.len);
+                    for (bcls.constructors, 0..) |sid, idx| {
+                        out[idx] = .{ .sid = sid, .env = child_env };
+                    }
+                    return .{ .inherited_sigs = out };
+                }
+                if (bcls.extends_clause) |next_hc| {
+                    cur_hc = next_hc;
+                    cur_env = child_env;
+                } else {
+                    return .default_zero_arg;
+                }
+            }
+            return .unknown_external_base;
+        }
+
         fn collectInheritedHeritageClauses(
             self: *Self,
             parent_env: ?*const HeritageEnv,
@@ -7385,11 +8099,37 @@ fn LowerCtx(comptime GraphType: type) type {
             out_methods: *std.ArrayList(SourcedMethod),
             out_call_sigs: *std.ArrayList(SourcedSig),
             out_construct_sigs: *std.ArrayList(SourcedSig),
+            out_index_sigs: *std.ArrayList(SourcedIndexSig),
             seen_methods: *std.StringHashMapUnmanaged(void),
             derived_methods: *std.StringHashMapUnmanaged(void),
             visited_bases: *std.AutoHashMapUnmanaged(u32, void),
         ) error{OutOfMemory}!void {
+            if (extends_clauses.len <= 1) {
+                for (extends_clauses) |hc| {
+                    try self.collectInheritedHeritageClause(
+                        parent_env,
+                        hc,
+                        out_props,
+                        out_methods,
+                        out_call_sigs,
+                        out_construct_sigs,
+                        out_index_sigs,
+                        seen_methods,
+                        derived_methods,
+                        visited_bases,
+                    );
+                }
+                return;
+            }
+
+            // Clone `seen_methods` per sibling heritage clause so sibling `extends Left, Right`
+            // preserve overloaded methods from both siblings while `appendMethodDedupOverloads`
+            // deduplicates identical signatures and `visited_bases` prevents diamond repetition!
+            var merged_seen = try seen_methods.clone(self.scratch);
+            defer merged_seen.deinit(self.scratch);
             for (extends_clauses) |hc| {
+                var branch_seen = try seen_methods.clone(self.scratch);
+                defer branch_seen.deinit(self.scratch);
                 try self.collectInheritedHeritageClause(
                     parent_env,
                     hc,
@@ -7397,20 +8137,26 @@ fn LowerCtx(comptime GraphType: type) type {
                     out_methods,
                     out_call_sigs,
                     out_construct_sigs,
-                    seen_methods,
+                    out_index_sigs,
+                    &branch_seen,
                     derived_methods,
                     visited_bases,
                 );
+                var bit = branch_seen.keyIterator();
+                while (bit.next()) |k| try merged_seen.put(self.scratch, k.*, {});
             }
+            var mit = merged_seen.keyIterator();
+            while (mit.next()) |k| try seen_methods.put(self.scratch, k.*, {});
         }
 
-        fn collectHandleIntersectionMembers(
+        fn collectObjectIntersectionMembers(
             self: *Self,
             ty_id: u32,
             out_props: *std.ArrayList(SourcedProp),
             out_methods: *std.ArrayList(SourcedMethod),
             out_call_sigs: *std.ArrayList(SourcedSig),
             out_construct_sigs: *std.ArrayList(SourcedSig),
+            out_index_sigs: *std.ArrayList(SourcedIndexSig),
         ) error{OutOfMemory}!bool {
             var seen_methods: std.StringHashMapUnmanaged(void) = .empty;
             defer seen_methods.deinit(self.scratch);
@@ -7427,6 +8173,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 out_methods,
                 out_call_sigs,
                 out_construct_sigs,
+                out_index_sigs,
                 &seen_methods,
                 &derived_methods,
                 &visited_bases,
@@ -7444,6 +8191,7 @@ fn LowerCtx(comptime GraphType: type) type {
             out_methods: *std.ArrayList(SourcedMethod),
             out_call_sigs: *std.ArrayList(SourcedSig),
             out_construct_sigs: *std.ArrayList(SourcedSig),
+            out_index_sigs: *std.ArrayList(SourcedIndexSig),
             seen_methods: *std.StringHashMapUnmanaged(void),
             derived_methods: *std.StringHashMapUnmanaged(void),
             visited_bases: *std.AutoHashMapUnmanaged(u32, void),
@@ -7454,6 +8202,14 @@ fn LowerCtx(comptime GraphType: type) type {
             if (ty_id >= self.graph.types.len or depth > 16) return false;
             const tn = self.graph.types[ty_id];
             switch (tn.kind) {
+                .function_type => |sid| {
+                    try appendUniqueSourcedSig(out_call_sigs, self.scratch, .{ .sid = sid, .env = env });
+                    return true;
+                },
+                .constructor_type => |sid| {
+                    try appendUniqueSourcedSig(out_construct_sigs, self.scratch, .{ .sid = sid, .env = env });
+                    return true;
+                },
                 .object_literal => |obj| {
                     const split = try self.splitObjectLiteralPropsAndMethodsWithEnv(obj.properties, env);
                     for (split.methods) |sm| {
@@ -7464,7 +8220,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                         const mw = self.str(sm.method.name);
                         if (!seen_methods.contains(mw)) {
-                            try out_methods.append(self.scratch, sm);
+                            try self.appendMethodDedupOverloads(out_methods, sm);
                             try newly_seen_methods.append(self.scratch, mw);
                         }
                     }
@@ -7488,10 +8244,15 @@ fn LowerCtx(comptime GraphType: type) type {
                     for (obj.construct_signatures) |sid| {
                         try appendUniqueSourcedSig(out_construct_sigs, self.scratch, .{ .sid = sid, .env = env });
                     }
+                    for (obj.index_signatures) |isig| {
+                        try out_index_sigs.append(self.scratch, .{ .sig = isig, .env = env });
+                    }
                     return true;
                 },
                 .intersection => |parts| {
-                    if (parts.len == 0 or self.detectOpenPrimitiveIntersection(parts) != null) return false;
+                    if (parts.len == 0 or
+                        self.detectOpenPrimitiveIntersection(parts) != null or
+                        self.detectBrandedPrimitiveIntersection(parts, 0) != null) return false;
 
                     var tmp_props: std.ArrayList(SourcedProp) = .empty;
                     defer tmp_props.deinit(self.scratch);
@@ -7501,6 +8262,8 @@ fn LowerCtx(comptime GraphType: type) type {
                     defer tmp_calls.deinit(self.scratch);
                     var tmp_ctors: std.ArrayList(SourcedSig) = .empty;
                     defer tmp_ctors.deinit(self.scratch);
+                    var tmp_index_sigs: std.ArrayList(SourcedIndexSig) = .empty;
+                    defer tmp_index_sigs.deinit(self.scratch);
                     var tmp_bases = try visited_bases.clone(self.scratch);
                     defer tmp_bases.deinit(self.scratch);
                     var tmp_newly_seen: std.ArrayList([]const u8) = .empty;
@@ -7516,6 +8279,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             &tmp_methods,
                             &tmp_calls,
                             &tmp_ctors,
+                            &tmp_index_sigs,
                             &part_seen,
                             derived_methods,
                             &tmp_bases,
@@ -7527,10 +8291,11 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                     }
 
-                    for (tmp_methods.items) |sm| try out_methods.append(self.scratch, sm);
+                    for (tmp_methods.items) |sm| try self.appendMethodDedupOverloads(out_methods, sm);
                     for (tmp_props.items) |sp| try self.upsertPropWithMode(out_props, sp, prefer_required_props);
                     for (tmp_calls.items) |ss| try appendUniqueSourcedSig(out_call_sigs, self.scratch, ss);
                     for (tmp_ctors.items) |ss| try appendUniqueSourcedSig(out_construct_sigs, self.scratch, ss);
+                    for (tmp_index_sigs.items) |sis| try out_index_sigs.append(self.scratch, sis);
                     for (tmp_newly_seen.items) |mw| try newly_seen_methods.append(self.scratch, mw);
                     var bit = tmp_bases.keyIterator();
                     while (bit.next()) |k| try visited_bases.put(self.scratch, k.*, {});
@@ -7562,6 +8327,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                             out_methods,
                                             out_call_sigs,
                                             out_construct_sigs,
+                                            out_index_sigs,
                                             seen_methods,
                                             derived_methods,
                                             visited_bases,
@@ -7588,6 +8354,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                     out_methods,
                                     out_call_sigs,
                                     out_construct_sigs,
+                                    out_index_sigs,
                                     &sub_seen,
                                     derived_methods,
                                     visited_bases,
@@ -7614,6 +8381,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                     out_methods,
                                     out_call_sigs,
                                     out_construct_sigs,
+                                    out_index_sigs,
                                     seen_methods,
                                     derived_methods,
                                     visited_bases,
@@ -7632,6 +8400,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                             out_methods,
                                             out_call_sigs,
                                             out_construct_sigs,
+                                            out_index_sigs,
                                             seen_methods,
                                             derived_methods,
                                             visited_bases,
@@ -7655,6 +8424,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                 out_methods,
                                 out_call_sigs,
                                 out_construct_sigs,
+                                out_index_sigs,
                                 seen_methods,
                                 derived_methods,
                                 visited_bases,
@@ -7676,6 +8446,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                 out_methods,
                                 out_call_sigs,
                                 out_construct_sigs,
+                                out_index_sigs,
                                 seen_methods,
                                 derived_methods,
                                 visited_bases,
@@ -7698,6 +8469,7 @@ fn LowerCtx(comptime GraphType: type) type {
             out_methods: *std.ArrayList(SourcedMethod),
             out_call_sigs: *std.ArrayList(SourcedSig),
             out_construct_sigs: *std.ArrayList(SourcedSig),
+            out_index_sigs: *std.ArrayList(SourcedIndexSig),
             seen_methods: *std.StringHashMapUnmanaged(void),
             derived_methods: *std.StringHashMapUnmanaged(void),
             visited_bases: *std.AutoHashMapUnmanaged(u32, void),
@@ -7715,6 +8487,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             out_methods,
                             out_call_sigs,
                             out_construct_sigs,
+                            out_index_sigs,
                             seen_methods,
                             derived_methods,
                             visited_bases,
@@ -7735,6 +8508,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         out_methods,
                         out_call_sigs,
                         out_construct_sigs,
+                        out_index_sigs,
                         seen_methods,
                         derived_methods,
                         visited_bases,
@@ -7755,6 +8529,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         out_methods,
                         out_call_sigs,
                         out_construct_sigs,
+                        out_index_sigs,
                         seen_methods,
                         derived_methods,
                         visited_bases,
@@ -7772,6 +8547,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                     out_methods,
                                     out_call_sigs,
                                     out_construct_sigs,
+                                    out_index_sigs,
                                     seen_methods,
                                     derived_methods,
                                     visited_bases,
@@ -7798,6 +8574,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     out_methods,
                     out_call_sigs,
                     out_construct_sigs,
+                    out_index_sigs,
                     seen_methods,
                     derived_methods,
                     visited_bases,
@@ -7818,6 +8595,7 @@ fn LowerCtx(comptime GraphType: type) type {
             out_methods: *std.ArrayList(SourcedMethod),
             out_call_sigs: *std.ArrayList(SourcedSig),
             out_construct_sigs: *std.ArrayList(SourcedSig),
+            out_index_sigs: *std.ArrayList(SourcedIndexSig),
             seen_methods: *std.StringHashMapUnmanaged(void),
             derived_methods: *std.StringHashMapUnmanaged(void),
             visited_bases: *std.AutoHashMapUnmanaged(u32, void),
@@ -7826,6 +8604,7 @@ fn LowerCtx(comptime GraphType: type) type {
             if (self.isBundledLibDecl(base_did)) return;
             if (visited_bases.contains(base_did)) return;
             const bd = self.graph.decls[base_did];
+            const b_wire = if (bd.export_name) |esid| self.str(esid) else self.str(bd.name);
             if (bd.kind != .interface_decl and bd.kind != .class_decl) return;
 
             const child_env = try self.buildHeritageEnv(parent_env, bd.type_params, type_args);
@@ -7833,7 +8612,11 @@ fn LowerCtx(comptime GraphType: type) type {
             try visited_bases.put(self.scratch, base_did, {});
             for (bd.merged_with) |mid| {
                 if (mid < self.graph.decls.len and self.graph.decls[mid].kind == .interface_decl) {
-                    try visited_bases.put(self.scratch, mid, {});
+                    const md = self.graph.decls[mid];
+                    const m_wire = if (md.export_name) |esid| self.str(esid) else self.str(md.name);
+                    if (merge_decls.sameWireName(b_wire, m_wire)) {
+                        try visited_bases.put(self.scratch, mid, {});
+                    }
                 }
             }
 
@@ -7848,7 +8631,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         if (bm.modifiers.static_mod or bm.modifiers.private_mod or bm.modifiers.protected_mod or bm.computed_symbol != null) continue;
                         const mw = self.str(bm.name);
                         if (!seen_methods.contains(mw)) {
-                            try out_methods.append(self.scratch, .{ .method = bm, .env = child_env });
+                            try self.appendMethodDedupOverloads(out_methods, .{ .method = bm, .env = child_env });
                             try newly_seen_methods.append(self.scratch, mw);
                         }
                     }
@@ -7864,13 +8647,14 @@ fn LowerCtx(comptime GraphType: type) type {
                     }
                     for (biface.call_signatures) |sid| try appendUniqueSourcedSig(out_call_sigs, self.scratch, .{ .sid = sid, .env = child_env });
                     for (biface.construct_signatures) |sid| try appendUniqueSourcedSig(out_construct_sigs, self.scratch, .{ .sid = sid, .env = child_env });
+                    for (biface.index_signatures) |isig| try out_index_sigs.append(self.scratch, .{ .sig = isig, .env = child_env });
                 },
                 .class_decl => |bcls| {
                     for (bcls.methods) |bm| {
                         if (bm.modifiers.static_mod or bm.modifiers.private_mod or bm.modifiers.protected_mod or bm.computed_symbol != null) continue;
                         const mw = self.str(bm.name);
                         if (!seen_methods.contains(mw)) {
-                            try out_methods.append(self.scratch, .{ .method = bm, .env = child_env });
+                            try self.appendMethodDedupOverloads(out_methods, .{ .method = bm, .env = child_env });
                             try newly_seen_methods.append(self.scratch, mw);
                         }
                     }
@@ -7884,6 +8668,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                         try newly_seen_methods.append(self.scratch, pw);
                     }
+                    for (bcls.index_signatures) |isig| try out_index_sigs.append(self.scratch, .{ .sig = isig, .env = child_env });
                 },
                 else => unreachable,
             }
@@ -7893,12 +8678,14 @@ fn LowerCtx(comptime GraphType: type) type {
                 if (mid == base_did or mid >= self.graph.decls.len) continue;
                 const mdecl = self.graph.decls[mid];
                 if (mdecl.kind != .interface_decl) continue;
+                const m_wire = if (mdecl.export_name) |esid| self.str(esid) else self.str(mdecl.name);
+                if (!merge_decls.sameWireName(b_wire, m_wire)) continue;
                 const miface = mdecl.kind.interface_decl;
                 for (miface.methods) |bm| {
                     if (bm.modifiers.static_mod or bm.modifiers.private_mod or bm.modifiers.protected_mod or bm.computed_symbol != null) continue;
                     const mw = self.str(bm.name);
                     if (!seen_methods.contains(mw)) {
-                        try out_methods.append(self.scratch, .{ .method = bm, .env = child_env });
+                        try self.appendMethodDedupOverloads(out_methods, .{ .method = bm, .env = child_env });
                         try newly_seen_methods.append(self.scratch, mw);
                     }
                 }
@@ -7916,6 +8703,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 if (bd.kind == .interface_decl) {
                     for (miface.construct_signatures) |sid| try appendUniqueSourcedSig(out_construct_sigs, self.scratch, .{ .sid = sid, .env = child_env });
                 }
+                for (miface.index_signatures) |isig| try out_index_sigs.append(self.scratch, .{ .sig = isig, .env = child_env });
             }
 
             // Record `bd`'s instance members BEFORE recursing into `GrandBase` so `bd` overrides `GrandBase`.
@@ -7943,6 +8731,8 @@ fn LowerCtx(comptime GraphType: type) type {
                 if (mid == base_did or mid >= self.graph.decls.len) continue;
                 const mdecl = self.graph.decls[mid];
                 if (mdecl.kind != .interface_decl) continue;
+                const m_wire = if (mdecl.export_name) |esid| self.str(esid) else self.str(mdecl.name);
+                if (!merge_decls.sameWireName(b_wire, m_wire)) continue;
                 for (mdecl.kind.interface_decl.methods) |bm| {
                     if (bm.modifiers.static_mod or bm.modifiers.private_mod or bm.modifiers.protected_mod or bm.computed_symbol != null) continue;
                     try sub_derived_methods.put(self.scratch, self.str(bm.name), {});
@@ -7959,6 +8749,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         out_methods,
                         out_call_sigs,
                         out_construct_sigs,
+                        out_index_sigs,
                         seen_methods,
                         &sub_derived_methods,
                         visited_bases,
@@ -7973,6 +8764,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             out_methods,
                             out_call_sigs,
                             out_construct_sigs,
+                            out_index_sigs,
                             seen_methods,
                             &sub_derived_methods,
                             visited_bases,
@@ -7985,6 +8777,8 @@ fn LowerCtx(comptime GraphType: type) type {
                 if (mid == base_did or mid >= self.graph.decls.len) continue;
                 const mdecl = self.graph.decls[mid];
                 if (mdecl.kind != .interface_decl) continue;
+                const m_wire = if (mdecl.export_name) |esid| self.str(esid) else self.str(mdecl.name);
+                if (!merge_decls.sameWireName(b_wire, m_wire)) continue;
                 try self.collectInheritedHeritageClauses(
                     child_env,
                     mdecl.kind.interface_decl.extends_clauses,
@@ -7992,6 +8786,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     out_methods,
                     out_call_sigs,
                     out_construct_sigs,
+                    out_index_sigs,
                     seen_methods,
                     &sub_derived_methods,
                     visited_bases,
@@ -8102,20 +8897,535 @@ fn LowerCtx(comptime GraphType: type) type {
             return try list.toOwnedSlice(self.alloc);
         }
 
+        const MergedCallFnSlot = struct {
+            source_decl_id: u32,
+            sig_id: u32,
+            zig_ident: []const u8,
+            logical_name: []const u8,
+            alloc_companion_ident: ?[]const u8,
+            is_default_export: bool,
+            is_global_scope: bool,
+            decl_jsdoc: ?JsDocIr,
+        };
+
+        fn prebindMergedCallFnSlots(
+            self: *Self,
+            owner_decl_id: u32,
+            owner_wire: []const u8,
+            merged_ids: []const u32,
+            always_emit: bool,
+            target_scope: *naming.ScopeNamer,
+            outer_active_tps: []const ActiveTypeParam,
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+        ) error{OutOfMemory}![]MergedCallFnSlot {
+            var slots: std.ArrayList(MergedCallFnSlot) = .empty;
+            for (merged_ids) |mid| {
+                if (mid == owner_decl_id or mid >= self.graph.decls.len) continue;
+                const md = self.graph.decls[mid];
+                if (md.kind != .function_decl) continue;
+                if (md.modifiers.private_mod or md.modifiers.protected_mod) continue;
+                const m_wire = if (md.export_name) |esid| self.str(esid) else self.str(md.name);
+                if (!merge_decls.sameWireName(owner_wire, m_wire)) continue;
+                if (!always_emit and !self.merged_fn_consumed.contains(mid) and target_scope.isTaken("call")) {
+                    continue;
+                }
+                const decl_jsdoc = try self.lowerJsDoc(md.jsdoc);
+                const is_global = self.global_aug_decls.contains(mid);
+                for (md.kind.function_decl) |sid| {
+                    const cb = try target_scope.bind("call", .camel);
+                    const zig_ident = try self.alloc.dupe(u8, cb.zig_ident);
+                    const logical_name = try self.alloc.dupe(u8, cb.logical_name);
+                    cb.deinit(self.scratch);
+
+                    var alloc_ident: ?[]const u8 = null;
+                    if (try self.previewSigMayAllocateOnDecode(
+                        sid,
+                        target_scope,
+                        outer_active_tps,
+                        null,
+                        imports_used,
+                        needs_runtime,
+                    )) {
+                        const raw_alloc = try std.fmt.allocPrint(self.scratch, "{s}Alloc", .{logical_name});
+                        defer self.scratch.free(raw_alloc);
+                        const ab = try target_scope.bind(raw_alloc, .camel);
+                        alloc_ident = try self.alloc.dupe(u8, ab.zig_ident);
+                        ab.deinit(self.scratch);
+                    }
+
+                    try slots.append(self.scratch, .{
+                        .source_decl_id = mid,
+                        .sig_id = sid,
+                        .zig_ident = zig_ident,
+                        .logical_name = logical_name,
+                        .alloc_companion_ident = alloc_ident,
+                        .is_default_export = md.modifiers.default_export or
+                            (std.mem.eql(u8, owner_wire, "default") and self.js_exported_decls.contains(mid)),
+                        .is_global_scope = is_global,
+                        .decl_jsdoc = decl_jsdoc,
+                    });
+                }
+            }
+            return try slots.toOwnedSlice(self.scratch);
+        }
+
+        fn finishMergedCallFns(
+            self: *Self,
+            owner_wire: []const u8,
+            slots: []const MergedCallFnSlot,
+            target_scope: *naming.ScopeNamer,
+            outer_active_tps: []const ActiveTypeParam,
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+        ) error{OutOfMemory}![]DeclIr {
+            if (slots.len == 0) return &.{};
+            needs_runtime.* = true;
+            var out = try self.alloc.alloc(DeclIr, slots.len);
+            for (slots, 0..) |slot, idx| {
+                const sig_ir = try self.lowerSignature(
+                    slot.sig_id,
+                    target_scope,
+                    false,
+                    outer_active_tps,
+                    null,
+                    imports_used,
+                    needs_runtime,
+                );
+                out[idx] = .{
+                    .source_decl_id = slot.source_decl_id,
+                    .zig_ident = slot.zig_ident,
+                    .logical_name = slot.logical_name,
+                    .wire_name = try self.alloc.dupe(u8, owner_wire),
+                    .is_exported = true,
+                    .is_js_exported = false,
+                    .is_default_export = slot.is_default_export,
+                    .is_global_scope = slot.is_global_scope,
+                    .alloc_companion_ident = slot.alloc_companion_ident,
+                    .jsdoc = sig_ir.jsdoc orelse slot.decl_jsdoc,
+                    .kind = .{ .function_decl = sig_ir },
+                };
+            }
+            return out;
+        }
+
+        fn expandIndexSigKeyGraphTypes(
+            self: *const Self,
+            key_ty_id: u32,
+            out: *std.ArrayList(u32),
+            depth: usize,
+        ) error{OutOfMemory}!void {
+            if (key_ty_id >= self.graph.types.len or depth > 8) return;
+            const tn = self.graph.types[key_ty_id];
+            switch (tn.kind) {
+                .reference => |ref| {
+                    if (ref.type_args.len == 0) {
+                        if (ref.target_decl) |td| {
+                            if (td < self.graph.decls.len and self.graph.decls[td].kind == .type_alias_decl) {
+                                const alias_ty_id = self.graph.decls[td].kind.type_alias_decl;
+                                if (alias_ty_id < self.graph.types.len and self.graph.types[alias_ty_id].kind == .union_type) {
+                                    const arms = self.graph.types[alias_ty_id].kind.union_type;
+                                    var all_lits = arms.len > 0;
+                                    for (arms) |aid| {
+                                        if (aid >= self.graph.types.len or self.graph.types[aid].kind != .literal) {
+                                            all_lits = false;
+                                            break;
+                                        }
+                                    }
+                                    if (!all_lits) {
+                                        for (arms) |aid| try self.expandIndexSigKeyGraphTypes(aid, out, depth + 1);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    try out.append(self.scratch, key_ty_id);
+                },
+                .union_type => |arms| {
+                    var all_lits = arms.len > 0;
+                    for (arms) |aid| {
+                        if (aid >= self.graph.types.len or self.graph.types[aid].kind != .literal) {
+                            all_lits = false;
+                            break;
+                        }
+                    }
+                    if (all_lits) {
+                        try out.append(self.scratch, key_ty_id);
+                    } else {
+                        for (arms) |aid| try self.expandIndexSigKeyGraphTypes(aid, out, depth + 1);
+                    }
+                },
+                else => try out.append(self.scratch, key_ty_id),
+            }
+        }
+
+        fn classifyGraphIndexKeyCategory(
+            self: *const Self,
+            key_ty_id: u32,
+            depth: usize,
+        ) lower_heritage.IndexKeyCategory {
+            if (key_ty_id >= self.graph.types.len or depth > 8) return .other_key;
+            return switch (self.graph.types[key_ty_id].kind) {
+                .string_type => .string_key,
+                .number_type => .number_key,
+                .symbol_type, .unique_symbol => .symbol_key,
+                .template_literal => .template_key,
+                .intersection => |parts| blk: {
+                    if (self.detectOpenPrimitiveIntersection(parts)) |base_kind| {
+                        break :blk switch (base_kind) {
+                            .str => .string_key,
+                            .num => .number_key,
+                            else => .other_key,
+                        };
+                    }
+                    if (self.detectBrandedPrimitiveIntersection(parts, 0)) |bpk| {
+                        break :blk switch (bpk) {
+                            .str => .string_key,
+                            .num => .number_key,
+                            .symbol => .symbol_key,
+                            else => .other_key,
+                        };
+                    }
+                    break :blk .other_key;
+                },
+                .reference => |ref| blk: {
+                    if (ref.type_args.len == 0) {
+                        if (ref.target_decl) |td| {
+                            if (td < self.graph.decls.len and self.graph.decls[td].kind == .type_alias_decl) {
+                                break :blk self.classifyGraphIndexKeyCategory(
+                                    self.graph.decls[td].kind.type_alias_decl,
+                                    depth + 1,
+                                );
+                            }
+                        }
+                    }
+                    break :blk .other_key;
+                },
+                else => .other_key,
+            };
+        }
+
+        fn normalizeIndexKeyTypeAndCategory(
+            self: *Self,
+            graph_key_ty_id: u32,
+            lowered_key_ty: *const TypeIr,
+        ) error{OutOfMemory}!struct { ty: *const TypeIr, category: lower_heritage.IndexKeyCategory } {
+            const graph_cat = self.classifyGraphIndexKeyCategory(graph_key_ty_id, 0);
+            switch (lowered_key_ty.*) {
+                .string_type, .js_string => return .{ .ty = lowered_key_ty, .category = .string_key },
+                .f64_type, .i64_type => return .{ .ty = lowered_key_ty, .category = .number_key },
+                .js_symbol => return .{ .ty = lowered_key_ty, .category = .symbol_key },
+                .template_pattern => return .{ .ty = lowered_key_ty, .category = .template_key },
+                .inline_enum => |en| {
+                    var all_str = en.members.len > 0;
+                    for (en.members) |m| {
+                        if (m.alias_of_zig_ident != null) continue;
+                        if (m.value != .str) all_str = false;
+                    }
+                    if (all_str or en.backing != .none) {
+                        const cat: lower_heritage.IndexKeyCategory = if (graph_cat == .template_key) .template_key else .other_key;
+                        return .{ .ty = lowered_key_ty, .category = cat };
+                    }
+                    return .{ .ty = try self.makeType(.js_any), .category = .other_key };
+                },
+                .open_literal_union => |olu| return switch (olu.base_kind) {
+                    .str => .{ .ty = try self.makeType(.string_type), .category = .string_key },
+                    .num => .{ .ty = try self.makeType(.f64_type), .category = .number_key },
+                    else => .{ .ty = try self.makeType(.js_any), .category = .other_key },
+                },
+                .js_any, .js_unknown, .js_value => return .{ .ty = lowered_key_ty, .category = graph_cat },
+                .decl_ref => |dr| {
+                    if (graph_cat == .template_key) {
+                        return .{ .ty = lowered_key_ty, .category = .template_key };
+                    }
+                    if (dr.target_decl_id < self.graph.decls.len) {
+                        const td = self.graph.decls[dr.target_decl_id];
+                        switch (td.kind) {
+                            .enum_decl => |ed| {
+                                var has_unknown = false;
+                                var all_str = ed.members.len > 0;
+                                var all_num = ed.members.len > 0;
+                                for (ed.members) |em| {
+                                    if (em.value) |ev| {
+                                        switch (ev) {
+                                            .str => all_num = false,
+                                            .num => |n| {
+                                                all_str = false;
+                                                if (!std.math.isFinite(n)) has_unknown = true;
+                                            },
+                                            else => {
+                                                all_str = false;
+                                                all_num = false;
+                                                has_unknown = true;
+                                            },
+                                        }
+                                    } else {
+                                        all_str = false;
+                                        all_num = false;
+                                        has_unknown = true;
+                                    }
+                                }
+                                if (!has_unknown and (all_str or all_num)) {
+                                    return .{ .ty = lowered_key_ty, .category = .other_key };
+                                }
+                            },
+                            .type_alias_decl => |ta_ty_id| {
+                                if (ta_ty_id < self.graph.types.len) {
+                                    const atk = self.graph.types[ta_ty_id].kind;
+                                    if (atk == .string_type or atk == .number_type or atk == .symbol_type or
+                                        atk == .unique_symbol or atk == .template_literal)
+                                    {
+                                        return .{ .ty = lowered_key_ty, .category = graph_cat };
+                                    }
+                                    if (atk == .union_type) {
+                                        const arms = atk.union_type;
+                                        var all_str = arms.len > 0;
+                                        var all_num = arms.len > 0;
+                                        for (arms) |aid| {
+                                            if (aid >= self.graph.types.len or self.graph.types[aid].kind != .literal) {
+                                                all_str = false;
+                                                all_num = false;
+                                                break;
+                                            }
+                                            switch (self.graph.types[aid].kind.literal) {
+                                                .str => all_num = false,
+                                                .num => all_str = false,
+                                                else => {
+                                                    all_str = false;
+                                                    all_num = false;
+                                                },
+                                            }
+                                        }
+                                        if (all_str or all_num) {
+                                            return .{ .ty = lowered_key_ty, .category = .other_key };
+                                        }
+                                    }
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                    if (graph_cat == .string_key) return .{ .ty = try self.makeType(.string_type), .category = .string_key };
+                    if (graph_cat == .number_key) return .{ .ty = try self.makeType(.f64_type), .category = .number_key };
+                    return .{ .ty = try self.makeType(.js_any), .category = .other_key };
+                },
+                else => {
+                    if (graph_cat == .string_key) return .{ .ty = try self.makeType(.string_type), .category = .string_key };
+                    if (graph_cat == .number_key) return .{ .ty = try self.makeType(.f64_type), .category = .number_key };
+                    return .{ .ty = try self.makeType(.js_any), .category = .other_key };
+                },
+            }
+        }
+
+        fn canonicalMergedStructOwnerId(self: *const Self, did: u32) u32 {
+            if (did >= self.graph.decls.len) return did;
+            if (!self.merged_iface_consumed.contains(did)) return did;
+            const d = self.graph.decls[did];
+            const dw = if (d.export_name) |esid| self.str(esid) else self.str(d.name);
+            for (d.merged_with) |mid| {
+                if (mid < self.graph.decls.len and !self.merged_iface_consumed.contains(mid)) {
+                    const md = self.graph.decls[mid];
+                    const mw = if (md.export_name) |esid| self.str(esid) else self.str(md.name);
+                    if ((md.kind == .class_decl or md.kind == .interface_decl) and merge_decls.sameWireName(dw, mw)) {
+                        return mid;
+                    }
+                }
+            }
+            return did;
+        }
+
+        fn isDeclEmittedAsStructWithRepr(
+            self: *Self,
+            did: u32,
+            repr: classify_decls.ObjectDeclKind,
+        ) error{OutOfMemory}!bool {
+            if (did >= self.graph.decls.len) return false;
+            if (self.isBundledLibDecl(did)) return false;
+            if (!self.decl_locations.contains(did)) return false;
+            const d = self.graph.decls[did];
+            switch (d.kind) {
+                .class_decl => return repr == .handle_wrapper,
+                .interface_decl => return (try self.classifyDecl(did)).kind == repr,
+                .type_alias_decl => |ta_ty_id| {
+                    if (ta_ty_id >= self.graph.types.len) return false;
+                    const tn = self.graph.types[ta_ty_id];
+                    switch (tn.kind) {
+                        .object_literal => return (try self.classifyDecl(did)).kind == repr,
+                        .intersection => |parts| {
+                            if (parts.len == 0 or
+                                self.detectOpenPrimitiveIntersection(parts) != null or
+                                self.detectBrandedPrimitiveIntersection(parts, 0) != null) return false;
+                            if ((try self.classifyDecl(did)).kind != repr) return false;
+                            var p: std.ArrayList(SourcedProp) = .empty;
+                            defer p.deinit(self.scratch);
+                            var m: std.ArrayList(SourcedMethod) = .empty;
+                            defer m.deinit(self.scratch);
+                            var cs: std.ArrayList(SourcedSig) = .empty;
+                            defer cs.deinit(self.scratch);
+                            var ks: std.ArrayList(SourcedSig) = .empty;
+                            defer ks.deinit(self.scratch);
+                            var is: std.ArrayList(SourcedIndexSig) = .empty;
+                            defer is.deinit(self.scratch);
+                            return try self.collectObjectIntersectionMembers(ta_ty_id, &p, &m, &cs, &ks, &is);
+                        },
+                        else => return false,
+                    }
+                },
+                else => return false,
+            }
+        }
+
+        fn appendDirectBaseFromGraphType(
+            self: *Self,
+            owner_decl_id: u32,
+            repr: classify_decls.ObjectDeclKind,
+            ty_id: u32,
+            env: ?*const HeritageEnv,
+            owner_active_tps: []const ActiveTypeParam,
+            self_ident_opt: ?[]const u8,
+            visited_ty: *std.AutoHashMapUnmanaged(u32, void),
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+            env_cache: *std.AutoHashMapUnmanaged(*const HeritageEnv, []const ActiveTypeParam),
+            out: *std.ArrayList(*const TypeIr),
+            depth: usize,
+        ) error{OutOfMemory}!void {
+            if (ty_id >= self.graph.types.len or depth > 12) return;
+            const tn = self.graph.types[ty_id];
+            switch (tn.kind) {
+                .intersection => |parts| {
+                    if (self.detectOpenPrimitiveIntersection(parts) != null or
+                        self.detectBrandedPrimitiveIntersection(parts, 0) != null) return;
+                    for (parts) |pid| {
+                        try self.appendDirectBaseFromGraphType(
+                            owner_decl_id,
+                            repr,
+                            pid,
+                            env,
+                            owner_active_tps,
+                            self_ident_opt,
+                            visited_ty,
+                            imports_used,
+                            needs_runtime,
+                            env_cache,
+                            out,
+                            depth + 1,
+                        );
+                    }
+                },
+                .reference => |ref| {
+                    const raw_td = ref.target_decl orelse return;
+                    const td = self.canonicalMergedStructOwnerId(raw_td);
+                    if (td == owner_decl_id or td >= self.graph.decls.len) return;
+                    if (self.isBundledLibDecl(td)) return;
+
+                    if (try self.isDeclEmittedAsStructWithRepr(td, repr)) {
+                        const active_tps = try self.resolveHeritageActiveTps(
+                            env,
+                            owner_active_tps,
+                            self_ident_opt,
+                            imports_used,
+                            needs_runtime,
+                            env_cache,
+                            0,
+                        );
+                        visited_ty.clearRetainingCapacity();
+                        const b_ty = try self.lowerType(
+                            ty_id,
+                            false,
+                            active_tps,
+                            self_ident_opt,
+                            visited_ty,
+                            imports_used,
+                            needs_runtime,
+                        );
+                        if (b_ty.* == .decl_ref) {
+                            var clean_dr = b_ty.decl_ref;
+                            clean_dr.indirect = false;
+                            const clean_ty = try self.makeType(.{ .decl_ref = clean_dr });
+                            for (out.items) |existing| {
+                                if (typeIrEql(existing, clean_ty, 0)) return;
+                            }
+                            try out.append(self.alloc, clean_ty);
+                        }
+                        return;
+                    }
+
+                    // Transparent non-struct `type_alias_decl` (`type Alias<U> = Base<U>`): unwrap!
+                    const d = self.graph.decls[td];
+                    if (d.kind == .type_alias_decl) {
+                        const child_env = try self.buildHeritageEnv(env, d.type_params, ref.type_args);
+                        try self.appendDirectBaseFromGraphType(
+                            owner_decl_id,
+                            repr,
+                            d.kind.type_alias_decl,
+                            child_env,
+                            owner_active_tps,
+                            self_ident_opt,
+                            visited_ty,
+                            imports_used,
+                            needs_runtime,
+                            env_cache,
+                            out,
+                            depth + 1,
+                        );
+                    }
+                },
+                else => {},
+            }
+        }
+
+        fn resolveDirectStructBases(
+            self: *Self,
+            owner_decl_id: u32,
+            repr: classify_decls.ObjectDeclKind,
+            sourced_bases: []const SourcedBaseClause,
+            owner_active_tps: []const ActiveTypeParam,
+            self_ident_opt: ?[]const u8,
+            visited_ty: *std.AutoHashMapUnmanaged(u32, void),
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+            env_cache: *std.AutoHashMapUnmanaged(*const HeritageEnv, []const ActiveTypeParam),
+        ) error{OutOfMemory}![]const *const TypeIr {
+            if (sourced_bases.len == 0) return &.{};
+            var out: std.ArrayList(*const TypeIr) = .empty;
+            for (sourced_bases) |sb| {
+                try self.appendDirectBaseFromGraphType(
+                    owner_decl_id,
+                    repr,
+                    sb.target_type,
+                    sb.env,
+                    owner_active_tps,
+                    self_ident_opt,
+                    visited_ty,
+                    imports_used,
+                    needs_runtime,
+                    env_cache,
+                    &out,
+                    0,
+                );
+            }
+            return try out.toOwnedSlice(self.alloc);
+        }
+
         fn lowerStructDecl(
             self: *Self,
             final_mod_idx: u32,
             owner_decl_id: u32,
             explicit_cls: classify_decls.DeclClassification,
             is_abstract: bool,
-            has_explicit_extends: bool,
+            allow_default_ctor: bool,
             raw_tps: []const u32,
             raw_ctors: []const u32,
+            inherited_ctors: []const SourcedSig,
             raw_props: []const SourcedProp,
             companion_static_props: []const u32,
             raw_methods: []const SourcedMethod,
             call_sigs: []const SourcedSig,
             construct_sigs: []const SourcedSig,
+            raw_index_sigs: []const SourcedIndexSig,
+            sourced_bases: []const SourcedBaseClause,
             merged_ids: []const u32,
             parent_scope: *const naming.ScopeNamer,
             prebound_names: *const std.AutoHashMapUnmanaged(u32, naming.BoundName),
@@ -8130,6 +9440,12 @@ fn LowerCtx(comptime GraphType: type) type {
             const is_callable_handle = explicit_cls.is_callable_handle;
             const owner_is_class_decl = owner_decl_id < self.graph.decls.len and
                 self.graph.decls[owner_decl_id].kind == .class_decl;
+            const owner_is_iface_decl = owner_decl_id < self.graph.decls.len and
+                self.graph.decls[owner_decl_id].kind == .interface_decl;
+            const owner_wire: []const u8 = if (owner_decl_id < self.graph.decls.len) blk: {
+                const od = self.graph.decls[owner_decl_id];
+                break :blk if (od.export_name) |esid| self.str(esid) else self.str(od.name);
+            } else "";
 
             const saved_in_handle = self.in_handle_struct;
             self.in_handle_struct = (repr == .handle_wrapper);
@@ -8198,6 +9514,18 @@ fn LowerCtx(comptime GraphType: type) type {
             var env_cache: std.AutoHashMapUnmanaged(*const HeritageEnv, []const ActiveTypeParam) = .empty;
             defer env_cache.deinit(self.scratch);
 
+            const direct_bases = try self.resolveDirectStructBases(
+                owner_decl_id,
+                repr,
+                sourced_bases,
+                tp_res.active,
+                self_ident,
+                &visited,
+                imports_used,
+                needs_runtime,
+                &env_cache,
+            );
+
             if (repr == .value_struct) {
                 const fields = try self.lowerSourcedFields(
                     raw_props,
@@ -8210,6 +9538,20 @@ fn LowerCtx(comptime GraphType: type) type {
                     needs_runtime,
                     &env_cache,
                 );
+
+                const merged_call_slots = if (owner_is_iface_decl and raw_tps.len == 0)
+                    try self.prebindMergedCallFnSlots(
+                        owner_decl_id,
+                        owner_wire,
+                        merged_ids,
+                        false,
+                        &struct_scope,
+                        outer_active_tps,
+                        imports_used,
+                        needs_runtime,
+                    )
+                else
+                    &[_]MergedCallFnSlot{};
 
                 var nested_decls: std.ArrayList(DeclIr) = .empty;
                 try self.lowerMergedStructNestedDecls(
@@ -8229,12 +9571,25 @@ fn LowerCtx(comptime GraphType: type) type {
                 const to_js_ref_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "toJsRef");
                 const from_js_ref_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "fromJsRef");
                 const from_js_ref_alloc_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "fromJsRefAlloc");
-                if (to_js_ref_ident != null or from_js_ref_ident != null or from_js_ref_alloc_ident != null) {
+                const as_ident = if (direct_bases.len > 0)
+                    try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "as")
+                else
+                    null;
+                if (to_js_ref_ident != null or from_js_ref_ident != null or from_js_ref_alloc_ident != null or as_ident != null) {
                     needs_runtime.* = true;
                 }
+                const merged_call_fns = try self.finishMergedCallFns(
+                    owner_wire,
+                    merged_call_slots,
+                    &struct_scope,
+                    outer_active_tps,
+                    imports_used,
+                    needs_runtime,
+                );
                 const self_param_ident = try lower_objects.chooseNonShadowingParamIdent(&struct_scope, self.scratch, self.alloc, "self");
                 const raw_param_ident = try lower_objects.chooseNonShadowingParamIdent(&struct_scope, self.scratch, self.alloc, "raw");
                 const alloc_param_ident = try lower_objects.chooseNonShadowingParamIdent(&struct_scope, self.scratch, self.alloc, "allocator");
+                const base_tp_ident = try lower_objects.chooseNonShadowingParamIdent(&struct_scope, self.scratch, self.alloc, "Base");
 
                 return .{
                     .repr = .value_struct,
@@ -8247,14 +9602,18 @@ fn LowerCtx(comptime GraphType: type) type {
                     .self_param_ident = self_param_ident,
                     .raw_param_ident = raw_param_ident,
                     .alloc_param_ident = alloc_param_ident,
+                    .base_type_param_ident = base_tp_ident,
                     .to_js_ref_ident = to_js_ref_ident,
                     .from_js_ref_ident = from_js_ref_ident,
                     .from_js_ref_alloc_ident = from_js_ref_alloc_ident,
+                    .as_ident = as_ident,
+                    .bases = direct_bases,
                     .type_params = tp_res.ir,
                     .fields = fields,
                     .static_props = &.{},
                     .constructors = &.{},
                     .methods = &.{},
+                    .merged_call_fns = merged_call_fns,
                     .nested_decls = try nested_decls.toOwnedSlice(self.alloc),
                 };
             }
@@ -8359,6 +9718,8 @@ fn LowerCtx(comptime GraphType: type) type {
             if (is_class and !is_abstract) {
                 if (raw_ctors.len > 0) {
                     for (raw_ctors) |sid| try cand_ctor_sigs.append(self.scratch, .{ .sid = sid, .env = null });
+                } else if (inherited_ctors.len > 0) {
+                    for (inherited_ctors) |ss| try cand_ctor_sigs.append(self.scratch, ss);
                 } else {
                     for (construct_sigs) |ss| try cand_ctor_sigs.append(self.scratch, ss);
                 }
@@ -8381,7 +9742,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 !is_abstract and
                 !has_private_constructor and
                 cand_ctor_sigs.items.len == 0 and
-                !has_explicit_extends;
+                allow_default_ctor;
 
             const ctor_count = if (synthesize_default_ctor) @as(usize, 1) else public_ctor_sigs.items.len;
             var ctor_idents = try self.scratch.alloc([]const u8, ctor_count);
@@ -8586,11 +9947,151 @@ fn LowerCtx(comptime GraphType: type) type {
                 });
             }
 
-            // 5. Backing `ref` field (`ref` or `__zigar_ref` when `.ref()` exists) + lifecycle helpers!
+            // 4b. Dynamic index signatures (`[key: string]: V`, `[index: number]: V`, ``[attr: `data-${string}`]: V``).
+            const UniqueIndexCand = struct {
+                key_ty: *const TypeIr,
+                category: lower_heritage.IndexKeyCategory,
+                getter_ty: *const TypeIr,
+                strict_undefined_missing: bool,
+                setter_ty: *const TypeIr,
+                is_readonly: bool,
+            };
+            var unique_index_cands: std.ArrayList(UniqueIndexCand) = .empty;
+            defer unique_index_cands.deinit(self.scratch);
+
+            for (raw_index_sigs) |sis| {
+                const isig_active_tps = try self.resolveHeritageActiveTps(
+                    sis.env,
+                    tp_res.active,
+                    self_ident,
+                    imports_used,
+                    needs_runtime,
+                    &env_cache,
+                    0,
+                );
+                visited.clearRetainingCapacity();
+                const raw_val_ty = try self.lowerType(
+                    sis.sig.value_type,
+                    false,
+                    isig_active_tps,
+                    self_ident,
+                    &visited,
+                    imports_used,
+                    needs_runtime,
+                );
+                var getter_ty: *const TypeIr = raw_val_ty;
+                var strict_undefined_missing = true;
+                switch (raw_val_ty.*) {
+                    .optional => |opt| {
+                        getter_ty = raw_val_ty;
+                        strict_undefined_missing = (opt.nullish_kind == .undefined_only);
+                    },
+                    .js_any, .js_unknown, .js_value, .void_type => {
+                        getter_ty = raw_val_ty;
+                        strict_undefined_missing = false;
+                    },
+                    else => {
+                        getter_ty = try self.wrapOptional(raw_val_ty);
+                        strict_undefined_missing = true;
+                    },
+                }
+
+                var expanded_keys: std.ArrayList(u32) = .empty;
+                defer expanded_keys.deinit(self.scratch);
+                try self.expandIndexSigKeyGraphTypes(sis.sig.key_type, &expanded_keys, 0);
+
+                for (expanded_keys.items) |k_graph_ty_id| {
+                    visited.clearRetainingCapacity();
+                    const raw_key_ty = try self.lowerType(
+                        k_graph_ty_id,
+                        false,
+                        isig_active_tps,
+                        self_ident,
+                        &visited,
+                        imports_used,
+                        needs_runtime,
+                    );
+                    const norm_key = try self.normalizeIndexKeyTypeAndCategory(k_graph_ty_id, raw_key_ty);
+                    var dup_key = false;
+                    for (unique_index_cands.items) |existing| {
+                        if (typeIrEql(existing.key_ty, norm_key.ty, 0)) {
+                            dup_key = true;
+                            break;
+                        }
+                    }
+                    if (!dup_key) {
+                        try unique_index_cands.append(self.scratch, .{
+                            .key_ty = norm_key.ty,
+                            .category = norm_key.category,
+                            .getter_ty = getter_ty,
+                            .strict_undefined_missing = strict_undefined_missing,
+                            .setter_ty = raw_val_ty,
+                            .is_readonly = sis.sig.is_readonly,
+                        });
+                    }
+                }
+            }
+
+            var has_string_indexer = false;
+            for (unique_index_cands.items) |uic| {
+                if (uic.category == .string_key) {
+                    has_string_indexer = true;
+                    break;
+                }
+            }
+
+            var index_accessors: std.ArrayList(IndexAccessorIr) = .empty;
+            for (unique_index_cands.items, 0..) |uic, idx| {
+                const allow_short_primary = (uic.category == .string_key) or (!has_string_indexer and idx == 0);
+                const bound_idx = try lower_heritage.bindIndexAccessorNames(
+                    &struct_scope,
+                    self.scratch,
+                    self.alloc,
+                    uic.category,
+                    uic.is_readonly,
+                    allow_short_primary,
+                );
+                var getter_alloc_ident: ?[]const u8 = null;
+                if (try self.typeMayAllocateOnDecode(uic.getter_ty)) {
+                    getter_alloc_ident = try lower_heritage.bindIndexGetterAllocName(
+                        &struct_scope,
+                        self.scratch,
+                        self.alloc,
+                        bound_idx.getter_logical,
+                    );
+                }
+                try index_accessors.append(self.alloc, .{
+                    .getter_ident = bound_idx.getter_ident,
+                    .getter_alloc_ident = getter_alloc_ident,
+                    .key_ty = uic.key_ty,
+                    .getter_ty = uic.getter_ty,
+                    .strict_undefined_missing = uic.strict_undefined_missing,
+                    .setter_ident = bound_idx.setter_ident,
+                    .setter_ty = uic.setter_ty,
+                });
+            }
+
+            // 4c. Empty dictionary `init()` factory when this is a pure dictionary interface (`{}` is valid).
+            const empty_init_ident = if (lower_heritage.shouldSynthesizeIndexedEmptyInit(
+                is_class,
+                is_callable_handle,
+                ctor_count,
+                index_accessors.items.len,
+                required_methods.items.len,
+                required_props.items.len,
+            ))
+                try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "init")
+            else
+                null;
+
+            // 5. Backing `ref` field (`ref` or `__zigar_ref` when `.ref()` exists) + lifecycle & cast helpers!
             const ref_field_ident = try lower_objects.bindBackingRefFieldIdent(&struct_scope, self.scratch, self.alloc);
             const deinit_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "deinit");
             const to_js_ref_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "toJsRef");
             const from_js_ref_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "fromJsRef");
+            const clone_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "clone");
+            const as_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "as");
+            const try_as_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "tryAs");
 
             // 6. Method `*Alloc` companions (bound AFTER explicit methods/props/helpers, BEFORE `lowerSignature`).
             for (method_slots.items) |*slot| {
@@ -8619,8 +10120,23 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
             }
 
-            // 7. Nested declarations (`merged_ns_consumed` & `merged_generic_ns_peer`) so any newly
-            // added sibling aliases are ALSO in `struct_scope` before parameter naming!
+            // 7. Nested declarations (`merged_ns_consumed` & `merged_generic_ns_peer`) + merged static `call`
+            // functions (`interface $` + `function $`) so ALL struct-level declarations are registered in
+            // `struct_scope` BEFORE step 8 (`lowerSignature`)!
+            const merged_call_slots = if (owner_is_iface_decl and raw_tps.len == 0)
+                try self.prebindMergedCallFnSlots(
+                    owner_decl_id,
+                    owner_wire,
+                    merged_ids,
+                    false,
+                    &struct_scope,
+                    outer_active_tps,
+                    imports_used,
+                    needs_runtime,
+                )
+            else
+                &[_]MergedCallFnSlot{};
+
             var nested_decls: std.ArrayList(DeclIr) = .empty;
             try self.lowerMergedStructNestedDecls(
                 final_mod_idx,
@@ -8637,7 +10153,7 @@ fn LowerCtx(comptime GraphType: type) type {
             );
 
             // 8. Now `struct_scope` has EVERY declaration in this struct: lower constructors, methods,
-            // and non-shadowing helper/accessor parameter names!
+            // merged call functions, and non-shadowing helper/accessor parameter names!
             const self_param_ident = try lower_objects.chooseNonShadowingParamIdent(
                 &struct_scope,
                 self.scratch,
@@ -8649,6 +10165,18 @@ fn LowerCtx(comptime GraphType: type) type {
                 self.scratch,
                 self.alloc,
                 "raw",
+            );
+            const base_tp_ident = try lower_objects.chooseNonShadowingParamIdent(
+                &struct_scope,
+                self.scratch,
+                self.alloc,
+                "Base",
+            );
+            const sub_tp_ident = try lower_objects.chooseNonShadowingParamIdent(
+                &struct_scope,
+                self.scratch,
+                self.alloc,
+                "Sub",
             );
             for (instance_props.items) |*ip| {
                 if (ip.getter_alloc_ident != null) {
@@ -8668,6 +10196,49 @@ fn LowerCtx(comptime GraphType: type) type {
                     );
                 }
             }
+            for (index_accessors.items, unique_index_cands.items) |*ia, uic| {
+                const raw_key_name = uic.category.defaultKeyParamRawName();
+                ia.key_param_ident = try lower_objects.chooseNonShadowingParamIdent(
+                    &struct_scope,
+                    self.scratch,
+                    self.alloc,
+                    raw_key_name,
+                );
+                if (ia.getter_alloc_ident != null) {
+                    var alloc_scope = naming.ScopeNamer.initParam(self.scratch, &struct_scope);
+                    defer alloc_scope.deinit();
+                    try alloc_scope.reserve(self_param_ident);
+                    try alloc_scope.reserve(ia.key_param_ident);
+                    ia.getter_alloc_param_ident = try lower_objects.chooseNonShadowingParamIdent(
+                        &alloc_scope,
+                        self.scratch,
+                        self.alloc,
+                        "allocator",
+                    );
+                }
+                if (ia.setter_ident != null) {
+                    ia.setter_key_param_ident = ia.key_param_ident;
+                    var set_scope = naming.ScopeNamer.initParam(self.scratch, &struct_scope);
+                    defer set_scope.deinit();
+                    try set_scope.reserve(self_param_ident);
+                    try set_scope.reserve(ia.setter_key_param_ident);
+                    ia.setter_val_param_ident = try lower_objects.chooseNonShadowingParamIdent(
+                        &set_scope,
+                        self.scratch,
+                        self.alloc,
+                        "value",
+                    );
+                }
+            }
+
+            const merged_call_fns = try self.finishMergedCallFns(
+                owner_wire,
+                merged_call_slots,
+                &struct_scope,
+                outer_active_tps,
+                imports_used,
+                needs_runtime,
+            );
 
             var ctors = try self.alloc.alloc(ConstructorIr, ctor_count);
             if (synthesize_default_ctor) {
@@ -8755,19 +10326,61 @@ fn LowerCtx(comptime GraphType: type) type {
                 .ref_field_ident = ref_field_ident,
                 .self_param_ident = self_param_ident,
                 .raw_param_ident = raw_param_ident,
+                .base_type_param_ident = base_tp_ident,
+                .sub_type_param_ident = sub_tp_ident,
                 .to_js_ref_ident = to_js_ref_ident,
                 .from_js_ref_ident = from_js_ref_ident,
                 .deinit_ident = deinit_ident,
+                .as_ident = as_ident,
+                .try_as_ident = try_as_ident,
+                .clone_ident = clone_ident,
+                .empty_init_ident = empty_init_ident,
                 .required_methods = try required_methods.toOwnedSlice(self.alloc),
                 .required_props = try required_props.toOwnedSlice(self.alloc),
+                .bases = direct_bases,
                 .type_params = tp_res.ir,
                 .fields = &.{},
                 .instance_props = try instance_props.toOwnedSlice(self.alloc),
+                .index_accessors = try index_accessors.toOwnedSlice(self.alloc),
                 .static_props = try static_props.toOwnedSlice(self.alloc),
                 .constructors = ctors,
                 .methods = methods,
+                .merged_call_fns = merged_call_fns,
                 .nested_decls = try nested_decls.toOwnedSlice(self.alloc),
             };
+        }
+
+        fn collectConsumedMergedNamespaceChildren(
+            self: *Self,
+            owner_decl_id: u32,
+            owner_wire: []const u8,
+            merged_ids: []const u32,
+            initial_children: []const u32,
+        ) error{OutOfMemory}![]u32 {
+            var ns_owners: std.ArrayList(u32) = .empty;
+            defer ns_owners.deinit(self.scratch);
+            var ns_slices: std.ArrayList([]const u32) = .empty;
+            defer ns_slices.deinit(self.scratch);
+
+            try ns_owners.append(self.scratch, owner_decl_id);
+            if (initial_children.len > 0) {
+                try ns_slices.append(self.scratch, initial_children);
+            }
+            for (merged_ids) |mid| {
+                if (mid == owner_decl_id or mid >= self.graph.decls.len) continue;
+                if (!self.merged_ns_consumed.contains(mid)) continue;
+                const md = self.graph.decls[mid];
+                if (md.kind != .namespace_decl) continue;
+                const m_wire = if (md.export_name) |esid| self.str(esid) else self.str(md.name);
+                if (!merge_decls.sameWireName(owner_wire, m_wire)) continue;
+                try ns_owners.append(self.scratch, mid);
+                try ns_slices.append(self.scratch, md.kind.namespace_decl);
+            }
+            return try merge_decls.mergeNamespaceChildIds(
+                self.scratch,
+                ns_owners.items,
+                ns_slices.items,
+            );
         }
 
         fn lowerMergedStructNestedDecls(
@@ -8784,24 +10397,29 @@ fn LowerCtx(comptime GraphType: type) type {
             nested_decls: *std.ArrayList(DeclIr),
             active_decls: *std.AutoHashMapUnmanaged(u32, void),
         ) error{OutOfMemory}!void {
-            for (merged_ids) |mid| {
-                if (self.merged_ns_consumed.contains(mid)) {
-                    for (self.graph.decls[mid].kind.namespace_decl) |cid| {
-                        try self.lowerDeclIntoListInner(
-                            final_mod_idx,
-                            cid,
-                            false,
-                            struct_scope,
-                            prebound_names,
-                            prebound_overloads,
-                            active_tps,
-                            imports_used,
-                            needs_runtime,
-                            nested_decls,
-                            active_decls,
-                        );
-                    }
-                }
+            if (owner_decl_id >= self.graph.decls.len) return;
+            const owner_d = self.graph.decls[owner_decl_id];
+            const owner_wire = if (owner_d.export_name) |esid| self.str(esid) else self.str(owner_d.name);
+            const merged_ns_children = try self.collectConsumedMergedNamespaceChildren(
+                owner_decl_id,
+                owner_wire,
+                merged_ids,
+                &.{},
+            );
+            for (merged_ns_children) |cid| {
+                try self.lowerDeclIntoListInner(
+                    final_mod_idx,
+                    cid,
+                    false,
+                    struct_scope,
+                    prebound_names,
+                    prebound_overloads,
+                    active_tps,
+                    imports_used,
+                    needs_runtime,
+                    nested_decls,
+                    active_decls,
+                );
             }
 
             if (self.merged_generic_ns_peer.get(owner_decl_id)) |ns_peer_id| {
@@ -9067,7 +10685,466 @@ fn LowerCtx(comptime GraphType: type) type {
             }
         }
 
+        const DisjointTypeDomain = enum {
+            str,
+            num,
+            bigint,
+            boolean,
+            symbol,
+            null_dom,
+            undef_dom,
+            non_prim_obj,
+        };
+
+        const IntersectionDomainState = struct {
+            domain: ?DisjointTypeDomain = null,
+            str_lit: ?[]const u8 = null,
+            num_lit: ?f64 = null,
+            bigint_lit: ?[]const u8 = null,
+            bool_lit: ?bool = null,
+        };
+
+        fn foldArmIntoDomainState(
+            self: *const Self,
+            types_slice: anytype,
+            ty_id: u32,
+            st: *IntersectionDomainState,
+            obj_arms: *std.ArrayList(u32),
+            depth: usize,
+        ) error{OutOfMemory}!bool {
+            if (ty_id >= types_slice.len or depth > 8) return true;
+            const tn = types_slice[ty_id];
+            switch (tn.kind) {
+                .never_type => return false,
+                .string_type, .template_literal => {
+                    if (st.domain != null and st.domain.? != .str) return false;
+                    st.domain = .str;
+                    if (tn.kind == .template_literal and tn.kind.template_literal.spans.len == 0) {
+                        const lit_s = self.str(tn.kind.template_literal.head);
+                        if (st.str_lit) |prev| {
+                            if (!std.mem.eql(u8, prev, lit_s)) return false;
+                        } else {
+                            st.str_lit = lit_s;
+                        }
+                    }
+                    return true;
+                },
+                .number_type => {
+                    if (st.domain != null and st.domain.? != .num) return false;
+                    st.domain = .num;
+                    return true;
+                },
+                .bigint_type => {
+                    if (st.domain != null and st.domain.? != .bigint) return false;
+                    st.domain = .bigint;
+                    return true;
+                },
+                .boolean_type => {
+                    if (st.domain != null and st.domain.? != .boolean) return false;
+                    st.domain = .boolean;
+                    return true;
+                },
+                .symbol_type, .unique_symbol => {
+                    if (st.domain != null and st.domain.? != .symbol) return false;
+                    st.domain = .symbol;
+                    return true;
+                },
+                .null_type => {
+                    if (st.domain != null and st.domain.? != .null_dom) return false;
+                    st.domain = .null_dom;
+                    return true;
+                },
+                .undefined_type, .void_type => {
+                    if (st.domain != null and st.domain.? != .undef_dom) return false;
+                    st.domain = .undef_dom;
+                    return true;
+                },
+                .object_type, .array, .readonly_array, .tuple, .readonly_tuple, .function_type, .constructor_type => {
+                    if (st.domain != null and st.domain.? != .non_prim_obj) return false;
+                    st.domain = .non_prim_obj;
+                    return true;
+                },
+                .literal => |lit| {
+                    switch (lit) {
+                        .str => |sid| {
+                            if (st.domain != null and st.domain.? != .str) return false;
+                            st.domain = .str;
+                            const s = self.str(sid);
+                            if (st.str_lit) |prev| {
+                                if (!std.mem.eql(u8, prev, s)) return false;
+                            } else {
+                                st.str_lit = s;
+                            }
+                        },
+                        .num => |n| {
+                            if (st.domain != null and st.domain.? != .num) return false;
+                            st.domain = .num;
+                            if (st.num_lit) |prev| {
+                                if (prev != n) return false;
+                            } else {
+                                st.num_lit = n;
+                            }
+                        },
+                        .bigint_literal => |sid| {
+                            if (st.domain != null and st.domain.? != .bigint) return false;
+                            st.domain = .bigint;
+                            const norm = try lower_types.normalizeBigIntLiteral(self.scratch, self.str(sid));
+                            if (st.bigint_lit) |prev| {
+                                if (!std.mem.eql(u8, prev, norm)) return false;
+                            } else {
+                                st.bigint_lit = norm;
+                            }
+                        },
+                        .boolean => |b| {
+                            if (st.domain != null and st.domain.? != .boolean) return false;
+                            st.domain = .boolean;
+                            if (st.bool_lit) |prev| {
+                                if (prev != b) return false;
+                            } else {
+                                st.bool_lit = b;
+                            }
+                        },
+                    }
+                    return true;
+                },
+                .intersection => |sub_parts| {
+                    if (sub_parts.len == 0) return true;
+                    for (sub_parts) |spid| {
+                        if (!try self.foldArmIntoDomainState(types_slice, spid, st, obj_arms, depth + 1)) return false;
+                    }
+                    return true;
+                },
+                .object_literal => {
+                    try obj_arms.append(self.scratch, ty_id);
+                    return true;
+                },
+                .reference => |ref| {
+                    if (ref.target_decl) |td| {
+                        if (td < self.graph.decls.len) {
+                            const d = self.graph.decls[td];
+                            switch (d.kind) {
+                                .type_alias_decl => |alias_ty| {
+                                    if (d.type_params.len == 0 and ref.type_args.len == 0) {
+                                        return self.foldArmIntoDomainState(types_slice, alias_ty, st, obj_arms, depth + 1);
+                                    }
+                                },
+                                .class_decl => {
+                                    if (st.domain != null and st.domain.? != .non_prim_obj) return false;
+                                    st.domain = .non_prim_obj;
+                                },
+                                .interface_decl => {
+                                    if (d.type_params.len == 0 and ref.type_args.len == 0) {
+                                        try obj_arms.append(self.scratch, ty_id);
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                    return true;
+                },
+                else => return true,
+            }
+        }
+
+        const ConflictCheckProp = struct {
+            wire: []const u8,
+            ty: u32,
+        };
+
+        fn collectRequiredPlainPropsForConflictCheck(
+            self: *const Self,
+            types_slice: anytype,
+            arm_ty_id: u32,
+            out: *std.ArrayList(ConflictCheckProp),
+        ) error{OutOfMemory}!void {
+            if (arm_ty_id >= types_slice.len) return;
+            switch (types_slice[arm_ty_id].kind) {
+                .object_literal => |obj| {
+                    for (obj.properties) |pid| {
+                        if (pid >= self.graph.properties.len) continue;
+                        const p = self.graph.properties[pid];
+                        if (p.modifiers.optional_mod or p.modifiers.method_mod or p.modifiers.static_mod or
+                            p.modifiers.private_mod or p.modifiers.protected_mod or p.computed_symbol != null) continue;
+                        try out.append(self.scratch, .{ .wire = self.str(p.name), .ty = p.ty });
+                    }
+                },
+                .reference => |ref| {
+                    if (ref.target_decl) |td| {
+                        if (td < self.graph.decls.len and ref.type_args.len == 0) {
+                            const d = self.graph.decls[td];
+                            if (d.kind == .interface_decl and d.type_params.len == 0 and d.kind.interface_decl.extends_clauses.len == 0) {
+                                for (d.kind.interface_decl.properties) |pid| {
+                                    if (pid >= self.graph.properties.len) continue;
+                                    const p = self.graph.properties[pid];
+                                    if (p.modifiers.optional_mod or p.modifiers.method_mod or p.modifiers.static_mod or
+                                        p.modifiers.private_mod or p.modifiers.protected_mod or p.computed_symbol != null) continue;
+                                    try out.append(self.scratch, .{ .wire = self.str(p.name), .ty = p.ty });
+                                }
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        fn isUninhabitedIntersectionInTypes(
+            self: *const Self,
+            types_slice: anytype,
+            parts: []const u32,
+            depth: usize,
+        ) error{OutOfMemory}!bool {
+            if (parts.len == 0 or depth > 6) return false;
+            var st: IntersectionDomainState = .{};
+            var obj_arms: std.ArrayList(u32) = .empty;
+            defer obj_arms.deinit(self.scratch);
+
+            if (!try self.foldArmIntoDomainState(types_slice, parts[0], &st, &obj_arms, 0)) return true;
+            for (parts[1..]) |pid| {
+                if (!try self.foldArmIntoDomainState(types_slice, pid, &st, &obj_arms, 0)) return true;
+            }
+
+            // Detect conflicting required scalar/literal object properties (`{ kind: "a" } & { kind: "b" }`).
+            if (st.domain == null and obj_arms.items.len >= 2) {
+                var req_props: std.ArrayList(ConflictCheckProp) = .empty;
+                defer req_props.deinit(self.scratch);
+                for (obj_arms.items) |oaid| {
+                    try self.collectRequiredPlainPropsForConflictCheck(types_slice, oaid, &req_props);
+                }
+                for (req_props.items, 0..) |pa, i| {
+                    for (req_props.items[i + 1 ..]) |pb| {
+                        if (!std.mem.eql(u8, pa.wire, pb.wire)) continue;
+                        var prop_st: IntersectionDomainState = .{};
+                        var dummy_objs: std.ArrayList(u32) = .empty;
+                        defer dummy_objs.deinit(self.scratch);
+                        if (!try self.foldArmIntoDomainState(types_slice, pa.ty, &prop_st, &dummy_objs, depth + 1)) return true;
+                        if (prop_st.domain == null) continue;
+                        var prop_st_b: IntersectionDomainState = .{};
+                        if (!try self.foldArmIntoDomainState(types_slice, pb.ty, &prop_st_b, &dummy_objs, depth + 1)) return true;
+                        if (prop_st_b.domain == null) continue;
+                        const pair = [_]u32{ pa.ty, pb.ty };
+                        var merged_prop_st: IntersectionDomainState = .{};
+                        if (!try self.foldArmIntoDomainState(types_slice, pair[0], &merged_prop_st, &dummy_objs, depth + 1) or
+                            !try self.foldArmIntoDomainState(types_slice, pair[1], &merged_prop_st, &dummy_objs, depth + 1))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+
+        /// Simplifies intersections whose arms are purely compatible scalar primitives/literals
+        /// (for example `"b" & string` -> `"b"` or `"b" & "b"` -> `"b"`) without touching
+        /// object/brand intersections such as `string & {}` or `string & Brand`.
+        fn simplifyPureScalarIntersectionInTypes(
+            self: *const Self,
+            types_slice: anytype,
+            parts: []const u32,
+            depth: usize,
+        ) ?u32 {
+            if (parts.len == 0 or depth > 6) return null;
+            var prim_id: ?u32 = null;
+            var lit_id: ?u32 = null;
+            for (parts) |pid| {
+                if (!self.collectPureScalarIntersectionArm(types_slice, pid, &prim_id, &lit_id, depth)) return null;
+            }
+            return lit_id orelse prim_id;
+        }
+
+        fn collectPureScalarIntersectionArm(
+            self: *const Self,
+            types_slice: anytype,
+            arm_id: u32,
+            prim_id: *?u32,
+            lit_id: *?u32,
+            depth: usize,
+        ) bool {
+            if (arm_id >= types_slice.len or depth > 6) return false;
+            const tn = types_slice[arm_id];
+            switch (tn.kind) {
+                .string_type, .number_type, .bigint_type, .boolean_type, .symbol_type, .unique_symbol => {
+                    if (prim_id.* == null) prim_id.* = arm_id;
+                    return true;
+                },
+                .literal => {
+                    if (lit_id.* == null) lit_id.* = arm_id;
+                    return true;
+                },
+                .intersection => |sub| {
+                    if (sub.len == 0) return false;
+                    for (sub) |spid| {
+                        if (!self.collectPureScalarIntersectionArm(types_slice, spid, prim_id, lit_id, depth + 1)) return false;
+                    }
+                    return true;
+                },
+                .reference => |ref| {
+                    if (ref.target_decl) |td| {
+                        if (td < self.graph.decls.len and ref.type_args.len == 0) {
+                            const d = self.graph.decls[td];
+                            if (d.kind == .type_alias_decl and d.type_params.len == 0) {
+                                return self.collectPureScalarIntersectionArm(types_slice, d.kind.type_alias_decl, prim_id, lit_id, depth + 1);
+                            }
+                        }
+                    }
+                    return false;
+                },
+                else => return false,
+            }
+        }
+
+        fn getDistributableUnionArmsInTypes(
+            self: *const Self,
+            types_slice: anytype,
+            arm_id: u32,
+        ) ?[]const u32 {
+            if (arm_id >= types_slice.len) return null;
+            const tn = types_slice[arm_id];
+            switch (tn.kind) {
+                .union_type => |u_arms| {
+                    if (u_arms.len >= 2 and u_arms.len <= 16) return u_arms;
+                    return null;
+                },
+                .reference => |ref| {
+                    if (ref.target_decl) |td| {
+                        if (td < self.graph.decls.len and ref.type_args.len == 0) {
+                            const d = self.graph.decls[td];
+                            if (d.kind == .type_alias_decl and d.type_params.len == 0) {
+                                const target_id = d.kind.type_alias_decl;
+                                if (target_id < types_slice.len and types_slice[target_id].kind == .union_type) {
+                                    const u_arms = types_slice[target_id].kind.union_type;
+                                    if (u_arms.len >= 2 and u_arms.len <= 16) return u_arms;
+                                }
+                            }
+                        }
+                    }
+                    return null;
+                },
+                else => return null,
+            }
+        }
+
+        fn normalizeIntersectionGraphTypes(self: *Self) error{OutOfMemory}!void {
+            if (self.graph.types.len == 0) return;
+            var any_intersection = false;
+            for (self.graph.types) |tn| {
+                if (tn.kind == .intersection) {
+                    any_intersection = true;
+                    break;
+                }
+            }
+            if (!any_intersection) return;
+
+            const TypeNodeElem = @TypeOf(self.graph.types[0]);
+            var types: std.ArrayList(TypeNodeElem) = .empty;
+            try types.appendSlice(self.alloc, self.graph.types);
+
+            var pass: usize = 0;
+            while (pass < 3) : (pass += 1) {
+                var changed = false;
+                const pass_len = types.items.len;
+                var tid: usize = 0;
+                while (tid < pass_len) : (tid += 1) {
+                    if (types.items[tid].kind != .intersection) continue;
+                    const parts = types.items[tid].kind.intersection;
+
+                    // 1. Reduce uninhabited intersections (`string & number`, `{ kind: "a" } & { kind: "b" }`) -> `never`.
+                    if (try self.isUninhabitedIntersectionInTypes(types.items, parts, 0)) {
+                        types.items[tid].kind = .never_type;
+                        types.items[tid].resolved_type = null;
+                        changed = true;
+                        continue;
+                    }
+
+                    // 2. Simplify pure scalar intersections (`"b" & string` -> `"b"`, `"b" & "b"` -> `"b"`).
+                    if (self.simplifyPureScalarIntersectionInTypes(types.items, parts, 0)) |scalar_id| {
+                        types.items[tid].kind = types.items[scalar_id].kind;
+                        types.items[tid].resolved_type = types.items[scalar_id].resolved_type;
+                        changed = true;
+                        continue;
+                    }
+
+                    // 3. Distribute intersections over unions: `(A | B) & C` -> `(A & C) | (B & C)` (bounded <= 16 combinations).
+                    var has_union_arm = false;
+                    var total_combos: usize = 1;
+                    var overflow = false;
+                    for (parts) |pid| {
+                        if (self.getDistributableUnionArmsInTypes(types.items, pid)) |u_arms| {
+                            has_union_arm = true;
+                            if (total_combos > 16 / u_arms.len) {
+                                overflow = true;
+                                break;
+                            }
+                            total_combos *= u_arms.len;
+                        }
+                    }
+                    if (!has_union_arm or overflow or total_combos < 2 or total_combos > 16) continue;
+
+                    var arm_choices = try self.scratch.alloc([]const u32, parts.len);
+                    defer self.scratch.free(arm_choices);
+                    var single_buf = try self.scratch.alloc([1]u32, parts.len);
+                    defer self.scratch.free(single_buf);
+                    for (parts, 0..) |pid, pi| {
+                        if (self.getDistributableUnionArmsInTypes(types.items, pid)) |u_arms| {
+                            arm_choices[pi] = u_arms;
+                        } else {
+                            single_buf[pi] = .{pid};
+                            arm_choices[pi] = &single_buf[pi];
+                        }
+                    }
+
+                    var combo_buf = try self.scratch.alloc(u32, parts.len);
+                    defer self.scratch.free(combo_buf);
+                    var distributed_arms: std.ArrayList(u32) = .empty;
+                    defer distributed_arms.deinit(self.scratch);
+
+                    for (0..total_combos) |ci| {
+                        var rem = ci;
+                        var pi: usize = parts.len;
+                        while (pi > 0) {
+                            pi -= 1;
+                            const opts = arm_choices[pi];
+                            combo_buf[pi] = opts[rem % opts.len];
+                            rem /= opts.len;
+                        }
+                        if (try self.isUninhabitedIntersectionInTypes(types.items, combo_buf, 0)) continue;
+                        if (self.simplifyPureScalarIntersectionInTypes(types.items, combo_buf, 0)) |scalar_id| {
+                            try distributed_arms.append(self.scratch, scalar_id);
+                        } else {
+                            const owned_combo = try self.alloc.dupe(u32, combo_buf);
+                            const new_id: u32 = @intCast(types.items.len);
+                            try types.append(self.alloc, .{
+                                .id = new_id,
+                                .kind = .{ .intersection = owned_combo },
+                                .resolved_type = null,
+                            });
+                            try distributed_arms.append(self.scratch, new_id);
+                        }
+                    }
+
+                    if (distributed_arms.items.len == 0) {
+                        types.items[tid].kind = .never_type;
+                        types.items[tid].resolved_type = null;
+                    } else if (distributed_arms.items.len == 1) {
+                        const only_id = distributed_arms.items[0];
+                        types.items[tid].kind = types.items[only_id].kind;
+                        types.items[tid].resolved_type = types.items[only_id].resolved_type;
+                    } else {
+                        types.items[tid].kind = .{ .union_type = try self.alloc.dupe(u32, distributed_arms.items) };
+                        types.items[tid].resolved_type = null;
+                    }
+                    changed = true;
+                }
+                if (!changed) break;
+            }
+
+            self.graph.types = types.items;
+        }
+
         fn build(self: *Self) LowerError![]ModuleIr {
+            try self.normalizeIntersectionGraphTypes();
             try self.computeTypeRefCounts();
             try self.discoverCandidates();
             const selected_cands = try self.filterAndCloseDependencies();
@@ -9199,7 +11276,12 @@ fn LowerCtx(comptime GraphType: type) type {
 
                     const export_wire = fe.wire_name_override orelse
                         (if (sd.export_name) |esid| self.str(esid) else self.str(sd.name));
-                    const style: naming.NameStyle = if (fe.wire_name_override != null) .preserve else self.declNameStyle(sd);
+                    const style: naming.NameStyle = if (fe.wire_name_override != null)
+                        .preserve
+                    else if (self.merged_ctor_var_consumed.contains(fe.decl_id) or self.merged_fn_consumed.contains(fe.decl_id))
+                        .pascal
+                    else
+                        self.declNameStyle(sd);
 
                     if (!fe.is_default_export) {
                         if (seen_non_default_decls.contains(fe.decl_id) or seen_export_wires.contains(export_wire)) continue;
@@ -9275,7 +11357,12 @@ fn LowerCtx(comptime GraphType: type) type {
                     if (seen_export_wires.contains(export_wire)) continue;
                     if (item.wire_name_override == null and seen_non_default_decls.contains(item.decl_id)) continue;
 
-                    const style: naming.NameStyle = if (item.wire_name_override != null) .preserve else self.declNameStyle(sd);
+                    const style: naming.NameStyle = if (item.wire_name_override != null)
+                        .preserve
+                    else if (self.merged_ctor_var_consumed.contains(item.decl_id) or self.merged_fn_consumed.contains(item.decl_id))
+                        .pascal
+                    else
+                        self.declNameStyle(sd);
                     const desired_styled = switch (style) {
                         .preserve => try self.scratch.dupe(u8, export_wire),
                         .camel => try naming.toCamelCase(self.scratch, export_wire),
@@ -9403,9 +11490,23 @@ fn LowerCtx(comptime GraphType: type) type {
                 if (cand.export_equals_decl_id) |eq_did| {
                     for (decl_irs.items) |di| {
                         if (di.source_decl_id == eq_did) {
-                            export_equals_ident = di.zig_ident;
+                            export_equals_ident = di.logical_name;
                             export_equals_wire_name = di.wire_name;
                             break;
+                        }
+                    }
+                    if (export_equals_ident == null and eq_did < self.graph.decls.len) {
+                        const eq_d = self.graph.decls[eq_did];
+                        const eq_wire = if (eq_d.export_name) |esid| self.str(esid) else self.str(eq_d.name);
+                        for (eq_d.merged_with) |mid| {
+                            for (decl_irs.items) |di| {
+                                if (di.source_decl_id == mid and merge_decls.sameWireName(eq_wire, di.wire_name)) {
+                                    export_equals_ident = di.logical_name;
+                                    export_equals_wire_name = di.wire_name;
+                                    break;
+                                }
+                            }
+                            if (export_equals_ident != null) break;
                         }
                     }
                 }
@@ -9453,10 +11554,102 @@ fn LowerCtx(comptime GraphType: type) type {
                 };
             }
 
+            try self.synthesizeReExportAllocCompanions(modules, mod_scopes);
             try self.breakValueTypeCycles(modules);
             return modules;
         }
+
+        fn synthesizeReExportAllocCompanions(
+            self: *Self,
+            modules: []ModuleIr,
+            mod_scopes: []naming.ScopeNamer,
+        ) error{OutOfMemory}!void {
+            var pass: usize = 0;
+            while (pass < 4) : (pass += 1) {
+                var added_any = false;
+                for (modules, 0..) |*m, m_idx| {
+                    var extras: std.ArrayList(DeclIr) = .empty;
+                    defer extras.deinit(self.scratch);
+                    const comp_updates = try self.scratch.alloc(?[]const u8, m.decls.len);
+                    defer self.scratch.free(comp_updates);
+                    @memset(comp_updates, null);
+
+                    for (m.decls, 0..) |d, di| {
+                        if (d.kind != .re_export_decl or d.alloc_companion_ident != null) continue;
+                        const re = d.kind.re_export_decl;
+                        if (re.target_module_index >= modules.len or re.target_zig_path.len == 0) continue;
+                        const target_mod = modules[re.target_module_index];
+                        const target_di = findNestedDeclByZigPath(target_mod.decls, re.target_zig_path) orelse continue;
+                        const target_alloc_ident = target_di.alloc_companion_ident orelse continue;
+
+                        const desired_alloc = try std.fmt.allocPrint(self.scratch, "{s}Alloc", .{d.logical_name});
+                        defer self.scratch.free(desired_alloc);
+                        if (mod_scopes[m_idx].isTaken(desired_alloc)) continue;
+
+                        const alloc_sb = try mod_scopes[m_idx].bind(desired_alloc, .preserve);
+                        defer alloc_sb.deinit(self.scratch);
+
+                        const new_zig_ident = try self.alloc.dupe(u8, alloc_sb.zig_ident);
+                        const new_logical = try self.alloc.dupe(u8, alloc_sb.logical_name);
+                        const alloc_path = try self.alloc.alloc([]const u8, re.target_zig_path.len);
+                        for (re.target_zig_path[0 .. re.target_zig_path.len - 1], 0..) |seg, si| {
+                            alloc_path[si] = seg;
+                        }
+                        alloc_path[re.target_zig_path.len - 1] = target_alloc_ident;
+
+                        comp_updates[di] = new_zig_ident;
+                        try extras.append(self.scratch, .{
+                            .source_decl_id = d.source_decl_id,
+                            .zig_ident = new_zig_ident,
+                            .logical_name = new_logical,
+                            .wire_name = d.wire_name,
+                            .is_exported = true,
+                            .is_js_exported = false,
+                            .is_default_export = false,
+                            .jsdoc = null,
+                            .kind = .{
+                                .re_export_decl = .{
+                                    .target_module_index = re.target_module_index,
+                                    .target_zig_path = alloc_path,
+                                },
+                            },
+                        });
+                        added_any = true;
+                    }
+
+                    if (extras.items.len > 0) {
+                        const merged = try self.alloc.alloc(DeclIr, m.decls.len + extras.items.len);
+                        @memcpy(merged[0..m.decls.len], m.decls);
+                        for (comp_updates, 0..) |cu_opt, di| {
+                            if (cu_opt) |cu| merged[di].alloc_companion_ident = cu;
+                        }
+                        @memcpy(merged[m.decls.len..], extras.items);
+                        m.decls = merged;
+                    }
+                }
+                if (!added_any) break;
+            }
+        }
     };
+}
+
+fn findNestedDeclByZigPath(decls: []const DeclIr, path: []const []const u8) ?DeclIr {
+    if (path.len == 0) return null;
+    const head = path[0];
+    for (decls) |d| {
+        if (std.mem.eql(u8, d.zig_ident, head) or std.mem.eql(u8, d.logical_name, head)) {
+            if (path.len == 1) return d;
+            return switch (d.kind) {
+                .namespace_decl => |ns| findNestedDeclByZigPath(ns.children, path[1..]) orelse
+                    findNestedDeclByZigPath(ns.merged_call_fns, path[1..]),
+                .struct_decl => |st| findNestedDeclByZigPath(st.nested_decls, path[1..]) orelse
+                    findNestedDeclByZigPath(st.merged_call_fns, path[1..]),
+                .enum_decl => |en| findNestedDeclByZigPath(en.nested_decls, path[1..]),
+                else => null,
+            };
+        }
+    }
+    return null;
 }
 
 fn deduplicateDeclIrsInPlace(scratch: std.mem.Allocator, list: *std.ArrayList(DeclIr)) error{OutOfMemory}!void {
@@ -9478,6 +11671,14 @@ fn appendUniqueU32(list: *std.ArrayList(u32), allocator: std.mem.Allocator, val:
         if (existing == val) return;
     }
     try list.append(allocator, val);
+}
+
+fn isPureDollarOrUnderscoreIdent(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |ch| {
+        if (ch != '$' and ch != '_') return false;
+    }
+    return true;
 }
 
 fn isAllUpperOrUnderscore(s: []const u8) bool {
@@ -9532,12 +11733,12 @@ fn indexDeclPointersByPath(
         }
 
         switch (d.kind) {
-            .namespace_decl => |children| {
+            .namespace_decl => |*ns| {
                 const sub_prefix = try allocator.alloc([]const u8, prefix.len + 1);
                 defer allocator.free(sub_prefix);
                 @memcpy(sub_prefix[0..prefix.len], prefix);
                 sub_prefix[prefix.len] = d.zig_ident;
-                try indexDeclPointersByPath(allocator, mod_idx, sub_prefix, @constCast(children), map);
+                try indexDeclPointersByPath(allocator, mod_idx, sub_prefix, @constCast(ns.children), map);
             },
             .struct_decl => |*st| {
                 if (st.nested_decls.len > 0) {
@@ -9546,6 +11747,15 @@ fn indexDeclPointersByPath(
                     @memcpy(sub_prefix[0..prefix.len], prefix);
                     sub_prefix[prefix.len] = d.zig_ident;
                     try indexDeclPointersByPath(allocator, mod_idx, sub_prefix, @constCast(st.nested_decls), map);
+                }
+            },
+            .enum_decl => |*en| {
+                if (en.nested_decls.len > 0) {
+                    const sub_prefix = try allocator.alloc([]const u8, prefix.len + 1);
+                    defer allocator.free(sub_prefix);
+                    @memcpy(sub_prefix[0..prefix.len], prefix);
+                    sub_prefix[prefix.len] = d.zig_ident;
+                    try indexDeclPointersByPath(allocator, mod_idx, sub_prefix, @constCast(en.nested_decls), map);
                 }
             },
             else => {},
@@ -9586,6 +11796,17 @@ fn dfsValueCycleDeclByPath(
                 }
             }
         },
+        .enum_decl => |*en| {
+            if (en.nested_decls.len > 0) {
+                const sub_prefix = try state_alloc.alloc([]const u8, prefix.len + 1);
+                defer state_alloc.free(sub_prefix);
+                @memcpy(sub_prefix[0..prefix.len], prefix);
+                sub_prefix[prefix.len] = d.zig_ident;
+                for (@constCast(en.nested_decls)) |*nd| {
+                    try dfsValueCycleDeclByPath(state_alloc, ir_alloc, mod_idx, sub_prefix, nd, decl_map, state);
+                }
+            }
+        },
         .union_decl => |*un| {
             for (un.variants) |v| {
                 try dfsValueCycleTypeByPath(state_alloc, ir_alloc, @constCast(v.payload), decl_map, state);
@@ -9605,12 +11826,12 @@ fn dfsValueCycleDeclByPath(
                 try dfsValueCycleDeclByPath(state_alloc, ir_alloc, re.target_module_index, parent_prefix, target_decl, decl_map, state);
             }
         },
-        .namespace_decl => |children| {
+        .namespace_decl => |*ns| {
             const sub_prefix = try state_alloc.alloc([]const u8, prefix.len + 1);
             defer state_alloc.free(sub_prefix);
             @memcpy(sub_prefix[0..prefix.len], prefix);
             sub_prefix[prefix.len] = d.zig_ident;
-            for (@constCast(children)) |*cd| {
+            for (@constCast(ns.children)) |*cd| {
                 try dfsValueCycleDeclByPath(state_alloc, ir_alloc, mod_idx, sub_prefix, cd, decl_map, state);
             }
         },

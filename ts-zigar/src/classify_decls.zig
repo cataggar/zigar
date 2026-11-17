@@ -89,6 +89,13 @@ pub fn Classifier(comptime Graph: type) type {
                     .is_callable_handle = true,
                 };
             }
+            if (obj.index_signatures.len > 0) {
+                return .{
+                    .kind = .handle_wrapper,
+                    .is_class = false,
+                    .is_callable_handle = false,
+                };
+            }
             for (obj.properties) |pid| {
                 if (self.propRequiresHandle(pid)) {
                     return .{
@@ -373,6 +380,11 @@ pub fn Classifier(comptime Graph: type) type {
             const tn = self.graph.types[ty_id];
             switch (tn.kind) {
                 .object_literal => |obj| return self.classifyObjectLiteralData(obj),
+                .function_type, .constructor_type => return .{
+                    .kind = .handle_wrapper,
+                    .is_class = false,
+                    .is_callable_handle = true,
+                },
                 .intersection => |parts| {
                     var needs_handle = false;
                     var is_callable = false;
@@ -494,7 +506,7 @@ pub fn Classifier(comptime Graph: type) type {
                     var has_merged_class = false;
                     var has_call_sigs = iface.call_signatures.len > 0;
                     var has_construct_sigs = iface.construct_signatures.len > 0;
-                    var needs_handle = iface.methods.len > 0;
+                    var needs_handle = iface.methods.len > 0 or iface.index_signatures.len > 0;
 
                     if (!needs_handle) {
                         for (iface.properties) |pid| {
@@ -520,7 +532,7 @@ pub fn Classifier(comptime Graph: type) type {
                             .interface_decl => |miface| {
                                 if (miface.call_signatures.len > 0) has_call_sigs = true;
                                 if (miface.construct_signatures.len > 0) has_construct_sigs = true;
-                                if (miface.methods.len > 0) needs_handle = true;
+                                if (miface.methods.len > 0 or miface.index_signatures.len > 0) needs_handle = true;
                                 if (!needs_handle) {
                                     for (miface.properties) |pid| {
                                         if (self.propRequiresHandle(pid)) {
