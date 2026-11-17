@@ -2,6 +2,7 @@ const std = @import("std");
 const ir = @import("ir.zig");
 const naming = @import("naming.zig");
 const lower_types = @import("lower_types.zig");
+const lower_unions = @import("lower_unions.zig");
 
 pub const EmittedFile = struct {
     /// POSIX relative path inside `out_dir` (e.g. `"root.zig"`, `"fs/promises.zig"`).
@@ -675,6 +676,20 @@ const ModuleEmitCtx = struct {
         return null;
     }
 
+    fn findTargetGenericUnion(self: *const ModuleEmitCtx, dref: ir.DeclRefIr) ?ir.UnionDeclIr {
+        if (dref.module_index >= self.pkg.modules.len) return null;
+        const target_mod = &self.pkg.modules[dref.module_index];
+        if (findDeclByZigPath(target_mod.decls, dref.decl_zig_path)) |target_decl| {
+            switch (target_decl.kind) {
+                .union_decl => |un| {
+                    if (un.type_params.len > 0) return un;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
     fn appendNullishFingerprint(
         self: *const ModuleEmitCtx,
         buf: *std.ArrayList(u8),
@@ -727,6 +742,15 @@ const ModuleEmitCtx = struct {
                     try buf.append(self.allocator, ',');
                 }
                 try buf.append(self.allocator, ')');
+            },
+            .tagged_union => |tu| {
+                try buf.append(self.allocator, '|');
+                for (tu.variants) |v| {
+                    try buf.appendSlice(self.allocator, v.logical_name);
+                    try buf.append(self.allocator, ':');
+                    try self.appendNullishFingerprint(buf, v.payload, env, fp_visited, depth + 1);
+                    try buf.append(self.allocator, '|');
+                }
             },
             .type_param_ref => |tp_ident| {
                 if (env) |e| {
@@ -789,6 +813,35 @@ const ModuleEmitCtx = struct {
                     };
                     try buf.print(self.allocator, "s{d}:{d}<", .{ dref.module_index, dref.target_decl_id });
                     for (st.type_params, 0..) |tp, idx| {
+                        if (idx > 0) try buf.append(self.allocator, ',');
+                        if (idx < dref.type_args.len) {
+                            try self.appendNullishFingerprint(buf, dref.type_args[idx], env, &next_fp, depth + 1);
+                        } else if (tp.default_type) |def_ty| {
+                            try self.appendNullishFingerprint(buf, def_ty, &self_env, &next_fp, depth + 1);
+                        } else {
+                            try buf.append(self.allocator, '_');
+                        }
+                    }
+                    try buf.append(self.allocator, '>');
+                    return;
+                }
+                if (self.findTargetGenericUnion(dref)) |un| {
+                    if (isFpVisited(fp_visited, dref.module_index, dref.target_decl_id)) {
+                        try buf.print(self.allocator, "^u{d}:{d}", .{ dref.module_index, dref.target_decl_id });
+                        return;
+                    }
+                    const next_fp = FpVisited{
+                        .mod_idx = dref.module_index,
+                        .decl_id = dref.target_decl_id,
+                        .prev = fp_visited,
+                    };
+                    const self_env = TypeParamEnv{
+                        .params = un.type_params,
+                        .args = dref.type_args,
+                        .arg_env = env,
+                    };
+                    try buf.print(self.allocator, "u{d}:{d}<", .{ dref.module_index, dref.target_decl_id });
+                    for (un.type_params, 0..) |tp, idx| {
                         if (idx > 0) try buf.append(self.allocator, ',');
                         if (idx < dref.type_args.len) {
                             try self.appendNullishFingerprint(buf, dref.type_args[idx], env, &next_fp, depth + 1);
@@ -915,7 +968,7 @@ const ModuleEmitCtx = struct {
     ) bool {
         if (depth >= 24) return false;
         return switch (ty.*) {
-            .anon_struct, .tuple => true,
+            .anon_struct, .tuple, .tagged_union => true,
             .optional => |opt| self.aliasTargetIsKeyableContainer(opt.child, env, depth + 1),
             .pointer_const => |inner| self.aliasTargetIsKeyableContainer(inner, env, depth + 1),
             .type_param_ref => |tp_ident| blk: {
@@ -982,6 +1035,13 @@ const ModuleEmitCtx = struct {
                 }
                 return false;
             },
+            .tagged_union => |tu| {
+                if (env == null) return false;
+                for (tu.variants) |v| {
+                    if (try self.typeNeedsNullishSpecEnv(v.payload, env, visited, depth + 1)) return true;
+                }
+                return false;
+            },
             .type_param_ref => |tp_ident| {
                 if (env) |e| {
                     for (e.params, 0..) |tp, idx| {
@@ -1043,6 +1103,22 @@ const ModuleEmitCtx = struct {
                     }
                     return false;
                 }
+                if (self.findTargetGenericUnion(dref)) |un| {
+                    if (!try self.genericParamsArgsNeedSpec(un.type_params, dref, env, visited, depth)) return false;
+                    const key = try self.computeDeclSpecKey("u", dref, un.type_params, env);
+                    defer self.allocator.free(key);
+                    if (isDeclKeyVisited(visited, key)) return true;
+                    const next_visited = VisitedDecl{ .key = key, .prev = visited };
+                    const next_env = TypeParamEnv{
+                        .params = un.type_params,
+                        .args = dref.type_args,
+                        .arg_env = env,
+                    };
+                    for (un.variants) |v| {
+                        if (try self.typeNeedsNullishSpecEnv(v.payload, &next_env, &next_visited, depth + 1)) return true;
+                    }
+                    return false;
+                }
                 return false;
             },
             else => return false,
@@ -1085,6 +1161,36 @@ const ModuleEmitCtx = struct {
             try self.emitStringLit(f.logical_name);
             try self.out.appendSlice(self.allocator, ", .nullish = ");
             try self.emitNullishSpecEnv(f.ty, env, visited, null, f.is_optional, depth + 1);
+            try self.out.appendSlice(self.allocator, " }");
+            emitted += 1;
+        }
+        try self.out.appendSlice(self.allocator, " } }");
+    }
+
+    fn emitVariantsNullishSpecList(
+        self: *ModuleEmitCtx,
+        variants: []const ir.UnionVariantIr,
+        env: *const TypeParamEnv,
+        visited: ?*const VisitedDecl,
+        spec_id: ?[]const u8,
+        self_tag: []const u8,
+        depth: usize,
+    ) error{OutOfMemory}!void {
+        try self.out.appendSlice(self.allocator, ".{ ");
+        if (spec_id) |id_str| {
+            try self.out.appendSlice(self.allocator, ".id = ");
+            try self.emitStringLit(id_str);
+            try self.out.appendSlice(self.allocator, ", ");
+        }
+        try self.out.print(self.allocator, ".self = {s}, .variants = .{{ ", .{self_tag});
+        var emitted: usize = 0;
+        for (variants) |v| {
+            if (!try self.typeNeedsNullishSpecEnv(v.payload, env, visited, depth + 1)) continue;
+            if (emitted > 0) try self.out.appendSlice(self.allocator, ", ");
+            try self.out.appendSlice(self.allocator, ".{ .name = ");
+            try self.emitStringLit(v.logical_name);
+            try self.out.appendSlice(self.allocator, ", .nullish = ");
+            try self.emitNullishSpecEnv(v.payload, env, visited, null, false, depth + 1);
             try self.out.appendSlice(self.allocator, " }");
             emitted += 1;
         }
@@ -1165,6 +1271,15 @@ const ModuleEmitCtx = struct {
                             }
                         }
                         try self.out.appendSlice(self.allocator, " } }");
+                        return;
+                    }
+                }
+                try self.out.appendSlice(self.allocator, default_self_tag);
+            },
+            .tagged_union => |tu| {
+                if (env) |e| {
+                    if (try self.typeNeedsNullishSpecEnv(ty, e, visited, depth)) {
+                        try self.emitVariantsNullishSpecList(tu.variants, e, visited, pending_id, default_self_tag, depth);
                         return;
                     }
                 }
@@ -1253,6 +1368,33 @@ const ModuleEmitCtx = struct {
                         }
                         if (has_field_spec) {
                             try self.emitFieldsNullishSpecList(st.fields, &next_env, &next_visited, key, default_self_tag, depth);
+                            return;
+                        }
+                    }
+                }
+                if (self.findTargetGenericUnion(dref)) |un| {
+                    if (try self.genericParamsArgsNeedSpec(un.type_params, dref, env, visited, depth)) {
+                        const key = try self.computeDeclSpecKey("u", dref, un.type_params, env);
+                        defer self.allocator.free(key);
+                        if (isDeclKeyVisited(visited, key)) {
+                            try self.emitRecurseSpec(key, is_optional_site);
+                            return;
+                        }
+                        const next_visited = VisitedDecl{ .key = key, .prev = visited };
+                        const next_env = TypeParamEnv{
+                            .params = un.type_params,
+                            .args = dref.type_args,
+                            .arg_env = env,
+                        };
+                        var has_variant_spec = false;
+                        for (un.variants) |v| {
+                            if (try self.typeNeedsNullishSpecEnv(v.payload, &next_env, &next_visited, depth + 1)) {
+                                has_variant_spec = true;
+                                break;
+                            }
+                        }
+                        if (has_variant_spec) {
+                            try self.emitVariantsNullishSpecList(un.variants, &next_env, &next_visited, key, default_self_tag, depth);
                             return;
                         }
                     }
@@ -1443,33 +1585,26 @@ const ModuleEmitCtx = struct {
                     if (f.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
                     try self.out.print(self.allocator, "{s}: ", .{f.zig_ident});
                     try self.emitType(f.ty);
-                    if (f.is_optional and self.isResolvedOptional(f.ty)) {
-                        try self.out.appendSlice(self.allocator, " = null");
-                    }
+                    try self.emitFieldDefaultValue(f);
                     try self.out.appendSlice(self.allocator, ",\n");
                 }
                 try self.out.appendSlice(self.allocator, "pub const zigar_js = .{\n.fields = .{\n");
                 for (fields) |f| {
-                    try self.out.appendSlice(self.allocator, ".{ .name = ");
-                    try self.emitStringLit(f.logical_name);
-                    try self.out.appendSlice(self.allocator, ", .js_name = ");
-                    try self.emitStringLit(f.wire_name);
-                    try self.out.print(self.allocator, ", .is_optional = {s}, .nullish = ", .{
-                        if (f.is_optional) "true" else "false",
-                    });
-                    try self.emitNullishSpec(f.ty, f.is_optional);
-                    try self.out.appendSlice(self.allocator, " },\n");
+                    try self.emitFieldDescriptorEntry(f);
                 }
                 try self.out.appendSlice(self.allocator, "},\n};\n}");
             },
-            .tagged_union => |vars| {
-                try self.out.appendSlice(self.allocator, "union(enum) {\n");
-                for (vars) |v| {
-                    try self.out.print(self.allocator, "{s}: ", .{v.zig_ident});
-                    try self.emitType(v.payload);
-                    try self.out.appendSlice(self.allocator, ",\n");
-                }
-                try self.out.append(self.allocator, '}');
+            .inline_enum => |en| {
+                try self.emitClosedEnumBody(null, false, en.backing, en.members);
+            },
+            .open_literal_union => |olu| {
+                try self.emitOpenLiteralBody(null, olu);
+            },
+            .template_pattern => |pat| {
+                try self.emitTemplatePatternBody(null, pat);
+            },
+            .tagged_union => |tu| {
+                try self.emitTaggedUnionBody(null, &.{}, tu.discriminant_prop, tu.variants);
             },
             .decl_ref => |dref| {
                 if (dref.indirect) {
@@ -1756,7 +1891,7 @@ const ModuleEmitCtx = struct {
         try self.out.appendSlice(self.allocator, " {\n");
 
         if (d.alloc_companion_ident) |alloc_fn_ident| {
-            try self.out.print(self.allocator, "return {s}(", .{alloc_fn_ident});
+            try self.out.print(self.allocator, "return @This().{s}(", .{alloc_fn_ident});
             var call_idx: usize = 0;
             for (sig.type_params) |tp| {
                 if (call_idx > 0) try self.out.appendSlice(self.allocator, ", ");
@@ -1805,10 +1940,84 @@ const ModuleEmitCtx = struct {
         }
     }
 
+    fn emitFieldDefaultValue(self: *ModuleEmitCtx, f: ir.FieldIr) error{OutOfMemory}!void {
+        if (f.is_optional and self.isResolvedOptional(f.ty)) {
+            try self.out.appendSlice(self.allocator, " = null");
+            return;
+        }
+        if (!f.is_optional) {
+            if (f.literal_constraint) |lc| {
+                switch (lc) {
+                    .str => |s| {
+                        try self.out.appendSlice(self.allocator, " = ");
+                        try self.emitStringLit(s);
+                    },
+                    .num => |n| {
+                        if (std.math.isFinite(n)) {
+                            try self.out.print(self.allocator, " = {d}", .{n});
+                        }
+                    },
+                    .boolean => |b| {
+                        try self.out.print(self.allocator, " = {s}", .{if (b) "true" else "false"});
+                    },
+                    .bigint_val => |bi| {
+                        if (std.fmt.parseInt(i64, bi, 0)) |iv| {
+                            try self.out.print(self.allocator, " = {d}", .{iv});
+                        } else |_| {}
+                    },
+                    .enum_member => |em| {
+                        try self.out.print(self.allocator, " = .{s}", .{em.tag_zig_ident});
+                    },
+                }
+            }
+        }
+    }
+
+    fn emitFieldDescriptorEntry(self: *ModuleEmitCtx, f: ir.FieldIr) error{OutOfMemory}!void {
+        try self.out.appendSlice(self.allocator, ".{ .name = ");
+        try self.emitStringLit(f.logical_name);
+        try self.out.appendSlice(self.allocator, ", .js_name = ");
+        try self.emitStringLit(f.wire_name);
+        try self.out.print(self.allocator, ", .is_optional = {s}, .nullish = ", .{
+            if (f.is_optional) "true" else "false",
+        });
+        try self.emitNullishSpec(f.ty, f.is_optional);
+        if (f.literal_constraint) |lc| {
+            switch (lc) {
+                .str => |s| {
+                    try self.out.appendSlice(self.allocator, ", .expected_str = ");
+                    try self.emitStringLit(s);
+                },
+                .num => |n| {
+                    if (std.math.isFinite(n)) {
+                        try self.out.print(self.allocator, ", .expected_num = @as(f64, {d})", .{n});
+                    }
+                },
+                .boolean => |b| {
+                    try self.out.print(self.allocator, ", .expected_bool = {s}", .{if (b) "true" else "false"});
+                },
+                .bigint_val => |bi| {
+                    if (std.fmt.parseInt(i64, bi, 0)) |iv| {
+                        try self.out.print(self.allocator, ", .expected_bigint_i64 = @as(i64, {d})", .{iv});
+                    } else |_| {
+                        try self.out.appendSlice(self.allocator, ", .expected_bigint_str = ");
+                        try self.emitStringLit(bi);
+                    }
+                },
+                .enum_member => |em| {
+                    try self.out.appendSlice(self.allocator, ", .expected_enum_tag = ");
+                    try self.emitStringLit(em.tag_logical_name);
+                },
+            }
+        }
+        try self.out.appendSlice(self.allocator, " },\n");
+    }
+
     fn emitStructBody(
         self: *ModuleEmitCtx,
         wire_name: []const u8,
         is_global_scope: bool,
+        is_default_export: bool,
         push_owner_seg: bool,
         st: ir.StructDeclIr,
     ) error{OutOfMemory}!void {
@@ -1854,9 +2063,7 @@ const ModuleEmitCtx = struct {
             if (f.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
             try self.out.print(self.allocator, "{s}: ", .{f.zig_ident});
             try self.emitType(f.ty);
-            if (f.is_optional and self.isResolvedOptional(f.ty)) {
-                try self.out.appendSlice(self.allocator, " = null");
-            }
+            try self.emitFieldDefaultValue(f);
             try self.out.appendSlice(self.allocator, ",\n");
         }
 
@@ -1894,15 +2101,17 @@ const ModuleEmitCtx = struct {
             try self.emitFunction("pub ", m.zig_ident, self_ty, m.signature);
         }
 
-        if (push_owner_seg) {
-            try self.ns_wire_path.append(self.allocator, wire_name);
-        }
-        defer if (push_owner_seg) {
-            _ = self.ns_wire_path.pop();
-        };
+        {
+            if (push_owner_seg) {
+                try self.ns_wire_path.append(self.allocator, wire_name);
+            }
+            defer if (push_owner_seg) {
+                _ = self.ns_wire_path.pop();
+            };
 
-        for (st.nested_decls) |nd| {
-            try self.emitDecl(nd);
+            for (st.nested_decls) |nd| {
+                try self.emitDecl(nd);
+            }
         }
 
         try self.out.appendSlice(self.allocator, "pub const zigar_js = .{\n.js_name = ");
@@ -1918,6 +2127,10 @@ const ModuleEmitCtx = struct {
         try self.out.print(self.allocator, ",\n.is_class = {s}", .{
             if (st.is_class) "true" else "false",
         });
+        if (st.is_class) {
+            try self.out.appendSlice(self.allocator, ",\n.ctor_target = ");
+            try self.emitCallTargetLiteral(is_global_scope, wire_name, is_default_export, null);
+        }
         if (st.has_private_constructor) {
             try self.out.appendSlice(self.allocator, ",\n.has_private_constructor = true");
         }
@@ -1926,15 +2139,7 @@ const ModuleEmitCtx = struct {
         }
         try self.out.appendSlice(self.allocator, ",\n.fields = .{\n");
         for (st.fields) |f| {
-            try self.out.appendSlice(self.allocator, ".{ .name = ");
-            try self.emitStringLit(f.logical_name);
-            try self.out.appendSlice(self.allocator, ", .js_name = ");
-            try self.emitStringLit(f.wire_name);
-            try self.out.print(self.allocator, ", .is_optional = {s}, .nullish = ", .{
-                if (f.is_optional) "true" else "false",
-            });
-            try self.emitNullishSpec(f.ty, f.is_optional);
-            try self.out.appendSlice(self.allocator, " },\n");
+            try self.emitFieldDescriptorEntry(f);
         }
         try self.out.appendSlice(self.allocator, "},\n.methods = .{\n");
         for (st.methods) |m| {
@@ -1949,6 +2154,143 @@ const ModuleEmitCtx = struct {
         try self.out.appendSlice(self.allocator, "},\n};\n}");
     }
 
+    fn enumMembersHaveLogicalName(members: []const ir.EnumMemberIr, name: []const u8) bool {
+        for (members) |m| {
+            if (std.mem.eql(u8, m.logical_name, name)) return true;
+        }
+        return false;
+    }
+
+    fn emitEnumValueDescriptorField(self: *ModuleEmitCtx, val: ir.EnumValueIr) error{OutOfMemory}!void {
+        switch (val) {
+            .unknown => {},
+            .str => |s| {
+                try self.out.appendSlice(self.allocator, ", .str_value = ");
+                try self.emitStringLit(s);
+            },
+            .num => |n| {
+                if (std.math.isFinite(n)) {
+                    try self.out.print(self.allocator, ", .num_value = @as(f64, {d})", .{n});
+                }
+            },
+            .boolean => |b| {
+                try self.out.print(self.allocator, ", .bool_value = {s}", .{if (b) "true" else "false"});
+            },
+            .bigint_val => |bi| {
+                try self.out.appendSlice(self.allocator, ", .bigint_value = ");
+                try self.emitStringLit(bi);
+            },
+        }
+    }
+
+    fn emitClosedEnumBody(
+        self: *ModuleEmitCtx,
+        wire_name: ?[]const u8,
+        is_const: bool,
+        backing: lower_unions.EnumBackingKind,
+        members: []const ir.EnumMemberIr,
+    ) error{OutOfMemory}!void {
+        switch (backing) {
+            .none => try self.out.appendSlice(self.allocator, "enum {\n"),
+            .i32 => try self.out.appendSlice(self.allocator, "enum(i32) {\n"),
+            .i64 => try self.out.appendSlice(self.allocator, "enum(i64) {\n"),
+        }
+
+        var all_primary_str = true;
+        var has_primary = false;
+        for (members) |m| {
+            if (m.alias_of_zig_ident != null) continue;
+            has_primary = true;
+            if (m.value != .str) {
+                all_primary_str = false;
+            }
+            if (m.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
+            if (backing != .none and m.int_backing_val != null) {
+                try self.out.print(self.allocator, "{s} = {d},\n", .{ m.zig_ident, m.int_backing_val.? });
+            } else {
+                try self.out.print(self.allocator, "{s},\n", .{m.zig_ident});
+            }
+        }
+
+        for (members) |m| {
+            if (m.alias_of_zig_ident) |target_ident| {
+                if (m.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
+                try self.out.print(self.allocator, "pub const {s}: @This() = .{s};\n", .{ m.zig_ident, target_ident });
+            }
+        }
+
+        if (has_primary and all_primary_str) {
+            if (!enumMembersHaveLogicalName(members, "toSlice")) {
+                try self.out.appendSlice(self.allocator, "pub fn toSlice(__zigar_self: @This()) []const u8 {\nreturn switch (__zigar_self) {\n");
+                for (members) |m| {
+                    if (m.alias_of_zig_ident != null) continue;
+                    try self.out.print(self.allocator, ".{s} => ", .{m.zig_ident});
+                    try self.emitStringLit(m.value.str);
+                    try self.out.appendSlice(self.allocator, ",\n");
+                }
+                try self.out.appendSlice(self.allocator, "};\n}\n");
+            }
+            if (!enumMembersHaveLogicalName(members, "fromSlice")) {
+                try self.out.appendSlice(self.allocator, "pub fn fromSlice(__zigar_val: []const u8) ?@This() {\n");
+                for (members) |m| {
+                    if (m.alias_of_zig_ident != null) continue;
+                    try self.out.appendSlice(self.allocator, "if (@import(\"std\").mem.eql(u8, __zigar_val, ");
+                    try self.emitStringLit(m.value.str);
+                    try self.out.print(self.allocator, ")) return .{s};\n", .{m.zig_ident});
+                }
+                try self.out.appendSlice(self.allocator, "return null;\n}\n");
+            }
+        }
+
+        if (has_primary and backing != .none) {
+            const int_ty_name = if (backing == .i32) "i32" else "i64";
+            if (!enumMembersHaveLogicalName(members, "toInt")) {
+                try self.out.print(
+                    self.allocator,
+                    "pub fn toInt(__zigar_self: @This()) {s} {{\nreturn @intFromEnum(__zigar_self);\n}}\n",
+                    .{int_ty_name},
+                );
+            }
+            if (!enumMembersHaveLogicalName(members, "fromInt")) {
+                try self.out.print(
+                    self.allocator,
+                    "pub fn fromInt(__zigar_val: {s}) ?@This() {{\nreturn switch (__zigar_val) {{\n",
+                    .{int_ty_name},
+                );
+                for (members) |m| {
+                    if (m.alias_of_zig_ident != null) continue;
+                    if (m.int_backing_val) |iv| {
+                        try self.out.print(self.allocator, "{d} => .{s},\n", .{ iv, m.zig_ident });
+                    }
+                }
+                try self.out.appendSlice(self.allocator, "else => null,\n};\n}\n");
+            }
+        }
+
+        try self.out.appendSlice(self.allocator, "pub const zigar_js = .{\n");
+        if (wire_name) |wn| {
+            try self.out.appendSlice(self.allocator, ".js_name = ");
+            try self.emitStringLit(wn);
+            try self.out.appendSlice(self.allocator, ",\n");
+        }
+        try self.out.print(self.allocator, ".is_const = {s},\n.members = .{{\n", .{
+            if (is_const) "true" else "false",
+        });
+        for (members) |m| {
+            try self.out.appendSlice(self.allocator, ".{ .tag = ");
+            try self.emitStringLit(m.logical_name);
+            try self.out.appendSlice(self.allocator, ", .js_name = ");
+            try self.emitStringLit(m.wire_name);
+            if (m.alias_of_logical_name) |alias_target| {
+                try self.out.appendSlice(self.allocator, ", .is_alias = true, .alias_of = ");
+                try self.emitStringLit(alias_target);
+            }
+            try self.emitEnumValueDescriptorField(m.value);
+            try self.out.appendSlice(self.allocator, " },\n");
+        }
+        try self.out.appendSlice(self.allocator, "},\n};\n}");
+    }
+
     fn emitEnumBody(
         self: *ModuleEmitCtx,
         wire_name: []const u8,
@@ -1956,43 +2298,24 @@ const ModuleEmitCtx = struct {
         push_owner_seg: bool,
         is_const: bool,
         has_unknown_values: bool,
+        backing: lower_unions.EnumBackingKind,
         members: []const ir.EnumMemberIr,
-    ) !void {
+    ) error{OutOfMemory}!void {
         if (has_unknown_values) {
             try self.out.appendSlice(self.allocator, "struct {\n__zigar_value: __zigar_js.Any = .{ .handle = 0 },\n");
             for (members) |m| {
                 if (m.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
-                switch (m.value) {
-                    .unknown => {
-                        try self.out.print(self.allocator, "pub const {s}: __zigar_js.GlobalTarget(@This(), ", .{m.zig_ident});
-                        try self.emitCallTargetLiteral(
-                            is_global_scope,
-                            m.wire_name,
-                            false,
-                            if (push_owner_seg) wire_name else null,
-                        );
-                        try self.out.appendSlice(self.allocator, ", .none) = .{};\n");
-                    },
-                    .str => |s| {
-                        try self.out.print(self.allocator, "pub const {s}: []const u8 = ", .{m.zig_ident});
-                        try self.emitStringLit(s);
-                        try self.out.appendSlice(self.allocator, ";\n");
-                    },
-                    .num => |n| {
-                        if (std.math.isFinite(n)) {
-                            try self.out.print(self.allocator, "pub const {s}: f64 = {d};\n", .{ m.zig_ident, n });
-                        } else {
-                            try self.out.print(self.allocator, "pub const {s}: __zigar_js.GlobalTarget(@This(), ", .{m.zig_ident});
-                            try self.emitCallTargetLiteral(
-                                is_global_scope,
-                                m.wire_name,
-                                false,
-                                if (push_owner_seg) wire_name else null,
-                            );
-                            try self.out.appendSlice(self.allocator, ", .none) = .{};\n");
-                        }
-                    },
-                }
+                try self.out.print(self.allocator, "pub const {s}: __zigar_js.GlobalTarget(@This(), ", .{m.zig_ident});
+                try self.emitCallTargetLiteral(
+                    is_global_scope,
+                    m.wire_name,
+                    false,
+                    if (push_owner_seg) wire_name else null,
+                );
+                try self.out.appendSlice(self.allocator, ", .none) = .{};\n");
+            }
+            if (!enumMembersHaveLogicalName(members, "deinit")) {
+                try self.out.appendSlice(self.allocator, "pub fn deinit(__zigar_self: @This()) void {\n__zigar_self.__zigar_value.deinit();\n}\n");
             }
             try self.out.appendSlice(self.allocator, "pub const zigar_js = .{\n.js_name = ");
             try self.emitStringLit(wire_name);
@@ -2004,19 +2327,10 @@ const ModuleEmitCtx = struct {
                 try self.emitStringLit(m.logical_name);
                 try self.out.appendSlice(self.allocator, ", .js_name = ");
                 try self.emitStringLit(m.wire_name);
-                switch (m.value) {
-                    .unknown => try self.out.appendSlice(self.allocator, ", .is_unknown = true"),
-                    .str => |s| {
-                        try self.out.appendSlice(self.allocator, ", .str_value = ");
-                        try self.emitStringLit(s);
-                    },
-                    .num => |n| {
-                        if (std.math.isFinite(n)) {
-                            try self.out.print(self.allocator, ", .num_value = @as(f64, {d})", .{n});
-                        } else {
-                            try self.out.appendSlice(self.allocator, ", .is_unknown = true");
-                        }
-                    },
+                if (m.value == .unknown or (m.value == .num and !std.math.isFinite(m.value.num))) {
+                    try self.out.appendSlice(self.allocator, ", .is_unknown = true");
+                } else {
+                    try self.emitEnumValueDescriptorField(m.value);
                 }
                 try self.out.appendSlice(self.allocator, " },\n");
             }
@@ -2024,32 +2338,226 @@ const ModuleEmitCtx = struct {
             return;
         }
 
-        try self.out.appendSlice(self.allocator, "enum {\n");
-        for (members) |m| {
-            if (m.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
+        try self.emitClosedEnumBody(wire_name, is_const, backing, members);
+    }
+
+    fn emitOpenLiteralBody(
+        self: *ModuleEmitCtx,
+        wire_name: ?[]const u8,
+        olu: ir.OpenLiteralUnionIr,
+    ) error{OutOfMemory}!void {
+        var has_from_collision = std.mem.eql(u8, olu.custom_logical_name, "from");
+        if (!has_from_collision) {
+            for (olu.known_members) |m| {
+                if (std.mem.eql(u8, m.logical_name, "from")) {
+                    has_from_collision = true;
+                    break;
+                }
+            }
+        }
+
+        var frame_buf: [2][]const u8 = .{ "zigar_js", "from" };
+        const frame_slice: []const []const u8 = if (has_from_collision) frame_buf[0..1] else frame_buf[0..2];
+        try self.nested_decl_scopes.append(self.allocator, frame_slice);
+        defer _ = self.nested_decl_scopes.pop();
+
+        try self.out.appendSlice(self.allocator, "union(enum) {\n");
+        for (olu.known_members) |m| {
+            if (m.alias_of_zig_ident != null) continue;
             try self.out.print(self.allocator, "{s},\n", .{m.zig_ident});
         }
-        try self.out.appendSlice(self.allocator, "pub const zigar_js = .{\n.js_name = ");
-        try self.emitStringLit(wire_name);
-        try self.out.print(self.allocator, ",\n.is_const = {s},\n.members = .{{\n", .{
-            if (is_const) "true" else "false",
-        });
-        for (members) |m| {
+        try self.out.print(self.allocator, "{s}: ", .{olu.custom_tag_ident});
+        try self.emitType(olu.custom_payload);
+        try self.out.appendSlice(self.allocator, ",\n");
+
+        if (!has_from_collision) {
+            switch (olu.base_kind) {
+                .str => {
+                    try self.out.appendSlice(self.allocator, "pub fn from(__zigar_val: []const u8) @This() {\n");
+                    for (olu.known_members) |m| {
+                        if (m.alias_of_zig_ident != null) continue;
+                        try self.out.appendSlice(self.allocator, "if (@import(\"std\").mem.eql(u8, __zigar_val, ");
+                        try self.emitStringLit(m.value.str);
+                        try self.out.print(self.allocator, ")) return .{s};\n", .{m.zig_ident});
+                    }
+                    try self.out.print(self.allocator, "return .{{ .{s} = __zigar_val }};\n}}\n", .{olu.custom_tag_ident});
+                },
+                .num => {
+                    try self.out.appendSlice(self.allocator, "pub fn from(__zigar_val: f64) @This() {\n");
+                    for (olu.known_members) |m| {
+                        if (m.alias_of_zig_ident != null) continue;
+                        if (m.value == .num and std.math.isFinite(m.value.num)) {
+                            try self.out.print(self.allocator, "if (__zigar_val == @as(f64, {d})) return .{s};\n", .{ m.value.num, m.zig_ident });
+                        }
+                    }
+                    try self.out.print(self.allocator, "return .{{ .{s} = __zigar_val }};\n}}\n", .{olu.custom_tag_ident});
+                },
+                .bigint => {
+                    try self.out.appendSlice(self.allocator, "pub fn from(__zigar_val: i64) @This() {\n");
+                    for (olu.known_members) |m| {
+                        if (m.alias_of_zig_ident != null) continue;
+                        if (m.value == .bigint_val) {
+                            if (std.fmt.parseInt(i64, m.value.bigint_val, 0)) |iv| {
+                                try self.out.print(self.allocator, "if (__zigar_val == @as(i64, {d})) return .{s};\n", .{ iv, m.zig_ident });
+                            } else |_| {}
+                        }
+                    }
+                    try self.out.print(self.allocator, "return .{{ .{s} = __zigar_val }};\n}}\n", .{olu.custom_tag_ident});
+                },
+            }
+        }
+
+        try self.out.appendSlice(self.allocator, "pub const zigar_js = .{\n");
+        if (wire_name) |wn| {
+            try self.out.appendSlice(self.allocator, ".js_name = ");
+            try self.emitStringLit(wn);
+            try self.out.appendSlice(self.allocator, ",\n");
+        }
+        try self.out.appendSlice(self.allocator, ".is_open_literal = true,\n.variants = .{\n");
+        for (olu.known_members) |m| {
+            if (m.alias_of_zig_ident != null) continue;
             try self.out.appendSlice(self.allocator, ".{ .tag = ");
             try self.emitStringLit(m.logical_name);
             try self.out.appendSlice(self.allocator, ", .js_name = ");
             try self.emitStringLit(m.wire_name);
-            switch (m.value) {
-                .unknown => {},
-                .str => |s| {
-                    try self.out.appendSlice(self.allocator, ", .str_value = ");
-                    try self.emitStringLit(s);
-                },
-                .num => |n| {
-                    if (std.math.isFinite(n)) {
-                        try self.out.print(self.allocator, ", .num_value = @as(f64, {d})", .{n});
+            try self.out.appendSlice(self.allocator, ", .is_unit_literal = true");
+            try self.emitEnumValueDescriptorField(m.value);
+            try self.out.appendSlice(self.allocator, " },\n");
+        }
+        try self.out.appendSlice(self.allocator, ".{ .tag = ");
+        try self.emitStringLit(olu.custom_logical_name);
+        try self.out.appendSlice(self.allocator, ", .js_name = ");
+        try self.emitStringLit(olu.custom_logical_name);
+        try self.out.appendSlice(self.allocator, ", .is_custom = true },\n},\n};\n}");
+    }
+
+    fn emitTemplatePatternBody(
+        self: *ModuleEmitCtx,
+        wire_name: ?[]const u8,
+        pat: ir.TemplatePatternIr,
+    ) error{OutOfMemory}!void {
+        try self.out.appendSlice(self.allocator, "struct {\nraw: []const u8,\npub const zigar_js = .{\n");
+        if (wire_name) |wn| {
+            try self.out.appendSlice(self.allocator, ".js_name = ");
+            try self.emitStringLit(wn);
+            try self.out.appendSlice(self.allocator, ",\n");
+        }
+        try self.out.appendSlice(self.allocator, ".is_template_literal = true,\n.head = ");
+        try self.emitStringLit(pat.head);
+        try self.out.appendSlice(self.allocator, ",\n.spans = .{\n");
+        for (pat.spans) |sp| {
+            try self.out.print(self.allocator, ".{{ .placeholder = .{s}, .choices = .{{ ", .{@tagName(sp.placeholder)});
+            for (sp.choices, 0..) |ch_str, ci| {
+                if (ci > 0) try self.out.appendSlice(self.allocator, ", ");
+                try self.emitStringLit(ch_str);
+            }
+            try self.out.appendSlice(self.allocator, " }, .literal_tail = ");
+            try self.emitStringLit(sp.literal_tail);
+            try self.out.appendSlice(self.allocator, " },\n");
+        }
+        try self.out.appendSlice(
+            self.allocator,
+            "},\n};\npub fn matches(__zigar_val: []const u8) bool {\nreturn __zigar_js.matchTemplatePattern(@This().zigar_js, __zigar_val);\n}\n" ++
+                "pub fn from(__zigar_val: []const u8) error{TypeError}!@This() {\nif (!@This().matches(__zigar_val)) return error.TypeError;\nreturn .{ .raw = __zigar_val };\n}\n" ++
+                "pub fn initComptime(comptime __zigar_val: []const u8) @This() {\ncomptime {\n@setEvalBranchQuota(20000);\nif (!__zigar_js.matchTemplatePattern(@This().zigar_js, __zigar_val)) {\n" ++
+                "@compileError(\"String literal does not match TypeScript template literal pattern\");\n}\n}\nreturn .{ .raw = __zigar_val };\n}\n}",
+        );
+    }
+
+    fn emitTaggedUnionBody(
+        self: *ModuleEmitCtx,
+        wire_name: ?[]const u8,
+        type_params: []const ir.TypeParamIr,
+        discriminant_prop: ?[]const u8,
+        variants: []const ir.UnionVariantIr,
+    ) error{OutOfMemory}!void {
+        var has_from_collision = false;
+        for (variants) |v| {
+            if (std.mem.eql(u8, v.logical_name, "from")) {
+                has_from_collision = true;
+                break;
+            }
+        }
+
+        var frame_buf: [2][]const u8 = .{ "zigar_js", "from" };
+        const frame_slice: []const []const u8 = if (has_from_collision) frame_buf[0..1] else frame_buf[0..2];
+        try self.nested_decl_scopes.append(self.allocator, frame_slice);
+        defer _ = self.nested_decl_scopes.pop();
+
+        try self.out.appendSlice(self.allocator, "union(enum) {\n");
+        for (variants) |v| {
+            if (v.payload.* == .void_type and v.unit_literal != null) {
+                try self.out.print(self.allocator, "{s},\n", .{v.zig_ident});
+            } else {
+                try self.out.print(self.allocator, "{s}: ", .{v.zig_ident});
+                try self.emitType(v.payload);
+                try self.out.appendSlice(self.allocator, ",\n");
+            }
+        }
+        if (!has_from_collision) {
+            try self.out.appendSlice(self.allocator, "pub fn from(__zigar_val: anytype) @This() {\nreturn __zigar_js.coerceUnion(@This(), __zigar_val);\n}\n");
+        }
+        try self.out.appendSlice(self.allocator, "pub const zigar_js = .{\n");
+        if (wire_name) |wn| {
+            try self.out.appendSlice(self.allocator, ".js_name = ");
+            try self.emitStringLit(wn);
+            try self.out.appendSlice(self.allocator, ",\n");
+        }
+        if (type_params.len > 0) {
+            try self.out.appendSlice(self.allocator, ".type_params = .{ ");
+            for (type_params, 0..) |tp, idx| {
+                if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
+                try self.out.appendSlice(self.allocator, tp.zig_ident);
+            }
+            try self.out.appendSlice(self.allocator, " },\n");
+        }
+        if (discriminant_prop) |dp| {
+            try self.out.appendSlice(self.allocator, ".discriminant = ");
+            try self.emitStringLit(dp);
+            try self.out.appendSlice(self.allocator, ",\n");
+        }
+        try self.out.appendSlice(self.allocator, ".variants = .{\n");
+        for (variants) |v| {
+            try self.out.appendSlice(self.allocator, ".{ .tag = ");
+            try self.emitStringLit(v.logical_name);
+            try self.out.appendSlice(self.allocator, ", .js_name = ");
+            try self.emitStringLit(v.wire_tag);
+            if (v.unit_literal) |ul| {
+                try self.out.appendSlice(self.allocator, ", .is_unit_literal = true");
+                try self.emitEnumValueDescriptorField(ul);
+            }
+            if (v.disc_values.len > 0) {
+                try self.out.appendSlice(self.allocator, ", .disc_values = .{ ");
+                for (v.disc_values, 0..) |dv, di| {
+                    if (di > 0) try self.out.appendSlice(self.allocator, ", ");
+                    switch (dv) {
+                        .str => |s| {
+                            try self.out.appendSlice(self.allocator, ".{ .str_value = ");
+                            try self.emitStringLit(s);
+                            try self.out.appendSlice(self.allocator, " }");
+                        },
+                        .num => |n| {
+                            if (std.math.isFinite(n)) {
+                                try self.out.print(self.allocator, ".{{ .num_value = @as(f64, {d}) }}", .{n});
+                            } else {
+                                try self.out.appendSlice(self.allocator, ".{}");
+                            }
+                        },
+                        .boolean => |b| {
+                            try self.out.print(self.allocator, ".{{ .bool_value = {s} }}", .{if (b) "true" else "false"});
+                        },
+                        .bigint_val => |bi| {
+                            try self.out.appendSlice(self.allocator, ".{ .bigint_value = ");
+                            try self.emitStringLit(bi);
+                            try self.out.appendSlice(self.allocator, " }");
+                        },
                     }
-                },
+                }
+                try self.out.appendSlice(self.allocator, " }");
+            }
+            if (type_params.len == 0 and (try self.typeNeedsNullishSpecEnv(v.payload, null, null, 0))) {
+                try self.out.appendSlice(self.allocator, ", .nullish = ");
+                try self.emitNullishSpec(v.payload, false);
             }
             try self.out.appendSlice(self.allocator, " },\n");
         }
@@ -2095,9 +2603,12 @@ const ModuleEmitCtx = struct {
             },
             .struct_decl => |st| {
                 const push_owner = true;
+                const is_default_cls = !d.is_global_scope and
+                    self.ns_wire_path.items.len == 0 and
+                    (d.is_default_export or self.isExportEqualsRootDecl(d));
                 if (st.type_params.len == 0) {
                     try self.out.print(self.allocator, "{s}const {s} = ", .{ pub_kw, d.zig_ident });
-                    try self.emitStructBody(d.wire_name, d.is_global_scope, push_owner, st);
+                    try self.emitStructBody(d.wire_name, d.is_global_scope, is_default_cls, push_owner, st);
                     try self.out.appendSlice(self.allocator, ";\n");
                 } else {
                     try self.out.print(self.allocator, "{s}fn {s}(", .{ pub_kw, d.zig_ident });
@@ -2106,52 +2617,45 @@ const ModuleEmitCtx = struct {
                         try self.out.print(self.allocator, "comptime {s}: type", .{tp.zig_ident});
                     }
                     try self.out.appendSlice(self.allocator, ") type {\nreturn ");
-                    try self.emitStructBody(d.wire_name, d.is_global_scope, push_owner, st);
+                    try self.emitStructBody(d.wire_name, d.is_global_scope, is_default_cls, push_owner, st);
                     try self.out.appendSlice(self.allocator, ";\n}\n");
                 }
             },
             .enum_decl => |en| {
                 const push_owner = true;
                 try self.out.print(self.allocator, "{s}const {s} = ", .{ pub_kw, d.zig_ident });
-                try self.emitEnumBody(d.wire_name, d.is_global_scope, push_owner, en.is_const, en.has_unknown_values, en.members);
+                try self.emitEnumBody(d.wire_name, d.is_global_scope, push_owner, en.is_const, en.has_unknown_values, en.backing, en.members);
                 try self.out.appendSlice(self.allocator, ";\n");
             },
-            .string_enum_decl => |members| {
+            .literal_enum_decl => |en| {
                 try self.out.print(self.allocator, "{s}const {s} = ", .{ pub_kw, d.zig_ident });
-                try self.emitEnumBody(d.wire_name, d.is_global_scope, false, false, false, members);
+                try self.emitClosedEnumBody(d.wire_name, false, en.backing, en.members);
+                try self.out.appendSlice(self.allocator, ";\n");
+            },
+            .open_literal_decl => |olu| {
+                try self.out.print(self.allocator, "{s}const {s} = ", .{ pub_kw, d.zig_ident });
+                try self.emitOpenLiteralBody(d.wire_name, olu);
+                try self.out.appendSlice(self.allocator, ";\n");
+            },
+            .template_pattern_decl => |pat| {
+                try self.out.print(self.allocator, "{s}const {s} = ", .{ pub_kw, d.zig_ident });
+                try self.emitTemplatePatternBody(d.wire_name, pat);
                 try self.out.appendSlice(self.allocator, ";\n");
             },
             .union_decl => |un| {
                 if (un.type_params.len == 0) {
-                    try self.out.print(self.allocator, "{s}const {s} = union(enum) {{\n", .{ pub_kw, d.zig_ident });
-                    for (un.variants) |v| {
-                        try self.out.print(self.allocator, "{s}: ", .{v.zig_ident});
-                        try self.emitType(v.payload);
-                        try self.out.appendSlice(self.allocator, ",\n");
-                    }
-                    try self.out.appendSlice(self.allocator, "pub const zigar_js = .{ .js_name = ");
-                    try self.emitStringLit(d.wire_name);
-                    try self.out.appendSlice(self.allocator, " };\n};\n");
+                    try self.out.print(self.allocator, "{s}const {s} = ", .{ pub_kw, d.zig_ident });
+                    try self.emitTaggedUnionBody(d.wire_name, &.{}, un.discriminant_prop, un.variants);
+                    try self.out.appendSlice(self.allocator, ";\n");
                 } else {
                     try self.out.print(self.allocator, "{s}fn {s}(", .{ pub_kw, d.zig_ident });
                     for (un.type_params, 0..) |tp, idx| {
                         if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
                         try self.out.print(self.allocator, "comptime {s}: type", .{tp.zig_ident});
                     }
-                    try self.out.appendSlice(self.allocator, ") type {\nreturn union(enum) {\n");
-                    for (un.variants) |v| {
-                        try self.out.print(self.allocator, "{s}: ", .{v.zig_ident});
-                        try self.emitType(v.payload);
-                        try self.out.appendSlice(self.allocator, ",\n");
-                    }
-                    try self.out.appendSlice(self.allocator, "pub const zigar_js = .{ .js_name = ");
-                    try self.emitStringLit(d.wire_name);
-                    try self.out.appendSlice(self.allocator, ", .type_params = .{ ");
-                    for (un.type_params, 0..) |tp, idx| {
-                        if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
-                        try self.out.appendSlice(self.allocator, tp.zig_ident);
-                    }
-                    try self.out.appendSlice(self.allocator, " } };\n};\n}\n");
+                    try self.out.appendSlice(self.allocator, ") type {\nreturn ");
+                    try self.emitTaggedUnionBody(d.wire_name, un.type_params, un.discriminant_prop, un.variants);
+                    try self.out.appendSlice(self.allocator, ";\n}\n");
                 }
             },
             .type_alias => |ta| {
@@ -2254,7 +2758,7 @@ const ModuleEmitCtx = struct {
 
 fn typeHasInlineNominal(ty: *const ir.TypeIr) bool {
     return switch (ty.*) {
-        .tuple, .anon_struct, .tagged_union => true,
+        .tuple, .anon_struct, .tagged_union, .inline_enum, .open_literal_union, .template_pattern => true,
         .optional => |opt| typeHasInlineNominal(opt.child),
         .pointer_const, .slice, .promise => |inner| typeHasInlineNominal(inner),
         .js_map => |m| typeHasInlineNominal(m.key) or typeHasInlineNominal(m.value),
@@ -2305,8 +2809,9 @@ fn typeUsesTypeParam(ty: *const ir.TypeIr, tp_ident: []const u8) bool {
             }
             break :blk false;
         },
-        .tagged_union => |vars| blk: {
-            for (vars) |v| {
+        .open_literal_union => |olu| typeUsesTypeParam(olu.custom_payload, tp_ident),
+        .tagged_union => |tu| blk: {
+            for (tu.variants) |v| {
                 if (typeUsesTypeParam(v.payload, tp_ident)) break :blk true;
             }
             break :blk false;
@@ -3392,6 +3897,269 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\            try raw_js.trySetPropDynamic(cur, self.js_name, encoded);
         \\        }
         \\    };
+        \\}
+        \\
+        \\pub const TemplatePlaceholderKind = if (has_host) raw_js.TemplatePlaceholderKind else enum {
+        \\    any_string,
+        \\    number,
+        \\    bigint,
+        \\    boolean,
+        \\    literal_set,
+        \\};
+        \\
+        \\fn resolveTemplatePlaceholderKind(comptime raw: anytype) TemplatePlaceholderKind {
+        \\    const RawT = @TypeOf(raw);
+        \\    if (RawT == TemplatePlaceholderKind) return raw;
+        \\    return switch (@typeInfo(RawT)) {
+        \\        .enum_literal, .@"enum" => @field(TemplatePlaceholderKind, @tagName(raw)),
+        \\        else => @compileError("Invalid template placeholder kind: " ++ @typeName(RawT)),
+        \\    };
+        \\}
+        \\
+        \\fn slotMatchesBytes(comptime raw_kind: anytype, comptime choices: anytype, seg: []const u8) bool {
+        \\    const kind = comptime resolveTemplatePlaceholderKind(raw_kind);
+        \\    return switch (kind) {
+        \\        .any_string => true,
+        \\        .boolean => std.mem.eql(u8, seg, "true") or std.mem.eql(u8, seg, "false"),
+        \\        .bigint => blk: {
+        \\            if (seg.len == 0) break :blk false;
+        \\            const digits = if (seg[0] == '-') seg[1..] else seg;
+        \\            if (digits.len == 0 or std.mem.eql(u8, seg, "-0")) break :blk false;
+        \\            for (digits) |ch| {
+        \\                if (ch < '0' or ch > '9') break :blk false;
+        \\            }
+        \\            break :blk true;
+        \\        },
+        \\        .number => blk: {
+        \\            if (seg.len == 0) break :blk false;
+        \\            if (std.mem.eql(u8, seg, "NaN") or
+        \\                std.mem.eql(u8, seg, "Infinity") or
+        \\                std.mem.eql(u8, seg, "-Infinity") or
+        \\                std.mem.eql(u8, seg, "+Infinity")) break :blk true;
+        \\            for (seg) |ch| {
+        \\                if (ch <= ' ' or ch == '_') break :blk false;
+        \\            }
+        \\            if (std.mem.startsWith(u8, seg, "0x") or std.mem.startsWith(u8, seg, "0X") or
+        \\                std.mem.startsWith(u8, seg, "0o") or std.mem.startsWith(u8, seg, "0O") or
+        \\                std.mem.startsWith(u8, seg, "0b") or std.mem.startsWith(u8, seg, "0B"))
+        \\            {
+        \\                _ = std.fmt.parseInt(u64, seg, 0) catch break :blk false;
+        \\                break :blk true;
+        \\            }
+        \\            for (seg) |ch| {
+        \\                if (std.ascii.isAlphabetic(ch) and ch != 'e' and ch != 'E') break :blk false;
+        \\            }
+        \\            _ = std.fmt.parseFloat(f64, seg) catch break :blk false;
+        \\            break :blk true;
+        \\        },
+        \\        .literal_set => blk: {
+        \\            inline for (choices) |c| {
+        \\                if (std.mem.eql(u8, seg, c)) break :blk true;
+        \\            }
+        \\            break :blk false;
+        \\        },
+        \\    };
+        \\}
+        \\
+        \\fn matchTemplateSpansAt(
+        \\    comptime spans: anytype,
+        \\    comptime idx: usize,
+        \\    rem: []const u8,
+        \\    failed_bits: ?*[spans.len][8]u64,
+        \\    steps_left: *usize,
+        \\) bool {
+        \\    if (idx >= spans.len) return rem.len == 0;
+        \\    if (steps_left.* == 0) return false;
+        \\    steps_left.* -= 1;
+        \\    if (failed_bits) |fb| {
+        \\        if (rem.len < 512) {
+        \\            const word = rem.len >> 6;
+        \\            const bit: u6 = @intCast(rem.len & 63);
+        \\            if ((fb[idx][word] & (@as(u64, 1) << bit)) != 0) return false;
+        \\        }
+        \\    }
+        \\    const sp = spans[idx];
+        \\    const sep: []const u8 = sp.literal_tail;
+        \\    if (idx + 1 == spans.len) {
+        \\        if (!std.mem.endsWith(u8, rem, sep)) return false;
+        \\        const ok = slotMatchesBytes(sp.placeholder, sp.choices, rem[0 .. rem.len - sep.len]);
+        \\        if (!ok) {
+        \\            if (failed_bits) |fb| {
+        \\                if (rem.len < 512) fb[idx][rem.len >> 6] |= (@as(u64, 1) << @intCast(rem.len & 63));
+        \\            }
+        \\        }
+        \\        return ok;
+        \\    }
+        \\    if (sep.len == 0) {
+        \\        if (comptime (resolveTemplatePlaceholderKind(sp.placeholder) == .any_string and
+        \\            resolveTemplatePlaceholderKind(spans[idx + 1].placeholder) == .any_string))
+        \\        {
+        \\            return matchTemplateSpansAt(spans, idx + 1, rem, failed_bits, steps_left);
+        \\        }
+        \\        var split: usize = 0;
+        \\        while (split <= rem.len) : (split += 1) {
+        \\            if (slotMatchesBytes(sp.placeholder, sp.choices, rem[0..split]) and
+        \\                matchTemplateSpansAt(spans, idx + 1, rem[split..], failed_bits, steps_left))
+        \\            {
+        \\                return true;
+        \\            }
+        \\        }
+        \\        if (failed_bits) |fb| {
+        \\            if (rem.len < 512) fb[idx][rem.len >> 6] |= (@as(u64, 1) << @intCast(rem.len & 63));
+        \\        }
+        \\        return false;
+        \\    }
+        \\    var search_from: usize = 0;
+        \\    while (search_from + sep.len <= rem.len) {
+        \\        const rel = std.mem.indexOfPos(u8, rem, search_from, sep) orelse break;
+        \\        if (slotMatchesBytes(sp.placeholder, sp.choices, rem[0..rel]) and
+        \\            matchTemplateSpansAt(spans, idx + 1, rem[rel + sep.len ..], failed_bits, steps_left))
+        \\        {
+        \\            return true;
+        \\        }
+        \\        search_from = rel + 1;
+        \\    }
+        \\    if (failed_bits) |fb| {
+        \\        if (rem.len < 512) fb[idx][rem.len >> 6] |= (@as(u64, 1) << @intCast(rem.len & 63));
+        \\    }
+        \\    return false;
+        \\}
+        \\
+        \\pub fn matchTemplatePattern(comptime spec: anytype, s: []const u8) bool {
+        \\    if (has_host) return raw_js.matchTemplatePattern(spec, s);
+        \\    const head: []const u8 = spec.head;
+        \\    if (!std.mem.startsWith(u8, s, head)) return false;
+        \\    var pos: usize = head.len;
+        \\    inline for (spec.spans) |sp| {
+        \\        if (sp.literal_tail.len > 0) {
+        \\            const found = std.mem.indexOfPos(u8, s, pos, sp.literal_tail) orelse return false;
+        \\            pos = found + sp.literal_tail.len;
+        \\        }
+        \\    }
+        \\    var steps_left: usize = 65_536;
+        \\    if (comptime (spec.spans.len > 0 and spec.spans.len <= 32)) {
+        \\        var fb: [spec.spans.len][8]u64 = @splat(@splat(0));
+        \\        return matchTemplateSpansAt(spec.spans, 0, s[head.len..], &fb, &steps_left);
+        \\    }
+        \\    return matchTemplateSpansAt(spec.spans, 0, s[head.len..], null, &steps_left);
+        \\}
+        \\
+        \\fn isStringSliceCoercible(comptime T: type) bool {
+        \\    if (T == []const u8 or T == []u8) return true;
+        \\    return switch (@typeInfo(T)) {
+        \\        .pointer => |pt| pt.size == .one and @typeInfo(pt.child) == .array and @typeInfo(pt.child).array.child == u8,
+        \\        else => false,
+        \\    };
+        \\}
+        \\
+        \\pub fn coerceUnion(comptime U: type, val: anytype) U {
+        \\    if (has_host) return raw_js.coerceUnion(U, val);
+        \\    const ValT = @TypeOf(val);
+        \\    if (ValT == U) return val;
+        \\    const un = @typeInfo(U).@"union";
+        \\    comptime var exact_idx: ?usize = null;
+        \\    comptime var exact_count: usize = 0;
+        \\    inline for (un.field_names, 0..) |_, i| {
+        \\        const FT = un.field_types[i];
+        \\        if (FT != void and FT == ValT) {
+        \\            exact_idx = i;
+        \\            exact_count += 1;
+        \\        }
+        \\    }
+        \\    if (exact_count == 1) {
+        \\        return @unionInit(U, un.field_names[exact_idx.?], val);
+        \\    }
+        \\    if (comptime isStringSliceCoercible(ValT)) {
+        \\        const slice_val: []const u8 = val;
+        \\        if (@hasDecl(U, "zigar_js") and @hasField(@TypeOf(U.zigar_js), "variants")) {
+        \\            inline for (U.zigar_js.variants) |v| {
+        \\                if (@hasField(@TypeOf(v), "is_unit_literal") and @hasField(@TypeOf(v), "str_value")) {
+        \\                    if (std.mem.eql(u8, slice_val, v.str_value)) {
+        \\                        return @unionInit(U, v.tag, {});
+        \\                    }
+        \\                }
+        \\            }
+        \\        }
+        \\        comptime var str_idx: ?usize = null;
+        \\        comptime var str_count: usize = 0;
+        \\        inline for (un.field_names, 0..) |_, i| {
+        \\            if (un.field_types[i] == []const u8) {
+        \\                str_idx = i;
+        \\                str_count += 1;
+        \\            }
+        \\        }
+        \\        if (str_count == 1) {
+        \\            return @unionInit(U, un.field_names[str_idx.?], slice_val);
+        \\        }
+        \\    }
+        \\    if (ValT == bool) {
+        \\        if (@hasDecl(U, "zigar_js") and @hasField(@TypeOf(U.zigar_js), "variants")) {
+        \\            inline for (U.zigar_js.variants) |v| {
+        \\                if (@hasField(@TypeOf(v), "is_unit_literal") and @hasField(@TypeOf(v), "bool_value")) {
+        \\                    if (val == v.bool_value) {
+        \\                        return @unionInit(U, v.tag, {});
+        \\                    }
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\    if (ValT == f64) {
+        \\        if (@hasDecl(U, "zigar_js") and @hasField(@TypeOf(U.zigar_js), "variants")) {
+        \\            inline for (U.zigar_js.variants) |v| {
+        \\                if (@hasField(@TypeOf(v), "is_unit_literal") and @hasField(@TypeOf(v), "num_value")) {
+        \\                    if (val == v.num_value) {
+        \\                        return @unionInit(U, v.tag, {});
+        \\                    }
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\    if (ValT == i64) {
+        \\        if (@hasDecl(U, "zigar_js") and @hasField(@TypeOf(U.zigar_js), "variants")) {
+        \\            inline for (U.zigar_js.variants) |v| {
+        \\                if (@hasField(@TypeOf(v), "is_unit_literal") and @hasField(@TypeOf(v), "bigint_value")) {
+        \\                    if (comptime @as(?i64, std.fmt.parseInt(i64, v.bigint_value, 0) catch null)) |iv| {
+        \\                        if (val == iv) return @unionInit(U, v.tag, {});
+        \\                    }
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\    const val_info = @typeInfo(ValT);
+        \\    if (val_info == .comptime_int or val_info == .comptime_float) {
+        \\        if (@hasDecl(U, "zigar_js") and @hasField(@TypeOf(U.zigar_js), "variants")) {
+        \\            inline for (U.zigar_js.variants) |v| {
+        \\                if (@hasField(@TypeOf(v), "is_unit_literal") and @hasField(@TypeOf(v), "num_value")) {
+        \\                    if (@as(f64, val) == v.num_value) {
+        \\                        return @unionInit(U, v.tag, {});
+        \\                    }
+        \\                }
+        \\            }
+        \\            if (val_info == .comptime_int) {
+        \\                inline for (U.zigar_js.variants) |v| {
+        \\                    if (@hasField(@TypeOf(v), "is_unit_literal") and @hasField(@TypeOf(v), "bigint_value")) {
+        \\                        if (comptime @as(?i64, std.fmt.parseInt(i64, v.bigint_value, 0) catch null)) |iv| {
+        \\                            if (val == iv) return @unionInit(U, v.tag, {});
+        \\                        }
+        \\                    }
+        \\                }
+        \\            }
+        \\        }
+        \\        comptime var num_idx: ?usize = null;
+        \\        comptime var num_count: usize = 0;
+        \\        inline for (un.field_names, 0..) |_, i| {
+        \\            const FT = un.field_types[i];
+        \\            if (FT == f64 or (val_info == .comptime_int and (FT == i64 or FT == i32))) {
+        \\                num_idx = i;
+        \\                num_count += 1;
+        \\            }
+        \\        }
+        \\        if (num_count == 1) {
+        \\            const TargetNum = un.field_types[num_idx.?];
+        \\            return @unionInit(U, un.field_names[num_idx.?], @as(TargetNum, val));
+        \\        }
+        \\    }
+        \\    @compileError("Cannot unambiguously coerce value of type " ++ @typeName(ValT) ++ " into union " ++ @typeName(U));
         \\}
         \\
         \\pub fn Global(comptime T: type) type {

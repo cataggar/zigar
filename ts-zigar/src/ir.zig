@@ -2,6 +2,7 @@ const std = @import("std");
 const cli = @import("cli.zig");
 const naming = @import("naming.zig");
 const lower_types = @import("lower_types.zig");
+const lower_unions = @import("lower_unions.zig");
 
 /// Lowering configuration for `lowerGraph`.
 pub const LowerOptions = struct {
@@ -60,6 +61,18 @@ pub const SignatureIr = struct {
     jsdoc: ?JsDocIr,
 };
 
+pub const FieldLiteralConstraintIr = union(enum) {
+    str: []const u8,
+    num: f64,
+    bigint_val: []const u8,
+    boolean: bool,
+    enum_member: struct {
+        enum_decl_id: u32,
+        tag_zig_ident: []const u8,
+        tag_logical_name: []const u8,
+    },
+};
+
 pub const FieldIr = struct {
     zig_ident: []const u8,
     logical_name: []const u8,
@@ -68,6 +81,7 @@ pub const FieldIr = struct {
     is_optional: bool,
     is_readonly: bool,
     nullish_kind: lower_types.NullishKind = .none,
+    literal_constraint: ?FieldLiteralConstraintIr = null,
     jsdoc: ?JsDocIr,
 };
 
@@ -84,6 +98,8 @@ pub const EnumValueIr = union(enum) {
     unknown,
     num: f64,
     str: []const u8,
+    boolean: bool,
+    bigint_val: []const u8,
 };
 
 pub const EnumMemberIr = struct {
@@ -91,6 +107,9 @@ pub const EnumMemberIr = struct {
     logical_name: []const u8,
     wire_name: []const u8,
     value: EnumValueIr,
+    int_backing_val: ?i64 = null,
+    alias_of_zig_ident: ?[]const u8 = null,
+    alias_of_logical_name: ?[]const u8 = null,
     jsdoc: ?JsDocIr,
 };
 
@@ -127,10 +146,49 @@ pub const OptionalTypeIr = struct {
     nullish_kind: lower_types.NullishKind = .null_or_undefined,
 };
 
+pub const VariantDiscriminantValueIr = union(enum) {
+    str: []const u8,
+    num: f64,
+    boolean: bool,
+    bigint_val: []const u8,
+};
+
 pub const UnionVariantIr = struct {
     zig_ident: []const u8,
+    logical_name: []const u8,
     wire_tag: []const u8,
     payload: *const TypeIr,
+    unit_literal: ?EnumValueIr = null,
+    disc_values: []const VariantDiscriminantValueIr = &.{},
+};
+
+pub const TaggedUnionIr = struct {
+    discriminant_prop: ?[]const u8 = null,
+    variants: []const UnionVariantIr,
+};
+
+pub const InlineEnumIr = struct {
+    backing: lower_unions.EnumBackingKind,
+    members: []const EnumMemberIr,
+};
+
+pub const OpenLiteralUnionIr = struct {
+    base_kind: lower_unions.OpenPrimitiveKind,
+    known_members: []const EnumMemberIr,
+    custom_tag_ident: []const u8,
+    custom_logical_name: []const u8,
+    custom_payload: *const TypeIr,
+};
+
+pub const TemplateSpanIr = struct {
+    placeholder: lower_unions.TemplatePlaceholderKind,
+    choices: []const []const u8 = &.{},
+    literal_tail: []const u8,
+};
+
+pub const TemplatePatternIr = struct {
+    head: []const u8,
+    spans: []const TemplateSpanIr,
 };
 
 pub const FnPtrIr = struct {
@@ -177,7 +235,10 @@ pub const TypeIr = union(enum) {
     tuple: []const TupleElemIr,
     fn_ptr: FnPtrIr,
     anon_struct: []const FieldIr,
-    tagged_union: []const UnionVariantIr,
+    inline_enum: InlineEnumIr,
+    open_literal_union: OpenLiteralUnionIr,
+    template_pattern: TemplatePatternIr,
+    tagged_union: TaggedUnionIr,
     decl_ref: DeclRefIr,
 };
 
@@ -210,6 +271,12 @@ pub const StructDeclIr = struct {
     nested_decls: []const DeclIr,
 };
 
+pub const UnionDeclIr = struct {
+    type_params: []const TypeParamIr,
+    discriminant_prop: ?[]const u8 = null,
+    variants: []const UnionVariantIr,
+};
+
 pub const DeclKindIr = union(enum) {
     function_decl: SignatureIr,
     const_literal: struct {
@@ -221,13 +288,13 @@ pub const DeclKindIr = union(enum) {
     enum_decl: struct {
         is_const: bool,
         has_unknown_values: bool = false,
+        backing: lower_unions.EnumBackingKind = .none,
         members: []const EnumMemberIr,
     },
-    string_enum_decl: []const EnumMemberIr,
-    union_decl: struct {
-        type_params: []const TypeParamIr,
-        variants: []const UnionVariantIr,
-    },
+    literal_enum_decl: InlineEnumIr,
+    open_literal_decl: OpenLiteralUnionIr,
+    template_pattern_decl: TemplatePatternIr,
+    union_decl: UnionDeclIr,
     type_alias: struct {
         type_params: []const TypeParamIr,
         target: *const TypeIr,
@@ -725,6 +792,26 @@ fn LowerCtx(comptime GraphType: type) type {
             const td = target_decl orelse return true;
             if (td >= self.graph.decls.len) return true;
             if (self.global_aug_decls.contains(td)) return true;
+
+            if (self.decl_to_cand.get(td)) |c_idx| {
+                if (c_idx < self.candidates.items.len and self.candidates.items[c_idx].source_mod_ids.items.len == 0) {
+                    const cand_spec = self.candidates.items[c_idx].wire_specifier;
+                    if (lower_types.isBuiltinBufferOrGlobalsModule(cand_spec, "")) {
+                        return true;
+                    }
+                }
+            }
+
+            var cur_ns_opt = self.child_to_parent_ns.get(td);
+            var ns_depth: usize = 0;
+            while (cur_ns_opt) |ns_id| : (ns_depth += 1) {
+                if (ns_depth >= 32 or ns_id >= self.graph.decls.len) break;
+                const ns_name = self.str(self.graph.decls[ns_id].name);
+                if (lower_types.isBuiltinBufferOrGlobalsModule(ns_name, "")) {
+                    return true;
+                }
+                cur_ns_opt = self.child_to_parent_ns.get(ns_id);
+            }
 
             const owner_mid = self.findGraphModuleIndexById(self.graph.decls[td].module) orelse return true;
             const owner_mod = self.graph.modules[owner_mid];
@@ -2799,7 +2886,30 @@ fn LowerCtx(comptime GraphType: type) type {
                 .boolean_type => return self.makeType(.bool_type),
                 .number_type => return self.makeType(.f64_type),
                 .bigint_type => return self.makeType(.i64_type),
-                .string_type, .template_literal, .intrinsic => return self.makeType(.string_type),
+                .string_type => return self.makeType(.string_type),
+                .intrinsic => {
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) {
+                            return self.lowerType(rt, is_return_pos, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                        }
+                    }
+                    return self.makeType(.string_type);
+                },
+                .template_literal => |tl| {
+                    return self.lowerTemplateLiteralInline(
+                        ty_id,
+                        tl,
+                        tn.resolved_type,
+                        ref_cnt,
+                        can_hoist_in_mod,
+                        no_free_vars,
+                        active_tps,
+                        self_ident_opt,
+                        visited,
+                        imports_used,
+                        needs_runtime,
+                    );
+                },
                 .symbol_type, .unique_symbol => {
                     needs_runtime.* = true;
                     return self.makeType(.js_symbol);
@@ -2909,46 +3019,18 @@ fn LowerCtx(comptime GraphType: type) type {
                     return tup_ir;
                 },
                 .union_type => |arms| {
-                    var non_null: std.ArrayList(u32) = .empty;
-                    defer non_null.deinit(self.scratch);
-                    var nullish: lower_types.NullishKind = .none;
-
-                    for (arms) |arm_id| {
-                        if (arm_id >= self.graph.types.len) continue;
-                        switch (self.graph.types[arm_id].kind) {
-                            .null_type => nullish = nullish.merge(.null_only),
-                            .undefined_type, .void_type => nullish = nullish.merge(.undefined_only),
-                            .never_type => {},
-                            else => try non_null.append(self.scratch, arm_id),
-                        }
-                    }
-
-                    if (non_null.items.len == 0) {
-                        if (nullish != .none) {
-                            needs_runtime.* = true;
-                            const jv = try self.makeType(.js_any);
-                            return self.makeType(.{ .optional = .{ .child = jv, .nullish_kind = nullish } });
-                        }
-                        return self.makeType(.void_type);
-                    }
-
-                    var base_ty: *TypeIr = undefined;
-                    if (non_null.items.len == 1) {
-                        base_ty = try self.lowerType(non_null.items[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
-                    } else if (self.allArmsSameScalarKind(non_null.items)) |scalar_ty| {
-                        base_ty = try self.makeType(scalar_ty);
-                    } else {
-                        // Lower general multi-arm union in inline type position to `zigar_js.Any`
-                        // (top-level `type Foo = A | B` emits a dedicated `union(enum)` via `lowerUnionDecl`).
-                        needs_runtime.* = true;
-                        base_ty = try self.makeType(.js_any);
-                    }
-
-                    const final_u = if (nullish != .none) try self.wrapOptionalWithNullish(base_ty, nullish) else base_ty;
-                    if (ref_cnt > 1 and can_hoist_in_mod and isSafeToShareTypeIrPtr(final_u) and (no_free_vars or try self.isClosedTypeSubgraph(ty_id))) {
-                        try self.cur_mod_closed_types.put(self.scratch, ty_id, final_u);
-                    }
-                    return final_u;
+                    return self.lowerUnionTypeInline(
+                        ty_id,
+                        arms,
+                        ref_cnt,
+                        can_hoist_in_mod,
+                        no_free_vars,
+                        active_tps,
+                        self_ident_opt,
+                        visited,
+                        imports_used,
+                        needs_runtime,
+                    );
                 },
                 .reference => |ref| {
                     const ref_name = self.str(ref.target_name);
@@ -3251,6 +3333,20 @@ fn LowerCtx(comptime GraphType: type) type {
                     needs_runtime.* = true;
                     return self.makeType(.js_object);
                 },
+                .intersection => |parts| {
+                    return self.lowerIntersectionInline(
+                        ty_id,
+                        parts,
+                        ref_cnt,
+                        can_hoist_in_mod,
+                        no_free_vars,
+                        active_tps,
+                        self_ident_opt,
+                        visited,
+                        imports_used,
+                        needs_runtime,
+                    );
+                },
                 else => {
                     if (tn.resolved_type) |rt| {
                         if (rt != ty_id) {
@@ -3446,8 +3542,11 @@ fn LowerCtx(comptime GraphType: type) type {
                 bound.deinit(self.scratch);
 
                 var f_ty = try self.lowerType(p.ty, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                var lit_constraint: ?FieldLiteralConstraintIr = null;
                 if (p.modifiers.optional_mod) {
                     f_ty = try self.wrapOptional(f_ty);
+                } else {
+                    lit_constraint = try self.extractCompatibleFieldLiteralConstraint(p.ty, f_ty);
                 }
 
                 try list.append(self.alloc, .{
@@ -3458,6 +3557,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     .is_optional = p.modifiers.optional_mod,
                     .is_readonly = p.modifiers.readonly_mod,
                     .nullish_kind = if (f_ty.* == .optional) f_ty.optional.nullish_kind else .none,
+                    .literal_constraint = lit_constraint,
                     .jsdoc = try self.lowerJsDoc(p.jsdoc),
                 });
             }
@@ -3576,7 +3676,9 @@ fn LowerCtx(comptime GraphType: type) type {
 
         fn typeMayAllocateOnDecode(self: *const Self, ty: *const TypeIr) bool {
             return switch (ty.*) {
-                .string_type, .bytes_type, .typed_slice, .slice, .pointer_const, .type_param_ref => true,
+                .string_type, .bytes_type, .typed_slice, .slice, .pointer_const, .type_param_ref, .template_pattern => true,
+                .inline_enum => false,
+                .open_literal_union => |olu| olu.base_kind == .str,
                 .optional => |opt| self.typeMayAllocateOnDecode(opt.child),
                 .tuple => |elems| blk: {
                     for (elems) |el| {
@@ -3590,8 +3692,8 @@ fn LowerCtx(comptime GraphType: type) type {
                     }
                     break :blk false;
                 },
-                .tagged_union => |vars| blk: {
-                    for (vars) |v| {
+                .tagged_union => |tu| blk: {
+                    for (tu.variants) |v| {
                         if (self.typeMayAllocateOnDecode(v.payload)) break :blk true;
                     }
                     break :blk false;
@@ -3607,37 +3709,1830 @@ fn LowerCtx(comptime GraphType: type) type {
             };
         }
 
-        fn tryLowerStringEnum(self: *Self, ty_id: u32) !?[]EnumMemberIr {
+        const EnumMemberLookup = struct {
+            enum_decl_id: u32,
+            member_idx: usize,
+            tag_zig_ident: []const u8,
+            tag_logical_name: []const u8,
+            value: EnumValueIr,
+        };
+
+        fn resolveEnumMemberReference(self: *Self, ty_id: u32) error{OutOfMemory}!?EnumMemberLookup {
             if (ty_id >= self.graph.types.len) return null;
             const tn = self.graph.types[ty_id];
-            if (tn.kind != .union_type) return null;
-            const arms = tn.kind.union_type;
-            if (arms.len < 2) return null;
+            if (tn.kind != .reference) return null;
+            const ref = tn.kind.reference;
+            const td = ref.target_decl orelse return null;
+            if (td >= self.graph.decls.len) return null;
+            const decl = self.graph.decls[td];
+            if (decl.kind != .enum_decl) return null;
+            const en = decl.kind.enum_decl;
+            if (en.members.len == 0) return null;
 
-            for (arms) |aid| {
-                if (aid >= self.graph.types.len) return null;
-                const ak = self.graph.types[aid].kind;
-                if (ak != .literal or ak.literal != .str) return null;
+            const ref_name = self.str(ref.target_name);
+            const dot_idx = std.mem.lastIndexOfScalar(u8, ref_name, '.') orelse return null;
+            const member_suffix = ref_name[dot_idx + 1 ..];
+            if (member_suffix.len == 0) return null;
+
+            // Verify every member in the parent enum has a known value; otherwise runtime representation is a struct wrapper.
+            for (en.members) |m| {
+                const mv = m.value orelse return null;
+                switch (mv) {
+                    .num => |n| if (!std.math.isFinite(n)) return null,
+                    .str, .boolean, .bigint_literal => {},
+                }
+            }
+
+            var target_member_idx: ?usize = null;
+            for (en.members, 0..) |m, idx| {
+                if (std.mem.eql(u8, self.str(m.name), member_suffix)) {
+                    target_member_idx = idx;
+                    break;
+                }
+            }
+            const found_idx = target_member_idx orelse return null;
+
+            // Replay exact member ScopeNamer binding order so aliased/deduplicated tag names match 1-for-1!
+            var member_scope = naming.ScopeNamer.initContainer(self.scratch, null);
+            defer member_scope.deinit();
+            try member_scope.reserve("zigar_js");
+            try member_scope.reserve("__zigar_value");
+
+            var chosen_zig_ident: []const u8 = "";
+            var chosen_logical_name: []const u8 = "";
+            for (en.members, 0..) |m, idx| {
+                const mb = try member_scope.bind(self.str(m.name), .snake);
+                if (idx == found_idx) {
+                    chosen_zig_ident = try self.alloc.dupe(u8, mb.zig_ident);
+                    chosen_logical_name = try self.alloc.dupe(u8, mb.logical_name);
+                }
+                mb.deinit(self.scratch);
+            }
+
+            const mv = en.members[found_idx].value.?;
+            const val_ir: EnumValueIr = switch (mv) {
+                .num => |n| .{ .num = n },
+                .str => |sid| .{ .str = self.str(sid) },
+                .boolean => |b| .{ .boolean = b },
+                .bigint_literal => |sid| .{ .bigint_val = self.str(sid) },
+            };
+
+            return .{
+                .enum_decl_id = td,
+                .member_idx = found_idx,
+                .tag_zig_ident = chosen_zig_ident,
+                .tag_logical_name = chosen_logical_name,
+                .value = val_ir,
+            };
+        }
+
+        fn extractClosedLiteralFromType(
+            self: *Self,
+            ty_id: u32,
+            depth: usize,
+        ) error{OutOfMemory}!?lower_unions.ClosedLiteralValue {
+            if (ty_id >= self.graph.types.len or depth > 8) return null;
+            const tn = self.graph.types[ty_id];
+            switch (tn.kind) {
+                .literal => |lit| return switch (lit) {
+                    .str => |sid| .{ .str = self.str(sid) },
+                    .num => |n| if (std.math.isFinite(n)) .{ .num = n } else null,
+                    .boolean => |b| .{ .boolean = b },
+                    .bigint_literal => |sid| .{ .bigint_val = try lower_types.normalizeBigIntLiteral(self.alloc, self.str(sid)) },
+                },
+                .template_literal => |tl| {
+                    if (tl.spans.len == 0) return .{ .str = self.str(tl.head) };
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) return self.extractClosedLiteralFromType(rt, depth + 1);
+                    }
+                    return null;
+                },
+                .intrinsic => {
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) return self.extractClosedLiteralFromType(rt, depth + 1);
+                    }
+                    return null;
+                },
+                .reference => |ref| {
+                    if (try self.resolveEnumMemberReference(ty_id)) |em| {
+                        return switch (em.value) {
+                            .str => |s| .{ .str = s },
+                            .num => |n| .{ .num = n },
+                            .boolean => |b| .{ .boolean = b },
+                            .bigint_val => |bi| .{ .bigint_val = try lower_types.normalizeBigIntLiteral(self.alloc, bi) },
+                            .unknown => null,
+                        };
+                    }
+                    if (ref.target_decl) |td| {
+                        if (td < self.graph.decls.len) {
+                            const d = self.graph.decls[td];
+                            if (d.kind == .type_alias_decl and d.type_params.len == 0) {
+                                return self.extractClosedLiteralFromType(d.kind.type_alias_decl, depth + 1);
+                            }
+                        }
+                    } else if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) return self.extractClosedLiteralFromType(rt, depth + 1);
+                    }
+                    return null;
+                },
+                else => return null,
+            }
+        }
+
+        fn resolveUnderlyingBuiltinKind(self: *const Self, ty: *const TypeIr, depth: usize) std.meta.Tag(TypeIr) {
+            if (depth > 8) return @as(std.meta.Tag(TypeIr), ty.*);
+            if (ty.* == .decl_ref) {
+                const dr = ty.decl_ref;
+                if (!dr.indirect and dr.type_args.len == 0 and dr.target_decl_id < self.graph.decls.len) {
+                    const d = self.graph.decls[dr.target_decl_id];
+                    if (d.kind == .type_alias_decl) {
+                        const target_ty_id = d.kind.type_alias_decl;
+                        if (target_ty_id < self.graph.types.len) {
+                            switch (self.graph.types[target_ty_id].kind) {
+                                .literal => |lit| return switch (lit) {
+                                    .str => .string_type,
+                                    .num => .f64_type,
+                                    .boolean => .bool_type,
+                                    .bigint_literal => .i64_type,
+                                },
+                                .string_type => return .string_type,
+                                .number_type => return .f64_type,
+                                .boolean_type => return .bool_type,
+                                .bigint_type => return .i64_type,
+                                else => {},
+                            }
+                        }
+                    }
+                }
+            }
+            return @as(std.meta.Tag(TypeIr), ty.*);
+        }
+
+        fn extractCompatibleFieldLiteralConstraint(
+            self: *Self,
+            raw_ty_id: u32,
+            lowered_ty: *const TypeIr,
+        ) error{OutOfMemory}!?FieldLiteralConstraintIr {
+            if (try self.resolveEnumMemberReference(raw_ty_id)) |em| {
+                if (lowered_ty.* == .decl_ref and !lowered_ty.decl_ref.indirect and lowered_ty.decl_ref.target_decl_id == em.enum_decl_id) {
+                    return .{
+                        .enum_member = .{
+                            .enum_decl_id = em.enum_decl_id,
+                            .tag_zig_ident = em.tag_zig_ident,
+                            .tag_logical_name = em.tag_logical_name,
+                        },
+                    };
+                }
+                return null;
+            }
+
+            // Do not attach a literal default when `raw_ty_id` is a reference to a multi-member or nominal enum/alias
+            // unless `lowered_ty` actually lowered to the corresponding scalar type!
+            const underlying_tag = self.resolveUnderlyingBuiltinKind(lowered_ty, 0);
+            const clv = (try self.extractClosedLiteralFromType(raw_ty_id, 0)) orelse return null;
+            switch (clv) {
+                .str => |s| {
+                    if (underlying_tag != .string_type) return null;
+                    return .{ .str = try self.alloc.dupe(u8, s) };
+                },
+                .num => |n| {
+                    if (underlying_tag != .f64_type) return null;
+                    return .{ .num = n };
+                },
+                .boolean => |b| {
+                    if (underlying_tag != .bool_type) return null;
+                    return .{ .boolean = b };
+                },
+                .bigint_val => |bi| {
+                    if (underlying_tag != .i64_type) return null;
+                    _ = std.fmt.parseInt(i64, bi, 0) catch return null;
+                    return .{ .bigint_val = bi };
+                },
+            }
+        }
+
+        fn isEmptyObjectMarkerType(self: *const Self, ty_id: u32, depth: usize) bool {
+            if (ty_id >= self.graph.types.len or depth > 4) return false;
+            const tn = self.graph.types[ty_id];
+            switch (tn.kind) {
+                .object_literal => |obj| {
+                    return obj.properties.len == 0 and
+                        obj.call_signatures.len == 0 and
+                        obj.construct_signatures.len == 0 and
+                        obj.index_signatures.len == 0;
+                },
+                .reference => |ref| {
+                    const rname = self.str(ref.target_name);
+                    if (std.mem.eql(u8, rname, "Record") and ref.type_args.len == 2) {
+                        const k_id = ref.type_args[0];
+                        if (k_id < self.graph.types.len and self.graph.types[k_id].kind == .never_type) return true;
+                    }
+                    if (ref.target_decl == null) {
+                        if (tn.resolved_type) |rt| {
+                            if (rt != ty_id) return self.isEmptyObjectMarkerType(rt, depth + 1);
+                        }
+                    }
+                    return false;
+                },
+                else => return false,
+            }
+        }
+
+        fn detectOpenPrimitiveIntersection(self: *const Self, parts: []const u32) ?lower_unions.OpenPrimitiveKind {
+            if (parts.len < 2) return null;
+            var prim_opt: ?lower_unions.OpenPrimitiveKind = null;
+            var saw_empty_obj = false;
+            for (parts) |pid| {
+                if (pid >= self.graph.types.len) return null;
+                switch (self.graph.types[pid].kind) {
+                    .string_type => {
+                        if (prim_opt != null and prim_opt.? != .str) return null;
+                        prim_opt = .str;
+                    },
+                    .number_type => {
+                        if (prim_opt != null and prim_opt.? != .num) return null;
+                        prim_opt = .num;
+                    },
+                    .bigint_type => {
+                        if (prim_opt != null and prim_opt.? != .bigint) return null;
+                        prim_opt = .bigint;
+                    },
+                    else => {
+                        if (self.isEmptyObjectMarkerType(pid, 0)) {
+                            saw_empty_obj = true;
+                        } else {
+                            return null;
+                        }
+                    },
+                }
+            }
+            if (saw_empty_obj) return prim_opt;
+            return null;
+        }
+
+        fn classifyOpenSlotType(self: *const Self, ty_id: u32, depth: usize) ?lower_unions.TemplatePlaceholderKind {
+            if (ty_id >= self.graph.types.len or depth > 6) return null;
+            const tn = self.graph.types[ty_id];
+            return switch (tn.kind) {
+                .string_type, .any_type => .any_string,
+                .number_type => .number,
+                .bigint_type => .bigint,
+                .boolean_type => .boolean,
+                .intersection => |parts| blk: {
+                    if (self.detectOpenPrimitiveIntersection(parts)) |opk| {
+                        break :blk switch (opk) {
+                            .str => .any_string,
+                            .num => .number,
+                            .bigint => .bigint,
+                        };
+                    }
+                    break :blk null;
+                },
+                .reference => |ref| blk: {
+                    if (ref.target_decl) |td| {
+                        if (td < self.graph.decls.len and ref.type_args.len == 0) {
+                            const d = self.graph.decls[td];
+                            if (d.kind == .type_alias_decl and d.type_params.len == 0) {
+                                break :blk self.classifyOpenSlotType(d.kind.type_alias_decl, depth + 1);
+                            }
+                        }
+                    }
+                    break :blk null;
+                },
+                else => null,
+            };
+        }
+
+        fn tryExpandFiniteStringSet(
+            self: *Self,
+            ty_id: u32,
+            out: *std.ArrayList([]const u8),
+            depth: usize,
+        ) error{OutOfMemory}!bool {
+            if (ty_id >= self.graph.types.len or depth > 8) return false;
+            const tn = self.graph.types[ty_id];
+            switch (tn.kind) {
+                .never_type => return true,
+                .null_type => {
+                    try out.append(self.alloc, "null");
+                    return out.items.len <= lower_unions.max_template_expansion;
+                },
+                .undefined_type => {
+                    try out.append(self.alloc, "undefined");
+                    return out.items.len <= lower_unions.max_template_expansion;
+                },
+                .boolean_type => {
+                    try out.append(self.alloc, "false");
+                    try out.append(self.alloc, "true");
+                    return out.items.len <= lower_unions.max_template_expansion;
+                },
+                .literal => |lit| {
+                    switch (lit) {
+                        .str => |sid| try out.append(self.alloc, self.str(sid)),
+                        .boolean => |b| try out.append(self.alloc, if (b) "true" else "false"),
+                        .num => |n| {
+                            if (!std.math.isFinite(n)) return false;
+                            if (lower_unions.exactIntI64(n)) |iv| {
+                                try out.append(self.alloc, try std.fmt.allocPrint(self.alloc, "{d}", .{iv}));
+                            } else {
+                                try out.append(self.alloc, try std.fmt.allocPrint(self.alloc, "{d}", .{n}));
+                            }
+                        },
+                        .bigint_literal => |sid| {
+                            const clean = try lower_types.normalizeBigIntLiteral(self.alloc, self.str(sid));
+                            if (std.fmt.parseInt(i128, clean, 0)) |iv| {
+                                try out.append(self.alloc, try std.fmt.allocPrint(self.alloc, "{d}", .{iv}));
+                            } else |_| {
+                                try out.append(self.alloc, clean);
+                            }
+                        },
+                    }
+                    return out.items.len <= lower_unions.max_template_expansion;
+                },
+                .union_type => |arms| {
+                    for (arms) |aid| {
+                        if (!try self.tryExpandFiniteStringSet(aid, out, depth + 1)) return false;
+                        if (out.items.len > lower_unions.max_template_expansion) return false;
+                    }
+                    return true;
+                },
+                .template_literal => |tl| {
+                    if (tl.spans.len == 0) {
+                        try out.append(self.alloc, self.str(tl.head));
+                        return out.items.len <= lower_unions.max_template_expansion;
+                    }
+                    var span_alts = try self.scratch.alloc([]const []const u8, tl.spans.len);
+                    defer self.scratch.free(span_alts);
+                    var seps = try self.scratch.alloc([]const u8, tl.spans.len);
+                    defer self.scratch.free(seps);
+
+                    for (tl.spans, 0..) |sp, idx| {
+                        var sub: std.ArrayList([]const u8) = .empty;
+                        if (!try self.tryExpandFiniteStringSet(sp.ty, &sub, depth + 1)) {
+                            sub.deinit(self.alloc);
+                            return false;
+                        }
+                        span_alts[idx] = try sub.toOwnedSlice(self.alloc);
+                        seps[idx] = self.str(sp.literal);
+                    }
+                    const expanded = (try lower_unions.expandTemplateCrossProduct(
+                        self.alloc,
+                        self.str(tl.head),
+                        span_alts,
+                        seps,
+                    )) orelse return false;
+                    defer self.alloc.free(expanded);
+                    for (expanded) |s| {
+                        try out.append(self.alloc, s);
+                        if (out.items.len > lower_unions.max_template_expansion) return false;
+                    }
+                    return true;
+                },
+                .intrinsic => {
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) return self.tryExpandFiniteStringSet(rt, out, depth + 1);
+                    }
+                    return false;
+                },
+                .reference => |ref| {
+                    if (try self.resolveEnumMemberReference(ty_id)) |em| {
+                        switch (em.value) {
+                            .str => |s| try out.append(self.alloc, s),
+                            .num => |n| {
+                                if (!std.math.isFinite(n)) return false;
+                                if (lower_unions.exactIntI64(n)) |iv| {
+                                    try out.append(self.alloc, try std.fmt.allocPrint(self.alloc, "{d}", .{iv}));
+                                } else {
+                                    try out.append(self.alloc, try std.fmt.allocPrint(self.alloc, "{d}", .{n}));
+                                }
+                            },
+                            .boolean => |b| try out.append(self.alloc, if (b) "true" else "false"),
+                            .bigint_val => |bi| try out.append(self.alloc, bi),
+                            .unknown => return false,
+                        }
+                        return out.items.len <= lower_unions.max_template_expansion;
+                    }
+                    if (ref.target_decl) |td| {
+                        if (td < self.graph.decls.len and ref.type_args.len == 0) {
+                            const d = self.graph.decls[td];
+                            switch (d.kind) {
+                                .type_alias_decl => |alias_ty| {
+                                    if (d.type_params.len == 0) {
+                                        return self.tryExpandFiniteStringSet(alias_ty, out, depth + 1);
+                                    }
+                                },
+                                .enum_decl => |en| {
+                                    if (en.members.len == 0 or en.members.len > lower_unions.max_template_expansion) return false;
+                                    const saved_len = out.items.len;
+                                    for (en.members) |m| {
+                                        const mv = m.value orelse {
+                                            out.shrinkRetainingCapacity(saved_len);
+                                            return false;
+                                        };
+                                        switch (mv) {
+                                            .str => |sid| try out.append(self.alloc, self.str(sid)),
+                                            .num => |n| {
+                                                if (!std.math.isFinite(n)) {
+                                                    out.shrinkRetainingCapacity(saved_len);
+                                                    return false;
+                                                }
+                                                if (lower_unions.exactIntI64(n)) |iv| {
+                                                    try out.append(self.alloc, try std.fmt.allocPrint(self.alloc, "{d}", .{iv}));
+                                                } else {
+                                                    try out.append(self.alloc, try std.fmt.allocPrint(self.alloc, "{d}", .{n}));
+                                                }
+                                            },
+                                            else => {
+                                                out.shrinkRetainingCapacity(saved_len);
+                                                return false;
+                                            },
+                                        }
+                                        if (out.items.len > lower_unions.max_template_expansion) return false;
+                                    }
+                                    return true;
+                                },
+                                else => {},
+                            }
+                        }
+                    } else if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) return self.tryExpandFiniteStringSet(rt, out, depth + 1);
+                    }
+                    return false;
+                },
+                else => return false,
+            }
+        }
+
+        fn buildStringEnumFromUniqueStrings(self: *Self, strs: []const []const u8) error{OutOfMemory}!InlineEnumIr {
+            var unique: std.ArrayList([]const u8) = .empty;
+            defer unique.deinit(self.scratch);
+            for (strs) |s| {
+                var dup = false;
+                for (unique.items) |u| {
+                    if (std.mem.eql(u8, u, s)) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) try unique.append(self.scratch, s);
             }
 
             var tag_scope = naming.ScopeNamer.init(self.scratch, null);
             defer tag_scope.deinit();
             try tag_scope.reserve("zigar_js");
 
-            var members = try self.alloc.alloc(EnumMemberIr, arms.len);
-            for (arms, 0..) |aid, idx| {
-                const raw_s = self.str(self.graph.types[aid].kind.literal.str);
-                const bound = try tag_scope.bind(raw_s, .snake);
+            var members = try self.alloc.alloc(EnumMemberIr, unique.items.len);
+            for (unique.items, 0..) |raw_s, idx| {
+                const hint = try lower_unions.formatLiteralTagHint(self.scratch, .{ .str = raw_s });
+                defer self.scratch.free(hint);
+                const bound = try tag_scope.bind(hint, .snake);
+                const dup_s = try self.alloc.dupe(u8, raw_s);
                 members[idx] = .{
                     .zig_ident = try self.alloc.dupe(u8, bound.zig_ident),
                     .logical_name = try self.alloc.dupe(u8, bound.logical_name),
-                    .wire_name = try self.alloc.dupe(u8, bound.wire_name),
-                    .value = .{ .str = try self.alloc.dupe(u8, raw_s) },
+                    .wire_name = dup_s,
+                    .value = .{ .str = dup_s },
                     .jsdoc = null,
                 };
                 bound.deinit(self.scratch);
             }
-            return members;
+            return .{ .backing = .none, .members = members };
+        }
+
+        const PendingTemplateSpan = struct {
+            placeholder: lower_unions.TemplatePlaceholderKind,
+            choices: []const []const u8,
+            tail: std.ArrayList(u8),
+        };
+
+        fn tryBuildDirectTemplatePattern(self: *Self, tl: anytype) error{OutOfMemory}!?TemplatePatternIr {
+            if (tl.spans.len == 0 or tl.spans.len > lower_unions.max_template_pattern_spans) return null;
+            var prefix_buf: std.ArrayList(u8) = .empty;
+            errdefer prefix_buf.deinit(self.alloc);
+            try prefix_buf.appendSlice(self.alloc, self.str(tl.head));
+
+            var pending: std.ArrayList(PendingTemplateSpan) = .empty;
+            defer {
+                for (pending.items) |*ps| ps.tail.deinit(self.alloc);
+                pending.deinit(self.scratch);
+            }
+
+            for (tl.spans) |sp| {
+                var finite_strs: std.ArrayList([]const u8) = .empty;
+                if (try self.tryExpandFiniteStringSet(sp.ty, &finite_strs, 0) and finite_strs.items.len > 0) {
+                    var unique: std.ArrayList([]const u8) = .empty;
+                    defer unique.deinit(self.scratch);
+                    for (finite_strs.items) |s| {
+                        var dup = false;
+                        for (unique.items) |u| {
+                            if (std.mem.eql(u8, u, s)) {
+                                dup = true;
+                                break;
+                            }
+                        }
+                        if (!dup) try unique.append(self.scratch, s);
+                    }
+                    finite_strs.deinit(self.alloc);
+
+                    if (unique.items.len == 1) {
+                        const fold_target = if (pending.items.len > 0) &pending.items[pending.items.len - 1].tail else &prefix_buf;
+                        try fold_target.appendSlice(self.alloc, unique.items[0]);
+                        try fold_target.appendSlice(self.alloc, self.str(sp.literal));
+                        continue;
+                    }
+                    var owned_choices = try self.alloc.alloc([]const u8, unique.items.len);
+                    for (unique.items, 0..) |u, ci| {
+                        owned_choices[ci] = try self.alloc.dupe(u8, u);
+                    }
+                    var tb: std.ArrayList(u8) = .empty;
+                    try tb.appendSlice(self.alloc, self.str(sp.literal));
+                    try pending.append(self.scratch, .{
+                        .placeholder = .literal_set,
+                        .choices = owned_choices,
+                        .tail = tb,
+                    });
+                    continue;
+                }
+                finite_strs.deinit(self.alloc);
+
+                if (self.classifyOpenSlotType(sp.ty, 0)) |slot_kind| {
+                    var tb: std.ArrayList(u8) = .empty;
+                    try tb.appendSlice(self.alloc, self.str(sp.literal));
+                    try pending.append(self.scratch, .{
+                        .placeholder = slot_kind,
+                        .choices = &.{},
+                        .tail = tb,
+                    });
+                } else {
+                    prefix_buf.deinit(self.alloc);
+                    return null;
+                }
+            }
+
+            if (pending.items.len == 0) {
+                prefix_buf.deinit(self.alloc);
+                return null;
+            }
+
+            var out_spans = try self.alloc.alloc(TemplateSpanIr, pending.items.len);
+            for (pending.items, 0..) |*ps, idx| {
+                out_spans[idx] = .{
+                    .placeholder = ps.placeholder,
+                    .choices = ps.choices,
+                    .literal_tail = try ps.tail.toOwnedSlice(self.alloc),
+                };
+            }
+            return .{
+                .head = try prefix_buf.toOwnedSlice(self.alloc),
+                .spans = out_spans,
+            };
+        }
+
+        fn lowerTemplateLiteralInline(
+            self: *Self,
+            ty_id: u32,
+            tl: anytype,
+            resolved_opt: ?u32,
+            ref_cnt: u32,
+            can_hoist_in_mod: bool,
+            no_free_vars: bool,
+            active_tps: []const ActiveTypeParam,
+            self_ident_opt: ?[]const u8,
+            visited: *std.AutoHashMapUnmanaged(u32, void),
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+        ) error{OutOfMemory}!*TypeIr {
+            if (tl.spans.len == 0) return self.makeType(.string_type);
+
+            var finite_strs: std.ArrayList([]const u8) = .empty;
+            defer finite_strs.deinit(self.alloc);
+            if (try self.tryExpandFiniteStringSet(ty_id, &finite_strs, 0)) {
+                if (finite_strs.items.len <= 1) return self.makeType(.string_type);
+                const enum_ir = try self.buildStringEnumFromUniqueStrings(finite_strs.items);
+                if (enum_ir.members.len <= 1) return self.makeType(.string_type);
+                if (can_hoist_in_mod and (no_free_vars or try self.isClosedTypeSubgraph(ty_id)) and (ref_cnt > 1 or enum_ir.members.len > 8)) {
+                    const h = try self.allocFreshAnonHelperName("__zigar_AnonEnum", active_tps);
+                    const hloc = DeclLocation{
+                        .module_index = self.cur_mod_idx,
+                        .zig_path = h.path,
+                        .type_param_defaults = &.{},
+                    };
+                    try self.cur_mod_hoisted_locs.put(self.scratch, ty_id, hloc);
+                    try self.cur_mod_decls_out.?.append(self.alloc, .{
+                        .source_decl_id = null,
+                        .zig_ident = h.zig_ident,
+                        .logical_name = h.logical,
+                        .wire_name = h.logical,
+                        .is_exported = false,
+                        .is_js_exported = false,
+                        .is_default_export = false,
+                        .jsdoc = null,
+                        .kind = .{ .literal_enum_decl = enum_ir },
+                    });
+                    return self.makeHoistedDeclRef(hloc);
+                }
+                if (self.inline_anon_depth >= 3 or enum_ir.members.len > 64) {
+                    return self.makeType(.string_type);
+                }
+                return self.makeType(.{ .inline_enum = enum_ir });
+            }
+
+            if (try self.tryBuildDirectTemplatePattern(tl)) |pat_ir| {
+                needs_runtime.* = true;
+                if (can_hoist_in_mod and (no_free_vars or try self.isClosedTypeSubgraph(ty_id)) and ref_cnt > 1) {
+                    const h = try self.allocFreshAnonHelperName("__zigar_AnonTemplate", active_tps);
+                    const hloc = DeclLocation{
+                        .module_index = self.cur_mod_idx,
+                        .zig_path = h.path,
+                        .type_param_defaults = &.{},
+                    };
+                    try self.cur_mod_hoisted_locs.put(self.scratch, ty_id, hloc);
+                    try self.cur_mod_decls_out.?.append(self.alloc, .{
+                        .source_decl_id = null,
+                        .zig_ident = h.zig_ident,
+                        .logical_name = h.logical,
+                        .wire_name = h.logical,
+                        .is_exported = false,
+                        .is_js_exported = false,
+                        .is_default_export = false,
+                        .jsdoc = null,
+                        .kind = .{ .template_pattern_decl = pat_ir },
+                    });
+                    return self.makeHoistedDeclRef(hloc);
+                }
+                if (self.inline_anon_depth >= 3) {
+                    return self.makeType(.string_type);
+                }
+                return self.makeType(.{ .template_pattern = pat_ir });
+            }
+
+            // If TypeScript Checker distributed a union inside a template literal (`${"http"|"https"}://${string}`),
+            // delegate to the resolved union!
+            if (resolved_opt) |rt| {
+                if (rt != ty_id and rt < self.graph.types.len and self.graph.types[rt].kind == .union_type) {
+                    return self.lowerType(rt, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                }
+            }
+            return self.makeType(.string_type);
+        }
+
+        const MergedPropSpec = struct {
+            prop_id: u32,
+            name_sid: u32,
+            wire: []const u8,
+            ty: u32,
+            optional: bool,
+            readonly: bool,
+            jsdoc: @TypeOf(@as(*const anyopaque, undefined)),
+        };
+
+        const RawObjectPropItem = struct {
+            name_sid: u32,
+            wire: []const u8,
+            ty: u32,
+            optional: bool,
+            readonly: bool,
+            source_prop_id: u32,
+        };
+
+        fn typeHasNarrowerLiteralInfo(self: *Self, ty_id: u32, depth: usize) error{OutOfMemory}!bool {
+            if (ty_id >= self.graph.types.len or depth > 6) return false;
+            if ((try self.extractClosedLiteralFromType(ty_id, 0)) != null) return true;
+            const tn = self.graph.types[ty_id];
+            if (tn.kind == .union_type) {
+                for (tn.kind.union_type) |aid| {
+                    if (aid < self.graph.types.len) {
+                        const ak = self.graph.types[aid].kind;
+                        if (ak == .never_type) continue;
+                        if ((try self.extractClosedLiteralFromType(aid, 0)) == null) return false;
+                    }
+                }
+                return tn.kind.union_type.len > 0;
+            }
+            return false;
+        }
+
+        fn mergePropIntoList(
+            self: *Self,
+            list: *std.ArrayList(RawObjectPropItem),
+            item: RawObjectPropItem,
+        ) error{OutOfMemory}!void {
+            for (list.items) |*existing| {
+                if (std.mem.eql(u8, existing.wire, item.wire)) {
+                    existing.optional = existing.optional and item.optional;
+                    existing.readonly = existing.readonly and item.readonly;
+                    const item_narrow = try self.typeHasNarrowerLiteralInfo(item.ty, 0);
+                    const exist_narrow = try self.typeHasNarrowerLiteralInfo(existing.ty, 0);
+                    if (item_narrow and !exist_narrow) {
+                        existing.ty = item.ty;
+                        existing.source_prop_id = item.source_prop_id;
+                    } else if (!exist_narrow) {
+                        existing.ty = item.ty;
+                        existing.source_prop_id = item.source_prop_id;
+                    }
+                    return;
+                }
+            }
+            try list.append(self.scratch, item);
+        }
+
+        fn collectObjectArmProps(
+            self: *Self,
+            ty_id: u32,
+            allow_class_decl: bool,
+            out: *std.ArrayList(RawObjectPropItem),
+            depth: usize,
+        ) error{OutOfMemory}!bool {
+            if (ty_id >= self.graph.types.len or depth > 8) return false;
+            const tn = self.graph.types[ty_id];
+            switch (tn.kind) {
+                .object_literal => |obj| {
+                    if (obj.call_signatures.len > 0 or obj.construct_signatures.len > 0) return false;
+                    for (obj.properties) |pid| {
+                        if (pid >= self.graph.properties.len) continue;
+                        const p = self.graph.properties[pid];
+                        if (p.modifiers.private_mod or p.modifiers.protected_mod or p.modifiers.static_mod) continue;
+                        try self.mergePropIntoList(out, .{
+                            .name_sid = p.name,
+                            .wire = self.str(p.name),
+                            .ty = p.ty,
+                            .optional = p.modifiers.optional_mod,
+                            .readonly = p.modifiers.readonly_mod,
+                            .source_prop_id = pid,
+                        });
+                    }
+                    return true;
+                },
+                .intersection => |parts| {
+                    if (parts.len == 0) return false;
+                    for (parts) |pid| {
+                        if (!try self.collectObjectArmProps(pid, allow_class_decl, out, depth + 1)) return false;
+                    }
+                    return true;
+                },
+                .reference => |ref| {
+                    if (self.isBuiltinMappedReference(self.str(ref.target_name), ref.type_args.len, ref.target_decl)) return false;
+                    const rname = self.str(ref.target_name);
+                    if (std.mem.eql(u8, rname, "Array") or std.mem.eql(u8, rname, "ReadonlyArray") or
+                        std.mem.eql(u8, rname, "Promise") or std.mem.eql(u8, rname, "PromiseLike") or
+                        std.mem.eql(u8, rname, "Map") or std.mem.eql(u8, rname, "ReadonlyMap") or
+                        std.mem.eql(u8, rname, "Set") or std.mem.eql(u8, rname, "ReadonlySet"))
+                    {
+                        return false;
+                    }
+                    if (ref.target_decl) |td| {
+                        if (td >= self.graph.decls.len) return false;
+                        const d = self.graph.decls[td];
+                        // For generic references (`Box<T>`), only inspect when 0 type args or resolved_type is concrete.
+                        if (d.type_params.len > 0 and ref.type_args.len > 0) {
+                            if (d.kind == .type_alias_decl) {
+                                if (tn.resolved_type) |rt| {
+                                    if (rt != ty_id) return self.collectObjectArmProps(rt, allow_class_decl, out, depth + 1);
+                                }
+                            }
+                            return false;
+                        }
+                        switch (d.kind) {
+                            .interface_decl => |iface| {
+                                if (iface.call_signatures.len > 0 or iface.construct_signatures.len > 0) return false;
+                                for (iface.extends_clauses) |hc| {
+                                    _ = try self.collectObjectArmProps(hc.target_type, allow_class_decl, out, depth + 1);
+                                }
+                                for (iface.properties) |pid| {
+                                    if (pid >= self.graph.properties.len) continue;
+                                    const p = self.graph.properties[pid];
+                                    if (p.modifiers.private_mod or p.modifiers.protected_mod or p.modifiers.static_mod) continue;
+                                    try self.mergePropIntoList(out, .{
+                                        .name_sid = p.name,
+                                        .wire = self.str(p.name),
+                                        .ty = p.ty,
+                                        .optional = p.modifiers.optional_mod,
+                                        .readonly = p.modifiers.readonly_mod,
+                                        .source_prop_id = pid,
+                                    });
+                                }
+                                return true;
+                            },
+                            .class_decl => |cls| {
+                                if (!allow_class_decl) return false;
+                                if (cls.extends_clause) |hc| {
+                                    _ = try self.collectObjectArmProps(hc.target_type, allow_class_decl, out, depth + 1);
+                                }
+                                for (cls.implements_clauses) |hc| {
+                                    _ = try self.collectObjectArmProps(hc.target_type, allow_class_decl, out, depth + 1);
+                                }
+                                for (cls.properties) |pid| {
+                                    if (pid >= self.graph.properties.len) continue;
+                                    const p = self.graph.properties[pid];
+                                    if (p.modifiers.private_mod or p.modifiers.protected_mod or p.modifiers.static_mod) continue;
+                                    try self.mergePropIntoList(out, .{
+                                        .name_sid = p.name,
+                                        .wire = self.str(p.name),
+                                        .ty = p.ty,
+                                        .optional = p.modifiers.optional_mod,
+                                        .readonly = p.modifiers.readonly_mod,
+                                        .source_prop_id = pid,
+                                    });
+                                }
+                                return true;
+                            },
+                            .type_alias_decl => |alias_ty| {
+                                return self.collectObjectArmProps(alias_ty, allow_class_decl, out, depth + 1);
+                            },
+                            else => return false,
+                        }
+                    } else if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) return self.collectObjectArmProps(rt, allow_class_decl, out, depth + 1);
+                    }
+                    return false;
+                },
+                else => return false,
+            }
+        }
+
+        fn lowerMergedRawProps(
+            self: *Self,
+            raw_props: []const RawObjectPropItem,
+            field_scope: *naming.ScopeNamer,
+            active_tps: []const ActiveTypeParam,
+            self_ident_opt: ?[]const u8,
+            visited: *std.AutoHashMapUnmanaged(u32, void),
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+        ) error{OutOfMemory}![]FieldIr {
+            var list: std.ArrayList(FieldIr) = .empty;
+            errdefer list.deinit(self.alloc);
+
+            for (raw_props) |rp| {
+                const bound = try field_scope.bind(rp.wire, .snake);
+                const zig_ident = try self.alloc.dupe(u8, bound.zig_ident);
+                const logical = try self.alloc.dupe(u8, bound.logical_name);
+                const wire_copy = try self.alloc.dupe(u8, bound.wire_name);
+                bound.deinit(self.scratch);
+
+                var f_ty = try self.lowerType(rp.ty, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                var lit_constraint: ?FieldLiteralConstraintIr = null;
+                if (rp.optional) {
+                    f_ty = try self.wrapOptional(f_ty);
+                } else {
+                    lit_constraint = try self.extractCompatibleFieldLiteralConstraint(rp.ty, f_ty);
+                }
+                const jsdoc = if (rp.source_prop_id < self.graph.properties.len)
+                    try self.lowerJsDoc(self.graph.properties[rp.source_prop_id].jsdoc)
+                else
+                    null;
+
+                try list.append(self.alloc, .{
+                    .zig_ident = zig_ident,
+                    .logical_name = logical,
+                    .wire_name = wire_copy,
+                    .ty = f_ty,
+                    .is_optional = rp.optional,
+                    .is_readonly = rp.readonly,
+                    .nullish_kind = if (f_ty.* == .optional) f_ty.optional.nullish_kind else .none,
+                    .literal_constraint = lit_constraint,
+                    .jsdoc = jsdoc,
+                });
+            }
+            return try list.toOwnedSlice(self.alloc);
+        }
+
+        fn lowerIntersectionInline(
+            self: *Self,
+            ty_id: u32,
+            parts: []const u32,
+            ref_cnt: u32,
+            can_hoist_in_mod: bool,
+            no_free_vars: bool,
+            active_tps: []const ActiveTypeParam,
+            self_ident_opt: ?[]const u8,
+            visited: *std.AutoHashMapUnmanaged(u32, void),
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+        ) error{OutOfMemory}!*TypeIr {
+            if (self.detectOpenPrimitiveIntersection(parts)) |opk| {
+                return switch (opk) {
+                    .str => self.makeType(.string_type),
+                    .num => self.makeType(.f64_type),
+                    .bigint => self.makeType(.i64_type),
+                };
+            }
+
+            var merged_props: std.ArrayList(RawObjectPropItem) = .empty;
+            defer merged_props.deinit(self.scratch);
+            if (try self.collectObjectArmProps(ty_id, false, &merged_props, 0) and merged_props.items.len > 0) {
+                if (ref_cnt > 1 and can_hoist_in_mod and (no_free_vars or try self.isClosedTypeSubgraph(ty_id))) {
+                    const h = try self.allocFreshAnonHelperName("__zigar_AnonObj", active_tps);
+                    const hloc = DeclLocation{
+                        .module_index = self.cur_mod_idx,
+                        .zig_path = h.path,
+                        .type_param_defaults = &.{},
+                    };
+                    try self.cur_mod_hoisted_locs.put(self.scratch, ty_id, hloc);
+
+                    var anon_scope = naming.ScopeNamer.initContainer(self.scratch, null);
+                    defer anon_scope.deinit();
+                    try anon_scope.reserve("zigar_js");
+
+                    var fresh_visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                    defer fresh_visited.deinit(self.scratch);
+                    const saved_depth = self.inline_anon_depth;
+                    self.inline_anon_depth = 0;
+                    defer self.inline_anon_depth = saved_depth;
+
+                    const fields = try self.lowerMergedRawProps(
+                        merged_props.items,
+                        &anon_scope,
+                        &.{},
+                        null,
+                        &fresh_visited,
+                        imports_used,
+                        needs_runtime,
+                    );
+                    const target_ty = try self.makeType(.{ .anon_struct = fields });
+                    try self.cur_mod_decls_out.?.append(self.alloc, .{
+                        .source_decl_id = null,
+                        .zig_ident = h.zig_ident,
+                        .logical_name = h.logical,
+                        .wire_name = h.logical,
+                        .is_exported = false,
+                        .is_js_exported = false,
+                        .is_default_export = false,
+                        .jsdoc = null,
+                        .kind = .{ .type_alias = .{ .type_params = &.{}, .target = target_ty } },
+                    });
+                    return self.makeHoistedDeclRef(hloc);
+                }
+
+                if (self.inline_anon_depth >= 3 or merged_props.items.len > 48) {
+                    needs_runtime.* = true;
+                    return self.makeType(.js_object);
+                }
+
+                var anon_scope = naming.ScopeNamer.initContainer(self.scratch, null);
+                defer anon_scope.deinit();
+                try anon_scope.reserve("zigar_js");
+                self.inline_anon_depth += 1;
+                defer self.inline_anon_depth -= 1;
+
+                const fields = try self.lowerMergedRawProps(
+                    merged_props.items,
+                    &anon_scope,
+                    active_tps,
+                    self_ident_opt,
+                    visited,
+                    imports_used,
+                    needs_runtime,
+                );
+                return self.makeType(.{ .anon_struct = fields });
+            }
+
+            needs_runtime.* = true;
+            return self.makeType(.js_value);
+        }
+
+        fn collectFlattenedUnionArms(
+            self: *const Self,
+            arms: []const u32,
+            non_null: *std.ArrayList(u32),
+            nullish: *lower_types.NullishKind,
+            depth: usize,
+        ) error{OutOfMemory}!void {
+            if (depth > 8) return;
+            for (arms) |arm_id| {
+                if (arm_id >= self.graph.types.len) continue;
+                switch (self.graph.types[arm_id].kind) {
+                    .null_type => nullish.* = nullish.merge(.null_only),
+                    .undefined_type, .void_type => nullish.* = nullish.merge(.undefined_only),
+                    .never_type => {},
+                    .union_type => |sub_arms| try self.collectFlattenedUnionArms(sub_arms, non_null, nullish, depth + 1),
+                    else => try non_null.append(self.scratch, arm_id),
+                }
+            }
+        }
+
+        fn closedLiteralToEnumValue(self: *Self, clv: lower_unions.ClosedLiteralValue) error{OutOfMemory}!EnumValueIr {
+            return switch (clv) {
+                .str => |s| .{ .str = try self.alloc.dupe(u8, s) },
+                .num => |n| .{ .num = n },
+                .boolean => |b| .{ .boolean = b },
+                .bigint_val => |bi| .{ .bigint_val = try lower_types.normalizeBigIntLiteral(self.alloc, bi) },
+            };
+        }
+
+        fn buildEnumMembersFromClosedLiterals(
+            self: *Self,
+            vals: []const lower_unions.ClosedLiteralValue,
+        ) error{OutOfMemory}!InlineEnumIr {
+            const analysis = try lower_unions.analyzeClosedEnumValues(self.scratch, vals);
+            defer analysis.deinit(self.scratch);
+
+            var tag_scope = naming.ScopeNamer.init(self.scratch, null);
+            defer tag_scope.deinit();
+            try tag_scope.reserve("zigar_js");
+
+            var members = try self.alloc.alloc(EnumMemberIr, vals.len);
+            for (vals, 0..) |v, idx| {
+                const hint = try lower_unions.formatLiteralTagHint(self.scratch, v);
+                defer self.scratch.free(hint);
+                const bound = try tag_scope.bind(hint, .snake);
+                const wire_str: []const u8 = switch (v) {
+                    .str => |s| try self.alloc.dupe(u8, s),
+                    else => try self.alloc.dupe(u8, bound.logical_name),
+                };
+                members[idx] = .{
+                    .zig_ident = try self.alloc.dupe(u8, bound.zig_ident),
+                    .logical_name = try self.alloc.dupe(u8, bound.logical_name),
+                    .wire_name = wire_str,
+                    .value = try self.closedLiteralToEnumValue(v),
+                    .int_backing_val = analysis.layouts[idx].int_tag_value,
+                    .alias_of_zig_ident = if (analysis.layouts[idx].alias_of_index) |pidx| members[pidx].zig_ident else null,
+                    .alias_of_logical_name = if (analysis.layouts[idx].alias_of_index) |pidx| members[pidx].logical_name else null,
+                    .jsdoc = null,
+                };
+                bound.deinit(self.scratch);
+            }
+            return .{ .backing = analysis.backing, .members = members };
+        }
+
+        fn appendUniqueClosedLiteral(
+            self: *Self,
+            list: *std.ArrayList(lower_unions.ClosedLiteralValue),
+            val: lower_unions.ClosedLiteralValue,
+        ) error{OutOfMemory}!void {
+            for (list.items) |existing| {
+                if (lower_unions.closedLiteralEql(existing, val)) return;
+            }
+            try list.append(self.scratch, val);
+        }
+
+        fn tryCollectClosedLiteralsFromArm(
+            self: *Self,
+            arm_id: u32,
+            out: *std.ArrayList(lower_unions.ClosedLiteralValue),
+            expand_alias_refs: bool,
+            depth: usize,
+        ) error{OutOfMemory}!bool {
+            if (arm_id >= self.graph.types.len or depth > 6) return false;
+            const tn = self.graph.types[arm_id];
+            switch (tn.kind) {
+                .literal => {
+                    if (try self.extractClosedLiteralFromType(arm_id, 0)) |clv| {
+                        try self.appendUniqueClosedLiteral(out, clv);
+                        return out.items.len <= 128;
+                    }
+                    return false;
+                },
+                .template_literal => {
+                    var strs: std.ArrayList([]const u8) = .empty;
+                    defer strs.deinit(self.alloc);
+                    if (!try self.tryExpandFiniteStringSet(arm_id, &strs, 0)) return false;
+                    for (strs.items) |s| {
+                        try self.appendUniqueClosedLiteral(out, .{ .str = s });
+                        if (out.items.len > 128) return false;
+                    }
+                    return true;
+                },
+                .intrinsic => {
+                    if (tn.resolved_type) |rt| {
+                        if (rt != arm_id) return self.tryCollectClosedLiteralsFromArm(rt, out, expand_alias_refs, depth + 1);
+                    }
+                    return false;
+                },
+                .union_type => |sub_arms| {
+                    for (sub_arms) |sa| {
+                        if (sa < self.graph.types.len and self.graph.types[sa].kind == .never_type) continue;
+                        if (!try self.tryCollectClosedLiteralsFromArm(sa, out, expand_alias_refs, depth + 1)) return false;
+                    }
+                    return true;
+                },
+                .reference => |ref| {
+                    if (try self.resolveEnumMemberReference(arm_id)) |em| {
+                        const clv: lower_unions.ClosedLiteralValue = switch (em.value) {
+                            .str => |s| .{ .str = s },
+                            .num => |n| .{ .num = n },
+                            .boolean => |b| .{ .boolean = b },
+                            .bigint_val => |bi| .{ .bigint_val = try lower_types.normalizeBigIntLiteral(self.alloc, bi) },
+                            .unknown => return false,
+                        };
+                        try self.appendUniqueClosedLiteral(out, clv);
+                        return out.items.len <= 128;
+                    }
+                    if (expand_alias_refs) {
+                        if (ref.target_decl) |td| {
+                            if (td < self.graph.decls.len and ref.type_args.len == 0) {
+                                const d = self.graph.decls[td];
+                                if (d.kind == .type_alias_decl and d.type_params.len == 0) {
+                                    return self.tryCollectClosedLiteralsFromArm(d.kind.type_alias_decl, out, true, depth + 1);
+                                }
+                            }
+                        } else if (tn.resolved_type) |rt| {
+                            if (rt != arm_id) return self.tryCollectClosedLiteralsFromArm(rt, out, true, depth + 1);
+                        }
+                    } else if (ref.target_decl == null) {
+                        if (tn.resolved_type) |rt| {
+                            if (rt != arm_id) return self.tryCollectClosedLiteralsFromArm(rt, out, false, depth + 1);
+                        }
+                    }
+                    return false;
+                },
+                else => return false,
+            }
+        }
+
+        fn isExactBooleanPair(vals: []const lower_unions.ClosedLiteralValue) bool {
+            if (vals.len != 2) return false;
+            if (vals[0] != .boolean or vals[1] != .boolean) return false;
+            return vals[0].boolean != vals[1].boolean;
+        }
+
+        fn tryBuildClosedLiteralEnum(
+            self: *Self,
+            non_null_arms: []const u32,
+        ) error{OutOfMemory}!?InlineEnumIr {
+            if (non_null_arms.len == 0) return null;
+            var vals: std.ArrayList(lower_unions.ClosedLiteralValue) = .empty;
+            defer vals.deinit(self.scratch);
+            for (non_null_arms) |aid| {
+                if (!try self.tryCollectClosedLiteralsFromArm(aid, &vals, false, 0)) return null;
+            }
+            if (vals.items.len < 2) return null;
+            if (isExactBooleanPair(vals.items)) return null;
+            return try self.buildEnumMembersFromClosedLiterals(vals.items);
+        }
+
+        fn tryBuildOpenLiteralUnion(
+            self: *Self,
+            non_null_arms: []const u32,
+        ) error{OutOfMemory}!?OpenLiteralUnionIr {
+            if (non_null_arms.len < 2) return null;
+            var open_prim_opt: ?lower_unions.OpenPrimitiveKind = null;
+            var vals: std.ArrayList(lower_unions.ClosedLiteralValue) = .empty;
+            defer vals.deinit(self.scratch);
+
+            for (non_null_arms) |aid| {
+                if (aid >= self.graph.types.len) return null;
+                const tn = self.graph.types[aid];
+                if (tn.kind == .intersection) {
+                    if (self.detectOpenPrimitiveIntersection(tn.kind.intersection)) |opk| {
+                        if (open_prim_opt != null and open_prim_opt.? != opk) return null;
+                        open_prim_opt = opk;
+                        continue;
+                    }
+                }
+                if (!try self.tryCollectClosedLiteralsFromArm(aid, &vals, true, 0)) return null;
+            }
+
+            const open_prim = open_prim_opt orelse return null;
+            if (vals.items.len == 0 or vals.items.len > 128) return null;
+
+            for (vals.items) |v| {
+                const matches_prim = switch (open_prim) {
+                    .str => v == .str,
+                    .num => v == .num,
+                    .bigint => blk: {
+                        if (v != .bigint_val) break :blk false;
+                        _ = std.fmt.parseInt(i64, v.bigint_val, 0) catch break :blk false;
+                        break :blk true;
+                    },
+                };
+                if (!matches_prim) return null;
+            }
+
+            var tag_scope = naming.ScopeNamer.init(self.scratch, null);
+            defer tag_scope.deinit();
+            try tag_scope.reserve("zigar_js");
+
+            var known_members = try self.alloc.alloc(EnumMemberIr, vals.items.len);
+            for (vals.items, 0..) |v, idx| {
+                const hint = try lower_unions.formatLiteralTagHint(self.scratch, v);
+                defer self.scratch.free(hint);
+                const bound = try tag_scope.bind(hint, .snake);
+                const wire_str: []const u8 = switch (v) {
+                    .str => |s| try self.alloc.dupe(u8, s),
+                    else => try self.alloc.dupe(u8, bound.logical_name),
+                };
+                known_members[idx] = .{
+                    .zig_ident = try self.alloc.dupe(u8, bound.zig_ident),
+                    .logical_name = try self.alloc.dupe(u8, bound.logical_name),
+                    .wire_name = wire_str,
+                    .value = try self.closedLiteralToEnumValue(v),
+                    .jsdoc = null,
+                };
+                bound.deinit(self.scratch);
+            }
+
+            const custom_bound = try tag_scope.bind("custom", .snake);
+            const custom_ident = try self.alloc.dupe(u8, custom_bound.zig_ident);
+            const custom_logical = try self.alloc.dupe(u8, custom_bound.logical_name);
+            custom_bound.deinit(self.scratch);
+
+            const custom_payload = switch (open_prim) {
+                .str => try self.makeType(.string_type),
+                .num => try self.makeType(.f64_type),
+                .bigint => try self.makeType(.i64_type),
+            };
+
+            return .{
+                .base_kind = open_prim,
+                .known_members = known_members,
+                .custom_tag_ident = custom_ident,
+                .custom_logical_name = custom_logical,
+                .custom_payload = custom_payload,
+            };
+        }
+
+        fn fieldConstraintEql(a: ?FieldLiteralConstraintIr, b: ?FieldLiteralConstraintIr) bool {
+            if (a == null and b == null) return true;
+            if (a == null or b == null) return false;
+            const va = a.?;
+            const vb = b.?;
+            if (@as(std.meta.Tag(FieldLiteralConstraintIr), va) != @as(std.meta.Tag(FieldLiteralConstraintIr), vb)) return false;
+            return switch (va) {
+                .str => |sa| std.mem.eql(u8, sa, vb.str),
+                .num => |na| na == vb.num,
+                .boolean => |ba| ba == vb.boolean,
+                .bigint_val => |bia| std.mem.eql(u8, bia, vb.bigint_val),
+                .enum_member => |ema| ema.enum_decl_id == vb.enum_member.enum_decl_id and
+                    std.mem.eql(u8, ema.tag_logical_name, vb.enum_member.tag_logical_name),
+            };
+        }
+
+        fn typeIrEql(a: *const TypeIr, b: *const TypeIr, depth: usize) bool {
+            if (a == b) return true;
+            if (depth > 8) return false;
+            if (@as(std.meta.Tag(TypeIr), a.*) != @as(std.meta.Tag(TypeIr), b.*)) return false;
+            return switch (a.*) {
+                .void_type,
+                .noreturn_type,
+                .bool_type,
+                .f64_type,
+                .i64_type,
+                .string_type,
+                .bytes_type,
+                .js_value,
+                .js_any,
+                .js_unknown,
+                .js_object,
+                .js_symbol,
+                .js_bigint,
+                .js_string,
+                => true,
+                .typed_slice => |pa| pa == b.typed_slice,
+                .binary_view => |ba| ba == b.binary_view,
+                .self_type => |sa| std.mem.eql(u8, sa, b.self_type),
+                .type_param_ref => |ta| std.mem.eql(u8, ta, b.type_param_ref),
+                .optional => |oa| oa.nullish_kind == b.optional.nullish_kind and typeIrEql(oa.child, b.optional.child, depth + 1),
+                .pointer_const => |ia| typeIrEql(ia, b.pointer_const, depth + 1),
+                .slice => |sa| typeIrEql(sa, b.slice, depth + 1),
+                .promise => |pa| typeIrEql(pa, b.promise, depth + 1),
+                .js_map => |ma| typeIrEql(ma.key, b.js_map.key, depth + 1) and typeIrEql(ma.value, b.js_map.value, depth + 1),
+                .decl_ref => |da| blk: {
+                    const db = b.decl_ref;
+                    if (da.module_index != db.module_index or da.target_decl_id != db.target_decl_id or da.indirect != db.indirect) break :blk false;
+                    if (da.decl_zig_path.len != db.decl_zig_path.len or da.type_args.len != db.type_args.len) break :blk false;
+                    for (da.decl_zig_path, db.decl_zig_path) |sa, sb| {
+                        if (!std.mem.eql(u8, sa, sb)) break :blk false;
+                    }
+                    for (da.type_args, db.type_args) |taa, tab| {
+                        if (!typeIrEql(taa, tab, depth + 1)) break :blk false;
+                    }
+                    break :blk true;
+                },
+                .tuple => |ta| blk: {
+                    const tb = b.tuple;
+                    if (ta.len != tb.len) break :blk false;
+                    for (ta, tb) |ea, eb| {
+                        if (ea.is_optional != eb.is_optional or ea.is_variadic != eb.is_variadic or ea.nullish_kind != eb.nullish_kind) break :blk false;
+                        if (!typeIrEql(ea.ty, eb.ty, depth + 1)) break :blk false;
+                    }
+                    break :blk true;
+                },
+                .anon_struct => |fa| blk: {
+                    const fb = b.anon_struct;
+                    if (fa.len != fb.len) break :blk false;
+                    for (fa, fb) |xa, xb| {
+                        if (!std.mem.eql(u8, xa.wire_name, xb.wire_name) or xa.is_optional != xb.is_optional) break :blk false;
+                        if (!fieldConstraintEql(xa.literal_constraint, xb.literal_constraint)) break :blk false;
+                        if (!typeIrEql(xa.ty, xb.ty, depth + 1)) break :blk false;
+                    }
+                    break :blk true;
+                },
+                .template_pattern => |pa| blk: {
+                    const pb = b.template_pattern;
+                    if (!std.mem.eql(u8, pa.head, pb.head) or pa.spans.len != pb.spans.len) break :blk false;
+                    for (pa.spans, pb.spans) |sa, sb| {
+                        if (sa.placeholder != sb.placeholder or
+                            !std.mem.eql(u8, sa.literal_tail, sb.literal_tail) or
+                            sa.choices.len != sb.choices.len) break :blk false;
+                        for (sa.choices, sb.choices) |ca, cb| {
+                            if (!std.mem.eql(u8, ca, cb)) break :blk false;
+                        }
+                    }
+                    break :blk true;
+                },
+                else => false,
+            };
+        }
+
+        const LoweredArmEntry = struct {
+            ast_arm_id: u32,
+            ty: *TypeIr,
+        };
+
+        const GeneralUnionOutcome = union(enum) {
+            single: *TypeIr,
+            tagged: TaggedUnionIr,
+        };
+
+        fn trySelectDiscriminantForArms(
+            self: *Self,
+            arms: []const LoweredArmEntry,
+        ) error{OutOfMemory}!?lower_unions.SelectedDiscriminant {
+            if (arms.len < 2) return null;
+
+            var arm_prop_lists = try self.scratch.alloc([]const lower_unions.CandidateDiscProp, arms.len);
+            var prop_SubSlices: std.ArrayList([]lower_unions.CandidateDiscProp) = .empty;
+            var val_SubSlices: std.ArrayList([]lower_unions.ClosedLiteralValue) = .empty;
+            defer {
+                for (val_SubSlices.items) |s| self.scratch.free(s);
+                val_SubSlices.deinit(self.scratch);
+                for (prop_SubSlices.items) |s| self.scratch.free(s);
+                prop_SubSlices.deinit(self.scratch);
+                self.scratch.free(arm_prop_lists);
+            }
+
+            for (arms, 0..) |entry, idx| {
+                // Only consider plain/class object arms for object-property discriminant dispatch.
+                switch (entry.ty.*) {
+                    .anon_struct, .decl_ref => {},
+                    else => return null,
+                }
+                var raw_props: std.ArrayList(RawObjectPropItem) = .empty;
+                defer raw_props.deinit(self.scratch);
+                if (!try self.collectObjectArmProps(entry.ast_arm_id, true, &raw_props, 0)) return null;
+                if (raw_props.items.len == 0) return null;
+
+                var infos: std.ArrayList(lower_unions.CandidateDiscProp) = .empty;
+                for (raw_props.items) |rp| {
+                    if (rp.optional) continue;
+                    var enum_hint_opt: ?[]const u8 = null;
+                    if (try self.resolveEnumMemberReference(rp.ty)) |em| {
+                        enum_hint_opt = em.tag_logical_name;
+                    }
+                    var lits: std.ArrayList(lower_unions.ClosedLiteralValue) = .empty;
+                    if (try self.tryCollectClosedLiteralsFromArm(rp.ty, &lits, true, 0) and lits.items.len > 0) {
+                        const lit_slice = try lits.toOwnedSlice(self.scratch);
+                        try val_SubSlices.append(self.scratch, lit_slice);
+                        try infos.append(self.scratch, .{
+                            .wire_name = rp.wire,
+                            .values = lit_slice,
+                            .enum_member_hint = enum_hint_opt,
+                        });
+                    } else {
+                        lits.deinit(self.scratch);
+                    }
+                }
+                if (infos.items.len == 0) {
+                    infos.deinit(self.scratch);
+                    return null;
+                }
+                const info_slice = try infos.toOwnedSlice(self.scratch);
+                try prop_SubSlices.append(self.scratch, info_slice);
+                arm_prop_lists[idx] = info_slice;
+            }
+
+            return try lower_unions.selectDiscriminantProperty(self.alloc, arm_prop_lists);
+        }
+
+        fn buildGeneralUnionOutcome(
+            self: *Self,
+            non_null_arms: []const u32,
+            active_tps: []const ActiveTypeParam,
+            self_ident_opt: ?[]const u8,
+            visited: *std.AutoHashMapUnmanaged(u32, void),
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+        ) error{OutOfMemory}!GeneralUnionOutcome {
+            var has_open_str = false;
+            var has_open_num = false;
+            var has_open_bigint = false;
+            var has_open_bool = false;
+
+            for (non_null_arms) |aid| {
+                const k = self.graph.types[aid].kind;
+                switch (k) {
+                    .string_type => has_open_str = true,
+                    .number_type => has_open_num = true,
+                    .bigint_type => has_open_bigint = true,
+                    .boolean_type => has_open_bool = true,
+                    .intersection => |parts| {
+                        if (self.detectOpenPrimitiveIntersection(parts)) |opk| {
+                            switch (opk) {
+                                .str => has_open_str = true,
+                                .num => has_open_num = true,
+                                .bigint => has_open_bigint = true,
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+
+            var raw_lits: std.ArrayList(lower_unions.ClosedLiteralValue) = .empty;
+            defer raw_lits.deinit(self.scratch);
+            var other_arm_ids: std.ArrayList(u32) = .empty;
+            defer other_arm_ids.deinit(self.scratch);
+
+            for (non_null_arms) |aid| {
+                var arm_lits: std.ArrayList(lower_unions.ClosedLiteralValue) = .empty;
+                defer arm_lits.deinit(self.scratch);
+                if (try self.tryCollectClosedLiteralsFromArm(aid, &arm_lits, false, 0) and arm_lits.items.len > 0) {
+                    for (arm_lits.items) |clv| {
+                        try self.appendUniqueClosedLiteral(&raw_lits, clv);
+                    }
+                } else {
+                    try other_arm_ids.append(self.scratch, aid);
+                }
+            }
+
+            // Detect `true | false` pair among literal arms -> promote to open `boolean`!
+            var saw_true = false;
+            var saw_false = false;
+            for (raw_lits.items) |clv| {
+                if (clv == .boolean) {
+                    if (clv.boolean) saw_true = true else saw_false = true;
+                }
+            }
+            const promote_bool_pair = !has_open_bool and saw_true and saw_false;
+            if (promote_bool_pair) has_open_bool = true;
+
+            var rem_lits: std.ArrayList(lower_unions.ClosedLiteralValue) = .empty;
+            defer rem_lits.deinit(self.scratch);
+            for (raw_lits.items) |clv| {
+                const absorbed = switch (clv) {
+                    .str => has_open_str,
+                    .num => has_open_num,
+                    .boolean => has_open_bool,
+                    .bigint_val => has_open_bigint,
+                };
+                if (!absorbed) try rem_lits.append(self.scratch, clv);
+            }
+
+            var deduped_others: std.ArrayList(LoweredArmEntry) = .empty;
+            defer deduped_others.deinit(self.scratch);
+
+            if (promote_bool_pair) {
+                try deduped_others.append(self.scratch, .{
+                    .ast_arm_id = non_null_arms[0],
+                    .ty = try self.makeType(.bool_type),
+                });
+            }
+
+            for (other_arm_ids.items) |aid| {
+                var arm_visited = try visited.clone(self.scratch);
+                defer arm_visited.deinit(self.scratch);
+                const payload = try self.lowerType(aid, false, active_tps, self_ident_opt, &arm_visited, imports_used, needs_runtime);
+                var is_dup = false;
+                for (deduped_others.items) |existing| {
+                    if (typeIrEql(existing.ty, payload, 0)) {
+                        is_dup = true;
+                        break;
+                    }
+                }
+                if (!is_dup) {
+                    try deduped_others.append(self.scratch, .{ .ast_arm_id = aid, .ty = payload });
+                }
+            }
+
+            if (rem_lits.items.len == 0 and deduped_others.items.len == 1) {
+                return .{ .single = deduped_others.items[0].ty };
+            }
+            if (rem_lits.items.len == 0 and deduped_others.items.len == 0) {
+                return .{ .single = try self.makeType(.void_type) };
+            }
+
+            needs_runtime.* = true;
+
+            var disc_sel_opt: ?lower_unions.SelectedDiscriminant = null;
+            defer if (disc_sel_opt) |ds| ds.deinit(self.alloc);
+            if (rem_lits.items.len == 0 and deduped_others.items.len >= 2) {
+                disc_sel_opt = try self.trySelectDiscriminantForArms(deduped_others.items);
+            }
+
+            var var_scope = naming.ScopeNamer.init(self.scratch, null);
+            defer var_scope.deinit();
+            try var_scope.reserve("zigar_js");
+
+            var variants: std.ArrayList(UnionVariantIr) = .empty;
+            errdefer variants.deinit(self.alloc);
+
+            if (rem_lits.items.len > 0 and rem_lits.items.len <= 16) {
+                const void_ty = try self.makeType(.void_type);
+                for (rem_lits.items) |clv| {
+                    const hint = try lower_unions.formatLiteralTagHint(self.scratch, clv);
+                    defer self.scratch.free(hint);
+                    const bound = try var_scope.bind(hint, .snake);
+                    const wire_str: []const u8 = switch (clv) {
+                        .str => |s| try self.alloc.dupe(u8, s),
+                        else => try self.alloc.dupe(u8, bound.logical_name),
+                    };
+                    try variants.append(self.alloc, .{
+                        .zig_ident = try self.alloc.dupe(u8, bound.zig_ident),
+                        .logical_name = try self.alloc.dupe(u8, bound.logical_name),
+                        .wire_tag = wire_str,
+                        .payload = void_ty,
+                        .unit_literal = try self.closedLiteralToEnumValue(clv),
+                    });
+                    bound.deinit(self.scratch);
+                }
+            } else if (rem_lits.items.len > 16) {
+                const inline_en = try self.buildEnumMembersFromClosedLiterals(rem_lits.items);
+                const en_ty = try self.makeType(.{ .inline_enum = inline_en });
+                const bound = try var_scope.bind("literal", .snake);
+                try variants.append(self.alloc, .{
+                    .zig_ident = try self.alloc.dupe(u8, bound.zig_ident),
+                    .logical_name = try self.alloc.dupe(u8, bound.logical_name),
+                    .wire_tag = try self.alloc.dupe(u8, bound.wire_name),
+                    .payload = en_ty,
+                });
+                bound.deinit(self.scratch);
+            }
+
+            for (deduped_others.items, 0..) |entry, idx| {
+                var disc_vals_ir: []VariantDiscriminantValueIr = &.{};
+                var hint: []const u8 = "";
+                var free_hint = false;
+
+                if (disc_sel_opt) |ds| {
+                    const arm_dvals = ds.arm_values[idx];
+                    disc_vals_ir = try self.alloc.alloc(VariantDiscriminantValueIr, arm_dvals.len);
+                    for (arm_dvals, 0..) |dv, di| {
+                        disc_vals_ir[di] = switch (dv) {
+                            .str => |s| .{ .str = try self.alloc.dupe(u8, s) },
+                            .num => |n| .{ .num = n },
+                            .boolean => |b| .{ .boolean = b },
+                            .bigint_val => |bi| .{ .bigint_val = try lower_types.normalizeBigIntLiteral(self.alloc, bi) },
+                        };
+                    }
+                    if (self.graph.types[entry.ast_arm_id].kind == .reference) {
+                        const rname = self.str(self.graph.types[entry.ast_arm_id].kind.reference.target_name);
+                        hint = lower_types.stripGlobalQualifier(rname);
+                    } else {
+                        hint = try lower_unions.formatDiscriminantVariantHint(
+                            self.scratch,
+                            ds.wire_name,
+                            arm_dvals,
+                            ds.arm_hints[idx],
+                        );
+                        free_hint = true;
+                    }
+                } else {
+                    hint = self.deriveVariantTagHint(entry.ast_arm_id, entry.ty, idx);
+                }
+                defer if (free_hint) self.scratch.free(hint);
+
+                const bound = try var_scope.bind(hint, .snake);
+                try variants.append(self.alloc, .{
+                    .zig_ident = try self.alloc.dupe(u8, bound.zig_ident),
+                    .logical_name = try self.alloc.dupe(u8, bound.logical_name),
+                    .wire_tag = try self.alloc.dupe(u8, bound.wire_name),
+                    .payload = entry.ty,
+                    .disc_values = disc_vals_ir,
+                });
+                bound.deinit(self.scratch);
+            }
+
+            const disc_prop_copy: ?[]const u8 = if (disc_sel_opt) |ds|
+                try self.alloc.dupe(u8, ds.wire_name)
+            else
+                null;
+
+            return .{
+                .tagged = .{
+                    .discriminant_prop = disc_prop_copy,
+                    .variants = try variants.toOwnedSlice(self.alloc),
+                },
+            };
+        }
+
+        fn lowerUnionTypeInline(
+            self: *Self,
+            ty_id: u32,
+            arms: []const u32,
+            ref_cnt: u32,
+            can_hoist_in_mod: bool,
+            no_free_vars: bool,
+            active_tps: []const ActiveTypeParam,
+            self_ident_opt: ?[]const u8,
+            visited: *std.AutoHashMapUnmanaged(u32, void),
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+        ) error{OutOfMemory}!*TypeIr {
+            var non_null: std.ArrayList(u32) = .empty;
+            defer non_null.deinit(self.scratch);
+            var nullish: lower_types.NullishKind = .none;
+            try self.collectFlattenedUnionArms(arms, &non_null, &nullish, 0);
+
+            if (non_null.items.len == 0) {
+                if (nullish != .none) {
+                    needs_runtime.* = true;
+                    const jv = try self.makeType(.js_any);
+                    return self.makeType(.{ .optional = .{ .child = jv, .nullish_kind = nullish } });
+                }
+                return self.makeType(.void_type);
+            }
+
+            if (non_null.items.len == 1) {
+                const base_ty = try self.lowerType(non_null.items[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                const final_u = if (nullish != .none) try self.wrapOptionalWithNullish(base_ty, nullish) else base_ty;
+                if (ref_cnt > 1 and can_hoist_in_mod and isSafeToShareTypeIrPtr(final_u) and (no_free_vars or try self.isClosedTypeSubgraph(ty_id))) {
+                    try self.cur_mod_closed_types.put(self.scratch, ty_id, final_u);
+                }
+                return final_u;
+            }
+
+            // 1. Open-literal autocomplete union (`"red" | "green" | (string & {})`)!
+            if (try self.tryBuildOpenLiteralUnion(non_null.items)) |olu| {
+                const base_ty: *TypeIr = if (can_hoist_in_mod and (no_free_vars or try self.isClosedTypeSubgraph(ty_id)) and ref_cnt > 1) blk: {
+                    const h = try self.allocFreshAnonHelperName("__zigar_AnonUnion", active_tps);
+                    const hloc = DeclLocation{
+                        .module_index = self.cur_mod_idx,
+                        .zig_path = h.path,
+                        .type_param_defaults = &.{},
+                    };
+                    if (nullish == .none) try self.cur_mod_hoisted_locs.put(self.scratch, ty_id, hloc);
+                    try self.cur_mod_decls_out.?.append(self.alloc, .{
+                        .source_decl_id = null,
+                        .zig_ident = h.zig_ident,
+                        .logical_name = h.logical,
+                        .wire_name = h.logical,
+                        .is_exported = false,
+                        .is_js_exported = false,
+                        .is_default_export = false,
+                        .jsdoc = null,
+                        .kind = .{ .open_literal_decl = olu },
+                    });
+                    break :blk try self.makeHoistedDeclRef(hloc);
+                } else if (self.inline_anon_depth >= 3)
+                    switch (olu.base_kind) {
+                        .str => try self.makeType(.string_type),
+                        .num => try self.makeType(.f64_type),
+                        .bigint => try self.makeType(.i64_type),
+                    }
+                else
+                    try self.makeType(.{ .open_literal_union = olu });
+
+                return if (nullish != .none) try self.wrapOptionalWithNullish(base_ty, nullish) else base_ty;
+            }
+
+            // 2. Closed scalar literal union (`"a" | "b"`, `200 | 404`, `"auto" | 0 | false | 10n`)!
+            if (try self.tryBuildClosedLiteralEnum(non_null.items)) |enum_ir| {
+                const base_ty: *TypeIr = if (can_hoist_in_mod and (no_free_vars or try self.isClosedTypeSubgraph(ty_id)) and (ref_cnt > 1 or enum_ir.members.len > 8)) blk: {
+                    const h = try self.allocFreshAnonHelperName("__zigar_AnonEnum", active_tps);
+                    const hloc = DeclLocation{
+                        .module_index = self.cur_mod_idx,
+                        .zig_path = h.path,
+                        .type_param_defaults = &.{},
+                    };
+                    if (nullish == .none) try self.cur_mod_hoisted_locs.put(self.scratch, ty_id, hloc);
+                    try self.cur_mod_decls_out.?.append(self.alloc, .{
+                        .source_decl_id = null,
+                        .zig_ident = h.zig_ident,
+                        .logical_name = h.logical,
+                        .wire_name = h.logical,
+                        .is_exported = false,
+                        .is_js_exported = false,
+                        .is_default_export = false,
+                        .jsdoc = null,
+                        .kind = .{ .literal_enum_decl = enum_ir },
+                    });
+                    break :blk try self.makeHoistedDeclRef(hloc);
+                } else if (self.inline_anon_depth >= 3 or enum_ir.members.len > 64) blk: {
+                    if (self.allArmsSameScalarKind(non_null.items)) |scalar_ty| {
+                        break :blk try self.makeType(scalar_ty);
+                    }
+                    needs_runtime.* = true;
+                    break :blk try self.makeType(.js_any);
+                } else try self.makeType(.{ .inline_enum = enum_ir });
+
+                return if (nullish != .none) try self.wrapOptionalWithNullish(base_ty, nullish) else base_ty;
+            }
+
+            // 3. Exact `true | false` or absorbed homogeneous scalar union (`string | "foo"`, `number | 0`).
+            if (self.allArmsSameScalarKind(non_null.items)) |scalar_ty| {
+                const base_ty = try self.makeType(scalar_ty);
+                const final_u = if (nullish != .none) try self.wrapOptionalWithNullish(base_ty, nullish) else base_ty;
+                if (ref_cnt > 1 and can_hoist_in_mod and isSafeToShareTypeIrPtr(final_u) and (no_free_vars or try self.isClosedTypeSubgraph(ty_id))) {
+                    try self.cur_mod_closed_types.put(self.scratch, ty_id, final_u);
+                }
+                return final_u;
+            }
+
+            // 4. Discriminated or heterogeneous multi-arm union (`A | B`, `Buffer | string`, etc.)!
+            if (non_null.items.len > 32) {
+                needs_runtime.* = true;
+                const jv = try self.makeType(.js_any);
+                return if (nullish != .none) try self.wrapOptionalWithNullish(jv, nullish) else jv;
+            }
+
+            const can_hoist_union = can_hoist_in_mod and ref_cnt > 1 and (no_free_vars or try self.isClosedTypeSubgraph(ty_id));
+            if (can_hoist_union and nullish == .none) {
+                const h = try self.allocFreshAnonHelperName("__zigar_AnonUnion", active_tps);
+                const hloc = DeclLocation{
+                    .module_index = self.cur_mod_idx,
+                    .zig_path = h.path,
+                    .type_param_defaults = &.{},
+                };
+                try self.cur_mod_hoisted_locs.put(self.scratch, ty_id, hloc);
+
+                var fresh_visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                defer fresh_visited.deinit(self.scratch);
+                const saved_depth = self.inline_anon_depth;
+                self.inline_anon_depth = 0;
+                defer self.inline_anon_depth = saved_depth;
+
+                const outcome = try self.buildGeneralUnionOutcome(non_null.items, &.{}, null, &fresh_visited, imports_used, needs_runtime);
+                switch (outcome) {
+                    .single => |single_ty| {
+                        try self.cur_mod_decls_out.?.append(self.alloc, .{
+                            .source_decl_id = null,
+                            .zig_ident = h.zig_ident,
+                            .logical_name = h.logical,
+                            .wire_name = h.logical,
+                            .is_exported = false,
+                            .is_js_exported = false,
+                            .is_default_export = false,
+                            .jsdoc = null,
+                            .kind = .{ .type_alias = .{ .type_params = &.{}, .target = single_ty } },
+                        });
+                    },
+                    .tagged => |tu| {
+                        try self.cur_mod_decls_out.?.append(self.alloc, .{
+                            .source_decl_id = null,
+                            .zig_ident = h.zig_ident,
+                            .logical_name = h.logical,
+                            .wire_name = h.logical,
+                            .is_exported = false,
+                            .is_js_exported = false,
+                            .is_default_export = false,
+                            .jsdoc = null,
+                            .kind = .{
+                                .union_decl = .{
+                                    .type_params = &.{},
+                                    .discriminant_prop = tu.discriminant_prop,
+                                    .variants = tu.variants,
+                                },
+                            },
+                        });
+                    },
+                }
+                return self.makeHoistedDeclRef(hloc);
+            }
+
+            if (!can_hoist_union and self.inline_anon_depth >= 3) {
+                needs_runtime.* = true;
+                const jv = try self.makeType(.js_any);
+                return if (nullish != .none) try self.wrapOptionalWithNullish(jv, nullish) else jv;
+            }
+
+            self.inline_anon_depth += 1;
+            defer self.inline_anon_depth -= 1;
+
+            const outcome = try self.buildGeneralUnionOutcome(non_null.items, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+            const base_ty: *TypeIr = switch (outcome) {
+                .single => |single_ty| single_ty,
+                .tagged => |tu| blk: {
+                    if (can_hoist_union) {
+                        const h = try self.allocFreshAnonHelperName("__zigar_AnonUnion", active_tps);
+                        const hloc = DeclLocation{
+                            .module_index = self.cur_mod_idx,
+                            .zig_path = h.path,
+                            .type_param_defaults = &.{},
+                        };
+                        try self.cur_mod_decls_out.?.append(self.alloc, .{
+                            .source_decl_id = null,
+                            .zig_ident = h.zig_ident,
+                            .logical_name = h.logical,
+                            .wire_name = h.logical,
+                            .is_exported = false,
+                            .is_js_exported = false,
+                            .is_default_export = false,
+                            .jsdoc = null,
+                            .kind = .{
+                                .union_decl = .{
+                                    .type_params = &.{},
+                                    .discriminant_prop = tu.discriminant_prop,
+                                    .variants = tu.variants,
+                                },
+                            },
+                        });
+                        break :blk try self.makeHoistedDeclRef(hloc);
+                    }
+                    break :blk try self.makeType(.{ .tagged_union = tu });
+                },
+            };
+            return if (nullish != .none) try self.wrapOptionalWithNullish(base_ty, nullish) else base_ty;
         }
 
         fn tryLowerUnionDeclVariants(
@@ -3646,57 +5541,58 @@ fn LowerCtx(comptime GraphType: type) type {
             active_tps: []const ActiveTypeParam,
             imports_used: *std.AutoHashMapUnmanaged(u32, void),
             needs_runtime: *bool,
-        ) !?[]UnionVariantIr {
+        ) error{OutOfMemory}!?TaggedUnionIr {
             if (ty_id >= self.graph.types.len) return null;
             const tn = self.graph.types[ty_id];
-            if (tn.kind != .union_type) return null;
-            const arms = tn.kind.union_type;
+            const union_arms: []const u32 = if (tn.kind == .union_type)
+                tn.kind.union_type
+            else if (tn.kind == .template_literal and tn.resolved_type != null and tn.resolved_type.? < self.graph.types.len and self.graph.types[tn.resolved_type.?].kind == .union_type)
+                self.graph.types[tn.resolved_type.?].kind.union_type
+            else
+                return null;
 
-            // Keep nullable single-type unions (`T | null`) as clean `?T` type aliases!
+            // Keep nullable unions (`T | null`, `A | B | undefined`) as `?Target` type aliases so `.nullish` metadata is preserved!
             var non_null: std.ArrayList(u32) = .empty;
             defer non_null.deinit(self.scratch);
-            var has_nullish = false;
-            for (arms) |aid| {
-                if (aid >= self.graph.types.len) continue;
-                switch (self.graph.types[aid].kind) {
-                    .null_type, .undefined_type, .void_type => has_nullish = true,
-                    .never_type => {},
-                    else => try non_null.append(self.scratch, aid),
-                }
-            }
-            if (has_nullish or non_null.items.len < 2) return null;
+            var nullish: lower_types.NullishKind = .none;
+            try self.collectFlattenedUnionArms(union_arms, &non_null, &nullish, 0);
+            if (nullish != .none or non_null.items.len < 2 or non_null.items.len > 64) return null;
 
-            var var_scope = naming.ScopeNamer.init(self.scratch, null);
-            defer var_scope.deinit();
-            try var_scope.reserve("zigar_js");
+            // Let homogeneous scalar unions like `string | "foo"` or `true | false` collapse cleanly to `[]const u8` / `bool`!
+            if (self.allArmsSameScalarKind(non_null.items) != null) return null;
 
             var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
             defer visited.deinit(self.scratch);
-
-            var variants = try self.alloc.alloc(UnionVariantIr, non_null.items.len);
-            for (non_null.items, 0..) |aid, idx| {
-                visited.clearRetainingCapacity();
-                const payload = try self.lowerType(aid, false, active_tps, null, &visited, imports_used, needs_runtime);
-                const hint = self.deriveVariantTagHint(aid, idx);
-                const bound = try var_scope.bind(hint, .snake);
-                variants[idx] = .{
-                    .zig_ident = try self.alloc.dupe(u8, bound.zig_ident),
-                    .wire_tag = try self.alloc.dupe(u8, bound.wire_name),
-                    .payload = payload,
-                };
-                bound.deinit(self.scratch);
-            }
-            return variants;
+            const outcome = try self.buildGeneralUnionOutcome(non_null.items, active_tps, null, &visited, imports_used, needs_runtime);
+            return switch (outcome) {
+                .single => null,
+                .tagged => |tu| tu,
+            };
         }
 
-        fn deriveVariantTagHint(self: *Self, arm_ty_id: u32, idx: usize) []const u8 {
+        fn deriveVariantTagHint(self: *Self, arm_ty_id: u32, lowered_payload: *const TypeIr, idx: usize) []const u8 {
             const ak = self.graph.types[arm_ty_id].kind;
             switch (ak) {
                 .string_type => return "str",
                 .number_type => return "num",
                 .boolean_type => return "boolean",
                 .bigint_type => return "bigint",
-                .reference => |ref| return self.str(ref.target_name),
+                .symbol_type, .unique_symbol => return "symbol",
+                .object_type => return "object",
+                .array, .readonly_array => return "array",
+                .tuple, .readonly_tuple => return "tuple",
+                .function_type => return "func",
+                .template_literal => return "pattern",
+                .reference => |ref| return lower_types.stripGlobalQualifier(self.str(ref.target_name)),
+                .intersection => |parts| {
+                    if (self.detectOpenPrimitiveIntersection(parts)) |opk| {
+                        return switch (opk) {
+                            .str => "str",
+                            .num => "num",
+                            .bigint => "bigint",
+                        };
+                    }
+                },
                 .object_literal => |obj| {
                     for (obj.properties) |pid| {
                         if (pid >= self.graph.properties.len) continue;
@@ -3714,6 +5610,17 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                     }
                 },
+                else => {},
+            }
+            switch (lowered_payload.*) {
+                .binary_view => |bvk| return bvk.zigTypeIdent(),
+                .slice => return "array",
+                .tuple => return "tuple",
+                .fn_ptr => return "func",
+                .anon_struct => return "record",
+                .js_object => return "object",
+                .js_map => return "map",
+                .promise => return "promise",
                 else => {},
             }
             return std.fmt.allocPrint(self.alloc, "variant_{d}", .{idx}) catch "variant";
@@ -4017,14 +5924,15 @@ fn LowerCtx(comptime GraphType: type) type {
                         const mb = try member_scope.bind(m_wire, .snake);
                         const val_ir: EnumValueIr = if (m.value) |mv| switch (mv) {
                             .num => |n| blk: {
-                                if (!std.math.isFinite(n)) has_unknown = true;
+                                if (!std.math.isFinite(n)) {
+                                    has_unknown = true;
+                                    break :blk .unknown;
+                                }
                                 break :blk .{ .num = n };
                             },
                             .str => |sid| .{ .str = try self.alloc.dupe(u8, self.str(sid)) },
-                            .bigint_literal, .boolean => blk: {
-                                has_unknown = true;
-                                break :blk .unknown;
-                            },
+                            .boolean => |b| .{ .boolean = b },
+                            .bigint_literal => |sid| .{ .bigint_val = try lower_types.normalizeBigIntLiteral(self.alloc, self.str(sid)) },
                         } else blk: {
                             has_unknown = true;
                             break :blk .unknown;
@@ -4038,7 +5946,34 @@ fn LowerCtx(comptime GraphType: type) type {
                         };
                         mb.deinit(self.scratch);
                     }
-                    if (has_unknown) needs_runtime.* = true;
+
+                    var backing: lower_unions.EnumBackingKind = .none;
+                    if (!has_unknown) {
+                        var closed_vals = try self.scratch.alloc(lower_unions.ClosedLiteralValue, members.len);
+                        defer self.scratch.free(closed_vals);
+                        for (members, 0..) |m, idx| {
+                            closed_vals[idx] = switch (m.value) {
+                                .num => |n| .{ .num = n },
+                                .str => |s| .{ .str = s },
+                                .boolean => |b| .{ .boolean = b },
+                                .bigint_val => |bi| .{ .bigint_val = bi },
+                                .unknown => unreachable,
+                            };
+                        }
+                        const analysis = try lower_unions.analyzeClosedEnumValues(self.scratch, closed_vals);
+                        defer analysis.deinit(self.scratch);
+                        backing = analysis.backing;
+                        for (members, 0..) |*m, idx| {
+                            m.int_backing_val = analysis.layouts[idx].int_tag_value;
+                            if (analysis.layouts[idx].alias_of_index) |pidx| {
+                                m.alias_of_zig_ident = members[pidx].zig_ident;
+                                m.alias_of_logical_name = members[pidx].logical_name;
+                            }
+                        }
+                    } else {
+                        needs_runtime.* = true;
+                    }
+
                     try out_list.append(self.alloc, .{
                         .source_decl_id = decl_id,
                         .zig_ident = bound.zig_ident,
@@ -4052,6 +5987,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             .enum_decl = .{
                                 .is_const = en.is_const,
                                 .has_unknown_values = has_unknown,
+                                .backing = backing,
                                 .members = members,
                             },
                         },
@@ -4069,26 +6005,94 @@ fn LowerCtx(comptime GraphType: type) type {
                         needs_runtime,
                     );
 
-                    // 1. Non-generic string-literal union -> first-class Zig `enum`!
-                    if (d.type_params.len == 0) {
-                        if (try self.tryLowerStringEnum(ty_id)) |str_members| {
-                            try out_list.append(self.alloc, .{
-                                .source_decl_id = decl_id,
-                                .zig_ident = bound.zig_ident,
-                                .logical_name = bound.logical_name,
-                                .wire_name = bound.wire_name,
-                                .is_exported = is_exported,
-                                .is_js_exported = is_js_exported,
-                                .is_default_export = is_default_export,
-                                .jsdoc = top_jsdoc,
-                                .kind = .{ .string_enum_decl = str_members },
-                            });
-                            return;
+                    if (d.type_params.len == 0 and ty_id < self.graph.types.len) {
+                        const tn_alias = self.graph.types[ty_id];
+                        switch (tn_alias.kind) {
+                            .union_type => |u_arms| {
+                                var non_null: std.ArrayList(u32) = .empty;
+                                defer non_null.deinit(self.scratch);
+                                var nullish: lower_types.NullishKind = .none;
+                                try self.collectFlattenedUnionArms(u_arms, &non_null, &nullish, 0);
+
+                                if (nullish == .none and non_null.items.len > 0) {
+                                    // 1a. Open-literal autocomplete union (`"red" | "green" | (string & {})`)!
+                                    if (try self.tryBuildOpenLiteralUnion(non_null.items)) |olu| {
+                                        try out_list.append(self.alloc, .{
+                                            .source_decl_id = decl_id,
+                                            .zig_ident = bound.zig_ident,
+                                            .logical_name = bound.logical_name,
+                                            .wire_name = bound.wire_name,
+                                            .is_exported = is_exported,
+                                            .is_js_exported = is_js_exported,
+                                            .is_default_export = is_default_export,
+                                            .jsdoc = top_jsdoc,
+                                            .kind = .{ .open_literal_decl = olu },
+                                        });
+                                        return;
+                                    }
+
+                                    // 1b. Closed literal / finite-template union -> first-class Zig `enum`!
+                                    if (try self.tryBuildClosedLiteralEnum(non_null.items)) |enum_ir| {
+                                        try out_list.append(self.alloc, .{
+                                            .source_decl_id = decl_id,
+                                            .zig_ident = bound.zig_ident,
+                                            .logical_name = bound.logical_name,
+                                            .wire_name = bound.wire_name,
+                                            .is_exported = is_exported,
+                                            .is_js_exported = is_js_exported,
+                                            .is_default_export = is_default_export,
+                                            .jsdoc = top_jsdoc,
+                                            .kind = .{ .literal_enum_decl = enum_ir },
+                                        });
+                                        return;
+                                    }
+                                }
+                            },
+                            .template_literal => |tl| {
+                                if (tl.spans.len > 0) {
+                                    var finite_strs: std.ArrayList([]const u8) = .empty;
+                                    defer finite_strs.deinit(self.alloc);
+                                    if (try self.tryExpandFiniteStringSet(ty_id, &finite_strs, 0)) {
+                                        if (finite_strs.items.len >= 2) {
+                                            const enum_ir = try self.buildStringEnumFromUniqueStrings(finite_strs.items);
+                                            if (enum_ir.members.len >= 2) {
+                                                try out_list.append(self.alloc, .{
+                                                    .source_decl_id = decl_id,
+                                                    .zig_ident = bound.zig_ident,
+                                                    .logical_name = bound.logical_name,
+                                                    .wire_name = bound.wire_name,
+                                                    .is_exported = is_exported,
+                                                    .is_js_exported = is_js_exported,
+                                                    .is_default_export = is_default_export,
+                                                    .jsdoc = top_jsdoc,
+                                                    .kind = .{ .literal_enum_decl = enum_ir },
+                                                });
+                                                return;
+                                            }
+                                        }
+                                    } else if (try self.tryBuildDirectTemplatePattern(tl)) |pat_ir| {
+                                        needs_runtime.* = true;
+                                        try out_list.append(self.alloc, .{
+                                            .source_decl_id = decl_id,
+                                            .zig_ident = bound.zig_ident,
+                                            .logical_name = bound.logical_name,
+                                            .wire_name = bound.wire_name,
+                                            .is_exported = is_exported,
+                                            .is_js_exported = is_js_exported,
+                                            .is_default_export = is_default_export,
+                                            .jsdoc = top_jsdoc,
+                                            .kind = .{ .template_pattern_decl = pat_ir },
+                                        });
+                                        return;
+                                    }
+                                }
+                            },
+                            else => {},
                         }
                     }
 
                     // 2. Multi-arm discriminated/heterogeneous union -> Zig `union(enum)`!
-                    if (try self.tryLowerUnionDeclVariants(ty_id, tp_res.active, imports_used, needs_runtime)) |variants| {
+                    if (try self.tryLowerUnionDeclVariants(ty_id, tp_res.active, imports_used, needs_runtime)) |tu| {
                         try out_list.append(self.alloc, .{
                             .source_decl_id = decl_id,
                             .zig_ident = bound.zig_ident,
@@ -4098,7 +6102,13 @@ fn LowerCtx(comptime GraphType: type) type {
                             .is_js_exported = is_js_exported,
                             .is_default_export = is_default_export,
                             .jsdoc = top_jsdoc,
-                            .kind = .{ .union_decl = .{ .type_params = tp_res.ir, .variants = variants } },
+                            .kind = .{
+                                .union_decl = .{
+                                    .type_params = tp_res.ir,
+                                    .discriminant_prop = tu.discriminant_prop,
+                                    .variants = tu.variants,
+                                },
+                            },
                         });
                         return;
                     }
@@ -5480,8 +7490,8 @@ fn dfsValueCycleTypeByPath(
                 try dfsValueCycleTypeByPath(state_alloc, ir_alloc, @constCast(f.ty), decl_map, state);
             }
         },
-        .tagged_union => |vars| {
-            for (vars) |v| {
+        .tagged_union => |tu| {
+            for (tu.variants) |v| {
                 try dfsValueCycleTypeByPath(state_alloc, ir_alloc, @constCast(v.payload), decl_map, state);
             }
         },
@@ -5543,7 +7553,7 @@ fn declUsesTypeParamByValue(
     decl_map: *const std.StringHashMapUnmanaged(*DeclIr),
     depth: usize,
 ) bool {
-    if (depth >= 16) return false;
+    if (depth >= 16) return true;
     return switch (d.kind) {
         .type_alias => |ta| typeUsesParamByValue(state_alloc, ta.target, tp_ident, decl_map, depth + 1),
         .struct_decl => |st| blk: {
@@ -5569,7 +7579,7 @@ fn typeUsesParamByValue(
     decl_map: *const std.StringHashMapUnmanaged(*DeclIr),
     depth: usize,
 ) bool {
-    if (depth >= 16) return false;
+    if (depth >= 16) return true;
     return switch (ty.*) {
         .slice, .pointer_const, .fn_ptr, .promise, .js_map => false,
         .type_param_ref => |id| std.mem.eql(u8, id, tp_ident),
@@ -5586,8 +7596,8 @@ fn typeUsesParamByValue(
             }
             break :blk false;
         },
-        .tagged_union => |vars| blk: {
-            for (vars) |v| {
+        .tagged_union => |tu| blk: {
+            for (tu.variants) |v| {
                 if (typeUsesParamByValue(state_alloc, v.payload, tp_ident, decl_map, depth + 1)) break :blk true;
             }
             break :blk false;

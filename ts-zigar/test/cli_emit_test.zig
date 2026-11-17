@@ -2735,3 +2735,340 @@ test "Issue #46 keyed generic container nullish overrides: mutual recursion, inl
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
 }
 
+test "Issue #47 (M3.1b): enums, closed/open literal unions, template literals, discriminated unions, recursive/heterogeneous unions, and generic union nullish specs" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue47-unions", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const src_dir = try std.fmt.allocPrint(alloc, "{s}/src", .{sandbox});
+    defer alloc.free(src_dir);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+    try cwd.createDirPath(io, src_dir);
+
+    {
+        var d = try cwd.openDir(io, src_dir, .{});
+        defer d.close(io);
+        try d.writeFile(io, .{
+            .sub_path = "cjs_emitter.d.ts",
+            .data =
+            \\declare class MiniEmitter {
+            \\    maxListeners: number;
+            \\    compare(val: MiniEmitter): -1 | 0 | 1;
+            \\}
+            \\export = MiniEmitter;
+            ,
+        });
+        try d.writeFile(io, .{
+            .sub_path = "index.d.ts",
+            .data =
+            \\import MiniEmitter = require("./cjs_emitter");
+            \\
+            \\export enum HttpStatus {
+            \\    Ok = 200,
+            \\    SuccessAlias = 200,
+            \\    Created = 201,
+            \\    NotFound = 404,
+            \\}
+            \\export const enum LogLevel {
+            \\    Debug = "debug",
+            \\    Info = "info",
+            \\    InfoAlias = "info",
+            \\    Warn = "warn",
+            \\}
+            \\export enum MixedMode {
+            \\    Auto = "auto",
+            \\    Manual = 1,
+            \\}
+            \\export enum LargeEnum {
+            \\    Big = 5_000_000_000,
+            \\    NegBig = -5_000_000_000,
+            \\}
+            \\export enum OpKind {
+            \\    Add = "add",
+            \\    Sub = "sub",
+            \\}
+            \\
+            \\export type Encoding = "utf8" | "utf-8" | "hex" | "base64";
+            \\export type CompareResult = -1 | 0 | 1;
+            \\export type FloatChoice = 0.5 | 1.5 | 2.5;
+            \\export type BigChoice = 10n | 20n;
+            \\export type CollapsedBool = true | false;
+            \\
+            \\export type OpenEncoding = "utf8" | "hex" | (string & {});
+            \\export type OpenPort = 80 | 443 | (number & {});
+            \\export type OpenFromCollision = "from" | "to" | (string & {});
+            \\
+            \\export type EventHook = `on${"Data" | "End" | "Error"}`;
+            \\export type SemVer = `v${number}.${number}.${number}`;
+            \\export type HttpUrl = `${"http" | "https"}://${string}`;
+            \\
+            \\export interface SharedMeta {
+            \\    traceId: string;
+            \\}
+            \\export type AuditEvent =
+            \\    | (SharedMeta & { kind: "created"; owner: string })
+            \\    | (SharedMeta & { kind: "updated" | "patched"; rev: number })
+            \\    | (SharedMeta & { kind: "deleted"; soft?: boolean });
+            \\
+            \\export type Outcome =
+            \\    | { ok: true; payload: string }
+            \\    | { ok: false; code: number; detail: string | null };
+            \\
+            \\export type OpCommand =
+            \\    | { op: OpKind.Add; delta: number }
+            \\    | { op: OpKind.Sub; delta: number };
+            \\
+            \\export type JsonValue =
+            \\    | string
+            \\    | number
+            \\    | boolean
+            \\    | null
+            \\    | JsonValue[]
+            \\    | { [key: string]: JsonValue };
+            \\
+            \\export type HeteroInput =
+            \\    | [string]
+            \\    | [string, number]
+            \\    | string[]
+            \\    | Uint8Array
+            \\    | MiniEmitter
+            \\    | SemVer
+            \\    | { host: string; port?: number }
+            \\    | string
+            \\    | number;
+            \\
+            \\export type GenericEnvelope<T> =
+            \\    | { tag: "val"; item: T }
+            \\    | { tag: "empty"; reason: string | null };
+            \\
+            \\export declare function checkEncoding(enc: Encoding, openEnc: OpenEncoding, col: OpenFromCollision): CompareResult;
+            \\export declare function checkSemVer(ver: SemVer, hook: EventHook, url: HttpUrl): SemVer;
+            \\export declare function handleEvent(ev: AuditEvent, out: Outcome, cmd: OpCommand): Outcome;
+            \\export declare function echoHetero(input: HeteroInput, json: JsonValue): HeteroInput;
+            \\export declare function unwrapEnvelope(env: GenericEnvelope<number | undefined>): GenericEnvelope<string | null>;
+            ,
+        });
+    }
+
+    const index_dts = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{src_dir});
+    defer alloc.free(index_dts);
+    const cjs_dts = try std.fmt.allocPrint(alloc, "{s}/cjs_emitter.d.ts", .{src_dir});
+    defer alloc.free(cjs_dts);
+
+    const cli_args = [_][]const u8{ "-t", index_dts, "-t", cjs_dts, "-d", out_dir };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Issue #47 pipeline error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+
+    // Golden source checks on `index.zig` and `cjs_emitter.zig`
+    {
+        var out_h = try cwd.openDir(io, out_dir, .{});
+        defer out_h.close(io);
+
+        const cjs_src = try out_h.readFileAlloc(io, "cjs_emitter.zig", alloc, .limited(128 * 1024));
+        defer alloc.free(cjs_src);
+        try std.testing.expect(std.mem.indexOf(u8, cjs_src, ".ctor_target = .{ .module = \"cjs_emitter\", .name = \"MiniEmitter\", .is_default = true }") != null);
+
+        const idx_src = try out_h.readFileAlloc(io, "index.zig", alloc, .limited(512 * 1024));
+        defer alloc.free(idx_src);
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, "pub const CollapsedBool = bool;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, ".is_alias = true, .alias_of = \"ok\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, ".is_open_literal = true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, ".is_template_literal = true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, ".discriminant = \"kind\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, ".discriminant = \"ok\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, ".discriminant = \"op\"") != null);
+        // GenericEnvelope<number | undefined> must propagate `.variants` nullish override into `.item = .undefined_only`!
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, ".variants = .{ .{ .name = \"val\", .nullish = .{") != null);
+        try std.testing.expect(std.mem.indexOf(u8, idx_src, ".name = \"item\", .nullish = .undefined_only") != null);
+    }
+
+    const consumer_zig = try std.fmt.allocPrint(alloc, "{s}/consumer_issue47.zig", .{sandbox});
+    defer alloc.free(consumer_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "consumer_issue47.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r = @import("out/root.zig");
+            \\
+            \\test "Issue #47 Sema: enums, aliases, open literals, template patterns, discriminated & recursive unions" {
+            \\    // 1. Enums: backing types, aliases, const enum, i64 enum, mixed enum
+            \\    try std.testing.expectEqual(@as(i32, 200), r.HttpStatus.ok.toInt());
+            \\    try std.testing.expectEqual(r.HttpStatus.ok, r.HttpStatus.success_alias);
+            \\    try std.testing.expectEqual(@as(?r.HttpStatus, .not_found), r.HttpStatus.fromInt(404));
+            \\    try std.testing.expect(r.LogLevel.zigar_js.is_const);
+            \\    try std.testing.expectEqualStrings("info", r.LogLevel.info.toSlice());
+            \\    try std.testing.expectEqual(r.LogLevel.info, r.LogLevel.info_alias);
+            \\    try std.testing.expectEqual(@as(i64, 5_000_000_000), r.LargeEnum.big.toInt());
+            \\    try std.testing.expect(@typeInfo(r.MixedMode) == .@"enum");
+            \\
+            \\    // 2. Closed literal unions -> Zig enums + collapsed bool
+            \\    try std.testing.expect(@typeInfo(r.Encoding) == .@"enum");
+            \\    try std.testing.expectEqualStrings("utf-8", r.Encoding.utf_8.toSlice());
+            \\    try std.testing.expectEqual(@as(i32, -1), r.CompareResult.neg_1.toInt());
+            \\    try std.testing.expect(r.CollapsedBool == bool);
+            \\
+            \\    // 3. Open literal unions + `from` collision guard
+            \\    try std.testing.expectEqual(r.OpenEncoding.utf8, r.OpenEncoding.from("utf8"));
+            \\    const custom_enc = r.OpenEncoding.from("win1252");
+            \\    try std.testing.expectEqualStrings("win1252", custom_enc.custom);
+            \\    try std.testing.expectEqual(r.OpenPort.n_443, r.OpenPort.from(443));
+            \\    try std.testing.expectEqual(@as(f64, 8080), r.OpenPort.from(8080).custom);
+            \\    const fc: r.OpenFromCollision = .from;
+            \\    try std.testing.expect(fc == .from);
+            \\
+            \\    // 4. Finite & open template literals (`initComptime`, `matches`, `from`)
+            \\    try std.testing.expect(@typeInfo(r.EventHook) == .@"enum");
+            \\    try std.testing.expectEqualStrings("onData", r.EventHook.on_data.toSlice());
+            \\    const ver = comptime r.SemVer.initComptime("v26.1.0");
+            \\    try std.testing.expectEqualStrings("v26.1.0", ver.raw);
+            \\    try std.testing.expect(r.SemVer.matches("v0.17.1"));
+            \\    try std.testing.expect(!r.SemVer.matches("v0.17"));
+            \\    try std.testing.expectError(error.TypeError, r.SemVer.from("bad"));
+            \\    const url = comptime r.HttpUrl.initComptime("https://ziglang.org/download");
+            \\    try std.testing.expectEqualStrings("https://ziglang.org/download", url.raw);
+            \\
+            \\    // 5. Discriminated unions (intersection flattened, multi-tag, boolean, enum-member, generic)
+            \\    const ev1: r.AuditEvent = .{ .created = .{ .trace_id = "t1", .owner = "alice" } };
+            \\    try std.testing.expectEqualStrings("created", ev1.created.kind);
+            \\    const ev2: r.AuditEvent = .{ .updated_or_patched = .{ .trace_id = "t2", .kind = .patched, .rev = 3 } };
+            \\    try std.testing.expectEqual(@as(f64, 3), ev2.updated_or_patched.rev);
+            \\    const out_ok: r.Outcome = .{ .ok_true = .{ .payload = "done" } };
+            \\    try std.testing.expect(out_ok.ok_true.ok);
+            \\    const cmd_add: r.OpCommand = .{ .add = .{ .delta = 5 } };
+            \\    try std.testing.expectEqual(r.OpKind.add, cmd_add.add.op);
+            \\    const env_val: r.GenericEnvelope(?f64) = .{ .val = .{ .item = null } };
+            \\    try std.testing.expectEqualStrings("val", env_val.val.tag);
+            \\
+            \\    // 6. Recursive JsonValue has finite @sizeOf, and HeteroInput.from coerces cleanly
+            \\    try std.testing.expect(@sizeOf(r.JsonValue) > 0);
+            \\    const hi_str = r.HeteroInput.from("hello");
+            \\    try std.testing.expectEqualStrings("hello", hi_str.str);
+            \\    const hi_ver = r.HeteroInput.from(ver);
+            \\    try std.testing.expectEqualStrings("v26.1.0", hi_ver.sem_ver.raw);
+            \\}
+            ,
+        });
+    }
+
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
+}
+
+test "Issue #47 @types/node@26 sweep: buffer, fs, events, http, stream pass AstGen and deep 3-level recursive Zig Sema" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const types_node_dir = "/d/zigar-worktrees/.cache/ts-zigar/types-node26/node_modules/@types/node";
+    _ = cwd.statFile(io, "/d/zigar-worktrees/.cache/ts-zigar/types-node26/node_modules/@types/node/package.json", .{}) catch {
+        return error.SkipZigTest;
+    };
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue47-node26-sweep", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const cli_args = [_][]const u8{
+        "-t", types_node_dir,
+        "-m", "buffer",
+        "-m", "fs",
+        "-m", "events",
+        "-m", "http",
+        "-m", "stream",
+        "-d", out_dir,
+    };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Issue #47 @types/node@26 sweep error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+
+    const probe_zig = try std.fmt.allocPrint(alloc, "{s}/deep_sema_probe.zig", .{sandbox});
+    defer alloc.free(probe_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "deep_sema_probe.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r = @import("out/root.zig");
+            \\const globals = @import("out/globals.zig");
+            \\
+            \\fn touchRecursive(comptime T: type, comptime depth: usize) void {
+            \\    if (depth == 0) return;
+            \\    inline for (comptime std.meta.declarations(T)) |decl_name| {
+            \\        const val = @field(T, decl_name);
+            \\        _ = &@field(T, decl_name);
+            \\        if (@TypeOf(val) == type) {
+            \\            _ = @sizeOf(val);
+            \\            switch (@typeInfo(val)) {
+            \\                .@"struct", .@"union", .@"enum" => touchRecursive(val, depth - 1),
+            \\                else => {},
+            \\            }
+            \\        }
+            \\    }
+            \\}
+            \\
+            \\test "deep 3-level Sema across @types/node@26 buffer, fs, events, http, stream, globals" {
+            \\    @setEvalBranchQuota(10_000_000);
+            \\    touchRecursive(r.node_buffer, 3);
+            \\    touchRecursive(r.node_fs, 3);
+            \\    touchRecursive(r.node_events, 3);
+            \\    touchRecursive(r.node_http, 3);
+            \\    touchRecursive(r.node_stream, 3);
+            \\    touchRecursive(globals, 3);
+            \\
+            \\    try std.testing.expect(@typeInfo(r.node_buffer.BufferEncoding) == .@"enum");
+            \\    try std.testing.expectEqualStrings("utf-8", r.node_buffer.BufferEncoding.utf_8.toSlice());
+            \\    try std.testing.expectEqual(@as(?r.node_buffer.BufferEncoding, .hex), r.node_buffer.BufferEncoding.fromSlice("hex"));
+            \\    try std.testing.expect(@typeInfo(r.node_fs.BufferEncodingOption) == .@"union");
+            \\    try std.testing.expect(@typeInfo(r.node_fs.PathLike) == .@"union");
+            \\    try std.testing.expect(@typeInfo(r.node_fs.OpenMode) == .@"union");
+            \\}
+            ,
+        });
+    }
+
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", probe_zig });
+}
+
+
