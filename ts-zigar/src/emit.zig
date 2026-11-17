@@ -1,6 +1,7 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const naming = @import("naming.zig");
+const lower_types = @import("lower_types.zig");
 
 pub const EmittedFile = struct {
     /// POSIX relative path inside `out_dir` (e.g. `"root.zig"`, `"fs/promises.zig"`).
@@ -140,6 +141,25 @@ pub fn emitPackage(allocator: std.mem.Allocator, pkg: *const ir.PackageIr) std.m
                 return .{ .ast_error = diag_msg };
             },
         }
+    }
+
+    const raw_rt = try renderRuntimeRaw(allocator);
+    defer allocator.free(raw_rt);
+
+    switch (try validateAndFormatZigSource(allocator, "__zigar_runtime.zig", raw_rt)) {
+        .formatted => |fmt_rt| {
+            const rel_owned = try allocator.dupe(u8, "__zigar_runtime.zig");
+            errdefer allocator.free(rel_owned);
+            try files.append(allocator, .{
+                .rel_path = rel_owned,
+                .contents = fmt_rt,
+            });
+        },
+        .diagnostic => |diag_msg| {
+            for (files.items) |f| f.deinit(allocator);
+            files.deinit(allocator);
+            return .{ .ast_error = diag_msg };
+        },
     }
 
     const raw_root = try renderRootRaw(allocator, pkg);
@@ -374,14 +394,81 @@ const ModuleEmitCtx = struct {
     mod: *const ir.ModuleIr,
     out: std.ArrayList(u8) = .empty,
     nested_decl_scopes: std.ArrayList([]const []const u8) = .empty,
+    ns_wire_path: std.ArrayList([]const u8) = .empty,
     active_source_decls: std.AutoHashMapUnmanaged(u32, void) = .empty,
     emit_depth: usize = 0,
+    ret_type_counter: u32 = 0,
     used_self_mod_alias: bool = false,
 
     fn deinit(self: *ModuleEmitCtx) void {
         self.out.deinit(self.allocator);
         self.nested_decl_scopes.deinit(self.allocator);
+        self.ns_wire_path.deinit(self.allocator);
         self.active_source_decls.deinit(self.allocator);
+    }
+
+    fn isExportEqualsRootDecl(self: *const ModuleEmitCtx, d: ir.DeclIr) bool {
+        if (self.ns_wire_path.items.len != 0) return false;
+        const eq_wire = self.mod.export_equals_wire_name orelse return false;
+        return std.mem.eql(u8, eq_wire, d.wire_name);
+    }
+
+    fn emitCallTargetLiteral(
+        self: *ModuleEmitCtx,
+        is_global_scope: bool,
+        wire_name: []const u8,
+        is_default_call: bool,
+        extra_seg: ?[]const u8,
+    ) !void {
+        try self.out.appendSlice(self.allocator, ".{ ");
+        if (!is_global_scope) {
+            try self.out.appendSlice(self.allocator, ".module = ");
+            try self.emitStringLit(self.mod.wire_specifier);
+            try self.out.appendSlice(self.allocator, ", ");
+        }
+        var from_default = false;
+        var ns_start: usize = 0;
+        var skip_extra_seg = false;
+        if (!is_global_scope) {
+            if (self.mod.export_equals_wire_name) |eq_name| {
+                if (self.ns_wire_path.items.len > 0) {
+                    if (std.mem.eql(u8, self.ns_wire_path.items[0], eq_name)) {
+                        from_default = true;
+                        ns_start = 1;
+                    }
+                } else if (extra_seg) |es| {
+                    if (std.mem.eql(u8, es, eq_name)) {
+                        from_default = true;
+                        skip_extra_seg = true;
+                    }
+                }
+            }
+        }
+        const rem_ns = self.ns_wire_path.items[ns_start..];
+        const eff_extra: ?[]const u8 = if (skip_extra_seg) null else extra_seg;
+        if (rem_ns.len > 0 or eff_extra != null) {
+            try self.out.appendSlice(self.allocator, ".ns_path = &.{ ");
+            var seg_i: usize = 0;
+            for (rem_ns) |seg| {
+                if (seg_i > 0) try self.out.appendSlice(self.allocator, ", ");
+                try self.emitStringLit(seg);
+                seg_i += 1;
+            }
+            if (eff_extra) |es| {
+                if (seg_i > 0) try self.out.appendSlice(self.allocator, ", ");
+                try self.emitStringLit(es);
+            }
+            try self.out.appendSlice(self.allocator, " }, ");
+        }
+        try self.out.appendSlice(self.allocator, ".name = ");
+        try self.emitStringLit(wire_name);
+        if (is_default_call) {
+            try self.out.appendSlice(self.allocator, ", .is_default = true");
+        }
+        if (from_default) {
+            try self.out.appendSlice(self.allocator, ", .from_default = true");
+        }
+        try self.out.appendSlice(self.allocator, " }");
     }
 
     fn lookupImportAlias(self: *const ModuleEmitCtx, target_mod_idx: u32) ?[]const u8 {
@@ -401,6 +488,94 @@ const ModuleEmitCtx = struct {
         return false;
     }
 
+    fn isIdentTakenInCurrentScope(
+        self: *const ModuleEmitCtx,
+        ident: []const u8,
+        type_params: []const ir.TypeParamIr,
+    ) bool {
+        if (self.isShadowedInNestedScope(ident)) return true;
+        for (type_params) |tp| {
+            if (std.mem.eql(u8, unquoteZigIdent(tp.zig_ident), ident)) return true;
+        }
+        for (self.mod.imports) |imp| {
+            if (std.mem.eql(u8, unquoteZigIdent(imp.local_alias), ident)) return true;
+        }
+        for (self.mod.decls) |decl| {
+            if (std.mem.eql(u8, unquoteZigIdent(decl.zig_ident), ident)) return true;
+            if (decl.alloc_companion_ident) |aci| {
+                if (std.mem.eql(u8, unquoteZigIdent(aci), ident)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn freshPrivateTypeIdent(
+        self: *ModuleEmitCtx,
+        sig: ir.SignatureIr,
+    ) ![]u8 {
+        while (true) {
+            self.ret_type_counter += 1;
+            const cand = try std.fmt.allocPrint(self.allocator, "__ZigarRet_{d}", .{self.ret_type_counter});
+            var collides = self.isIdentTakenInCurrentScope(cand, sig.type_params);
+            if (!collides) {
+                if (sig.alloc_param_ident) |api| {
+                    if (std.mem.eql(u8, unquoteZigIdent(api), cand)) collides = true;
+                }
+            }
+            if (!collides) {
+                for (sig.params) |p| {
+                    if (std.mem.eql(u8, unquoteZigIdent(p.zig_ident), cand)) {
+                        collides = true;
+                        break;
+                    }
+                }
+            }
+            if (!collides) return cand;
+            self.allocator.free(cand);
+        }
+    }
+
+    fn emitSharedNominalTypeExpr(
+        self: *ModuleEmitCtx,
+        ty: *const ir.TypeIr,
+        sig: ir.SignatureIr,
+    ) ![]u8 {
+        const type_ident = try self.freshPrivateTypeIdent(sig);
+        defer self.allocator.free(type_ident);
+
+        if (sig.type_params.len == 0) {
+            try self.out.print(self.allocator, "const {s} = ", .{type_ident});
+            try self.emitType(ty);
+            try self.out.appendSlice(self.allocator, ";\n");
+            return try self.allocator.dupe(u8, type_ident);
+        } else {
+            try self.out.print(self.allocator, "fn {s}(", .{type_ident});
+            for (sig.type_params, 0..) |tp, idx| {
+                if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
+                try self.out.print(self.allocator, "comptime {s}: type", .{tp.zig_ident});
+            }
+            try self.out.appendSlice(self.allocator, ") type {\n");
+            for (sig.type_params) |tp| {
+                if (!typeUsesTypeParam(ty, tp.zig_ident)) {
+                    try self.out.print(self.allocator, "_ = {s};\n", .{tp.zig_ident});
+                }
+            }
+            try self.out.appendSlice(self.allocator, "return ");
+            try self.emitType(ty);
+            try self.out.appendSlice(self.allocator, ";\n}\n");
+
+            var expr: std.ArrayList(u8) = .empty;
+            errdefer expr.deinit(self.allocator);
+            try expr.print(self.allocator, "{s}(", .{type_ident});
+            for (sig.type_params, 0..) |tp, idx| {
+                if (idx > 0) try expr.appendSlice(self.allocator, ", ");
+                try expr.appendSlice(self.allocator, tp.zig_ident);
+            }
+            try expr.append(self.allocator, ')');
+            return try expr.toOwnedSlice(self.allocator);
+        }
+    }
+
     fn emitIdentSegment(self: *ModuleEmitCtx, seg: []const u8) !void {
         if (seg.len >= 3 and std.mem.startsWith(u8, seg, "@\"") and seg[seg.len - 1] == '"') {
             try self.out.appendSlice(self.allocator, seg);
@@ -417,6 +592,746 @@ const ModuleEmitCtx = struct {
         try self.out.appendSlice(self.allocator, lit);
     }
 
+    fn findDeclByZigPath(decls: []const ir.DeclIr, path: []const []const u8) ?*const ir.DeclIr {
+        if (path.len == 0) return null;
+        const head = unquoteZigIdent(path[0]);
+        for (decls) |*d| {
+            if (std.mem.eql(u8, unquoteZigIdent(d.zig_ident), head)) {
+                if (path.len == 1) return d;
+                return switch (d.kind) {
+                    .namespace_decl => |sub| findDeclByZigPath(sub, path[1..]),
+                    .struct_decl => |st| findDeclByZigPath(st.nested_decls, path[1..]),
+                    else => null,
+                };
+            }
+        }
+        return null;
+    }
+
+    const TypeParamEnv = struct {
+        params: []const ir.TypeParamIr,
+        args: []const *const ir.TypeIr,
+        arg_env: ?*const TypeParamEnv,
+    };
+
+    const VisitedDecl = struct {
+        key: []const u8,
+        prev: ?*const VisitedDecl,
+    };
+
+    fn isDeclKeyVisited(visited: ?*const VisitedDecl, key: []const u8) bool {
+        var cur = visited;
+        while (cur) |v| : (cur = v.prev) {
+            if (std.mem.eql(u8, v.key, key)) return true;
+        }
+        return false;
+    }
+
+    const FpVisited = struct {
+        mod_idx: u32,
+        decl_id: u32,
+        prev: ?*const FpVisited,
+    };
+
+    fn isFpVisited(visited: ?*const FpVisited, mod_idx: u32, decl_id: u32) bool {
+        var cur = visited;
+        while (cur) |v| : (cur = v.prev) {
+            if (v.mod_idx == mod_idx and v.decl_id == decl_id) return true;
+        }
+        return false;
+    }
+
+    const TargetTypeAlias = struct {
+        type_params: []const ir.TypeParamIr,
+        target: *const ir.TypeIr,
+    };
+
+    fn findTargetTypeAlias(self: *const ModuleEmitCtx, dref: ir.DeclRefIr) ?TargetTypeAlias {
+        if (dref.module_index >= self.pkg.modules.len) return null;
+        const target_mod = &self.pkg.modules[dref.module_index];
+        if (findDeclByZigPath(target_mod.decls, dref.decl_zig_path)) |target_decl| {
+            switch (target_decl.kind) {
+                .type_alias => |ta| return .{
+                    .type_params = ta.type_params,
+                    .target = ta.target,
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn findTargetGenericStruct(self: *const ModuleEmitCtx, dref: ir.DeclRefIr) ?ir.StructDeclIr {
+        if (dref.module_index >= self.pkg.modules.len) return null;
+        const target_mod = &self.pkg.modules[dref.module_index];
+        if (findDeclByZigPath(target_mod.decls, dref.decl_zig_path)) |target_decl| {
+            switch (target_decl.kind) {
+                .struct_decl => |st| {
+                    if (st.type_params.len > 0) return st;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn appendNullishFingerprint(
+        self: *const ModuleEmitCtx,
+        buf: *std.ArrayList(u8),
+        ty: *const ir.TypeIr,
+        env: ?*const TypeParamEnv,
+        fp_visited: ?*const FpVisited,
+        depth: usize,
+    ) error{OutOfMemory}!void {
+        if (depth >= 24) {
+            try buf.append(self.allocator, '_');
+            return;
+        }
+        switch (ty.*) {
+            .optional => |opt| {
+                const tag: []const u8 = switch (opt.nullish_kind) {
+                    .undefined_only, .none => "?u(",
+                    .null_only, .null_or_undefined => "?n(",
+                };
+                try buf.appendSlice(self.allocator, tag);
+                try self.appendNullishFingerprint(buf, opt.child, env, fp_visited, depth + 1);
+                try buf.append(self.allocator, ')');
+            },
+            .slice => |elem_ty| {
+                try buf.append(self.allocator, '[');
+                try self.appendNullishFingerprint(buf, elem_ty, env, fp_visited, depth + 1);
+                try buf.append(self.allocator, ']');
+            },
+            .pointer_const => |inner| {
+                try self.appendNullishFingerprint(buf, inner, env, fp_visited, depth + 1);
+            },
+            .anon_struct => |fields| {
+                try buf.append(self.allocator, '{');
+                for (fields) |f| {
+                    try buf.appendSlice(self.allocator, f.logical_name);
+                    try buf.append(self.allocator, if (f.is_optional) '?' else ':');
+                    try self.appendNullishFingerprint(buf, f.ty, env, fp_visited, depth + 1);
+                    try buf.append(self.allocator, ';');
+                }
+                try buf.append(self.allocator, '}');
+            },
+            .tuple => |elems| {
+                try buf.append(self.allocator, '(');
+                for (elems) |el| {
+                    if (el.is_variadic) {
+                        try buf.appendSlice(self.allocator, "...");
+                    } else if (el.is_optional) {
+                        try buf.append(self.allocator, '?');
+                    }
+                    try self.appendNullishFingerprint(buf, el.ty, env, fp_visited, depth + 1);
+                    try buf.append(self.allocator, ',');
+                }
+                try buf.append(self.allocator, ')');
+            },
+            .type_param_ref => |tp_ident| {
+                if (env) |e| {
+                    for (e.params, 0..) |tp, idx| {
+                        if (std.mem.eql(u8, tp.zig_ident, tp_ident)) {
+                            if (idx < e.args.len) {
+                                try self.appendNullishFingerprint(buf, e.args[idx], e.arg_env, fp_visited, depth + 1);
+                                return;
+                            }
+                            if (tp.default_type) |def_ty| {
+                                try self.appendNullishFingerprint(buf, def_ty, e, fp_visited, depth + 1);
+                                return;
+                            }
+                            break;
+                        }
+                    }
+                }
+                try buf.append(self.allocator, '@');
+                try buf.appendSlice(self.allocator, tp_ident);
+            },
+            .decl_ref => |dref| {
+                if (self.findTargetTypeAlias(dref)) |ta| {
+                    if (ta.type_params.len > 0 and isFpVisited(fp_visited, dref.module_index, dref.target_decl_id)) {
+                        try buf.print(self.allocator, "^a{d}:{d}", .{ dref.module_index, dref.target_decl_id });
+                        return;
+                    }
+                    const next_fp = FpVisited{
+                        .mod_idx = dref.module_index,
+                        .decl_id = dref.target_decl_id,
+                        .prev = fp_visited,
+                    };
+                    const next_env = TypeParamEnv{
+                        .params = ta.type_params,
+                        .args = dref.type_args,
+                        .arg_env = env,
+                    };
+                    try self.appendNullishFingerprint(
+                        buf,
+                        ta.target,
+                        if (ta.type_params.len > 0) &next_env else null,
+                        if (ta.type_params.len > 0) &next_fp else fp_visited,
+                        depth + 1,
+                    );
+                    return;
+                }
+                if (self.findTargetGenericStruct(dref)) |st| {
+                    if (isFpVisited(fp_visited, dref.module_index, dref.target_decl_id)) {
+                        try buf.print(self.allocator, "^s{d}:{d}", .{ dref.module_index, dref.target_decl_id });
+                        return;
+                    }
+                    const next_fp = FpVisited{
+                        .mod_idx = dref.module_index,
+                        .decl_id = dref.target_decl_id,
+                        .prev = fp_visited,
+                    };
+                    const self_env = TypeParamEnv{
+                        .params = st.type_params,
+                        .args = dref.type_args,
+                        .arg_env = env,
+                    };
+                    try buf.print(self.allocator, "s{d}:{d}<", .{ dref.module_index, dref.target_decl_id });
+                    for (st.type_params, 0..) |tp, idx| {
+                        if (idx > 0) try buf.append(self.allocator, ',');
+                        if (idx < dref.type_args.len) {
+                            try self.appendNullishFingerprint(buf, dref.type_args[idx], env, &next_fp, depth + 1);
+                        } else if (tp.default_type) |def_ty| {
+                            try self.appendNullishFingerprint(buf, def_ty, &self_env, &next_fp, depth + 1);
+                        } else {
+                            try buf.append(self.allocator, '_');
+                        }
+                    }
+                    try buf.append(self.allocator, '>');
+                    return;
+                }
+                try buf.append(self.allocator, '_');
+            },
+            else => try buf.append(self.allocator, '_'),
+        }
+    }
+
+    fn computeDeclSpecKey(
+        self: *const ModuleEmitCtx,
+        kind_prefix: []const u8,
+        dref: ir.DeclRefIr,
+        type_params: []const ir.TypeParamIr,
+        env: ?*const TypeParamEnv,
+    ) error{OutOfMemory}![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+        try buf.print(self.allocator, "{s}:{d}:{d}:", .{ kind_prefix, dref.module_index, dref.target_decl_id });
+        const self_env = TypeParamEnv{
+            .params = type_params,
+            .args = dref.type_args,
+            .arg_env = env,
+        };
+        for (type_params, 0..) |tp, idx| {
+            if (idx > 0) try buf.append(self.allocator, ',');
+            if (idx < dref.type_args.len) {
+                try self.appendNullishFingerprint(&buf, dref.type_args[idx], env, null, 0);
+            } else if (tp.default_type) |def_ty| {
+                try self.appendNullishFingerprint(&buf, def_ty, &self_env, null, 0);
+            } else {
+                try buf.append(self.allocator, '_');
+            }
+        }
+        return try buf.toOwnedSlice(self.allocator);
+    }
+
+    fn genericParamsArgsNeedSpec(
+        self: *const ModuleEmitCtx,
+        type_params: []const ir.TypeParamIr,
+        dref: ir.DeclRefIr,
+        env: ?*const TypeParamEnv,
+        visited: ?*const VisitedDecl,
+        depth: usize,
+    ) error{OutOfMemory}!bool {
+        const self_env = TypeParamEnv{
+            .params = type_params,
+            .args = dref.type_args,
+            .arg_env = env,
+        };
+        for (type_params, 0..) |tp, idx| {
+            if (idx < dref.type_args.len) {
+                if (try self.typeNeedsNullishSpecEnv(dref.type_args[idx], env, visited, depth + 1)) return true;
+            } else if (tp.default_type) |def_ty| {
+                if (try self.typeNeedsNullishSpecEnv(def_ty, &self_env, visited, depth + 1)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn isResolvedOptionalEnv(
+        self: *const ModuleEmitCtx,
+        ty: *const ir.TypeIr,
+        env: ?*const TypeParamEnv,
+        depth: usize,
+    ) bool {
+        if (depth >= 24) return false;
+        switch (ty.*) {
+            .optional => return true,
+            .pointer_const => |inner| return self.isResolvedOptionalEnv(inner, env, depth + 1),
+            .type_param_ref => |tp_ident| {
+                if (env) |e| {
+                    for (e.params, 0..) |tp, idx| {
+                        if (std.mem.eql(u8, tp.zig_ident, tp_ident)) {
+                            if (idx < e.args.len) {
+                                return self.isResolvedOptionalEnv(e.args[idx], e.arg_env, depth + 1);
+                            }
+                            if (tp.default_type) |def_ty| {
+                                return self.isResolvedOptionalEnv(def_ty, e, depth + 1);
+                            }
+                            return false;
+                        }
+                    }
+                }
+                return false;
+            },
+            .decl_ref => |dref| {
+                if (self.findTargetTypeAlias(dref)) |ta| {
+                    const next_env = TypeParamEnv{
+                        .params = ta.type_params,
+                        .args = dref.type_args,
+                        .arg_env = env,
+                    };
+                    return self.isResolvedOptionalEnv(
+                        ta.target,
+                        if (ta.type_params.len > 0) &next_env else null,
+                        depth + 1,
+                    );
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    fn isResolvedOptional(self: *const ModuleEmitCtx, ty: *const ir.TypeIr) bool {
+        return self.isResolvedOptionalEnv(ty, null, 0);
+    }
+
+    fn aliasTargetIsKeyableContainer(
+        self: *const ModuleEmitCtx,
+        ty: *const ir.TypeIr,
+        env: ?*const TypeParamEnv,
+        depth: usize,
+    ) bool {
+        if (depth >= 24) return false;
+        return switch (ty.*) {
+            .anon_struct, .tuple => true,
+            .optional => |opt| self.aliasTargetIsKeyableContainer(opt.child, env, depth + 1),
+            .pointer_const => |inner| self.aliasTargetIsKeyableContainer(inner, env, depth + 1),
+            .type_param_ref => |tp_ident| blk: {
+                if (env) |e| {
+                    for (e.params, 0..) |tp, idx| {
+                        if (std.mem.eql(u8, tp.zig_ident, tp_ident)) {
+                            if (idx < e.args.len) {
+                                break :blk self.aliasTargetIsKeyableContainer(e.args[idx], e.arg_env, depth + 1);
+                            }
+                            if (tp.default_type) |def_ty| {
+                                break :blk self.aliasTargetIsKeyableContainer(def_ty, e, depth + 1);
+                            }
+                            break :blk false;
+                        }
+                    }
+                }
+                break :blk false;
+            },
+            .decl_ref => |dref| blk: {
+                if (self.findTargetTypeAlias(dref)) |inner_ta| {
+                    if (self.aliasTargetIsKeyableContainer(inner_ta.target, null, depth + 1)) {
+                        break :blk false;
+                    }
+                    const next_env = TypeParamEnv{
+                        .params = inner_ta.type_params,
+                        .args = dref.type_args,
+                        .arg_env = env,
+                    };
+                    break :blk self.aliasTargetIsKeyableContainer(
+                        inner_ta.target,
+                        if (inner_ta.type_params.len > 0) &next_env else null,
+                        depth + 1,
+                    );
+                }
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
+    fn typeNeedsNullishSpecEnv(
+        self: *const ModuleEmitCtx,
+        ty: *const ir.TypeIr,
+        env: ?*const TypeParamEnv,
+        visited: ?*const VisitedDecl,
+        depth: usize,
+    ) error{OutOfMemory}!bool {
+        if (depth >= 24) return false;
+        switch (ty.*) {
+            .optional => return true,
+            .slice => |elem_ty| return self.typeNeedsNullishSpecEnv(elem_ty, env, visited, depth + 1),
+            .pointer_const => |inner| return self.typeNeedsNullishSpecEnv(inner, env, visited, depth + 1),
+            .anon_struct => |fields| {
+                if (env == null) return false;
+                for (fields) |f| {
+                    if (try self.typeNeedsNullishSpecEnv(f.ty, env, visited, depth + 1)) return true;
+                }
+                return false;
+            },
+            .tuple => |elems| {
+                if (env == null) return false;
+                for (elems) |el| {
+                    if (try self.typeNeedsNullishSpecEnv(el.ty, env, visited, depth + 1)) return true;
+                }
+                return false;
+            },
+            .type_param_ref => |tp_ident| {
+                if (env) |e| {
+                    for (e.params, 0..) |tp, idx| {
+                        if (std.mem.eql(u8, tp.zig_ident, tp_ident)) {
+                            if (idx < e.args.len) {
+                                return self.typeNeedsNullishSpecEnv(e.args[idx], e.arg_env, visited, depth + 1);
+                            }
+                            if (tp.default_type) |def_ty| {
+                                return self.typeNeedsNullishSpecEnv(def_ty, e, visited, depth + 1);
+                            }
+                            return false;
+                        }
+                    }
+                }
+                return false;
+            },
+            .decl_ref => |dref| {
+                if (self.findTargetTypeAlias(dref)) |ta| {
+                    if (ta.type_params.len > 0 and self.aliasTargetIsKeyableContainer(ta.target, null, 0)) {
+                        if (!try self.genericParamsArgsNeedSpec(ta.type_params, dref, env, visited, depth)) {
+                            return self.typeNeedsNullishSpecEnv(ta.target, null, visited, depth + 1);
+                        }
+                        const key = try self.computeDeclSpecKey("a", dref, ta.type_params, env);
+                        defer self.allocator.free(key);
+                        if (isDeclKeyVisited(visited, key)) return true;
+                        const next_visited = VisitedDecl{ .key = key, .prev = visited };
+                        const next_env = TypeParamEnv{
+                            .params = ta.type_params,
+                            .args = dref.type_args,
+                            .arg_env = env,
+                        };
+                        return try self.typeNeedsNullishSpecEnv(ta.target, &next_env, &next_visited, depth + 1);
+                    }
+                    const next_env = TypeParamEnv{
+                        .params = ta.type_params,
+                        .args = dref.type_args,
+                        .arg_env = env,
+                    };
+                    return self.typeNeedsNullishSpecEnv(
+                        ta.target,
+                        if (ta.type_params.len > 0) &next_env else null,
+                        visited,
+                        depth + 1,
+                    );
+                }
+                if (self.findTargetGenericStruct(dref)) |st| {
+                    if (!try self.genericParamsArgsNeedSpec(st.type_params, dref, env, visited, depth)) return false;
+                    const key = try self.computeDeclSpecKey("s", dref, st.type_params, env);
+                    defer self.allocator.free(key);
+                    if (isDeclKeyVisited(visited, key)) return true;
+                    const next_visited = VisitedDecl{ .key = key, .prev = visited };
+                    const next_env = TypeParamEnv{
+                        .params = st.type_params,
+                        .args = dref.type_args,
+                        .arg_env = env,
+                    };
+                    for (st.fields) |f| {
+                        if (try self.typeNeedsNullishSpecEnv(f.ty, &next_env, &next_visited, depth + 1)) return true;
+                    }
+                    return false;
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    fn emitRecurseSpec(self: *ModuleEmitCtx, key: []const u8, is_optional_site: bool) error{OutOfMemory}!void {
+        if (is_optional_site) {
+            try self.out.appendSlice(self.allocator, ".{ .self = .undefined_only, .child = .{ .recurse = ");
+            try self.emitStringLit(key);
+            try self.out.appendSlice(self.allocator, " } }");
+        } else {
+            try self.out.appendSlice(self.allocator, ".{ .recurse = ");
+            try self.emitStringLit(key);
+            try self.out.appendSlice(self.allocator, " }");
+        }
+    }
+
+    fn emitFieldsNullishSpecList(
+        self: *ModuleEmitCtx,
+        fields: []const ir.FieldIr,
+        env: *const TypeParamEnv,
+        visited: ?*const VisitedDecl,
+        spec_id: ?[]const u8,
+        self_tag: []const u8,
+        depth: usize,
+    ) error{OutOfMemory}!void {
+        try self.out.appendSlice(self.allocator, ".{ ");
+        if (spec_id) |id_str| {
+            try self.out.appendSlice(self.allocator, ".id = ");
+            try self.emitStringLit(id_str);
+            try self.out.appendSlice(self.allocator, ", ");
+        }
+        try self.out.print(self.allocator, ".self = {s}, .fields = .{{ ", .{self_tag});
+        var emitted: usize = 0;
+        for (fields) |f| {
+            if (!try self.typeNeedsNullishSpecEnv(f.ty, env, visited, depth + 1)) continue;
+            if (emitted > 0) try self.out.appendSlice(self.allocator, ", ");
+            try self.out.appendSlice(self.allocator, ".{ .name = ");
+            try self.emitStringLit(f.logical_name);
+            try self.out.appendSlice(self.allocator, ", .nullish = ");
+            try self.emitNullishSpecEnv(f.ty, env, visited, null, f.is_optional, depth + 1);
+            try self.out.appendSlice(self.allocator, " }");
+            emitted += 1;
+        }
+        try self.out.appendSlice(self.allocator, " } }");
+    }
+
+    fn emitNullishSpecEnv(
+        self: *ModuleEmitCtx,
+        ty: *const ir.TypeIr,
+        env: ?*const TypeParamEnv,
+        visited: ?*const VisitedDecl,
+        pending_id: ?[]const u8,
+        is_optional_site: bool,
+        depth: usize,
+    ) error{OutOfMemory}!void {
+        if (depth >= 24) {
+            try self.out.appendSlice(self.allocator, if (is_optional_site) ".undefined_only" else ".none");
+            return;
+        }
+        const default_self_tag: []const u8 = if (is_optional_site) ".undefined_only" else ".none";
+        switch (ty.*) {
+            .optional => |opt| {
+                const self_tag: []const u8 = if (is_optional_site)
+                    ".undefined_only"
+                else switch (opt.nullish_kind) {
+                    .undefined_only => ".undefined_only",
+                    .null_only, .null_or_undefined => ".null_only",
+                    .none => ".undefined_only",
+                };
+                if (try self.typeNeedsNullishSpecEnv(opt.child, env, visited, depth + 1)) {
+                    try self.out.appendSlice(self.allocator, ".{ ");
+                    if (pending_id) |id_str| {
+                        try self.out.appendSlice(self.allocator, ".id = ");
+                        try self.emitStringLit(id_str);
+                        try self.out.appendSlice(self.allocator, ", ");
+                    }
+                    try self.out.print(self.allocator, ".self = {s}, .child = ", .{self_tag});
+                    try self.emitNullishSpecEnv(opt.child, env, visited, null, false, depth + 1);
+                    try self.out.appendSlice(self.allocator, " }");
+                } else {
+                    try self.out.appendSlice(self.allocator, self_tag);
+                }
+            },
+            .slice => |elem_ty| {
+                if (try self.typeNeedsNullishSpecEnv(elem_ty, env, visited, depth + 1)) {
+                    try self.out.print(self.allocator, ".{{ .self = {s}, .elem = ", .{default_self_tag});
+                    try self.emitNullishSpecEnv(elem_ty, env, visited, null, false, depth + 1);
+                    try self.out.appendSlice(self.allocator, " }");
+                } else {
+                    try self.out.appendSlice(self.allocator, default_self_tag);
+                }
+            },
+            .anon_struct => |fields| {
+                if (env) |e| {
+                    if (try self.typeNeedsNullishSpecEnv(ty, e, visited, depth)) {
+                        try self.emitFieldsNullishSpecList(fields, e, visited, pending_id, default_self_tag, depth);
+                        return;
+                    }
+                }
+                try self.out.appendSlice(self.allocator, default_self_tag);
+            },
+            .tuple => |elems| {
+                if (env) |e| {
+                    if (try self.typeNeedsNullishSpecEnv(ty, e, visited, depth)) {
+                        try self.out.appendSlice(self.allocator, ".{ ");
+                        if (pending_id) |id_str| {
+                            try self.out.appendSlice(self.allocator, ".id = ");
+                            try self.emitStringLit(id_str);
+                            try self.out.appendSlice(self.allocator, ", ");
+                        }
+                        try self.out.print(self.allocator, ".self = {s}, .tuple = .{{ ", .{default_self_tag});
+                        for (elems, 0..) |el, idx| {
+                            if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
+                            if (el.is_variadic) {
+                                try self.emitSliceElemNullishSpecEnv(el.ty, e, visited, depth + 1);
+                            } else {
+                                try self.emitNullishSpecEnv(el.ty, e, visited, null, el.is_optional, depth + 1);
+                            }
+                        }
+                        try self.out.appendSlice(self.allocator, " } }");
+                        return;
+                    }
+                }
+                try self.out.appendSlice(self.allocator, default_self_tag);
+            },
+            .pointer_const => |inner| {
+                try self.emitNullishSpecEnv(inner, env, visited, pending_id, is_optional_site, depth + 1);
+            },
+            .type_param_ref => |tp_ident| {
+                if (env) |e| {
+                    for (e.params, 0..) |tp, idx| {
+                        if (std.mem.eql(u8, tp.zig_ident, tp_ident)) {
+                            if (idx < e.args.len) {
+                                try self.emitNullishSpecEnv(e.args[idx], e.arg_env, visited, pending_id, is_optional_site, depth + 1);
+                                return;
+                            }
+                            if (tp.default_type) |def_ty| {
+                                try self.emitNullishSpecEnv(def_ty, e, visited, pending_id, is_optional_site, depth + 1);
+                                return;
+                            }
+                            break;
+                        }
+                    }
+                }
+                try self.out.appendSlice(self.allocator, default_self_tag);
+            },
+            .decl_ref => |dref| {
+                if (self.findTargetTypeAlias(dref)) |ta| {
+                    if (ta.type_params.len > 0 and self.aliasTargetIsKeyableContainer(ta.target, null, 0)) {
+                        if (try self.genericParamsArgsNeedSpec(ta.type_params, dref, env, visited, depth)) {
+                            const key = try self.computeDeclSpecKey("a", dref, ta.type_params, env);
+                            defer self.allocator.free(key);
+                            if (isDeclKeyVisited(visited, key)) {
+                                try self.emitRecurseSpec(key, is_optional_site);
+                                return;
+                            }
+                            const next_visited = VisitedDecl{ .key = key, .prev = visited };
+                            const next_env = TypeParamEnv{
+                                .params = ta.type_params,
+                                .args = dref.type_args,
+                                .arg_env = env,
+                            };
+                            if (try self.typeNeedsNullishSpecEnv(ta.target, &next_env, &next_visited, depth + 1)) {
+                                try self.emitNullishSpecEnv(ta.target, &next_env, &next_visited, key, is_optional_site, depth + 1);
+                                return;
+                            }
+                        }
+                        try self.emitNullishSpecEnv(ta.target, null, visited, null, is_optional_site, depth + 1);
+                        return;
+                    }
+                    const next_env = TypeParamEnv{
+                        .params = ta.type_params,
+                        .args = dref.type_args,
+                        .arg_env = env,
+                    };
+                    try self.emitNullishSpecEnv(
+                        ta.target,
+                        if (ta.type_params.len > 0) &next_env else null,
+                        visited,
+                        pending_id,
+                        is_optional_site,
+                        depth + 1,
+                    );
+                    return;
+                }
+                if (self.findTargetGenericStruct(dref)) |st| {
+                    if (try self.genericParamsArgsNeedSpec(st.type_params, dref, env, visited, depth)) {
+                        const key = try self.computeDeclSpecKey("s", dref, st.type_params, env);
+                        defer self.allocator.free(key);
+                        if (isDeclKeyVisited(visited, key)) {
+                            try self.emitRecurseSpec(key, is_optional_site);
+                            return;
+                        }
+                        const next_visited = VisitedDecl{ .key = key, .prev = visited };
+                        const next_env = TypeParamEnv{
+                            .params = st.type_params,
+                            .args = dref.type_args,
+                            .arg_env = env,
+                        };
+                        var has_field_spec = false;
+                        for (st.fields) |f| {
+                            if (try self.typeNeedsNullishSpecEnv(f.ty, &next_env, &next_visited, depth + 1)) {
+                                has_field_spec = true;
+                                break;
+                            }
+                        }
+                        if (has_field_spec) {
+                            try self.emitFieldsNullishSpecList(st.fields, &next_env, &next_visited, key, default_self_tag, depth);
+                            return;
+                        }
+                    }
+                }
+                try self.out.appendSlice(self.allocator, default_self_tag);
+            },
+            else => {
+                try self.out.appendSlice(self.allocator, default_self_tag);
+            },
+        }
+    }
+
+    fn emitNullishSpec(self: *ModuleEmitCtx, ty: *const ir.TypeIr, is_optional_site: bool) error{OutOfMemory}!void {
+        try self.emitNullishSpecEnv(ty, null, null, null, is_optional_site, 0);
+    }
+
+    fn emitSliceElemNullishSpecEnv(
+        self: *ModuleEmitCtx,
+        ty: *const ir.TypeIr,
+        env: ?*const TypeParamEnv,
+        visited: ?*const VisitedDecl,
+        depth: usize,
+    ) error{OutOfMemory}!void {
+        if (depth >= 24) {
+            try self.out.appendSlice(self.allocator, ".none");
+            return;
+        }
+        switch (ty.*) {
+            .slice => |elem_ty| {
+                try self.emitNullishSpecEnv(elem_ty, env, visited, null, false, depth + 1);
+            },
+            .pointer_const => |inner| {
+                try self.emitSliceElemNullishSpecEnv(inner, env, visited, depth + 1);
+            },
+            .type_param_ref => |tp_ident| {
+                if (env) |e| {
+                    for (e.params, 0..) |tp, idx| {
+                        if (std.mem.eql(u8, tp.zig_ident, tp_ident)) {
+                            if (idx < e.args.len) {
+                                try self.emitSliceElemNullishSpecEnv(e.args[idx], e.arg_env, visited, depth + 1);
+                                return;
+                            }
+                            if (tp.default_type) |def_ty| {
+                                try self.emitSliceElemNullishSpecEnv(def_ty, e, visited, depth + 1);
+                                return;
+                            }
+                            break;
+                        }
+                    }
+                }
+                try self.out.appendSlice(self.allocator, ".none");
+            },
+            .decl_ref => |dref| {
+                if (self.findTargetTypeAlias(dref)) |ta| {
+                    const next_env = TypeParamEnv{
+                        .params = ta.type_params,
+                        .args = dref.type_args,
+                        .arg_env = env,
+                    };
+                    try self.emitSliceElemNullishSpecEnv(
+                        ta.target,
+                        if (ta.type_params.len > 0) &next_env else null,
+                        visited,
+                        depth + 1,
+                    );
+                    return;
+                }
+                try self.out.appendSlice(self.allocator, ".none");
+            },
+            else => {
+                try self.out.appendSlice(self.allocator, ".none");
+            },
+        }
+    }
+
+    fn emitSliceElemNullishSpec(self: *ModuleEmitCtx, ty: *const ir.TypeIr) error{OutOfMemory}!void {
+        try self.emitSliceElemNullishSpecEnv(ty, null, null, 0);
+    }
+
     fn emitType(self: *ModuleEmitCtx, ty: *const ir.TypeIr) error{OutOfMemory}!void {
         switch (ty.*) {
             .void_type => try self.out.appendSlice(self.allocator, "void"),
@@ -426,14 +1341,18 @@ const ModuleEmitCtx = struct {
             .i64_type => try self.out.appendSlice(self.allocator, "i64"),
             .string_type, .bytes_type => try self.out.appendSlice(self.allocator, "[]const u8"),
             .typed_slice => |el| try self.out.print(self.allocator, "[]const {s}", .{@tagName(el)}),
-            .js_value => try self.out.appendSlice(self.allocator, "__zigar_js.JsValue"),
-            .js_object => try self.out.appendSlice(self.allocator, "__zigar_js.JsObject"),
-            .js_symbol => try self.out.appendSlice(self.allocator, "__zigar_js.JsSymbol"),
+            .js_value, .js_any => try self.out.appendSlice(self.allocator, "__zigar_js.Any"),
+            .js_unknown => try self.out.appendSlice(self.allocator, "__zigar_js.Unknown"),
+            .js_object => try self.out.appendSlice(self.allocator, "__zigar_js.Object"),
+            .js_symbol => try self.out.appendSlice(self.allocator, "__zigar_js.Symbol"),
+            .js_bigint => try self.out.appendSlice(self.allocator, "__zigar_js.BigInt"),
+            .js_string => try self.out.appendSlice(self.allocator, "__zigar_js.String"),
+            .binary_view => |bvk| try self.out.print(self.allocator, "__zigar_js.{s}", .{bvk.zigTypeIdent()}),
             .self_type => |sid| try self.emitIdentSegment(sid),
             .type_param_ref => |tp_ident| try self.out.appendSlice(self.allocator, tp_ident),
-            .optional => |inner| {
+            .optional => |opt| {
                 try self.out.append(self.allocator, '?');
-                try self.emitType(inner);
+                try self.emitType(opt.child);
             },
             .pointer_const => |inner| {
                 try self.out.appendSlice(self.allocator, "*const ");
@@ -449,23 +1368,61 @@ const ModuleEmitCtx = struct {
                 try self.out.append(self.allocator, ')');
             },
             .js_map => |m| {
-                try self.out.appendSlice(self.allocator, "__zigar_js.JsMap(");
+                try self.out.appendSlice(self.allocator, "__zigar_js.Map(");
                 try self.emitType(m.key);
                 try self.out.appendSlice(self.allocator, ", ");
                 try self.emitType(m.value);
                 try self.out.append(self.allocator, ')');
             },
             .tuple => |elems| {
+                var variadic_idx: ?usize = null;
+                for (elems, 0..) |el, idx| {
+                    if (el.is_variadic and variadic_idx == null) {
+                        variadic_idx = idx;
+                    }
+                }
+
+                const tup_frame = [_][]const u8{"zigar_js_tuple"};
+                try self.nested_decl_scopes.append(self.allocator, &tup_frame);
+                defer _ = self.nested_decl_scopes.pop();
+
                 try self.out.appendSlice(self.allocator, "struct { ");
                 for (elems, 0..) |el, idx| {
                     if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
                     try self.out.print(self.allocator, "{s}: ", .{el.zig_ident});
                     try self.emitType(el.ty);
-                    if (el.ty.* == .optional) {
+                    if (el.is_variadic) {
+                        try self.out.appendSlice(self.allocator, " = &.{}");
+                    } else if (el.is_optional and self.isResolvedOptional(el.ty)) {
                         try self.out.appendSlice(self.allocator, " = null");
                     }
                 }
-                try self.out.appendSlice(self.allocator, " }");
+                if (elems.len > 0) try self.out.appendSlice(self.allocator, ", ");
+                if (variadic_idx) |vi| {
+                    try self.out.print(
+                        self.allocator,
+                        "pub const zigar_js_tuple = .{{ .variadic_index = @as(?usize, {d}), .fields = .{{ ",
+                        .{vi},
+                    );
+                } else {
+                    try self.out.appendSlice(
+                        self.allocator,
+                        "pub const zigar_js_tuple = .{ .variadic_index = @as(?usize, null), .fields = .{ ",
+                    );
+                }
+                for (elems, 0..) |el, idx| {
+                    if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
+                    try self.out.print(self.allocator, ".{{ .is_optional = {s}, .nullish = ", .{
+                        if (el.is_optional) "true" else "false",
+                    });
+                    if (el.is_variadic) {
+                        try self.emitSliceElemNullishSpec(el.ty);
+                    } else {
+                        try self.emitNullishSpec(el.ty, el.is_optional);
+                    }
+                    try self.out.appendSlice(self.allocator, " }");
+                }
+                try self.out.appendSlice(self.allocator, " } }; }");
             },
             .fn_ptr => |fp| {
                 try self.out.appendSlice(self.allocator, "*const fn (");
@@ -477,17 +1434,33 @@ const ModuleEmitCtx = struct {
                 try self.emitType(fp.return_type);
             },
             .anon_struct => |fields| {
+                const anon_frame = [_][]const u8{"zigar_js"};
+                try self.nested_decl_scopes.append(self.allocator, &anon_frame);
+                defer _ = self.nested_decl_scopes.pop();
+
                 try self.out.appendSlice(self.allocator, "struct {\n");
                 for (fields) |f| {
                     if (f.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
                     try self.out.print(self.allocator, "{s}: ", .{f.zig_ident});
                     try self.emitType(f.ty);
-                    if (f.ty.* == .optional) {
+                    if (f.is_optional and self.isResolvedOptional(f.ty)) {
                         try self.out.appendSlice(self.allocator, " = null");
                     }
                     try self.out.appendSlice(self.allocator, ",\n");
                 }
-                try self.out.append(self.allocator, '}');
+                try self.out.appendSlice(self.allocator, "pub const zigar_js = .{\n.fields = .{\n");
+                for (fields) |f| {
+                    try self.out.appendSlice(self.allocator, ".{ .name = ");
+                    try self.emitStringLit(f.logical_name);
+                    try self.out.appendSlice(self.allocator, ", .js_name = ");
+                    try self.emitStringLit(f.wire_name);
+                    try self.out.print(self.allocator, ", .is_optional = {s}, .nullish = ", .{
+                        if (f.is_optional) "true" else "false",
+                    });
+                    try self.emitNullishSpec(f.ty, f.is_optional);
+                    try self.out.appendSlice(self.allocator, " },\n");
+                }
+                try self.out.appendSlice(self.allocator, "},\n};\n}");
             },
             .tagged_union => |vars| {
                 try self.out.appendSlice(self.allocator, "union(enum) {\n");
@@ -561,10 +1534,11 @@ const ModuleEmitCtx = struct {
             },
             .bigint_val => |raw_bi| {
                 _ = ty;
-                const clean_bi = std.mem.trimEnd(u8, std.mem.trim(u8, raw_bi, " \t"), "n");
-                if (std.fmt.parseInt(i64, clean_bi, 10)) |parsed_i64| {
+                const clean_bi = try lower_types.normalizeBigIntLiteral(self.allocator, raw_bi);
+                defer self.allocator.free(clean_bi);
+                if (std.fmt.parseInt(i64, clean_bi, 0)) |parsed_i64| {
                     try self.out.print(self.allocator, "{s}const {s}: i64 = {d};\n", .{ pub_kw, zig_ident, parsed_i64 });
-                } else |_| if (std.fmt.parseInt(i128, clean_bi, 10)) |parsed_i128| {
+                } else |_| if (std.fmt.parseInt(i128, clean_bi, 0)) |parsed_i128| {
                     try self.out.print(self.allocator, "{s}const {s}: i128 = {d};\n", .{ pub_kw, zig_ident, parsed_i128 });
                 } else |_| {
                     try self.out.print(self.allocator, "{s}const {s}: []const u8 = ", .{ pub_kw, zig_ident });
@@ -623,12 +1597,226 @@ const ModuleEmitCtx = struct {
         try self.out.appendSlice(self.allocator, "@panic(\"ts-zigar host stub\");\n}\n");
     }
 
+    fn emitCallableFunctionBody(
+        self: *ModuleEmitCtx,
+        d: ir.DeclIr,
+        sig: ir.SignatureIr,
+        alloc_ident_opt: ?[]const u8,
+        ret_type_expr_opt: ?[]const u8,
+        is_default_call: bool,
+    ) !void {
+        for (sig.type_params) |tp| {
+            if (!signatureUsesTypeParam(sig, tp.zig_ident)) {
+                try self.out.print(self.allocator, "_ = {s};\n", .{tp.zig_ident});
+            }
+        }
+
+        const has_rest = sig.params.len > 0 and sig.params[sig.params.len - 1].is_rest;
+        const fixed_len = if (has_rest) sig.params.len - 1 else sig.params.len;
+
+        var first_trailing_opt: usize = fixed_len;
+        while (first_trailing_opt > 0 and
+            sig.params[first_trailing_opt - 1].is_optional and
+            self.isResolvedOptional(sig.params[first_trailing_opt - 1].ty))
+        {
+            first_trailing_opt -= 1;
+        }
+
+        try self.out.appendSlice(self.allocator, "const __zigar_args = try __zigar_js.initArgs();\ndefer __zigar_args.deinit();\n");
+        if (first_trailing_opt < fixed_len) {
+            try self.out.print(self.allocator, "var __zigar_argc: usize = {d};\n", .{fixed_len});
+            if (has_rest) {
+                try self.out.print(self.allocator, "if ({s}.len == 0) {{\n", .{sig.params[fixed_len].zig_ident});
+            }
+            var rev: usize = fixed_len;
+            while (rev > first_trailing_opt) {
+                rev -= 1;
+                try self.out.print(
+                    self.allocator,
+                    "if (__zigar_argc == {d} and {s} == null) __zigar_argc = {d};\n",
+                    .{ rev + 1, sig.params[rev].zig_ident, rev },
+                );
+            }
+            if (has_rest) {
+                try self.out.appendSlice(self.allocator, "}\n");
+            }
+        }
+        for (sig.params[0..fixed_len], 0..) |p, pi| {
+            if (pi >= first_trailing_opt) {
+                try self.out.print(
+                    self.allocator,
+                    "if (__zigar_argc > {d}) try __zigar_js.pushArg(__zigar_args, {s}, ",
+                    .{ pi, p.zig_ident },
+                );
+            } else {
+                try self.out.print(
+                    self.allocator,
+                    "try __zigar_js.pushArg(__zigar_args, {s}, ",
+                    .{p.zig_ident},
+                );
+            }
+            try self.emitNullishSpec(p.ty, p.is_optional);
+            try self.out.appendSlice(self.allocator, ");\n");
+        }
+        if (has_rest) {
+            const rest_param = sig.params[fixed_len];
+            try self.out.print(
+                self.allocator,
+                "try __zigar_js.pushRestArgs(__zigar_args, {s}, ",
+                .{rest_param.zig_ident},
+            );
+            try self.emitSliceElemNullishSpec(rest_param.ty);
+            try self.out.appendSlice(self.allocator, ");\n");
+        }
+
+        if (alloc_ident_opt) |alloc_param| {
+            try self.out.appendSlice(self.allocator, "return __zigar_js.invokeTargetAlloc(");
+            if (ret_type_expr_opt) |rtexpr| {
+                try self.out.appendSlice(self.allocator, rtexpr);
+            } else {
+                try self.emitType(sig.return_type);
+            }
+            try self.out.print(self.allocator, ", {s}, ", .{alloc_param});
+            try self.emitCallTargetLiteral(d.is_global_scope, d.wire_name, is_default_call, null);
+            try self.out.appendSlice(self.allocator, ", __zigar_args);\n");
+        } else {
+            try self.out.appendSlice(self.allocator, "return __zigar_js.invokeTarget(");
+            if (ret_type_expr_opt) |rtexpr| {
+                try self.out.appendSlice(self.allocator, rtexpr);
+            } else {
+                try self.emitType(sig.return_type);
+            }
+            try self.out.appendSlice(self.allocator, ", ");
+            try self.emitCallTargetLiteral(d.is_global_scope, d.wire_name, is_default_call, null);
+            try self.out.appendSlice(self.allocator, ", __zigar_args);\n");
+        }
+    }
+
+    fn emitCallableFunction(
+        self: *ModuleEmitCtx,
+        pub_kw: []const u8,
+        d: ir.DeclIr,
+        sig: ir.SignatureIr,
+    ) !void {
+        const is_default_call = !d.is_global_scope and
+            self.ns_wire_path.items.len == 0 and
+            (d.is_default_export or self.isExportEqualsRootDecl(d));
+
+        var param_type_exprs = try self.allocator.alloc(?[]u8, sig.params.len);
+        @memset(param_type_exprs, null);
+        defer {
+            for (param_type_exprs) |pte_opt| {
+                if (pte_opt) |buf| self.allocator.free(buf);
+            }
+            self.allocator.free(param_type_exprs);
+        }
+
+        if (d.alloc_companion_ident != null) {
+            for (sig.params, 0..) |p, pi| {
+                if (typeHasInlineNominal(p.ty)) {
+                    param_type_exprs[pi] = try self.emitSharedNominalTypeExpr(p.ty, sig);
+                }
+            }
+        }
+
+        var ret_type_expr_opt: ?[]u8 = null;
+        defer if (ret_type_expr_opt) |buf| self.allocator.free(buf);
+
+        if (typeHasInlineNominal(sig.return_type)) {
+            ret_type_expr_opt = try self.emitSharedNominalTypeExpr(sig.return_type, sig);
+        }
+
+        if (d.jsdoc) |jd| {
+            try appendJsDocComments(&self.out, self.allocator, jd);
+        }
+
+        try self.out.print(self.allocator, "{s}fn {s}(", .{ pub_kw, d.zig_ident });
+        var param_count: usize = 0;
+        for (sig.type_params) |tp| {
+            if (param_count > 0) try self.out.appendSlice(self.allocator, ", ");
+            try self.out.print(self.allocator, "comptime {s}: type", .{tp.zig_ident});
+            param_count += 1;
+        }
+        for (sig.params, 0..) |p, pi| {
+            if (param_count > 0) try self.out.appendSlice(self.allocator, ", ");
+            try self.out.print(self.allocator, "{s}: ", .{p.zig_ident});
+            if (param_type_exprs[pi]) |ptexpr| {
+                try self.out.appendSlice(self.allocator, ptexpr);
+            } else {
+                try self.emitType(p.ty);
+            }
+            param_count += 1;
+        }
+        try self.out.appendSlice(self.allocator, ") __zigar_js.CallError!");
+        if (ret_type_expr_opt) |rtexpr| {
+            try self.out.appendSlice(self.allocator, rtexpr);
+        } else {
+            try self.emitType(sig.return_type);
+        }
+        try self.out.appendSlice(self.allocator, " {\n");
+
+        if (d.alloc_companion_ident) |alloc_fn_ident| {
+            try self.out.print(self.allocator, "return {s}(", .{alloc_fn_ident});
+            var call_idx: usize = 0;
+            for (sig.type_params) |tp| {
+                if (call_idx > 0) try self.out.appendSlice(self.allocator, ", ");
+                try self.out.appendSlice(self.allocator, tp.zig_ident);
+                call_idx += 1;
+            }
+            if (call_idx > 0) try self.out.appendSlice(self.allocator, ", ");
+            try self.out.appendSlice(self.allocator, "try __zigar_js.defaultAllocator()");
+            call_idx += 1;
+            for (sig.params) |p| {
+                try self.out.print(self.allocator, ", {s}", .{p.zig_ident});
+            }
+            try self.out.appendSlice(self.allocator, ");\n}\n");
+
+            const alloc_param = sig.alloc_param_ident orelse "allocator";
+            try self.out.print(self.allocator, "{s}fn {s}(", .{ pub_kw, alloc_fn_ident });
+            var ap_count: usize = 0;
+            for (sig.type_params) |tp| {
+                if (ap_count > 0) try self.out.appendSlice(self.allocator, ", ");
+                try self.out.print(self.allocator, "comptime {s}: type", .{tp.zig_ident});
+                ap_count += 1;
+            }
+            if (ap_count > 0) try self.out.appendSlice(self.allocator, ", ");
+            try self.out.print(self.allocator, "{s}: @import(\"std\").mem.Allocator", .{alloc_param});
+            ap_count += 1;
+            for (sig.params, 0..) |p, pi| {
+                try self.out.print(self.allocator, ", {s}: ", .{p.zig_ident});
+                if (param_type_exprs[pi]) |ptexpr| {
+                    try self.out.appendSlice(self.allocator, ptexpr);
+                } else {
+                    try self.emitType(p.ty);
+                }
+            }
+            try self.out.appendSlice(self.allocator, ") __zigar_js.CallError!");
+            if (ret_type_expr_opt) |rtexpr| {
+                try self.out.appendSlice(self.allocator, rtexpr);
+            } else {
+                try self.emitType(sig.return_type);
+            }
+            try self.out.appendSlice(self.allocator, " {\n");
+            try self.emitCallableFunctionBody(d, sig, alloc_param, ret_type_expr_opt, is_default_call);
+            try self.out.appendSlice(self.allocator, "}\n");
+        } else {
+            try self.emitCallableFunctionBody(d, sig, null, ret_type_expr_opt, is_default_call);
+            try self.out.appendSlice(self.allocator, "}\n");
+        }
+    }
+
     fn emitStructBody(
         self: *ModuleEmitCtx,
         wire_name: []const u8,
+        is_global_scope: bool,
+        push_owner_seg: bool,
         st: ir.StructDeclIr,
     ) error{OutOfMemory}!void {
-        const frame_count = 2 + st.static_props.len + st.constructors.len + st.methods.len + st.nested_decls.len;
+        var extra_alloc_companions: usize = 0;
+        for (st.nested_decls) |nd| {
+            if (nd.alloc_companion_ident != null) extra_alloc_companions += 1;
+        }
+        const frame_count = 2 + st.static_props.len + st.constructors.len + st.methods.len + st.nested_decls.len + extra_alloc_companions;
         var frame = try self.allocator.alloc([]const u8, frame_count);
         defer self.allocator.free(frame);
         var fi: usize = 0;
@@ -651,6 +1839,10 @@ const ModuleEmitCtx = struct {
         for (st.nested_decls) |nd| {
             frame[fi] = nd.zig_ident;
             fi += 1;
+            if (nd.alloc_companion_ident) |aci| {
+                frame[fi] = aci;
+                fi += 1;
+            }
         }
         try self.nested_decl_scopes.append(self.allocator, frame);
         defer _ = self.nested_decl_scopes.pop();
@@ -662,7 +1854,7 @@ const ModuleEmitCtx = struct {
             if (f.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
             try self.out.print(self.allocator, "{s}: ", .{f.zig_ident});
             try self.emitType(f.ty);
-            if (f.ty.* == .optional) {
+            if (f.is_optional and self.isResolvedOptional(f.ty)) {
                 try self.out.appendSlice(self.allocator, " = null");
             }
             try self.out.appendSlice(self.allocator, ",\n");
@@ -673,11 +1865,18 @@ const ModuleEmitCtx = struct {
             if (sp.literal) |lit| {
                 try self.emitLiteralConst("pub ", sp.zig_ident, sp.ty, lit);
             } else {
-                try self.out.print(self.allocator, "pub const {s}: __zigar_js.Global(", .{sp.zig_ident});
+                try self.out.print(self.allocator, "pub const {s}: __zigar_js.GlobalTarget(", .{sp.zig_ident});
                 try self.emitType(sp.ty);
-                try self.out.appendSlice(self.allocator, ") = .{ .js_name = ");
-                try self.emitStringLit(sp.wire_name);
-                try self.out.appendSlice(self.allocator, " };\n");
+                try self.out.appendSlice(self.allocator, ", ");
+                try self.emitCallTargetLiteral(
+                    is_global_scope,
+                    sp.wire_name,
+                    false,
+                    if (push_owner_seg) wire_name else null,
+                );
+                try self.out.appendSlice(self.allocator, ", ");
+                try self.emitNullishSpec(sp.ty, false);
+                try self.out.appendSlice(self.allocator, ") = .{};\n");
             }
         }
 
@@ -694,6 +1893,13 @@ const ModuleEmitCtx = struct {
             const self_ty: ?[]const u8 = if (m.is_static) null else self_ptr_ty;
             try self.emitFunction("pub ", m.zig_ident, self_ty, m.signature);
         }
+
+        if (push_owner_seg) {
+            try self.ns_wire_path.append(self.allocator, wire_name);
+        }
+        defer if (push_owner_seg) {
+            _ = self.ns_wire_path.pop();
+        };
 
         for (st.nested_decls) |nd| {
             try self.emitDecl(nd);
@@ -724,6 +1930,10 @@ const ModuleEmitCtx = struct {
             try self.emitStringLit(f.logical_name);
             try self.out.appendSlice(self.allocator, ", .js_name = ");
             try self.emitStringLit(f.wire_name);
+            try self.out.print(self.allocator, ", .is_optional = {s}, .nullish = ", .{
+                if (f.is_optional) "true" else "false",
+            });
+            try self.emitNullishSpec(f.ty, f.is_optional);
             try self.out.appendSlice(self.allocator, " },\n");
         }
         try self.out.appendSlice(self.allocator, "},\n.methods = .{\n");
@@ -742,19 +1952,26 @@ const ModuleEmitCtx = struct {
     fn emitEnumBody(
         self: *ModuleEmitCtx,
         wire_name: []const u8,
+        is_global_scope: bool,
+        push_owner_seg: bool,
         is_const: bool,
         has_unknown_values: bool,
         members: []const ir.EnumMemberIr,
     ) !void {
         if (has_unknown_values) {
-            try self.out.appendSlice(self.allocator, "struct {\n__zigar_value: __zigar_js.JsValue = .{},\n");
+            try self.out.appendSlice(self.allocator, "struct {\n__zigar_value: __zigar_js.Any = .{ .handle = 0 },\n");
             for (members) |m| {
                 if (m.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
                 switch (m.value) {
                     .unknown => {
-                        try self.out.print(self.allocator, "pub const {s}: __zigar_js.Global(@This()) = .{{ .js_name = ", .{m.zig_ident});
-                        try self.emitStringLit(m.wire_name);
-                        try self.out.appendSlice(self.allocator, " };\n");
+                        try self.out.print(self.allocator, "pub const {s}: __zigar_js.GlobalTarget(@This(), ", .{m.zig_ident});
+                        try self.emitCallTargetLiteral(
+                            is_global_scope,
+                            m.wire_name,
+                            false,
+                            if (push_owner_seg) wire_name else null,
+                        );
+                        try self.out.appendSlice(self.allocator, ", .none) = .{};\n");
                     },
                     .str => |s| {
                         try self.out.print(self.allocator, "pub const {s}: []const u8 = ", .{m.zig_ident});
@@ -765,9 +1982,14 @@ const ModuleEmitCtx = struct {
                         if (std.math.isFinite(n)) {
                             try self.out.print(self.allocator, "pub const {s}: f64 = {d};\n", .{ m.zig_ident, n });
                         } else {
-                            try self.out.print(self.allocator, "pub const {s}: __zigar_js.Global(@This()) = .{{ .js_name = ", .{m.zig_ident});
-                            try self.emitStringLit(m.wire_name);
-                            try self.out.appendSlice(self.allocator, " };\n");
+                            try self.out.print(self.allocator, "pub const {s}: __zigar_js.GlobalTarget(@This(), ", .{m.zig_ident});
+                            try self.emitCallTargetLiteral(
+                                is_global_scope,
+                                m.wire_name,
+                                false,
+                                if (push_owner_seg) wire_name else null,
+                            );
+                            try self.out.appendSlice(self.allocator, ", .none) = .{};\n");
                         }
                     },
                 }
@@ -848,29 +2070,34 @@ const ModuleEmitCtx = struct {
         self.emit_depth += 1;
         defer self.emit_depth -= 1;
 
-        if (d.jsdoc) |jd| {
-            try appendJsDocComments(&self.out, self.allocator, jd);
+        if (d.kind != .function_decl) {
+            if (d.jsdoc) |jd| {
+                try appendJsDocComments(&self.out, self.allocator, jd);
+            }
         }
         const pub_kw = if (d.is_exported) "pub " else "";
 
         switch (d.kind) {
             .function_decl => |sig| {
-                try self.emitFunction(pub_kw, d.zig_ident, null, sig);
+                try self.emitCallableFunction(pub_kw, d, sig);
             },
             .const_literal => |cl| {
                 try self.emitLiteralConst(pub_kw, d.zig_ident, cl.ty, cl.value);
             },
             .global_var => |gty| {
-                try self.out.print(self.allocator, "{s}const {s}: __zigar_js.Global(", .{ pub_kw, d.zig_ident });
+                try self.out.print(self.allocator, "{s}const {s}: __zigar_js.GlobalTarget(", .{ pub_kw, d.zig_ident });
                 try self.emitType(gty);
-                try self.out.appendSlice(self.allocator, ") = .{ .js_name = ");
-                try self.emitStringLit(d.wire_name);
-                try self.out.appendSlice(self.allocator, " };\n");
+                try self.out.appendSlice(self.allocator, ", ");
+                try self.emitCallTargetLiteral(d.is_global_scope, d.wire_name, false, null);
+                try self.out.appendSlice(self.allocator, ", ");
+                try self.emitNullishSpec(gty, false);
+                try self.out.appendSlice(self.allocator, ") = .{};\n");
             },
             .struct_decl => |st| {
+                const push_owner = true;
                 if (st.type_params.len == 0) {
                     try self.out.print(self.allocator, "{s}const {s} = ", .{ pub_kw, d.zig_ident });
-                    try self.emitStructBody(d.wire_name, st);
+                    try self.emitStructBody(d.wire_name, d.is_global_scope, push_owner, st);
                     try self.out.appendSlice(self.allocator, ";\n");
                 } else {
                     try self.out.print(self.allocator, "{s}fn {s}(", .{ pub_kw, d.zig_ident });
@@ -879,18 +2106,19 @@ const ModuleEmitCtx = struct {
                         try self.out.print(self.allocator, "comptime {s}: type", .{tp.zig_ident});
                     }
                     try self.out.appendSlice(self.allocator, ") type {\nreturn ");
-                    try self.emitStructBody(d.wire_name, st);
+                    try self.emitStructBody(d.wire_name, d.is_global_scope, push_owner, st);
                     try self.out.appendSlice(self.allocator, ";\n}\n");
                 }
             },
             .enum_decl => |en| {
+                const push_owner = true;
                 try self.out.print(self.allocator, "{s}const {s} = ", .{ pub_kw, d.zig_ident });
-                try self.emitEnumBody(d.wire_name, en.is_const, en.has_unknown_values, en.members);
+                try self.emitEnumBody(d.wire_name, d.is_global_scope, push_owner, en.is_const, en.has_unknown_values, en.members);
                 try self.out.appendSlice(self.allocator, ";\n");
             },
             .string_enum_decl => |members| {
                 try self.out.print(self.allocator, "{s}const {s} = ", .{ pub_kw, d.zig_ident });
-                try self.emitEnumBody(d.wire_name, false, false, members);
+                try self.emitEnumBody(d.wire_name, d.is_global_scope, false, false, false, members);
                 try self.out.appendSlice(self.allocator, ";\n");
             },
             .union_decl => |un| {
@@ -949,14 +2177,27 @@ const ModuleEmitCtx = struct {
                 }
             },
             .namespace_decl => |children| {
-                const frame = try self.allocator.alloc([]const u8, children.len + 1);
-                defer self.allocator.free(frame);
-                for (children, 0..) |cd, idx| {
-                    frame[idx] = cd.zig_ident;
+                var extra_allocs: usize = 0;
+                for (children) |cd| {
+                    if (cd.alloc_companion_ident != null) extra_allocs += 1;
                 }
-                frame[children.len] = "zigar_js";
+                const frame = try self.allocator.alloc([]const u8, children.len + extra_allocs + 1);
+                defer self.allocator.free(frame);
+                var fi: usize = 0;
+                for (children) |cd| {
+                    frame[fi] = cd.zig_ident;
+                    fi += 1;
+                    if (cd.alloc_companion_ident) |aci| {
+                        frame[fi] = aci;
+                        fi += 1;
+                    }
+                }
+                frame[fi] = "zigar_js";
                 try self.nested_decl_scopes.append(self.allocator, frame);
                 defer _ = self.nested_decl_scopes.pop();
+
+                try self.ns_wire_path.append(self.allocator, d.wire_name);
+                defer _ = self.ns_wire_path.pop();
 
                 try self.out.print(self.allocator, "{s}const {s} = struct {{\n", .{ pub_kw, d.zig_ident });
                 for (children) |cd| {
@@ -1011,6 +2252,28 @@ const ModuleEmitCtx = struct {
     }
 };
 
+fn typeHasInlineNominal(ty: *const ir.TypeIr) bool {
+    return switch (ty.*) {
+        .tuple, .anon_struct, .tagged_union => true,
+        .optional => |opt| typeHasInlineNominal(opt.child),
+        .pointer_const, .slice, .promise => |inner| typeHasInlineNominal(inner),
+        .js_map => |m| typeHasInlineNominal(m.key) or typeHasInlineNominal(m.value),
+        .fn_ptr => |fp| blk: {
+            for (fp.params) |pt| {
+                if (typeHasInlineNominal(pt)) break :blk true;
+            }
+            break :blk typeHasInlineNominal(fp.return_type);
+        },
+        .decl_ref => |dref| blk: {
+            for (dref.type_args) |ta| {
+                if (typeHasInlineNominal(ta)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
 fn signatureUsesTypeParam(sig: ir.SignatureIr, tp_ident: []const u8) bool {
     for (sig.params) |p| {
         if (typeUsesTypeParam(p.ty, tp_ident)) return true;
@@ -1021,7 +2284,8 @@ fn signatureUsesTypeParam(sig: ir.SignatureIr, tp_ident: []const u8) bool {
 fn typeUsesTypeParam(ty: *const ir.TypeIr, tp_ident: []const u8) bool {
     return switch (ty.*) {
         .type_param_ref => |ref_id| std.mem.eql(u8, ref_id, tp_ident),
-        .optional, .pointer_const, .slice, .promise => |inner| typeUsesTypeParam(inner, tp_ident),
+        .optional => |opt| typeUsesTypeParam(opt.child, tp_ident),
+        .pointer_const, .slice, .promise => |inner| typeUsesTypeParam(inner, tp_ident),
         .js_map => |m| typeUsesTypeParam(m.key, tp_ident) or typeUsesTypeParam(m.value, tp_ident),
         .tuple => |elems| blk: {
             for (elems) |el| {
@@ -1151,109 +2415,31 @@ fn renderRootRaw(
     // Re-export top-level symbols directly on `root.zig` (without `usingnamespace`, which does not
     // exist in Zig 0.17) when there is a single primary module or an `index` entry module!
     const barrel_mod = if (primary_count == 1) single_primary else index_primary;
-    var barrel_exports: std.ArrayList(ir.DeclIr) = .empty;
+    var barrel_exports: std.ArrayList([]const u8) = .empty;
     defer barrel_exports.deinit(allocator);
     if (barrel_mod) |bm| {
         for (bm.decls) |d| {
             if (!d.is_exported or !d.is_js_exported) continue;
-            if (root_scope.isTaken(d.logical_name)) continue;
-            try root_scope.reserve(d.logical_name);
-            try barrel_exports.append(allocator, d);
+            if (!root_scope.isTaken(d.logical_name)) {
+                try root_scope.reserve(d.logical_name);
+                try barrel_exports.append(allocator, d.zig_ident);
+            }
+            if (d.alloc_companion_ident) |aci| {
+                if (!root_scope.isTaken(aci)) {
+                    try root_scope.reserve(aci);
+                    try barrel_exports.append(allocator, aci);
+                }
+            }
         }
     }
 
-    // Allocate non-shadowing parameter names inside `zigar_js` helpers so top-level exports
-    // named `T`, `K`, `V`, `self`, `Promise`, `JsMap`, `Global`, etc. never collide or shadow!
-    var zigar_js_scope = naming.ScopeNamer.initContainer(allocator, &root_scope);
-    defer zigar_js_scope.deinit();
-    try zigar_js_scope.reserve("JsValue");
-    try zigar_js_scope.reserve("JsObject");
-    try zigar_js_scope.reserve("JsSymbol");
-    try zigar_js_scope.reserve("Promise");
-    try zigar_js_scope.reserve("JsMap");
-    try zigar_js_scope.reserve("Global");
-
-    var promise_p = naming.ScopeNamer.initParam(allocator, &zigar_js_scope);
-    defer promise_p.deinit();
-    const tp_promise = try promise_p.bind("T", .pascal);
-    defer tp_promise.deinit(allocator);
-
-    var map_p = naming.ScopeNamer.initParam(allocator, &zigar_js_scope);
-    defer map_p.deinit();
-    const tp_k = try map_p.bind("K", .pascal);
-    defer tp_k.deinit(allocator);
-    const tp_v = try map_p.bind("V", .pascal);
-    defer tp_v.deinit(allocator);
-
-    var global_p = naming.ScopeNamer.initParam(allocator, &zigar_js_scope);
-    defer global_p.deinit();
-    const tp_global = try global_p.bind("T", .pascal);
-    defer tp_global.deinit(allocator);
-
-    var global_struct_scope = naming.ScopeNamer.initContainer(allocator, &global_p);
-    defer global_struct_scope.deinit();
-    try global_struct_scope.reserve("ValueType");
-    try global_struct_scope.reserve("get");
-
-    var global_get_p = naming.ScopeNamer.initParam(allocator, &global_struct_scope);
-    defer global_get_p.deinit();
-    const p_self = try global_get_p.bind("self", .preserve);
-    defer p_self.deinit(allocator);
-
-    try out.print(
+    try out.appendSlice(
         allocator,
         \\// Generated by ts-zigar (TypeScript 7.1). Do not edit manually.
         \\
-        \\pub const zigar_js = struct {{
-        \\    pub const JsValue = struct {{
-        \\        handle: u32 = 0,
-        \\    }};
-        \\    pub const JsObject = struct {{
-        \\        handle: u32 = 0,
-        \\    }};
-        \\    pub const JsSymbol = struct {{
-        \\        id: u32 = 0,
-        \\    }};
-        \\    pub fn Promise(comptime {s}: type) type {{
-        \\        return struct {{
-        \\            pub const Payload = {s};
-        \\            handle: u32 = 0,
-        \\        }};
-        \\    }}
-        \\    pub fn JsMap(comptime {s}: type, comptime {s}: type) type {{
-        \\        return struct {{
-        \\            pub const Key = {s};
-        \\            pub const Value = {s};
-        \\            handle: u32 = 0,
-        \\        }};
-        \\    }}
-        \\    pub fn Global(comptime {s}: type) type {{
-        \\        return struct {{
-        \\            pub const ValueType = {s};
-        \\            js_name: []const u8,
-        \\            pub fn get({s}: @This()) {s} {{
-        \\                _ = {s};
-        \\                @panic("ts-zigar host stub");
-        \\            }}
-        \\        }};
-        \\    }}
-        \\}};
+        \\pub const zigar_js = @import("__zigar_runtime.zig");
         \\
         \\
-    ,
-        .{
-            tp_promise.zig_ident,
-            tp_promise.zig_ident,
-            tp_k.zig_ident,
-            tp_v.zig_ident,
-            tp_k.zig_ident,
-            tp_v.zig_ident,
-            tp_global.zig_ident,
-            tp_global.zig_ident,
-            p_self.zig_ident,
-            tp_global.zig_ident,
-            p_self.zig_ident,
-        },
     );
 
     for (pkg.modules) |*m| {
@@ -1266,11 +2452,11 @@ fn renderRootRaw(
     if (barrel_mod) |bm| {
         if (barrel_exports.items.len > 0) {
             try out.append(allocator, '\n');
-            for (barrel_exports.items) |d| {
+            for (barrel_exports.items) |export_ident| {
                 try out.print(allocator, "pub const {s} = {s}.{s};\n", .{
-                    d.zig_ident,
+                    export_ident,
                     bm.root_export_ident,
-                    d.zig_ident,
+                    export_ident,
                 });
             }
         }
@@ -1285,6 +2471,934 @@ fn renderRootRaw(
     try out.appendSlice(allocator, "}\n");
 
     return try out.toOwnedSlice(allocator);
+}
+
+fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
+    return try allocator.dupe(
+        u8,
+        \\// Generated by ts-zigar (TypeScript 7.1). Do not edit manually.
+        \\
+        \\const std = @import("std");
+        \\const root = @import("root");
+        \\
+        \\pub const has_host: bool = @hasDecl(root, "host") and @TypeOf(root.host) == type and @hasDecl(root.host, "js");
+        \\const raw_js = if (has_host) root.host.js else struct {};
+        \\
+        \\pub const OfflineError = error{
+        \\    OffJsThread,
+        \\    HostUnavailable,
+        \\    JsException,
+        \\    Unexpected,
+        \\};
+        \\
+        \\pub const OfflineCallError = OfflineError || std.mem.Allocator.Error || error{
+        \\    TypeError,
+        \\    RangeError,
+        \\    SyntaxError,
+        \\    ReferenceError,
+        \\    NotCallable,
+        \\    NotConstructable,
+        \\    IntegerOverflow,
+        \\};
+        \\
+        \\pub const OfflineOverflowError = OfflineError || error{
+        \\    TypeError,
+        \\    IntegerOverflow,
+        \\};
+        \\
+        \\pub const OfflineAllocError = OfflineError || std.mem.Allocator.Error || error{
+        \\    TypeError,
+        \\    RangeError,
+        \\    IntegerOverflow,
+        \\};
+        \\
+        \\pub const Error = if (has_host) raw_js.Error else OfflineError;
+        \\pub const CallError = if (has_host) raw_js.CallError else OfflineCallError;
+        \\pub const OverflowError = if (has_host) raw_js.OverflowError else OfflineOverflowError;
+        \\pub const AllocError = if (has_host) raw_js.AllocError else OfflineAllocError;
+        \\
+        \\pub const OfflineJsType = enum(u32) {
+        \\    undefined = 0,
+        \\    object = 1,
+        \\    boolean = 2,
+        \\    number = 3,
+        \\    bigint = 4,
+        \\    string = 5,
+        \\    symbol = 6,
+        \\    function = 7,
+        \\    invalid = 0xffffffff,
+        \\};
+        \\
+        \\pub const JsType = if (has_host) raw_js.JsType else OfflineJsType;
+        \\
+        \\pub const OfflineNullishKind = enum {
+        \\    none,
+        \\    undefined_only,
+        \\    null_only,
+        \\    null_or_undefined,
+        \\};
+        \\
+        \\pub const NullishKind = if (has_host) raw_js.NullishKind else OfflineNullishKind;
+        \\
+        \\pub fn StubNullable(comptime T: type) type {
+        \\    return union(enum) {
+        \\        pub const is_zigar_nullable = true;
+        \\        pub const Payload = T;
+        \\
+        \\        undefined: void,
+        \\        null: void,
+        \\        value: T,
+        \\
+        \\        pub fn isUndefined(self: @This()) bool {
+        \\            return self == .undefined;
+        \\        }
+        \\
+        \\        pub fn isNull(self: @This()) bool {
+        \\            return self == .null;
+        \\        }
+        \\
+        \\        pub fn isNullOrUndefined(self: @This()) bool {
+        \\            return self != .value;
+        \\        }
+        \\
+        \\        pub fn hasValue(self: @This()) bool {
+        \\            return self == .value;
+        \\        }
+        \\
+        \\        pub fn toOptional(self: @This()) ?T {
+        \\            return switch (self) {
+        \\                .value => |v| v,
+        \\                .undefined, .null => null,
+        \\            };
+        \\        }
+        \\
+        \\        pub fn orElse(self: @This(), default_val: T) T {
+        \\            return switch (self) {
+        \\                .value => |v| v,
+        \\                .undefined, .null => default_val,
+        \\            };
+        \\        }
+        \\    };
+        \\}
+        \\
+        \\pub const Nullable = if (has_host) raw_js.Nullable else StubNullable;
+        \\
+        \\pub fn StubRef(comptime T: type) type {
+        \\    return extern struct {
+        \\        const Self = @This();
+        \\        pub const Target = T;
+        \\        pub const is_js_value = true;
+        \\
+        \\        handle: u32 = 0,
+        \\
+        \\        pub const @"undefined": Self = .{ .handle = 0 };
+        \\        pub const @"null": Self = .{ .handle = 1 };
+        \\        pub const @"false": Self = .{ .handle = 2 };
+        \\        pub const @"true": Self = .{ .handle = 3 };
+        \\        pub const globalThis: Self = .{ .handle = 4 };
+        \\
+        \\        pub fn fromBool(v: bool) Self {
+        \\            return if (v) Self.@"true" else Self.@"false";
+        \\        }
+        \\
+        \\        pub fn isUndefined(self: Self) bool {
+        \\            return self.handle == 0;
+        \\        }
+        \\
+        \\        pub fn isNull(self: Self) bool {
+        \\            return self.handle == 1;
+        \\        }
+        \\
+        \\        pub fn isNullOrUndefined(self: Self) bool {
+        \\            return self.handle <= 1;
+        \\        }
+        \\
+        \\        pub fn clone(self: Self) Self {
+        \\            return self;
+        \\        }
+        \\
+        \\        pub fn tryClone(self: Self) Error!Self {
+        \\            return self;
+        \\        }
+        \\
+        \\        pub fn deinit(_: Self) void {}
+        \\
+        \\        pub fn tryDeinit(_: Self) Error!void {}
+        \\
+        \\        pub fn eql(self: Self, other: anytype) bool {
+        \\            return self.handle == other.handle;
+        \\        }
+        \\
+        \\        pub fn tryEql(_: Self, _: anytype) Error!bool {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn tryTypeof(_: Self) Error!JsType {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn cast(self: Self, comptime U: type) StubRef(U) {
+        \\            return .{ .handle = self.handle };
+        \\        }
+        \\    };
+        \\}
+        \\
+        \\pub const RawAny = if (has_host) raw_js.Any else opaque {};
+        \\pub const RawUnknown = if (has_host) raw_js.Unknown else opaque {};
+        \\pub const RawObject = if (has_host) raw_js.Object else opaque {};
+        \\pub const RawSymbol = if (has_host) raw_js.Symbol else opaque {};
+        \\pub const RawFunction = if (has_host) raw_js.Function else opaque {};
+        \\
+        \\pub const Ref = if (has_host) raw_js.Ref else StubRef;
+        \\
+        \\pub const Any = Ref(RawAny);
+        \\pub const Unknown = Ref(RawUnknown);
+        \\pub const Object = Ref(RawObject);
+        \\pub const Symbol = Ref(RawSymbol);
+        \\pub const Function = Ref(RawFunction);
+        \\
+        \\pub const JsValue = Any;
+        \\pub const JsObject = Object;
+        \\pub const JsSymbol = Symbol;
+        \\
+        \\pub const StubHandle = extern struct {
+        \\    const Self = @This();
+        \\    pub const is_js_value = true;
+        \\
+        \\    handle: u32 = 0,
+        \\
+        \\    pub const @"undefined": Self = .{ .handle = 0 };
+        \\    pub const @"null": Self = .{ .handle = 1 };
+        \\
+        \\    pub fn isUndefined(self: Self) bool {
+        \\        return self.handle == 0;
+        \\    }
+        \\
+        \\    pub fn isNull(self: Self) bool {
+        \\        return self.handle == 1;
+        \\    }
+        \\
+        \\    pub fn isNullOrUndefined(self: Self) bool {
+        \\        return self.handle <= 1;
+        \\    }
+        \\
+        \\    pub fn clone(self: Self) Self {
+        \\        return self;
+        \\    }
+        \\
+        \\    pub fn tryClone(self: Self) Error!Self {
+        \\        return self;
+        \\    }
+        \\
+        \\    pub fn deinit(_: Self) void {}
+        \\
+        \\    pub fn tryDeinit(_: Self) Error!void {}
+        \\
+        \\    pub fn eql(self: Self, other: anytype) bool {
+        \\        return self.handle == other.handle;
+        \\    }
+        \\
+        \\    pub fn tryEql(_: Self, _: anytype) Error!bool {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn ref(self: Self) Any {
+        \\        return .{ .handle = self.handle };
+        \\    }
+        \\
+        \\    pub fn toRef(self: Self) Any {
+        \\        return .{ .handle = self.handle };
+        \\    }
+        \\
+        \\    pub fn fromRef(v: anytype) Self {
+        \\        return .{ .handle = v.handle };
+        \\    }
+        \\};
+        \\
+        \\pub const StubString = extern struct {
+        \\    const Self = @This();
+        \\    pub const is_js_value = true;
+        \\    pub const is_js_string = true;
+        \\
+        \\    handle: u32 = 0,
+        \\
+        \\    pub fn fromSlice(_: []const u8) CallError!Self {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn byteLen(_: Self) CallError!usize {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn utf16Len(_: Self) CallError!usize {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn isEmpty(_: Self) CallError!bool {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn toSliceAlloc(_: Self, _: std.mem.Allocator) AllocError![]u8 {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn clone(self: Self) Self {
+        \\        return self;
+        \\    }
+        \\
+        \\    pub fn deinit(_: Self) void {}
+        \\
+        \\    pub fn eql(self: Self, other: anytype) bool {
+        \\        return self.handle == other.handle;
+        \\    }
+        \\};
+        \\
+        \\pub const StubBigInt = extern struct {
+        \\    const Self = @This();
+        \\    pub const is_js_value = true;
+        \\
+        \\    handle: u32 = 0,
+        \\
+        \\    pub fn fromI64(_: i64) Error!Self {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn fromU64(_: u64) Error!Self {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn fromI128(_: i128) Error!Self {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn fromU128(_: u128) Error!Self {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn fromString(_: []const u8) Error!Self {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn toI64(_: Self) OverflowError!i64 {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn toU64(_: Self) OverflowError!u64 {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn toI128(_: Self) OverflowError!i128 {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn toU128(_: Self) OverflowError!u128 {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn toStringAlloc(_: Self, _: std.mem.Allocator, _: u8) AllocError![]u8 {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn clone(self: Self) Self {
+        \\        return self;
+        \\    }
+        \\
+        \\    pub fn deinit(_: Self) void {}
+        \\
+        \\    pub fn eql(self: Self, other: anytype) bool {
+        \\        return self.handle == other.handle;
+        \\    }
+        \\};
+        \\
+        \\pub const String = if (has_host) raw_js.String else StubString;
+        \\pub const BigInt = if (has_host) raw_js.BigInt else StubBigInt;
+        \\pub const Date = if (has_host) raw_js.Date else StubHandle;
+        \\pub const RegExp = if (has_host) raw_js.RegExp else StubHandle;
+        \\
+        \\pub const Buffer = if (has_host) raw_js.Buffer else StubHandle;
+        \\pub const Uint8Array = if (has_host) raw_js.Uint8Array else StubHandle;
+        \\pub const Uint8ClampedArray = if (has_host) raw_js.Uint8ClampedArray else StubHandle;
+        \\pub const Int8Array = if (has_host) raw_js.Int8Array else StubHandle;
+        \\pub const Uint16Array = if (has_host) raw_js.Uint16Array else StubHandle;
+        \\pub const Int16Array = if (has_host) raw_js.Int16Array else StubHandle;
+        \\pub const Uint32Array = if (has_host) raw_js.Uint32Array else StubHandle;
+        \\pub const Int32Array = if (has_host) raw_js.Int32Array else StubHandle;
+        \\pub const BigUint64Array = if (has_host) raw_js.BigUint64Array else StubHandle;
+        \\pub const BigInt64Array = if (has_host) raw_js.BigInt64Array else StubHandle;
+        \\pub const Float32Array = if (has_host) raw_js.Float32Array else StubHandle;
+        \\pub const Float64Array = if (has_host) raw_js.Float64Array else StubHandle;
+        \\pub const ArrayBuffer = if (has_host) raw_js.ArrayBuffer else StubHandle;
+        \\pub const SharedArrayBuffer = if (has_host) raw_js.SharedArrayBuffer else StubHandle;
+        \\pub const DataView = if (has_host) raw_js.DataView else StubHandle;
+        \\
+        \\pub fn StubPromise(comptime T: type) type {
+        \\    return extern struct {
+        \\        const Self = @This();
+        \\        pub const Payload = T;
+        \\        pub const is_js_value = true;
+        \\
+        \\        handle: u32 = 0,
+        \\
+        \\        pub fn clone(self: Self) Self {
+        \\            return self;
+        \\        }
+        \\
+        \\        pub fn deinit(_: Self) void {}
+        \\    };
+        \\}
+        \\
+        \\pub fn StubArray(comptime T: type) type {
+        \\    return extern struct {
+        \\        const Self = @This();
+        \\        pub const Elem = T;
+        \\        pub const is_js_value = true;
+        \\
+        \\        handle: u32 = 0,
+        \\
+        \\        pub fn init() CallError!Self {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn initCapacity(_: usize) CallError!Self {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn len(_: Self) CallError!usize {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn get(_: Self, _: usize) CallError!T {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn getAlloc(_: Self, _: std.mem.Allocator, _: usize) AllocError!T {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn set(_: Self, _: usize, _: anytype) CallError!void {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn push(_: Self, _: anytype) CallError!usize {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn clone(self: Self) Self {
+        \\            return self;
+        \\        }
+        \\
+        \\        pub fn deinit(_: Self) void {}
+        \\    };
+        \\}
+        \\
+        \\pub fn StubMap(comptime K: type, comptime V: type) type {
+        \\    return extern struct {
+        \\        const Self = @This();
+        \\        pub const Key = K;
+        \\        pub const Value = V;
+        \\        pub const is_js_value = true;
+        \\
+        \\        handle: u32 = 0,
+        \\
+        \\        pub fn clone(self: Self) Self {
+        \\            return self;
+        \\        }
+        \\
+        \\        pub fn deinit(_: Self) void {}
+        \\    };
+        \\}
+        \\
+        \\pub fn StubSet(comptime T: type) type {
+        \\    return extern struct {
+        \\        const Self = @This();
+        \\        pub const Elem = T;
+        \\        pub const is_js_value = true;
+        \\
+        \\        handle: u32 = 0,
+        \\
+        \\        pub fn clone(self: Self) Self {
+        \\            return self;
+        \\        }
+        \\
+        \\        pub fn deinit(_: Self) void {}
+        \\    };
+        \\}
+        \\
+        \\pub fn StubRecord(comptime K: type, comptime V: type) type {
+        \\    return extern struct {
+        \\        const Self = @This();
+        \\        pub const Key = K;
+        \\        pub const Value = V;
+        \\        pub const is_js_value = true;
+        \\
+        \\        handle: u32 = 0,
+        \\
+        \\        pub fn clone(self: Self) Self {
+        \\            return self;
+        \\        }
+        \\
+        \\        pub fn deinit(_: Self) void {}
+        \\    };
+        \\}
+        \\
+        \\pub fn StubIterator(comptime T: type) type {
+        \\    return extern struct {
+        \\        const Self = @This();
+        \\        pub const Elem = T;
+        \\        pub const is_js_value = true;
+        \\
+        \\        handle: u32 = 0,
+        \\
+        \\        pub fn clone(self: Self) Self {
+        \\            return self;
+        \\        }
+        \\
+        \\        pub fn deinit(_: Self) void {}
+        \\    };
+        \\}
+        \\
+        \\pub fn StubAsyncIterator(comptime T: type) type {
+        \\    return extern struct {
+        \\        const Self = @This();
+        \\        pub const Elem = T;
+        \\        pub const is_js_value = true;
+        \\
+        \\        handle: u32 = 0,
+        \\
+        \\        pub fn clone(self: Self) Self {
+        \\            return self;
+        \\        }
+        \\
+        \\        pub fn deinit(_: Self) void {}
+        \\    };
+        \\}
+        \\
+        \\pub const StubJsException = struct {
+        \\    raw: Any = Any.@"undefined",
+        \\
+        \\    pub fn value(self: @This()) Any {
+        \\        return self.raw;
+        \\    }
+        \\
+        \\    pub fn deinit(_: anytype) void {}
+        \\
+        \\    pub fn message(_: @This(), _: std.mem.Allocator) Error!?[]const u8 {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn name(_: @This(), _: std.mem.Allocator) Error!?[]const u8 {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn code(_: @This(), _: std.mem.Allocator) Error!?[]const u8 {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn stack(_: @This(), _: std.mem.Allocator) Error!?[]const u8 {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\};
+        \\
+        \\pub const Promise = if (has_host) raw_js.Promise else StubPromise;
+        \\pub const Array = if (has_host) raw_js.Array else StubArray;
+        \\pub const Map = if (has_host) raw_js.Map else StubMap;
+        \\pub const JsMap = Map;
+        \\pub const Set = if (has_host) raw_js.Set else StubSet;
+        \\pub const Record = if (has_host) raw_js.Record else StubRecord;
+        \\pub const Iterator = if (has_host) raw_js.Iterator else StubIterator;
+        \\pub const AsyncIterator = if (has_host) raw_js.AsyncIterator else StubAsyncIterator;
+        \\pub const JsException = if (has_host) raw_js.JsException else StubJsException;
+        \\
+        \\pub fn activeHandleCount() u32 {
+        \\    if (has_host) return raw_js.activeHandleCount();
+        \\    return 0;
+        \\}
+        \\
+        \\pub fn lastError() ?JsException {
+        \\    if (has_host) return raw_js.lastError();
+        \\    return null;
+        \\}
+        \\
+        \\pub fn takeLastError() ?JsException {
+        \\    if (has_host) return raw_js.takeLastError();
+        \\    return null;
+        \\}
+        \\
+        \\pub fn hasLastError() bool {
+        \\    if (has_host) return raw_js.hasLastError();
+        \\    return false;
+        \\}
+        \\
+        \\pub fn clearLastError() void {
+        \\    if (has_host) raw_js.clearLastError();
+        \\}
+        \\
+        \\pub fn symbolFor(key: []const u8) CallError!Symbol {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    const sym_ctor = try raw_js.getGlobal(CallError!Any, "Symbol");
+        \\    defer sym_ctor.deinit();
+        \\    return try raw_js.callMethod(fn ([]const u8) CallError!Symbol, sym_ctor, "for", .{key});
+        \\}
+        \\
+        \\pub fn createSymbol(description: ?[]const u8) CallError!Symbol {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    const sym_ctor = try raw_js.getGlobal(CallError!Function, "Symbol");
+        \\    defer sym_ctor.deinit();
+        \\    if (description) |desc| {
+        \\        return try raw_js.callFn(fn ([]const u8) CallError!Symbol, sym_ctor, .{desc});
+        \\    }
+        \\    return try raw_js.callFn(fn () CallError!Symbol, sym_ctor, .{});
+        \\}
+        \\
+        \\pub fn symbolKeyFor(allocator: std.mem.Allocator, sym: Symbol) CallError!?[]const u8 {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    const sym_ctor = try raw_js.getGlobal(CallError!Any, "Symbol");
+        \\    defer sym_ctor.deinit();
+        \\    return try raw_js.callMethod(fn (std.mem.Allocator, Symbol) CallError!?[]const u8, sym_ctor, "keyFor", .{ allocator, sym });
+        \\}
+        \\
+        \\pub fn defaultAllocator() CallError!std.mem.Allocator {
+        \\    if (has_host and @hasDecl(root.host, "default_allocator")) {
+        \\        return root.host.default_allocator;
+        \\    }
+        \\    return error.HostUnavailable;
+        \\}
+        \\
+        \\pub const CallTarget = struct {
+        \\    module: ?[]const u8 = null,
+        \\    ns_path: []const []const u8 = &.{},
+        \\    name: []const u8 = "",
+        \\    is_default: bool = false,
+        \\    from_default: bool = false,
+        \\};
+        \\
+        \\pub const Args = Array(Any);
+        \\
+        \\pub fn initArgs() CallError!Args {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    return try Args.init();
+        \\}
+        \\
+        \\pub fn toJsRefWithSpec(comptime T: type, value: T, comptime spec: anytype) CallError!Any {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    return try raw_js.toJsRefWithSpec(T, value, spec);
+        \\}
+        \\
+        \\pub fn toJsRefWithNullish(comptime T: type, value: T, comptime nk: NullishKind) CallError!Any {
+        \\    return toJsRefWithSpec(T, value, nk);
+        \\}
+        \\
+        \\pub fn toJsRef(comptime T: type, value: T) CallError!Any {
+        \\    return toJsRefWithSpec(T, value, .null_or_undefined);
+        \\}
+        \\
+        \\pub fn fromJsRefAlloc(comptime T: type, allocator: std.mem.Allocator, value: anytype) CallError!T {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    return try raw_js.fromJsRefAlloc(T, allocator, value);
+        \\}
+        \\
+        \\pub fn fromJsRef(comptime T: type, value: anytype) CallError!T {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    return try raw_js.fromJsRef(T, value);
+        \\}
+        \\
+        \\pub fn needsDecodeAllocator(comptime T: type) bool {
+        \\    if (has_host) return raw_js.needsDecodeAllocator(T);
+        \\    return switch (@typeInfo(T)) {
+        \\        .optional => |opt| needsDecodeAllocator(opt.child),
+        \\        .pointer => |pt| switch (pt.size) {
+        \\            .slice => true,
+        \\            .one => @typeInfo(pt.child) != .@"fn",
+        \\            else => false,
+        \\        },
+        \\        .@"struct" => |st| blk: {
+        \\            if (@hasDecl(T, "is_js_value") and T.is_js_value) break :blk false;
+        \\            for (st.field_types) |ft| {
+        \\                if (needsDecodeAllocator(ft)) break :blk true;
+        \\            }
+        \\            break :blk false;
+        \\        },
+        \\        .@"union" => |un| blk: {
+        \\            for (un.field_types) |ft| {
+        \\                if (needsDecodeAllocator(ft)) break :blk true;
+        \\            }
+        \\            break :blk false;
+        \\        },
+        \\        else => false,
+        \\    };
+        \\}
+        \\
+        \\pub fn freeDecoded(comptime T: type, allocator: std.mem.Allocator, value: T) void {
+        \\    if (has_host) {
+        \\        raw_js.freeDecoded(T, allocator, value);
+        \\        return;
+        \\    }
+        \\    switch (@typeInfo(T)) {
+        \\        .optional => |opt| {
+        \\            if (value) |v| freeDecoded(opt.child, allocator, v);
+        \\        },
+        \\        .pointer => |pt| switch (pt.size) {
+        \\            .slice => {
+        \\                if (pt.child != u8) {
+        \\                    for (value) |elem| freeDecoded(pt.child, allocator, elem);
+        \\                }
+        \\                allocator.free(value);
+        \\            },
+        \\            .one => {
+        \\                if (@typeInfo(pt.child) != .@"fn") {
+        \\                    freeDecoded(pt.child, allocator, value.*);
+        \\                    allocator.destroy(value);
+        \\                }
+        \\            },
+        \\            else => {},
+        \\        },
+        \\        .@"struct" => |st| {
+        \\            if (@hasDecl(T, "is_js_value") and T.is_js_value) {
+        \\                value.deinit();
+        \\                return;
+        \\            }
+        \\            inline for (st.field_names, 0..) |fname, fi| {
+        \\                freeDecoded(st.field_types[fi], allocator, @field(value, fname));
+        \\            }
+        \\        },
+        \\        .@"union" => |un| {
+        \\            if (un.tag_type != null) {
+        \\                switch (value) {
+        \\                    inline else => |payload| freeDecoded(@TypeOf(payload), allocator, payload),
+        \\                }
+        \\            }
+        \\        },
+        \\        else => {},
+        \\    }
+        \\}
+        \\
+        \\pub fn pushArg(args: Args, value: anytype, comptime spec: anytype) CallError!void {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    const encoded = try toJsRefWithSpec(@TypeOf(value), value, spec);
+        \\    defer encoded.deinit();
+        \\    _ = try args.push(encoded);
+        \\}
+        \\
+        \\pub fn pushRestArgs(args: Args, slice_val: anytype, comptime elem_spec: anytype) CallError!void {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    const SliceT = @TypeOf(slice_val);
+        \\    const ElemT = @typeInfo(SliceT).pointer.child;
+        \\    for (slice_val) |item| {
+        \\        const encoded = try toJsRefWithSpec(ElemT, item, elem_spec);
+        \\        defer encoded.deinit();
+        \\        _ = try args.push(encoded);
+        \\    }
+        \\}
+        \\
+        \\fn invokeRawTarget(comptime target: CallTarget, args: Args) CallError!Any {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    var callee: Any = Any.@"undefined";
+        \\    var recv: Any = Any.@"undefined";
+        \\
+        \\    if (comptime (target.is_default and target.module != null and target.ns_path.len == 0)) {
+        \\        callee = try raw_js.importModuleDefaultAs(CallError!Any, target.module.?);
+        \\    } else {
+        \\        var cur: Any = if (comptime (target.from_default and target.module != null))
+        \\            try raw_js.importModuleDefaultAs(CallError!Any, target.module.?)
+        \\        else if (comptime (target.module != null))
+        \\            .{ .handle = (try raw_js.importModule(target.module.?)).handle }
+        \\        else
+        \\            Any.globalThis;
+        \\        errdefer cur.deinit();
+        \\
+        \\        inline for (target.ns_path) |seg| {
+        \\            const next = try raw_js.getProp(CallError!Any, cur, seg);
+        \\            cur.deinit();
+        \\            cur = next;
+        \\        }
+        \\        callee = try raw_js.getProp(CallError!Any, cur, target.name);
+        \\        if (comptime (!target.from_default and target.ns_path.len == 0)) {
+        \\            cur.deinit();
+        \\            recv = Any.@"undefined";
+        \\        } else {
+        \\            recv = cur;
+        \\        }
+        \\    }
+        \\    defer callee.deinit();
+        \\    defer recv.deinit();
+        \\
+        \\    if ((try callee.tryTypeof()) != .function) {
+        \\        return error.NotCallable;
+        \\    }
+        \\
+        \\    const reflect = try raw_js.getGlobal(CallError!Object, "Reflect");
+        \\    defer reflect.deinit();
+        \\    return try raw_js.callMethod(
+        \\        fn (Any, Any, Args) CallError!Any,
+        \\        reflect,
+        \\        "apply",
+        \\        .{ callee, recv, args },
+        \\    );
+        \\}
+        \\
+        \\pub fn invokeTarget(comptime T: type, comptime target: CallTarget, args: Args) CallError!T {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    const raw = try invokeRawTarget(target, args);
+        \\    defer raw.deinit();
+        \\    if (T == noreturn) {
+        \\        return error.Unexpected;
+        \\    }
+        \\    return try fromJsRef(T, raw);
+        \\}
+        \\
+        \\pub fn invokeTargetAlloc(
+        \\    comptime T: type,
+        \\    allocator: std.mem.Allocator,
+        \\    comptime target: CallTarget,
+        \\    args: Args,
+        \\) CallError!T {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    const raw = try invokeRawTarget(target, args);
+        \\    defer raw.deinit();
+        \\    if (T == noreturn) {
+        \\        return error.Unexpected;
+        \\    }
+        \\    return try fromJsRefAlloc(T, allocator, raw);
+        \\}
+        \\
+        \\pub fn invokeTargetNoreturn(comptime target: CallTarget, args: Args) noreturn {
+        \\    if (has_host) {
+        \\        const raw = invokeRawTarget(target, args) catch {
+        \\            args.deinit();
+        \\            @panic("ts-zigar noreturn function threw");
+        \\        };
+        \\        raw.deinit();
+        \\        args.deinit();
+        \\        @panic("ts-zigar noreturn function returned");
+        \\    }
+        \\    args.deinit();
+        \\    @panic("ts-zigar host unavailable");
+        \\}
+        \\
+        \\fn getGlobalTargetRaw(comptime target: CallTarget) CallError!Any {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    if (comptime (target.is_default and target.module != null and target.ns_path.len == 0)) {
+        \\        return try raw_js.importModuleDefaultAs(CallError!Any, target.module.?);
+        \\    }
+        \\    var cur: Any = if (comptime (target.from_default and target.module != null))
+        \\        try raw_js.importModuleDefaultAs(CallError!Any, target.module.?)
+        \\    else if (comptime (target.module != null))
+        \\        .{ .handle = (try raw_js.importModule(target.module.?)).handle }
+        \\    else
+        \\        Any.globalThis;
+        \\    errdefer cur.deinit();
+        \\
+        \\    inline for (target.ns_path) |seg| {
+        \\        const next = try raw_js.getProp(CallError!Any, cur, seg);
+        \\        cur.deinit();
+        \\        cur = next;
+        \\    }
+        \\    const out = try raw_js.getProp(CallError!Any, cur, target.name);
+        \\    cur.deinit();
+        \\    return out;
+        \\}
+        \\
+        \\fn setGlobalTargetRaw(comptime target: CallTarget, val: Any) CallError!void {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    var cur: Any = if (comptime (target.from_default and target.module != null))
+        \\        try raw_js.importModuleDefaultAs(CallError!Any, target.module.?)
+        \\    else if (comptime (target.module != null))
+        \\        .{ .handle = (try raw_js.importModule(target.module.?)).handle }
+        \\    else
+        \\        Any.globalThis;
+        \\    errdefer cur.deinit();
+        \\
+        \\    inline for (target.ns_path) |seg| {
+        \\        const next = try raw_js.getProp(CallError!Any, cur, seg);
+        \\        cur.deinit();
+        \\        cur = next;
+        \\    }
+        \\    try raw_js.trySetProp(cur, target.name, val);
+        \\    cur.deinit();
+        \\}
+        \\
+        \\pub fn GlobalTarget(comptime T: type, comptime target: CallTarget, comptime spec: anytype) type {
+        \\    return struct {
+        \\        pub const ValueType = T;
+        \\        pub const call_target: CallTarget = target;
+        \\        pub const nullish_spec = spec;
+        \\
+        \\        js_name: []const u8 = target.name,
+        \\
+        \\        pub fn get(_: @This()) CallError!T {
+        \\            if (!has_host) return error.HostUnavailable;
+        \\            const raw = try getGlobalTargetRaw(target);
+        \\            defer raw.deinit();
+        \\            return try fromJsRef(T, raw);
+        \\        }
+        \\
+        \\        pub fn getAlloc(_: @This(), allocator: std.mem.Allocator) CallError!T {
+        \\            if (!has_host) return error.HostUnavailable;
+        \\            const raw = try getGlobalTargetRaw(target);
+        \\            defer raw.deinit();
+        \\            return try fromJsRefAlloc(T, allocator, raw);
+        \\        }
+        \\
+        \\        pub fn set(_: @This(), value: T) CallError!void {
+        \\            if (!has_host) return error.HostUnavailable;
+        \\            const encoded = try toJsRefWithSpec(T, value, spec);
+        \\            defer encoded.deinit();
+        \\            try setGlobalTargetRaw(target, encoded);
+        \\        }
+        \\    };
+        \\}
+        \\
+        \\pub fn GlobalWithSpec(comptime T: type, comptime spec: anytype) type {
+        \\    return struct {
+        \\        pub const ValueType = T;
+        \\        pub const nullish_spec = spec;
+        \\
+        \\        js_name: []const u8,
+        \\        module: ?[]const u8 = null,
+        \\
+        \\        pub fn get(self: @This()) CallError!T {
+        \\            if (!has_host) return error.HostUnavailable;
+        \\            var cur: Any = if (self.module) |m|
+        \\                .{ .handle = (try raw_js.importModuleDynamic(m)).handle }
+        \\            else
+        \\                Any.globalThis;
+        \\            defer cur.deinit();
+        \\            const raw = try raw_js.getPropDynamic(CallError!Any, cur, self.js_name);
+        \\            defer raw.deinit();
+        \\            return try fromJsRef(T, raw);
+        \\        }
+        \\
+        \\        pub fn getAlloc(self: @This(), allocator: std.mem.Allocator) CallError!T {
+        \\            if (!has_host) return error.HostUnavailable;
+        \\            var cur: Any = if (self.module) |m|
+        \\                .{ .handle = (try raw_js.importModuleDynamic(m)).handle }
+        \\            else
+        \\                Any.globalThis;
+        \\            defer cur.deinit();
+        \\            const raw = try raw_js.getPropDynamic(CallError!Any, cur, self.js_name);
+        \\            defer raw.deinit();
+        \\            return try fromJsRefAlloc(T, allocator, raw);
+        \\        }
+        \\
+        \\        pub fn set(self: @This(), value: T) CallError!void {
+        \\            if (!has_host) return error.HostUnavailable;
+        \\            const encoded = try toJsRefWithSpec(T, value, spec);
+        \\            defer encoded.deinit();
+        \\            var cur: Any = if (self.module) |m|
+        \\                .{ .handle = (try raw_js.importModuleDynamic(m)).handle }
+        \\            else
+        \\                Any.globalThis;
+        \\            defer cur.deinit();
+        \\            try raw_js.trySetPropDynamic(cur, self.js_name, encoded);
+        \\        }
+        \\    };
+        \\}
+        \\
+        \\pub fn Global(comptime T: type) type {
+        \\    return GlobalWithSpec(T, .null_or_undefined);
+        \\}
+        \\
+    );
 }
 
 test "appendJsDocComments normalizes CRLF, @param/@returns/@deprecated, and avoids //! or ////" {

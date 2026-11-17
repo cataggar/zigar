@@ -7,7 +7,7 @@ import { isErrorJSON, NotInErrorSet } from '../errors.js';
 import {
   ALLOCATOR, CLASS, FALLBACK, MEMORY, RESTORE, RETURN, SLOTS, THROWING, VISIT, VIVIFICATE, ZIG,
 } from '../symbols.js';
-import { clearView, decodeText, hasJsValue, isPromise } from '../utils.js';
+import { clearView, decodeText, encodeText, hasJsValue, isPromise } from '../utils.js';
 
 export const NO_CAPTURED_ERROR_HANDLE = 7;
 
@@ -122,6 +122,13 @@ export const CollectionSubOp = {
   RegExpTest: 43,
   RegExpSource: 44,
   RegExpFlags: 45,
+  StringFromUtf8: 46,
+  StringToUtf8: 47,
+  StringByteLen: 48,
+  StringUtf16Len: 49,
+  StringIsString: 50,
+  ValueIdentity: 51,
+  BinaryIsKind: 52,
 };
 
 export const HostOpFlag = {
@@ -1034,7 +1041,7 @@ export default mixin({
             if (v === null || v === undefined) return v;
             if (typeof(v) === 'string') return v;
             if (typeof(v.string) === 'string') return v.string;
-            const mem = v[MEMORY];
+            const mem = (process.env.TARGET === 'wasm' && v[RESTORE]) ? v[RESTORE]() : v[MEMORY];
             if (mem) {
               return decodeText(new Uint8Array(mem.buffer, mem.byteOffset, mem.byteLength));
             }
@@ -2030,6 +2037,23 @@ function isSharedArrayBuffer(val) {
   return typeof(SharedArrayBuffer) === 'function' && val instanceof SharedArrayBuffer;
 }
 
+function isBinaryKind(rawTarget, kind) {
+  switch (kind) {
+    case BinaryKind.ArrayBuffer:
+      return rawTarget instanceof ArrayBuffer;
+    case BinaryKind.SharedArrayBuffer:
+      return isSharedArrayBuffer(rawTarget);
+    case BinaryKind.DataView:
+      return rawTarget instanceof DataView;
+    case BinaryKind.Buffer:
+      return typeof(globalThis.Buffer?.isBuffer) === 'function' && globalThis.Buffer.isBuffer(rawTarget);
+    default: {
+      const Ctor = TYPED_ARRAY_CTORS[kind - BinaryKind.Uint8Array];
+      return typeof(Ctor) === 'function' && rawTarget instanceof Ctor;
+    }
+  }
+}
+
 function getBinaryBytesView(rawTarget) {
   if (ArrayBuffer.isView(rawTarget)) {
     return new Uint8Array(rawTarget.buffer, rawTarget.byteOffset, rawTarget.byteLength);
@@ -2425,6 +2449,40 @@ function executeCollectionOp(env, subOp, jsArgs) {
       return { result: ensureRegExp(jsArgs[0]).source, skipWriteSuccess: false };
     case CollectionSubOp.RegExpFlags:
       return { result: ensureRegExp(jsArgs[0]).flags, skipWriteSuccess: false };
+    case CollectionSubOp.StringFromUtf8: {
+      const s = jsArgs[0];
+      return { result: typeof(s) === 'string' ? s : String(s ?? ''), skipWriteSuccess: false };
+    }
+    case CollectionSubOp.StringToUtf8: {
+      const s = jsArgs[0];
+      if (typeof(s) !== 'string') {
+        throw new TypeError('Expected JS string');
+      }
+      return { result: s, skipWriteSuccess: false };
+    }
+    case CollectionSubOp.StringByteLen: {
+      const s = jsArgs[0];
+      if (typeof(s) !== 'string') {
+        throw new TypeError('Expected JS string');
+      }
+      const len = typeof(globalThis.Buffer?.byteLength) === 'function'
+        ? globalThis.Buffer.byteLength(s, 'utf8')
+        : encodeText(s, 'utf-8').byteLength;
+      return { result: len, skipWriteSuccess: false };
+    }
+    case CollectionSubOp.StringUtf16Len: {
+      const s = jsArgs[0];
+      if (typeof(s) !== 'string') {
+        throw new TypeError('Expected JS string');
+      }
+      return { result: s.length, skipWriteSuccess: false };
+    }
+    case CollectionSubOp.StringIsString:
+      return { result: typeof(jsArgs[0]) === 'string', skipWriteSuccess: false };
+    case CollectionSubOp.ValueIdentity:
+      return { result: jsArgs[0], skipWriteSuccess: false };
+    case CollectionSubOp.BinaryIsKind:
+      return { result: isBinaryKind(jsArgs[0], Number(jsArgs[1]) >>> 0), skipWriteSuccess: false };
     default:
       throw new Error(`Unknown collection sub-operation: ${subOp}`);
   }

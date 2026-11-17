@@ -845,65 +845,71 @@ pub fn runPipelineWithHost(
         allocator,
         prog,
         host_mod.defaultExtractConfig(extract_root_slices.items),
-    ) catch |err| {
-        return .{ .err = try std.fmt.allocPrint(allocator, "Failed to extract TypeScript declaration graph: {s}", .{@errorName(err)}) };
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .err = try std.fmt.allocPrint(allocator, "Failed to extract TypeScript declaration graph: {s}", .{@errorName(err)}) },
     };
     var graph_res_active = true;
     defer if (graph_res_active) host_mod.TypeScriptHost.freeValue(@TypeOf(graph_res), allocator, graph_res);
 
     var iter: usize = 0;
     while (iter < 64 and graph_res == .ok) : (iter += 1) {
-        const g = graph_res.ok;
-        var newly_discovered: std.ArrayList([]u8) = .empty;
-        errdefer {
-            for (newly_discovered.items) |p| allocator.free(p);
-            newly_discovered.deinit(allocator);
-        }
-
-        for (g.modules) |m| {
-            if (!isUnextractedStubModule(m)) continue;
-            const fp = if (m.file_path < g.strings.len) g.strings[m.file_path] else "";
-            if (fp.len == 0 or isBundledLibVfsPath(fp)) continue;
-            if (extract_roots_set.contains(fp)) continue;
-            var dup_in_batch = false;
-            for (newly_discovered.items) |np| {
-                if (std.mem.eql(u8, np, fp)) {
-                    dup_in_batch = true;
-                    break;
-                }
+        const discovered_any = blk: {
+            const g = graph_res.ok;
+            var newly_discovered: std.ArrayList([]u8) = .empty;
+            errdefer {
+                for (newly_discovered.items) |p| allocator.free(p);
+                newly_discovered.deinit(allocator);
             }
-            if (dup_in_batch) continue;
-            try newly_discovered.ensureUnusedCapacity(allocator, 1);
-            const duped = try allocator.dupe(u8, fp);
-            newly_discovered.appendAssumeCapacity(duped);
-        }
 
-        if (newly_discovered.items.len == 0) {
+            for (g.modules) |m| {
+                if (!isUnextractedStubModule(m)) continue;
+                const fp = if (m.file_path < g.strings.len) g.strings[m.file_path] else "";
+                if (fp.len == 0 or isBundledLibVfsPath(fp)) continue;
+                if (extract_roots_set.contains(fp)) continue;
+                var dup_in_batch = false;
+                for (newly_discovered.items) |np| {
+                    if (std.mem.eql(u8, np, fp)) {
+                        dup_in_batch = true;
+                        break;
+                    }
+                }
+                if (dup_in_batch) continue;
+                try newly_discovered.ensureUnusedCapacity(allocator, 1);
+                const duped = try allocator.dupe(u8, fp);
+                newly_discovered.appendAssumeCapacity(duped);
+            }
+
+            if (newly_discovered.items.len == 0) {
+                newly_discovered.deinit(allocator);
+                break :blk false;
+            }
+
+            try extract_roots.ensureUnusedCapacity(allocator, newly_discovered.items.len);
+            try extract_roots_set.ensureUnusedCapacity(allocator, @intCast(newly_discovered.items.len));
+            try extract_root_slices.ensureUnusedCapacity(allocator, newly_discovered.items.len);
+
+            host_mod.TypeScriptHost.freeValue(@TypeOf(graph_res), allocator, graph_res);
+            graph_res_active = false;
+
+            for (newly_discovered.items) |owned_fp| {
+                extract_roots.appendAssumeCapacity(owned_fp);
+                extract_roots_set.putAssumeCapacity(owned_fp, {});
+                extract_root_slices.appendAssumeCapacity(owned_fp);
+            }
+            newly_discovered.clearRetainingCapacity();
             newly_discovered.deinit(allocator);
-            break;
-        }
-
-        try extract_roots.ensureUnusedCapacity(allocator, newly_discovered.items.len);
-        try extract_roots_set.ensureUnusedCapacity(allocator, @intCast(newly_discovered.items.len));
-        try extract_root_slices.ensureUnusedCapacity(allocator, newly_discovered.items.len);
-
-        host_mod.TypeScriptHost.freeValue(@TypeOf(graph_res), allocator, graph_res);
-        graph_res_active = false;
-
-        for (newly_discovered.items) |owned_fp| {
-            extract_roots.appendAssumeCapacity(owned_fp);
-            extract_roots_set.putAssumeCapacity(owned_fp, {});
-            extract_root_slices.appendAssumeCapacity(owned_fp);
-        }
-        newly_discovered.clearRetainingCapacity();
-        newly_discovered.deinit(allocator);
+            break :blk true;
+        };
+        if (!discovered_any) break;
 
         graph_res = ts_host.extractModuleGraph(
             allocator,
             prog,
             host_mod.defaultExtractConfig(extract_root_slices.items),
-        ) catch |err| {
-            return .{ .err = try std.fmt.allocPrint(allocator, "Failed to extract TypeScript declaration graph: {s}", .{@errorName(err)}) };
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .err = try std.fmt.allocPrint(allocator, "Failed to extract TypeScript declaration graph: {s}", .{@errorName(err)}) },
         };
         graph_res_active = true;
     }

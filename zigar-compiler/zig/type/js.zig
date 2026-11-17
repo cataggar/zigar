@@ -41,6 +41,65 @@ pub const OverflowError = Error || error{Overflow};
 
 pub const AllocError = Error || std.mem.Allocator.Error;
 
+pub const NullishKind = enum {
+    none,
+    undefined_only,
+    null_only,
+    null_or_undefined,
+};
+
+pub fn Nullable(comptime T: type) type {
+    return union(enum) {
+        @"undefined",
+        @"null",
+        value: T,
+
+        pub const Value = T;
+        pub const is_zigar_nullable = true;
+
+        pub inline fn isUndefined(self: @This()) bool {
+            return self == .@"undefined";
+        }
+
+        pub inline fn isNull(self: @This()) bool {
+            return self == .@"null";
+        }
+
+        pub inline fn isNullOrUndefined(self: @This()) bool {
+            return self != .value;
+        }
+
+        pub inline fn toOptional(self: @This()) ?T {
+            return switch (self) {
+                .value => |v| v,
+                else => null,
+            };
+        }
+
+        pub inline fn fromOptional(opt: ?T) @This() {
+            return if (opt) |v| .{ .value = v } else .@"null";
+        }
+
+        pub inline fn fromOptionalUndefined(opt: ?T) @This() {
+            return if (opt) |v| .{ .value = v } else .@"undefined";
+        }
+
+        pub fn deinit(self: @This()) void {
+            switch (self) {
+                .value => |v| {
+                    if (@typeInfo(T) == .@"struct" and @hasDecl(T, "deinit")) {
+                        const DeinitFn = @TypeOf(T.deinit);
+                        if (@typeInfo(DeinitFn) == .@"fn" and @typeInfo(DeinitFn).@"fn".param_types.len == 1) {
+                            v.deinit();
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    };
+}
+
 pub const HostOp = enum(u32) {
     import_module = 1,
     get_global = 2,
@@ -145,6 +204,13 @@ pub const CollectionSubOp = enum(u32) {
     regexp_test = 43,
     regexp_source = 44,
     regexp_flags = 45,
+    string_from_utf8 = 46,
+    string_to_utf8 = 47,
+    string_byte_len = 48,
+    string_utf16_len = 49,
+    string_is_string = 50,
+    value_identity = 51,
+    binary_is_kind = 52,
 };
 
 pub const HostOpFlags = packed struct(u32) {
@@ -451,6 +517,8 @@ pub fn Js(comptime host: type) type {
         pub const Object = module.Object;
         pub const Symbol = module.Symbol;
         pub const Function = module.Function;
+        pub const NullishKind = module.NullishKind;
+        pub const Nullable = module.Nullable;
 
         pub const reserved_undefined_handle = module.reserved_undefined_handle;
         pub const reserved_null_handle = module.reserved_null_handle;
@@ -2971,6 +3039,7 @@ pub fn Js(comptime host: type) type {
         fn ByteBufferLike(comptime kind: module.BinaryKind) type {
             return extern struct {
                 const Self = @This();
+                pub const binary_kind = kind;
                 pub const internal_type: util.InternalType = .js_value;
 
                 handle: u32,
@@ -3090,6 +3159,7 @@ pub fn Js(comptime host: type) type {
 
         pub const DataView = extern struct {
             const Self = @This();
+            pub const binary_kind: module.BinaryKind = .data_view;
             pub const internal_type: util.InternalType = .js_value;
 
             handle: u32,
@@ -3471,6 +3541,7 @@ pub fn Js(comptime host: type) type {
 
         pub const Buffer = extern struct {
             const Self = @This();
+            pub const binary_kind: module.BinaryKind = .buffer;
             pub const internal_type: util.InternalType = .js_value;
 
             handle: u32,
@@ -4615,6 +4686,958 @@ pub fn Js(comptime host: type) type {
                 return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.regexp_flags), "", HostFn, .{ allocator, .{ .handle = self.handle } });
             }
         };
+
+        pub const String = extern struct {
+            const Self = @This();
+            pub const internal_type: util.InternalType = .js_value;
+
+            handle: u32,
+
+            pub const @"undefined": Self = .{ .handle = module.reserved_undefined_handle };
+            pub const @"null": Self = .{ .handle = module.reserved_null_handle };
+
+            pub inline fn ref(self: Self) Ref(module.Any) {
+                return .{ .handle = self.handle };
+            }
+
+            pub inline fn toRef(self: Self) Ref(module.Any) {
+                return .{ .handle = self.handle };
+            }
+
+            pub inline fn fromRef(value: anytype) Self {
+                return .{ .handle = extractHandle(value) };
+            }
+
+            pub inline fn isUndefined(self: Self) bool {
+                return self.handle == module.reserved_undefined_handle;
+            }
+
+            pub inline fn isNull(self: Self) bool {
+                return self.handle == module.reserved_null_handle;
+            }
+
+            pub inline fn isNullOrUndefined(self: Self) bool {
+                return self.handle <= module.reserved_null_handle;
+            }
+
+            pub inline fn isReserved(self: Self) bool {
+                return self.handle < module.first_dynamic_slot;
+            }
+
+            pub fn clone(self: Self) Self {
+                return .{ .handle = self.ref().clone().handle };
+            }
+
+            pub fn tryClone(self: Self) module.Error!Self {
+                return .{ .handle = (try self.ref().tryClone()).handle };
+            }
+
+            pub fn deinit(self: Self) void {
+                self.ref().deinit();
+            }
+
+            pub fn tryDeinit(self: Self) module.Error!void {
+                return self.ref().tryDeinit();
+            }
+
+            pub fn eql(self: Self, other: anytype) bool {
+                return self.ref().eql(other);
+            }
+
+            pub fn tryEql(self: Self, other: anytype) module.Error!bool {
+                return self.ref().tryEql(other);
+            }
+
+            pub fn isString(value: anytype) module.Error!bool {
+                const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!bool);
+                return dispatchHostOpRawFlags(
+                    .collection_op,
+                    @intFromEnum(module.CollectionSubOp.string_is_string),
+                    "",
+                    HostFn,
+                    .{.{ .handle = extractHandle(value) }},
+                );
+            }
+
+            pub fn fromSlice(utf8: []const u8) module.Error!Self {
+                const HostFn = buildFnType(&.{[]const u8}, module.Error!Self);
+                return dispatchHostOpRawFlags(
+                    .collection_op,
+                    @intFromEnum(module.CollectionSubOp.string_from_utf8),
+                    "",
+                    HostFn,
+                    .{utf8},
+                );
+            }
+
+            pub fn empty() module.Error!Self {
+                return fromSlice("");
+            }
+
+            pub fn byteLen(self: Self) module.Error!usize {
+                const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!usize);
+                return dispatchHostOpRawFlags(
+                    .collection_op,
+                    @intFromEnum(module.CollectionSubOp.string_byte_len),
+                    "",
+                    HostFn,
+                    .{.{ .handle = self.handle }},
+                );
+            }
+
+            pub const len = byteLen;
+
+            pub fn utf16Len(self: Self) module.Error!usize {
+                const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!usize);
+                return dispatchHostOpRawFlags(
+                    .collection_op,
+                    @intFromEnum(module.CollectionSubOp.string_utf16_len),
+                    "",
+                    HostFn,
+                    .{.{ .handle = self.handle }},
+                );
+            }
+
+            pub fn toSliceAlloc(self: Self, allocator: std.mem.Allocator) module.AllocError![]u8 {
+                const HostFn = buildFnType(&.{ std.mem.Allocator, Ref(module.Any) }, module.AllocError![]u8);
+                return dispatchHostOpRawFlags(
+                    .collection_op,
+                    @intFromEnum(module.CollectionSubOp.string_to_utf8),
+                    "",
+                    HostFn,
+                    .{ allocator, .{ .handle = self.handle } },
+                );
+            }
+
+            pub const toOwnedSlice = toSliceAlloc;
+        };
+
+        pub fn isNullableType(comptime T: type) bool {
+            return @typeInfo(T) == .@"union" and @hasDecl(T, "is_zigar_nullable") and T.is_zigar_nullable;
+        }
+
+        pub fn isTupleStructType(comptime T: type) bool {
+            return @typeInfo(T) == .@"struct" and util.getInternalType(T) == null and @hasDecl(T, "zigar_js_tuple");
+        }
+
+        fn seenContainsType(comptime seen: anytype, comptime T: type) bool {
+            inline for (seen) |S| {
+                if (S == T) return true;
+            }
+            return false;
+        }
+
+        fn needsDecodeAllocatorInner(comptime T: type, comptime seen: anytype) bool {
+            if (comptime seenContainsType(seen, T)) return false;
+            if (comptime util.getInternalType(T) == .js_value) return false;
+            const next_seen = seen ++ .{T};
+            return switch (@typeInfo(T)) {
+                .void, .bool, .int, .float, .@"enum" => false,
+                .pointer => |pt| switch (pt.size) {
+                    .slice => true,
+                    .one => @typeInfo(pt.child) != .@"fn",
+                    else => false,
+                },
+                .optional => |op| needsDecodeAllocatorInner(op.child, next_seen),
+                .@"union" => |un| blk: {
+                    if (isNullableType(T)) {
+                        break :blk needsDecodeAllocatorInner(T.Value, next_seen);
+                    }
+                    inline for (un.field_types) |FieldType| {
+                        if (needsDecodeAllocatorInner(FieldType, next_seen)) break :blk true;
+                    }
+                    break :blk false;
+                },
+                .@"struct" => |st| blk: {
+                    inline for (st.field_types) |FieldType| {
+                        if (needsDecodeAllocatorInner(FieldType, next_seen)) break :blk true;
+                    }
+                    break :blk false;
+                },
+                else => false,
+            };
+        }
+
+        pub fn needsDecodeAllocator(comptime T: type) bool {
+            return needsDecodeAllocatorInner(T, .{});
+        }
+
+        pub fn freeDecoded(comptime T: type, allocator: std.mem.Allocator, value: T) void {
+            if (comptime util.getInternalType(T) == .js_value) {
+                (Ref(module.Any){ .handle = extractHandle(value) }).deinit();
+                return;
+            }
+            switch (@typeInfo(T)) {
+                .void, .bool, .int, .float, .@"enum" => {},
+                .pointer => |pt| switch (pt.size) {
+                    .slice => {
+                        if (pt.child != u8) {
+                            for (value) |elem| {
+                                freeDecoded(pt.child, allocator, elem);
+                            }
+                        }
+                        allocator.free(value);
+                    },
+                    .one => {
+                        if (comptime (@typeInfo(pt.child) != .@"fn")) {
+                            freeDecoded(pt.child, allocator, value.*);
+                            allocator.destroy(@constCast(value));
+                        }
+                    },
+                    else => {},
+                },
+                .optional => |op| {
+                    if (value) |v| {
+                        freeDecoded(op.child, allocator, v);
+                    }
+                },
+                .@"union" => {
+                    if (comptime isNullableType(T)) {
+                        switch (value) {
+                            .value => |v| freeDecoded(T.Value, allocator, v),
+                            else => {},
+                        }
+                    } else {
+                        switch (value) {
+                            inline else => |payload| freeDecoded(@TypeOf(payload), allocator, payload),
+                        }
+                    }
+                },
+                .@"struct" => |st| {
+                    inline for (st.field_names, 0..) |fname, fi| {
+                        freeDecoded(st.field_types[fi], allocator, @field(value, fname));
+                    }
+                },
+                else => {},
+            }
+        }
+
+        fn resolveNullishTag(comptime raw: anytype) module.NullishKind {
+            const RawT = @TypeOf(raw);
+            if (RawT == module.NullishKind) return raw;
+            return switch (@typeInfo(RawT)) {
+                .enum_literal, .@"enum" => @field(module.NullishKind, @tagName(raw)),
+                else => @compileError("Invalid nullish tag type: " ++ @typeName(RawT)),
+            };
+        }
+
+        fn specSelfNullish(comptime spec: anytype) module.NullishKind {
+            const SpecT = @TypeOf(spec);
+            if (SpecT == module.NullishKind) return spec;
+            return switch (@typeInfo(SpecT)) {
+                .enum_literal, .@"enum" => resolveNullishTag(spec),
+                .@"struct" => if (@hasField(SpecT, "self")) resolveNullishTag(spec.self) else .none,
+                else => .none,
+            };
+        }
+
+        fn tupleFieldIsOptional(comptime T: type, comptime idx: usize) bool {
+            const meta = T.zigar_js_tuple;
+            if (@hasField(@TypeOf(meta), "variadic_index")) {
+                if (meta.variadic_index) |vi| {
+                    if (idx == vi) return false;
+                }
+            }
+            if (@hasField(@TypeOf(meta), "fields")) {
+                if (idx < meta.fields.len) {
+                    const fm = meta.fields[idx];
+                    if (@hasField(@TypeOf(fm), "is_optional")) return fm.is_optional;
+                }
+                return false;
+            }
+            if (@hasField(@TypeOf(meta), "optional_mask") and idx < 64) {
+                return ((meta.optional_mask >> @intCast(idx)) & 1) != 0;
+            }
+            const st = @typeInfo(T).@"struct";
+            return st.field_attrs[idx].default_value_ptr != null and @typeInfo(st.field_types[idx]) == .optional;
+        }
+
+        fn tupleFieldNullishKind(comptime T: type, comptime idx: usize) module.NullishKind {
+            const meta = T.zigar_js_tuple;
+            if (@hasField(@TypeOf(meta), "null_only_mask") and idx < 64) {
+                if (((meta.null_only_mask >> @intCast(idx)) & 1) != 0) {
+                    return .null_only;
+                }
+            }
+            if (tupleFieldIsOptional(T, idx)) return .undefined_only;
+            return .null_or_undefined;
+        }
+
+        fn structFieldWireName(comptime T: type, comptime field_name: []const u8) []const u8 {
+            if (@hasDecl(T, "zigar_js")) {
+                const meta = T.zigar_js;
+                if (@hasField(@TypeOf(meta), "fields")) {
+                    inline for (meta.fields) |fm| {
+                        if (std.mem.eql(u8, fm.name, field_name)) {
+                            if (@hasField(@TypeOf(fm), "js_name")) return fm.js_name;
+                            return field_name;
+                        }
+                    }
+                }
+            }
+            return field_name;
+        }
+
+        fn structFieldIsOptional(comptime T: type, comptime field_idx: usize) bool {
+            const st = @typeInfo(T).@"struct";
+            const field_name = st.field_names[field_idx];
+            if (@hasDecl(T, "zigar_js")) {
+                const meta = T.zigar_js;
+                if (@hasField(@TypeOf(meta), "fields")) {
+                    inline for (meta.fields) |fm| {
+                        if (std.mem.eql(u8, fm.name, field_name)) {
+                            if (@hasField(@TypeOf(fm), "is_optional")) return fm.is_optional;
+                            break;
+                        }
+                    }
+                }
+            }
+            return @typeInfo(st.field_types[field_idx]) == .optional and st.field_attrs[field_idx].default_value_ptr != null;
+        }
+
+        fn binaryIsKind(value: Ref(module.Any), kind: module.BinaryKind) module.Error!bool {
+            const HostFn = buildFnType(&.{ Ref(module.Any), u32 }, module.Error!bool);
+            return dispatchHostOpRawFlags(
+                .collection_op,
+                @intFromEnum(module.CollectionSubOp.binary_is_kind),
+                "",
+                HostFn,
+                .{ value, @intFromEnum(kind) },
+            );
+        }
+
+        fn stackHasSpecId(comptime stack: anytype, comptime target_id: []const u8) bool {
+            inline for (stack) |entry| {
+                if (@typeInfo(@TypeOf(entry)) == .@"struct" and
+                    @hasField(@TypeOf(entry), "id") and
+                    std.mem.eql(u8, entry.id, target_id))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        fn ResolveSpecType(comptime raw_spec: anytype, comptime stack: anytype) type {
+            if (@typeInfo(@TypeOf(raw_spec)) == .@"struct" and @hasField(@TypeOf(raw_spec), "recurse")) {
+                for (stack) |entry| {
+                    if (@typeInfo(@TypeOf(entry)) == .@"struct" and
+                        @hasField(@TypeOf(entry), "id") and
+                        std.mem.eql(u8, entry.id, raw_spec.recurse))
+                    {
+                        return @TypeOf(entry);
+                    }
+                }
+                @compileError("unresolved nullish recurse id: " ++ raw_spec.recurse);
+            }
+            return @TypeOf(raw_spec);
+        }
+
+        fn resolveSpecFromStack(comptime raw_spec: anytype, comptime stack: anytype) ResolveSpecType(raw_spec, stack) {
+            if (comptime (@typeInfo(@TypeOf(raw_spec)) == .@"struct" and @hasField(@TypeOf(raw_spec), "recurse"))) {
+                inline for (stack) |entry| {
+                    if (comptime (@typeInfo(@TypeOf(entry)) == .@"struct" and
+                        @hasField(@TypeOf(entry), "id") and
+                        std.mem.eql(u8, entry.id, raw_spec.recurse)))
+                    {
+                        return entry;
+                    }
+                }
+                @compileError("unresolved nullish recurse id: " ++ raw_spec.recurse);
+            }
+            return raw_spec;
+        }
+
+        fn toJsRefWithSpecImpl(
+            comptime T: type,
+            value: T,
+            comptime raw_spec: anytype,
+            comptime ancestor_stack: anytype,
+        ) module.CallError!Ref(module.Any) {
+            const spec = comptime resolveSpecFromStack(raw_spec, ancestor_stack);
+            const next_stack = comptime if (@typeInfo(@TypeOf(spec)) == .@"struct" and
+                @hasField(@TypeOf(spec), "id") and
+                !stackHasSpecId(ancestor_stack, spec.id))
+                ancestor_stack ++ .{spec}
+            else
+                ancestor_stack;
+
+            if (T == void) return Ref(module.Any).@"undefined";
+            if (T == bool) return Ref(module.Any).fromBool(value);
+            if (comptime util.getInternalType(T) == .js_value) {
+                const r: Ref(module.Any) = .{ .handle = extractHandle(value) };
+                return try r.tryClone();
+            }
+            if (comptime isNullableType(T)) {
+                const child_spec = comptime if (@typeInfo(@TypeOf(spec)) == .@"struct" and @hasField(@TypeOf(spec), "child"))
+                    spec.child
+                else
+                    module.NullishKind.none;
+                return switch (value) {
+                    .@"undefined" => Ref(module.Any).@"undefined",
+                    .@"null" => Ref(module.Any).@"null",
+                    .value => |v| toJsRefWithSpecImpl(T.Value, v, child_spec, next_stack),
+                };
+            }
+            switch (@typeInfo(T)) {
+                .optional => |op| {
+                    if (value) |v| {
+                        const child_spec = comptime if (@typeInfo(@TypeOf(spec)) == .@"struct" and @hasField(@TypeOf(spec), "child"))
+                            spec.child
+                        else
+                            module.NullishKind.none;
+                        return toJsRefWithSpecImpl(op.child, v, child_spec, next_stack);
+                    }
+                    return switch (comptime specSelfNullish(spec)) {
+                        .undefined_only => Ref(module.Any).@"undefined",
+                        .none, .null_only, .null_or_undefined => Ref(module.Any).@"null",
+                    };
+                },
+                .int, .float => {
+                    const HostFn = buildFnType(&.{T}, module.CallError!Ref(module.Any));
+                    return dispatchHostOpRawFlags(
+                        .collection_op,
+                        @intFromEnum(module.CollectionSubOp.value_identity),
+                        "",
+                        HostFn,
+                        .{value},
+                    );
+                },
+                .pointer => |pt| switch (pt.size) {
+                    .slice => {
+                        if (pt.child == u8) {
+                            const str = try String.fromSlice(value);
+                            return str.toRef();
+                        }
+                        const elem_spec = comptime if (@typeInfo(@TypeOf(spec)) == .@"struct" and @hasField(@TypeOf(spec), "elem"))
+                            spec.elem
+                        else
+                            module.NullishKind.none;
+                        const js_arr = try Array(Ref(module.Any)).withCapacity(value.len);
+                        errdefer js_arr.deinit();
+                        for (value, 0..) |elem, idx| {
+                            const elem_ref = try toJsRefWithSpecImpl(pt.child, elem, elem_spec, next_stack);
+                            defer elem_ref.deinit();
+                            try js_arr.set(idx, elem_ref);
+                        }
+                        return .{ .handle = js_arr.handle };
+                    },
+                    .one => {
+                        if (comptime (@typeInfo(pt.child) == .@"fn")) {
+                            return error.TypeError;
+                        }
+                        if (comptime (@typeInfo(pt.child) == .array and @typeInfo(pt.child).array.child == u8)) {
+                            const str = try String.fromSlice(value);
+                            return str.toRef();
+                        }
+                        return toJsRefWithSpecImpl(pt.child, value.*, spec, next_stack);
+                    },
+                    else => @compileError("Unsupported pointer type for JS conversion: " ++ @typeName(T)),
+                },
+                .@"struct" => |st| {
+                    if (comptime isTupleStructType(T)) {
+                        const meta = T.zigar_js_tuple;
+                        const var_idx_opt: ?usize = if (@hasField(@TypeOf(meta), "variadic_index")) meta.variadic_index else null;
+                        const has_tuple_override = comptime (@typeInfo(@TypeOf(spec)) == .@"struct" and @hasField(@TypeOf(spec), "tuple"));
+                        const js_arr = try Array(Ref(module.Any)).init();
+                        errdefer js_arr.deinit();
+
+                        if (comptime (var_idx_opt == null)) {
+                            var effective_len: usize = st.field_names.len;
+                            inline for (0..st.field_names.len) |rev_step| {
+                                const fi = st.field_names.len - 1 - rev_step;
+                                if (effective_len == fi + 1 and comptime tupleFieldIsOptional(T, fi) and @typeInfo(st.field_types[fi]) == .optional) {
+                                    if (@field(value, st.field_names[fi]) == null) {
+                                        effective_len = fi;
+                                    }
+                                }
+                            }
+                            inline for (st.field_names, 0..) |fname, fi| {
+                                if (fi < effective_len) {
+                                    const fspec = comptime blk: {
+                                        if (has_tuple_override and fi < spec.tuple.len) {
+                                            break :blk spec.tuple[fi];
+                                        }
+                                        if (@hasField(@TypeOf(meta), "fields") and fi < meta.fields.len and @hasField(@TypeOf(meta.fields[fi]), "nullish")) {
+                                            break :blk meta.fields[fi].nullish;
+                                        }
+                                        break :blk tupleFieldNullishKind(T, fi);
+                                    };
+                                    const elem_ref = try toJsRefWithSpecImpl(st.field_types[fi], @field(value, fname), fspec, next_stack);
+                                    defer elem_ref.deinit();
+                                    _ = try js_arr.push(elem_ref);
+                                }
+                            }
+                            return .{ .handle = js_arr.handle };
+                        } else {
+                            const v_idx: usize = comptime var_idx_opt.?;
+                            const trailing_count: usize = comptime (st.field_names.len - 1 - v_idx);
+                            const rest_slice = @field(value, st.field_names[v_idx]);
+                            var leading_len: usize = v_idx;
+                            if (trailing_count == 0 and rest_slice.len == 0) {
+                                inline for (0..v_idx) |rev_step| {
+                                    const fi = v_idx - 1 - rev_step;
+                                    if (leading_len == fi + 1 and comptime tupleFieldIsOptional(T, fi) and @typeInfo(st.field_types[fi]) == .optional) {
+                                        if (@field(value, st.field_names[fi]) == null) {
+                                            leading_len = fi;
+                                        }
+                                    }
+                                }
+                            }
+                            inline for (st.field_names, 0..) |fname, fi| {
+                                const ftype = st.field_types[fi];
+                                if (comptime (fi < v_idx)) {
+                                    if (fi < leading_len) {
+                                        const fspec = comptime blk: {
+                                            if (has_tuple_override and fi < spec.tuple.len) {
+                                                break :blk spec.tuple[fi];
+                                            }
+                                            if (@hasField(@TypeOf(meta), "fields") and fi < meta.fields.len and @hasField(@TypeOf(meta.fields[fi]), "nullish")) {
+                                                break :blk meta.fields[fi].nullish;
+                                            }
+                                            break :blk tupleFieldNullishKind(T, fi);
+                                        };
+                                        const elem_ref = try toJsRefWithSpecImpl(ftype, @field(value, fname), fspec, next_stack);
+                                        defer elem_ref.deinit();
+                                        _ = try js_arr.push(elem_ref);
+                                    }
+                                } else if (comptime (fi == v_idx)) {
+                                    const RestElem = @typeInfo(ftype).pointer.child;
+                                    const rest_elem_spec = comptime blk: {
+                                        if (has_tuple_override and fi < spec.tuple.len) {
+                                            break :blk spec.tuple[fi];
+                                        }
+                                        if (@hasField(@TypeOf(meta), "fields") and fi < meta.fields.len and @hasField(@TypeOf(meta.fields[fi]), "nullish")) {
+                                            break :blk meta.fields[fi].nullish;
+                                        }
+                                        break :blk module.NullishKind.none;
+                                    };
+                                    for (rest_slice) |re| {
+                                        const elem_ref = try toJsRefWithSpecImpl(RestElem, re, rest_elem_spec, next_stack);
+                                        defer elem_ref.deinit();
+                                        _ = try js_arr.push(elem_ref);
+                                    }
+                                } else {
+                                    const fspec = comptime blk: {
+                                        if (has_tuple_override and fi < spec.tuple.len) {
+                                            break :blk spec.tuple[fi];
+                                        }
+                                        if (@hasField(@TypeOf(meta), "fields") and fi < meta.fields.len and @hasField(@TypeOf(meta.fields[fi]), "nullish")) {
+                                            break :blk meta.fields[fi].nullish;
+                                        }
+                                        break :blk tupleFieldNullishKind(T, fi);
+                                    };
+                                    const elem_ref = try toJsRefWithSpecImpl(ftype, @field(value, fname), fspec, next_stack);
+                                    defer elem_ref.deinit();
+                                    _ = try js_arr.push(elem_ref);
+                                }
+                            }
+                            return .{ .handle = js_arr.handle };
+                        }
+                    }
+
+                    if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_enum") and T.zigar_js.is_enum and @hasField(T, "__zigar_value")) {
+                        return toJsRefWithSpecImpl(@TypeOf(value.__zigar_value), value.__zigar_value, module.NullishKind.none, .{});
+                    }
+
+                    const has_fields_override = comptime (@typeInfo(@TypeOf(spec)) == .@"struct" and @hasField(@TypeOf(spec), "fields"));
+
+                    const rec = try Record([]const u8, Ref(module.Any)).init();
+                    errdefer rec.deinit();
+                    inline for (st.field_names, 0..) |fname, fi| {
+                        const ftype = st.field_types[fi];
+                        const fval = @field(value, fname);
+                        const wire_key = comptime structFieldWireName(T, fname);
+                        const is_opt = comptime structFieldIsOptional(T, fi);
+                        const field_spec = comptime blk: {
+                            if (has_fields_override) {
+                                for (spec.fields) |fm| {
+                                    if (std.mem.eql(u8, fm.name, fname)) {
+                                        if (@hasField(@TypeOf(fm), "nullish")) break :blk fm.nullish;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "fields")) {
+                                for (T.zigar_js.fields) |fm| {
+                                    if (std.mem.eql(u8, fm.name, fname)) {
+                                        if (@hasField(@TypeOf(fm), "nullish")) break :blk fm.nullish;
+                                        break;
+                                    }
+                                }
+                            }
+                            break :blk module.NullishKind.null_or_undefined;
+                        };
+                        if (comptime (is_opt and isNullableType(ftype))) {
+                            if (fval != .@"undefined") {
+                                const prop_ref = try toJsRefWithSpecImpl(ftype, fval, field_spec, next_stack);
+                                defer prop_ref.deinit();
+                                try rec.set(wire_key, prop_ref);
+                            }
+                        } else if (comptime (is_opt and @typeInfo(ftype) == .optional)) {
+                            if (fval != null) {
+                                const prop_ref = try toJsRefWithSpecImpl(ftype, fval, field_spec, next_stack);
+                                defer prop_ref.deinit();
+                                try rec.set(wire_key, prop_ref);
+                            }
+                        } else {
+                            const prop_ref = try toJsRefWithSpecImpl(ftype, fval, field_spec, next_stack);
+                            defer prop_ref.deinit();
+                            try rec.set(wire_key, prop_ref);
+                        }
+                    }
+                    return .{ .handle = rec.handle };
+                },
+                .@"enum" => {
+                    if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "members")) {
+                        inline for (T.zigar_js.members) |m| {
+                            if (value == @field(T, m.tag)) {
+                                if (@hasField(@TypeOf(m), "str_value")) {
+                                    return (try String.fromSlice(m.str_value)).toRef();
+                                }
+                                if (@hasField(@TypeOf(m), "num_value")) {
+                                    return toJsRefWithSpecImpl(f64, m.num_value, module.NullishKind.none, .{});
+                                }
+                            }
+                        }
+                    }
+                    return (try String.fromSlice(@tagName(value))).toRef();
+                },
+                .@"union" => {
+                    return switch (value) {
+                        inline else => |payload| toJsRefWithSpecImpl(@TypeOf(payload), payload, module.NullishKind.none, next_stack),
+                    };
+                },
+                else => @compileError("Unsupported Zig type for JS conversion: " ++ @typeName(T)),
+            }
+        }
+
+        pub fn toJsRefWithSpec(
+            comptime T: type,
+            value: T,
+            comptime spec: anytype,
+        ) module.CallError!Ref(module.Any) {
+            return toJsRefWithSpecImpl(T, value, spec, .{});
+        }
+
+        pub fn toJsRefWithNullish(
+            comptime T: type,
+            value: T,
+            comptime nullish_kind: module.NullishKind,
+        ) module.CallError!Ref(module.Any) {
+            return toJsRefWithSpec(T, value, nullish_kind);
+        }
+
+        pub fn toJsRef(comptime T: type, value: T) module.CallError!Ref(module.Any) {
+            return toJsRefWithSpec(T, value, module.NullishKind.none);
+        }
+
+        pub fn fromJsRefAlloc(
+            comptime T: type,
+            allocator: std.mem.Allocator,
+            value: anytype,
+        ) module.CallError!T {
+            const raw: Ref(module.Any) = .{ .handle = extractHandle(value) };
+            if (T == void) return {};
+            if (comptime isNullableType(T)) {
+                if (raw.isUndefined()) return .@"undefined";
+                if (raw.isNull()) return .@"null";
+                return .{ .value = try fromJsRefAlloc(T.Value, allocator, raw) };
+            }
+            if (@typeInfo(T) == .optional) {
+                if (raw.isNullOrUndefined()) return null;
+                return try fromJsRefAlloc(@typeInfo(T).optional.child, allocator, raw);
+            }
+            if (comptime util.getInternalType(T) == .js_value) {
+                if (T == String) {
+                    if (!(try String.isString(raw))) return error.TypeError;
+                    return .{ .handle = (try raw.tryClone()).handle };
+                }
+                if (T == BigInt) {
+                    if ((try raw.tryTypeof()) != .bigint) return error.TypeError;
+                    return .{ .handle = (try raw.tryClone()).handle };
+                }
+                if (@hasDecl(T, "binary_kind")) {
+                    if (!(try binaryIsKind(raw, T.binary_kind))) return error.TypeError;
+                    return .{ .handle = (try raw.tryClone()).handle };
+                }
+                if (@hasDecl(T, "Target")) {
+                    if (T.Target == module.Symbol) {
+                        if ((try raw.tryTypeof()) != .symbol) return error.TypeError;
+                    } else if (T.Target == module.Function) {
+                        if ((try raw.tryTypeof()) != .function) return error.TypeError;
+                    } else if (T.Target == module.Object) {
+                        if (raw.isNullOrUndefined()) return error.TypeError;
+                        const jt = try raw.tryTypeof();
+                        if (jt != .object and jt != .function) return error.TypeError;
+                    }
+                }
+                return .{ .handle = (try raw.tryClone()).handle };
+            }
+
+            switch (@typeInfo(T)) {
+                .bool => {
+                    if ((try raw.tryTypeof()) != .boolean) return error.TypeError;
+                    const HostFn = buildFnType(&.{Ref(module.Any)}, module.CallError!bool);
+                    return dispatchHostOpRawFlags(
+                        .collection_op,
+                        @intFromEnum(module.CollectionSubOp.value_identity),
+                        "",
+                        HostFn,
+                        .{raw},
+                    );
+                },
+                .float => {
+                    if ((try raw.tryTypeof()) != .number) return error.TypeError;
+                    const HostFn = buildFnType(&.{Ref(module.Any)}, module.CallError!T);
+                    return dispatchHostOpRawFlags(
+                        .collection_op,
+                        @intFromEnum(module.CollectionSubOp.value_identity),
+                        "",
+                        HostFn,
+                        .{raw},
+                    );
+                },
+                .int => |it| {
+                    const expected_jt: module.JsType = if (it.bits > 32) .bigint else .number;
+                    const jt = try raw.tryTypeof();
+                    if (jt != expected_jt) return error.TypeError;
+                    const HostFn = buildFnType(&.{Ref(module.Any)}, module.CallError!T);
+                    return dispatchHostOpRawFlags(
+                        .collection_op,
+                        @intFromEnum(module.CollectionSubOp.value_identity),
+                        "",
+                        HostFn,
+                        .{raw},
+                    );
+                },
+                .pointer => |pt| switch (pt.size) {
+                    .slice => {
+                        if (pt.child == u8) {
+                            if (!(try String.isString(raw))) return error.TypeError;
+                            const str = String{ .handle = raw.handle };
+                            return try str.toSliceAlloc(allocator);
+                        }
+                        if (!(try Array(Ref(module.Any)).isArray(raw))) return error.TypeError;
+                        const arr = Array(Ref(module.Any)).fromRef(raw);
+                        const count = try arr.len();
+                        const buf = try allocator.alloc(pt.child, count);
+                        var initialized: usize = 0;
+                        errdefer {
+                            for (buf[0..initialized]) |elem| {
+                                freeDecoded(pt.child, allocator, elem);
+                            }
+                            allocator.free(buf);
+                        }
+                        while (initialized < count) : (initialized += 1) {
+                            const elem_ref = try arr.get(initialized);
+                            defer elem_ref.deinit();
+                            buf[initialized] = try fromJsRefAlloc(pt.child, allocator, elem_ref);
+                        }
+                        return buf;
+                    },
+                    .one => {
+                        if (comptime (@typeInfo(pt.child) == .@"fn")) {
+                            return error.TypeError;
+                        }
+                        const ptr = try allocator.create(pt.child);
+                        errdefer allocator.destroy(ptr);
+                        ptr.* = try fromJsRefAlloc(pt.child, allocator, raw);
+                        return ptr;
+                    },
+                    else => @compileError("Unsupported pointer type for JS decode: " ++ @typeName(T)),
+                },
+                .@"struct" => |st| {
+                    if (comptime isTupleStructType(T)) {
+                        if (!(try Array(Ref(module.Any)).isArray(raw))) return error.TypeError;
+                        if (st.field_names.len == 0) return .{};
+
+                        const arr = Array(Ref(module.Any)).fromRef(raw);
+                        const arr_len = try arr.len();
+                        const meta = T.zigar_js_tuple;
+                        const var_idx_opt: ?usize = if (@hasField(@TypeOf(meta), "variadic_index")) meta.variadic_index else null;
+
+                        var out: T = undefined;
+                        var field_init: [st.field_names.len]bool = @splat(false);
+                        errdefer {
+                            inline for (st.field_names, 0..) |fname, fi| {
+                                if (field_init[fi]) {
+                                    freeDecoded(st.field_types[fi], allocator, @field(out, fname));
+                                }
+                            }
+                        }
+
+                        if (comptime (var_idx_opt == null)) {
+                            const min_req = comptime blk: {
+                                var req: usize = 0;
+                                for (0..st.field_names.len) |fi| {
+                                    if (!tupleFieldIsOptional(T, fi)) req = fi + 1;
+                                }
+                                break :blk req;
+                            };
+                            if (arr_len < min_req) return error.TypeError;
+                            inline for (st.field_names, 0..) |fname, fi| {
+                                const ftype = st.field_types[fi];
+                                if (fi < arr_len) {
+                                    const elem_ref = try arr.get(fi);
+                                    defer elem_ref.deinit();
+                                    @field(out, fname) = try fromJsRefAlloc(ftype, allocator, elem_ref);
+                                    field_init[fi] = true;
+                                } else if (comptime (@typeInfo(ftype) == .optional)) {
+                                    @field(out, fname) = null;
+                                    field_init[fi] = true;
+                                } else {
+                                    return error.TypeError;
+                                }
+                            }
+                            return out;
+                        } else {
+                            const v_idx: usize = comptime var_idx_opt.?;
+                            const trailing_count: usize = comptime (st.field_names.len - 1 - v_idx);
+                            const req_leading: usize = comptime blk: {
+                                if (trailing_count > 0) break :blk v_idx;
+                                var req: usize = 0;
+                                for (0..v_idx) |fi| {
+                                    if (!tupleFieldIsOptional(T, fi)) req = fi + 1;
+                                }
+                                break :blk req;
+                            };
+                            if (arr_len < req_leading + trailing_count) return error.TypeError;
+                            const avail_before_trailing = arr_len - trailing_count;
+                            const leading_present = @min(v_idx, avail_before_trailing);
+                            const rest_start = leading_present;
+                            const rest_len = avail_before_trailing - rest_start;
+
+                            inline for (st.field_names, 0..) |fname, fi| {
+                                const ftype = st.field_types[fi];
+                                if (comptime (fi < v_idx)) {
+                                    if (fi < leading_present) {
+                                        const elem_ref = try arr.get(fi);
+                                        defer elem_ref.deinit();
+                                        @field(out, fname) = try fromJsRefAlloc(ftype, allocator, elem_ref);
+                                        field_init[fi] = true;
+                                    } else if (comptime (@typeInfo(ftype) == .optional)) {
+                                        @field(out, fname) = null;
+                                        field_init[fi] = true;
+                                    } else {
+                                        return error.TypeError;
+                                    }
+                                } else if (comptime (fi == v_idx)) {
+                                    const RestElem = @typeInfo(ftype).pointer.child;
+                                    const rest_buf = try allocator.alloc(RestElem, rest_len);
+                                    var ri: usize = 0;
+                                    errdefer {
+                                        for (rest_buf[0..ri]) |re| freeDecoded(RestElem, allocator, re);
+                                        allocator.free(rest_buf);
+                                    }
+                                    while (ri < rest_len) : (ri += 1) {
+                                        const elem_ref = try arr.get(rest_start + ri);
+                                        defer elem_ref.deinit();
+                                        rest_buf[ri] = try fromJsRefAlloc(RestElem, allocator, elem_ref);
+                                    }
+                                    @field(out, fname) = rest_buf;
+                                    field_init[fi] = true;
+                                } else {
+                                    const trail_offset = comptime (fi - (v_idx + 1));
+                                    const elem_ref = try arr.get(avail_before_trailing + trail_offset);
+                                    defer elem_ref.deinit();
+                                    @field(out, fname) = try fromJsRefAlloc(ftype, allocator, elem_ref);
+                                    field_init[fi] = true;
+                                }
+                            }
+                            return out;
+                        }
+                    }
+
+                    if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_enum") and T.zigar_js.is_enum and @hasField(T, "__zigar_value")) {
+                        return .{ .__zigar_value = try fromJsRefAlloc(@FieldType(T, "__zigar_value"), allocator, raw) };
+                    }
+
+                    if (raw.isNullOrUndefined()) return error.TypeError;
+                    const jt = try raw.tryTypeof();
+                    if (jt != .object and jt != .function) return error.TypeError;
+                    if (st.field_names.len == 0) return .{};
+
+                    const obj = raw.cast(module.Object);
+                    var out: T = undefined;
+                    var field_init: [st.field_names.len]bool = @splat(false);
+                    errdefer {
+                        inline for (st.field_names, 0..) |fname, fi| {
+                            if (field_init[fi]) {
+                                freeDecoded(st.field_types[fi], allocator, @field(out, fname));
+                            }
+                        }
+                    }
+                    inline for (st.field_names, 0..) |fname, fi| {
+                        const ftype = st.field_types[fi];
+                        const wire_key = comptime structFieldWireName(T, fname);
+                        const prop_ref = try getProp(module.CallError!Ref(module.Any), obj, wire_key);
+                        defer prop_ref.deinit();
+                        @field(out, fname) = try fromJsRefAlloc(ftype, allocator, prop_ref);
+                        field_init[fi] = true;
+                    }
+                    return out;
+                },
+                .@"enum" => {
+                    const jt = try raw.tryTypeof();
+                    var enum_buf: [512]u8 = undefined;
+                    var enum_fba = std.heap.FixedBufferAllocator.init(&enum_buf);
+                    const str_alloc = if (@hasDecl(host, "default_allocator")) host.default_allocator else enum_fba.allocator();
+                    if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "members")) {
+                        if (jt == .string) {
+                            const s = try (String{ .handle = raw.handle }).toSliceAlloc(str_alloc);
+                            defer str_alloc.free(s);
+                            inline for (T.zigar_js.members) |m| {
+                                if (@hasField(@TypeOf(m), "str_value")) {
+                                    if (std.mem.eql(u8, s, m.str_value)) return @field(T, m.tag);
+                                }
+                            }
+                            return error.TypeError;
+                        }
+                        if (jt == .number) {
+                            const n = try fromJsRefAlloc(f64, allocator, raw);
+                            inline for (T.zigar_js.members) |m| {
+                                if (@hasField(@TypeOf(m), "num_value")) {
+                                    if (n == m.num_value) return @field(T, m.tag);
+                                }
+                            }
+                            return error.TypeError;
+                        }
+                        return error.TypeError;
+                    }
+                    if (jt == .string) {
+                        const s = try (String{ .handle = raw.handle }).toSliceAlloc(str_alloc);
+                        defer str_alloc.free(s);
+                        if (std.meta.stringToEnum(T, s)) |tag| return tag;
+                    }
+                    return error.TypeError;
+                },
+                .@"union" => |un| {
+                    inline for (un.field_names, 0..) |fname, fi| {
+                        if (fromJsRefAlloc(un.field_types[fi], allocator, raw)) |decoded| {
+                            return @unionInit(T, fname, decoded);
+                        } else |err| switch (err) {
+                            error.OutOfMemory, error.OffJsThread, error.HostUnavailable => return err,
+                            else => {},
+                        }
+                    }
+                    return error.TypeError;
+                },
+                else => @compileError("Unsupported Zig type for JS decode: " ++ @typeName(T)),
+            }
+        }
+
+        pub fn fromJsRef(comptime T: type, value: anytype) module.CallError!T {
+            if (comptime needsDecodeAllocator(T)) {
+                if (@hasDecl(host, "default_allocator")) {
+                    return fromJsRefAlloc(T, host.default_allocator, value);
+                }
+                return error.HostUnavailable;
+            }
+            var stack_buf: [512]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
+            return fromJsRefAlloc(T, fba.allocator(), value);
+        }
     };
 }
 
@@ -6240,5 +7263,578 @@ test "CallbackRegistry: FIFO reuse, permanent retirement at 0xFFF, multi-slab O(
     try expectEqual(@as(u32, 0), js.activeCallbackCount());
     try expectEqual(@as(u32, 0), js.activeHandleCount());
 }
+
+test "Js.String, Nullable(T), needsDecodeAllocator, and tuple/slice marshaling helpers" {
+    const RecProp = struct {
+        key: []u8,
+        val: u32,
+    };
+
+    const ValEntry = union(enum) {
+        unused,
+        str: []u8,
+        num: f64,
+        bi: i64,
+        arr: std.ArrayList(u32),
+        rec: std.ArrayList(RecProp),
+        buf: usize,
+    };
+
+    const MarshalingMockHost = struct {
+        var entries: [256]ValEntry = @splat(.unused);
+        var refcounts: [256]u32 = @splat(0);
+
+        fn reset() void {
+            for (&entries, 0..) |*e, idx| {
+                switch (e.*) {
+                    .str => |s| std.testing.allocator.free(s),
+                    .arr => |*a| a.deinit(std.testing.allocator),
+                    .rec => |*r| {
+                        for (r.items) |kv| std.testing.allocator.free(kv.key);
+                        r.deinit(std.testing.allocator);
+                    },
+                    else => {},
+                }
+                e.* = .unused;
+                refcounts[idx] = 0;
+            }
+        }
+
+        fn allocVal(v: ValEntry) u32 {
+            for (8..entries.len) |idx| {
+                if (refcounts[idx] == 0) {
+                    entries[idx] = v;
+                    refcounts[idx] = 1;
+                    return @intCast((1 << 20) | idx);
+                }
+            }
+            unreachable;
+        }
+
+        pub fn cloneJsValue(handle: u32) u32 {
+            if (handle < 8) return handle;
+            const slot = handle & 0xFFFFF;
+            std.debug.assert(refcounts[slot] > 0);
+            refcounts[slot] += 1;
+            return handle;
+        }
+
+        pub fn releaseJsValue(handle: u32) void {
+            if (handle < 8) return;
+            const slot = handle & 0xFFFFF;
+            std.debug.assert(refcounts[slot] > 0);
+            refcounts[slot] -= 1;
+            if (refcounts[slot] == 0) {
+                switch (entries[slot]) {
+                    .str => |s| std.testing.allocator.free(s),
+                    .arr => |*a| {
+                        for (a.items) |child_h| releaseJsValue(child_h);
+                        a.deinit(std.testing.allocator);
+                    },
+                    .rec => |*r| {
+                        for (r.items) |kv| {
+                            std.testing.allocator.free(kv.key);
+                            releaseJsValue(kv.val);
+                        }
+                        r.deinit(std.testing.allocator);
+                    },
+                    else => {},
+                }
+                entries[slot] = .unused;
+            }
+        }
+
+        pub fn typeofJsValue(handle: u32) JsType {
+            if (handle == 0) return .@"undefined";
+            if (handle == 1 or handle == 4) return .object;
+            if (handle == 2 or handle == 3) return .boolean;
+            const slot = handle & 0xFFFFF;
+            return switch (entries[slot]) {
+                .str => .string,
+                .num => .number,
+                .bi => .bigint,
+                .arr, .rec, .buf => .object,
+                .unused => .@"undefined",
+            };
+        }
+
+        pub fn instanceofJsValue(_: u32, _: u32) bool {
+            return false;
+        }
+
+        pub fn equalJsValue(lhs: u32, rhs: u32) bool {
+            return lhs == rhs;
+        }
+
+        pub fn getJsValueCount() u32 {
+            var total: u32 = 0;
+            for (refcounts) |rc| total += rc;
+            return total;
+        }
+
+        pub fn invokeJsHostOp(desc_ptr: *const anyopaque, arg_ptr: *anyopaque, _: usize) E {
+            const desc: *const HostOpDescriptor = @ptrCast(@alignCast(desc_ptr));
+            const op: HostOp = @enumFromInt(desc.op);
+            const J = Js(@This());
+            switch (op) {
+                .binary_create => {
+                    const Frame = arg_struct.ArgStruct(fn (usize, usize, bool) Error!J.Buffer);
+                    const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    f.retval = .{ .handle = allocVal(.{ .buf = f.@"1" }) };
+                },
+                .binary_info => {
+                    const info: BinaryInfoKind = @enumFromInt(desc.flags);
+                    switch (info) {
+                        .is_array => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!bool);
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const h = f.@"0".handle;
+                            f.retval = h >= 8 and entries[h & 0xFFFFF] == .arr;
+                        },
+                        else => return .FAULT,
+                    }
+                },
+                .collection_op => {
+                    const sub: CollectionSubOp = @enumFromInt(desc.flags);
+                    switch (sub) {
+                        .string_from_utf8 => {
+                            const Frame = arg_struct.ArgStruct(fn ([]const u8) Error!J.String);
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const copy = std.testing.allocator.dupe(u8, f.@"0") catch return .FAULT;
+                            f.retval = .{ .handle = allocVal(.{ .str = copy }) };
+                        },
+                        .string_to_utf8 => {
+                            const Frame = arg_struct.ArgStruct(fn (std.mem.Allocator, J.Ref(Any)) AllocError![]u8);
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const h = f.@"1".handle;
+                            if (h < 8 or entries[h & 0xFFFFF] != .str) {
+                                f.retval = error.JsException;
+                            } else {
+                                f.retval = f.@"0".dupe(u8, entries[h & 0xFFFFF].str);
+                            }
+                        },
+                        .string_byte_len => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!usize);
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const h = f.@"0".handle;
+                            if (h < 8 or entries[h & 0xFFFFF] != .str) {
+                                f.retval = error.JsException;
+                            } else {
+                                f.retval = entries[h & 0xFFFFF].str.len;
+                            }
+                        },
+                        .string_utf16_len => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!usize);
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const h = f.@"0".handle;
+                            if (h < 8 or entries[h & 0xFFFFF] != .str) {
+                                f.retval = error.JsException;
+                            } else {
+                                f.retval = std.unicode.calcUtf16LeLen(entries[h & 0xFFFFF].str) catch return .FAULT;
+                            }
+                        },
+                        .string_is_string => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!bool);
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const h = f.@"0".handle;
+                            f.retval = h >= 8 and entries[h & 0xFFFFF] == .str;
+                        },
+                        .binary_is_kind => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), u32) Error!bool);
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const h = f.@"0".handle;
+                            f.retval = h >= 8 and entries[h & 0xFFFFF] == .buf and f.@"1" == @intFromEnum(BinaryKind.buffer);
+                        },
+                        .value_identity => {
+                            // Discriminate signature hash for f64/i64/bool box & unbox
+                            const BoxF64 = fn (f64) CallError!J.Ref(Any);
+                            const UnboxF64 = fn (J.Ref(Any)) CallError!f64;
+                            const BoxI64 = fn (i64) CallError!J.Ref(Any);
+                            const UnboxI64 = fn (J.Ref(Any)) CallError!i64;
+                            const UnboxBool = fn (J.Ref(Any)) CallError!bool;
+                            if (desc.signature == signature.get(arg_struct.ArgStruct(BoxF64))) {
+                                const f: *arg_struct.ArgStruct(BoxF64) = @ptrCast(@alignCast(arg_ptr));
+                                f.retval = .{ .handle = allocVal(.{ .num = f.@"0" }) };
+                            } else if (desc.signature == signature.get(arg_struct.ArgStruct(UnboxF64))) {
+                                const f: *arg_struct.ArgStruct(UnboxF64) = @ptrCast(@alignCast(arg_ptr));
+                                f.retval = entries[f.@"0".handle & 0xFFFFF].num;
+                            } else if (desc.signature == signature.get(arg_struct.ArgStruct(BoxI64))) {
+                                const f: *arg_struct.ArgStruct(BoxI64) = @ptrCast(@alignCast(arg_ptr));
+                                f.retval = .{ .handle = allocVal(.{ .bi = f.@"0" }) };
+                            } else if (desc.signature == signature.get(arg_struct.ArgStruct(UnboxI64))) {
+                                const f: *arg_struct.ArgStruct(UnboxI64) = @ptrCast(@alignCast(arg_ptr));
+                                f.retval = entries[f.@"0".handle & 0xFFFFF].bi;
+                            } else if (desc.signature == signature.get(arg_struct.ArgStruct(UnboxBool))) {
+                                const f: *arg_struct.ArgStruct(UnboxBool) = @ptrCast(@alignCast(arg_ptr));
+                                f.retval = (f.@"0".handle == 3);
+                            } else return .FAULT;
+                        },
+                        .array_init => {
+                            const Frame = arg_struct.ArgStruct(fn () Error!J.Array(J.Ref(Any)));
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            f.retval = .{ .handle = allocVal(.{ .arr = .empty }) };
+                        },
+                        .array_with_capacity => {
+                            const Frame = arg_struct.ArgStruct(fn (usize) Error!J.Array(J.Ref(Any)));
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            var list: std.ArrayList(u32) = .empty;
+                            list.appendNTimes(std.testing.allocator, 0, f.@"0") catch return .FAULT;
+                            f.retval = .{ .handle = allocVal(.{ .arr = list }) };
+                        },
+                        .array_len => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!usize);
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            f.retval = entries[f.@"0".handle & 0xFFFFF].arr.items.len;
+                        },
+                        .array_get => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), usize) Error!J.Ref(Any));
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const items = entries[f.@"0".handle & 0xFFFFF].arr.items;
+                            const elem_h = if (f.@"1" < items.len) cloneJsValue(items[f.@"1"]) else 0;
+                            f.retval = .{ .handle = elem_h };
+                        },
+                        .array_set => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), usize, J.Ref(Any)) Error!void);
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            var arr_ptr = &entries[f.@"0".handle & 0xFFFFF].arr;
+                            releaseJsValue(arr_ptr.items[f.@"1"]);
+                            arr_ptr.items[f.@"1"] = cloneJsValue(f.@"2".handle);
+                            f.retval = {};
+                        },
+                        .array_push => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), J.Ref(Any)) Error!usize);
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            var arr_ptr = &entries[f.@"0".handle & 0xFFFFF].arr;
+                            arr_ptr.append(std.testing.allocator, cloneJsValue(f.@"1".handle)) catch return .FAULT;
+                            f.retval = arr_ptr.items.len;
+                        },
+                        .record_init => {
+                            const Frame = arg_struct.ArgStruct(fn () Error!J.Record([]const u8, J.Ref(Any)));
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            f.retval = .{ .handle = allocVal(.{ .rec = .empty }) };
+                        },
+                        .record_set => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), []const u8, J.Ref(Any)) Error!void);
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            var rec_ptr = &entries[f.@"0".handle & 0xFFFFF].rec;
+                            for (rec_ptr.items) |*kv| {
+                                if (std.mem.eql(u8, kv.key, f.@"1")) {
+                                    releaseJsValue(kv.val);
+                                    kv.val = cloneJsValue(f.@"2".handle);
+                                    f.retval = {};
+                                    return .SUCCESS;
+                                }
+                            }
+                            const k_copy = std.testing.allocator.dupe(u8, f.@"1") catch return .FAULT;
+                            rec_ptr.append(std.testing.allocator, .{ .key = k_copy, .val = cloneJsValue(f.@"2".handle) }) catch {
+                                std.testing.allocator.free(k_copy);
+                                return .FAULT;
+                            };
+                            f.retval = {};
+                        },
+                        .record_get => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), []const u8, usize) Error!J.Ref(Any));
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const rec_items = entries[f.@"0".handle & 0xFFFFF].rec.items;
+                            const missing_ptr: *u8 = @ptrFromInt(f.@"2");
+                            for (rec_items) |kv| {
+                                if (std.mem.eql(u8, kv.key, f.@"1")) {
+                                    missing_ptr.* = 0;
+                                    f.retval = .{ .handle = cloneJsValue(kv.val) };
+                                    return .SUCCESS;
+                                }
+                            }
+                            missing_ptr.* = 1;
+                            f.retval = .{ .handle = 0 };
+                        },
+                        .record_has => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), []const u8) Error!bool);
+                            const f: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const rec_items = entries[f.@"0".handle & 0xFFFFF].rec.items;
+                            var found = false;
+                            for (rec_items) |kv| {
+                                if (std.mem.eql(u8, kv.key, f.@"1")) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            f.retval = found;
+                        },
+                        else => return .FAULT,
+                    }
+                },
+                else => return .FAULT,
+            }
+            return .SUCCESS;
+        }
+    };
+    defer MarshalingMockHost.reset();
+
+    const js = Js(MarshalingMockHost);
+    const alloc = std.testing.allocator;
+
+    // 1. Js.String layout, UTF-8 / UTF-16 lengths, and roundtrip
+    try expectEqual(@as(usize, 4), @sizeOf(js.String));
+    try expectEqual(util.InternalType.js_value, util.getInternalType(js.String));
+    const s_emoji = try js.String.fromSlice("hi 🚀");
+    try expect(try js.String.isString(s_emoji));
+    try expect(!try js.String.isString(js.Ref(js.Any).@"null"));
+    try expectEqual(@as(usize, 7), try s_emoji.byteLen());
+    try expectEqual(@as(usize, 5), try s_emoji.utf16Len());
+    const s_back = try s_emoji.toSliceAlloc(alloc);
+    try std.testing.expectEqualStrings("hi 🚀", s_back);
+    alloc.free(s_back);
+    s_emoji.deinit();
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    // 2. Nullable(T) tri-state semantics & deinit
+    const NBuf = js.Nullable(js.Buffer);
+    const n_undef: NBuf = .@"undefined";
+    const n_null: NBuf = .@"null";
+    try expect(n_undef.isUndefined() and n_undef.isNullOrUndefined());
+    try expect(n_null.isNull() and n_null.isNullOrUndefined());
+    try expectEqual(@as(?js.Buffer, null), n_undef.toOptional());
+    try expectEqual(NBuf.@"null", NBuf.fromOptional(null));
+    try expectEqual(NBuf.@"undefined", NBuf.fromOptionalUndefined(null));
+    const buf_v = try js.Buffer.alloc(16);
+    const n_val: NBuf = .{ .value = buf_v };
+    try expect(!n_val.isNullOrUndefined());
+    n_val.deinit();
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    // 3. needsDecodeAllocator traits
+    try expect(!js.needsDecodeAllocator(f64));
+    try expect(!js.needsDecodeAllocator(js.Buffer));
+    try expect(!js.needsDecodeAllocator(js.Nullable(js.String)));
+    try expect(js.needsDecodeAllocator([]const u8));
+    try expect(js.needsDecodeAllocator(?[]const u8));
+
+    // 4. Optional & Nullable NullishKind marshaling
+    const r_opt_undef = try js.toJsRefWithNullish(?f64, null, .undefined_only);
+    try expect(r_opt_undef.isUndefined());
+    const r_opt_null = try js.toJsRefWithNullish(?f64, null, .null_only);
+    try expect(r_opt_null.isNull());
+    try expectEqual(js.Nullable(f64).@"undefined", try js.fromJsRef(js.Nullable(f64), r_opt_undef));
+    try expectEqual(js.Nullable(f64).@"null", try js.fromJsRef(js.Nullable(f64), r_opt_null));
+
+    // 5. Tuple marshaling: trailing-null omission, leading/middle/trailing variadic, and errdefer leak cleanup
+    const OptTuple = struct {
+        host: []const u8,
+        port: ?f64 = null,
+        pub const zigar_js_tuple = .{
+            .variadic_index = @as(?usize, null),
+            .optional_mask = @as(u64, 0b10),
+        };
+    };
+    const t1_ref = try js.toJsRef(OptTuple, .{ .host = "localhost" });
+    try expectEqual(@as(usize, 1), try js.Array(js.Ref(js.Any)).fromRef(t1_ref).len());
+    const t1_dec = try js.fromJsRefAlloc(OptTuple, alloc, t1_ref);
+    t1_ref.deinit();
+    try std.testing.expectEqualStrings("localhost", t1_dec.host);
+    try expectEqual(@as(?f64, null), t1_dec.port);
+    js.freeDecoded(OptTuple, alloc, t1_dec);
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    const MidVarTuple = struct {
+        head: i64,
+        mid: []const []const u8 = &.{},
+        tail: bool,
+        pub const zigar_js_tuple = .{
+            .variadic_index = @as(?usize, 1),
+            .optional_mask = @as(u64, 0),
+        };
+    };
+    const mv_ref = try js.toJsRef(MidVarTuple, .{ .head = -99, .mid = &.{ "alpha", "beta" }, .tail = true });
+    try expectEqual(@as(usize, 4), try js.Array(js.Ref(js.Any)).fromRef(mv_ref).len());
+    const mv_dec = try js.fromJsRefAlloc(MidVarTuple, alloc, mv_ref);
+    mv_ref.deinit();
+    try expectEqual(@as(i64, -99), mv_dec.head);
+    try expectEqual(@as(usize, 2), mv_dec.mid.len);
+    try std.testing.expectEqualStrings("alpha", mv_dec.mid[0]);
+    try std.testing.expectEqualStrings("beta", mv_dec.mid[1]);
+    try expect(mv_dec.tail);
+    js.freeDecoded(MidVarTuple, alloc, mv_dec);
+
+    // Partial-decode failure on element 2 AFTER element 0 allocated []const u8 and element 1 cloned Buffer:
+    // std.testing.allocator + activeHandleCount() verify ZERO Zig or JS handle leaks!
+    const PartialFailTuple = struct {
+        label: []const u8,
+        buf: js.Buffer,
+        num: f64,
+        pub const zigar_js_tuple = .{
+            .variadic_index = @as(?usize, null),
+            .optional_mask = @as(u64, 0),
+        };
+    };
+    const bad_arr = try js.Array(js.Ref(js.Any)).init();
+    const s_tmp = try js.String.fromSlice("allocated-before-error");
+    const b_tmp = try js.Buffer.alloc(8);
+    _ = try bad_arr.push(s_tmp.toRef());
+    _ = try bad_arr.push(b_tmp.toRef().cast(js.Any));
+    // Push a string where f64 is expected so element 2 fails with error.TypeError!
+    _ = try bad_arr.push(s_tmp.toRef());
+    s_tmp.deinit();
+    b_tmp.deinit();
+    try std.testing.expectError(error.TypeError, js.fromJsRefAlloc(PartialFailTuple, alloc, bad_arr.toRef()));
+    bad_arr.deinit();
+    const non_str = try js.toJsRef(f64, 123);
+    try std.testing.expectError(error.TypeError, js.fromJsRefAlloc([]const u8, alloc, non_str));
+    try std.testing.expect(!js.hasLastError());
+    non_str.deinit();
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    // 6. Recursive NullishSpec: slices, required vs optional struct fields, Nullable(T), and >64-elem tuples
+    {
+        const s_null_arr = try js.toJsRefWithSpec([]const ?[]const u8, &.{ "hi", null }, .{ .self = .none, .elem = .null_only });
+        defer s_null_arr.deinit();
+        const js_sn = js.Array(js.Ref(js.Any)).fromRef(s_null_arr);
+        try expectEqual(@as(usize, 2), try js_sn.len());
+        const sn0 = try js_sn.get(0);
+        defer sn0.deinit();
+        try expect(try js.String.isString(sn0));
+        const sn1 = try js_sn.get(1);
+        defer sn1.deinit();
+        try expect(sn1.isNull());
+
+        const n_undef_arr = try js.toJsRefWithSpec([]const ?f64, &.{ 1.0, null }, .{ .self = .none, .elem = .undefined_only });
+        defer n_undef_arr.deinit();
+        const js_nu = js.Array(js.Ref(js.Any)).fromRef(n_undef_arr);
+        try expectEqual(@as(usize, 2), try js_nu.len());
+        const nu1 = try js_nu.get(1);
+        defer nu1.deinit();
+        try expect(nu1.isUndefined());
+
+        const Payload = struct {
+            req_null: ?f64,
+            req_undef: ?f64,
+            opt_num: ?f64 = null,
+            opt_tri: js.Nullable(f64) = .@"undefined",
+            items: ?[]const ?[]const u8 = null,
+
+            pub const zigar_js = .{
+                .fields = .{
+                    .{ .name = "req_null", .js_name = "reqNull", .is_optional = false, .nullish = .null_only },
+                    .{ .name = "req_undef", .js_name = "reqUndef", .is_optional = false, .nullish = .undefined_only },
+                    .{ .name = "opt_num", .js_name = "optNum", .is_optional = true, .nullish = .undefined_only },
+                    .{ .name = "opt_tri", .js_name = "optTri", .is_optional = true, .nullish = .null_only },
+                    .{
+                        .name = "items",
+                        .js_name = "items",
+                        .is_optional = true,
+                        .nullish = .{ .self = .undefined_only, .child = .{ .self = .none, .elem = .null_only } },
+                    },
+                },
+            };
+        };
+
+        // Case A: required null/undefined preserved, optional null/.undefined omitted
+        const p1_ref = try js.toJsRef(Payload, .{ .req_null = null, .req_undef = null });
+        defer p1_ref.deinit();
+        const p1_rec = js.Record([]const u8, js.Ref(js.Any)).fromRef(p1_ref);
+        try expect(try p1_rec.has("reqNull"));
+        try expect((try p1_rec.get("reqNull")).?.isNull());
+        try expect(try p1_rec.has("reqUndef"));
+        try expect((try p1_rec.get("reqUndef")).?.isUndefined());
+        try expect(!try p1_rec.has("optNum"));
+        try expect((try p1_rec.get("optNum")) == null);
+        try expect(!try p1_rec.has("optTri"));
+        try expect(!try p1_rec.has("items"));
+
+        // Case B: optional Nullable(f64) set to .null MUST be emitted as null; items present preserves element null
+        const p2_ref = try js.toJsRef(Payload, .{
+            .req_null = 5.0,
+            .req_undef = 6.0,
+            .opt_tri = .@"null",
+            .items = &.{ "ok", null },
+        });
+        defer p2_ref.deinit();
+        const p2_rec = js.Record([]const u8, js.Ref(js.Any)).fromRef(p2_ref);
+        try expect(try p2_rec.has("optTri"));
+        try expect((try p2_rec.get("optTri")).?.isNull());
+        try expect(try p2_rec.has("items"));
+        const p2_items_ref = (try p2_rec.get("items")).?;
+        defer p2_items_ref.deinit();
+        const p2_items = js.Array(js.Ref(js.Any)).fromRef(p2_items_ref);
+        try expectEqual(@as(usize, 2), try p2_items.len());
+        const p2_i1 = try p2_items.get(1);
+        defer p2_i1.deinit();
+        try expect(p2_i1.isNull());
+
+        // Case C: Tuple `.fields` metadata with undefined_only, null_only, optional, and variadic rest null_only
+        const SpecTuple = struct {
+            v: ?f64,
+            w: ?[]const u8,
+            opt: ?bool = null,
+            rest: []const ?f64 = &.{},
+            pub const zigar_js_tuple = .{
+                .variadic_index = @as(?usize, 3),
+                .fields = .{
+                    .{ .is_optional = false, .nullish = .undefined_only },
+                    .{ .is_optional = false, .nullish = .null_only },
+                    .{ .is_optional = true, .nullish = .undefined_only },
+                    .{ .is_optional = false, .nullish = .null_only },
+                },
+            };
+        };
+        const st_ref = try js.toJsRef(SpecTuple, .{
+            .v = null,
+            .w = null,
+            .opt = null,
+            .rest = &.{ 9.0, null },
+        });
+        defer st_ref.deinit();
+        const st_arr = js.Array(js.Ref(js.Any)).fromRef(st_ref);
+        try expectEqual(@as(usize, 5), try st_arr.len());
+        try expect((try st_arr.get(0)).isUndefined());
+        try expect((try st_arr.get(1)).isNull());
+        try expect((try st_arr.get(2)).isUndefined());
+        const st_3 = try st_arr.get(3);
+        defer st_3.deinit();
+        try expectEqual(@as(f64, 9.0), try js.fromJsRef(f64, st_3));
+        try expect((try st_arr.get(4)).isNull());
+
+        // Case D: 66-element tuple (>64 elements) exercises index 64 (.undefined_only) and index 65 (is_optional = true)
+        const Wide66 = struct {
+            @"0": bool = true, @"1": bool = true, @"2": bool = true, @"3": bool = true,
+            @"4": bool = true, @"5": bool = true, @"6": bool = true, @"7": bool = true,
+            @"8": bool = true, @"9": bool = true, @"10": bool = true, @"11": bool = true,
+            @"12": bool = true, @"13": bool = true, @"14": bool = true, @"15": bool = true,
+            @"16": bool = true, @"17": bool = true, @"18": bool = true, @"19": bool = true,
+            @"20": bool = true, @"21": bool = true, @"22": bool = true, @"23": bool = true,
+            @"24": bool = true, @"25": bool = true, @"26": bool = true, @"27": bool = true,
+            @"28": bool = true, @"29": bool = true, @"30": bool = true, @"31": bool = true,
+            @"32": bool = true, @"33": bool = true, @"34": bool = true, @"35": bool = true,
+            @"36": bool = true, @"37": bool = true, @"38": bool = true, @"39": bool = true,
+            @"40": bool = true, @"41": bool = true, @"42": bool = true, @"43": bool = true,
+            @"44": bool = true, @"45": bool = true, @"46": bool = true, @"47": bool = true,
+            @"48": bool = true, @"49": bool = true, @"50": bool = true, @"51": bool = true,
+            @"52": bool = true, @"53": bool = true, @"54": bool = true, @"55": bool = true,
+            @"56": bool = true, @"57": bool = true, @"58": bool = true, @"59": bool = true,
+            @"60": bool = true, @"61": bool = true, @"62": bool = true, @"63": bool = true,
+            @"64": ?f64,
+            @"65": ?f64 = null,
+            pub const zigar_js_tuple = blk: {
+                const Entry = struct { is_optional: bool, nullish: js.NullishKind };
+                const prefix: [64]Entry = @splat(.{ .is_optional = false, .nullish = .none });
+                const suffix = [_]Entry{
+                    .{ .is_optional = false, .nullish = .undefined_only },
+                    .{ .is_optional = true, .nullish = .undefined_only },
+                };
+                break :blk .{
+                    .variadic_index = @as(?usize, null),
+                    .fields = prefix ++ suffix,
+                };
+            };
+        };
+        const w66_ref = try js.toJsRef(Wide66, .{ .@"64" = null });
+        defer w66_ref.deinit();
+        const w66_arr = js.Array(js.Ref(js.Any)).fromRef(w66_ref);
+        // Element 65 (is_optional = true, null) trimmed -> length 65; element 64 (.undefined_only, null) -> undefined!
+        try expectEqual(@as(usize, 65), try w66_arr.len());
+        try expect((try w66_arr.get(64)).isUndefined());
+    }
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+}
+
 
 

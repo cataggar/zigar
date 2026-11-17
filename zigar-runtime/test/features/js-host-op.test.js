@@ -2,6 +2,7 @@ import { expect } from 'chai';
 import {
   MemberFlag,
   MemberType,
+  OptionalFlag,
   PointerFlag,
   PosixError,
   PrimitiveFlag,
@@ -12,7 +13,7 @@ import {
   StructureType,
 } from '../../src/constants.js';
 import { defineEnvironment } from '../../src/environment.js';
-import { AwaitMode, BinaryInfoKind, BinaryKind, HostOpCode, HostOpFlag } from '../../src/features/js-host-op.js';
+import { AwaitMode, BinaryInfoKind, BinaryKind, CollectionSubOp, HostOpCode, HostOpFlag } from '../../src/features/js-host-op.js';
 import '../../src/mixins.js';
 import { MEMORY, SLOTS, ZIG } from '../../src/symbols.js';
 
@@ -2479,6 +2480,165 @@ describe('Feature: js-host-op', function() {
     env.setWorkerJsErrorContext(0n);
     expect(env.workerErrorFrames.size).to.equal(0);
     env.releaseJsValue(boomTargetHandle);
+    expect(env.getJsValueCount()).to.equal(0);
+  });
+
+  it('should execute String, ValueIdentity, BinaryIsKind collection ops and unwrap optional const strings', function() {
+    const env = new Env();
+    const harness = createMemoryHarness(env);
+    const s = defineHostOpStructures(env, harness.is64);
+
+    // 1. StringFromUtf8 / StringByteLen / StringUtf16Len / StringIsString
+    const argsFromStr = s.makeArgStruct(9101n, s.jsRef, [ s.strPtr ]);
+    const descFromStr = writeDescriptor(harness, 0x100, {
+      signature: 9101n,
+      op: HostOpCode.CollectionOp,
+      flags: CollectionSubOp.StringFromUtf8,
+      argSize: argsFromStr.byteSize,
+    });
+    const utf8Bytes = new TextEncoder().encode('zig 🚀');
+    harness.writeBytes(0x400, utf8Bytes);
+    const frameFromStr = harness.viewAt(0x300, argsFromStr.byteSize);
+    writePtr(frameFromStr, argsFromStr.instance.members[1].bitOffset >> 3, harness.addrOf(0x400), harness.is64);
+    writePtr(frameFromStr, (argsFromStr.instance.members[1].bitOffset >> 3) + harness.ptrSize, utf8Bytes.length, harness.is64);
+    expect(env.invokeJsHostOp(descFromStr, harness.addrOf(0x300), argsFromStr.byteSize)).to.equal(PosixError.NONE);
+    const strHandle = frameFromStr.getUint32(0, true);
+    expect(env.getJsValue(strHandle)).to.equal('zig 🚀');
+
+    const argsBool = s.makeArgStruct(9102n, s.boolStruct, [ s.jsRef ]);
+    const descIsStr = writeDescriptor(harness, 0x140, {
+      signature: 9102n,
+      op: HostOpCode.CollectionOp,
+      flags: CollectionSubOp.StringIsString,
+      argSize: argsBool.byteSize,
+    });
+    const frameBool = harness.viewAt(0x340, argsBool.byteSize);
+    frameBool.setUint32(argsBool.instance.members[1].bitOffset >> 3, strHandle, true);
+    expect(env.invokeJsHostOp(descIsStr, harness.addrOf(0x340), argsBool.byteSize)).to.equal(PosixError.NONE);
+    expect(frameBool.getUint8(0)).to.equal(1);
+
+    frameBool.setUint32(argsBool.instance.members[1].bitOffset >> 3, 1, true); // reserved null
+    expect(env.invokeJsHostOp(descIsStr, harness.addrOf(0x340), argsBool.byteSize)).to.equal(PosixError.NONE);
+    expect(frameBool.getUint8(0)).to.equal(0);
+
+    const argsLen = s.makeArgStruct(9103n, s.usizeStruct, [ s.jsRef ]);
+    const descByteLen = writeDescriptor(harness, 0x180, {
+      signature: 9103n,
+      op: HostOpCode.CollectionOp,
+      flags: CollectionSubOp.StringByteLen,
+      argSize: argsLen.byteSize,
+    });
+    const descUtf16Len = writeDescriptor(harness, 0x1C0, {
+      signature: 9103n,
+      op: HostOpCode.CollectionOp,
+      flags: CollectionSubOp.StringUtf16Len,
+      argSize: argsLen.byteSize,
+    });
+    const frameLen = harness.viewAt(0x380, argsLen.byteSize);
+    frameLen.setUint32(argsLen.instance.members[1].bitOffset >> 3, strHandle, true);
+    expect(env.invokeJsHostOp(descByteLen, harness.addrOf(0x380), argsLen.byteSize)).to.equal(PosixError.NONE);
+    expect(Number(harness.is64 ? frameLen.getBigUint64(0, true) : frameLen.getUint32(0, true))).to.equal(8);
+    expect(env.invokeJsHostOp(descUtf16Len, harness.addrOf(0x380), argsLen.byteSize)).to.equal(PosixError.NONE);
+    expect(Number(harness.is64 ? frameLen.getBigUint64(0, true) : frameLen.getUint32(0, true))).to.equal(6);
+
+    // 2. BinaryIsKind distinguishes Buffer, Uint8Array, Float64Array, and non-binary objects
+    const argsBinKind = s.makeArgStruct(9104n, s.boolStruct, [ s.jsRef, s.u32 ]);
+    const descBinKind = writeDescriptor(harness, 0x200, {
+      signature: 9104n,
+      op: HostOpCode.CollectionOp,
+      flags: CollectionSubOp.BinaryIsKind,
+      argSize: argsBinKind.byteSize,
+    });
+    const f64ArrHandle = env.allocJsValue(new Float64Array([ 1.5, 2.5 ]));
+    const u8ArrHandle = env.allocJsValue(new Uint8Array([ 1, 2 ]));
+    const frameBK = harness.viewAt(0x3C0, argsBinKind.byteSize);
+    const offTarget = argsBinKind.instance.members[1].bitOffset >> 3;
+    const offKind = argsBinKind.instance.members[2].bitOffset >> 3;
+
+    frameBK.setUint32(offTarget, f64ArrHandle, true);
+    frameBK.setUint32(offKind, BinaryKind.Float64Array, true);
+    expect(env.invokeJsHostOp(descBinKind, harness.addrOf(0x3C0), argsBinKind.byteSize)).to.equal(PosixError.NONE);
+    expect(frameBK.getUint8(0)).to.equal(1);
+
+    frameBK.setUint32(offKind, BinaryKind.Uint8Array, true);
+    expect(env.invokeJsHostOp(descBinKind, harness.addrOf(0x3C0), argsBinKind.byteSize)).to.equal(PosixError.NONE);
+    expect(frameBK.getUint8(0)).to.equal(0);
+
+    frameBK.setUint32(offTarget, u8ArrHandle, true);
+    frameBK.setUint32(offKind, BinaryKind.Buffer, true);
+    expect(env.invokeJsHostOp(descBinKind, harness.addrOf(0x3C0), argsBinKind.byteSize)).to.equal(PosixError.NONE);
+    expect(frameBK.getUint8(0)).to.equal(0);
+
+    // 3. Optional const string (?[]const u8) unwraps to null when null and JS primitive string when non-null
+    const optConstStr = {
+      type: StructureType.Optional,
+      name: '?[]const u8',
+      byteSize: harness.ptrSize * 2,
+      align: harness.ptrSize,
+      flags: StructureFlag.HasPointer | StructureFlag.HasObject | StructureFlag.HasSlot | StructureFlag.HasValue | OptionalFlag.HasSelector,
+      signature: 9105n,
+      instance: {
+        members: [
+          {
+            type: MemberType.Object,
+            bitOffset: 0,
+            bitSize: harness.ptrSize * 16,
+            byteSize: harness.ptrSize * 2,
+            slot: 0,
+            structure: s.strPtr,
+          },
+          {
+            type: MemberType.Bool,
+            flags: MemberFlag.IsSelector,
+            bitOffset: 0,
+            bitSize: 1,
+            byteSize: harness.ptrSize,
+            structure: s.boolStruct,
+          },
+        ],
+      },
+      static: {},
+    };
+    env.beginStructure(optConstStr);
+    env.finishStructure(optConstStr);
+
+    const receivedOptArgs = [];
+    const optFnHandle = env.allocJsValue((arg) => {
+      receivedOptArgs.push([ typeof arg, arg ]);
+      return arg === null ? -1 : arg.length;
+    });
+    const argsCallOptStr = s.makeArgStruct(9106n, s.i32, [ s.jsRef, optConstStr ]);
+    const descCallOptStr = writeDescriptor(harness, 0x240, {
+      signature: 9106n,
+      op: HostOpCode.CallFn,
+      flags: 0,
+      argSize: argsCallOptStr.byteSize,
+    });
+    const frameOptStr = harness.viewAt(0x500, argsCallOptStr.byteSize);
+    const offFn = argsCallOptStr.instance.members[1].bitOffset >> 3;
+    const offOpt = argsCallOptStr.instance.members[2].bitOffset >> 3;
+    frameOptStr.setUint32(offFn, optFnHandle, true);
+
+    // Null case (ptr = 0, len = 0)
+    writePtr(frameOptStr, offOpt, 0, harness.is64);
+    writePtr(frameOptStr, offOpt + harness.ptrSize, 0, harness.is64);
+    expect(env.invokeJsHostOp(descCallOptStr, harness.addrOf(0x500), argsCallOptStr.byteSize)).to.equal(PosixError.NONE);
+    expect(frameOptStr.getInt32(0, true)).to.equal(-1);
+
+    // Present case (ptr = 0x400 -> 'zig 🚀', len = 8 UTF-8 bytes = 6 UTF-16 code units)
+    writePtr(frameOptStr, offOpt, harness.addrOf(0x400), harness.is64);
+    writePtr(frameOptStr, offOpt + harness.ptrSize, utf8Bytes.length, harness.is64);
+    expect(env.invokeJsHostOp(descCallOptStr, harness.addrOf(0x500), argsCallOptStr.byteSize)).to.equal(PosixError.NONE);
+    expect(frameOptStr.getInt32(0, true)).to.equal(6);
+    expect(receivedOptArgs).to.deep.equal([
+      [ 'object', null ],
+      [ 'string', 'zig 🚀' ],
+    ]);
+
+    env.releaseJsValue(optFnHandle);
+    env.releaseJsValue(f64ArrHandle);
+    env.releaseJsValue(u8ArrHandle);
+    env.releaseJsValue(strHandle);
     expect(env.getJsValueCount()).to.equal(0);
   });
 });
