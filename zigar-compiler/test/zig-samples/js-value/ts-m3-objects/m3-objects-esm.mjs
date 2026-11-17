@@ -363,4 +363,80 @@ export function produceNumericNullOnlyBox() {
   return { x: 123, y: 'alpha' };
 }
 
+export function echoExtOptsT(opts) {
+  return {
+    a: opts.a + 1,
+    b: opts.b ?? 'from-js',
+    c: opts.c + 2,
+  };
+}
+
+export function echoExtPick(opts) {
+  if ('b' in opts) {
+    throw new TypeError('ExtPick should not contain omitted field b');
+  }
+  return {
+    a: opts.a * 2,
+    c: opts.c * 3,
+  };
+}
+
+export function makeExtLoggerT(level, extra) {
+  return {
+    level: Number(level),
+    extra: Number(extra),
+    log(msg) {
+      return `[${this.level}+${this.extra}] ${msg}`;
+    },
+  };
+}
+
+export function produceBadExtLoggerT() {
+  return {
+    level: 1,
+    log(msg) {
+      return msg;
+    },
+  };
+}
+
+export function makeInter(a) {
+  return {
+    a: Number(a),
+    run(step) {
+      this.a += Number(step);
+      return this.a;
+    },
+  };
+}
+
+export function produceBadInter() {
+  return { a: 10 };
+}
+
+export function makeBoth(level, extra) {
+  return {
+    level: Number(level),
+    extra: Number(extra),
+    log(msg) {
+      return `${this.level}:${this.extra}:${msg}`;
+    },
+  };
+}
+
+export function makeInlineInter(a) {
+  return {
+    a: Number(a),
+    run() {
+      this.a += 1;
+      return this.a;
+    },
+  };
+}
+
+export function consumeInlineInter(x) {
+  return x.run() + x.a;
+}
+
+
 

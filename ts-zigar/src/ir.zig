@@ -668,6 +668,14 @@ fn LowerCtx(comptime GraphType: type) type {
             return cls.classifyObjectLiteralData(obj);
         }
 
+        fn classifyObjectType(self: *Self, ty_id: u32) error{OutOfMemory}!classify_decls.DeclClassification {
+            var cls = classify_decls.Classifier(GraphType).init(self.scratch, &self.graph);
+            defer cls.state.deinit(self.scratch);
+            cls.memo = self.decl_classifications;
+            defer self.decl_classifications = cls.memo;
+            return try cls.classifyObjectType(ty_id, 0);
+        }
+
         fn isPrimaryVfsPath(self: *const Self, fp: []const u8) bool {
             if (fp.len == 0) return false;
             for (self.options.primary_vfs_paths) |p| {
@@ -4906,6 +4914,85 @@ fn LowerCtx(comptime GraphType: type) type {
                 return self.makeType(.{ .anon_struct = fields });
             }
 
+            const inter_cls = try self.classifyObjectType(ty_id);
+            if (inter_cls.kind == .handle_wrapper) {
+                var inter_props: std.ArrayList(SourcedProp) = .empty;
+                defer inter_props.deinit(self.scratch);
+                var inter_methods: std.ArrayList(SourcedMethod) = .empty;
+                defer inter_methods.deinit(self.scratch);
+                var inter_calls: std.ArrayList(SourcedSig) = .empty;
+                defer inter_calls.deinit(self.scratch);
+                var inter_ctors: std.ArrayList(SourcedSig) = .empty;
+                defer inter_ctors.deinit(self.scratch);
+
+                if (try self.collectHandleIntersectionMembers(
+                    ty_id,
+                    &inter_props,
+                    &inter_methods,
+                    &inter_calls,
+                    &inter_ctors,
+                ) and (inter_props.items.len > 0 or inter_methods.items.len > 0 or
+                    inter_calls.items.len > 0 or inter_ctors.items.len > 0))
+                {
+                    const is_closed = no_free_vars or try self.isClosedTypeSubgraph(ty_id);
+                    if (can_hoist_in_mod and is_closed and self.cur_mod_root_scope != null) {
+                        const h = try self.allocFreshAnonHelperName("__zigar_AnonHandle", active_tps);
+                        const hloc = DeclLocation{
+                            .module_index = self.cur_mod_idx,
+                            .zig_path = h.path,
+                            .type_param_defaults = &.{},
+                        };
+                        try self.cur_mod_hoisted_locs.put(self.scratch, ty_id, hloc);
+
+                        var empty_names: std.AutoHashMapUnmanaged(u32, naming.BoundName) = .empty;
+                        var empty_ovs: std.AutoHashMapUnmanaged(u32, []naming.BoundName) = .empty;
+                        var empty_active: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                        defer empty_active.deinit(self.scratch);
+
+                        const saved_depth = self.inline_anon_depth;
+                        self.inline_anon_depth = 0;
+                        defer self.inline_anon_depth = saved_depth;
+
+                        const struct_ir = try self.lowerStructDecl(
+                            self.cur_mod_idx,
+                            std.math.maxInt(u32),
+                            inter_cls,
+                            false,
+                            false,
+                            &.{},
+                            &.{},
+                            inter_props.items,
+                            &.{},
+                            inter_methods.items,
+                            inter_calls.items,
+                            inter_ctors.items,
+                            &.{},
+                            self.cur_mod_root_scope.?,
+                            &empty_names,
+                            &empty_ovs,
+                            &.{},
+                            imports_used,
+                            needs_runtime,
+                            &empty_active,
+                        );
+                        try self.cur_mod_decls_out.?.append(self.alloc, .{
+                            .source_decl_id = null,
+                            .zig_ident = h.zig_ident,
+                            .logical_name = h.logical,
+                            .wire_name = h.logical,
+                            .is_exported = false,
+                            .is_js_exported = false,
+                            .is_default_export = false,
+                            .jsdoc = null,
+                            .kind = .{ .struct_decl = struct_ir },
+                        });
+                        return self.makeHoistedDeclRef(hloc);
+                    }
+                    needs_runtime.* = true;
+                    return self.makeType(if (inter_cls.is_callable_handle) .js_function else .js_object);
+                }
+            }
+
             if (ty_id < self.graph.types.len) {
                 if (self.graph.types[ty_id].resolved_type) |rt| {
                     if (rt != ty_id and rt < self.graph.types.len and self.graph.types[rt].kind == .object_literal) {
@@ -6715,6 +6802,68 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                     }
 
+                    // 3b. Handle-bearing intersection type alias (`type Inter = { a: number } & { run(): void }`,
+                    //     `type Both = LoggerT & { extra: number }`) -> merged `.handle_wrapper` `struct`!
+                    if (ty_id < self.graph.types.len and self.graph.types[ty_id].kind == .intersection) {
+                        const inter_cls = try self.classifyDecl(decl_id);
+                        if (inter_cls.kind == .handle_wrapper) {
+                            var inter_props: std.ArrayList(SourcedProp) = .empty;
+                            defer inter_props.deinit(self.scratch);
+                            var inter_methods: std.ArrayList(SourcedMethod) = .empty;
+                            defer inter_methods.deinit(self.scratch);
+                            var inter_calls: std.ArrayList(SourcedSig) = .empty;
+                            defer inter_calls.deinit(self.scratch);
+                            var inter_ctors: std.ArrayList(SourcedSig) = .empty;
+                            defer inter_ctors.deinit(self.scratch);
+
+                            if (try self.collectHandleIntersectionMembers(
+                                ty_id,
+                                &inter_props,
+                                &inter_methods,
+                                &inter_calls,
+                                &inter_ctors,
+                            ) and (inter_props.items.len > 0 or inter_methods.items.len > 0 or
+                                inter_calls.items.len > 0 or inter_ctors.items.len > 0))
+                            {
+                                const struct_ir = try self.lowerStructDecl(
+                                    final_mod_idx,
+                                    decl_id,
+                                    inter_cls,
+                                    false,
+                                    false,
+                                    d.type_params,
+                                    &.{},
+                                    inter_props.items,
+                                    &.{},
+                                    inter_methods.items,
+                                    inter_calls.items,
+                                    inter_ctors.items,
+                                    &.{},
+                                    scope,
+                                    prebound_names,
+                                    prebound_overloads,
+                                    outer_active_tps,
+                                    imports_used,
+                                    needs_runtime,
+                                    active_decls,
+                                );
+                                try out_list.append(self.alloc, .{
+                                    .source_decl_id = decl_id,
+                                    .zig_ident = bound.zig_ident,
+                                    .logical_name = bound.logical_name,
+                                    .wire_name = bound.wire_name,
+                                    .is_exported = is_exported,
+                                    .is_js_exported = is_js_exported,
+                                    .is_default_export = is_default_export,
+                                    .is_global_scope = is_global_scope,
+                                    .jsdoc = top_jsdoc,
+                                    .kind = .{ .struct_decl = struct_ir },
+                                });
+                                return;
+                            }
+                        }
+                    }
+
                     var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
                     defer visited.deinit(self.scratch);
                     const is_never_alias = (ty_id < self.graph.types.len and self.graph.types[ty_id].kind == .never_type);
@@ -6972,6 +7121,14 @@ fn LowerCtx(comptime GraphType: type) type {
         }
 
         fn splitObjectLiteralPropsAndMethods(self: *Self, prop_ids: []const u32) error{OutOfMemory}!ObjectLiteralMemberSplit {
+            return self.splitObjectLiteralPropsAndMethodsWithEnv(prop_ids, null);
+        }
+
+        fn splitObjectLiteralPropsAndMethodsWithEnv(
+            self: *Self,
+            prop_ids: []const u32,
+            env: ?*const HeritageEnv,
+        ) error{OutOfMemory}!ObjectLiteralMemberSplit {
             var props: std.ArrayList(SourcedProp) = .empty;
             var methods: std.ArrayList(SourcedMethod) = .empty;
             for (prop_ids) |pid| {
@@ -6989,14 +7146,14 @@ fn LowerCtx(comptime GraphType: type) type {
                                     .modifiers = p.modifiers,
                                     .jsdoc = p.jsdoc,
                                 },
-                                .env = null,
+                                .env = env,
                             });
                             continue;
                         }
                         sigs.deinit(self.scratch);
                     }
                 }
-                try props.append(self.scratch, .{ .pid = pid, .env = null });
+                try props.append(self.scratch, .{ .pid = pid, .env = env });
             }
             return .{
                 .props = try props.toOwnedSlice(self.scratch),
@@ -7024,9 +7181,25 @@ fn LowerCtx(comptime GraphType: type) type {
         }
 
         fn upsertPropByWireName(self: *Self, list: *std.ArrayList(SourcedProp), sp: SourcedProp) error{OutOfMemory}!void {
+            return self.upsertPropWithMode(list, sp, false);
+        }
+
+        fn upsertPropWithMode(
+            self: *Self,
+            list: *std.ArrayList(SourcedProp),
+            sp: SourcedProp,
+            prefer_required: bool,
+        ) error{OutOfMemory}!void {
             if (sp.pid >= self.graph.properties.len) return;
+            const new_prop = self.graph.properties[sp.pid];
             for (list.items, 0..) |existing, idx| {
                 if (self.propsShareIdentity(existing.pid, sp.pid)) {
+                    if (prefer_required and existing.pid < self.graph.properties.len) {
+                        const old_prop = self.graph.properties[existing.pid];
+                        if (!old_prop.modifiers.optional_mod and new_prop.modifiers.optional_mod) {
+                            return;
+                        }
+                    }
                     list.items[idx] = sp;
                     return;
                 }
@@ -7231,6 +7404,292 @@ fn LowerCtx(comptime GraphType: type) type {
             }
         }
 
+        fn collectHandleIntersectionMembers(
+            self: *Self,
+            ty_id: u32,
+            out_props: *std.ArrayList(SourcedProp),
+            out_methods: *std.ArrayList(SourcedMethod),
+            out_call_sigs: *std.ArrayList(SourcedSig),
+            out_construct_sigs: *std.ArrayList(SourcedSig),
+        ) error{OutOfMemory}!bool {
+            var seen_methods: std.StringHashMapUnmanaged(void) = .empty;
+            defer seen_methods.deinit(self.scratch);
+            var derived_methods: std.StringHashMapUnmanaged(void) = .empty;
+            defer derived_methods.deinit(self.scratch);
+            var visited_bases: std.AutoHashMapUnmanaged(u32, void) = .empty;
+            defer visited_bases.deinit(self.scratch);
+            var newly_seen: std.ArrayList([]const u8) = .empty;
+            defer newly_seen.deinit(self.scratch);
+            return self.collectStructuralTypeMembers(
+                ty_id,
+                null,
+                out_props,
+                out_methods,
+                out_call_sigs,
+                out_construct_sigs,
+                &seen_methods,
+                &derived_methods,
+                &visited_bases,
+                &newly_seen,
+                true,
+                0,
+            );
+        }
+
+        fn collectStructuralTypeMembers(
+            self: *Self,
+            ty_id: u32,
+            env: ?*const HeritageEnv,
+            out_props: *std.ArrayList(SourcedProp),
+            out_methods: *std.ArrayList(SourcedMethod),
+            out_call_sigs: *std.ArrayList(SourcedSig),
+            out_construct_sigs: *std.ArrayList(SourcedSig),
+            seen_methods: *std.StringHashMapUnmanaged(void),
+            derived_methods: *std.StringHashMapUnmanaged(void),
+            visited_bases: *std.AutoHashMapUnmanaged(u32, void),
+            newly_seen_methods: *std.ArrayList([]const u8),
+            prefer_required_props: bool,
+            depth: usize,
+        ) error{OutOfMemory}!bool {
+            if (ty_id >= self.graph.types.len or depth > 16) return false;
+            const tn = self.graph.types[ty_id];
+            switch (tn.kind) {
+                .object_literal => |obj| {
+                    const split = try self.splitObjectLiteralPropsAndMethodsWithEnv(obj.properties, env);
+                    for (split.methods) |sm| {
+                        if (sm.method.modifiers.static_mod or sm.method.modifiers.private_mod or
+                            sm.method.modifiers.protected_mod or sm.method.computed_symbol != null)
+                        {
+                            continue;
+                        }
+                        const mw = self.str(sm.method.name);
+                        if (!seen_methods.contains(mw)) {
+                            try out_methods.append(self.scratch, sm);
+                            try newly_seen_methods.append(self.scratch, mw);
+                        }
+                    }
+                    for (split.props) |sp| {
+                        if (sp.pid >= self.graph.properties.len) continue;
+                        const p = self.graph.properties[sp.pid];
+                        if (p.modifiers.static_mod or p.modifiers.private_mod or
+                            p.modifiers.protected_mod or p.computed_symbol != null)
+                        {
+                            continue;
+                        }
+                        const pw = self.str(p.name);
+                        if (!derived_methods.contains(pw)) {
+                            try self.upsertPropWithMode(out_props, sp, prefer_required_props);
+                        }
+                        try newly_seen_methods.append(self.scratch, pw);
+                    }
+                    for (obj.call_signatures) |sid| {
+                        try appendUniqueSourcedSig(out_call_sigs, self.scratch, .{ .sid = sid, .env = env });
+                    }
+                    for (obj.construct_signatures) |sid| {
+                        try appendUniqueSourcedSig(out_construct_sigs, self.scratch, .{ .sid = sid, .env = env });
+                    }
+                    return true;
+                },
+                .intersection => |parts| {
+                    if (parts.len == 0 or self.detectOpenPrimitiveIntersection(parts) != null) return false;
+
+                    var tmp_props: std.ArrayList(SourcedProp) = .empty;
+                    defer tmp_props.deinit(self.scratch);
+                    var tmp_methods: std.ArrayList(SourcedMethod) = .empty;
+                    defer tmp_methods.deinit(self.scratch);
+                    var tmp_calls: std.ArrayList(SourcedSig) = .empty;
+                    defer tmp_calls.deinit(self.scratch);
+                    var tmp_ctors: std.ArrayList(SourcedSig) = .empty;
+                    defer tmp_ctors.deinit(self.scratch);
+                    var tmp_bases = try visited_bases.clone(self.scratch);
+                    defer tmp_bases.deinit(self.scratch);
+                    var tmp_newly_seen: std.ArrayList([]const u8) = .empty;
+                    defer tmp_newly_seen.deinit(self.scratch);
+
+                    for (parts) |pid| {
+                        var part_seen = try seen_methods.clone(self.scratch);
+                        defer part_seen.deinit(self.scratch);
+                        if (!try self.collectStructuralTypeMembers(
+                            pid,
+                            env,
+                            &tmp_props,
+                            &tmp_methods,
+                            &tmp_calls,
+                            &tmp_ctors,
+                            &part_seen,
+                            derived_methods,
+                            &tmp_bases,
+                            &tmp_newly_seen,
+                            true,
+                            depth + 1,
+                        )) {
+                            return false;
+                        }
+                    }
+
+                    for (tmp_methods.items) |sm| try out_methods.append(self.scratch, sm);
+                    for (tmp_props.items) |sp| try self.upsertPropWithMode(out_props, sp, prefer_required_props);
+                    for (tmp_calls.items) |ss| try appendUniqueSourcedSig(out_call_sigs, self.scratch, ss);
+                    for (tmp_ctors.items) |ss| try appendUniqueSourcedSig(out_construct_sigs, self.scratch, ss);
+                    for (tmp_newly_seen.items) |mw| try newly_seen_methods.append(self.scratch, mw);
+                    var bit = tmp_bases.keyIterator();
+                    while (bit.next()) |k| try visited_bases.put(self.scratch, k.*, {});
+                    return true;
+                },
+                .reference => |ref| {
+                    const rname = self.str(ref.target_name);
+                    if (self.isBuiltinMappedReference(rname, ref.type_args.len, ref.target_decl)) return false;
+                    if (std.mem.eql(u8, rname, "Array") or std.mem.eql(u8, rname, "ReadonlyArray") or
+                        std.mem.eql(u8, rname, "Iterable") or std.mem.eql(u8, rname, "IterableIterator") or
+                        std.mem.eql(u8, rname, "Promise") or std.mem.eql(u8, rname, "PromiseLike") or
+                        std.mem.eql(u8, rname, "Map") or std.mem.eql(u8, rname, "ReadonlyMap") or
+                        std.mem.eql(u8, rname, "Set") or std.mem.eql(u8, rname, "ReadonlySet") or
+                        std.mem.eql(u8, rname, "Record"))
+                    {
+                        return false;
+                    }
+                    if (ref.target_decl) |td| {
+                        if (td >= self.graph.decls.len) return false;
+                        const bd = self.graph.decls[td];
+                        if (self.isBundledLibDecl(td)) {
+                            if (bd.kind == .type_alias_decl) {
+                                if (tn.resolved_type) |rt| {
+                                    if (rt != ty_id) {
+                                        return self.collectStructuralTypeMembers(
+                                            rt,
+                                            env,
+                                            out_props,
+                                            out_methods,
+                                            out_call_sigs,
+                                            out_construct_sigs,
+                                            seen_methods,
+                                            derived_methods,
+                                            visited_bases,
+                                            newly_seen_methods,
+                                            prefer_required_props,
+                                            depth + 1,
+                                        );
+                                    }
+                                }
+                            }
+                            return false;
+                        }
+                        switch (bd.kind) {
+                            .interface_decl, .class_decl => {
+                                var sub_seen = try seen_methods.clone(self.scratch);
+                                defer sub_seen.deinit(self.scratch);
+                                const before_methods = out_methods.items.len;
+                                const before_props = out_props.items.len;
+                                try self.collectInheritedDeclMembers(
+                                    env,
+                                    td,
+                                    ref.type_args,
+                                    out_props,
+                                    out_methods,
+                                    out_call_sigs,
+                                    out_construct_sigs,
+                                    &sub_seen,
+                                    derived_methods,
+                                    visited_bases,
+                                    prefer_required_props,
+                                );
+                                for (out_methods.items[before_methods..]) |sm| {
+                                    try newly_seen_methods.append(self.scratch, self.str(sm.method.name));
+                                }
+                                for (out_props.items[before_props..]) |sp| {
+                                    if (sp.pid < self.graph.properties.len) {
+                                        try newly_seen_methods.append(self.scratch, self.str(self.graph.properties[sp.pid].name));
+                                    }
+                                }
+                                return true;
+                            },
+                            .type_alias_decl => |alias_ty| {
+                                if (visited_bases.contains(td)) return true;
+                                try visited_bases.put(self.scratch, td, {});
+                                const child_env = try self.buildHeritageEnv(env, bd.type_params, ref.type_args);
+                                if (try self.collectStructuralTypeMembers(
+                                    alias_ty,
+                                    child_env,
+                                    out_props,
+                                    out_methods,
+                                    out_call_sigs,
+                                    out_construct_sigs,
+                                    seen_methods,
+                                    derived_methods,
+                                    visited_bases,
+                                    newly_seen_methods,
+                                    prefer_required_props,
+                                    depth + 1,
+                                )) {
+                                    return true;
+                                }
+                                if (tn.resolved_type) |rt| {
+                                    if (rt != ty_id) {
+                                        return self.collectStructuralTypeMembers(
+                                            rt,
+                                            env,
+                                            out_props,
+                                            out_methods,
+                                            out_call_sigs,
+                                            out_construct_sigs,
+                                            seen_methods,
+                                            derived_methods,
+                                            visited_bases,
+                                            newly_seen_methods,
+                                            prefer_required_props,
+                                            depth + 1,
+                                        );
+                                    }
+                                }
+                                return false;
+                            },
+                            else => return false,
+                        }
+                    }
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) {
+                            return self.collectStructuralTypeMembers(
+                                rt,
+                                env,
+                                out_props,
+                                out_methods,
+                                out_call_sigs,
+                                out_construct_sigs,
+                                seen_methods,
+                                derived_methods,
+                                visited_bases,
+                                newly_seen_methods,
+                                prefer_required_props,
+                                depth + 1,
+                            );
+                        }
+                    }
+                    return false;
+                },
+                else => {
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) {
+                            return self.collectStructuralTypeMembers(
+                                rt,
+                                env,
+                                out_props,
+                                out_methods,
+                                out_call_sigs,
+                                out_construct_sigs,
+                                seen_methods,
+                                derived_methods,
+                                visited_bases,
+                                newly_seen_methods,
+                                prefer_required_props,
+                                depth + 1,
+                            );
+                        }
+                    }
+                    return false;
+                },
+            }
+        }
+
         fn collectInheritedHeritageClause(
             self: *Self,
             parent_env: ?*const HeritageEnv,
@@ -7243,13 +7702,133 @@ fn LowerCtx(comptime GraphType: type) type {
             derived_methods: *std.StringHashMapUnmanaged(void),
             visited_bases: *std.AutoHashMapUnmanaged(u32, void),
         ) error{OutOfMemory}!void {
-            const base_did = self.resolveHeritageTargetDecl(hc) orelse return;
+            if (self.resolveHeritageTargetDecl(hc)) |base_did| {
+                const bd = self.graph.decls[base_did];
+                if (self.isBundledLibDecl(base_did)) {
+                    if (bd.kind == .type_alias_decl and hc.target_type < self.graph.types.len) {
+                        var newly_seen: std.ArrayList([]const u8) = .empty;
+                        defer newly_seen.deinit(self.scratch);
+                        _ = try self.collectStructuralTypeMembers(
+                            hc.target_type,
+                            parent_env,
+                            out_props,
+                            out_methods,
+                            out_call_sigs,
+                            out_construct_sigs,
+                            seen_methods,
+                            derived_methods,
+                            visited_bases,
+                            &newly_seen,
+                            false,
+                            0,
+                        );
+                        for (newly_seen.items) |mw| try seen_methods.put(self.scratch, mw, {});
+                    }
+                    return;
+                }
+                if (bd.kind == .interface_decl or bd.kind == .class_decl) {
+                    try self.collectInheritedDeclMembers(
+                        parent_env,
+                        base_did,
+                        hc.type_args,
+                        out_props,
+                        out_methods,
+                        out_call_sigs,
+                        out_construct_sigs,
+                        seen_methods,
+                        derived_methods,
+                        visited_bases,
+                        false,
+                    );
+                    return;
+                }
+                if (bd.kind == .type_alias_decl) {
+                    if (visited_bases.contains(base_did)) return;
+                    try visited_bases.put(self.scratch, base_did, {});
+                    const child_env = try self.buildHeritageEnv(parent_env, bd.type_params, hc.type_args);
+                    var newly_seen: std.ArrayList([]const u8) = .empty;
+                    defer newly_seen.deinit(self.scratch);
+                    const ok = try self.collectStructuralTypeMembers(
+                        bd.kind.type_alias_decl,
+                        child_env,
+                        out_props,
+                        out_methods,
+                        out_call_sigs,
+                        out_construct_sigs,
+                        seen_methods,
+                        derived_methods,
+                        visited_bases,
+                        &newly_seen,
+                        false,
+                        0,
+                    );
+                    if (!ok and hc.target_type < self.graph.types.len) {
+                        if (self.graph.types[hc.target_type].resolved_type) |rt| {
+                            if (rt != hc.target_type) {
+                                _ = try self.collectStructuralTypeMembers(
+                                    rt,
+                                    parent_env,
+                                    out_props,
+                                    out_methods,
+                                    out_call_sigs,
+                                    out_construct_sigs,
+                                    seen_methods,
+                                    derived_methods,
+                                    visited_bases,
+                                    &newly_seen,
+                                    false,
+                                    0,
+                                );
+                            }
+                        }
+                    }
+                    for (newly_seen.items) |mw| try seen_methods.put(self.scratch, mw, {});
+                    return;
+                }
+                return;
+            }
+
+            if (hc.target_type < self.graph.types.len) {
+                var newly_seen: std.ArrayList([]const u8) = .empty;
+                defer newly_seen.deinit(self.scratch);
+                _ = try self.collectStructuralTypeMembers(
+                    hc.target_type,
+                    parent_env,
+                    out_props,
+                    out_methods,
+                    out_call_sigs,
+                    out_construct_sigs,
+                    seen_methods,
+                    derived_methods,
+                    visited_bases,
+                    &newly_seen,
+                    false,
+                    0,
+                );
+                for (newly_seen.items) |mw| try seen_methods.put(self.scratch, mw, {});
+            }
+        }
+
+        fn collectInheritedDeclMembers(
+            self: *Self,
+            parent_env: ?*const HeritageEnv,
+            base_did: u32,
+            type_args: []const u32,
+            out_props: *std.ArrayList(SourcedProp),
+            out_methods: *std.ArrayList(SourcedMethod),
+            out_call_sigs: *std.ArrayList(SourcedSig),
+            out_construct_sigs: *std.ArrayList(SourcedSig),
+            seen_methods: *std.StringHashMapUnmanaged(void),
+            derived_methods: *std.StringHashMapUnmanaged(void),
+            visited_bases: *std.AutoHashMapUnmanaged(u32, void),
+            prefer_required_props: bool,
+        ) error{OutOfMemory}!void {
             if (self.isBundledLibDecl(base_did)) return;
             if (visited_bases.contains(base_did)) return;
             const bd = self.graph.decls[base_did];
             if (bd.kind != .interface_decl and bd.kind != .class_decl) return;
 
-            const child_env = try self.buildHeritageEnv(parent_env, bd.type_params, hc.type_args);
+            const child_env = try self.buildHeritageEnv(parent_env, bd.type_params, type_args);
 
             try visited_bases.put(self.scratch, base_did, {});
             for (bd.merged_with) |mid| {
@@ -7420,7 +7999,7 @@ fn LowerCtx(comptime GraphType: type) type {
             }
 
             for (bd_props.items) |sp| {
-                try self.upsertPropByWireName(out_props, sp);
+                try self.upsertPropWithMode(out_props, sp, prefer_required_props);
             }
         }
 

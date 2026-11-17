@@ -354,19 +354,112 @@ pub fn Classifier(comptime Graph: type) type {
             return result;
         }
 
+        fn isBuiltinNonObjectRef(rname: []const u8) bool {
+            return std.mem.eql(u8, rname, "Array") or
+                std.mem.eql(u8, rname, "ReadonlyArray") or
+                std.mem.eql(u8, rname, "Iterable") or
+                std.mem.eql(u8, rname, "IterableIterator") or
+                std.mem.eql(u8, rname, "Set") or
+                std.mem.eql(u8, rname, "ReadonlySet") or
+                std.mem.eql(u8, rname, "Map") or
+                std.mem.eql(u8, rname, "ReadonlyMap") or
+                std.mem.eql(u8, rname, "Promise") or
+                std.mem.eql(u8, rname, "PromiseLike") or
+                std.mem.eql(u8, rname, "Record");
+        }
+
+        pub fn classifyObjectType(self: *Self, ty_id: u32, depth: usize) error{OutOfMemory}!DeclClassification {
+            if (ty_id >= self.graph.types.len or depth > 16) return .{ .kind = .value_struct };
+            const tn = self.graph.types[ty_id];
+            switch (tn.kind) {
+                .object_literal => |obj| return self.classifyObjectLiteralData(obj),
+                .intersection => |parts| {
+                    var needs_handle = false;
+                    var is_callable = false;
+                    for (parts) |pid| {
+                        const sub = try self.classifyObjectType(pid, depth + 1);
+                        if (sub.kind == .handle_wrapper) {
+                            needs_handle = true;
+                            if (sub.is_callable_handle) is_callable = true;
+                        }
+                    }
+                    if (needs_handle) {
+                        return .{
+                            .kind = .handle_wrapper,
+                            .is_class = false,
+                            .is_callable_handle = is_callable,
+                        };
+                    }
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) return try self.classifyObjectType(rt, depth + 1);
+                    }
+                    return .{ .kind = .value_struct };
+                },
+                .reference => |ref| {
+                    if (isBuiltinNonObjectRef(self.str(ref.target_name))) {
+                        return .{ .kind = .value_struct };
+                    }
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) {
+                            const prefer_resolved = if (ref.target_decl) |td|
+                                (td < self.graph.decls.len and self.graph.decls[td].kind == .type_alias_decl and ref.type_args.len > 0)
+                            else
+                                true;
+                            if (prefer_resolved) {
+                                const resolved_cls = try self.classifyObjectType(rt, depth + 1);
+                                if (resolved_cls.kind == .handle_wrapper or ref.target_decl == null) {
+                                    return resolved_cls;
+                                }
+                            }
+                        }
+                    }
+                    if (ref.target_decl) |td| {
+                        if (td < self.graph.decls.len) {
+                            return try self.classifyDecl(td);
+                        }
+                    }
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) return try self.classifyObjectType(rt, depth + 1);
+                    }
+                    return .{ .kind = .value_struct };
+                },
+                else => {
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) return try self.classifyObjectType(rt, depth + 1);
+                    }
+                    return .{ .kind = .value_struct };
+                },
+            }
+        }
+
         fn classifyHeritageClause(self: *Self, hc: anytype) error{OutOfMemory}!DeclClassification {
+            if (hc.target_type < self.graph.types.len) {
+                const tn = self.graph.types[hc.target_type];
+                switch (tn.kind) {
+                    .object_literal, .intersection => return try self.classifyObjectType(hc.target_type, 0),
+                    .reference => |ref| {
+                        if (tn.resolved_type != null and (ref.target_decl == null or
+                            (ref.target_decl.? < self.graph.decls.len and
+                                self.graph.decls[ref.target_decl.?].kind == .type_alias_decl and
+                                ref.type_args.len > 0)))
+                        {
+                            return try self.classifyObjectType(hc.target_type, 0);
+                        }
+                    },
+                    else => {
+                        if (tn.resolved_type != null) {
+                            return try self.classifyObjectType(hc.target_type, 0);
+                        }
+                    },
+                }
+            }
             if (hc.target_decl) |td| {
                 if (td < self.graph.decls.len) {
                     return try self.classifyDecl(td);
                 }
             }
             if (hc.target_type < self.graph.types.len) {
-                const tn = self.graph.types[hc.target_type];
-                if (tn.kind == .reference) {
-                    if (tn.kind.reference.target_decl) |td| {
-                        return try self.classifyDecl(td);
-                    }
-                }
+                return try self.classifyObjectType(hc.target_type, 0);
             }
             return .{ .kind = .value_struct };
         }
@@ -484,37 +577,7 @@ pub fn Classifier(comptime Graph: type) type {
                     return .{ .kind = .value_struct };
                 },
                 .type_alias_decl => |ty_id| {
-                    if (ty_id >= self.graph.types.len) return .{ .kind = .value_struct };
-                    const tn = self.graph.types[ty_id];
-                    switch (tn.kind) {
-                        .object_literal => |obj| return self.classifyObjectLiteralData(obj),
-                        .reference => |ref| {
-                            if (ref.target_decl) |td| {
-                                if (td != decl_id) return try self.classifyDecl(td);
-                            }
-                            const rname = self.str(ref.target_name);
-                            if (std.mem.eql(u8, rname, "Array") or std.mem.eql(u8, rname, "ReadonlyArray") or
-                                std.mem.eql(u8, rname, "Iterable") or std.mem.eql(u8, rname, "IterableIterator") or
-                                std.mem.eql(u8, rname, "Set") or std.mem.eql(u8, rname, "ReadonlySet"))
-                            {
-                                return .{ .kind = .value_struct };
-                            }
-                            if (tn.resolved_type) |rt| {
-                                if (rt < self.graph.types.len and self.graph.types[rt].kind == .object_literal) {
-                                    return self.classifyObjectLiteralData(self.graph.types[rt].kind.object_literal);
-                                }
-                            }
-                            return .{ .kind = .value_struct };
-                        },
-                        else => {
-                            if (tn.resolved_type) |rt| {
-                                if (rt < self.graph.types.len and self.graph.types[rt].kind == .object_literal) {
-                                    return self.classifyObjectLiteralData(self.graph.types[rt].kind.object_literal);
-                                }
-                            }
-                            return .{ .kind = .value_struct };
-                        },
-                    }
+                    return try self.classifyObjectType(ty_id, 0);
                 },
                 else => return .{ .kind = .value_struct },
             }
@@ -545,6 +608,9 @@ test "Classifier distinguishes plain value_struct interfaces from classes, state
         "Widget", // 15
         "FactoryConfig", // 16
         "LoggerT", // 17
+        "Pick", // 18
+        "InterLogger", // 19
+        "ExtPickLogger", // 20
     };
 
     const props = [_]ts.types.PropNode{
@@ -695,6 +761,31 @@ test "Classifier distinguishes plain value_struct interfaces from classes, state
             },
             .resolved_type = null,
         },
+        // 9: object_literal `{ port?: number }` (plain value_struct arm)
+        .{
+            .id = 9,
+            .kind = .{
+                .object_literal = .{
+                    .properties = &.{0},
+                    .call_signatures = &.{},
+                    .construct_signatures = &.{},
+                    .index_signatures = &.{},
+                },
+            },
+            .resolved_type = null,
+        },
+        // 10: intersection `{ port?: number } & Logger`
+        .{
+            .id = 10,
+            .kind = .{ .intersection = &.{ 9, 6 } },
+            .resolved_type = null,
+        },
+        // 11: utility reference `Pick<LoggerT, "log">` (`target_decl = null`, `resolved_type = 8`)
+        .{
+            .id = 11,
+            .kind = .{ .reference = .{ .target_decl = null, .target_name = 18, .module_specifier = null, .type_args = &.{2} } },
+            .resolved_type = 8,
+        },
     };
 
     const logger_methods = [_]ts.types.MethodNode{
@@ -712,6 +803,9 @@ test "Classifier distinguishes plain value_struct interfaces from classes, state
     };
     const ext_logger = [_]ts.types.HeritageClause{
         .{ .target_type = 6, .target_decl = 2, .type_args = &.{} },
+    };
+    const ext_pick_logger = [_]ts.types.HeritageClause{
+        .{ .target_type = 11, .target_decl = null, .type_args = &.{2} },
     };
 
     const decls = [_]ts.types.DeclNode{
@@ -985,6 +1079,39 @@ test "Classifier distinguishes plain value_struct interfaces from classes, state
             .merged_with = &.{},
             .kind = .{ .type_alias_decl = 8 },
         },
+        // 15: type InterLogger = { port?: number } & Logger -> .handle_wrapper (`!is_class`)
+        .{
+            .id = 15,
+            .name = 19,
+            .export_name = null,
+            .module = 0,
+            .type_params = &.{},
+            .modifiers = .{ .export_decl = true },
+            .jsdoc = null,
+            .merged_with = &.{},
+            .kind = .{ .type_alias_decl = 10 },
+        },
+        // 16: interface ExtPickLogger extends Pick<LoggerT, "log"> { port?: number } -> .handle_wrapper
+        .{
+            .id = 16,
+            .name = 20,
+            .export_name = null,
+            .module = 0,
+            .type_params = &.{},
+            .modifiers = .{ .export_decl = true },
+            .jsdoc = null,
+            .merged_with = &.{},
+            .kind = .{
+                .interface_decl = .{
+                    .extends_clauses = &ext_pick_logger,
+                    .properties = &.{0},
+                    .methods = &.{},
+                    .call_signatures = &.{},
+                    .construct_signatures = &.{},
+                    .index_signatures = &.{},
+                },
+            },
+        },
     };
 
     const graph = ts.types.DeclarationGraph{
@@ -1044,4 +1171,12 @@ test "Classifier distinguishes plain value_struct interfaces from classes, state
     try std.testing.expectEqual(ObjectDeclKind.handle_wrapper, c14.kind);
     try std.testing.expect(!c14.is_class);
     try std.testing.expect(!c14.is_callable_handle);
+
+    const c15 = try cls.classifyDecl(15);
+    try std.testing.expectEqual(ObjectDeclKind.handle_wrapper, c15.kind);
+    try std.testing.expect(!c15.is_class);
+
+    const c16 = try cls.classifyDecl(16);
+    try std.testing.expectEqual(ObjectDeclKind.handle_wrapper, c16.kind);
+    try std.testing.expect(!c16.is_class);
 }

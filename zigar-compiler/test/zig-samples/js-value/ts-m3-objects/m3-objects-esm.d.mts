@@ -168,4 +168,39 @@ export interface NullOnlyBox extends NullableUnionBox<null> {}
 export function echoNullOnlyBox(box: NullOnlyBox): NullOnlyBox;
 export function produceNumericNullOnlyBox(): NullOnlyBox;
 
+export type OptsT = {
+  a: number;
+  b?: string;
+};
+export interface ExtOptsT extends OptsT {
+  c: number;
+}
+export function echoExtOptsT(opts: ExtOptsT): ExtOptsT;
+
+export interface OptsI {
+  a: number;
+  b: string;
+}
+export interface ExtPick extends Pick<OptsI, 'a'> {
+  c: number;
+}
+export function echoExtPick(opts: ExtPick): ExtPick;
+
+export interface ExtLoggerT extends LoggerT {
+  extra: number;
+}
+export function makeExtLoggerT(level: number, extra: number): ExtLoggerT;
+export function produceBadExtLoggerT(): ExtLoggerT;
+
+export type Inter = { a: number } & { run(step: number): number };
+export function makeInter(a: number): Inter;
+export function produceBadInter(): Inter;
+
+export type Both = LoggerT & { extra: number };
+export function makeBoth(level: number, extra: number): Both;
+
+export function makeInlineInter(a: number): { a: number } & { run(): number };
+export function consumeInlineInter(x: { a: number } & { run(): number }): number;
+
+
 

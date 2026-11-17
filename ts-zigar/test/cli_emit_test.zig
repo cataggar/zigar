@@ -3223,6 +3223,31 @@ test "Issue #48 M3.2a Sema: plain options structs vs handle classes, divergent a
             \\};
             \\export type PickedLogger = Pick<LoggerT, "level" | "log">;
             \\
+            \\export type OptsT = {
+            \\  a: number;
+            \\  b?: string;
+            \\};
+            \\export interface ExtOptsT extends OptsT {
+            \\  c: number;
+            \\}
+            \\export interface OptsI {
+            \\  a: number;
+            \\  b: string;
+            \\}
+            \\export interface ExtPick extends Pick<OptsI, "a"> {
+            \\  c: number;
+            \\}
+            \\export interface ExtLoggerT extends LoggerT {
+            \\  extra: number;
+            \\}
+            \\export interface ExtPickLogger extends Pick<LoggerT, "log"> {
+            \\  tag: string;
+            \\}
+            \\export type Inter = { a: number } & { run(step: number): number };
+            \\export type Both = LoggerT & { extra: number };
+            \\export declare function makeInlineInter(): { a: number } & { run(): number };
+            \\export declare function runInlineInter(x: { a: number } & { run(): number }): number;
+            \\
             \\export interface NullableUnionBox<T> {
             \\  x: T | string;
             \\  y: T | "alpha" | "beta";
@@ -3409,6 +3434,63 @@ test "Issue #48 M3.2a Sema: plain options structs vs handle classes, divergent a
             \\    const nb: r.NullOnlyBox = .{ .x = null, .y = .alpha };
             \\    try std.testing.expect(nb.x == null);
             \\    try std.testing.expectEqual(.alpha, nb.y.?);
+            \\
+            \\    // 12. `interface extends` type alias (`ExtOptsT`, `ExtLoggerT`) and utility base (`ExtPick`, `ExtPickLogger`):
+            \\    try std.testing.expect(!@hasField(@TypeOf(r.ExtOptsT.zigar_js), "is_handle"));
+            \\    const eo: r.ExtOptsT = .{ .a = 1, .c = 2 };
+            \\    try std.testing.expectEqual(@as(f64, 1), eo.a);
+            \\    try std.testing.expectEqual(@as(?[]const u8, null), eo.b);
+            \\    try std.testing.expectEqual(@as(f64, 2), eo.c);
+            \\
+            \\    try std.testing.expect(!@hasField(@TypeOf(r.ExtPick.zigar_js), "is_handle"));
+            \\    try std.testing.expect(!@hasField(r.ExtPick, "b"));
+            \\    const ep: r.ExtPick = .{ .a = 10, .c = 20 };
+            \\    try std.testing.expectEqual(@as(f64, 10), ep.a);
+            \\    try std.testing.expectEqual(@as(f64, 20), ep.c);
+            \\
+            \\    try std.testing.expect(r.ExtLoggerT.zigar_js.is_handle);
+            \\    const elt_log: *const fn (r.ExtLoggerT, std.mem.Allocator, []const u8) r.zigar_js.CallError![]const u8 = &r.ExtLoggerT.logAlloc;
+            \\    const elt_lvl: *const fn (r.ExtLoggerT) r.zigar_js.CallError!f64 = &r.ExtLoggerT.level;
+            \\    const elt_ext: *const fn (r.ExtLoggerT) r.zigar_js.CallError!f64 = &r.ExtLoggerT.extra;
+            \\    _ = elt_log;
+            \\    _ = elt_lvl;
+            \\    _ = elt_ext;
+            \\
+            \\    try std.testing.expect(r.ExtPickLogger.zigar_js.is_handle);
+            \\    try std.testing.expect(!@hasDecl(r.ExtPickLogger, "level"));
+            \\    const epl_log: *const fn (r.ExtPickLogger, std.mem.Allocator, []const u8) r.zigar_js.CallError![]const u8 = &r.ExtPickLogger.logAlloc;
+            \\    const epl_tag: *const fn (r.ExtPickLogger, std.mem.Allocator) r.zigar_js.CallError![]const u8 = &r.ExtPickLogger.tagAlloc;
+            \\    _ = epl_log;
+            \\    _ = epl_tag;
+            \\
+            \\    // 13. Handle-bearing intersections (`Inter`, `Both`, and inline `{ a: number } & { run(): number }`):
+            \\    try std.testing.expect(r.Inter.zigar_js.is_handle);
+            \\    const inter_a: *const fn (r.Inter) r.zigar_js.CallError!f64 = &r.Inter.a;
+            \\    const inter_run: *const fn (r.Inter, f64) r.zigar_js.CallError!f64 = &r.Inter.run;
+            \\    _ = inter_a;
+            \\    _ = inter_run;
+            \\
+            \\    try std.testing.expect(r.Both.zigar_js.is_handle);
+            \\    const both_log: *const fn (r.Both, std.mem.Allocator, []const u8) r.zigar_js.CallError![]const u8 = &r.Both.logAlloc;
+            \\    const both_lvl: *const fn (r.Both) r.zigar_js.CallError!f64 = &r.Both.level;
+            \\    const both_ext: *const fn (r.Both) r.zigar_js.CallError!f64 = &r.Both.extra;
+            \\    _ = both_log;
+            \\    _ = both_lvl;
+            \\    _ = both_ext;
+            \\
+            \\    const InlineHelper = struct {
+            \\        fn check() !void {
+            \\            var inl = try r.makeInlineInter();
+            \\            defer inl.deinit();
+            \\            try std.testing.expect(@TypeOf(inl).zigar_js.is_handle);
+            \\            const a_val: f64 = try inl.a();
+            \\            const r_val: f64 = try inl.run();
+            \\            _ = a_val;
+            \\            _ = r_val;
+            \\            _ = try r.runInlineInter(.{ .ref = inl.ref });
+            \\        }
+            \\    };
+            \\    _ = &InlineHelper.check;
             \\}
             ,
         });

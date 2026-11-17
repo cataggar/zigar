@@ -422,6 +422,45 @@ pub fn exerciseFactoryMergedAndGenericExtends(out_alloc: std.mem.Allocator) ![]c
         if (n2.y != .beta) return error.Unexpected;
 
         try std.testing.expectError(error.TypeError, m.produceNumericNullOnlyBoxAlloc(tracked_alloc));
+
+        // `ExtOptsT extends OptsT` and `ExtPick extends Pick<OptsI, 'a'>` preserve inherited fields cleanly!
+        const eo = try m.echoExtOptsTAlloc(tracked_alloc, .{ .a = 10, .c = 20 });
+        defer js.freeDecoded(m.ExtOptsT, tracked_alloc, eo);
+        if (eo.a != 11 or eo.c != 22) return error.Unexpected;
+        if (!std.mem.eql(u8, eo.b orelse return error.Unexpected, "from-js")) return error.Unexpected;
+
+        const ep = try m.echoExtPick(.{ .a = 3, .c = 4 });
+        if (ep.a != 6 or ep.c != 12) return error.Unexpected;
+
+        // `ExtLoggerT extends LoggerT` inherits `level` + `log` from object-literal type alias AND validates `extra`!
+        var ext_log = try m.makeExtLoggerT(3, 7);
+        defer ext_log.deinit();
+        if ((try ext_log.level()) != 3 or (try ext_log.extra()) != 7) return error.Unexpected;
+        const ext_msg = try ext_log.logAlloc(tracked_alloc, "up");
+        defer js.freeDecoded([]const u8, tracked_alloc, ext_msg);
+        if (!std.mem.eql(u8, ext_msg, "[3+7] up")) return error.Unexpected;
+        try std.testing.expectError(error.TypeError, m.produceBadExtLoggerT());
+
+        // Handle-bearing intersections: `Inter`, `Both = LoggerT & { extra: number }`, and inline `{ a: number } & { run(): number }`!
+        var inter = try m.makeInter(10);
+        defer inter.deinit();
+        if ((try inter.a()) != 10) return error.Unexpected;
+        if ((try inter.run(5)) != 15) return error.Unexpected;
+        if ((try inter.a()) != 15) return error.Unexpected;
+        try std.testing.expectError(error.TypeError, m.produceBadInter());
+
+        var both = try m.makeBoth(4, 9);
+        defer both.deinit();
+        if ((try both.level()) != 4 or (try both.extra()) != 9) return error.Unexpected;
+        const both_msg = try both.logAlloc(tracked_alloc, "hi");
+        defer js.freeDecoded([]const u8, tracked_alloc, both_msg);
+        if (!std.mem.eql(u8, both_msg, "4:9:hi")) return error.Unexpected;
+
+        var inl = try m.makeInlineInter(20);
+        defer inl.deinit();
+        if ((try inl.a()) != 20) return error.Unexpected;
+        if ((try inl.run()) != 21) return error.Unexpected;
+        if ((try m.consumeInlineInter(.{ .ref = inl.ref })) != 44) return error.Unexpected;
     }
 
     try checkInvariants(handles_before, allocs_before);
