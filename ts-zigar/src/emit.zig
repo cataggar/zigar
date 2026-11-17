@@ -907,6 +907,55 @@ const ModuleEmitCtx = struct {
         return self.isResolvedOptionalEnv(ty, null, 0);
     }
 
+    fn aliasTargetIsKeyableContainer(
+        self: *const ModuleEmitCtx,
+        ty: *const ir.TypeIr,
+        env: ?*const TypeParamEnv,
+        depth: usize,
+    ) bool {
+        if (depth >= 24) return false;
+        return switch (ty.*) {
+            .anon_struct, .tuple => true,
+            .optional => |opt| self.aliasTargetIsKeyableContainer(opt.child, env, depth + 1),
+            .pointer_const => |inner| self.aliasTargetIsKeyableContainer(inner, env, depth + 1),
+            .type_param_ref => |tp_ident| blk: {
+                if (env) |e| {
+                    for (e.params, 0..) |tp, idx| {
+                        if (std.mem.eql(u8, tp.zig_ident, tp_ident)) {
+                            if (idx < e.args.len) {
+                                break :blk self.aliasTargetIsKeyableContainer(e.args[idx], e.arg_env, depth + 1);
+                            }
+                            if (tp.default_type) |def_ty| {
+                                break :blk self.aliasTargetIsKeyableContainer(def_ty, e, depth + 1);
+                            }
+                            break :blk false;
+                        }
+                    }
+                }
+                break :blk false;
+            },
+            .decl_ref => |dref| blk: {
+                if (self.findTargetTypeAlias(dref)) |inner_ta| {
+                    if (self.aliasTargetIsKeyableContainer(inner_ta.target, null, depth + 1)) {
+                        break :blk false;
+                    }
+                    const next_env = TypeParamEnv{
+                        .params = inner_ta.type_params,
+                        .args = dref.type_args,
+                        .arg_env = env,
+                    };
+                    break :blk self.aliasTargetIsKeyableContainer(
+                        inner_ta.target,
+                        if (inner_ta.type_params.len > 0) &next_env else null,
+                        depth + 1,
+                    );
+                }
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
     fn typeNeedsNullishSpecEnv(
         self: *const ModuleEmitCtx,
         ty: *const ir.TypeIr,
@@ -951,8 +1000,10 @@ const ModuleEmitCtx = struct {
             },
             .decl_ref => |dref| {
                 if (self.findTargetTypeAlias(dref)) |ta| {
-                    if (ta.type_params.len > 0 and (ta.target.* == .anon_struct or ta.target.* == .tuple)) {
-                        if (!try self.genericParamsArgsNeedSpec(ta.type_params, dref, env, visited, depth)) return false;
+                    if (ta.type_params.len > 0 and self.aliasTargetIsKeyableContainer(ta.target, null, 0)) {
+                        if (!try self.genericParamsArgsNeedSpec(ta.type_params, dref, env, visited, depth)) {
+                            return self.typeNeedsNullishSpecEnv(ta.target, null, visited, depth + 1);
+                        }
                         const key = try self.computeDeclSpecKey("a", dref, ta.type_params, env);
                         defer self.allocator.free(key);
                         if (isDeclKeyVisited(visited, key)) return true;
@@ -1064,7 +1115,13 @@ const ModuleEmitCtx = struct {
                     .none => ".undefined_only",
                 };
                 if (try self.typeNeedsNullishSpecEnv(opt.child, env, visited, depth + 1)) {
-                    try self.out.print(self.allocator, ".{{ .self = {s}, .child = ", .{self_tag});
+                    try self.out.appendSlice(self.allocator, ".{ ");
+                    if (pending_id) |id_str| {
+                        try self.out.appendSlice(self.allocator, ".id = ");
+                        try self.emitStringLit(id_str);
+                        try self.out.appendSlice(self.allocator, ", ");
+                    }
+                    try self.out.print(self.allocator, ".self = {s}, .child = ", .{self_tag});
                     try self.emitNullishSpecEnv(opt.child, env, visited, null, false, depth + 1);
                     try self.out.appendSlice(self.allocator, " }");
                 } else {
@@ -1136,7 +1193,7 @@ const ModuleEmitCtx = struct {
             },
             .decl_ref => |dref| {
                 if (self.findTargetTypeAlias(dref)) |ta| {
-                    if (ta.type_params.len > 0 and (ta.target.* == .anon_struct or ta.target.* == .tuple)) {
+                    if (ta.type_params.len > 0 and self.aliasTargetIsKeyableContainer(ta.target, null, 0)) {
                         if (try self.genericParamsArgsNeedSpec(ta.type_params, dref, env, visited, depth)) {
                             const key = try self.computeDeclSpecKey("a", dref, ta.type_params, env);
                             defer self.allocator.free(key);
@@ -1155,7 +1212,7 @@ const ModuleEmitCtx = struct {
                                 return;
                             }
                         }
-                        try self.out.appendSlice(self.allocator, default_self_tag);
+                        try self.emitNullishSpecEnv(ta.target, null, visited, null, is_optional_site, depth + 1);
                         return;
                     }
                     const next_env = TypeParamEnv{

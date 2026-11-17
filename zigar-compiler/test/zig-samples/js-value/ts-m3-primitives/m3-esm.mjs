@@ -314,7 +314,7 @@ export function inspectGenericContainersUndef(undefBox, node, pair) {
   return `box(${tagJsVal(undefBox.val)},${boxOptPart})|nodes[${nodeParts.join('->')}]|pair[${tagJsVal(pair[0])},${tagJsVal(pair[1])}]`;
 }
 
-export function inspectDeepGenericRecursion(mutA, metaNode, polyNode, tree) {
+export function inspectDeepGenericRecursion(mutA, metaNode, polyNode, tree, nullableList, nullableTupleTree) {
   // 1. Mutual recursion: MutA -> MutB -> MutA -> MutB (every level must receive `undefined`, never `null`!)
   if (mutA.v !== undefined) throw new TypeError(`mutA.v expected undefined, got ${tagJsVal(mutA.v)}`);
   if (!mutA.b || mutA.b.w !== undefined) throw new TypeError(`mutA.b.w expected undefined, got ${tagJsVal(mutA.b?.w)}`);
@@ -348,7 +348,28 @@ export function inspectDeepGenericRecursion(mutA, metaNode, polyNode, tree) {
     return `${tagJsVal(n.v)}${kids}`;
   }
 
-  return `mut=ok|meta=ok|poly=undef+null|tree=${collectTree(tree)}`;
+  // 5. 7-node `NullableList<Undef<number>>` (`{ head: T; tail: NullableList<T> } | null`):
+  //    every `head` that was null in Zig MUST be `undefined` (even at nodes 6 and 7), and terminal `tail` MUST be `null`!
+  const listHeads = [];
+  let cur = nullableList;
+  while (cur !== null) {
+    if (cur === undefined) throw new TypeError('NullableList tail must terminate with null, never undefined');
+    if (cur.head === null) throw new TypeError(`NullableList<Undef<number>>.head became null at depth ${listHeads.length + 1}`);
+    listHeads.push(cur.head === undefined ? 'u' : String(cur.head));
+    cur = cur.tail;
+  }
+
+  // 6. 6-level `NullableTupleTree<Undef<number>>` (`[T, NullableTupleTree<T>[]] | null`):
+  //    tuple[0] must preserve `undefined` at every depth while null array elements remain `null`!
+  function collectOT(node, depth) {
+    if (node === null) return 'null';
+    if (node === undefined) throw new TypeError(`NullableTupleTree node became undefined at depth ${depth}`);
+    if (node[0] === null) throw new TypeError(`NullableTupleTree[0] became null at depth ${depth}`);
+    const h = node[0] === undefined ? 'u' : String(node[0]);
+    return `${h}(${node[1].map((c) => collectOT(c, depth + 1)).join(',')})`;
+  }
+
+  return `mut=ok|meta=ok|poly=undef+null|tree=${collectTree(tree)}|list=${listHeads.join(',')}|ot=${collectOT(nullableTupleTree, 1)}`;
 }
 
 export function sumRestGenericAlias(...nums) {

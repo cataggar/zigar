@@ -2567,6 +2567,15 @@ test "Issue #46 keyed generic container nullish overrides: mutual recursion, inl
             \\  kids?: AliasTree<T>[];
             \\};
             \\export type TupleTree<T> = [T, TupleTree<T>[]];
+            \\export type NullableList<T> = {
+            \\  head: T;
+            \\  tail: NullableList<T>;
+            \\} | null;
+            \\export type NullableTupleTree<T> = [T, NullableTupleTree<T>[]] | null;
+            \\export type ListViaMaybe<T> = Maybe<{
+            \\  head: T;
+            \\  tail: ListViaMaybe<T>;
+            \\}>;
             \\export interface MutA<T> {
             \\  v: T;
             \\  b?: MutB<T>;
@@ -2592,6 +2601,10 @@ test "Issue #46 keyed generic container nullish overrides: mutual recursion, inl
             \\export declare function takePoly(p: PolyNode<Undef<number>>): void;
             \\export declare function takeTree(t: AliasTree<Undef<number>>): void;
             \\export declare function takeTupleTree(t: TupleTree<Undef<number>>): void;
+            \\export declare function takeNullableList(l: NullableList<Undef<number>>): void;
+            \\export declare function takeNumberList(l: NullableList<number>): void;
+            \\export declare function takeNullableTupleTree(t: NullableTupleTree<Undef<number>>): void;
+            \\export declare function takeListViaMaybe(l: ListViaMaybe<Undef<number>>): void;
             \\export declare function takePair(p: PairAlias<Undef<string>>): void;
             \\export declare function takeIdRest(...nums: Id<number[]>): number;
             \\export type IdTuple = [string, ...Id<number[]>];
@@ -2619,28 +2632,102 @@ test "Issue #46 keyed generic container nullish overrides: mutual recursion, inl
         const src = try out_h.readFileAlloc(io, "index.zig", alloc, .limited(128 * 1024));
         defer alloc.free(src);
 
-        // 1. Keyed `.id = "s:..."` and `.{ .recurse = "s:..." }` emitted for `MutA` <-> `MutB`, `MetaNode`, and `PolyNode`!
-        try std.testing.expect(std.mem.indexOf(u8, src, ".id = \"s:0:") != null);
-        try std.testing.expect(std.mem.indexOf(u8, src, ".{ .recurse = \"s:0:") != null);
+        const Helper = struct {
+            fn fnBlock(haystack: []const u8, fn_header: []const u8) ![]const u8 {
+                const start = std.mem.indexOf(u8, haystack, fn_header) orelse return error.MissingFnHeader;
+                const rest = haystack[start..];
+                const end = std.mem.indexOf(u8, rest, "\n}\n") orelse rest.len;
+                return rest[0..end];
+            }
+            fn extractFirstId(block: []const u8) ![]const u8 {
+                const needle = ".id = \"";
+                const idx = std.mem.indexOf(u8, block, needle) orelse return error.MissingSpecId;
+                const after = block[idx + needle.len ..];
+                const q = std.mem.indexOfScalar(u8, after, '"') orelse return error.UnterminatedSpecId;
+                return after[0..q];
+            }
+        };
 
-        // 2. Polymorphic recursion (`PolyNode<Undef<number>>` with `alt?: PolyNode<Maybe<number>>`)
-        //    emits BOTH `?u(_)` (for outer `Undef<number>`) AND `?n(_)` (for `alt`'s `Maybe<number>` -> `.null_only`), NOT premature `.recurse`!
-        try std.testing.expect(std.mem.indexOf(u8, src, ":?u(_)\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, src, ":?n(_)\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, src, ".{ .name = \"val\", .nullish = .null_only }") != null);
+        // 1. Exact mutual recursion check on `takeMut`: `MutB.a` MUST recurse to `MutA`'s exact `.id`, NOT `MutB`'s!
+        {
+            const blk = try Helper.fnBlock(src, "pub fn takeMut(");
+            const mut_a_id = try Helper.extractFirstId(blk);
+            const after_first = blk[(std.mem.indexOf(u8, blk, mut_a_id).? + mut_a_id.len)..];
+            const mut_b_id = try Helper.extractFirstId(after_first);
+            try std.testing.expect(!std.mem.eql(u8, mut_a_id, mut_b_id));
+            const expected_mut = try std.fmt.allocPrint(
+                alloc,
+                ".{{ .id = \"{s}\", .self = .none, .fields = .{{ .{{ .name = \"v\", .nullish = .undefined_only }}, .{{ .name = \"b\", .nullish = .{{ .self = .undefined_only, .child = .{{ .id = \"{s}\", .self = .none, .fields = .{{ .{{ .name = \"w\", .nullish = .undefined_only }}, .{{ .name = \"a\", .nullish = .{{ .self = .undefined_only, .child = .{{ .recurse = \"{s}\" }} }} }} }} }} }} }} }} }}",
+                .{ mut_a_id, mut_b_id, mut_a_id },
+            );
+            defer alloc.free(expected_mut);
+            try std.testing.expect(std.mem.indexOf(u8, blk, expected_mut) != null);
+        }
 
-        // 3. Recursive object-alias `AliasTree<Undef<number>>` (`.elem = .{ .recurse = "s:0:...`) and
-        //    recursive tuple-alias `TupleTree<Undef<number>>` (`.elem = .{ .recurse = "a:0:...`) with bounded output size!
+        // 2. Exact polymorphic recursion check on `takePoly`: outer `PolyNode<Undef<number>>` has `?u(_)`,
+        //    `alt` (`PolyNode<Maybe<number>>`) has distinct `?n(_)` with `.val = .null_only` and `.same` recursing to `?n(_)`,
+        //    while outer `.same` recurses to `?u(_)`!
+        {
+            const blk = try Helper.fnBlock(src, "pub fn takePoly(");
+            const u_id = try Helper.extractFirstId(blk);
+            try std.testing.expect(std.mem.endsWith(u8, u_id, ":?u(_)"));
+            const prefix = u_id[0 .. u_id.len - ":?u(_)".len];
+            const n_id = try std.fmt.allocPrint(alloc, "{s}:?n(_)", .{prefix});
+            defer alloc.free(n_id);
+            const expected_poly = try std.fmt.allocPrint(
+                alloc,
+                ".{{ .id = \"{s}\", .self = .none, .fields = .{{ .{{ .name = \"val\", .nullish = .undefined_only }}, .{{ .name = \"alt\", .nullish = .{{ .self = .undefined_only, .child = .{{ .id = \"{s}\", .self = .none, .fields = .{{ .{{ .name = \"val\", .nullish = .null_only }}, .{{ .name = \"alt\", .nullish = .{{ .self = .undefined_only, .child = .{{ .recurse = \"{s}\" }} }} }}, .{{ .name = \"same\", .nullish = .{{ .self = .undefined_only, .child = .{{ .recurse = \"{s}\" }} }} }} }} }} }} }}, .{{ .name = \"same\", .nullish = .{{ .self = .undefined_only, .child = .{{ .recurse = \"{s}\" }} }} }} }} }}",
+                .{ u_id, n_id, n_id, n_id, u_id },
+            );
+            defer alloc.free(expected_poly);
+            try std.testing.expect(std.mem.indexOf(u8, blk, expected_poly) != null);
+        }
+
+        // 3. Exact nullable recursive generic alias checks (`NullableList<Undef<number>>`, `NullableList<number>`,
+        //    `NullableTupleTree<Undef<number>>`, and `ListViaMaybe<Undef<number>>`)!
+        {
+            const blk_list = try Helper.fnBlock(src, "pub fn takeNullableList(");
+            const list_id = try Helper.extractFirstId(blk_list);
+            const expected_list = try std.fmt.allocPrint(
+                alloc,
+                ".{{ .id = \"{s}\", .self = .null_only, .child = .{{ .self = .none, .fields = .{{ .{{ .name = \"head\", .nullish = .undefined_only }}, .{{ .name = \"tail\", .nullish = .{{ .recurse = \"{s}\" }} }} }} }} }}",
+                .{ list_id, list_id },
+            );
+            defer alloc.free(expected_list);
+            try std.testing.expect(std.mem.indexOf(u8, blk_list, expected_list) != null);
+
+            // `NullableList<number>` has no nullish type args -> compact `.null_only`, zero unrolling!
+            const blk_num_list = try Helper.fnBlock(src, "pub fn takeNumberList(");
+            try std.testing.expect(std.mem.indexOf(u8, blk_num_list, "try __zigar_js.pushArg(__zigar_args, l, .null_only);") != null);
+            try std.testing.expect(std.mem.indexOf(u8, blk_num_list, ".id =") == null);
+
+            const blk_ot = try Helper.fnBlock(src, "pub fn takeNullableTupleTree(");
+            const ot_id = try Helper.extractFirstId(blk_ot);
+            const expected_ot = try std.fmt.allocPrint(
+                alloc,
+                ".{{ .id = \"{s}\", .self = .null_only, .child = .{{ .self = .none, .tuple = .{{ .undefined_only, .{{ .self = .none, .elem = .{{ .recurse = \"{s}\" }} }} }} }} }}",
+                .{ ot_id, ot_id },
+            );
+            defer alloc.free(expected_ot);
+            try std.testing.expect(std.mem.indexOf(u8, blk_ot, expected_ot) != null);
+
+            const blk_via = try Helper.fnBlock(src, "pub fn takeListViaMaybe(");
+            const via_id = try Helper.extractFirstId(blk_via);
+            const expected_via = try std.fmt.allocPrint(
+                alloc,
+                ".{{ .id = \"{s}\", .self = .null_only, .child = .{{ .self = .none, .fields = .{{ .{{ .name = \"head\", .nullish = .undefined_only }}, .{{ .name = \"tail\", .nullish = .{{ .recurse = \"{s}\" }} }} }} }} }}",
+                .{ via_id, via_id },
+            );
+            defer alloc.free(expected_via);
+            try std.testing.expect(std.mem.indexOf(u8, blk_via, expected_via) != null);
+        }
+
+        // 4. `AliasTree`, `TupleTree`, `PairAlias<Undef<string>>`, and `Id<number[]>` rest/tuple checks + compact size!
         try std.testing.expect(std.mem.indexOf(u8, src, ".elem = .{ .recurse = \"s:0:") != null);
-        try std.testing.expect(std.mem.indexOf(u8, src, ".id = \"a:0:") != null);
         try std.testing.expect(std.mem.indexOf(u8, src, ".elem = .{ .recurse = \"a:0:") != null);
-        try std.testing.expect(src.len < 32768);
-
-        // 4. Generic tuple alias `PairAlias<Undef<string>>` emits `.tuple = .{ .undefined_only, .none }`!
         try std.testing.expect(std.mem.indexOf(u8, src, ".tuple = .{ .undefined_only, .none }") != null);
-
-        // 5. `takeIdRest(...nums: Id<number[]>)` and `IdTuple = [string, ...Id<number[]>]` do NOT double-wrap `[]const []const`!
         try std.testing.expect(std.mem.indexOf(u8, src, "[]const Id([]const f64)") == null);
+        try std.testing.expect(src.len < 40960);
     }
 
     const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});

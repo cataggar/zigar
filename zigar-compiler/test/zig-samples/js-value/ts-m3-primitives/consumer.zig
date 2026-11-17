@@ -775,18 +775,36 @@ pub fn exerciseNullishFidelity(out_alloc: std.mem.Allocator) ![]const u8 {
         const tree_leaf2: m3_esm.AliasTree(?f64) = .{ .v = 7 };
         const tree_mid: m3_esm.AliasTree(?f64) = .{ .v = null, .kids = &.{ tree_leaf1, tree_leaf2 } };
 
+        const list_end: m3_esm.NullableList(?f64) = null;
+        const list_n7: m3_esm.NullableList(?f64) = .{ .head = null, .tail = &list_end };
+        const list_n6: m3_esm.NullableList(?f64) = .{ .head = 60, .tail = &list_n7 };
+        const list_n5: m3_esm.NullableList(?f64) = .{ .head = null, .tail = &list_n6 };
+        const list_n4: m3_esm.NullableList(?f64) = .{ .head = 40, .tail = &list_n5 };
+        const list_n3: m3_esm.NullableList(?f64) = .{ .head = null, .tail = &list_n4 };
+        const list_n2: m3_esm.NullableList(?f64) = .{ .head = 20, .tail = &list_n3 };
+        const list_n1: m3_esm.NullableList(?f64) = .{ .head = null, .tail = &list_n2 };
+
+        const ot_n6: m3_esm.NullableTupleTree(?f64) = .{ .@"0" = null, .@"1" = &.{null} };
+        const ot_n5: m3_esm.NullableTupleTree(?f64) = .{ .@"0" = 5, .@"1" = &.{ot_n6} };
+        const ot_n4: m3_esm.NullableTupleTree(?f64) = .{ .@"0" = null, .@"1" = &.{ot_n5} };
+        const ot_n3: m3_esm.NullableTupleTree(?f64) = .{ .@"0" = 3, .@"1" = &.{ot_n4} };
+        const ot_n2: m3_esm.NullableTupleTree(?f64) = .{ .@"0" = null, .@"1" = &.{ot_n3} };
+        const ot_n1: m3_esm.NullableTupleTree(?f64) = .{ .@"0" = null, .@"1" = &.{ null, ot_n2 } };
+
         const deep_rec = try m3_esm.inspectDeepGenericRecursionAlloc(
             tracked_alloc,
             .{ .v = null, .b = mut_b1 },
             .{ .val = null, .meta = .{ .inner = &meta_inner } },
             .{ .val = null, .alt = &poly_alt, .same = &poly_same },
             .{ .v = null, .kids = &.{tree_mid} },
+            list_n1,
+            ot_n1,
         );
         defer js.freeDecoded([]const u8, tracked_alloc, deep_rec);
         if (!std.mem.eql(
             u8,
             deep_rec,
-            "mut=ok|meta=ok|poly=undef+null|tree=undefined[undefined[undefined,number:7]]",
+            "mut=ok|meta=ok|poly=undef+null|tree=undefined[undefined[undefined,number:7]]|list=u,20,u,40,u,60,u|ot=u(null,u(3(u(5(u(null))))))",
         )) {
             return error.Unexpected;
         }

@@ -5028,7 +5028,7 @@ pub fn Js(comptime host: type) type {
                         return @TypeOf(entry);
                     }
                 }
-                return module.NullishKind;
+                @compileError("unresolved nullish recurse id: " ++ raw_spec.recurse);
             }
             return @TypeOf(raw_spec);
         }
@@ -5043,7 +5043,7 @@ pub fn Js(comptime host: type) type {
                         return entry;
                     }
                 }
-                return module.NullishKind.none;
+                @compileError("unresolved nullish recurse id: " ++ raw_spec.recurse);
             }
             return raw_spec;
         }

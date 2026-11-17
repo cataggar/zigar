@@ -5489,32 +5489,137 @@ fn dfsValueCycleTypeByPath(
             if (ty.decl_ref.indirect) return;
             const target_key = try formatDeclCycleKey(state_alloc, ty.decl_ref.module_index, ty.decl_ref.decl_zig_path, null);
             defer state_alloc.free(target_key);
-            if (state.get(target_key)) |st| {
+            const cur_state = state.get(target_key);
+            if (cur_state) |st| {
                 if (st == 1) {
                     // Cycle back-edge detected! Mutate `ty.decl_ref` directly in place (`*const Target`).
                     ty.decl_ref.indirect = true;
                     return;
                 }
-                if (st == 2) return;
             }
             if (decl_map.get(target_key)) |target_decl| {
-                const parent_prefix = if (ty.decl_ref.decl_zig_path.len > 1)
-                    ty.decl_ref.decl_zig_path[0 .. ty.decl_ref.decl_zig_path.len - 1]
-                else
-                    &[_][]const u8{};
-                try dfsValueCycleDeclByPath(
-                    state_alloc,
-                    ir_alloc,
-                    ty.decl_ref.module_index,
-                    parent_prefix,
-                    target_decl,
-                    decl_map,
-                    state,
-                );
+                if (ty.decl_ref.type_args.len > 0) {
+                    const tps = switch (target_decl.kind) {
+                        .type_alias => |ta| ta.type_params,
+                        .struct_decl => |st_decl| st_decl.type_params,
+                        .union_decl => |un_decl| un_decl.type_params,
+                        else => &[_]TypeParamIr{},
+                    };
+                    for (ty.decl_ref.type_args, 0..) |arg_ty, idx| {
+                        const by_val = if (idx < tps.len)
+                            declUsesTypeParamByValue(state_alloc, target_decl, tps[idx].zig_ident, decl_map, 0)
+                        else
+                            false;
+                        if (by_val) {
+                            try dfsValueCycleTypeByPath(state_alloc, ir_alloc, @constCast(arg_ty), decl_map, state);
+                        }
+                    }
+                }
+                if (cur_state == null) {
+                    const parent_prefix = if (ty.decl_ref.decl_zig_path.len > 1)
+                        ty.decl_ref.decl_zig_path[0 .. ty.decl_ref.decl_zig_path.len - 1]
+                    else
+                        &[_][]const u8{};
+                    try dfsValueCycleDeclByPath(
+                        state_alloc,
+                        ir_alloc,
+                        ty.decl_ref.module_index,
+                        parent_prefix,
+                        target_decl,
+                        decl_map,
+                        state,
+                    );
+                }
             }
         },
         else => {},
     }
+}
+
+fn declUsesTypeParamByValue(
+    state_alloc: std.mem.Allocator,
+    d: *const DeclIr,
+    tp_ident: []const u8,
+    decl_map: *const std.StringHashMapUnmanaged(*DeclIr),
+    depth: usize,
+) bool {
+    if (depth >= 16) return false;
+    return switch (d.kind) {
+        .type_alias => |ta| typeUsesParamByValue(state_alloc, ta.target, tp_ident, decl_map, depth + 1),
+        .struct_decl => |st| blk: {
+            for (st.fields) |f| {
+                if (typeUsesParamByValue(state_alloc, f.ty, tp_ident, decl_map, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .union_decl => |un| blk: {
+            for (un.variants) |v| {
+                if (typeUsesParamByValue(state_alloc, v.payload, tp_ident, decl_map, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn typeUsesParamByValue(
+    state_alloc: std.mem.Allocator,
+    ty: *const TypeIr,
+    tp_ident: []const u8,
+    decl_map: *const std.StringHashMapUnmanaged(*DeclIr),
+    depth: usize,
+) bool {
+    if (depth >= 16) return false;
+    return switch (ty.*) {
+        .slice, .pointer_const, .fn_ptr, .promise, .js_map => false,
+        .type_param_ref => |id| std.mem.eql(u8, id, tp_ident),
+        .optional => |opt| typeUsesParamByValue(state_alloc, opt.child, tp_ident, decl_map, depth + 1),
+        .tuple => |elems| blk: {
+            for (elems) |el| {
+                if (!el.is_variadic and typeUsesParamByValue(state_alloc, el.ty, tp_ident, decl_map, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .anon_struct => |fields| blk: {
+            for (fields) |f| {
+                if (typeUsesParamByValue(state_alloc, f.ty, tp_ident, decl_map, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .tagged_union => |vars| blk: {
+            for (vars) |v| {
+                if (typeUsesParamByValue(state_alloc, v.payload, tp_ident, decl_map, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .decl_ref => |dr| blk: {
+            if (dr.indirect or dr.type_args.len == 0) break :blk false;
+            const target_key = formatDeclCycleKey(state_alloc, dr.module_index, dr.decl_zig_path, null) catch break :blk true;
+            defer state_alloc.free(target_key);
+            if (decl_map.get(target_key)) |td| {
+                const tps = switch (td.kind) {
+                    .type_alias => |ta| ta.type_params,
+                    .struct_decl => |st_decl| st_decl.type_params,
+                    .union_decl => |un_decl| un_decl.type_params,
+                    else => &[_]TypeParamIr{},
+                };
+                for (dr.type_args, 0..) |arg_ty, idx| {
+                    if (idx < tps.len and
+                        declUsesTypeParamByValue(state_alloc, td, tps[idx].zig_ident, decl_map, depth + 1) and
+                        typeUsesParamByValue(state_alloc, arg_ty, tp_ident, decl_map, depth + 1))
+                    {
+                        break :blk true;
+                    }
+                }
+                break :blk false;
+            }
+            for (dr.type_args) |arg_ty| {
+                if (typeUsesParamByValue(state_alloc, arg_ty, tp_ident, decl_map, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
 }
 
 test "applySubstitutions and moduleMatchesPattern handle prefixes and node: normalization" {

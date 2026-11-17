@@ -116,6 +116,13 @@ declare module "./m3-esm.mjs" {
     kids?: AliasTree<T>[];
   };
 
+  export type NullableList<T> = {
+    head: T;
+    tail: NullableList<T>;
+  } | null;
+
+  export type NullableTupleTree<T> = [T, NullableTupleTree<T>[]] | null;
+
   export let gMaybe: Maybe<number>;
   export let gUndefAlias: Undef<number>;
   export function inspectGenericAliasNullish(
@@ -133,6 +140,8 @@ declare module "./m3-esm.mjs" {
     metaNode: MetaNode<Undef<number>>,
     polyNode: PolyNode<Undef<number>>,
     tree: AliasTree<Undef<number>>,
+    nullableList: NullableList<Undef<number>>,
+    nullableTupleTree: NullableTupleTree<Undef<number>>,
   ): string;
   export function sumRestGenericAlias(...nums: Id<number[]>): number;
   export function readVariadicGenericAliasTuple(t: VariadicGenericAliasTuple): string;
