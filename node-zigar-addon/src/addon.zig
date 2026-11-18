@@ -88,6 +88,7 @@ const ModuleHost = struct {
     cleanup_hook_registered: bool = false,
     multithread_count: std.atomic.Value(usize) = .init(0),
     ts_mutex: std.Io.Mutex = .init,
+    pending_async_futexes: std.ArrayList(usize) = .empty,
     redirection_mask: hooks.Syscall.Mask = .{},
     redirecting_other_libraries: bool = false,
     hooks_installed: bool = false,
@@ -192,6 +193,56 @@ const ModuleHost = struct {
     threadlocal var active_thunk_frame: ?*const ActiveThunkFrame = null;
 
     var next_realm_tag: std.atomic.Value(u32) = .init(0);
+    var addon_library_pinned: std.atomic.Value(bool) = .init(false);
+
+    fn pinAddonLibraryOnce() void {
+        if (addon_library_pinned.load(.acquire)) return;
+        const ok = switch (builtin.target.os.tag) {
+            .windows => blk: {
+                var unused: c.HMODULE = undefined;
+                const rc = c.GetModuleHandleExA(
+                    c.GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | c.GET_MODULE_HANDLE_EX_FLAG_PIN,
+                    @ptrCast(&pinAddonLibraryOnce),
+                    &unused,
+                );
+                break :blk rc != 0;
+            },
+            else => blk: {
+                var info: c.Dl_info = undefined;
+                if (c.dladdr(@ptrCast(&pinAddonLibraryOnce), &info) != 0 and info.dli_fname != null) {
+                    const flags: u32 = c.RTLD_LAZY | c.RTLD_NODELETE | c.RTLD_NOLOAD;
+                    if (std.c.dlopen(info.dli_fname, @bitCast(flags))) |handle| {
+                        _ = std.c.dlclose(handle);
+                        break :blk true;
+                    }
+                }
+                break :blk false;
+            },
+        };
+        if (ok) addon_library_pinned.store(true, .release);
+    }
+
+    fn trackPendingAsyncFutex(self: *@This(), handle: usize) !void {
+        if (handle == 0) return;
+        try self.pending_async_futexes.append(c_allocator, handle);
+    }
+
+    fn untrackPendingAsyncFutex(self: *@This(), handle: usize) bool {
+        if (handle == 0) return false;
+        for (self.pending_async_futexes.items, 0..) |item, idx| {
+            if (item == handle) {
+                _ = self.pending_async_futexes.swapRemove(idx);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn completePendingAsyncFutex(self: *@This(), handle: usize, result: E) void {
+        if (self.untrackPendingAsyncFutex(handle)) {
+            Futex.wake(handle, result);
+        }
+    }
 
     var host_list: std.ArrayList(*@This()) = .empty;
     var host_list_mutex: std.Io.Mutex = .init;
@@ -220,6 +271,7 @@ const ModuleHost = struct {
     }
 
     fn attachExports(env: Env, exports: Value) !void {
+        pinAddonLibraryOnce();
         inline for (.{ "createEnvironment", "getGCStatistics" }) |name| {
             const func = @field(@This(), name);
             try env.setNamedProperty(exports, name, try env.createCallback(name, func, false, null));
@@ -320,20 +372,27 @@ const ModuleHost = struct {
             defer self.thread_syscall_trap_list_mutex.unlock(io);
             for (self.thread_syscall_trap_list.items) |ptr| ptr.* = false;
         }
-        self.ts_mutex.lockUncancelable(io);
-        defer self.ts_mutex.unlock(io);
-        self.env_closing.store(true, .release);
-        const field_names = @typeInfo(@FieldType(ModuleHost, "ts")).@"struct".field_names;
-        inline for (field_names) |field_name| {
-            if (@field(self.ts, field_name).swap(null, .acq_rel)) |ref| {
-                napi.releaseThreadsafeFunction(ref, .abort) catch {};
+        {
+            self.ts_mutex.lockUncancelable(io);
+            defer self.ts_mutex.unlock(io);
+            self.env_closing.store(true, .release);
+            const field_names = @typeInfo(@FieldType(ModuleHost, "ts")).@"struct".field_names;
+            inline for (field_names) |field_name| {
+                if (@field(self.ts, field_name).swap(null, .acq_rel)) |ref| {
+                    napi.releaseThreadsafeFunction(ref, .abort) catch {};
+                }
             }
         }
+        for (self.pending_async_futexes.items) |futex_handle| {
+            Futex.wake(futex_handle, .FAULT);
+        }
+        self.pending_async_futexes.clearAndFree(c_allocator);
     }
 
     fn release(self: *@This()) void {
         self.ref_count -= 1;
         if (self.ref_count == 0) {
+            self.pending_async_futexes.deinit(c_allocator);
             self.unregister();
             const env = self.env;
             if (self.cleanup_hook_registered) {
@@ -757,7 +816,7 @@ const ModuleHost = struct {
         const env = self.env;
         const handle = try env.getValueUsize(futex_handle);
         const value = try env.getValueUint32(async_result);
-        Futex.wake(handle, @enumFromInt(value));
+        self.completePendingAsyncFutex(handle, @enumFromInt(value));
     }
 
     const NumberType = enum(u32) {
@@ -1192,9 +1251,14 @@ const ModuleHost = struct {
 
     fn handleJscall(self: *@This(), call: *Jscall) !E {
         if (in_main_thread) {
-            errdefer {
-                if (call.futex_handle != 0) Futex.wake(call.futex_handle, E.FAULT);
+            const futex_handle = call.futex_handle;
+            if (futex_handle != 0) {
+                self.trackPendingAsyncFutex(futex_handle) catch {
+                    Futex.wake(futex_handle, .FAULT);
+                    return .FAULT;
+                };
             }
+            errdefer self.completePendingAsyncFutex(futex_handle, .FAULT);
             const env = self.env;
             const status = try env.callFunction(
                 try env.getNull(),
@@ -1203,7 +1267,7 @@ const ModuleHost = struct {
                     try env.createUint32(@as(u32, @truncate(call.fn_id))),
                     try env.createUsize(call.arg_address),
                     try env.createUint32(@as(u32, @truncate(call.arg_size))),
-                    try env.createUsize(call.futex_handle),
+                    try env.createUsize(futex_handle),
                 },
             );
             const status_value = try env.getValueUint32(status);
@@ -1218,8 +1282,16 @@ const ModuleHost = struct {
 
     fn handleSyscall(self: *@This(), call: *Syscall) !E {
         if (in_main_thread) {
+            const futex_handle = call.futex_handle;
+            if (futex_handle != 0) {
+                self.trackPendingAsyncFutex(futex_handle) catch {
+                    Futex.wake(futex_handle, .FAULT);
+                    return .FAULT;
+                };
+            }
+            errdefer self.completePendingAsyncFutex(futex_handle, .FAULT);
             const env = self.env;
-            const futex = switch (call.futex_handle) {
+            const futex = switch (futex_handle) {
                 0 => try env.getUndefined(),
                 else => |handle| try env.createUsize(handle),
             };
@@ -1729,7 +1801,7 @@ const ModuleHost = struct {
         }
         const env = self.env;
         if (env.getValueUsize(futex)) |handle| {
-            Futex.wake(handle, result);
+            self.completePendingAsyncFutex(handle, result);
         } else |_| {}
         return result;
     }
@@ -1883,7 +1955,7 @@ const ModuleHost = struct {
         if (!in_main_thread and self.env_closing.load(.acquire)) return .SUCCESS;
         var req: JsBridgeRequest = .{ .payload = .{ .release_js_value = .{ .handle = handle } } };
         const status = try self.dispatchWorkerJsBridge(&req);
-        if (status == .NOSYS and self.env_closing.load(.acquire)) return .SUCCESS;
+        if ((status == .NOSYS or status == .FAULT) and self.env_closing.load(.acquire)) return .SUCCESS;
         return status;
     }
 
@@ -2081,7 +2153,7 @@ const ModuleHost = struct {
         if (!in_main_thread and self.env_closing.load(.acquire)) return .SUCCESS;
         var req: JsBridgeRequest = .{ .payload = .{ .release_zig_callback = .{ .callback_id = callback_id } } };
         const status = try self.dispatchWorkerJsBridge(&req);
-        if (status == .NOSYS and self.env_closing.load(.acquire)) return .SUCCESS;
+        if ((status == .NOSYS or status == .FAULT) and self.env_closing.load(.acquire)) return .SUCCESS;
         return status;
     }
 
@@ -2118,7 +2190,7 @@ const ModuleHost = struct {
         }
         var req: JsBridgeRequest = .{ .payload = .{ .control_last_js_error = .{ .mode = mode, .dest = dest } } };
         const status = try self.dispatchWorkerJsBridge(&req);
-        if (mode == 3 and status == .NOSYS and self.env_closing.load(.acquire)) {
+        if (mode == 3 and (status == .NOSYS or status == .FAULT) and self.env_closing.load(.acquire)) {
             dest.* = 0;
             return .SUCCESS;
         }
@@ -2160,7 +2232,7 @@ const ModuleHost = struct {
         if (!catch_mode and !in_main_thread and self.env_closing.load(.acquire)) return .SUCCESS;
         var req: JsBridgeRequest = .{ .payload = .{ .dispose_js_value = .{ .handle = handle, .catch_mode = catch_mode } } };
         const status = try self.dispatchWorkerJsBridge(&req);
-        if (!catch_mode and status == .NOSYS and self.env_closing.load(.acquire)) return .SUCCESS;
+        if (!catch_mode and (status == .NOSYS or status == .FAULT) and self.env_closing.load(.acquire)) return .SUCCESS;
         return status;
     }
 
@@ -2199,7 +2271,7 @@ const ModuleHost = struct {
         if (!catch_mode and !in_main_thread and self.env_closing.load(.acquire)) return .SUCCESS;
         var req: JsBridgeRequest = .{ .payload = .{ .async_dispose_js_value = .{ .handle = handle, .catch_mode = catch_mode } } };
         const status = try self.dispatchWorkerJsBridge(&req);
-        if (!catch_mode and status == .NOSYS and self.env_closing.load(.acquire)) return .SUCCESS;
+        if (!catch_mode and (status == .NOSYS or status == .FAULT) and self.env_closing.load(.acquire)) return .SUCCESS;
         return status;
     }
 
@@ -2255,6 +2327,12 @@ const ModuleHost = struct {
 
         switch (req.payload) {
             .await_js_promise => |p| {
+                const futex_handle = req.futex_handle;
+                self.trackPendingAsyncFutex(futex_handle) catch {
+                    Futex.wake(futex_handle, .FAULT);
+                    return;
+                };
+                errdefer self.completePendingAsyncFutex(futex_handle, .FAULT);
                 const env = self.env;
                 const scope = try env.openHandleScope();
                 defer env.closeHandleScope(scope) catch {};
@@ -2269,11 +2347,17 @@ const ModuleHost = struct {
                         try env.createUsize(p.arg_size),
                         try env.createUsize(p.done_flag_addr),
                         try env.createBigintUint64(req.worker_id),
-                        try env.createUsize(req.futex_handle),
+                        try env.createUsize(futex_handle),
                     },
                 );
             },
             .async_dispose_js_value => |d| {
+                const futex_handle = req.futex_handle;
+                self.trackPendingAsyncFutex(futex_handle) catch {
+                    Futex.wake(futex_handle, .FAULT);
+                    return;
+                };
+                errdefer self.completePendingAsyncFutex(futex_handle, .FAULT);
                 const env = self.env;
                 const scope = try env.openHandleScope();
                 defer env.closeHandleScope(scope) catch {};
@@ -2284,7 +2368,7 @@ const ModuleHost = struct {
                         try env.createUint32(d.handle),
                         try env.getBoolean(d.catch_mode),
                         try env.createBigintUint64(req.worker_id),
-                        try env.createUsize(req.futex_handle),
+                        try env.createUsize(futex_handle),
                     },
                 );
             },
@@ -2359,6 +2443,7 @@ const ModuleHost = struct {
                     const tsfn = try env.createThreadsafeFunction(null, null, resource_name, 0, 1, null, null, @ptrCast(self), @ptrCast(&cb));
                     @field(self.ts, field_name).store(tsfn, .release);
                 }
+                pinAddonLibraryOnce();
                 self.addRef();
             }
         } else {
@@ -2397,39 +2482,37 @@ const ModuleHost = struct {
     const threadsafe_callback = struct {
         fn handle_jscall(env: ?*Env, _: ?Value, context: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
             const call: *Jscall = @ptrCast(@alignCast(data orelse return));
+            const futex_handle = call.futex_handle;
             if (env == null) {
-                if (call.futex_handle != 0) Futex.wake(call.futex_handle, .FAULT);
+                if (futex_handle != 0) Futex.wake(futex_handle, .FAULT);
                 return;
             }
             const self: *ModuleHost = @ptrCast(@alignCast(context orelse return));
             if (self.env_closing.load(.acquire)) {
-                if (call.futex_handle != 0) Futex.wake(call.futex_handle, .FAULT);
+                if (futex_handle != 0) Futex.wake(futex_handle, .FAULT);
                 return;
             }
-            _ = handleJscall(self, call) catch {
-                // wake caller if call fails since JavaScript isn't going to do it
-                if (call.futex_handle != 0) Futex.wake(call.futex_handle, .FAULT);
-            };
+            _ = handleJscall(self, call) catch {};
         }
 
         fn handle_js_bridge(env: ?*Env, _: ?Value, context: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
             const req: *JsBridgeRequest = @ptrCast(@alignCast(data orelse return));
+            const futex_handle = req.futex_handle;
             if (env == null) {
-                if (req.futex_handle != 0) Futex.wake(req.futex_handle, .FAULT);
+                if (futex_handle != 0) Futex.wake(futex_handle, .FAULT);
                 return;
             }
             const self: *ModuleHost = @ptrCast(@alignCast(context orelse return));
             if (self.env_closing.load(.acquire)) {
-                if (req.futex_handle != 0) Futex.wake(req.futex_handle, .FAULT);
+                if (futex_handle != 0) Futex.wake(futex_handle, .FAULT);
                 return;
             }
-            self.handleJsBridgeOnMainThread(req) catch {
-                if (req.futex_handle != 0) Futex.wake(req.futex_handle, .FAULT);
-            };
+            self.handleJsBridgeOnMainThread(req) catch {};
         }
 
         fn handle_syscall(env: ?*Env, _: ?Value, context: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
             const call: *Syscall = @ptrCast(@alignCast(data orelse return));
+            const futex_handle = call.futex_handle;
             if (env == null) {
                 if (call.cmd == .write_stderr) {
                     const len: usize = call.u.write_stderr.len;
@@ -2437,7 +2520,7 @@ const ModuleHost = struct {
                     c_allocator.destroy(call);
                     return;
                 }
-                if (call.futex_handle != 0) Futex.wake(call.futex_handle, .FAULT);
+                if (futex_handle != 0) Futex.wake(futex_handle, .FAULT);
                 return;
             }
             const self: *ModuleHost = @ptrCast(@alignCast(context orelse return));
@@ -2448,12 +2531,10 @@ const ModuleHost = struct {
                     c_allocator.destroy(call);
                     return;
                 }
-                if (call.futex_handle != 0) Futex.wake(call.futex_handle, .FAULT);
+                if (futex_handle != 0) Futex.wake(futex_handle, .FAULT);
                 return;
             }
-            _ = handleSyscall(self, call) catch {
-                if (call.futex_handle != 0) Futex.wake(call.futex_handle, .FAULT);
-            };
+            _ = handleSyscall(self, call) catch {};
         }
 
         fn release_function(env: ?*Env, _: ?Value, context: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
