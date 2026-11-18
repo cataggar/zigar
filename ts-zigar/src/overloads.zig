@@ -76,6 +76,23 @@ pub fn typeIrEqlWithTypeParams(
         .promise => |pa| typeIrEqlWithTypeParams(pa, b.promise, tp_names_a, tp_names_b, depth + 1),
         .js_map => |ma| typeIrEqlWithTypeParams(ma.key, b.js_map.key, tp_names_a, tp_names_b, depth + 1) and
             typeIrEqlWithTypeParams(ma.value, b.js_map.value, tp_names_a, tp_names_b, depth + 1),
+        .js_record => |ra| typeIrEqlWithTypeParams(ra.key, b.js_record.key, tp_names_a, tp_names_b, depth + 1) and
+            typeIrEqlWithTypeParams(ra.value, b.js_record.value, tp_names_a, tp_names_b, depth + 1),
+        .mapped_values_op => |ma| typeIrEqlWithTypeParams(ma.target, b.mapped_values_op.target, tp_names_a, tp_names_b, depth + 1) and
+            typeIrEqlWithTypeParams(ma.value, b.mapped_values_op.value, tp_names_a, tp_names_b, depth + 1),
+        .unary_type_op => |ua| ua.op == b.unary_type_op.op and
+            typeIrEqlWithTypeParams(ua.operand, b.unary_type_op.operand, tp_names_a, tp_names_b, depth + 1),
+        .key_filter_op => |ka| blk: {
+            const kb = b.key_filter_op;
+            if (ka.kind != kb.kind) break :blk false;
+            if (!typeIrEqlWithTypeParams(ka.target, kb.target, tp_names_a, tp_names_b, depth + 1)) break :blk false;
+            break :blk keyFilterSpecEqlWithTypeParams(ka.keys, kb.keys, tp_names_a, tp_names_b, depth + 1);
+        },
+        .index_access_op => |ia| blk: {
+            const ib = b.index_access_op;
+            if (!typeIrEqlWithTypeParams(ia.object_ty, ib.object_ty, tp_names_a, tp_names_b, depth + 1)) break :blk false;
+            break :blk indexAccessSpecEqlWithTypeParams(ia.index_spec, ib.index_spec, tp_names_a, tp_names_b, depth + 1);
+        },
         .tuple => |ta| blk: {
             const tb = b.tuple;
             if (ta.len != tb.len) break :blk false;
@@ -172,6 +189,51 @@ pub fn typeIrEqlWithTypeParams(
     };
 }
 
+fn keyFilterSpecEqlWithTypeParams(
+    a: anytype,
+    b: anytype,
+    tp_names_a: []const []const u8,
+    tp_names_b: []const []const u8,
+    depth: usize,
+) bool {
+    if (@intFromEnum(a) != @intFromEnum(b)) return false;
+    return switch (a) {
+        .ty => |ta| typeIrEqlWithTypeParams(ta, b.ty, tp_names_a, tp_names_b, depth),
+        .str_lit => |sa| std.mem.eql(u8, sa, b.str_lit),
+        .str_list => |la| blk: {
+            const lb = b.str_list;
+            if (la.len != lb.len) break :blk false;
+            for (la, lb) |sa, sb| {
+                if (!std.mem.eql(u8, sa, sb)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
+}
+
+fn indexAccessSpecEqlWithTypeParams(
+    a: anytype,
+    b: anytype,
+    tp_names_a: []const []const u8,
+    tp_names_b: []const []const u8,
+    depth: usize,
+) bool {
+    if (@intFromEnum(a) != @intFromEnum(b)) return false;
+    return switch (a) {
+        .ty => |ta| typeIrEqlWithTypeParams(ta, b.ty, tp_names_a, tp_names_b, depth),
+        .str_lit => |sa| std.mem.eql(u8, sa, b.str_lit),
+        .str_list => |la| blk: {
+            const lb = b.str_list;
+            if (la.len != lb.len) break :blk false;
+            for (la, lb) |sa, sb| {
+                if (!std.mem.eql(u8, sa, sb)) break :blk false;
+            }
+            break :blk true;
+        },
+        .int_lit => |ia| ia == b.int_lit,
+    };
+}
+
 fn indexOfStr(haystack: []const []const u8, needle: []const u8) ?usize {
     for (haystack, 0..) |item, idx| {
         if (std.mem.eql(u8, item, needle)) return idx;
@@ -200,6 +262,10 @@ pub fn signatureSubsumedBy(
         if ((tpa.constraint != null) != (tpb.constraint != null)) return false;
         if (tpa.constraint) |ca| {
             if (!typeIrEqlWithTypeParams(ca, tpb.constraint.?, tps_a, tps_b, 0)) return false;
+        }
+        if (tpa.default_type) |da| {
+            const db = tpb.default_type orelse return false;
+            if (!typeIrEqlWithTypeParams(da, db, tps_a, tps_b, 0)) return false;
         }
     }
 
@@ -429,6 +495,37 @@ fn appendTypeSlug(
                 try appendTypeSlug(buf, alloc, scratch, m.value, null, false, false, depth + 1);
             }
             try buf.appendSlice(alloc, "Map");
+        },
+        .js_record => |r| {
+            if (detailed) {
+                try appendTypeSlug(buf, alloc, scratch, r.key, null, false, false, depth + 1);
+                try appendTypeSlug(buf, alloc, scratch, r.value, null, false, false, depth + 1);
+            }
+            try buf.appendSlice(alloc, "Record");
+        },
+        .mapped_values_op => |mv| {
+            if (detailed) {
+                try appendTypeSlug(buf, alloc, scratch, mv.target, null, false, false, depth + 1);
+                try appendTypeSlug(buf, alloc, scratch, mv.value, null, false, false, depth + 1);
+            }
+            try appendTypeSlug(buf, alloc, scratch, mv.target, null, false, false, depth + 1);
+            try buf.appendSlice(alloc, "Mapped");
+        },
+        .unary_type_op => |uo| {
+            try buf.appendSlice(alloc, uo.op.runtimeHelperName());
+            if (detailed) {
+                try appendTypeSlug(buf, alloc, scratch, uo.operand, null, false, false, depth + 1);
+            }
+        },
+        .key_filter_op => |kf| {
+            try buf.appendSlice(alloc, kf.kind.runtimeHelperName());
+            if (detailed) {
+                try appendTypeSlug(buf, alloc, scratch, kf.target, null, false, false, depth + 1);
+            }
+        },
+        .index_access_op => |ia| {
+            try appendTypeSlug(buf, alloc, scratch, ia.object_ty, null, false, false, depth + 1);
+            try buf.appendSlice(alloc, "Prop");
         },
         .tuple => |elems| {
             if (detailed) {
@@ -939,6 +1036,30 @@ test "overloads: subsumption deduplication and deterministic semantic naming wit
         slice: *const SelfT,
         promise: *const SelfT,
         js_map: struct { key: *const SelfT, value: *const SelfT },
+        js_record: struct { key: *const SelfT, value: *const SelfT },
+        mapped_values_op: struct { target: *const SelfT, value: *const SelfT },
+        unary_type_op: struct {
+            op: @import("type_ops.zig").UnaryTypeOp,
+            operand: *const SelfT,
+        },
+        key_filter_op: struct {
+            kind: @import("type_ops.zig").KeyFilterKind,
+            target: *const SelfT,
+            keys: union(enum) {
+                ty: *const SelfT,
+                str_lit: []const u8,
+                str_list: []const []const u8,
+            },
+        },
+        index_access_op: struct {
+            object_ty: *const SelfT,
+            index_spec: union(enum) {
+                ty: *const SelfT,
+                str_lit: []const u8,
+                str_list: []const []const u8,
+                int_lit: usize,
+            },
+        },
         tuple: []const struct {
             ty: *const SelfT,
             is_optional: bool = false,
@@ -992,7 +1113,12 @@ test "overloads: subsumption deduplication and deterministic semantic naming wit
             return_type: *const MockType,
         } = null,
     };
-    const MockTp = struct { zig_ident: []const u8, logical_name: []const u8, constraint: ?*const MockType = null };
+    const MockTp = struct {
+        zig_ident: []const u8,
+        logical_name: []const u8,
+        constraint: ?*const MockType = null,
+        default_type: ?*const MockType = null,
+    };
     const MockSig = struct {
         type_params: []const MockTp = &.{},
         this_param: ?struct { ty: *const MockType } = null,
