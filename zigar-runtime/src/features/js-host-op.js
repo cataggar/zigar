@@ -254,8 +254,7 @@ export default mixin({
     try {
       const target = this.getJsValue(rawHandle);
       if (target !== null && target !== undefined) {
-        const sym = getDisposeSymbol();
-        const method = sym !== undefined ? target[sym] : undefined;
+        const method = lookupDisposeMethod(target);
         if (method !== undefined && method !== null) {
           if (typeof(method) !== 'function') {
             throw createNotCallableError('[Symbol.dispose] is not a function');
@@ -284,11 +283,9 @@ export default mixin({
       if (target === null || target === undefined) {
         return 0;
       }
-      const asyncSym = getAsyncDisposeSymbol();
-      let method = asyncSym !== undefined ? target[asyncSym] : undefined;
+      let method = lookupAsyncDisposeMethod(target);
       if (method === undefined || method === null) {
-        const syncSym = getDisposeSymbol();
-        method = syncSym !== undefined ? target[syncSym] : undefined;
+        method = lookupDisposeMethod(target);
         if (method === undefined || method === null) {
           return 0;
         }
@@ -388,11 +385,9 @@ export default mixin({
           this.finalizeAsyncCall(futexHandle, 0);
           return 0;
         }
-        const asyncSym = getAsyncDisposeSymbol();
-        let method = asyncSym !== undefined ? target[asyncSym] : undefined;
+        let method = lookupAsyncDisposeMethod(target);
         if (method === undefined || method === null) {
-          const syncSym = getDisposeSymbol();
-          method = syncSym !== undefined ? target[syncSym] : undefined;
+          method = lookupDisposeMethod(target);
           if (method === undefined || method === null) {
             this.finalizeAsyncCall(futexHandle, 0);
             return 0;
@@ -1835,12 +1830,20 @@ export default mixin({
   } : undefined),
 });
 
-function getDisposeSymbol() {
-  return Symbol.dispose ?? Symbol.for('nodejs.dispose');
+function lookupDisposeMethod(target) {
+  if (Symbol.dispose !== undefined) {
+    const method = target[Symbol.dispose];
+    if (method !== undefined && method !== null) return method;
+  }
+  return target[Symbol.for('nodejs.dispose')];
 }
 
-function getAsyncDisposeSymbol() {
-  return Symbol.asyncDispose ?? Symbol.for('nodejs.asyncDispose');
+function lookupAsyncDisposeMethod(target) {
+  if (Symbol.asyncDispose !== undefined) {
+    const method = target[Symbol.asyncDispose];
+    if (method !== undefined && method !== null) return method;
+  }
+  return target[Symbol.for('nodejs.asyncDispose')];
 }
 
 const noop = () => {};

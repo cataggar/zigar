@@ -19,6 +19,7 @@
 //!      plain `.value_struct` interfaces).
 
 const std = @import("std");
+const lower_protocols = @import("lower_protocols.zig");
 
 pub const ObjectDeclKind = enum {
     value_struct,
@@ -75,6 +76,7 @@ pub fn Classifier(comptime Graph: type) type {
         pub fn propRequiresHandle(self: *const Self, pid: u32) bool {
             if (pid >= self.graph.properties.len) return false;
             const p = self.graph.properties[pid];
+            if (p.computed_symbol != null) return true;
             if (p.has_getter or p.has_setter) return true;
             if (p.modifiers.method_mod or p.modifiers.accessor_mod or p.modifiers.private_mod or p.modifiers.protected_mod) return true;
             if (std.mem.eql(u8, self.str(p.name), "__zigar_private_brand")) return true;
@@ -364,8 +366,6 @@ pub fn Classifier(comptime Graph: type) type {
         fn isBuiltinNonObjectRef(rname: []const u8) bool {
             return std.mem.eql(u8, rname, "Array") or
                 std.mem.eql(u8, rname, "ReadonlyArray") or
-                std.mem.eql(u8, rname, "Iterable") or
-                std.mem.eql(u8, rname, "IterableIterator") or
                 std.mem.eql(u8, rname, "Set") or
                 std.mem.eql(u8, rname, "ReadonlySet") or
                 std.mem.eql(u8, rname, "Map") or
@@ -408,8 +408,12 @@ pub fn Classifier(comptime Graph: type) type {
                     return .{ .kind = .value_struct };
                 },
                 .reference => |ref| {
-                    if (isBuiltinNonObjectRef(self.str(ref.target_name))) {
+                    const rname = self.str(ref.target_name);
+                    if (isBuiltinNonObjectRef(rname)) {
                         return .{ .kind = .value_struct };
+                    }
+                    if (ref.target_decl == null and lower_protocols.classifyBuiltinProtocolRef(rname) != null) {
+                        return .{ .kind = .handle_wrapper };
                     }
                     if (tn.resolved_type) |rt| {
                         if (rt != ty_id) {
@@ -450,6 +454,9 @@ pub fn Classifier(comptime Graph: type) type {
                 switch (tn.kind) {
                     .object_literal, .intersection => return try self.classifyObjectType(hc.target_type, 0),
                     .reference => |ref| {
+                        if (ref.target_decl == null and lower_protocols.classifyBuiltinProtocolRef(self.str(ref.target_name)) != null) {
+                            return .{ .kind = .handle_wrapper };
+                        }
                         if (tn.resolved_type != null and (ref.target_decl == null or
                             (ref.target_decl.? < self.graph.decls.len and
                                 self.graph.decls[ref.target_decl.?].kind == .type_alias_decl and

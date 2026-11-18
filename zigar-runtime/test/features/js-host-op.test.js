@@ -1668,6 +1668,15 @@ describe('Feature: js-host-op', function() {
     expect(events).to.deep.equal([ 'dispose:r1' ]);
     expect(env.getJsValueCount()).to.equal(0);
 
+    const hNodeLegacy = env.allocJsValue({
+      [Symbol.for('nodejs.dispose')]() {
+        events.push('dispose:nodejs-legacy');
+      },
+    });
+    expect(env.disposeJsValue(hNodeLegacy, true)).to.equal(0);
+    expect(events).to.deep.equal([ 'dispose:r1', 'dispose:nodejs-legacy' ]);
+    expect(env.getJsValueCount()).to.equal(0);
+
     const disposeBoom = new Error('sync dispose failed');
     const hThrowCatch = env.allocJsValue({
       [Symbol.dispose]() {
@@ -1707,6 +1716,15 @@ describe('Feature: js-host-op', function() {
     });
     expect(env.asyncDisposeJsValue(hSyncAsyncDispose, true)).to.equal(0);
     expect(events).to.include('sync-async-dispose');
+    expect(env.getJsValueCount()).to.equal(0);
+
+    const hNodeLegacyAsync = env.allocJsValue({
+      [Symbol.for('nodejs.asyncDispose')]() {
+        events.push('nodejs-legacy-async-dispose');
+      },
+    });
+    expect(env.asyncDisposeJsValue(hNodeLegacyAsync, true)).to.equal(0);
+    expect(events).to.include('nodejs-legacy-async-dispose');
     expect(env.getJsValueCount()).to.equal(0);
 
     // Promise-returning [Symbol.asyncDispose] without JSPI NEVER drains nextTick/microtasks,

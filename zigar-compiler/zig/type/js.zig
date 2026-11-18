@@ -1754,6 +1754,15 @@ pub fn NonNullable(comptime T: type) type {
 }
 
 pub fn Awaited(comptime T: type) type {
+    if (@typeInfo(T) == .optional) {
+        const Child = @typeInfo(T).optional.child;
+        const Aw = Awaited(Child);
+        return if (Aw == Child) T else ?Aw;
+    }
+    if (isModuleNullableType(T)) {
+        const Aw = Awaited(T.Value);
+        return if (Aw == T.Value) T else Nullable(Aw);
+    }
     if (@typeInfo(T) == .@"struct") {
         if (@hasDecl(T, "is_js_promise") and T.is_js_promise and @hasDecl(T, "Payload")) {
             return Awaited(T.Payload);
@@ -2125,6 +2134,42 @@ pub fn InferSliceElem(comptime S: type) type {
     };
 }
 
+fn structProtocolElemForInfer(comptime T: type, comptime depth: usize) ?type {
+    if (depth >= 16 or @typeInfo(T) != .@"struct") return null;
+    if (@hasDecl(T, "zigar_js") and @TypeOf(T.zigar_js) != type) {
+        const MetaT = @TypeOf(T.zigar_js);
+        if (@hasField(MetaT, "iterator_elem")) return T.zigar_js.iterator_elem;
+        if (@hasField(MetaT, "async_iterator_elem")) return T.zigar_js.async_iterator_elem;
+        if (@hasField(MetaT, "set_elem")) return T.zigar_js.set_elem;
+        if (@hasField(MetaT, "bases")) {
+            inline for (T.zigar_js.bases) |BaseT| {
+                if (structProtocolElemForInfer(BaseT, depth + 1)) |et| return et;
+            }
+        }
+    }
+    return null;
+}
+
+/// Deduces `T` from an iterator, async iterator, iterable handle, Set, Array, or slice argument.
+pub fn InferIteratorElem(comptime IterT: type) type {
+    return switch (@typeInfo(IterT)) {
+        .pointer => InferSliceElem(IterT),
+        .array => InferSliceElem(IterT),
+        .@"struct" => blk: {
+            if ((@hasDecl(IterT, "is_js_iterator") and IterT.is_js_iterator) or
+                (@hasDecl(IterT, "is_js_async_iterator") and IterT.is_js_async_iterator) or
+                (@hasDecl(IterT, "is_js_array") and IterT.is_js_array) or
+                (@hasDecl(IterT, "is_js_set") and IterT.is_js_set))
+            {
+                break :blk if (@hasDecl(IterT, "Elem")) IterT.Elem else IterT.Element;
+            }
+            if (structProtocolElemForInfer(IterT, 0)) |et| break :blk et;
+            @compileError("zigar.js: expected Iterator, AsyncIterator, Iterable, or slice argument for generic element inference, got " ++ @typeName(IterT));
+        },
+        else => @compileError("zigar.js: expected Iterator, AsyncIterator, Iterable, or slice argument for generic element inference, got " ++ @typeName(IterT)),
+    };
+}
+
 /// Deduces `T` from a nullable/non-nullable argument passed for `?T`.
 pub fn InferOptionalChildWithFallback(comptime FallbackValue: type, comptime Opt: type) type {
     if (Opt == @TypeOf(null) or Opt == @TypeOf(undefined)) return FallbackValue;
@@ -2346,6 +2391,32 @@ fn unitLiteralSatisfiesConstraint(comptime vd: anytype, comptime Constraint: typ
     return false;
 }
 
+fn structHasProtocolFlag(comptime T: type, comptime flag_field: []const u8, comptime depth: usize) bool {
+    if (depth >= 16 or @typeInfo(T) != .@"struct") return false;
+    if (!isGeneratedHandleStruct(T)) return false;
+    const MetaT = @TypeOf(T.zigar_js);
+    if (@hasField(MetaT, flag_field) and @field(T.zigar_js, flag_field)) return true;
+    if (@hasField(MetaT, "bases")) {
+        inline for (T.zigar_js.bases) |BaseT| {
+            if (structHasProtocolFlag(BaseT, flag_field, depth + 1)) return true;
+        }
+    }
+    return false;
+}
+
+fn structProtocolElemType(comptime T: type, comptime elem_field: []const u8, comptime depth: usize) ?type {
+    if (depth >= 16 or @typeInfo(T) != .@"struct") return null;
+    if (!isGeneratedHandleStruct(T)) return null;
+    const MetaT = @TypeOf(T.zigar_js);
+    if (@hasField(MetaT, elem_field)) return @field(T.zigar_js, elem_field);
+    if (@hasField(MetaT, "bases")) {
+        inline for (T.zigar_js.bases) |BaseT| {
+            if (structProtocolElemType(BaseT, elem_field, depth + 1)) |et| return et;
+        }
+    }
+    return null;
+}
+
 pub fn satisfiesTypeConstraint(comptime T: type, comptime Constraint: type, comptime depth: usize) bool {
     @setEvalBranchQuota(200_000);
     if (T == Constraint or T == noreturn) return true;
@@ -2455,6 +2526,10 @@ pub fn satisfiesTypeConstraint(comptime T: type, comptime Constraint: type, comp
                     else
                         false,
                     .array => |tar| satisfiesTypeConstraint(tar.child, cpt.child, depth + 1),
+                    .@"struct" => if (@hasDecl(T, "is_js_array") and T.is_js_array) blk_arr: {
+                        const TElem = if (@hasDecl(T, "Elem")) T.Elem else T.Element;
+                        break :blk_arr satisfiesTypeConstraint(TElem, cpt.child, depth + 1);
+                    } else false,
                     else => false,
                 };
             }
@@ -2534,6 +2609,60 @@ pub fn satisfiesTypeConstraint(comptime T: type, comptime Constraint: type, comp
                 }
                 break :blk false;
             }
+            if (comptime (@hasDecl(Constraint, "is_js_disposable") and Constraint.is_js_disposable)) {
+                if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_disposable") and T.is_js_disposable)) break :blk true;
+                if (comptime structHasProtocolFlag(T, "has_dispose", 0)) break :blk true;
+                break :blk false;
+            }
+            if (comptime (@hasDecl(Constraint, "is_js_async_disposable") and Constraint.is_js_async_disposable)) {
+                if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_async_disposable") and T.is_js_async_disposable)) break :blk true;
+                if (comptime structHasProtocolFlag(T, "has_async_dispose", 0)) break :blk true;
+                break :blk false;
+            }
+            if (comptime (@hasDecl(Constraint, "is_js_iterator") and Constraint.is_js_iterator)) {
+                const CElem = if (@hasDecl(Constraint, "Elem")) Constraint.Elem else Constraint.Element;
+                if (comptime (@typeInfo(T) == .@"struct" and ((@hasDecl(T, "is_js_iterator") and T.is_js_iterator) or
+                    (@hasDecl(T, "is_js_array") and T.is_js_array) or
+                    (@hasDecl(T, "is_js_set") and T.is_js_set))))
+                {
+                    const TElem = if (@hasDecl(T, "Elem")) T.Elem else T.Element;
+                    break :blk satisfiesTypeConstraint(TElem, CElem, depth + 1);
+                }
+                if (comptime (@typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .slice)) {
+                    const ChildT = @typeInfo(T).pointer.child;
+                    if (ChildT == u8) {
+                        break :blk satisfiesTypeConstraint([]const u8, CElem, depth + 1) or satisfiesTypeConstraint(u8, CElem, depth + 1);
+                    }
+                    break :blk satisfiesTypeConstraint(ChildT, CElem, depth + 1);
+                }
+                if (comptime (@typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .one and @typeInfo(@typeInfo(T).pointer.child) == .array)) {
+                    break :blk satisfiesTypeConstraint(@typeInfo(@typeInfo(T).pointer.child).array.child, CElem, depth + 1);
+                }
+                if (comptime (@typeInfo(T) == .array)) {
+                    break :blk satisfiesTypeConstraint(@typeInfo(T).array.child, CElem, depth + 1);
+                }
+                if (comptime structHasProtocolFlag(T, "has_iterator", 0)) {
+                    if (comptime structProtocolElemType(T, "iterator_elem", 0)) |te| {
+                        break :blk satisfiesTypeConstraint(te, CElem, depth + 1);
+                    }
+                    break :blk true;
+                }
+                break :blk false;
+            }
+            if (comptime (@hasDecl(Constraint, "is_js_async_iterator") and Constraint.is_js_async_iterator)) {
+                const CElem = if (@hasDecl(Constraint, "Elem")) Constraint.Elem else Constraint.Element;
+                if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_async_iterator") and T.is_js_async_iterator)) {
+                    const TElem = if (@hasDecl(T, "Elem")) T.Elem else T.Element;
+                    break :blk satisfiesTypeConstraint(TElem, CElem, depth + 1);
+                }
+                if (comptime structHasProtocolFlag(T, "has_async_iterator", 0)) {
+                    if (comptime structProtocolElemType(T, "async_iterator_elem", 0)) |te| {
+                        break :blk satisfiesTypeConstraint(te, CElem, depth + 1);
+                    }
+                    break :blk true;
+                }
+                break :blk false;
+            }
             // `Promise<U>` constraint: accept `Promise<X>` where `X` satisfies `U`, or structural `then` handle.
             if (comptime (@hasDecl(Constraint, "is_js_promise") and Constraint.is_js_promise)) {
                 if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_promise") and T.is_js_promise)) {
@@ -2584,6 +2713,18 @@ pub fn satisfiesTypeConstraint(comptime T: type, comptime Constraint: type, comp
                     inline for (Constraint.zigar_js.required_props) |rp| {
                         if (!structProvidesMember(T, rp)) break :blk false;
                     }
+                }
+                if (comptime structHasProtocolFlag(Constraint, "has_dispose", 0)) {
+                    if (!((@hasDecl(T, "is_js_disposable") and T.is_js_disposable) or structHasProtocolFlag(T, "has_dispose", 0))) break :blk false;
+                }
+                if (comptime structHasProtocolFlag(Constraint, "has_async_dispose", 0)) {
+                    if (!((@hasDecl(T, "is_js_async_disposable") and T.is_js_async_disposable) or structHasProtocolFlag(T, "has_async_dispose", 0))) break :blk false;
+                }
+                if (comptime structHasProtocolFlag(Constraint, "has_iterator", 0)) {
+                    if (!((@hasDecl(T, "is_js_iterator") and T.is_js_iterator) or structHasProtocolFlag(T, "has_iterator", 0))) break :blk false;
+                }
+                if (comptime structHasProtocolFlag(Constraint, "has_async_iterator", 0)) {
+                    if (!((@hasDecl(T, "is_js_async_iterator") and T.is_js_async_iterator) or structHasProtocolFlag(T, "has_async_iterator", 0))) break :blk false;
                 }
                 break :blk true;
             }
@@ -2926,6 +3067,7 @@ pub fn Js(comptime host: type) type {
         }
         pub const isConstArrayPtr = module.isConstArrayPtr;
         pub const InferSliceElem = module.InferSliceElem;
+        pub const InferIteratorElem = module.InferIteratorElem;
         pub fn InferOptionalChild(comptime Opt: type) type {
             return module.InferOptionalChildWithFallback(Ref(module.Any), Opt);
         }
@@ -3533,6 +3675,203 @@ pub fn Js(comptime host: type) type {
             return r.tryAsyncDispose();
         }
 
+        pub fn openIterator(comptime ElemT: type, target: anytype) module.CallError!Iterator(ElemT) {
+            return try Iterator(ElemT).from(target);
+        }
+
+        pub fn openAsyncIterator(comptime ElemT: type, target: anytype) module.CallError!AsyncIterator(ElemT) {
+            return try AsyncIterator(ElemT).from(target);
+        }
+
+        fn PromisePayloadOf(comptime P: type) type {
+            if (@typeInfo(P) == .@"struct" and @hasDecl(P, "is_js_promise") and P.is_js_promise and @hasDecl(P, "Payload")) {
+                return P.Payload;
+            }
+            @compileError("Expected a js.Promise(T) type in promiseAll, received " ++ @typeName(P));
+        }
+
+        pub fn PromiseAllResult(comptime PromisesT: type) type {
+            return switch (@typeInfo(PromisesT)) {
+                .@"struct" => |st| blk: {
+                    comptime var payloads: [st.field_types.len]type = undefined;
+                    for (st.field_types, 0..) |FT, i| {
+                        payloads[i] = PromisePayloadOf(FT);
+                    }
+                    break :blk @Tuple(&payloads);
+                },
+                .array => |ar| [ar.len]PromisePayloadOf(ar.child),
+                .pointer => |pt| switch (pt.size) {
+                    .slice => []PromisePayloadOf(pt.child),
+                    .one => if (@typeInfo(pt.child) == .array)
+                        [@typeInfo(pt.child).array.len]PromisePayloadOf(@typeInfo(pt.child).array.child)
+                    else
+                        @compileError("Unsupported pointer input to promiseAll: " ++ @typeName(PromisesT)),
+                    else => @compileError("Unsupported pointer input to promiseAll: " ++ @typeName(PromisesT)),
+                },
+                else => @compileError("Expected tuple, array, or slice of js.Promise(T) in promiseAll, received " ++ @typeName(PromisesT)),
+            };
+        }
+
+        fn promiseAllNeedsAllocator(comptime PromisesT: type) bool {
+            return switch (@typeInfo(PromisesT)) {
+                .@"struct" => |st| blk: {
+                    for (st.field_types) |FT| {
+                        if (needsDecodeAllocator(PromisePayloadOf(FT))) break :blk true;
+                    }
+                    break :blk false;
+                },
+                .array => |ar| needsDecodeAllocator(PromisePayloadOf(ar.child)),
+                .pointer => |pt| switch (pt.size) {
+                    .slice => true,
+                    .one => if (@typeInfo(pt.child) == .array)
+                        needsDecodeAllocator(PromisePayloadOf(@typeInfo(pt.child).array.child))
+                    else
+                        true,
+                    else => true,
+                },
+                else => true,
+            };
+        }
+
+        pub fn promiseAllAlloc(
+            allocator: std.mem.Allocator,
+            promises: anytype,
+        ) module.CallError!PromiseAllResult(@TypeOf(promises)) {
+            const PromisesT = @TypeOf(promises);
+            const OutT = PromiseAllResult(PromisesT);
+            switch (@typeInfo(PromisesT)) {
+                .@"struct" => |st| {
+                    const count = st.field_types.len;
+                    if (comptime count == 0) {
+                        var empty_out: OutT = undefined;
+                        _ = &empty_out;
+                        return empty_out;
+                    }
+                    const js_arr = try Array(Ref(module.Any)).withCapacity(count);
+                    defer js_arr.deinit();
+                    inline for (0..count) |i| {
+                        try js_arr.set(i, promises[i].toRef().cast(module.Any));
+                    }
+                    const promise_ctor = try getGlobal(module.CallError!Ref(module.Any), "Promise");
+                    defer promise_ctor.deinit();
+                    const combined = try callMethod(
+                        fn (Array(Ref(module.Any))) module.CallError!Promise(Ref(module.Any)),
+                        promise_ctor,
+                        "all",
+                        .{js_arr},
+                    );
+                    defer combined.deinit();
+                    const res_ref = try combined.@"await"();
+                    defer res_ref.deinit();
+                    const res_arr = Array(Ref(module.Any)).fromRef(res_ref);
+                    var out: OutT = undefined;
+                    var decoded_mask: [count]bool = @splat(false);
+                    errdefer {
+                        inline for (0..count) |i| {
+                            if (decoded_mask[i]) {
+                                const ElemPayload = PromisePayloadOf(st.field_types[i]);
+                                freeDecoded(ElemPayload, allocator, out[i]);
+                            }
+                        }
+                    }
+                    inline for (0..count) |i| {
+                        const ElemPayload = PromisePayloadOf(st.field_types[i]);
+                        const elem_ref = try res_arr.get(i);
+                        defer elem_ref.deinit();
+                        out[i] = try fromJsRefAlloc(ElemPayload, allocator, elem_ref);
+                        decoded_mask[i] = true;
+                    }
+                    return out;
+                },
+                .array => |ar| {
+                    const ElemPayload = PromisePayloadOf(ar.child);
+                    if (comptime ar.len == 0) return .{};
+                    const js_arr = try Array(Ref(module.Any)).withCapacity(ar.len);
+                    defer js_arr.deinit();
+                    for (promises, 0..) |p, i| {
+                        try js_arr.set(i, p.toRef().cast(module.Any));
+                    }
+                    const promise_ctor = try getGlobal(module.CallError!Ref(module.Any), "Promise");
+                    defer promise_ctor.deinit();
+                    const combined = try callMethod(
+                        fn (Array(Ref(module.Any))) module.CallError!Promise(Ref(module.Any)),
+                        promise_ctor,
+                        "all",
+                        .{js_arr},
+                    );
+                    defer combined.deinit();
+                    const res_ref = try combined.@"await"();
+                    defer res_ref.deinit();
+                    const res_arr = Array(Ref(module.Any)).fromRef(res_ref);
+                    var out: OutT = undefined;
+                    var initialized: usize = 0;
+                    errdefer {
+                        for (out[0..initialized]) |elem| {
+                            freeDecoded(ElemPayload, allocator, elem);
+                        }
+                    }
+                    while (initialized < ar.len) : (initialized += 1) {
+                        const elem_ref = try res_arr.get(initialized);
+                        defer elem_ref.deinit();
+                        out[initialized] = try fromJsRefAlloc(ElemPayload, allocator, elem_ref);
+                    }
+                    return out;
+                },
+                .pointer => |pt| switch (pt.size) {
+                    .one => return promiseAllAlloc(allocator, promises.*),
+                    .slice => {
+                        const ElemPayload = PromisePayloadOf(pt.child);
+                        if (promises.len == 0) return try allocator.alloc(ElemPayload, 0);
+                        const js_arr = try Array(Ref(module.Any)).withCapacity(promises.len);
+                        defer js_arr.deinit();
+                        for (promises, 0..) |p, i| {
+                            try js_arr.set(i, p.toRef().cast(module.Any));
+                        }
+                        const promise_ctor = try getGlobal(module.CallError!Ref(module.Any), "Promise");
+                        defer promise_ctor.deinit();
+                        const combined = try callMethod(
+                            fn (Array(Ref(module.Any))) module.CallError!Promise(Ref(module.Any)),
+                            promise_ctor,
+                            "all",
+                            .{js_arr},
+                        );
+                        defer combined.deinit();
+                        const res_ref = try combined.@"await"();
+                        defer res_ref.deinit();
+                        const res_arr = Array(Ref(module.Any)).fromRef(res_ref);
+                        const out = try allocator.alloc(ElemPayload, promises.len);
+                        var initialized: usize = 0;
+                        errdefer {
+                            for (out[0..initialized]) |elem| {
+                                freeDecoded(ElemPayload, allocator, elem);
+                            }
+                            allocator.free(out);
+                        }
+                        while (initialized < promises.len) : (initialized += 1) {
+                            const elem_ref = try res_arr.get(initialized);
+                            defer elem_ref.deinit();
+                            out[initialized] = try fromJsRefAlloc(ElemPayload, allocator, elem_ref);
+                        }
+                        return out;
+                    },
+                    else => unreachable,
+                },
+                else => unreachable,
+            }
+        }
+
+        pub fn promiseAll(promises: anytype) module.CallError!PromiseAllResult(@TypeOf(promises)) {
+            if (comptime promiseAllNeedsAllocator(@TypeOf(promises))) {
+                if (@hasDecl(host, "default_allocator")) {
+                    return promiseAllAlloc(host.default_allocator, promises);
+                }
+                return error.HostUnavailable;
+            }
+            var stack_buf: [512]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
+            return promiseAllAlloc(fba.allocator(), promises);
+        }
+
         pub inline fn global() Ref(module.Object) {
             return Ref(module.Object).globalThis;
         }
@@ -4138,9 +4477,52 @@ pub fn Js(comptime host: type) type {
             return CallbackWithOptions(JsFnSig, .{ .async_call = true });
         }
 
+        fn isValidatedProtocolJsValue(comptime T: type) bool {
+            if (@typeInfo(T) != .@"struct") return false;
+            return (@hasDecl(T, "is_js_iterator") and T.is_js_iterator) or
+                (@hasDecl(T, "is_js_async_iterator") and T.is_js_async_iterator) or
+                (@hasDecl(T, "is_js_disposable") and T.is_js_disposable) or
+                (@hasDecl(T, "is_js_async_disposable") and T.is_js_async_disposable) or
+                (@hasDecl(T, "is_js_promise") and T.is_js_promise);
+        }
+
+        fn typeNeedsRefDecode(comptime T: type, comptime depth: usize) bool {
+            if (depth >= 16 or T == void) return false;
+            if (comptime util.getInternalType(T) == .js_value) return isValidatedProtocolJsValue(T);
+            if (comptime isNullableType(T)) return true;
+            return switch (@typeInfo(T)) {
+                .optional => |op| typeNeedsRefDecode(op.child, depth + 1),
+                .@"struct" => |st| blk: {
+                    if (isTupleStructType(T) or module.hasStructZigarJsMeta(T)) break :blk true;
+                    for (st.field_types) |ft| {
+                        if (typeNeedsRefDecode(ft, depth + 1)) break :blk true;
+                    }
+                    break :blk false;
+                },
+                .@"union" => |un| blk: {
+                    if (@hasDecl(T, "zigar_js")) break :blk true;
+                    if (un.field_names.len >= 2 and std.mem.eql(u8, un.field_names[0], "v0") and std.mem.eql(u8, un.field_names[1], "v1")) {
+                        break :blk true;
+                    }
+                    for (un.field_types) |ft| {
+                        if (typeNeedsRefDecode(ft, depth + 1)) break :blk true;
+                    }
+                    break :blk false;
+                },
+                .@"enum" => @hasDecl(T, "zigar_js"),
+                .pointer => |pt| switch (pt.size) {
+                    .slice, .one => if (pt.child == u8) false else typeNeedsRefDecode(pt.child, depth + 1),
+                    else => false,
+                },
+                .array => |ar| typeNeedsRefDecode(ar.child, depth + 1),
+                .error_union => |eu| typeNeedsRefDecode(eu.payload, depth + 1),
+                else => false,
+            };
+        }
+
         fn typeUsesTsZigarCallbackCodec(comptime T: type, comptime depth: usize) bool {
             if (depth >= 16 or T == void) return false;
-            if (comptime util.getInternalType(T) == .js_value) return false;
+            if (comptime util.getInternalType(T) == .js_value) return isValidatedProtocolJsValue(T);
             if (comptime isNullableType(T)) return true;
             return switch (@typeInfo(T)) {
                 .optional => true,
@@ -5686,13 +6068,26 @@ pub fn Js(comptime host: type) type {
                     return self.ref().tryEql(other);
                 }
 
-                pub fn @"await"(self: Self) module.Error!T {
+                pub const AwaitError = if (typeNeedsRefDecode(T, 0)) module.CallError else module.Error;
+                pub const AwaitAllocError = if (typeNeedsRefDecode(T, 0)) module.CallError else module.AllocError;
+
+                pub fn @"await"(self: Self) AwaitError!T {
+                    if (comptime typeNeedsRefDecode(T, 0)) {
+                        const raw = try dispatchAwaitOp(.promise, Ref(module.Any), false, self.handle, {}, null);
+                        defer raw.deinit();
+                        return try fromJsRef(T, raw);
+                    }
                     return dispatchAwaitOp(.promise, T, false, self.handle, {}, null);
                 }
 
                 pub const wait = @"await";
 
-                pub fn awaitAlloc(self: Self, allocator: std.mem.Allocator) module.AllocError!T {
+                pub fn awaitAlloc(self: Self, allocator: std.mem.Allocator) AwaitAllocError!T {
+                    if (comptime typeNeedsRefDecode(T, 0)) {
+                        const raw = try dispatchAwaitOp(.promise, Ref(module.Any), false, self.handle, {}, null);
+                        defer raw.deinit();
+                        return try fromJsRefAlloc(T, allocator, raw);
+                    }
                     return dispatchAwaitOp(.promise, T, true, self.handle, allocator, null);
                 }
 
@@ -6384,10 +6779,158 @@ pub fn Js(comptime host: type) type {
             }
         };
 
+        pub const Disposable = extern struct {
+            const Self = @This();
+            pub const is_js_disposable = true;
+            pub const internal_type: util.InternalType = .js_value;
+
+            handle: u32,
+
+            pub const @"undefined": Self = .{ .handle = module.reserved_undefined_handle };
+            pub const @"null": Self = .{ .handle = module.reserved_null_handle };
+
+            pub inline fn ref(self: Self) Ref(module.Object) {
+                return .{ .handle = self.handle };
+            }
+
+            pub inline fn toRef(self: Self) Ref(module.Object) {
+                return .{ .handle = self.handle };
+            }
+
+            pub inline fn fromRef(value: anytype) Self {
+                return .{ .handle = extractHandle(value) };
+            }
+
+            pub inline fn isUndefined(self: Self) bool {
+                return self.handle == module.reserved_undefined_handle;
+            }
+
+            pub inline fn isNull(self: Self) bool {
+                return self.handle == module.reserved_null_handle;
+            }
+
+            pub inline fn isNullOrUndefined(self: Self) bool {
+                return self.handle <= module.reserved_null_handle;
+            }
+
+            pub inline fn isReserved(self: Self) bool {
+                return self.handle < module.first_dynamic_slot;
+            }
+
+            pub fn clone(self: Self) Self {
+                return .{ .handle = self.ref().clone().handle };
+            }
+
+            pub fn tryClone(self: Self) module.Error!Self {
+                return .{ .handle = (try self.ref().tryClone()).handle };
+            }
+
+            pub fn dispose(self: Self) void {
+                self.ref().dispose();
+            }
+
+            pub fn tryDispose(self: Self) module.Error!void {
+                return self.ref().tryDispose();
+            }
+
+            pub fn deinit(self: Self) void {
+                self.ref().dispose();
+            }
+
+            pub fn tryDeinit(self: Self) module.Error!void {
+                return self.ref().tryDispose();
+            }
+
+            pub fn releaseHandleOnly(self: Self) void {
+                self.ref().deinit();
+            }
+
+            pub fn eql(self: Self, other: anytype) bool {
+                return self.ref().eql(other);
+            }
+
+            pub fn tryEql(self: Self, other: anytype) module.Error!bool {
+                return self.ref().tryEql(other);
+            }
+        };
+
+        pub const AsyncDisposable = extern struct {
+            const Self = @This();
+            pub const is_js_async_disposable = true;
+            pub const internal_type: util.InternalType = .js_value;
+
+            handle: u32,
+
+            pub const @"undefined": Self = .{ .handle = module.reserved_undefined_handle };
+            pub const @"null": Self = .{ .handle = module.reserved_null_handle };
+
+            pub inline fn ref(self: Self) Ref(module.Object) {
+                return .{ .handle = self.handle };
+            }
+
+            pub inline fn toRef(self: Self) Ref(module.Object) {
+                return .{ .handle = self.handle };
+            }
+
+            pub inline fn fromRef(value: anytype) Self {
+                return .{ .handle = extractHandle(value) };
+            }
+
+            pub inline fn isUndefined(self: Self) bool {
+                return self.handle == module.reserved_undefined_handle;
+            }
+
+            pub inline fn isNull(self: Self) bool {
+                return self.handle == module.reserved_null_handle;
+            }
+
+            pub inline fn isNullOrUndefined(self: Self) bool {
+                return self.handle <= module.reserved_null_handle;
+            }
+
+            pub inline fn isReserved(self: Self) bool {
+                return self.handle < module.first_dynamic_slot;
+            }
+
+            pub fn clone(self: Self) Self {
+                return .{ .handle = self.ref().clone().handle };
+            }
+
+            pub fn tryClone(self: Self) module.Error!Self {
+                return .{ .handle = (try self.ref().tryClone()).handle };
+            }
+
+            pub fn asyncDispose(self: Self) void {
+                self.ref().asyncDispose();
+            }
+
+            pub fn tryAsyncDispose(self: Self) module.Error!void {
+                return self.ref().tryAsyncDispose();
+            }
+
+            pub fn deinit(self: Self) void {
+                self.ref().deinit();
+            }
+
+            pub fn tryDeinit(self: Self) module.Error!void {
+                return self.ref().tryDeinit();
+            }
+
+            pub fn eql(self: Self, other: anytype) bool {
+                return self.ref().eql(other);
+            }
+
+            pub fn tryEql(self: Self, other: anytype) module.Error!bool {
+                return self.ref().tryEql(other);
+            }
+        };
+
         pub fn Iterator(comptime T: type) type {
             return extern struct {
                 const Self = @This();
                 pub const Element = T;
+                pub const Elem = T;
+                pub const is_js_iterator = true;
                 pub const internal_type: util.InternalType = .js_value;
 
                 handle: u32,
@@ -6452,8 +6995,25 @@ pub fn Js(comptime host: type) type {
                     return dispatchHostOpRawFlags(.get_iterator, 0, "", HostFn, .{.{ .handle = extractHandle(iterable) }});
                 }
 
-                pub fn next(self: Self) module.Error!?T {
+                pub const NextError = if (typeNeedsRefDecode(T, 0)) module.CallError else module.Error;
+                pub const NextAllocError = if (typeNeedsRefDecode(T, 0)) module.CallError else module.AllocError;
+
+                pub fn next(self: Self) NextError!?T {
                     var done_flag: u8 = 0;
+                    if (comptime typeNeedsRefDecode(T, 0)) {
+                        const maybe_raw = try dispatchHostOpOptionalFlag(
+                            .iterator_next,
+                            0,
+                            Ref(module.Any),
+                            module.Error,
+                            &.{ Ref(module.Any), usize },
+                            .{ .{ .handle = self.handle }, @intFromPtr(&done_flag) },
+                            &done_flag,
+                        );
+                        const raw = maybe_raw orelse return null;
+                        defer raw.deinit();
+                        return try fromJsRef(T, raw);
+                    }
                     return dispatchHostOpOptionalFlag(
                         .iterator_next,
                         0,
@@ -6465,8 +7025,22 @@ pub fn Js(comptime host: type) type {
                     );
                 }
 
-                pub fn nextAlloc(self: Self, allocator: std.mem.Allocator) module.AllocError!?T {
+                pub fn nextAlloc(self: Self, allocator: std.mem.Allocator) NextAllocError!?T {
                     var done_flag: u8 = 0;
+                    if (comptime typeNeedsRefDecode(T, 0)) {
+                        const maybe_raw = try dispatchHostOpOptionalFlag(
+                            .iterator_next,
+                            0,
+                            Ref(module.Any),
+                            module.Error,
+                            &.{ Ref(module.Any), usize },
+                            .{ .{ .handle = self.handle }, @intFromPtr(&done_flag) },
+                            &done_flag,
+                        );
+                        const raw = maybe_raw orelse return null;
+                        defer raw.deinit();
+                        return try fromJsRefAlloc(T, allocator, raw);
+                    }
                     return dispatchHostOpOptionalFlag(
                         .iterator_next,
                         0,
@@ -6491,6 +7065,8 @@ pub fn Js(comptime host: type) type {
             return extern struct {
                 const Self = @This();
                 pub const Element = T;
+                pub const Elem = T;
+                pub const is_js_async_iterator = true;
                 pub const internal_type: util.InternalType = .js_value;
 
                 handle: u32,
@@ -6555,13 +7131,28 @@ pub fn Js(comptime host: type) type {
                     return dispatchHostOpRawFlags(.get_iterator, 1, "", HostFn, .{.{ .handle = extractHandle(async_iterable) }});
                 }
 
-                pub fn next(self: Self) module.Error!?T {
+                pub const NextError = if (typeNeedsRefDecode(T, 0)) module.CallError else module.Error;
+                pub const NextAllocError = if (typeNeedsRefDecode(T, 0)) module.CallError else module.AllocError;
+
+                pub fn next(self: Self) NextError!?T {
                     var done_flag: u8 = 0;
+                    if (comptime typeNeedsRefDecode(T, 0)) {
+                        const maybe_raw = try dispatchAwaitOp(.async_iterator_next, Ref(module.Any), false, self.handle, {}, &done_flag);
+                        const raw = maybe_raw orelse return null;
+                        defer raw.deinit();
+                        return try fromJsRef(T, raw);
+                    }
                     return dispatchAwaitOp(.async_iterator_next, T, false, self.handle, {}, &done_flag);
                 }
 
-                pub fn nextAlloc(self: Self, allocator: std.mem.Allocator) module.AllocError!?T {
+                pub fn nextAlloc(self: Self, allocator: std.mem.Allocator) NextAllocError!?T {
                     var done_flag: u8 = 0;
+                    if (comptime typeNeedsRefDecode(T, 0)) {
+                        const maybe_raw = try dispatchAwaitOp(.async_iterator_next, Ref(module.Any), false, self.handle, {}, &done_flag);
+                        const raw = maybe_raw orelse return null;
+                        defer raw.deinit();
+                        return try fromJsRefAlloc(T, allocator, raw);
+                    }
                     return dispatchAwaitOp(.async_iterator_next, T, true, self.handle, allocator, &done_flag);
                 }
 
@@ -8224,6 +8815,10 @@ pub fn Js(comptime host: type) type {
                 if (FieldT == String) return 60;
                 if (@hasDecl(FieldT, "is_js_promise") and FieldT.is_js_promise) return 65;
                 if (@hasDecl(FieldT, "js_builtin_ctor")) return 65;
+                if (@hasDecl(FieldT, "is_js_async_iterator") and FieldT.is_js_async_iterator) return 73;
+                if (@hasDecl(FieldT, "is_js_async_disposable") and FieldT.is_js_async_disposable) return 73;
+                if (@hasDecl(FieldT, "is_js_iterator") and FieldT.is_js_iterator) return 74;
+                if (@hasDecl(FieldT, "is_js_disposable") and FieldT.is_js_disposable) return 74;
                 if (@hasDecl(FieldT, "is_js_record") and FieldT.is_js_record) return 90;
                 if (@hasDecl(FieldT, "Target")) {
                     if (FieldT.Target == module.Symbol) return 45;
@@ -8252,8 +8847,17 @@ pub fn Js(comptime host: type) type {
                         if (@hasField(@TypeOf(meta), "is_class") and meta.is_class) break :blk 70;
                         if (@hasField(@TypeOf(meta), "is_handle") and meta.is_handle) {
                             if (@hasField(@TypeOf(meta), "is_callable_handle") and meta.is_callable_handle) break :blk 71;
-                            if (@hasField(@TypeOf(meta), "required_methods") and meta.required_methods.len > 0) break :blk 72;
-                            if (@hasField(@TypeOf(meta), "required_props") and meta.required_props.len > 0) break :blk 79;
+                            const has_proto = (module.structHasProtocolFlag(FieldT, "has_iterator", 0) or
+                                module.structHasProtocolFlag(FieldT, "has_async_iterator", 0) or
+                                module.structHasProtocolFlag(FieldT, "has_dispose", 0) or
+                                module.structHasProtocolFlag(FieldT, "has_async_dispose", 0));
+                            const has_methods = (@hasField(@TypeOf(meta), "required_methods") and meta.required_methods.len > 0);
+                            const has_props = (@hasField(@TypeOf(meta), "required_props") and meta.required_props.len > 0);
+                            const has_bases = (@hasField(@TypeOf(meta), "bases") and meta.bases.len > 0);
+                            if (has_methods) break :blk 72;
+                            if (has_proto and (has_props or has_bases)) break :blk 72;
+                            if (has_proto) break :blk 74;
+                            if (has_props) break :blk 79;
                             break :blk 86;
                         }
                     }
@@ -8765,6 +9369,66 @@ pub fn Js(comptime host: type) type {
             return toJsRefWithSpec(T, value, module.NullishKind.none);
         }
 
+        fn hasCallableStringProp(raw: Ref(module.Any), comptime prop_name: []const u8) module.CallError!bool {
+            if (raw.isNullOrUndefined()) return false;
+            const jt = try raw.tryTypeof();
+            if (jt != .object and jt != .function) return false;
+            if (!(try raw.tryHas(prop_name))) return false;
+            const fn_ref = try getProp(module.CallError!Ref(module.Any), raw, prop_name);
+            defer fn_ref.deinit();
+            return !fn_ref.isNullOrUndefined() and (try fn_ref.tryTypeof()) == .function;
+        }
+
+        pub fn hasProtocolSymbolMethod(
+            raw: Ref(module.Any),
+            comptime symbol_prop: []const u8,
+            comptime fallback_for_key: ?[]const u8,
+        ) module.CallError!bool {
+            if (raw.isNullOrUndefined()) return false;
+            const jt = try raw.tryTypeof();
+            if (jt != .object and jt != .function) return false;
+            const sym_ctor = getGlobal(module.CallError!Ref(module.Any), "Symbol") catch |err| switch (err) {
+                error.OffJsThread, error.OutOfMemory, error.HostUnavailable => return err,
+                else => {
+                    clearLastError();
+                    return false;
+                },
+            };
+            defer sym_ctor.deinit();
+            if (sym_ctor.isNullOrUndefined()) return false;
+
+            if (getProp(module.CallError!Ref(module.Any), sym_ctor, symbol_prop)) |sym| {
+                defer sym.deinit();
+                if (!sym.isNullOrUndefined() and (try sym.tryTypeof()) == .symbol) {
+                    const fn_ref = try getPropDynamic(module.CallError!Ref(module.Any), raw, sym);
+                    defer fn_ref.deinit();
+                    if (!fn_ref.isNullOrUndefined() and (try fn_ref.tryTypeof()) == .function) {
+                        return true;
+                    }
+                }
+            } else |err| switch (err) {
+                error.OffJsThread, error.OutOfMemory, error.HostUnavailable => return err,
+                else => clearLastError(),
+            }
+
+            if (comptime fallback_for_key) |fb_key| {
+                if (callMethod(fn ([]const u8) module.CallError!Ref(module.Symbol), sym_ctor, "for", .{fb_key})) |fb_sym| {
+                    defer fb_sym.deinit();
+                    if (!fb_sym.isNullOrUndefined()) {
+                        const fn_ref = try getPropDynamic(module.CallError!Ref(module.Any), raw, fb_sym);
+                        defer fn_ref.deinit();
+                        if (!fn_ref.isNullOrUndefined() and (try fn_ref.tryTypeof()) == .function) {
+                            return true;
+                        }
+                    }
+                } else |err| switch (err) {
+                    error.OffJsThread, error.OutOfMemory, error.HostUnavailable => return err,
+                    else => clearLastError(),
+                }
+            }
+            return false;
+        }
+
         pub fn fromJsRefAlloc(
             comptime T: type,
             allocator: std.mem.Allocator,
@@ -8815,6 +9479,54 @@ pub fn Js(comptime host: type) type {
                         return error.TypeError;
                     }
                     return .{ .handle = (try raw.tryClone()).handle };
+                }
+                if (@hasDecl(T, "is_js_disposable") and T.is_js_disposable) {
+                    if (!(try hasProtocolSymbolMethod(raw, "dispose", "nodejs.dispose"))) {
+                        return error.TypeError;
+                    }
+                    return .{ .handle = (try raw.tryClone()).handle };
+                }
+                if (@hasDecl(T, "is_js_async_disposable") and T.is_js_async_disposable) {
+                    if (!(try hasProtocolSymbolMethod(raw, "asyncDispose", "nodejs.asyncDispose")) and
+                        !(try hasProtocolSymbolMethod(raw, "dispose", "nodejs.dispose")))
+                    {
+                        return error.TypeError;
+                    }
+                    return .{ .handle = (try raw.tryClone()).handle };
+                }
+                if (@hasDecl(T, "is_js_iterator") and T.is_js_iterator) {
+                    if (raw.isNullOrUndefined()) return error.TypeError;
+                    const jt = try raw.tryTypeof();
+                    if (jt != .object and jt != .function) return error.TypeError;
+                    if (try hasProtocolSymbolMethod(raw, "iterator", null)) {
+                        const ElemT = if (@hasDecl(T, "Elem")) T.Elem else T.Element;
+                        const iter = try Iterator(ElemT).from(raw);
+                        return .{ .handle = iter.handle };
+                    }
+                    if (try hasProtocolSymbolMethod(raw, "asyncIterator", null)) {
+                        return error.TypeError;
+                    }
+                    if (try hasCallableStringProp(raw, "next")) {
+                        return .{ .handle = (try raw.tryClone()).handle };
+                    }
+                    return error.TypeError;
+                }
+                if (@hasDecl(T, "is_js_async_iterator") and T.is_js_async_iterator) {
+                    if (raw.isNullOrUndefined()) return error.TypeError;
+                    const jt = try raw.tryTypeof();
+                    if (jt != .object and jt != .function) return error.TypeError;
+                    if (try hasProtocolSymbolMethod(raw, "asyncIterator", null)) {
+                        const ElemT = if (@hasDecl(T, "Elem")) T.Elem else T.Element;
+                        const iter = try AsyncIterator(ElemT).from(raw);
+                        return .{ .handle = iter.handle };
+                    }
+                    if (try hasProtocolSymbolMethod(raw, "iterator", null)) {
+                        return error.TypeError;
+                    }
+                    if (try hasCallableStringProp(raw, "next")) {
+                        return .{ .handle = (try raw.tryClone()).handle };
+                    }
+                    return error.TypeError;
                 }
                 if (@hasDecl(T, "js_builtin_ctor")) {
                     if (raw.isNullOrUndefined()) return error.TypeError;
@@ -9354,14 +10066,34 @@ pub fn Js(comptime host: type) type {
 
                 const req_methods = comptime if (@hasField(@TypeOf(T.zigar_js), "required_methods")) T.zigar_js.required_methods else &[_][]const u8{};
                 const req_props = comptime if (@hasField(@TypeOf(T.zigar_js), "required_props")) T.zigar_js.required_props else &[_][]const u8{};
+                const has_iter = comptime (@hasField(@TypeOf(T.zigar_js), "has_iterator") and T.zigar_js.has_iterator);
+                const has_async_iter = comptime (@hasField(@TypeOf(T.zigar_js), "has_async_iterator") and T.zigar_js.has_async_iterator);
+                const has_disp = comptime (@hasField(@TypeOf(T.zigar_js), "has_dispose") and T.zigar_js.has_dispose);
+                const has_async_disp = comptime (@hasField(@TypeOf(T.zigar_js), "has_async_dispose") and T.zigar_js.has_async_dispose);
                 const has_length_prop = comptime blk: {
                     for (req_props) |rp| {
                         if (std.mem.eql(u8, rp, "length")) break :blk true;
                     }
                     break :blk false;
                 };
-                if (comptime (!is_callable_h and !has_bases and req_methods.len == 0 and !has_length_prop)) {
+                if (comptime (!is_callable_h and !has_bases and req_methods.len == 0 and !has_length_prop and !has_iter)) {
                     if (jt == .object and (Array(Ref(module.Any)).isArray(raw) catch false)) {
+                        return false;
+                    }
+                }
+                if (comptime has_iter) {
+                    if (!(try hasProtocolSymbolMethod(raw, "iterator", null))) return false;
+                }
+                if (comptime has_async_iter) {
+                    if (!(try hasProtocolSymbolMethod(raw, "asyncIterator", null))) return false;
+                }
+                if (comptime has_disp) {
+                    if (!(try hasProtocolSymbolMethod(raw, "dispose", "nodejs.dispose"))) return false;
+                }
+                if (comptime has_async_disp) {
+                    if (!(try hasProtocolSymbolMethod(raw, "asyncDispose", "nodejs.asyncDispose")) and
+                        !(try hasProtocolSymbolMethod(raw, "dispose", "nodejs.dispose")))
+                    {
                         return false;
                     }
                 }
@@ -11304,6 +12036,8 @@ test "Standard wrappers: ABI layout, Promise, binary views, collections, BigInt,
         js.RegExp,
         js.Iterator(i32),
         js.AsyncIterator(i32),
+        js.Disposable,
+        js.AsyncDisposable,
     }) |WrapperT| {
         try expectEqual(@as(usize, 4), @sizeOf(WrapperT));
         try expectEqual(@as(usize, 4), @alignOf(WrapperT));
@@ -12945,6 +13679,43 @@ test "Js.String, Nullable(T), needsDecodeAllocator, and tuple/slice marshaling h
         try expect(js.MappedValues(js.BigInt, bool) == js.BigInt);
         try expect(js.IndexAccess(js.Array(f64), 0) == f64);
         comptime js.checkTypeConstraint(js.BigInt, i64);
+
+        // 10. M3.3c: Protocol wrappers (`Disposable`, `AsyncDisposable`, `Iterator`, `AsyncIterator`),
+        //     `Awaited(?Promise(T))` / `Awaited(Nullable(Promise(T)))`, `PromiseAllResult`, and protocol constraints
+        try expect(js.Awaited(?js.Promise(f64)) == ?f64);
+        try expect(js.Awaited(js.Nullable(js.Promise([]const u8))) == js.Nullable([]const u8));
+        try expect(js.Awaited(js.Promise(js.Promise(i32))) == i32);
+        try expect(js.PromiseAllResult(struct { js.Promise(f64), js.Promise([]const u8) }) == struct { f64, []const u8 });
+        try expect(js.PromiseAllResult([3]js.Promise(i32)) == [3]i32);
+        try expect(js.PromiseAllResult([]const js.Promise(bool)) == []bool);
+
+        const CustomDisp = struct {
+            ref: js.Ref(js.Object),
+            pub const zigar_js = .{ .is_handle = true, .has_dispose = true };
+        };
+        const CustomAsyncDisp = struct {
+            ref: js.Ref(js.Object),
+            pub const zigar_js = .{ .is_handle = true, .has_async_dispose = true };
+        };
+        const CustomIter = struct {
+            ref: js.Ref(js.Object),
+            pub const zigar_js = .{ .is_handle = true, .has_iterator = true, .iterator_elem = f64 };
+        };
+        const PlainHandleOnly = struct {
+            ref: js.Ref(js.Object),
+            pub const zigar_js = .{ .is_handle = true };
+        };
+        try expect(js.satisfiesTypeConstraint(js.Disposable, js.Disposable, 0));
+        try expect(js.satisfiesTypeConstraint(CustomDisp, js.Disposable, 0));
+        try expect(!js.satisfiesTypeConstraint(PlainHandleOnly, js.Disposable, 0));
+        try expect(!js.satisfiesTypeConstraint(CustomDisp, js.AsyncDisposable, 0));
+        try expect(js.satisfiesTypeConstraint(CustomAsyncDisp, js.AsyncDisposable, 0));
+        try expect(js.satisfiesTypeConstraint([]const f64, js.Iterator(f64), 0));
+        try expect(js.satisfiesTypeConstraint([2]f64, js.Iterator(f64), 0));
+        try expect(js.satisfiesTypeConstraint(js.Set(f64), js.Iterator(f64), 0));
+        try expect(js.satisfiesTypeConstraint(CustomIter, js.Iterator(f64), 0));
+        try expect(!js.satisfiesTypeConstraint(CustomIter, js.Iterator([]const u8), 0));
+        try expect(!js.satisfiesTypeConstraint(PlainHandleOnly, js.Iterator(f64), 0));
     }
     try expectEqual(@as(u32, 0), js.activeHandleCount());
 }
