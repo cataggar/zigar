@@ -1787,12 +1787,14 @@ const ModuleHost = struct {
     };
 
     fn dispatchWorkerJsBridge(self: *@This(), req: *JsBridgeRequest) !E {
+        if (in_main_thread) return .PERM;
+        if (self.env_closing.load(.acquire)) return .NOSYS;
         if (!self.canBridgeWorkerJs()) return .PERM;
         var futex: Futex = undefined;
         req.worker_id = @intCast(@intFromPtr(&in_main_thread));
         req.futex_handle = futex.init();
         self.callTsfn("handle_js_bridge", @ptrCast(req)) catch |err| switch (err) {
-            error.Disabled => return .PERM,
+            error.Disabled => return if (self.env_closing.load(.acquire)) .NOSYS else .PERM,
             else => return err,
         };
         return futex.wait();
@@ -1878,8 +1880,11 @@ const ModuleHost = struct {
 
     fn releaseJsValue(self: *@This(), handle: u32) !E {
         if (self.isOwnerJsThread()) return self.releaseJsValueOnEnv(handle);
+        if (!in_main_thread and self.env_closing.load(.acquire)) return .SUCCESS;
         var req: JsBridgeRequest = .{ .payload = .{ .release_js_value = .{ .handle = handle } } };
-        return self.dispatchWorkerJsBridge(&req);
+        const status = try self.dispatchWorkerJsBridge(&req);
+        if (status == .NOSYS and self.env_closing.load(.acquire)) return .SUCCESS;
+        return status;
     }
 
     fn typeofJsValueOnEnv(self: *@This(), handle: u32, dest: *u8) !E {
@@ -2073,8 +2078,11 @@ const ModuleHost = struct {
 
     fn releaseZigCallback(self: *@This(), callback_id: u32) !E {
         if (self.isOwnerJsThread()) return self.releaseZigCallbackOnEnv(callback_id);
+        if (!in_main_thread and self.env_closing.load(.acquire)) return .SUCCESS;
         var req: JsBridgeRequest = .{ .payload = .{ .release_zig_callback = .{ .callback_id = callback_id } } };
-        return self.dispatchWorkerJsBridge(&req);
+        const status = try self.dispatchWorkerJsBridge(&req);
+        if (status == .NOSYS and self.env_closing.load(.acquire)) return .SUCCESS;
+        return status;
     }
 
     fn controlLastJsErrorOnEnv(self: *@This(), mode: u32, dest: *u32) !E {
@@ -2104,8 +2112,17 @@ const ModuleHost = struct {
 
     fn controlLastJsError(self: *@This(), mode: u32, dest: *u32) !E {
         if (self.isOwnerJsThread()) return self.controlLastJsErrorOnEnv(mode, dest);
+        if (mode == 3 and !in_main_thread and self.env_closing.load(.acquire)) {
+            dest.* = 0;
+            return .SUCCESS;
+        }
         var req: JsBridgeRequest = .{ .payload = .{ .control_last_js_error = .{ .mode = mode, .dest = dest } } };
-        return self.dispatchWorkerJsBridge(&req);
+        const status = try self.dispatchWorkerJsBridge(&req);
+        if (mode == 3 and status == .NOSYS and self.env_closing.load(.acquire)) {
+            dest.* = 0;
+            return .SUCCESS;
+        }
+        return status;
     }
 
     fn disposeJsValueOnEnv(self: *@This(), handle: u32, catch_mode: bool) !E {
@@ -2140,8 +2157,11 @@ const ModuleHost = struct {
 
     fn disposeJsValue(self: *@This(), handle: u32, catch_mode: bool) !E {
         if (self.isOwnerJsThread()) return self.disposeJsValueOnEnv(handle, catch_mode);
+        if (!catch_mode and !in_main_thread and self.env_closing.load(.acquire)) return .SUCCESS;
         var req: JsBridgeRequest = .{ .payload = .{ .dispose_js_value = .{ .handle = handle, .catch_mode = catch_mode } } };
-        return self.dispatchWorkerJsBridge(&req);
+        const status = try self.dispatchWorkerJsBridge(&req);
+        if (!catch_mode and status == .NOSYS and self.env_closing.load(.acquire)) return .SUCCESS;
+        return status;
     }
 
     fn asyncDisposeJsValueOnEnv(self: *@This(), handle: u32, catch_mode: bool) !E {
@@ -2176,8 +2196,11 @@ const ModuleHost = struct {
 
     fn asyncDisposeJsValue(self: *@This(), handle: u32, catch_mode: bool) !E {
         if (self.isOwnerJsThread()) return self.asyncDisposeJsValueOnEnv(handle, catch_mode);
+        if (!catch_mode and !in_main_thread and self.env_closing.load(.acquire)) return .SUCCESS;
         var req: JsBridgeRequest = .{ .payload = .{ .async_dispose_js_value = .{ .handle = handle, .catch_mode = catch_mode } } };
-        return self.dispatchWorkerJsBridge(&req);
+        const status = try self.dispatchWorkerJsBridge(&req);
+        if (!catch_mode and status == .NOSYS and self.env_closing.load(.acquire)) return .SUCCESS;
+        return status;
     }
 
     fn suppressPromiseRejectionOnEnv(self: *@This(), handle: u32, mode: u32) void {

@@ -15,6 +15,8 @@ pub const lower_heritage = @import("lower_heritage.zig");
 pub const merge_decls = @import("merge_decls.zig");
 pub const lower_functions = @import("lower_functions.zig");
 pub const overloads = @import("overloads.zig");
+pub const lower_generics = @import("lower_generics.zig");
+pub const type_ops = @import("type_ops.zig");
 pub const ir = @import("ir.zig");
 pub const emit = @import("emit.zig");
 pub const driver = @import("driver.zig");
@@ -40,6 +42,8 @@ test {
     _ = merge_decls;
     _ = lower_functions;
     _ = overloads;
+    _ = lower_generics;
+    _ = type_ops;
     _ = ir;
     _ = emit;
     _ = driver;

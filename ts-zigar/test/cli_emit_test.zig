@@ -2458,7 +2458,7 @@ test "Issue #46 (M3.1a): primitives, optionals/nullish kinds, bigint literals, s
             \\    try std.testing.expect(!r.P.zigar_js.fields[0].is_optional and r.P.zigar_js.fields[0].nullish == .null_only);
             \\    try std.testing.expect(!r.P.zigar_js.fields[1].is_optional and r.P.zigar_js.fields[1].nullish == .undefined_only);
             \\    try std.testing.expect(r.P.zigar_js.fields[2].is_optional and r.P.zigar_js.fields[2].nullish == .undefined_only);
-            \\    try std.testing.expect(r.P.zigar_js.fields[3].is_optional and r.P.zigar_js.fields[3].nullish == .undefined_only);
+            \\    try std.testing.expect(r.P.zigar_js.fields[3].is_optional and r.P.zigar_js.fields[3].nullish == .null_or_undefined);
             \\    try std.testing.expect(r.P.zigar_js.fields[4].is_optional);
             \\    try std.testing.expect(r.P.zigar_js.fields[4].nullish.self == .undefined_only);
             \\    try std.testing.expect(r.P.zigar_js.fields[4].nullish.child.elem == .null_only);
@@ -4201,6 +4201,443 @@ test "Issue #50 M3.3a Sema: smart overloads, variadic rest params, callbacks, th
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
 }
+
+test "Issue #51 M3.3b Sema: comptime generics, Default/With/Infer companions, NoInfer, const T, type operators, utility types, and negative constraint @compileError" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    const cwd = std.Io.Dir.cwd();
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue51-generics", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const src_dir = try std.fmt.allocPrint(alloc, "{s}/src", .{sandbox});
+    defer alloc.free(src_dir);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+
+    try cwd.createDirPath(io, src_dir);
+    {
+        var sd = try cwd.openDir(io, src_dir, .{});
+        defer sd.close(io);
+        try sd.writeFile(io, .{
+            .sub_path = "m3_generics.d.ts",
+            .data =
+            \\export interface UserProfile {
+            \\  id: number;
+            \\  displayName: string;
+            \\  hostName: string;
+            \\  port?: number;
+            \\  apiSecret?: string | null;
+            \\}
+            \\
+            \\export interface DefaultMeta {
+            \\  requestId: string;
+            \\}
+            \\
+            \\export interface Envelope<T, Meta = DefaultMeta> {
+            \\  payload: T;
+            \\  meta: Meta;
+            \\}
+            \\
+            \\export interface VarianceProbe<in Contra, out Co, in out Inv, const Lit = "ok"> {
+            \\  accept(x: Contra): Co;
+            \\  current: Inv;
+            \\  readonly tag: Lit;
+            \\}
+            \\
+            \\export declare class GenericStore<K extends string, V = number> {
+            \\  constructor(namespace: K);
+            \\  get(key: K): V | undefined;
+            \\  set(key: K, val: V): void;
+            \\  transform<U>(key: K, fallback: U): U;
+            \\}
+            \\
+            \\export declare class ServiceClient {
+            \\  constructor(endpoint: string, retries?: number);
+            \\  ping(): boolean;
+            \\}
+            \\
+            \\export declare function makeSampleUser(name: string, age: number): UserProfile;
+            \\
+            \\export declare function identity<T>(value: T): T;
+            \\export declare function firstElem<T>(items: readonly T[]): T | undefined;
+            \\export declare function unwrapOpt<T = string>(value?: T | null): T;
+            \\export declare function awaitValue<T>(promise: Promise<T>): Promise<T>;
+            \\export declare function freezeTuple<const T>(items: T): T;
+            \\export declare function withFallback<T>(value: T, fallback: NoInfer<T>): T;
+            \\export declare function loadDefault<T = UserProfile>(path: string): T;
+            \\export declare function wrapEnvelope<T, Meta = DefaultMeta>(payload: T): Envelope<T, Meta>;
+            \\export declare function taggedItem<T extends { id: number }>(mode: "fast" | "slow", item: T): T;
+            \\export declare function getField<T extends object, K extends keyof T>(obj: T, key: K): T[K];
+            \\export declare function echoBig<T extends bigint>(x: T): T;
+            \\
+            \\export declare function overloadGeneric<T extends { id: number }>(item: T): number;
+            \\export declare function overloadGeneric(label: string): string;
+            \\
+            \\export type UserKey = keyof UserProfile;
+            \\export type UserName = UserProfile["displayName"];
+            \\export type PairTuple = [string, number];
+            \\export type PairFirst = PairTuple[0];
+            \\export type NumberListElem = (readonly number[])[number];
+            \\
+            \\export type PartialOf<T> = Partial<T>;
+            \\export type RequiredOf<T> = Required<T>;
+            \\export type ReadonlyOf<T> = Readonly<T>;
+            \\export type OpenMappedOptional<T> = { [P in keyof T]?: T[P] };
+            \\export type OpenMappedRequired<T> = { [P in keyof T]-?: T[P] };
+            \\export type Flags<T> = { [P in keyof T]: boolean };
+            \\export type OptFlags<T> = { [P in keyof T]?: boolean };
+            \\export type ReqFlags<T> = { [P in keyof T]-?: boolean };
+            \\export type PickNet<T> = Pick<T, "hostName" | "port">;
+            \\export type OmitSecret<T> = Omit<T, "apiSecret">;
+            \\export type RoleCounts = Record<"admin" | "guest", number>;
+            \\export type OpenRoleMap<V> = Record<"admin" | "guest", V>;
+            \\export type DynamicDict<V> = Record<string, V>;
+            \\export type CleanVal<T> = NonNullable<T>;
+            \\export type OpenNonNull<T> = T extends null | undefined ? never : T;
+            \\export type UnwrapAsync<T> = Awaited<T>;
+            \\export type OpenUnwrapPromise<T> = T extends Promise<infer U> ? U : T;
+            \\
+            \\export type FilteredLetters = Exclude<"a" | "b" | "c", "b">;
+            \\export type ExtractedStrs = Extract<"alpha" | "beta" | 42, string>;
+            \\export type SampleUserReturn = ReturnType<typeof makeSampleUser>;
+            \\export type SampleUserParams = Parameters<typeof makeSampleUser>;
+            \\export type ClientCtorParams = ConstructorParameters<typeof ServiceClient>;
+            \\export type ClientInst = InstanceType<typeof ServiceClient>;
+            \\
+            \\export declare const defaultEndpoint: { readonly host: string; readonly port: number };
+            \\export type EndpointConfig = typeof defaultEndpoint;
+            \\export declare function acceptEndpoint(ep: typeof defaultEndpoint): number;
+            \\
+            \\export type PredeclaredTheme = typeof defaultTheme;
+            \\export declare const defaultTheme: { readonly palette: string; readonly dark: boolean };
+            \\
+            \\export interface NullishMatrix {
+            \\    a: string | null;
+            \\    b?: string | null;
+            \\    c: string | undefined;
+            \\    d?: string;
+            \\}
+            \\
+            \\export enum NumericDir {
+            \\    Up = 0,
+            \\    Down = 1,
+            \\}
+            \\export type ClosedDirMap = Record<NumericDir, string>;
+            \\export type OpenDirMap<V> = Record<NumericDir, V>;
+            \\export type ValueAtUp<V> = Record<NumericDir, V>[NumericDir.Up];
+            \\export type At0<T extends { 0: string; 1: number }> = T[0];
+            \\export type PickMixed<T> = Pick<T, 0 | "host">;
+            ,
+        });
+    }
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const dts_file = try std.fmt.allocPrint(alloc, "{s}/m3_generics.d.ts", .{src_dir});
+    defer alloc.free(dts_file);
+    const cli_args = [_][]const u8{ "-t", dts_file, "-d", out_dir };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var pipe_res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer pipe_res.deinit(alloc);
+    if (pipe_res == .err) {
+        std.debug.print("Issue #51 pipeline error: {s}\n", .{pipe_res.err});
+    }
+    try std.testing.expect(pipe_res == .ok);
+
+    // Verify variance (`in`, `out`, `in out`) and `const` doc-comment rendering in generated Zig
+    const gen_zig_path = try std.fmt.allocPrint(alloc, "{s}/m3_generics.zig", .{out_dir});
+    defer alloc.free(gen_zig_path);
+    const gen_src = try cwd.readFileAlloc(io, gen_zig_path, alloc, .limited(2 * 1024 * 1024));
+    defer alloc.free(gen_src);
+    try std.testing.expect(std.mem.indexOf(u8, gen_src, "@typeParam in Contra") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen_src, "@typeParam out Co") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen_src, "@typeParam in out Inv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen_src, "@typeParam const Lit") != null);
+
+    // 1. Positive consumer Sema test exercising every generic/utility/operator construct
+    const consumer_zig = try std.fmt.allocPrint(alloc, "{s}/consumer_issue51.zig", .{sandbox});
+    defer alloc.free(consumer_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "consumer_issue51.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r = @import("out/root.zig");
+            \\const js = r.zigar_js;
+            \\const m = r.m3_generics;
+            \\
+            \\test "Issue #51 comptime generics, companions, inference, operators, and utility types" {
+            \\    // 1. Generic interfaces & classes + *Default and *With(.{ ... }) companions
+            \\    const EnvExplicit = m.Envelope(m.UserProfile, struct { trace: []const u8 });
+            \\    const EnvDef = m.EnvelopeDefault(m.UserProfile);
+            \\    const EnvWithMin = m.EnvelopeWith(.{ .T = m.UserProfile });
+            \\    const EnvWithFull = m.EnvelopeWith(.{ .T = m.UserProfile, .Meta = struct { seq: u32 } });
+            \\    try std.testing.expect(EnvDef == m.Envelope(m.UserProfile, m.DefaultMeta));
+            \\    try std.testing.expect(EnvWithMin == EnvDef);
+            \\    try std.testing.expect(@hasField(EnvExplicit, "payload") and @hasField(EnvExplicit, "meta"));
+            \\    try std.testing.expect(@hasField(EnvWithFull, "meta"));
+            \\
+            \\    const StoreDef = m.GenericStoreDefault([]const u8);
+            \\    const StoreWith = m.GenericStoreWith(.{ .K = []const u8 });
+            \\    try std.testing.expect(StoreDef == m.GenericStore([]const u8, f64));
+            \\    try std.testing.expect(StoreWith == StoreDef);
+            \\    try std.testing.expect(StoreDef.zigar_js.is_handle);
+            \\
+            \\    // 2. Generic functions + *Default + *Infer + const T + NoInfer<T> + inline nominal before deduced param
+            \\    try std.testing.expectError(error.HostUnavailable, m.identity(f64, 42));
+            \\    try std.testing.expectError(error.HostUnavailable, m.identityInfer(@as(f64, 42)));
+            \\    try std.testing.expectError(error.HostUnavailable, m.identityInferAlloc(std.testing.allocator, "zig"));
+            \\    try std.testing.expectError(error.HostUnavailable, m.firstElemInfer(&[_]f64{ 1, 2, 3 }));
+            \\    try std.testing.expectError(error.HostUnavailable, m.unwrapOptDefault(null));
+            \\    try std.testing.expectError(error.HostUnavailable, m.unwrapOptInferAlloc(std.testing.allocator, null));
+            \\    try std.testing.expectError(error.HostUnavailable, m.unwrapOptInfer(@as(?f64, 9)));
+            \\    try std.testing.expectError(error.HostUnavailable, m.awaitValueInfer(js.Promise(f64){}));
+            \\
+            \\    // `const T` preserves fixed array `[2]f64` instead of decaying to slice!
+            \\    const frozen_res = m.freezeTupleInfer(&[_]f64{ 10, 20 });
+            \\    try std.testing.expect(@TypeOf(frozen_res) == js.CallError![2]f64);
+            \\    try std.testing.expectError(error.HostUnavailable, frozen_res);
+            \\
+            \\    // `NoInfer<T>` excludes `fallback` from deduction so `T` is deduced purely from `value` (`f64`)
+            \\    const fb_res = m.withFallbackInfer(@as(f64, 3.5), 7);
+            \\    try std.testing.expect(@TypeOf(fb_res) == js.CallError!f64);
+            \\    try std.testing.expectError(error.HostUnavailable, fb_res);
+            \\
+            \\    // Pure-default `*Default` + mixed deduced-and-trailing-default `.from_default` `*Infer`
+            \\    try std.testing.expect(!@hasDecl(m, "loadDefaultInfer"));
+            \\    try std.testing.expectError(error.HostUnavailable, m.loadDefaultDefaultAlloc(std.testing.allocator, "/me"));
+            \\
+            \\    // Non-generic inline enum parameter (`"fast" | "slow"`) before deduced parameter `item: T`
+            \\    const sample_user: m.UserProfile = .{ .id = 1, .display_name = "Ada", .host_name = "localhost" };
+            \\    const wrapped_env = m.wrapEnvelopeInferAlloc(std.testing.allocator, sample_user);
+            \\    try std.testing.expect(@TypeOf(wrapped_env) == js.CallError!m.Envelope(m.UserProfile, m.DefaultMeta));
+            \\    try std.testing.expectError(error.HostUnavailable, wrapped_env);
+            \\    try std.testing.expectError(error.HostUnavailable, m.taggedItemInferAlloc(std.testing.allocator, .fast, sample_user));
+            \\
+            \\    // Generic overload dispatch (`T extends { id: number }` vs `string`) — both deduced and explicit type args
+            \\    try std.testing.expectError(error.HostUnavailable, m.overloadGeneric(sample_user));
+            \\    try std.testing.expectError(error.HostUnavailable, m.overloadGeneric(.{ m.UserProfile, sample_user }));
+            \\    try std.testing.expectError(error.HostUnavailable, m.overloadGenericAlloc(std.testing.allocator, "hello"));
+            \\
+            \\    // 3. `keyof T` & `T[K]` (`getField` with wire-name mapping `displayName` <-> `display_name`)
+            \\    try std.testing.expect(@typeInfo(m.UserKey) == .@"enum");
+            \\    try std.testing.expectEqualStrings("displayName", m.UserKey.display_name.toSlice());
+            \\    try std.testing.expect(m.UserName == []const u8);
+            \\    try std.testing.expect(m.PairFirst == []const u8);
+            \\    try std.testing.expect(m.NumberListElem == f64);
+            \\    const gf_res = m.getField(m.UserProfile, enum { displayName }, sample_user, .displayName);
+            \\    try std.testing.expect(@TypeOf(gf_res) == js.CallError![]const u8);
+            \\    try std.testing.expectError(error.HostUnavailable, gf_res);
+            \\
+            \\    // 4. Open & closed utility types + homomorphic mapped & conditional patterns
+            \\    const PUser = m.PartialOf(m.UserProfile);
+            \\    const p_inst: PUser = .{ .id = 7 };
+            \\    try std.testing.expectEqual(@as(?f64, 7), p_inst.id);
+            \\    try std.testing.expectEqual(@as(?[]const u8, null), p_inst.display_name);
+            \\
+            \\    const OMOpt = m.OpenMappedOptional(m.UserProfile);
+            \\    const omo_inst: OMOpt = .{};
+            \\    try std.testing.expectEqual(@as(?f64, null), omo_inst.id);
+            \\
+            \\    // Homomorphic `{ [P in keyof T]: boolean }` preserves `T`'s optional modifiers (`port` stays `?bool = null`)
+            \\    const UFlags = m.Flags(m.UserProfile);
+            \\    try std.testing.expect(@FieldType(UFlags, "id") == bool);
+            \\    try std.testing.expect(@FieldType(UFlags, "display_name") == bool);
+            \\    try std.testing.expect(@FieldType(UFlags, "port") == ?bool);
+            \\    try std.testing.expect(@FieldType(UFlags, "api_secret") == ?bool);
+            \\    const uf_inst: UFlags = .{ .id = true, .display_name = true, .host_name = false };
+            \\    try std.testing.expect(uf_inst.id and uf_inst.port == null and uf_inst.api_secret == null);
+            \\    const OptUFlags = m.OptFlags(m.UserProfile);
+            \\    const ouf_inst: OptUFlags = .{};
+            \\    try std.testing.expect(ouf_inst.id == null);
+            \\    const ReqUFlags = m.ReqFlags(m.UserProfile);
+            \\    try std.testing.expect(@FieldType(ReqUFlags, "port") == bool);
+            \\    try std.testing.expect(m.Flags([]const f64) == []const bool);
+            \\    try std.testing.expect(m.Flags([]f64) == []bool);
+            \\    try std.testing.expect(m.Flags([3]f64) == [3]bool);
+            \\    try std.testing.expect(m.Flags(struct { f64, []const u8 }) == [2]bool);
+            \\    try std.testing.expect(m.Flags([]const u8) == []const u8);
+            \\    try std.testing.expect(m.Flags(f64) == f64);
+            \\    try std.testing.expect(m.Flags(js.BigInt) == js.BigInt);
+            \\    try std.testing.expect(js.IndexAccess(js.Array(f64), 0) == f64);
+            \\    try std.testing.expectError(error.HostUnavailable, m.echoBig(js.BigInt, .{}));
+            \\    try std.testing.expectError(error.HostUnavailable, m.echoBigInfer(js.BigInt{}));
+            \\
+            \\    const RUser = m.RequiredOf(m.UserProfile);
+            \\    const OMReq = m.OpenMappedRequired(m.UserProfile);
+            \\    try std.testing.expect(@FieldType(RUser, "port") == f64);
+            \\    try std.testing.expect(@FieldType(RUser, "api_secret") == ?[]const u8);
+            \\    try std.testing.expect(@FieldType(OMReq, "port") == f64);
+            \\
+            \\    // `Required<NullishMatrix>` preserves `| null` and `: T | undefined` while removing `?` optionality
+            \\    const RNul = m.RequiredOf(m.NullishMatrix);
+            \\    const OMNul = m.OpenMappedRequired(m.NullishMatrix);
+            \\    try std.testing.expect(@FieldType(RNul, "a") == ?[]const u8);
+            \\    try std.testing.expect(@FieldType(RNul, "b") == ?[]const u8);
+            \\    try std.testing.expect(@FieldType(RNul, "c") == ?[]const u8);
+            \\    try std.testing.expect(@FieldType(RNul, "d") == []const u8);
+            \\    try std.testing.expect(@FieldType(OMNul, "b") == ?[]const u8);
+            \\    try std.testing.expect(@FieldType(OMNul, "d") == []const u8);
+            \\    inline for (@typeInfo(RNul).@"struct".field_names, 0..) |fnm, fi| {
+            \\        if (!std.mem.startsWith(u8, fnm, "__zigar_")) {
+            \\            try std.testing.expect(@typeInfo(RNul).@"struct".field_attrs[fi].default_value_ptr == null);
+            \\        }
+            \\    }
+            \\
+            \\    // Open `Record<"admin" | "guest", ?[]const u8>` requires every key (no `default_value_ptr`)
+            \\    const NullableRoleMap = m.OpenRoleMap(?[]const u8);
+            \\    inline for (@typeInfo(NullableRoleMap).@"struct".field_names, 0..) |fnm, fi| {
+            \\        if (!std.mem.startsWith(u8, fnm, "__zigar_")) {
+            \\            try std.testing.expect(@typeInfo(NullableRoleMap).@"struct".field_attrs[fi].default_value_ptr == null);
+            \\        }
+            \\    }
+            \\
+            \\    // Numeric-enum `Record<NumericDir, V>` matches closed `Record<NumericDir, string>` (`@"0"`, `@"1"`)
+            \\    const OpenDirStr = m.OpenDirMap([]const u8);
+            \\    try std.testing.expect(@hasField(m.ClosedDirMap, "0") and @hasField(m.ClosedDirMap, "1"));
+            \\    try std.testing.expect(@hasField(OpenDirStr, "0") and @hasField(OpenDirStr, "1"));
+            \\    const odm: OpenDirStr = .{ .@"0" = "up", .@"1" = "down" };
+            \\    try std.testing.expectEqualStrings("up", odm.@"0");
+            \\    try std.testing.expect(m.ValueAtUp([]const u8) == []const u8);
+            \\    try std.testing.expect(m.ValueAtUp(bool) == bool);
+            \\    const IndexedSample = struct { @"0": []const u8, @"1": f64, host: bool };
+            \\    try std.testing.expect(m.At0(IndexedSample) == []const u8);
+            \\    const PickedMixedSample = m.PickMixed(IndexedSample);
+            \\    try std.testing.expect(@hasField(PickedMixedSample, "0") and @hasField(PickedMixedSample, "host") and !@hasField(PickedMixedSample, "1"));
+            \\
+            \\    const ROUser = m.ReadonlyOf(m.UserProfile);
+            \\    try std.testing.expect(@hasField(ROUser, "display_name"));
+            \\
+            \\    const NetOnly = m.PickNet(m.UserProfile);
+            \\    try std.testing.expect(@hasField(NetOnly, "host_name") and @hasField(NetOnly, "port"));
+            \\    try std.testing.expect(!@hasField(NetOnly, "id") and !@hasField(NetOnly, "api_secret"));
+            \\
+            \\    const SafeUser = m.OmitSecret(m.UserProfile);
+            \\    try std.testing.expect(@hasField(SafeUser, "id") and !@hasField(SafeUser, "api_secret"));
+            \\
+            \\    // Closed-enum Record -> value struct; open `Record<string, V>` -> dynamic JS Record handle
+            \\    const rc: m.RoleCounts = .{ .admin = 2, .guest = 5 };
+            \\    try std.testing.expectEqual(@as(f64, 7), rc.admin + rc.guest);
+            \\    const orm: m.OpenRoleMap(bool) = .{ .admin = true, .guest = false };
+            \\    try std.testing.expect(orm.admin and !orm.guest);
+            \\    try std.testing.expect(@hasDecl(m.DynamicDict(f64), "is_js_record"));
+            \\
+            \\    // NonNullable & Awaited (both builtin & recognized open conditional patterns)
+            \\    try std.testing.expect(m.CleanVal(?[]const u8) == []const u8);
+            \\    try std.testing.expect(m.OpenNonNull(js.Nullable(f64)) == f64);
+            \\    try std.testing.expect(m.UnwrapAsync(js.Promise(js.Promise(bool))) == bool);
+            \\    try std.testing.expect(m.OpenUnwrapPromise(js.Promise([]const u8)) == []const u8);
+            \\
+            \\    // Closed conditional utilities (`Exclude`, `Extract`, `ReturnType`, `Parameters`, `ConstructorParameters`, `InstanceType`)
+            \\    try std.testing.expectEqualStrings("a", m.FilteredLetters.a.toSlice());
+            \\    try std.testing.expect(!@hasField(m.FilteredLetters, "b"));
+            \\    try std.testing.expectEqualStrings("alpha", m.ExtractedStrs.alpha.toSlice());
+            \\    try std.testing.expect(m.SampleUserReturn == m.UserProfile);
+            \\    const sp: m.SampleUserParams = .{ .name = "Grace", .age = 36 };
+            \\    try std.testing.expectEqualStrings("Grace", sp.name);
+            \\    const cp: m.ClientCtorParams = .{ .endpoint = "https://example.test" };
+            \\    try std.testing.expectEqual(@as(?f64, null), cp.retries);
+            \\    try std.testing.expect(m.ClientInst == m.ServiceClient);
+            \\
+            \\    // `typeof <constVar>` shares the exact nominal Zig struct regardless of declaration order
+            \\    const ep_val: m.EndpointConfig = .{ .host = "localhost", .port = 8080 };
+            \\    try std.testing.expect(@TypeOf(m.default_endpoint.getAlloc(std.testing.allocator)) == js.CallError!m.EndpointConfig);
+            \\    try std.testing.expectError(error.HostUnavailable, m.acceptEndpoint(ep_val));
+            \\    try std.testing.expect(@TypeOf(m.default_theme.getAlloc(std.testing.allocator)) == js.CallError!m.PredeclaredTheme);
+            \\}
+            ,
+        });
+    }
+
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
+
+    // 2. Negative Sema tests: verify invalid comptime `T extends Constraint` and missing `*With` keys produce `@compileError`!
+    const neg_cases = [_]struct {
+        filename: []const u8,
+        expected_err: []const u8,
+        source: []const u8,
+    }{
+        .{
+            .filename = "neg_bad_struct_constraint.zig",
+            .expected_err = "does not satisfy TypeScript constraint",
+            .source =
+            \\const r = @import("out/root.zig");
+            \\test "reject non-matching struct constraint" {
+            \\    _ = r.m3_generics.taggedItem(f64, .fast, 123);
+            \\}
+            ,
+        },
+        .{
+            .filename = "neg_bad_keyof_constraint.zig",
+            .expected_err = "does not satisfy TypeScript constraint",
+            .source =
+            \\const r = @import("out/root.zig");
+            \\test "reject invalid keyof property" {
+            \\    const u: r.m3_generics.UserProfile = .{ .id = 1, .display_name = "a", .host_name = "b" };
+            \\    _ = r.m3_generics.getField(r.m3_generics.UserProfile, enum { nonexistentField }, u, .nonexistentField);
+            \\}
+            ,
+        },
+        .{
+            .filename = "neg_missing_with_param.zig",
+            .expected_err = "Missing required type parameter '.T'",
+            .source =
+            \\const r = @import("out/root.zig");
+            \\test "reject missing required type param in EnvelopeWith" {
+            \\    const Bad = r.m3_generics.EnvelopeWith(.{});
+            \\    _ = @sizeOf(Bad);
+            \\}
+            ,
+        },
+        .{
+            .filename = "neg_bad_generic_overload.zig",
+            .expected_err = "No overload of",
+            .source =
+            \\const r = @import("out/root.zig");
+            \\test "reject generic overload when deduced type violates constraint" {
+            \\    const NoId = struct { name: []const u8 };
+            \\    _ = r.m3_generics.overloadGeneric(NoId{ .name = "nope" });
+            \\}
+            ,
+        },
+    };
+
+    for (neg_cases) |nc| {
+        {
+            var sb = try cwd.openDir(io, sandbox, .{});
+            defer sb.close(io);
+            try sb.writeFile(io, .{ .sub_path = nc.filename, .data = nc.source });
+        }
+        const neg_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ sandbox, nc.filename });
+        defer alloc.free(neg_path);
+        const res = try std.process.run(alloc, io, .{
+            .argv = &.{ test_options.zig_exe, "test", neg_path },
+        });
+        defer alloc.free(res.stdout);
+        defer alloc.free(res.stderr);
+        const failed = switch (res.term) {
+            .exited => |code| code != 0,
+            else => true,
+        };
+        try std.testing.expect(failed);
+        try std.testing.expect(std.mem.indexOf(u8, res.stderr, nc.expected_err) != null);
+    }
+}
+
 
 
 

@@ -3,6 +3,8 @@ const ir = @import("ir.zig");
 const naming = @import("naming.zig");
 const lower_types = @import("lower_types.zig");
 const lower_unions = @import("lower_unions.zig");
+const lower_generics = @import("lower_generics.zig");
+const type_ops = @import("type_ops.zig");
 
 pub const EmittedFile = struct {
     /// POSIX relative path inside `out_dir` (e.g. `"root.zig"`, `"fs/promises.zig"`).
@@ -401,6 +403,22 @@ const ModuleEmitCtx = struct {
     ret_type_counter: u32 = 0,
     used_self_mod_alias: bool = false,
     active_default_owner_wire: ?[]const u8 = null,
+    type_param_subst: ?[]const TypeParamSubst = null,
+
+    const TypeParamSubst = struct {
+        zig_ident: []const u8,
+        expr: []const u8,
+    };
+
+    const SharedTypeHelper = struct {
+        helper_ident: ?[]u8 = null,
+        call_expr: ?[]u8 = null,
+
+        fn deinit(self: SharedTypeHelper, allocator: std.mem.Allocator) void {
+            if (self.helper_ident) |h| allocator.free(h);
+            if (self.call_expr) |c| allocator.free(c);
+        }
+    };
 
     fn deinit(self: *ModuleEmitCtx) void {
         self.out.deinit(self.allocator);
@@ -505,8 +523,22 @@ const ModuleEmitCtx = struct {
         }
         for (self.mod.decls) |decl| {
             if (std.mem.eql(u8, unquoteZigIdent(decl.zig_ident), ident)) return true;
-            if (decl.alloc_companion_ident) |aci| {
-                if (std.mem.eql(u8, unquoteZigIdent(aci), ident)) return true;
+            const comp_opts = [_]?[]const u8{
+                decl.alloc_companion_ident,
+                decl.slice_companion_ident,
+                decl.slice_alloc_companion_ident,
+                decl.narrow_companion_ident,
+                decl.narrow_alloc_companion_ident,
+                decl.default_companion_ident,
+                decl.default_alloc_companion_ident,
+                decl.with_companion_ident,
+                decl.infer_companion_ident,
+                decl.infer_alloc_companion_ident,
+            };
+            for (comp_opts) |co| {
+                if (co) |ci| {
+                    if (std.mem.eql(u8, unquoteZigIdent(ci), ident)) return true;
+                }
             }
         }
         return false;
@@ -557,19 +589,22 @@ const ModuleEmitCtx = struct {
         }
     }
 
-    fn emitSharedNominalTypeExpr(
+    fn emitSharedNominalTypeHelper(
         self: *ModuleEmitCtx,
         ty: *const ir.TypeIr,
         sig: ir.SignatureIr,
-    ) ![]u8 {
+    ) !SharedTypeHelper {
         const type_ident = try self.freshPrivateTypeIdent(sig);
-        defer self.allocator.free(type_ident);
+        errdefer self.allocator.free(type_ident);
 
-        if (sig.type_params.len == 0) {
+        if (!typeUsesAnyTypeParam(ty, sig.type_params)) {
             try self.out.print(self.allocator, "const {s} = ", .{type_ident});
             try self.emitType(ty);
             try self.out.appendSlice(self.allocator, ";\n");
-            return try self.allocator.dupe(u8, type_ident);
+            return .{
+                .helper_ident = null,
+                .call_expr = type_ident,
+            };
         } else {
             try self.out.print(self.allocator, "fn {s}(", .{type_ident});
             for (sig.type_params, 0..) |tp, idx| {
@@ -594,8 +629,79 @@ const ModuleEmitCtx = struct {
                 try expr.appendSlice(self.allocator, tp.zig_ident);
             }
             try expr.append(self.allocator, ')');
-            return try expr.toOwnedSlice(self.allocator);
+            const call_expr = try expr.toOwnedSlice(self.allocator);
+            return .{
+                .helper_ident = type_ident,
+                .call_expr = call_expr,
+            };
         }
+    }
+
+    fn emitSharedNominalTypeExpr(
+        self: *ModuleEmitCtx,
+        ty: *const ir.TypeIr,
+        sig: ir.SignatureIr,
+    ) ![]u8 {
+        const helper = try self.emitSharedNominalTypeHelper(ty, sig);
+        if (helper.helper_ident) |h| self.allocator.free(h);
+        return helper.call_expr.?;
+    }
+
+    fn emitResolvedSharedType(
+        self: *ModuleEmitCtx,
+        ty: *const ir.TypeIr,
+        sig: ir.SignatureIr,
+        shared: SharedTypeHelper,
+    ) error{OutOfMemory}!void {
+        if (self.type_param_subst) |substs| {
+            if (shared.helper_ident) |hid| {
+                try self.out.print(self.allocator, "{s}(", .{hid});
+                for (sig.type_params, 0..) |tp, idx| {
+                    if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
+                    if (lookupTypeParamSubst(substs, tp.zig_ident)) |sub_expr| {
+                        try self.out.appendSlice(self.allocator, sub_expr);
+                    } else {
+                        try self.out.appendSlice(self.allocator, tp.zig_ident);
+                    }
+                }
+                try self.out.append(self.allocator, ')');
+                return;
+            }
+            if (shared.call_expr) |ce| {
+                try self.out.appendSlice(self.allocator, ce);
+                return;
+            }
+            try self.emitType(ty);
+            return;
+        }
+        if (shared.call_expr) |ce| {
+            try self.out.appendSlice(self.allocator, ce);
+        } else {
+            try self.emitType(ty);
+        }
+    }
+
+    fn renderTypeToOwnedSlice(
+        self: *ModuleEmitCtx,
+        ty: *const ir.TypeIr,
+        subst_opt: ?[]const TypeParamSubst,
+    ) error{OutOfMemory}![]u8 {
+        const saved_len = self.out.items.len;
+        const prev_subst = self.type_param_subst;
+        self.type_param_subst = subst_opt;
+        defer {
+            self.type_param_subst = prev_subst;
+            self.out.shrinkRetainingCapacity(saved_len);
+        }
+        try self.emitType(ty);
+        return try self.allocator.dupe(u8, self.out.items[saved_len..]);
+    }
+
+    fn lookupTypeParamSubst(substs: []const TypeParamSubst, tp_ident: []const u8) ?[]const u8 {
+        for (substs) |s| {
+            if (std.mem.eql(u8, s.zig_ident, tp_ident)) return s.expr;
+        }
+        return null;
     }
 
     fn emitIdentSegment(self: *ModuleEmitCtx, seg: []const u8) !void {
@@ -774,6 +880,35 @@ const ModuleEmitCtx = struct {
                     try buf.append(self.allocator, '|');
                 }
             },
+            .js_record => |r| {
+                try buf.appendSlice(self.allocator, "rec(");
+                try self.appendNullishFingerprint(buf, r.key, env, fp_visited, depth + 1);
+                try buf.append(self.allocator, ',');
+                try self.appendNullishFingerprint(buf, r.value, env, fp_visited, depth + 1);
+                try buf.append(self.allocator, ')');
+            },
+            .mapped_values_op => |mv| {
+                try buf.appendSlice(self.allocator, "mval(");
+                try self.appendNullishFingerprint(buf, mv.target, env, fp_visited, depth + 1);
+                try buf.append(self.allocator, ',');
+                try self.appendNullishFingerprint(buf, mv.value, env, fp_visited, depth + 1);
+                try buf.append(self.allocator, ')');
+            },
+            .unary_type_op => |uo| {
+                try buf.print(self.allocator, "{s}(", .{@tagName(uo.op)});
+                try self.appendNullishFingerprint(buf, uo.operand, env, fp_visited, depth + 1);
+                try buf.append(self.allocator, ')');
+            },
+            .key_filter_op => |kfo| {
+                try buf.print(self.allocator, "{s}(", .{@tagName(kfo.kind)});
+                try self.appendNullishFingerprint(buf, kfo.target, env, fp_visited, depth + 1);
+                try buf.append(self.allocator, ')');
+            },
+            .index_access_op => |iao| {
+                try buf.appendSlice(self.allocator, "idx(");
+                try self.appendNullishFingerprint(buf, iao.object_ty, env, fp_visited, depth + 1);
+                try buf.append(self.allocator, ')');
+            },
             .type_param_ref => |tp_ident| {
                 if (env) |e| {
                     for (e.params, 0..) |tp, idx| {
@@ -943,6 +1078,11 @@ const ModuleEmitCtx = struct {
         switch (ty.*) {
             .optional => return true,
             .pointer_const => |inner| return self.isResolvedOptionalEnv(inner, env, depth + 1),
+            .unary_type_op => |uo| return switch (uo.op) {
+                .non_nullable => false,
+                .readonly_type => self.isResolvedOptionalEnv(uo.operand, env, depth + 1),
+                else => false,
+            },
             .type_param_ref => |tp_ident| {
                 if (env) |e| {
                     for (e.params, 0..) |tp, idx| {
@@ -1159,6 +1299,12 @@ const ModuleEmitCtx = struct {
         }
     }
 
+    const OptionalSiteMode = enum {
+        none,
+        undefined_only,
+        preserve_null,
+    };
+
     fn emitFieldsNullishSpecList(
         self: *ModuleEmitCtx,
         fields: []const ir.FieldIr,
@@ -1182,7 +1328,7 @@ const ModuleEmitCtx = struct {
             try self.out.appendSlice(self.allocator, ".{ .name = ");
             try self.emitStringLit(f.logical_name);
             try self.out.appendSlice(self.allocator, ", .nullish = ");
-            try self.emitNullishSpecEnv(f.ty, env, visited, null, f.is_optional, depth + 1);
+            try self.emitNullishSpecEnvMode(f.ty, env, visited, null, if (f.is_optional) .preserve_null else .none, depth + 1);
             try self.out.appendSlice(self.allocator, " }");
             emitted += 1;
         }
@@ -1228,6 +1374,26 @@ const ModuleEmitCtx = struct {
         is_optional_site: bool,
         depth: usize,
     ) error{OutOfMemory}!void {
+        return self.emitNullishSpecEnvMode(
+            ty,
+            env,
+            visited,
+            pending_id,
+            if (is_optional_site) .undefined_only else .none,
+            depth,
+        );
+    }
+
+    fn emitNullishSpecEnvMode(
+        self: *ModuleEmitCtx,
+        ty: *const ir.TypeIr,
+        env: ?*const TypeParamEnv,
+        visited: ?*const VisitedDecl,
+        pending_id: ?[]const u8,
+        opt_site: OptionalSiteMode,
+        depth: usize,
+    ) error{OutOfMemory}!void {
+        const is_optional_site = (opt_site != .none);
         if (depth >= 24) {
             try self.out.appendSlice(self.allocator, if (is_optional_site) ".undefined_only" else ".none");
             return;
@@ -1235,12 +1401,17 @@ const ModuleEmitCtx = struct {
         const default_self_tag: []const u8 = if (is_optional_site) ".undefined_only" else ".none";
         switch (ty.*) {
             .optional => |opt| {
-                const self_tag: []const u8 = if (is_optional_site)
-                    ".undefined_only"
-                else switch (opt.nullish_kind) {
+                const self_tag: []const u8 = switch (opt_site) {
                     .undefined_only => ".undefined_only",
-                    .null_only, .null_or_undefined => ".null_only",
-                    .none => ".undefined_only",
+                    .preserve_null => switch (opt.nullish_kind) {
+                        .null_only, .null_or_undefined => ".null_or_undefined",
+                        .undefined_only, .none => ".undefined_only",
+                    },
+                    .none => switch (opt.nullish_kind) {
+                        .undefined_only => ".undefined_only",
+                        .null_only, .null_or_undefined => ".null_only",
+                        .none => ".undefined_only",
+                    },
                 };
                 if (try self.typeNeedsNullishSpecEnv(opt.child, env, visited, depth + 1)) {
                     try self.out.appendSlice(self.allocator, ".{ ");
@@ -1250,7 +1421,7 @@ const ModuleEmitCtx = struct {
                         try self.out.appendSlice(self.allocator, ", ");
                     }
                     try self.out.print(self.allocator, ".self = {s}, .child = ", .{self_tag});
-                    try self.emitNullishSpecEnv(opt.child, env, visited, null, false, depth + 1);
+                    try self.emitNullishSpecEnvMode(opt.child, env, visited, null, .none, depth + 1);
                     try self.out.appendSlice(self.allocator, " }");
                 } else {
                     try self.out.appendSlice(self.allocator, self_tag);
@@ -1308,18 +1479,18 @@ const ModuleEmitCtx = struct {
                 try self.out.appendSlice(self.allocator, default_self_tag);
             },
             .pointer_const => |inner| {
-                try self.emitNullishSpecEnv(inner, env, visited, pending_id, is_optional_site, depth + 1);
+                try self.emitNullishSpecEnvMode(inner, env, visited, pending_id, opt_site, depth + 1);
             },
             .type_param_ref => |tp_ident| {
                 if (env) |e| {
                     for (e.params, 0..) |tp, idx| {
                         if (std.mem.eql(u8, tp.zig_ident, tp_ident)) {
                             if (idx < e.args.len) {
-                                try self.emitNullishSpecEnv(e.args[idx], e.arg_env, visited, pending_id, is_optional_site, depth + 1);
+                                try self.emitNullishSpecEnvMode(e.args[idx], e.arg_env, visited, pending_id, opt_site, depth + 1);
                                 return;
                             }
                             if (tp.default_type) |def_ty| {
-                                try self.emitNullishSpecEnv(def_ty, e, visited, pending_id, is_optional_site, depth + 1);
+                                try self.emitNullishSpecEnvMode(def_ty, e, visited, pending_id, opt_site, depth + 1);
                                 return;
                             }
                             break;
@@ -1345,11 +1516,11 @@ const ModuleEmitCtx = struct {
                                 .arg_env = env,
                             };
                             if (try self.typeNeedsNullishSpecEnv(ta.target, &next_env, &next_visited, depth + 1)) {
-                                try self.emitNullishSpecEnv(ta.target, &next_env, &next_visited, key, is_optional_site, depth + 1);
+                                try self.emitNullishSpecEnvMode(ta.target, &next_env, &next_visited, key, opt_site, depth + 1);
                                 return;
                             }
                         }
-                        try self.emitNullishSpecEnv(ta.target, null, visited, null, is_optional_site, depth + 1);
+                        try self.emitNullishSpecEnvMode(ta.target, null, visited, null, opt_site, depth + 1);
                         return;
                     }
                     const next_env = TypeParamEnv{
@@ -1357,12 +1528,12 @@ const ModuleEmitCtx = struct {
                         .args = dref.type_args,
                         .arg_env = env,
                     };
-                    try self.emitNullishSpecEnv(
+                    try self.emitNullishSpecEnvMode(
                         ta.target,
                         if (ta.type_params.len > 0) &next_env else null,
                         visited,
                         pending_id,
-                        is_optional_site,
+                        opt_site,
                         depth + 1,
                     );
                     return;
@@ -1514,7 +1685,15 @@ const ModuleEmitCtx = struct {
             .js_string => try self.out.appendSlice(self.allocator, "__zigar_js.String"),
             .binary_view => |bvk| try self.out.print(self.allocator, "__zigar_js.{s}", .{bvk.zigTypeIdent()}),
             .self_type => |sid| try self.emitIdentSegment(sid),
-            .type_param_ref => |tp_ident| try self.out.appendSlice(self.allocator, tp_ident),
+            .type_param_ref => |tp_ident| {
+                if (self.type_param_subst) |substs| {
+                    if (lookupTypeParamSubst(substs, tp_ident)) |sub_expr| {
+                        try self.out.appendSlice(self.allocator, sub_expr);
+                        return;
+                    }
+                }
+                try self.out.appendSlice(self.allocator, tp_ident);
+            },
             .optional => |opt| {
                 try self.out.append(self.allocator, '?');
                 try self.emitType(opt.child);
@@ -1537,6 +1716,72 @@ const ModuleEmitCtx = struct {
                 try self.emitType(m.key);
                 try self.out.appendSlice(self.allocator, ", ");
                 try self.emitType(m.value);
+                try self.out.append(self.allocator, ')');
+            },
+            .js_record => |r| {
+                try self.out.appendSlice(self.allocator, "__zigar_js.Record(");
+                try self.emitType(r.key);
+                try self.out.appendSlice(self.allocator, ", ");
+                try self.emitType(r.value);
+                try self.out.append(self.allocator, ')');
+            },
+            .mapped_values_op => |mv| {
+                if (mv.value.* != .type_param_ref and try self.typeNeedsNullishSpecEnv(mv.value, null, null, 0)) {
+                    try self.out.appendSlice(self.allocator, "__zigar_js.MappedValuesSpec(");
+                    try self.emitType(mv.target);
+                    try self.out.appendSlice(self.allocator, ", ");
+                    try self.emitType(mv.value);
+                    try self.out.appendSlice(self.allocator, ", ");
+                    try self.emitNullishSpecEnvMode(mv.value, null, null, null, .none, 0);
+                    try self.out.append(self.allocator, ')');
+                } else {
+                    try self.out.appendSlice(self.allocator, "__zigar_js.MappedValues(");
+                    try self.emitType(mv.target);
+                    try self.out.appendSlice(self.allocator, ", ");
+                    try self.emitType(mv.value);
+                    try self.out.append(self.allocator, ')');
+                }
+            },
+            .unary_type_op => |uo| {
+                try self.out.print(self.allocator, "__zigar_js.{s}(", .{uo.op.runtimeHelperName()});
+                try self.emitType(uo.operand);
+                try self.out.append(self.allocator, ')');
+            },
+            .key_filter_op => |kfo| {
+                try self.out.print(self.allocator, "__zigar_js.{s}(", .{kfo.kind.runtimeHelperName()});
+                try self.emitType(kfo.target);
+                try self.out.appendSlice(self.allocator, ", ");
+                switch (kfo.keys) {
+                    .str_lit => |s| try self.emitStringLit(s),
+                    .str_list => |list| {
+                        try self.out.appendSlice(self.allocator, "&.{ ");
+                        for (list, 0..) |s, idx| {
+                            if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
+                            try self.emitStringLit(s);
+                        }
+                        try self.out.appendSlice(self.allocator, " }");
+                    },
+                    .ty => |te| try self.emitType(te),
+                }
+                try self.out.append(self.allocator, ')');
+            },
+            .index_access_op => |iao| {
+                try self.out.appendSlice(self.allocator, "__zigar_js.IndexAccess(");
+                try self.emitType(iao.object_ty);
+                try self.out.appendSlice(self.allocator, ", ");
+                switch (iao.index_spec) {
+                    .str_lit => |s| try self.emitStringLit(s),
+                    .str_list => |list| {
+                        try self.out.appendSlice(self.allocator, "&.{ ");
+                        for (list, 0..) |s, idx| {
+                            if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
+                            try self.emitStringLit(s);
+                        }
+                        try self.out.appendSlice(self.allocator, " }");
+                    },
+                    .int_lit => |i| try self.out.print(self.allocator, "{d}", .{i}),
+                    .ty => |te| try self.emitType(te),
+                }
                 try self.out.append(self.allocator, ')');
             },
             .tuple => |elems| {
@@ -1925,11 +2170,41 @@ const ModuleEmitCtx = struct {
             } else {
                 try self.out.appendSlice(self.allocator, "null");
             }
+            try self.out.appendSlice(self.allocator, "), .infer_fn_name = @as(?[]const u8, ");
+            if (cand.infer_target_ident) |ifn| {
+                try self.emitStringLit(ifn);
+            } else {
+                try self.out.appendSlice(self.allocator, "null");
+            }
+            try self.out.appendSlice(self.allocator, "), .infer_alloc_fn_name = @as(?[]const u8, ");
+            if (cand.infer_alloc_target_ident) |iafn| {
+                try self.emitStringLit(iafn);
+            } else {
+                try self.out.appendSlice(self.allocator, "null");
+            }
             try self.out.print(
                 self.allocator,
-                "), .type_param_count = @as(usize, {d}), .has_this_param = {s}, .has_rest = {s}, .min_arity = @as(usize, {d}), .fixed_params = .{{ ",
+                "), .type_param_count = @as(usize, {d}), .tp_constraints = .{{ ",
+                .{csig.type_params.len},
+            );
+            for (csig.type_params, 0..) |tp, tpi| {
+                if (tpi > 0) try self.out.appendSlice(self.allocator, ", ");
+                if (tp.enforce_constraint) {
+                    if (tp.constraint) |ct| {
+                        if (!typeUsesAnyTypeParam(ct, csig.type_params)) {
+                            try self.out.appendSlice(self.allocator, "@as(?type, ");
+                            try self.emitType(ct);
+                            try self.out.append(self.allocator, ')');
+                            continue;
+                        }
+                    }
+                }
+                try self.out.appendSlice(self.allocator, "@as(?type, null)");
+            }
+            try self.out.print(
+                self.allocator,
+                " }}, .has_this_param = {s}, .has_rest = {s}, .min_arity = @as(usize, {d}), .fixed_params = .{{ ",
                 .{
-                    csig.type_params.len,
                     if (has_this) "true" else "false",
                     if (has_rest) "true" else "false",
                     min_arity,
@@ -1937,30 +2212,47 @@ const ModuleEmitCtx = struct {
             );
             var emitted_fp: usize = 0;
             if (csig.this_param) |thp| {
+                const gp = classifyOverloadGenericParam(thp.ty, csig.type_params);
                 try self.out.print(
                     self.allocator,
-                    ".{{ .kind = .typed, .nullable = {s}, .cb_arity = @as(?usize, null) }}",
+                    ".{{ .kind = .typed, .nullable = {s}, .cb_arity = @as(?usize, null), .tp_idx = ",
                     .{if (self.isResolvedOptional(thp.ty)) "true" else "false"},
                 );
+                if (gp.tp_idx) |tpi| {
+                    try self.out.print(self.allocator, "@as(?usize, {d})", .{tpi});
+                } else {
+                    try self.out.appendSlice(self.allocator, "@as(?usize, null)");
+                }
+                try self.out.print(self.allocator, ", .tp_mode = .{s} }}", .{@tagName(gp.mode)});
                 emitted_fp += 1;
             }
             for (csig.params[0..fixed_len]) |p| {
                 if (emitted_fp > 0) try self.out.appendSlice(self.allocator, ", ");
                 const nullable = p.is_optional or self.isResolvedOptional(p.ty);
                 const kind_str = if (p.callback_sig != null) ".callback" else ".typed";
+                const gp = if (p.callback_sig != null)
+                    lower_generics.OverloadGenericParamRef{}
+                else
+                    classifyOverloadGenericParam(p.ty, csig.type_params);
                 if (p.callback_sig) |cbs| {
                     const cb_arity = cbs.params.len + @intFromBool(cbs.this_param != null);
                     try self.out.print(
                         self.allocator,
-                        ".{{ .kind = {s}, .nullable = {s}, .cb_arity = @as(?usize, {d}) }}",
+                        ".{{ .kind = {s}, .nullable = {s}, .cb_arity = @as(?usize, {d}), .tp_idx = @as(?usize, null), .tp_mode = .none }}",
                         .{ kind_str, if (nullable) "true" else "false", cb_arity },
                     );
                 } else {
                     try self.out.print(
                         self.allocator,
-                        ".{{ .kind = {s}, .nullable = {s}, .cb_arity = @as(?usize, null) }}",
+                        ".{{ .kind = {s}, .nullable = {s}, .cb_arity = @as(?usize, null), .tp_idx = ",
                         .{ kind_str, if (nullable) "true" else "false" },
                     );
+                    if (gp.tp_idx) |tpi| {
+                        try self.out.print(self.allocator, "@as(?usize, {d})", .{tpi});
+                    } else {
+                        try self.out.appendSlice(self.allocator, "@as(?usize, null)");
+                    }
+                    try self.out.print(self.allocator, ", .tp_mode = .{s} }}", .{@tagName(gp.mode)});
                 }
                 emitted_fp += 1;
             }
@@ -1973,30 +2265,535 @@ const ModuleEmitCtx = struct {
         if (recv_opt) |rv| {
             try self.out.print(
                 self.allocator,
-                "{s}fn {s}({s}: {s}, __zigar_ov_args: anytype) __zigar_js.OverloadMethodReturn(@This(), {s}, {s}, if (@typeInfo(@TypeOf(__zigar_ov_args)) == .enum_literal) @TypeOf(.{{__zigar_ov_args}}) else @TypeOf(__zigar_ov_args), false) {{\nreturn __zigar_js.dispatchOverloadMethod(@This(), {s}, {s}, __zigar_ov_args, null);\n}}\n",
+                "{s}inline fn {s}({s}: {s}, __zigar_ov_args: anytype) __zigar_js.OverloadMethodReturn(@This(), {s}, {s}, if (@typeInfo(@TypeOf(__zigar_ov_args)) == .enum_literal) @TypeOf(.{{__zigar_ov_args}}) else @TypeOf(__zigar_ov_args), false) {{\nreturn __zigar_js.dispatchOverloadMethod(@This(), {s}, {s}, __zigar_ov_args, null);\n}}\n",
                 .{ pub_kw, od.zig_ident, rv.ident, rv.self_ty, rv.self_ty, spec_ident, rv.ident, spec_ident },
             );
             if (od.alloc_companion_ident) |alloc_disp_id| {
                 try self.out.print(
                     self.allocator,
-                    "{s}fn {s}({s}: {s}, {s}: @import(\"std\").mem.Allocator, __zigar_ov_args: anytype) __zigar_js.OverloadMethodReturn(@This(), {s}, {s}, if (@typeInfo(@TypeOf(__zigar_ov_args)) == .enum_literal) @TypeOf(.{{__zigar_ov_args}}) else @TypeOf(__zigar_ov_args), true) {{\nreturn __zigar_js.dispatchOverloadMethod(@This(), {s}, {s}, __zigar_ov_args, {s});\n}}\n",
+                    "{s}inline fn {s}({s}: {s}, {s}: @import(\"std\").mem.Allocator, __zigar_ov_args: anytype) __zigar_js.OverloadMethodReturn(@This(), {s}, {s}, if (@typeInfo(@TypeOf(__zigar_ov_args)) == .enum_literal) @TypeOf(.{{__zigar_ov_args}}) else @TypeOf(__zigar_ov_args), true) {{\nreturn __zigar_js.dispatchOverloadMethod(@This(), {s}, {s}, __zigar_ov_args, {s});\n}}\n",
                     .{ pub_kw, alloc_disp_id, rv.ident, rv.self_ty, od.alloc_param_ident, rv.self_ty, spec_ident, rv.ident, spec_ident, od.alloc_param_ident },
                 );
             }
         } else {
             try self.out.print(
                 self.allocator,
-                "{s}fn {s}(__zigar_ov_args: anytype) __zigar_js.OverloadReturn(@This(), {s}, if (@typeInfo(@TypeOf(__zigar_ov_args)) == .enum_literal) @TypeOf(.{{__zigar_ov_args}}) else @TypeOf(__zigar_ov_args), false) {{\nreturn __zigar_js.dispatchOverload(@This(), {s}, __zigar_ov_args, null);\n}}\n",
+                "{s}inline fn {s}(__zigar_ov_args: anytype) __zigar_js.OverloadReturn(@This(), {s}, if (@typeInfo(@TypeOf(__zigar_ov_args)) == .enum_literal) @TypeOf(.{{__zigar_ov_args}}) else @TypeOf(__zigar_ov_args), false) {{\nreturn __zigar_js.dispatchOverload(@This(), {s}, __zigar_ov_args, null);\n}}\n",
                 .{ pub_kw, od.zig_ident, spec_ident, spec_ident },
             );
             if (od.alloc_companion_ident) |alloc_disp_id| {
                 try self.out.print(
                     self.allocator,
-                    "{s}fn {s}({s}: @import(\"std\").mem.Allocator, __zigar_ov_args: anytype) __zigar_js.OverloadReturn(@This(), {s}, if (@typeInfo(@TypeOf(__zigar_ov_args)) == .enum_literal) @TypeOf(.{{__zigar_ov_args}}) else @TypeOf(__zigar_ov_args), true) {{\nreturn __zigar_js.dispatchOverload(@This(), {s}, __zigar_ov_args, {s});\n}}\n",
+                    "{s}inline fn {s}({s}: @import(\"std\").mem.Allocator, __zigar_ov_args: anytype) __zigar_js.OverloadReturn(@This(), {s}, if (@typeInfo(@TypeOf(__zigar_ov_args)) == .enum_literal) @TypeOf(.{{__zigar_ov_args}}) else @TypeOf(__zigar_ov_args), true) {{\nreturn __zigar_js.dispatchOverload(@This(), {s}, __zigar_ov_args, {s});\n}}\n",
                     .{ pub_kw, alloc_disp_id, od.alloc_param_ident, spec_ident, spec_ident, od.alloc_param_ident },
                 );
             }
         }
+    }
+
+    fn emitTypeParamsDocComments(self: *ModuleEmitCtx, tps: []const ir.TypeParamIr) error{OutOfMemory}!void {
+        for (tps) |tp| {
+            const ct_str: ?[]u8 = if (tp.constraint) |ct|
+                if (typeHasInlineNominal(ct)) null else try self.renderTypeToOwnedSlice(ct, null)
+            else
+                null;
+            defer if (ct_str) |s| self.allocator.free(s);
+
+            const def_str: ?[]u8 = if (tp.default_type) |dt|
+                if (typeHasInlineNominal(dt)) null else try self.renderTypeToOwnedSlice(dt, null)
+            else
+                null;
+            defer if (def_str) |s| self.allocator.free(s);
+
+            if (try lower_generics.formatTypeParamDocLine(
+                self.allocator,
+                tp.wire_name,
+                tp.is_const,
+                tp.variance,
+                ct_str,
+                def_str,
+            )) |doc_line| {
+                defer self.allocator.free(doc_line);
+                try self.out.print(self.allocator, "/// {s}\n", .{doc_line});
+            }
+        }
+    }
+
+    fn emitTypeParamConstraintChecks(self: *ModuleEmitCtx, tps: []const ir.TypeParamIr) error{OutOfMemory}!void {
+        var any = false;
+        for (tps) |tp| {
+            if (tp.enforce_constraint and tp.constraint != null) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) return;
+        try self.out.appendSlice(self.allocator, "comptime {\n");
+        for (tps) |tp| {
+            if (tp.enforce_constraint) {
+                if (tp.constraint) |ct| {
+                    try self.out.print(self.allocator, "__zigar_js.checkTypeConstraint({s}, ", .{tp.zig_ident});
+                    try self.emitType(ct);
+                    try self.out.appendSlice(self.allocator, ");\n");
+                }
+            }
+        }
+        try self.out.appendSlice(self.allocator, "}\n");
+    }
+
+    fn emitGenericTypeCompanions(
+        self: *ModuleEmitCtx,
+        pub_kw: []const u8,
+        primary_ident: []const u8,
+        default_ident_opt: ?[]const u8,
+        with_ident_opt: ?[]const u8,
+        tps: []const ir.TypeParamIr,
+    ) error{OutOfMemory}!void {
+        if (tps.len == 0) return;
+
+        if (default_ident_opt) |def_ident| {
+            var has_defs = try self.allocator.alloc(bool, tps.len);
+            defer self.allocator.free(has_defs);
+            for (tps, 0..) |tp, idx| has_defs[idx] = tp.default_type != null;
+            const dp = lower_generics.analyzeDefaultPrefix(has_defs);
+
+            try self.out.print(self.allocator, "{s}fn {s}(", .{ pub_kw, def_ident });
+            for (tps[0..dp.required_count], 0..) |tp, idx| {
+                if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
+                try self.out.print(self.allocator, "comptime {s}: type", .{tp.zig_ident});
+            }
+            try self.out.appendSlice(self.allocator, ") type {\n");
+            for (tps[dp.required_count..]) |tp| {
+                try self.out.print(self.allocator, "const {s} = ", .{tp.zig_ident});
+                if (tp.default_type) |dt| {
+                    try self.emitType(dt);
+                } else {
+                    try self.out.appendSlice(self.allocator, "__zigar_js.Any");
+                }
+                try self.out.appendSlice(self.allocator, ";\n");
+            }
+            try self.out.print(self.allocator, "return @This().{s}(", .{primary_ident});
+            for (tps, 0..) |tp, idx| {
+                if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
+                try self.out.appendSlice(self.allocator, tp.zig_ident);
+            }
+            try self.out.appendSlice(self.allocator, ");\n}\n");
+        }
+
+        if (with_ident_opt) |with_ident| {
+            const ov_ident = "__zigar_tp_overrides";
+            try self.out.print(self.allocator, "{s}fn {s}(comptime {s}: anytype) type {{\n@setEvalBranchQuota(200_000);\n", .{
+                pub_kw,
+                with_ident,
+                ov_ident,
+            });
+            for (tps) |tp| {
+                try self.out.print(self.allocator, "const {s} = if (@hasField(@TypeOf({s}), ", .{
+                    tp.zig_ident,
+                    ov_ident,
+                });
+                try self.emitStringLit(tp.wire_name);
+                if (tp.default_type) |dt| {
+                    try self.out.print(self.allocator, ") and @TypeOf(@field({s}, ", .{ov_ident});
+                    try self.emitStringLit(tp.wire_name);
+                    try self.out.print(self.allocator, ")) != @TypeOf(.from_default)) @field({s}, ", .{ov_ident});
+                    try self.emitStringLit(tp.wire_name);
+                    try self.out.appendSlice(self.allocator, ") else ");
+                    try self.emitType(dt);
+                } else {
+                    try self.out.print(self.allocator, ")) @field({s}, ", .{ov_ident});
+                    try self.emitStringLit(tp.wire_name);
+                    try self.out.appendSlice(self.allocator, ") else ");
+                    const err_msg = try std.fmt.allocPrint(
+                        self.allocator,
+                        "Missing required type parameter '.{s}' in {s}",
+                        .{ tp.wire_name, with_ident },
+                    );
+                    defer self.allocator.free(err_msg);
+                    try self.out.appendSlice(self.allocator, "@compileError(");
+                    try self.emitStringLit(err_msg);
+                    try self.out.append(self.allocator, ')');
+                }
+                try self.out.appendSlice(self.allocator, ";\n");
+            }
+            try self.out.print(self.allocator, "return @This().{s}(", .{primary_ident});
+            for (tps, 0..) |tp, idx| {
+                if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
+                try self.out.appendSlice(self.allocator, tp.zig_ident);
+            }
+            try self.out.appendSlice(self.allocator, ");\n}\n");
+        }
+    }
+
+    fn emitGenericSigCompanions(
+        self: *ModuleEmitCtx,
+        pub_kw: []const u8,
+        primary_ident: []const u8,
+        alloc_primary_ident_opt: ?[]const u8,
+        default_ident_opt: ?[]const u8,
+        default_alloc_ident_opt: ?[]const u8,
+        infer_ident_opt: ?[]const u8,
+        infer_alloc_ident_opt: ?[]const u8,
+        sig: ir.SignatureIr,
+        recv_opt: ?RecvSpec,
+        this_shared: SharedTypeHelper,
+        param_shared: []const SharedTypeHelper,
+        ret_shared: SharedTypeHelper,
+    ) error{OutOfMemory}!void {
+        const recv_id_only: ?[]const u8 = if (recv_opt) |rv| rv.ident else null;
+
+        if (default_ident_opt) |def_ident| {
+            const dp = sig.default_prefix;
+            {
+                var substs: std.ArrayList(TypeParamSubst) = .empty;
+                defer {
+                    for (substs.items) |s| self.allocator.free(s.expr);
+                    substs.deinit(self.allocator);
+                }
+
+                for (sig.type_params[dp.required_count..]) |tp| {
+                    const expr = if (tp.default_type) |dt|
+                        try self.renderTypeToOwnedSlice(dt, substs.items)
+                    else
+                        try self.allocator.dupe(u8, "__zigar_js.Any");
+                    errdefer self.allocator.free(expr);
+                    try substs.append(self.allocator, .{
+                        .zig_ident = tp.zig_ident,
+                        .expr = expr,
+                    });
+                }
+
+                const prev_subst = self.type_param_subst;
+                self.type_param_subst = substs.items;
+                defer self.type_param_subst = prev_subst;
+
+                try self.emitDefaultSigVariant(
+                    pub_kw,
+                    def_ident,
+                    primary_ident,
+                    null,
+                    sig,
+                    dp.required_count,
+                    recv_opt,
+                    recv_id_only,
+                    substs.items,
+                    this_shared,
+                    param_shared,
+                    ret_shared,
+                );
+
+                if (default_alloc_ident_opt) |def_alloc_id| {
+                    if (alloc_primary_ident_opt) |alloc_prim_id| {
+                        const alloc_param = sig.alloc_param_ident orelse "allocator";
+                        try self.emitDefaultSigVariant(
+                            pub_kw,
+                            def_alloc_id,
+                            alloc_prim_id,
+                            alloc_param,
+                            sig,
+                            dp.required_count,
+                            recv_opt,
+                            recv_id_only,
+                            substs.items,
+                            this_shared,
+                            param_shared,
+                            ret_shared,
+                        );
+                    }
+                }
+            }
+        }
+
+        if (infer_ident_opt) |inf_ident| {
+            if (sig.infer_bindings) |bindings| {
+                var substs: std.ArrayList(TypeParamSubst) = .empty;
+                defer {
+                    for (substs.items) |s| self.allocator.free(s.expr);
+                    substs.deinit(self.allocator);
+                }
+
+                for (sig.type_params, 0..) |tp, tp_idx| {
+                    const b = bindings[tp_idx];
+                    const expr: []u8 = switch (b.mode) {
+                        .from_default => if (tp.default_type) |dt|
+                            try self.renderTypeToOwnedSlice(dt, substs.items)
+                        else
+                            try self.allocator.dupe(u8, "__zigar_js.Any"),
+                        .direct => blk: {
+                            const p_ident = sig.params[b.param_index].zig_ident;
+                            const helper_fn = if (tp.is_const) "InferConstJsType" else "InferJsType";
+                            const base_expr = try std.fmt.allocPrint(
+                                self.allocator,
+                                "__zigar_js.{s}(@TypeOf({s}))",
+                                .{ helper_fn, p_ident },
+                            );
+                            if (tp.constraint) |ct| {
+                                if (!typeUsesAnyTypeParam(ct, sig.type_params[tp_idx..]) and !typeHasInlineNominal(ct)) {
+                                    defer self.allocator.free(base_expr);
+                                    const ct_rendered = try self.renderTypeToOwnedSlice(ct, substs.items);
+                                    defer self.allocator.free(ct_rendered);
+                                    break :blk try std.fmt.allocPrint(
+                                        self.allocator,
+                                        "(if (@typeInfo(@TypeOf({s})) == .enum_literal) ({s}) else {s})",
+                                        .{ p_ident, ct_rendered, base_expr },
+                                    );
+                                }
+                            }
+                            break :blk base_expr;
+                        },
+                        .slice_elem => try std.fmt.allocPrint(
+                            self.allocator,
+                            "__zigar_js.InferSliceElem(@TypeOf({s}))",
+                            .{sig.params[b.param_index].zig_ident},
+                        ),
+                        .promise_payload => try std.fmt.allocPrint(
+                            self.allocator,
+                            "__zigar_js.Awaited(@TypeOf({s}))",
+                            .{sig.params[b.param_index].zig_ident},
+                        ),
+                        .optional_child => blk: {
+                            const p_ident = sig.params[b.param_index].zig_ident;
+                            if (tp.default_type) |dt| {
+                                if (!typeUsesAnyTypeParam(dt, sig.type_params[tp_idx..]) and !typeHasInlineNominal(dt)) {
+                                    const dt_rendered = try self.renderTypeToOwnedSlice(dt, substs.items);
+                                    defer self.allocator.free(dt_rendered);
+                                    break :blk try std.fmt.allocPrint(
+                                        self.allocator,
+                                        "(if (@TypeOf({s}) == @TypeOf(null)) ({s}) else __zigar_js.InferOptionalChild(@TypeOf({s})))",
+                                        .{ p_ident, dt_rendered, p_ident },
+                                    );
+                                }
+                            }
+                            break :blk try std.fmt.allocPrint(
+                                self.allocator,
+                                "__zigar_js.InferOptionalChild(@TypeOf({s}))",
+                                .{p_ident},
+                            );
+                        },
+                    };
+                    errdefer self.allocator.free(expr);
+                    try substs.append(self.allocator, .{
+                        .zig_ident = tp.zig_ident,
+                        .expr = expr,
+                    });
+                }
+
+                const prev_subst = self.type_param_subst;
+                self.type_param_subst = substs.items;
+                defer self.type_param_subst = prev_subst;
+
+                try self.emitInferSigVariant(
+                    pub_kw,
+                    inf_ident,
+                    primary_ident,
+                    null,
+                    sig,
+                    recv_opt,
+                    recv_id_only,
+                    substs.items,
+                    this_shared,
+                    param_shared,
+                    ret_shared,
+                );
+
+                if (infer_alloc_ident_opt) |inf_alloc_id| {
+                    if (alloc_primary_ident_opt) |alloc_prim_id| {
+                        const alloc_param = sig.alloc_param_ident orelse "allocator";
+                        try self.emitInferSigVariant(
+                            pub_kw,
+                            inf_alloc_id,
+                            alloc_prim_id,
+                            alloc_param,
+                            sig,
+                            recv_opt,
+                            recv_id_only,
+                            substs.items,
+                            this_shared,
+                            param_shared,
+                            ret_shared,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn emitDefaultSigVariant(
+        self: *ModuleEmitCtx,
+        pub_kw: []const u8,
+        fn_ident: []const u8,
+        target_ident: []const u8,
+        alloc_param_opt: ?[]const u8,
+        sig: ir.SignatureIr,
+        req_tp_len: usize,
+        recv_opt: ?RecvSpec,
+        recv_id_only: ?[]const u8,
+        substs: []const TypeParamSubst,
+        this_shared: SharedTypeHelper,
+        param_shared: []const SharedTypeHelper,
+        ret_shared: SharedTypeHelper,
+    ) error{OutOfMemory}!void {
+        try self.out.print(self.allocator, "{s}fn {s}(", .{ pub_kw, fn_ident });
+        var pcount: usize = 0;
+        if (recv_opt) |rv| {
+            try self.out.print(self.allocator, "{s}: {s}", .{ rv.ident, rv.self_ty });
+            pcount += 1;
+        }
+        for (sig.type_params[0..req_tp_len]) |tp| {
+            if (pcount > 0) try self.out.appendSlice(self.allocator, ", ");
+            try self.out.print(self.allocator, "comptime {s}: type", .{tp.zig_ident});
+            pcount += 1;
+        }
+        if (alloc_param_opt) |ap| {
+            if (pcount > 0) try self.out.appendSlice(self.allocator, ", ");
+            try self.out.print(self.allocator, "{s}: @import(\"std\").mem.Allocator", .{ap});
+            pcount += 1;
+        }
+        if (sig.this_param) |thp| {
+            if (pcount > 0) try self.out.appendSlice(self.allocator, ", ");
+            try self.out.print(self.allocator, "{s}: ", .{thp.zig_ident});
+            try self.emitResolvedSharedType(thp.ty, sig, this_shared);
+            pcount += 1;
+        }
+        for (sig.params, 0..) |p, pi| {
+            if (pcount > 0) try self.out.appendSlice(self.allocator, ", ");
+            if (p.callback_sig != null or p.is_rest) {
+                try self.out.print(self.allocator, "{s}: anytype", .{p.zig_ident});
+            } else {
+                try self.out.print(self.allocator, "{s}: ", .{p.zig_ident});
+                try self.emitResolvedSharedType(p.ty, sig, param_shared[pi]);
+            }
+            pcount += 1;
+        }
+        try self.out.appendSlice(self.allocator, ") __zigar_js.CallError!");
+        try self.emitResolvedSharedType(sig.return_type, sig, ret_shared);
+        try self.out.print(self.allocator, " {{\nreturn @This().{s}(", .{target_ident});
+
+        var cidx: usize = 0;
+        if (recv_id_only) |rid| {
+            try self.out.appendSlice(self.allocator, rid);
+            cidx += 1;
+        }
+        for (sig.type_params[0..req_tp_len]) |tp| {
+            if (cidx > 0) try self.out.appendSlice(self.allocator, ", ");
+            try self.out.appendSlice(self.allocator, tp.zig_ident);
+            cidx += 1;
+        }
+        for (substs) |s| {
+            if (cidx > 0) try self.out.appendSlice(self.allocator, ", ");
+            try self.out.appendSlice(self.allocator, s.expr);
+            cidx += 1;
+        }
+        if (alloc_param_opt) |ap| {
+            if (cidx > 0) try self.out.appendSlice(self.allocator, ", ");
+            try self.out.appendSlice(self.allocator, ap);
+            cidx += 1;
+        }
+        if (sig.this_param) |thp| {
+            if (cidx > 0) try self.out.appendSlice(self.allocator, ", ");
+            try self.out.appendSlice(self.allocator, thp.zig_ident);
+            cidx += 1;
+        }
+        for (sig.params) |p| {
+            if (cidx > 0) try self.out.appendSlice(self.allocator, ", ");
+            try self.out.appendSlice(self.allocator, p.zig_ident);
+            cidx += 1;
+        }
+        try self.out.appendSlice(self.allocator, ");\n}\n");
+    }
+
+    fn emitInferSigVariant(
+        self: *ModuleEmitCtx,
+        pub_kw: []const u8,
+        fn_ident: []const u8,
+        target_ident: []const u8,
+        alloc_param_opt: ?[]const u8,
+        sig: ir.SignatureIr,
+        recv_opt: ?RecvSpec,
+        recv_id_only: ?[]const u8,
+        substs: []const TypeParamSubst,
+        this_shared: SharedTypeHelper,
+        param_shared: []const SharedTypeHelper,
+        ret_shared: SharedTypeHelper,
+    ) error{OutOfMemory}!void {
+        try self.out.print(self.allocator, "{s}fn {s}(", .{ pub_kw, fn_ident });
+        var pcount: usize = 0;
+        if (recv_opt) |rv| {
+            try self.out.print(self.allocator, "{s}: {s}", .{ rv.ident, rv.self_ty });
+            pcount += 1;
+        }
+        if (alloc_param_opt) |ap| {
+            if (pcount > 0) try self.out.appendSlice(self.allocator, ", ");
+            try self.out.print(self.allocator, "{s}: @import(\"std\").mem.Allocator", .{ap});
+            pcount += 1;
+        }
+        if (sig.this_param) |thp| {
+            if (pcount > 0) try self.out.appendSlice(self.allocator, ", ");
+            if (typeUsesAnyTypeParam(thp.ty, sig.type_params)) {
+                try self.out.print(self.allocator, "{s}: anytype", .{thp.zig_ident});
+            } else {
+                try self.out.print(self.allocator, "{s}: ", .{thp.zig_ident});
+                try self.emitResolvedSharedType(thp.ty, sig, this_shared);
+            }
+            pcount += 1;
+        }
+        for (sig.params, 0..) |p, pi| {
+            if (pcount > 0) try self.out.appendSlice(self.allocator, ", ");
+            if (p.callback_sig != null or p.is_rest or typeUsesAnyTypeParam(p.ty, sig.type_params)) {
+                try self.out.print(self.allocator, "{s}: anytype", .{p.zig_ident});
+            } else {
+                try self.out.print(self.allocator, "{s}: ", .{p.zig_ident});
+                try self.emitResolvedSharedType(p.ty, sig, param_shared[pi]);
+            }
+            pcount += 1;
+        }
+        try self.out.appendSlice(self.allocator, ") __zigar_js.CallError!");
+        try self.emitResolvedSharedType(sig.return_type, sig, ret_shared);
+        try self.out.print(self.allocator, " {{\nreturn @This().{s}(", .{target_ident});
+
+        var cidx: usize = 0;
+        if (recv_id_only) |rid| {
+            try self.out.appendSlice(self.allocator, rid);
+            cidx += 1;
+        }
+        for (substs) |s| {
+            if (cidx > 0) try self.out.appendSlice(self.allocator, ", ");
+            try self.out.appendSlice(self.allocator, s.expr);
+            cidx += 1;
+        }
+        if (alloc_param_opt) |ap| {
+            if (cidx > 0) try self.out.appendSlice(self.allocator, ", ");
+            try self.out.appendSlice(self.allocator, ap);
+            cidx += 1;
+        }
+        if (sig.this_param) |thp| {
+            if (cidx > 0) try self.out.appendSlice(self.allocator, ", ");
+            try self.out.appendSlice(self.allocator, thp.zig_ident);
+            cidx += 1;
+        }
+        for (sig.params) |p| {
+            if (cidx > 0) try self.out.appendSlice(self.allocator, ", ");
+            var is_const_tp_direct = false;
+            if (p.ty.* == .type_param_ref) {
+                for (sig.type_params) |tp| {
+                    if (tp.is_const and std.mem.eql(u8, tp.zig_ident, p.ty.type_param_ref)) {
+                        is_const_tp_direct = true;
+                        break;
+                    }
+                }
+            }
+            if (is_const_tp_direct) {
+                try self.out.print(
+                    self.allocator,
+                    "if (comptime __zigar_js.isConstArrayPtr(@TypeOf({s}))) {s}.* else {s}",
+                    .{ p.zig_ident, p.zig_ident, p.zig_ident },
+                );
+            } else {
+                try self.out.appendSlice(self.allocator, p.zig_ident);
+            }
+            cidx += 1;
+        }
+        try self.out.appendSlice(self.allocator, ");\n}\n");
     }
 
     fn emitPackedArgsPrologue(
@@ -2004,8 +2801,9 @@ const ModuleEmitCtx = struct {
         sig: ir.SignatureIr,
         is_slice_companion: bool,
     ) !void {
+        try self.emitTypeParamConstraintChecks(sig.type_params);
         for (sig.type_params) |tp| {
-            if (!emittedSigUsesTypeParam(sig, tp.zig_ident)) {
+            if (!emittedSigUsesTypeParam(sig, tp.zig_ident) and !typeParamsCheckUsesIdent(sig.type_params, tp.zig_ident)) {
                 try self.out.print(self.allocator, "_ = {s};\n", .{tp.zig_ident});
             }
         }
@@ -2178,46 +2976,54 @@ const ModuleEmitCtx = struct {
             self.ns_wire_path.items.len == 0 and
             (d.is_default_export or self.isExportEqualsRootDecl(d) or std.mem.eql(u8, d.wire_name, "default"));
 
-        var param_type_exprs = try self.allocator.alloc(?[]u8, sig.params.len);
-        @memset(param_type_exprs, null);
+        var param_shared = try self.allocator.alloc(SharedTypeHelper, sig.params.len);
+        @memset(param_shared, .{});
         defer {
-            for (param_type_exprs) |pte_opt| {
-                if (pte_opt) |buf| self.allocator.free(buf);
-            }
-            self.allocator.free(param_type_exprs);
+            for (param_shared) |psh| psh.deinit(self.allocator);
+            self.allocator.free(param_shared);
         }
 
-        var this_type_expr_opt: ?[]u8 = null;
-        defer if (this_type_expr_opt) |buf| self.allocator.free(buf);
+        var param_type_exprs = try self.allocator.alloc(?[]u8, sig.params.len);
+        @memset(param_type_exprs, null);
+        defer self.allocator.free(param_type_exprs);
+
+        var this_shared: SharedTypeHelper = .{};
+        defer this_shared.deinit(self.allocator);
 
         const has_any_companion = d.alloc_companion_ident != null or
             d.slice_companion_ident != null or
-            d.narrow_companion_ident != null;
+            d.narrow_companion_ident != null or
+            d.default_companion_ident != null or
+            d.infer_companion_ident != null;
 
         if (has_any_companion) {
             if (sig.this_param) |thp| {
                 if (typeHasInlineNominal(thp.ty)) {
-                    this_type_expr_opt = try self.emitSharedNominalTypeExpr(thp.ty, sig);
+                    this_shared = try self.emitSharedNominalTypeHelper(thp.ty, sig);
                 }
             }
             for (sig.params, 0..) |p, pi| {
                 if (p.callback_sig != null) continue;
                 if (typeHasInlineNominal(p.ty)) {
-                    param_type_exprs[pi] = try self.emitSharedNominalTypeExpr(p.ty, sig);
+                    param_shared[pi] = try self.emitSharedNominalTypeHelper(p.ty, sig);
+                    param_type_exprs[pi] = param_shared[pi].call_expr;
                 }
             }
         }
+        const this_type_expr_opt: ?[]u8 = this_shared.call_expr;
 
-        var ret_type_expr_opt: ?[]u8 = null;
-        defer if (ret_type_expr_opt) |buf| self.allocator.free(buf);
+        var ret_shared: SharedTypeHelper = .{};
+        defer ret_shared.deinit(self.allocator);
 
         if (typeHasInlineNominal(sig.return_type)) {
-            ret_type_expr_opt = try self.emitSharedNominalTypeExpr(sig.return_type, sig);
+            ret_shared = try self.emitSharedNominalTypeHelper(sig.return_type, sig);
         }
+        const ret_type_expr_opt: ?[]u8 = ret_shared.call_expr;
 
         if (d.jsdoc) |jd| {
             try appendJsDocComments(&self.out, self.allocator, jd);
         }
+        try self.emitTypeParamsDocComments(sig.type_params);
 
         try self.out.print(self.allocator, "{s}fn {s}(", .{ pub_kw, d.zig_ident });
         try self.emitSigHeaderParams(sig, null, null, this_type_expr_opt, param_type_exprs, false);
@@ -2297,6 +3103,21 @@ const ModuleEmitCtx = struct {
                 param_type_exprs,
             );
         }
+
+        try self.emitGenericSigCompanions(
+            pub_kw,
+            d.zig_ident,
+            d.alloc_companion_ident,
+            d.default_companion_ident,
+            d.default_alloc_companion_ident,
+            d.infer_companion_ident,
+            d.infer_alloc_companion_ident,
+            sig,
+            null,
+            this_shared,
+            param_shared,
+            ret_shared,
+        );
     }
 
     fn emitFieldDefaultValue(self: *ModuleEmitCtx, f: ir.FieldIr) error{OutOfMemory}!void {
@@ -2340,7 +3161,7 @@ const ModuleEmitCtx = struct {
         try self.out.print(self.allocator, ", .is_optional = {s}, .nullish = ", .{
             if (f.is_optional) "true" else "false",
         });
-        try self.emitNullishSpec(f.ty, f.is_optional);
+        try self.emitNullishSpecEnvMode(f.ty, null, null, null, if (f.is_optional) .preserve_null else .none, 0);
         if (f.literal_constraint) |lc| {
             switch (lc) {
                 .str => |s| {
@@ -2405,6 +3226,7 @@ const ModuleEmitCtx = struct {
         }
 
         if (ctor.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
+        try self.emitTypeParamsDocComments(sig.type_params);
 
         try self.out.print(self.allocator, "pub fn {s}(", .{ctor.zig_ident});
         try self.emitSigHeaderParams(sig, null, null, null, param_type_exprs, false);
@@ -2574,43 +3396,51 @@ const ModuleEmitCtx = struct {
             .{ .ident = recv_ident, .self_ty = st.self_ident };
         const recv_id_only: ?[]const u8 = if (m.is_static) null else recv_ident;
 
-        var param_type_exprs = try self.allocator.alloc(?[]u8, sig.params.len);
-        @memset(param_type_exprs, null);
+        var param_shared = try self.allocator.alloc(SharedTypeHelper, sig.params.len);
+        @memset(param_shared, .{});
         defer {
-            for (param_type_exprs) |pte_opt| {
-                if (pte_opt) |buf| self.allocator.free(buf);
-            }
-            self.allocator.free(param_type_exprs);
+            for (param_shared) |psh| psh.deinit(self.allocator);
+            self.allocator.free(param_shared);
         }
 
-        var this_type_expr_opt: ?[]u8 = null;
-        defer if (this_type_expr_opt) |buf| self.allocator.free(buf);
+        var param_type_exprs = try self.allocator.alloc(?[]u8, sig.params.len);
+        @memset(param_type_exprs, null);
+        defer self.allocator.free(param_type_exprs);
+
+        var this_shared: SharedTypeHelper = .{};
+        defer this_shared.deinit(self.allocator);
 
         const has_any_companion = m.alloc_companion_ident != null or
             m.slice_companion_ident != null or
-            m.narrow_companion_ident != null;
+            m.narrow_companion_ident != null or
+            m.default_companion_ident != null or
+            m.infer_companion_ident != null;
 
         if (has_any_companion) {
             if (sig.this_param) |thp| {
                 if (typeHasInlineNominal(thp.ty)) {
-                    this_type_expr_opt = try self.emitSharedNominalTypeExpr(thp.ty, sig);
+                    this_shared = try self.emitSharedNominalTypeHelper(thp.ty, sig);
                 }
             }
             for (sig.params, 0..) |p, pi| {
                 if (p.callback_sig != null) continue;
                 if (typeHasInlineNominal(p.ty)) {
-                    param_type_exprs[pi] = try self.emitSharedNominalTypeExpr(p.ty, sig);
+                    param_shared[pi] = try self.emitSharedNominalTypeHelper(p.ty, sig);
+                    param_type_exprs[pi] = param_shared[pi].call_expr;
                 }
             }
         }
+        const this_type_expr_opt: ?[]u8 = this_shared.call_expr;
 
-        var ret_type_expr_opt: ?[]u8 = null;
-        defer if (ret_type_expr_opt) |buf| self.allocator.free(buf);
+        var ret_shared: SharedTypeHelper = .{};
+        defer ret_shared.deinit(self.allocator);
         if (typeHasInlineNominal(sig.return_type)) {
-            ret_type_expr_opt = try self.emitSharedNominalTypeExpr(sig.return_type, sig);
+            ret_shared = try self.emitSharedNominalTypeHelper(sig.return_type, sig);
         }
+        const ret_type_expr_opt: ?[]u8 = ret_shared.call_expr;
 
         if (m.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
+        try self.emitTypeParamsDocComments(sig.type_params);
 
         try self.out.print(self.allocator, "pub fn {s}(", .{m.zig_ident});
         try self.emitSigHeaderParams(sig, recv_opt, null, this_type_expr_opt, param_type_exprs, false);
@@ -2730,6 +3560,21 @@ const ModuleEmitCtx = struct {
                 param_type_exprs,
             );
         }
+
+        try self.emitGenericSigCompanions(
+            "pub ",
+            m.zig_ident,
+            m.alloc_companion_ident,
+            m.default_companion_ident,
+            m.default_alloc_companion_ident,
+            m.infer_companion_ident,
+            m.infer_alloc_companion_ident,
+            sig,
+            recv_opt,
+            this_shared,
+            param_shared,
+            ret_shared,
+        );
     }
 
     fn emitStructInstanceProp(
@@ -3019,6 +3864,11 @@ const ModuleEmitCtx = struct {
         if (d.slice_alloc_companion_ident) |saci| try frame_list.append(allocator, saci);
         if (d.narrow_companion_ident) |nci| try frame_list.append(allocator, nci);
         if (d.narrow_alloc_companion_ident) |naci| try frame_list.append(allocator, naci);
+        if (d.default_companion_ident) |dci| try frame_list.append(allocator, dci);
+        if (d.default_alloc_companion_ident) |daci| try frame_list.append(allocator, daci);
+        if (d.with_companion_ident) |wci| try frame_list.append(allocator, wci);
+        if (d.infer_companion_ident) |ici| try frame_list.append(allocator, ici);
+        if (d.infer_alloc_companion_ident) |iaci| try frame_list.append(allocator, iaci);
     }
 
     fn emitStructBody(
@@ -3057,6 +3907,10 @@ const ModuleEmitCtx = struct {
             if (m.slice_alloc_companion_ident) |saci| try frame_list.append(self.allocator, saci);
             if (m.narrow_companion_ident) |nci| try frame_list.append(self.allocator, nci);
             if (m.narrow_alloc_companion_ident) |naci| try frame_list.append(self.allocator, naci);
+            if (m.default_companion_ident) |dci| try frame_list.append(self.allocator, dci);
+            if (m.default_alloc_companion_ident) |daci| try frame_list.append(self.allocator, daci);
+            if (m.infer_companion_ident) |ici| try frame_list.append(self.allocator, ici);
+            if (m.infer_alloc_companion_ident) |iaci| try frame_list.append(self.allocator, iaci);
         }
         for (st.method_dispatches) |md| {
             try frame_list.append(self.allocator, md.zig_ident);
@@ -3886,14 +4740,24 @@ const ModuleEmitCtx = struct {
                     try self.emitStructBody(d.wire_name, d.is_global_scope, is_default_cls, push_owner, st);
                     try self.out.appendSlice(self.allocator, ";\n");
                 } else {
+                    try self.emitTypeParamsDocComments(st.type_params);
                     try self.out.print(self.allocator, "{s}fn {s}(", .{ pub_kw, d.zig_ident });
                     for (st.type_params, 0..) |tp, idx| {
                         if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
                         try self.out.print(self.allocator, "comptime {s}: type", .{tp.zig_ident});
                     }
-                    try self.out.appendSlice(self.allocator, ") type {\nreturn ");
+                    try self.out.appendSlice(self.allocator, ") type {\n");
+                    try self.emitTypeParamConstraintChecks(st.type_params);
+                    try self.out.appendSlice(self.allocator, "return ");
                     try self.emitStructBody(d.wire_name, d.is_global_scope, is_default_cls, push_owner, st);
                     try self.out.appendSlice(self.allocator, ";\n}\n");
+                    try self.emitGenericTypeCompanions(
+                        pub_kw,
+                        d.zig_ident,
+                        d.default_companion_ident,
+                        d.with_companion_ident,
+                        st.type_params,
+                    );
                 }
             },
             .enum_decl => |en| {
@@ -3923,14 +4787,24 @@ const ModuleEmitCtx = struct {
                     try self.emitTaggedUnionBody(d.wire_name, &.{}, un.discriminant_prop, un.variants);
                     try self.out.appendSlice(self.allocator, ";\n");
                 } else {
+                    try self.emitTypeParamsDocComments(un.type_params);
                     try self.out.print(self.allocator, "{s}fn {s}(", .{ pub_kw, d.zig_ident });
                     for (un.type_params, 0..) |tp, idx| {
                         if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
                         try self.out.print(self.allocator, "comptime {s}: type", .{tp.zig_ident});
                     }
-                    try self.out.appendSlice(self.allocator, ") type {\nreturn ");
+                    try self.out.appendSlice(self.allocator, ") type {\n");
+                    try self.emitTypeParamConstraintChecks(un.type_params);
+                    try self.out.appendSlice(self.allocator, "return ");
                     try self.emitTaggedUnionBody(d.wire_name, un.type_params, un.discriminant_prop, un.variants);
                     try self.out.appendSlice(self.allocator, ";\n}\n");
+                    try self.emitGenericTypeCompanions(
+                        pub_kw,
+                        d.zig_ident,
+                        d.default_companion_ident,
+                        d.with_companion_ident,
+                        un.type_params,
+                    );
                 }
             },
             .type_alias => |ta| {
@@ -3939,20 +4813,29 @@ const ModuleEmitCtx = struct {
                     try self.emitType(ta.target);
                     try self.out.appendSlice(self.allocator, ";\n");
                 } else {
+                    try self.emitTypeParamsDocComments(ta.type_params);
                     try self.out.print(self.allocator, "{s}fn {s}(", .{ pub_kw, d.zig_ident });
                     for (ta.type_params, 0..) |tp, idx| {
                         if (idx > 0) try self.out.appendSlice(self.allocator, ", ");
                         try self.out.print(self.allocator, "comptime {s}: type", .{tp.zig_ident});
                     }
                     try self.out.appendSlice(self.allocator, ") type {\n");
+                    try self.emitTypeParamConstraintChecks(ta.type_params);
                     for (ta.type_params) |tp| {
-                        if (!typeUsesTypeParam(ta.target, tp.zig_ident)) {
+                        if (!typeUsesTypeParam(ta.target, tp.zig_ident) and !typeParamsCheckUsesIdent(ta.type_params, tp.zig_ident)) {
                             try self.out.print(self.allocator, "_ = {s};\n", .{tp.zig_ident});
                         }
                     }
                     try self.out.appendSlice(self.allocator, "return ");
                     try self.emitType(ta.target);
                     try self.out.appendSlice(self.allocator, ";\n}\n");
+                    try self.emitGenericTypeCompanions(
+                        pub_kw,
+                        d.zig_ident,
+                        d.default_companion_ident,
+                        d.with_companion_ident,
+                        ta.type_params,
+                    );
                 }
             },
             .namespace_decl => |ns| {
@@ -4051,6 +4934,13 @@ fn typeHasInlineNominal(ty: *const ir.TypeIr) bool {
         .optional => |opt| typeHasInlineNominal(opt.child),
         .pointer_const, .slice, .promise => |inner| typeHasInlineNominal(inner),
         .js_map => |m| typeHasInlineNominal(m.key) or typeHasInlineNominal(m.value),
+        .js_record => |r| typeHasInlineNominal(r.key) or typeHasInlineNominal(r.value),
+        .mapped_values_op => |mv| typeHasInlineNominal(mv.target) or typeHasInlineNominal(mv.value),
+        .unary_type_op => |uo| typeHasInlineNominal(uo.operand),
+        .key_filter_op => |kfo| typeHasInlineNominal(kfo.target) or
+            (kfo.keys == .ty and typeHasInlineNominal(kfo.keys.ty)),
+        .index_access_op => |iao| typeHasInlineNominal(iao.object_ty) or
+            (iao.index_spec == .ty and typeHasInlineNominal(iao.index_spec.ty)),
         .fn_ptr => |fp| blk: {
             if (fp.this_param) |thp_ty| {
                 if (typeHasInlineNominal(thp_ty)) break :blk true;
@@ -4070,6 +4960,68 @@ fn typeHasInlineNominal(ty: *const ir.TypeIr) bool {
     };
 }
 
+fn classifyOverloadGenericParam(
+    ty: *const ir.TypeIr,
+    tps: []const ir.TypeParamIr,
+) lower_generics.OverloadGenericParamRef {
+    switch (ty.*) {
+        .type_param_ref => |ref_id| {
+            for (tps, 0..) |tp, idx| {
+                if (std.mem.eql(u8, tp.zig_ident, ref_id)) {
+                    return .{ .tp_idx = idx, .mode = .direct };
+                }
+            }
+        },
+        .optional => |opt| {
+            if (opt.child.* == .type_param_ref) {
+                for (tps, 0..) |tp, idx| {
+                    if (std.mem.eql(u8, tp.zig_ident, opt.child.type_param_ref)) {
+                        return .{ .tp_idx = idx, .mode = .optional_child };
+                    }
+                }
+            }
+        },
+        .slice => |elem_ty| {
+            if (elem_ty.* == .type_param_ref) {
+                for (tps, 0..) |tp, idx| {
+                    if (std.mem.eql(u8, tp.zig_ident, elem_ty.type_param_ref)) {
+                        return .{ .tp_idx = idx, .mode = .slice_elem };
+                    }
+                }
+            }
+        },
+        .promise => |prom_ty| {
+            if (prom_ty.* == .type_param_ref) {
+                for (tps, 0..) |tp, idx| {
+                    if (std.mem.eql(u8, tp.zig_ident, prom_ty.type_param_ref)) {
+                        return .{ .tp_idx = idx, .mode = .promise_payload };
+                    }
+                }
+            }
+        },
+        else => {},
+    }
+    return .{};
+}
+
+fn typeUsesAnyTypeParam(ty: *const ir.TypeIr, tps: []const ir.TypeParamIr) bool {
+    for (tps) |tp| {
+        if (typeUsesTypeParam(ty, tp.zig_ident)) return true;
+    }
+    return false;
+}
+
+fn typeParamsCheckUsesIdent(tps: []const ir.TypeParamIr, tp_ident: []const u8) bool {
+    for (tps) |tp| {
+        if (!tp.enforce_constraint) continue;
+        if (tp.constraint) |ct| {
+            if (std.mem.eql(u8, tp.zig_ident, tp_ident)) return true;
+            if (typeUsesTypeParam(ct, tp_ident)) return true;
+        }
+    }
+    return false;
+}
+
 fn emittedSigUsesTypeParam(sig: ir.SignatureIr, tp_ident: []const u8) bool {
     if (sig.this_param) |thp| {
         if (typeUsesTypeParam(thp.ty, tp_ident)) return true;
@@ -4087,6 +5039,13 @@ fn typeUsesTypeParam(ty: *const ir.TypeIr, tp_ident: []const u8) bool {
         .optional => |opt| typeUsesTypeParam(opt.child, tp_ident),
         .pointer_const, .slice, .promise => |inner| typeUsesTypeParam(inner, tp_ident),
         .js_map => |m| typeUsesTypeParam(m.key, tp_ident) or typeUsesTypeParam(m.value, tp_ident),
+        .js_record => |r| typeUsesTypeParam(r.key, tp_ident) or typeUsesTypeParam(r.value, tp_ident),
+        .mapped_values_op => |mv| typeUsesTypeParam(mv.target, tp_ident) or typeUsesTypeParam(mv.value, tp_ident),
+        .unary_type_op => |uo| typeUsesTypeParam(uo.operand, tp_ident),
+        .key_filter_op => |kfo| typeUsesTypeParam(kfo.target, tp_ident) or
+            (kfo.keys == .ty and typeUsesTypeParam(kfo.keys.ty, tp_ident)),
+        .index_access_op => |iao| typeUsesTypeParam(iao.object_ty, tp_ident) or
+            (iao.index_spec == .ty and typeUsesTypeParam(iao.index_spec.ty, tp_ident)),
         .tuple => |elems| blk: {
             for (elems) |el| {
                 if (typeUsesTypeParam(el.ty, tp_ident)) break :blk true;
@@ -4359,6 +5318,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    return union(enum) {
         \\        pub const is_zigar_nullable = true;
         \\        pub const Payload = T;
+        \\        pub const Value = T;
         \\
         \\        undefined: void,
         \\        null: void,
@@ -4572,6 +5532,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\pub const StubBigInt = extern struct {
         \\    const Self = @This();
         \\    pub const is_js_value = true;
+        \\    pub const is_js_bigint = true;
         \\
         \\    handle: u32 = 0,
         \\
@@ -4651,6 +5612,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    return extern struct {
         \\        const Self = @This();
         \\        pub const Payload = T;
+        \\        pub const is_js_promise = true;
         \\        pub const is_js_value = true;
         \\
         \\        handle: u32 = 0,
@@ -4666,7 +5628,9 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\pub fn StubArray(comptime T: type) type {
         \\    return extern struct {
         \\        const Self = @This();
+        \\        pub const Element = T;
         \\        pub const Elem = T;
+        \\        pub const is_js_array = true;
         \\        pub const is_js_value = true;
         \\
         \\        handle: u32 = 0,
@@ -4712,6 +5676,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\        const Self = @This();
         \\        pub const Key = K;
         \\        pub const Value = V;
+        \\        pub const is_js_map = true;
         \\        pub const is_js_value = true;
         \\
         \\        handle: u32 = 0,
@@ -4727,7 +5692,9 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\pub fn StubSet(comptime T: type) type {
         \\    return extern struct {
         \\        const Self = @This();
+        \\        pub const Element = T;
         \\        pub const Elem = T;
+        \\        pub const is_js_set = true;
         \\        pub const is_js_value = true;
         \\
         \\        handle: u32 = 0,
@@ -4741,10 +5708,14 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\}
         \\
         \\pub fn StubRecord(comptime K: type, comptime V: type) type {
+        \\    if (@typeInfo(K) == .@"enum" and @typeInfo(K).@"enum".mode == .exhaustive) {
+        \\        return standaloneEnumRecord(K, V);
+        \\    }
         \\    return extern struct {
         \\        const Self = @This();
         \\        pub const Key = K;
         \\        pub const Value = V;
+        \\        pub const is_js_record = true;
         \\        pub const is_js_value = true;
         \\
         \\        handle: u32 = 0,
@@ -4824,6 +5795,25 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\pub const Iterator = if (has_host) raw_js.Iterator else StubIterator;
         \\pub const AsyncIterator = if (has_host) raw_js.AsyncIterator else StubAsyncIterator;
         \\pub const JsException = if (has_host) raw_js.JsException else StubJsException;
+        \\pub const Partial = if (has_host) raw_js.Partial else standalonePartial;
+        \\pub const Required = if (has_host) raw_js.Required else standaloneRequired;
+        \\pub const Readonly = if (has_host) raw_js.Readonly else standaloneReadonly;
+        \\pub const Pick = if (has_host) raw_js.Pick else standalonePick;
+        \\pub const Omit = if (has_host) raw_js.Omit else standaloneOmit;
+        \\pub const EnumRecord = if (has_host) raw_js.EnumRecord else standaloneEnumRecord;
+        \\pub const NonNullable = if (has_host) raw_js.NonNullable else standaloneNonNullable;
+        \\pub const Awaited = if (has_host) raw_js.Awaited else standaloneAwaited;
+        \\pub const KeyOf = if (has_host) raw_js.KeyOf else standaloneKeyOf;
+        \\pub const MappedValues = if (has_host) raw_js.MappedValues else standaloneMappedValues;
+        \\pub const MappedValuesSpec = if (has_host) raw_js.MappedValuesSpec else standaloneMappedValuesSpec;
+        \\pub const IndexAccess = if (has_host) raw_js.IndexAccess else standaloneIndexAccess;
+        \\pub const InferJsType = if (has_host) raw_js.InferJsType else standaloneInferJsType;
+        \\pub const InferConstJsType = if (has_host) raw_js.InferConstJsType else standaloneInferConstJsType;
+        \\pub const isConstArrayPtr = if (has_host) raw_js.isConstArrayPtr else standaloneIsConstArrayPtr;
+        \\pub const InferSliceElem = if (has_host) raw_js.InferSliceElem else standaloneInferSliceElem;
+        \\pub const InferOptionalChild = if (has_host) raw_js.InferOptionalChild else standaloneInferOptionalChild;
+        \\pub const satisfiesTypeConstraint = if (has_host) raw_js.satisfiesTypeConstraint else standaloneSatisfiesTypeConstraint;
+        \\pub const checkTypeConstraint = if (has_host) raw_js.checkTypeConstraint else standaloneCheckTypeConstraint;
         \\
         \\pub fn activeHandleCount() u32 {
         \\    if (has_host) return raw_js.activeHandleCount();
@@ -4922,6 +5912,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    if (has_host) return raw_js.needsDecodeAllocator(T);
         \\    return switch (@typeInfo(T)) {
         \\        .optional => |opt| needsDecodeAllocator(opt.child),
+        \\        .array => |ar| needsDecodeAllocator(ar.child),
         \\        .pointer => |pt| switch (pt.size) {
         \\            .slice => true,
         \\            .one => @typeInfo(pt.child) != .@"fn",
@@ -4953,6 +5944,9 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\        .optional => |opt| {
         \\            if (value) |v| freeDecoded(opt.child, allocator, v);
         \\        },
+        \\        .array => |ar| {
+        \\            for (value) |elem| freeDecoded(ar.child, allocator, elem);
+        \\        },
         \\        .pointer => |pt| switch (pt.size) {
         \\            .slice => {
         \\                if (pt.child != u8) {
@@ -4961,7 +5955,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                allocator.free(value);
         \\            },
         \\            .one => {
-        \\                if (@typeInfo(pt.child) != .@"fn") {
+        \\                if (comptime (@typeInfo(pt.child) != .@"fn")) {
         \\                    freeDecoded(pt.child, allocator, value.*);
         \\                    allocator.destroy(value);
         \\                }
@@ -4969,7 +5963,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\            else => {},
         \\        },
         \\        .@"struct" => |st| {
-        \\            if ((@hasDecl(T, "is_js_value") and T.is_js_value) or isGeneratedHandleStruct(T)) {
+        \\            if (comptime ((@hasDecl(T, "is_js_value") and T.is_js_value) or isGeneratedHandleStruct(T))) {
         \\                value.deinit();
         \\                return;
         \\            }
@@ -6989,6 +7983,60 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    return dummyForType(FT);
         \\}
         \\
+        \\fn candidateUsesExplicitTypeParams(comptime cand: anytype, comptime TupT: type) bool {
+        \\    const tp_n: usize = cand.type_param_count;
+        \\    if (tp_n == 0) return false;
+        \\    const tst = @typeInfo(TupT).@"struct";
+        \\    if (tst.field_types.len < tp_n) return false;
+        \\    inline for (0..tp_n) |ti| {
+        \\        if (tst.field_types[ti] != type or !tst.field_attrs[ti].@"comptime") return false;
+        \\    }
+        \\    return true;
+        \\}
+        \\
+        \\fn tryInferOverloadParamType(
+        \\    comptime mode: anytype,
+        \\    comptime ArgT: type,
+        \\    comptime arg_attr: std.builtin.Type.Struct.FieldAttributes,
+        \\    comptime nullable: bool,
+        \\    comptime ConstraintOpt: ?type,
+        \\) ?type {
+        \\    return switch (mode) {
+        \\        .none => null,
+        \\        .direct => blk: {
+        \\            if (ArgT == @TypeOf(null) and !nullable) break :blk null;
+        \\            if (@typeInfo(ArgT) == .enum_literal) {
+        \\                if (ConstraintOpt) |CT| {
+        \\                    if (argMatchTier(CT, ArgT, arg_attr) != .none) break :blk CT;
+        \\                    break :blk null;
+        \\                }
+        \\                break :blk Any;
+        \\            }
+        \\            break :blk InferJsType(ArgT);
+        \\        },
+        \\        .optional_child => blk: {
+        \\            if (ArgT == @TypeOf(null)) break :blk Any;
+        \\            break :blk InferOptionalChild(ArgT);
+        \\        },
+        \\        .slice_elem => switch (@typeInfo(ArgT)) {
+        \\            .pointer => |p| if (p.size == .slice)
+        \\                p.child
+        \\            else if (p.size == .one and @typeInfo(p.child) == .array)
+        \\                @typeInfo(p.child).array.child
+        \\            else
+        \\                null,
+        \\            .array => |a| a.child,
+        \\            else => null,
+        \\        },
+        \\        .promise_payload => if (@typeInfo(ArgT) == .@"struct" and
+        \\            @hasDecl(ArgT, "is_js_promise") and ArgT.is_js_promise and @hasDecl(ArgT, "Payload"))
+        \\            ArgT.Payload
+        \\        else
+        \\            null,
+        \\        else => null,
+        \\    };
+        \\}
+        \\
         \\fn candidateScore(
         \\    comptime Owner: type,
         \\    comptime has_self: bool,
@@ -6997,11 +8045,23 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\) ?usize {
         \\    const tst = @typeInfo(TupT).@"struct";
         \\    const tp_n: usize = cand.type_param_count;
-        \\    if (tst.field_types.len < tp_n) return null;
-        \\    inline for (0..tp_n) |ti| {
-        \\        if (tst.field_types[ti] != type or !tst.field_attrs[ti].@"comptime") return null;
+        \\    const explicit_tps = candidateUsesExplicitTypeParams(cand, TupT);
+        \\    if (tp_n > 0 and !explicit_tps) {
+        \\        if (!@hasField(@TypeOf(cand), "infer_fn_name") or cand.infer_fn_name == null) return null;
         \\    }
-        \\    const val_argc: usize = tst.field_types.len - tp_n;
+        \\    const eff_tp_n: usize = if (explicit_tps) tp_n else 0;
+        \\    if (explicit_tps) {
+        \\        inline for (0..tp_n) |ti| {
+        \\            if (@hasField(@TypeOf(cand), "tp_constraints") and ti < cand.tp_constraints.len) {
+        \\                if (cand.tp_constraints[ti]) |ConstraintT| {
+        \\                    if (tst.field_attrs[ti].defaultValue(type)) |TpT| {
+        \\                        if (!satisfiesTypeConstraint(TpT, ConstraintT, 0)) return null;
+        \\                    }
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\    const val_argc: usize = tst.field_types.len - eff_tp_n;
         \\    const fixed_len: usize = cand.fixed_params.len;
         \\    if (val_argc < cand.min_arity) return null;
         \\    if (!cand.has_rest and val_argc > fixed_len) return null;
@@ -7011,10 +8071,12 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    const param_base: usize = @intFromBool(has_self) + tp_n;
         \\
         \\    comptime var score: usize = 1000;
+        \\    const deduced_cap = if (tp_n > 0) tp_n else 1;
+        \\    comptime var deduced_tps: [deduced_cap]?type = @splat(null);
         \\    const check_fixed = @min(val_argc, fixed_len);
         \\    inline for (0..check_fixed) |fi| {
-        \\        const ArgT = tst.field_types[tp_n + fi];
-        \\        const arg_attr = tst.field_attrs[tp_n + fi];
+        \\        const ArgT = tst.field_types[eff_tp_n + fi];
+        \\        const arg_attr = tst.field_attrs[eff_tp_n + fi];
         \\        const pspec = cand.fixed_params[fi];
         \\        if (pspec.kind == .callback) {
         \\            if (ArgT == @TypeOf(null)) {
@@ -7033,6 +8095,46 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                    .coerced => score += 10,
         \\                    .none => return null,
         \\                }
+        \\            } else if (@hasField(@TypeOf(pspec), "tp_idx") and pspec.tp_idx != null) {
+        \\                const tp_i = pspec.tp_idx.?;
+        \\                const ConstraintOpt: ?type = if (@hasField(@TypeOf(cand), "tp_constraints") and tp_i < cand.tp_constraints.len)
+        \\                    cand.tp_constraints[tp_i]
+        \\                else
+        \\                    null;
+        \\                if (explicit_tps) {
+        \\                    if (tst.field_attrs[tp_i].defaultValue(type)) |TpT| {
+        \\                        const ExpectedT = switch (pspec.tp_mode) {
+        \\                            .optional_child => if (@typeInfo(TpT) == .optional) TpT else ?TpT,
+        \\                            .slice_elem => []const TpT,
+        \\                            .promise_payload => Promise(TpT),
+        \\                            else => TpT,
+        \\                        };
+        \\                        switch (argMatchTier(ExpectedT, ArgT, arg_attr)) {
+        \\                            .literal_exact => score += 25,
+        \\                            .exact => score += 20,
+        \\                            .coerced => score += 10,
+        \\                            .none => return null,
+        \\                        }
+        \\                    } else {
+        \\                        score += 15;
+        \\                    }
+        \\                } else {
+        \\                    const DeducedT = tryInferOverloadParamType(pspec.tp_mode, ArgT, arg_attr, pspec.nullable, ConstraintOpt) orelse return null;
+        \\                    if (ConstraintOpt) |ConstraintT| {
+        \\                        if (!satisfiesTypeConstraint(DeducedT, ConstraintT, 0)) return null;
+        \\                    }
+        \\                    if (deduced_tps[tp_i]) |PrevT| {
+        \\                        if (PrevT != DeducedT and
+        \\                            argMatchTier(PrevT, DeducedT, arg_attr) == .none and
+        \\                            argMatchTier(DeducedT, PrevT, .{}) == .none)
+        \\                        {
+        \\                            return null;
+        \\                        }
+        \\                    } else {
+        \\                        deduced_tps[tp_i] = DeducedT;
+        \\                    }
+        \\                    score += if (ConstraintOpt != null) 14 else 12;
+        \\                }
         \\            } else {
         \\                score += 15;
         \\            }
@@ -7047,12 +8149,12 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                const ElemT = SliceElem(RestSliceT);
         \\                if (ElemT == Any or ElemT == Unknown) {
         \\                    score += (val_argc - fixed_len) * 2;
-        \\                } else if (val_argc == fixed_len + 1 and argMatchTier(RestSliceT, tst.field_types[tp_n + fixed_len], tst.field_attrs[tp_n + fixed_len]) != .none) {
+        \\                } else if (val_argc == fixed_len + 1 and argMatchTier(RestSliceT, tst.field_types[eff_tp_n + fixed_len], tst.field_attrs[eff_tp_n + fixed_len]) != .none) {
         \\                    score += 15;
         \\                } else {
         \\                    inline for (fixed_len..val_argc) |ri| {
-        \\                        const RArgT = tst.field_types[tp_n + ri];
-        \\                        switch (argMatchTier(ElemT, RArgT, tst.field_attrs[tp_n + ri])) {
+        \\                        const RArgT = tst.field_types[eff_tp_n + ri];
+        \\                        switch (argMatchTier(ElemT, RArgT, tst.field_attrs[eff_tp_n + ri])) {
         \\                            .literal_exact => score += 6,
         \\                            .exact => score += 5,
         \\                            .coerced => score += 2,
@@ -7077,6 +8179,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    comptime specs: anytype,
         \\    comptime TupT: type,
         \\) usize {
+        \\    @setEvalBranchQuota(200_000);
         \\    comptime var best_idx: ?usize = null;
         \\    comptime var best_score: usize = 0;
         \\    inline for (0..specs.len) |ci| {
@@ -7090,10 +8193,58 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    return best_idx orelse @compileError("No overload of " ++ @typeName(Owner) ++ " matches argument types " ++ @typeName(TupT));
         \\}
         \\
-        \\fn packRestStep(prefix: anytype, tup: anytype, comptime idx: usize) PackRestStepType(@TypeOf(prefix), @TypeOf(tup), idx) {
+        \\inline fn packRestStep(prefix: anytype, tup: anytype, comptime idx: usize) PackRestStepType(@TypeOf(prefix), @TypeOf(tup), idx) {
         \\    const tst = @typeInfo(@TypeOf(tup)).@"struct";
         \\    if (comptime idx >= tst.field_types.len) return prefix;
+        \\    if (comptime tst.field_attrs[idx].@"comptime") {
+        \\        const cv = comptime readComptimeDefault(tst.field_types[idx], tst.field_attrs[idx]);
+        \\        return packRestStep(prefix ++ .{cv}, tup, idx + 1);
+        \\    }
         \\    return packRestStep(prefix ++ .{tup[idx]}, tup, idx + 1);
+        \\}
+        \\
+        \\fn tupleHasComptimeField(comptime TupT: type) bool {
+        \\    const st = @typeInfo(TupT).@"struct";
+        \\    for (st.field_attrs) |attr| {
+        \\        if (attr.@"comptime") return true;
+        \\    }
+        \\    return false;
+        \\}
+        \\
+        \\fn AppendRuntimeTupleElem(comptime PrefixT: type, comptime ElemT: type) type {
+        \\    if (!tupleHasComptimeField(PrefixT) and !isComptimeOnlyArgType(ElemT)) {
+        \\        const Probe = struct {
+        \\            fn f(p: PrefixT, e: ElemT) @TypeOf(p ++ .{e}) {
+        \\                unreachable;
+        \\            }
+        \\        };
+        \\        return @typeInfo(@TypeOf(Probe.f)).@"fn".return_type.?;
+        \\    }
+        \\    return @TypeOf(dummyForType(PrefixT) ++ .{dummyForType(ElemT)});
+        \\}
+        \\
+        \\fn AppendComptimeTupleElem(comptime PrefixT: type, comptime cv: anytype) type {
+        \\    if (!tupleHasComptimeField(PrefixT)) {
+        \\        const Probe = struct {
+        \\            fn f(p: PrefixT) @TypeOf(p ++ .{cv}) {
+        \\                unreachable;
+        \\            }
+        \\        };
+        \\        return @typeInfo(@TypeOf(Probe.f)).@"fn".return_type.?;
+        \\    }
+        \\    return @TypeOf(dummyForType(PrefixT) ++ .{cv});
+        \\}
+        \\
+        \\fn ReturnTypeOfTupleCall(comptime Fn: anytype, comptime CallTupT: type) type {
+        \\    if (!tupleHasComptimeField(CallTupT)) {
+        \\        const Probe = struct {
+        \\            fn f(t: CallTupT) @TypeOf(@call(.auto, Fn, t)) {
+        \\                unreachable;
+        \\            }
+        \\        };
+        \\        return @typeInfo(@TypeOf(Probe.f)).@"fn".return_type.?;
+        \\    }
+        \\    return @TypeOf(@call(.auto, Fn, dummyForType(CallTupT)));
         \\}
         \\
         \\fn PackRestStepType(comptime PrefixT: type, comptime TupT: type, comptime idx: usize) type {
@@ -7103,9 +8254,9 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    const attr = tst.field_attrs[idx];
         \\    if (attr.@"comptime") {
         \\        const cv = readComptimeDefault(FT, attr);
-        \\        return PackRestStepType(@TypeOf(dummyForType(PrefixT) ++ .{cv}), TupT, idx + 1);
+        \\        return PackRestStepType(AppendComptimeTupleElem(PrefixT, cv), TupT, idx + 1);
         \\    }
-        \\    return PackRestStepType(@TypeOf(dummyForType(PrefixT) ++ .{dummyForType(FT)}), TupT, idx + 1);
+        \\    return PackRestStepType(AppendRuntimeTupleElem(PrefixT, FT), TupT, idx + 1);
         \\}
         \\
         \\fn BuildCallTupleType(
@@ -7119,7 +8270,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    comptime PrefixT: type,
         \\) type {
         \\    const tst = @typeInfo(TupT).@"struct";
-        \\    const tp_n: usize = cand.type_param_count;
+        \\    const tp_n: usize = if (candidateUsesExplicitTypeParams(cand, TupT)) cand.type_param_count else 0;
         \\    const fixed_len: usize = cand.fixed_params.len;
         \\    const val_argc: usize = tst.field_types.len - tp_n;
         \\    const target_params = @typeInfo(@TypeOf(TargetFn)).@"fn".param_types;
@@ -7127,10 +8278,10 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\
         \\    if (stage < tp_n) {
         \\        const cv = readComptimeDefault(type, tst.field_attrs[stage]);
-        \\        return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, @TypeOf(dummyForType(PrefixT) ++ .{cv}));
+        \\        return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, AppendComptimeTupleElem(PrefixT, cv));
         \\    }
         \\    if (pass_alloc and stage == tp_n) {
-        \\        return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, @TypeOf(dummyForType(PrefixT) ++ .{@as(std.mem.Allocator, undefined)}));
+        \\        return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, AppendRuntimeTupleElem(PrefixT, std.mem.Allocator));
         \\    }
         \\    const fi: usize = stage - tp_n - @intFromBool(pass_alloc);
         \\    if (fi < fixed_len) {
@@ -7142,40 +8293,50 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\            if (pspec.kind == .callback) {
         \\                if (attr.@"comptime") {
         \\                    const cv = readComptimeDefault(ArgT, attr);
-        \\                    return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, @TypeOf(dummyForType(PrefixT) ++ .{cv}));
+        \\                    return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, AppendComptimeTupleElem(PrefixT, cv));
         \\                }
-        \\                return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, @TypeOf(dummyForType(PrefixT) ++ .{dummyForType(ArgT)}));
+        \\                return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, AppendRuntimeTupleElem(PrefixT, ArgT));
         \\            } else if (target_params[fixed_param_base + fi]) |ParamT| {
-        \\                return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, @TypeOf(dummyForType(PrefixT) ++ .{dummyForType(ParamT)}));
+        \\                return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, AppendRuntimeTupleElem(PrefixT, ParamT));
         \\            } else {
         \\                if (attr.@"comptime") {
         \\                    const cv = readComptimeDefault(ArgT, attr);
-        \\                    return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, @TypeOf(dummyForType(PrefixT) ++ .{cv}));
+        \\                    return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, AppendComptimeTupleElem(PrefixT, cv));
         \\                }
-        \\                return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, @TypeOf(dummyForType(PrefixT) ++ .{dummyForType(ArgT)}));
+        \\                return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, AppendRuntimeTupleElem(PrefixT, ArgT));
         \\            }
         \\        } else {
         \\            if (pspec.kind == .callback) {
-        \\                return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, @TypeOf(dummyForType(PrefixT) ++ .{null}));
+        \\                return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, AppendComptimeTupleElem(PrefixT, null));
         \\            } else if (target_params[fixed_param_base + fi]) |ParamT| {
-        \\                return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, @TypeOf(dummyForType(PrefixT) ++ .{@as(ParamT, null)}));
+        \\                return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, AppendRuntimeTupleElem(PrefixT, ParamT));
         \\            } else {
-        \\                return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, @TypeOf(dummyForType(PrefixT) ++ .{null}));
+        \\                return BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, stage + 1, AppendComptimeTupleElem(PrefixT, null));
         \\            }
         \\        }
         \\    }
         \\    if (cand.has_rest and fi == fixed_len) {
         \\        const SubT = PackRestStepType(@TypeOf(.{}), TupT, tp_n + fixed_len);
-        \\        return @TypeOf(dummyForType(PrefixT) ++ .{dummyForType(SubT)});
+        \\        return AppendRuntimeTupleElem(PrefixT, SubT);
         \\    }
         \\    return PrefixT;
         \\}
         \\
-        \\fn fnHasGenericParam(comptime fni: std.builtin.Type.Fn) bool {
-        \\    for (fni.param_types) |pt| {
-        \\        if (pt == null) return true;
+        \\fn candidatePassAlloc(comptime cand: anytype, comptime TupT: type, comptime caller_has_alloc: bool) bool {
+        \\    if (!caller_has_alloc) return false;
+        \\    const use_infer = cand.type_param_count > 0 and !candidateUsesExplicitTypeParams(cand, TupT);
+        \\    if (use_infer) {
+        \\        return @hasField(@TypeOf(cand), "infer_alloc_fn_name") and cand.infer_alloc_fn_name != null;
         \\    }
-        \\    return false;
+        \\    return cand.alloc_fn_name != null;
+        \\}
+        \\
+        \\fn candidateTargetFnName(comptime cand: anytype, comptime TupT: type, comptime pass_alloc: bool) []const u8 {
+        \\    const use_infer = cand.type_param_count > 0 and !candidateUsesExplicitTypeParams(cand, TupT);
+        \\    if (use_infer) {
+        \\        return if (pass_alloc) cand.infer_alloc_fn_name.? else cand.infer_fn_name.?;
+        \\    }
+        \\    return if (pass_alloc) cand.alloc_fn_name.? else cand.fn_name;
         \\}
         \\
         \\fn CandidateCallReturnType(
@@ -7186,18 +8347,16 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    comptime TupT: type,
         \\    comptime caller_has_alloc: bool,
         \\) type {
-        \\    const pass_alloc = caller_has_alloc and (cand.alloc_fn_name != null);
-        \\    const TargetFn = if (pass_alloc) @field(Owner, cand.alloc_fn_name.?) else @field(Owner, cand.fn_name);
+        \\    const pass_alloc = candidatePassAlloc(cand, TupT, caller_has_alloc);
+        \\    const TargetFn = @field(Owner, candidateTargetFnName(cand, TupT, pass_alloc));
         \\    const fni = @typeInfo(@TypeOf(TargetFn)).@"fn";
-        \\    if (!fnHasGenericParam(fni)) {
-        \\        if (fni.return_type) |rt| return rt;
-        \\    }
-        \\    const InitPrefixT = if (has_self) @TypeOf(.{dummyForType(SelfT)}) else @TypeOf(.{});
+        \\    if (fni.return_type) |rt| return rt;
+        \\    const InitPrefixT = if (has_self) AppendRuntimeTupleElem(@TypeOf(.{}), SelfT) else @TypeOf(.{});
         \\    const FullTupT = BuildCallTupleType(TargetFn, has_self, SelfT, pass_alloc, cand, TupT, 0, InitPrefixT);
-        \\    return @TypeOf(@call(.auto, TargetFn, dummyForType(FullTupT)));
+        \\    return ReturnTypeOfTupleCall(TargetFn, FullTupT);
         \\}
         \\
-        \\fn invokeStep(
+        \\inline fn invokeStep(
         \\    comptime Owner: type,
         \\    comptime TargetFn: anytype,
         \\    comptime has_self: bool,
@@ -7206,19 +8365,22 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    alloc_val: std.mem.Allocator,
         \\    comptime cand: anytype,
         \\    comptime TupT: type,
-        \\    tup: TupT,
+        \\    tup: anytype,
         \\    comptime stage: usize,
         \\    prefix: anytype,
         \\) CandidateCallReturnType(Owner, has_self, SelfT, cand, TupT, pass_alloc) {
-        \\    const tp_n: usize = cand.type_param_count;
+        \\    const tst = @typeInfo(TupT).@"struct";
+        \\    const actual_tst = @typeInfo(@TypeOf(tup)).@"struct";
+        \\    const tp_n: usize = if (comptime candidateUsesExplicitTypeParams(cand, TupT)) cand.type_param_count else 0;
         \\    const fixed_len: usize = cand.fixed_params.len;
-        \\    const tup_len: usize = @typeInfo(TupT).@"struct".field_types.len;
+        \\    const tup_len: usize = tst.field_types.len;
         \\    const val_argc: usize = tup_len - tp_n;
         \\    const target_params = @typeInfo(@TypeOf(TargetFn)).@"fn".param_types;
         \\    const fixed_param_base: usize = @intFromBool(has_self) + tp_n + @intFromBool(pass_alloc);
         \\
         \\    if (comptime stage < tp_n) {
-        \\        return invokeStep(Owner, TargetFn, has_self, SelfT, pass_alloc, alloc_val, cand, TupT, tup, stage + 1, prefix ++ .{tup[stage]});
+        \\        const TpVal = comptime readComptimeDefault(type, actual_tst.field_attrs[stage]);
+        \\        return invokeStep(Owner, TargetFn, has_self, SelfT, pass_alloc, alloc_val, cand, TupT, tup, stage + 1, prefix ++ .{TpVal});
         \\    }
         \\    if (comptime (pass_alloc and stage == tp_n)) {
         \\        return invokeStep(Owner, TargetFn, has_self, SelfT, pass_alloc, alloc_val, cand, TupT, tup, stage + 1, prefix ++ .{alloc_val});
@@ -7227,7 +8389,19 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    if (comptime fi < fixed_len) {
         \\        const pspec = cand.fixed_params[fi];
         \\        if (comptime fi < val_argc) {
-        \\            const raw_arg = tup[tp_n + fi];
+        \\            const arg_idx = tp_n + fi;
+        \\            if (comptime actual_tst.field_attrs[arg_idx].@"comptime") {
+        \\                const comptime_arg = comptime readComptimeDefault(actual_tst.field_types[arg_idx], actual_tst.field_attrs[arg_idx]);
+        \\                if (comptime pspec.kind == .callback) {
+        \\                    return invokeStep(Owner, TargetFn, has_self, SelfT, pass_alloc, alloc_val, cand, TupT, tup, stage + 1, prefix ++ .{comptime_arg});
+        \\                } else if (comptime target_params[fixed_param_base + fi]) |ParamT| {
+        \\                    const coerced = coerceArgToParam(ParamT, comptime_arg);
+        \\                    return invokeStep(Owner, TargetFn, has_self, SelfT, pass_alloc, alloc_val, cand, TupT, tup, stage + 1, prefix ++ .{coerced});
+        \\                } else {
+        \\                    return invokeStep(Owner, TargetFn, has_self, SelfT, pass_alloc, alloc_val, cand, TupT, tup, stage + 1, prefix ++ .{comptime_arg});
+        \\                }
+        \\            }
+        \\            const raw_arg = tup[arg_idx];
         \\            if (comptime pspec.kind == .callback) {
         \\                return invokeStep(Owner, TargetFn, has_self, SelfT, pass_alloc, alloc_val, cand, TupT, tup, stage + 1, prefix ++ .{raw_arg});
         \\            } else if (comptime target_params[fixed_param_base + fi]) |ParamT| {
@@ -7253,10 +8427,26 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    return @call(.auto, TargetFn, prefix);
         \\}
         \\
+        \\fn isComptimeOnlyArgType(comptime T: type) bool {
+        \\    return switch (@typeInfo(T)) {
+        \\        .type, .comptime_int, .comptime_float, .enum_literal, .null, .undefined => true,
+        \\        .optional => |opt| isComptimeOnlyArgType(opt.child),
+        \\        .array => |ar| isComptimeOnlyArgType(ar.child),
+        \\        .pointer => |pt| isComptimeOnlyArgType(pt.child),
+        \\        .@"struct" => |st| blk: {
+        \\            for (st.field_types, 0..) |ft, fi| {
+        \\                if (!st.field_attrs[fi].@"comptime" and isComptimeOnlyArgType(ft)) break :blk true;
+        \\            }
+        \\            break :blk false;
+        \\        },
+        \\        else => false,
+        \\    };
+        \\}
+        \\
         \\fn wrapSingleArgTupleType(comptime ArgsT: type) type {
         \\    if (isTupleType(ArgsT)) return ArgsT;
         \\    if (ArgsT == type) return @TypeOf(.{u8});
-        \\    if (@typeInfo(ArgsT) == .@"fn" or @typeInfo(ArgsT) == .enum_literal) {
+        \\    if (!isComptimeOnlyArgType(ArgsT) or @typeInfo(ArgsT) == .enum_literal) {
         \\        return @Tuple(&[_]type{ArgsT});
         \\    }
         \\    return @TypeOf(.{dummyForType(ArgsT)});
@@ -7274,28 +8464,2076 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    return CandidateCallReturnType(Owner, true, SelfT, specs[ci], TupT, has_alloc);
         \\}
         \\
-        \\pub fn dispatchOverload(comptime Owner: type, comptime specs: anytype, args: anytype, alloc_opt: anytype) OverloadReturn(Owner, specs, @TypeOf(args), @TypeOf(alloc_opt) != @TypeOf(null)) {
+        \\pub inline fn dispatchOverload(comptime Owner: type, comptime specs: anytype, args: anytype, alloc_opt: anytype) OverloadReturn(Owner, specs, @TypeOf(args), @TypeOf(alloc_opt) != @TypeOf(null)) {
         \\    const has_alloc = comptime (@TypeOf(alloc_opt) != @TypeOf(null));
-        \\    const tup = if (comptime isTupleType(@TypeOf(args))) args else .{args};
-        \\    const TupT = @TypeOf(tup);
+        \\    const is_tup = comptime isTupleType(@TypeOf(args));
+        \\    const TupT = wrapSingleArgTupleType(@TypeOf(args));
         \\    const ci = comptime selectCandidateIndex(Owner, false, specs, TupT);
         \\    const cand = specs[ci];
-        \\    const pass_alloc = comptime (has_alloc and cand.alloc_fn_name != null);
-        \\    const TargetFn = if (pass_alloc) @field(Owner, cand.alloc_fn_name.?) else @field(Owner, cand.fn_name);
+        \\    const pass_alloc = comptime candidatePassAlloc(cand, TupT, has_alloc);
+        \\    const TargetFn = @field(Owner, candidateTargetFnName(cand, TupT, pass_alloc));
         \\    const alloc_val: std.mem.Allocator = if (has_alloc) alloc_opt else undefined;
-        \\    return invokeStep(Owner, TargetFn, false, void, pass_alloc, alloc_val, cand, TupT, tup, 0, .{});
+        \\    if (is_tup) {
+        \\        return invokeStep(Owner, TargetFn, false, void, pass_alloc, alloc_val, cand, TupT, args, 0, .{});
+        \\    }
+        \\    return invokeStep(Owner, TargetFn, false, void, pass_alloc, alloc_val, cand, TupT, .{args}, 0, .{});
         \\}
         \\
-        \\pub fn dispatchOverloadMethod(comptime Owner: type, self_val: anytype, comptime specs: anytype, args: anytype, alloc_opt: anytype) OverloadMethodReturn(Owner, @TypeOf(self_val), specs, @TypeOf(args), @TypeOf(alloc_opt) != @TypeOf(null)) {
+        \\pub inline fn dispatchOverloadMethod(comptime Owner: type, self_val: anytype, comptime specs: anytype, args: anytype, alloc_opt: anytype) OverloadMethodReturn(Owner, @TypeOf(self_val), specs, @TypeOf(args), @TypeOf(alloc_opt) != @TypeOf(null)) {
         \\    const has_alloc = comptime (@TypeOf(alloc_opt) != @TypeOf(null));
-        \\    const tup = if (comptime isTupleType(@TypeOf(args))) args else .{args};
-        \\    const TupT = @TypeOf(tup);
+        \\    const is_tup = comptime isTupleType(@TypeOf(args));
+        \\    const TupT = wrapSingleArgTupleType(@TypeOf(args));
         \\    const ci = comptime selectCandidateIndex(Owner, true, specs, TupT);
         \\    const cand = specs[ci];
-        \\    const pass_alloc = comptime (has_alloc and cand.alloc_fn_name != null);
-        \\    const TargetFn = if (pass_alloc) @field(Owner, cand.alloc_fn_name.?) else @field(Owner, cand.fn_name);
+        \\    const pass_alloc = comptime candidatePassAlloc(cand, TupT, has_alloc);
+        \\    const TargetFn = @field(Owner, candidateTargetFnName(cand, TupT, pass_alloc));
         \\    const alloc_val: std.mem.Allocator = if (has_alloc) alloc_opt else undefined;
-        \\    return invokeStep(Owner, TargetFn, true, @TypeOf(self_val), pass_alloc, alloc_val, cand, TupT, tup, 0, .{self_val});
+        \\    if (is_tup) {
+        \\        return invokeStep(Owner, TargetFn, true, @TypeOf(self_val), pass_alloc, alloc_val, cand, TupT, args, 0, .{self_val});
+        \\    }
+        \\    return invokeStep(Owner, TargetFn, true, @TypeOf(self_val), pass_alloc, alloc_val, cand, TupT, .{args}, 0, .{self_val});
+        \\}
+        \\
+        \\pub const hidden_meta_field_name = "__zigar_js_meta";
+        \\
+        \\fn isHiddenMetaField(comptime fname: []const u8) bool {
+        \\    return std.mem.eql(u8, fname, hidden_meta_field_name);
+        \\}
+        \\
+        \\fn hasStructZigarJsMeta(comptime T: type) bool {
+        \\    if (@typeInfo(T) != .@"struct") return false;
+        \\    if (@hasDecl(T, "zigar_js")) return true;
+        \\    if (@hasField(T, hidden_meta_field_name)) {
+        \\        const Carrier = @FieldType(T, hidden_meta_field_name);
+        \\        return @typeInfo(Carrier) == .@"struct" and @hasDecl(Carrier, "zigar_js");
+        \\    }
+        \\    return false;
+        \\}
+        \\
+        \\fn StructZigarJsMetaType(comptime T: type) type {
+        \\    if (@hasDecl(T, "zigar_js")) return @TypeOf(T.zigar_js);
+        \\    return @TypeOf(@FieldType(T, hidden_meta_field_name).zigar_js);
+        \\}
+        \\
+        \\fn getStructZigarJsMeta(comptime T: type) StructZigarJsMetaType(T) {
+        \\    if (@hasDecl(T, "zigar_js")) return T.zigar_js;
+        \\    return @FieldType(T, hidden_meta_field_name).zigar_js;
+        \\}
+        \\
+        \\fn isModuleNullableType(comptime T: type) bool {
+        \\    return @typeInfo(T) == .@"union" and @hasDecl(T, "is_zigar_nullable") and T.is_zigar_nullable;
+        \\}
+        \\
+        \\fn isPlainValueStructForTransform(comptime T: type) bool {
+        \\    if (@typeInfo(T) != .@"struct") return false;
+        \\    if (@typeInfo(T).@"struct".is_tuple) return false;
+        \\    if (isJsValueStruct(T)) return false;
+        \\    if (isGeneratedHandleStruct(T)) return false;
+        \\    if (@hasDecl(T, "zigar_js_tuple")) return false;
+        \\    if (hasStructZigarJsMeta(T)) {
+        \\        const meta = getStructZigarJsMeta(T);
+        \\        const MetaT = @TypeOf(meta);
+        \\        if (@hasField(MetaT, "is_template_literal") and meta.is_template_literal) return false;
+        \\        if (@hasField(MetaT, "is_enum") and meta.is_enum) return false;
+        \\        if (@hasField(MetaT, "is_open_literal") and meta.is_open_literal) return false;
+        \\    }
+        \\    return true;
+        \\}
+        \\
+        \\fn topStructFieldWireName(comptime T: type, comptime field_name: []const u8) []const u8 {
+        \\    if (hasStructZigarJsMeta(T)) {
+        \\        const meta = getStructZigarJsMeta(T);
+        \\        if (@hasField(@TypeOf(meta), "fields")) {
+        \\            inline for (meta.fields) |fm| {
+        \\                if (std.mem.eql(u8, fm.name, field_name)) {
+        \\                    if (@hasField(@TypeOf(fm), "js_name")) return fm.js_name;
+        \\                    return field_name;
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\    return field_name;
+        \\}
+        \\
+        \\fn topStructFieldIsOptional(comptime T: type, comptime field_name: []const u8, comptime has_default: bool) bool {
+        \\    if (hasStructZigarJsMeta(T)) {
+        \\        const meta = getStructZigarJsMeta(T);
+        \\        if (@hasField(@TypeOf(meta), "fields")) {
+        \\            inline for (meta.fields) |fm| {
+        \\                if (std.mem.eql(u8, fm.name, field_name)) {
+        \\                    if (@hasField(@TypeOf(fm), "is_optional")) return fm.is_optional;
+        \\                    return has_default;
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\    return has_default;
+        \\}
+        \\
+        \\const TransformMetaMode = enum {
+        \\    preserve,
+        \\    make_partial,
+        \\    make_required,
+        \\};
+        \\
+        \\fn specTopSelfNullish(comptime spec: anytype) NullishKind {
+        \\    const SpecT = @TypeOf(spec);
+        \\    if (SpecT == NullishKind) return spec;
+        \\    return switch (@typeInfo(SpecT)) {
+        \\        .enum_literal => @field(NullishKind, @tagName(spec)),
+        \\        .@"struct" => if (@hasField(SpecT, "self")) specTopSelfNullish(spec.self) else .none,
+        \\        else => .none,
+        \\    };
+        \\}
+        \\
+        \\fn RebuildSpecWithSelfType(comptime SpecT: type) type {
+        \\    if (@typeInfo(SpecT) != .@"struct" or !@hasField(SpecT, "self")) return NullishKind;
+        \\    if (@hasField(SpecT, "child")) {
+        \\        return if (@hasField(SpecT, "id"))
+        \\            struct { id: @FieldType(SpecT, "id"), self: NullishKind, child: @FieldType(SpecT, "child") }
+        \\        else
+        \\            struct { self: NullishKind, child: @FieldType(SpecT, "child") };
+        \\    }
+        \\    if (@hasField(SpecT, "elem")) {
+        \\        return struct { self: NullishKind, elem: @FieldType(SpecT, "elem") };
+        \\    }
+        \\    if (@hasField(SpecT, "fields")) {
+        \\        return if (@hasField(SpecT, "id"))
+        \\            struct { id: @FieldType(SpecT, "id"), self: NullishKind, fields: @FieldType(SpecT, "fields") }
+        \\        else
+        \\            struct { self: NullishKind, fields: @FieldType(SpecT, "fields") };
+        \\    }
+        \\    if (@hasField(SpecT, "variants")) {
+        \\        return if (@hasField(SpecT, "id"))
+        \\            struct { id: @FieldType(SpecT, "id"), self: NullishKind, variants: @FieldType(SpecT, "variants") }
+        \\        else
+        \\            struct { self: NullishKind, variants: @FieldType(SpecT, "variants") };
+        \\    }
+        \\    if (@hasField(SpecT, "tuple")) {
+        \\        return if (@hasField(SpecT, "id"))
+        \\            struct { id: @FieldType(SpecT, "id"), self: NullishKind, tuple: @FieldType(SpecT, "tuple") }
+        \\        else
+        \\            struct { self: NullishKind, tuple: @FieldType(SpecT, "tuple") };
+        \\    }
+        \\    return NullishKind;
+        \\}
+        \\
+        \\fn rebuildSpecWithSelf(comptime spec: anytype, comptime new_self: NullishKind) RebuildSpecWithSelfType(@TypeOf(spec)) {
+        \\    const SpecT = @TypeOf(spec);
+        \\    if (@typeInfo(SpecT) != .@"struct" or !@hasField(SpecT, "self")) return new_self;
+        \\    if (@hasField(SpecT, "child")) {
+        \\        return if (@hasField(SpecT, "id"))
+        \\            .{ .id = spec.id, .self = new_self, .child = spec.child }
+        \\        else
+        \\            .{ .self = new_self, .child = spec.child };
+        \\    }
+        \\    if (@hasField(SpecT, "elem")) {
+        \\        return .{ .self = new_self, .elem = spec.elem };
+        \\    }
+        \\    if (@hasField(SpecT, "fields")) {
+        \\        return if (@hasField(SpecT, "id"))
+        \\            .{ .id = spec.id, .self = new_self, .fields = spec.fields }
+        \\        else
+        \\            .{ .self = new_self, .fields = spec.fields };
+        \\    }
+        \\    if (@hasField(SpecT, "variants")) {
+        \\        return if (@hasField(SpecT, "id"))
+        \\            .{ .id = spec.id, .self = new_self, .variants = spec.variants }
+        \\        else
+        \\            .{ .self = new_self, .variants = spec.variants };
+        \\    }
+        \\    if (@hasField(SpecT, "tuple")) {
+        \\        return if (@hasField(SpecT, "id"))
+        \\            .{ .id = spec.id, .self = new_self, .tuple = spec.tuple }
+        \\        else
+        \\            .{ .self = new_self, .tuple = spec.tuple };
+        \\    }
+        \\    return new_self;
+        \\}
+        \\
+        \\fn UnwrapSpecChildType(comptime SpecT: type) type {
+        \\    if (@typeInfo(SpecT) == .@"struct" and @hasField(SpecT, "child")) {
+        \\        return @FieldType(SpecT, "child");
+        \\    }
+        \\    return NullishKind;
+        \\}
+        \\
+        \\fn unwrapSpecChild(comptime spec: anytype) UnwrapSpecChildType(@TypeOf(spec)) {
+        \\    const SpecT = @TypeOf(spec);
+        \\    if (@typeInfo(SpecT) == .@"struct" and @hasField(SpecT, "child")) {
+        \\        return spec.child;
+        \\    }
+        \\    return .none;
+        \\}
+        \\
+        \\fn WrapSpecAsOptionalType(comptime spec: anytype) type {
+        \\    const SpecT = @TypeOf(spec);
+        \\    if (@typeInfo(SpecT) == .@"struct") {
+        \\        return struct { self: NullishKind, child: SpecT };
+        \\    }
+        \\    const cur = specTopSelfNullish(spec);
+        \\    if (cur == .none) return NullishKind;
+        \\    return struct { self: NullishKind, child: NullishKind };
+        \\}
+        \\
+        \\fn wrapSpecAsOptional(comptime spec: anytype, comptime outer_self: NullishKind) WrapSpecAsOptionalType(spec) {
+        \\    const SpecT = @TypeOf(spec);
+        \\    if (@typeInfo(SpecT) == .@"struct") {
+        \\        return .{ .self = outer_self, .child = spec };
+        \\    }
+        \\    const cur = specTopSelfNullish(spec);
+        \\    if (cur == .none) return outer_self;
+        \\    return .{ .self = outer_self, .child = cur };
+        \\}
+        \\
+        \\fn ComputedTransformedNullishType(comptime T: type, comptime fname: []const u8, comptime mode: TransformMetaMode) type {
+        \\    const OrigFT = @FieldType(T, fname);
+        \\    if (hasStructZigarJsMeta(T)) {
+        \\        const meta = getStructZigarJsMeta(T);
+        \\        if (@hasField(@TypeOf(meta), "fields")) {
+        \\            inline for (meta.fields) |fm| {
+        \\                if (std.mem.eql(u8, fm.name, fname)) {
+        \\                    const FmT = @TypeOf(fm);
+        \\                    const has_nullish = @hasField(FmT, "nullish");
+        \\                    if (!has_nullish) return NullishKind;
+        \\                    const fm_is_opt = @hasField(FmT, "is_optional") and fm.is_optional;
+        \\                    const cur_self = specTopSelfNullish(fm.nullish);
+        \\                    return switch (mode) {
+        \\                        .preserve => @TypeOf(fm.nullish),
+        \\                        .make_partial => if (@typeInfo(OrigFT) == .optional or isModuleNullableType(OrigFT))
+        \\                            RebuildSpecWithSelfType(@TypeOf(fm.nullish))
+        \\                        else
+        \\                            WrapSpecAsOptionalType(fm.nullish),
+        \\                        .make_required => if (!fm_is_opt)
+        \\                            @TypeOf(fm.nullish)
+        \\                        else if (isModuleNullableType(OrigFT) or cur_self == .null_only or cur_self == .null_or_undefined)
+        \\                            RebuildSpecWithSelfType(@TypeOf(fm.nullish))
+        \\                        else
+        \\                            UnwrapSpecChildType(@TypeOf(fm.nullish)),
+        \\                    };
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\    return NullishKind;
+        \\}
+        \\
+        \\fn computeTransformedNullish(
+        \\    comptime T: type,
+        \\    comptime fname: []const u8,
+        \\    comptime mode: TransformMetaMode,
+        \\) ComputedTransformedNullishType(T, fname, mode) {
+        \\    const OrigFT = @FieldType(T, fname);
+        \\    if (hasStructZigarJsMeta(T)) {
+        \\        const meta = getStructZigarJsMeta(T);
+        \\        if (@hasField(@TypeOf(meta), "fields")) {
+        \\            inline for (meta.fields) |fm| {
+        \\                if (std.mem.eql(u8, fm.name, fname)) {
+        \\                    const FmT = @TypeOf(fm);
+        \\                    const has_nullish = @hasField(FmT, "nullish");
+        \\                    if (!has_nullish) {
+        \\                        return if (mode == .make_partial) NullishKind.undefined_only else NullishKind.none;
+        \\                    }
+        \\                    const fm_is_opt = @hasField(FmT, "is_optional") and fm.is_optional;
+        \\                    const cur_self = specTopSelfNullish(fm.nullish);
+        \\                    return switch (mode) {
+        \\                        .preserve => fm.nullish,
+        \\                        .make_partial => blk: {
+        \\                            if (@typeInfo(OrigFT) == .optional or isModuleNullableType(OrigFT)) {
+        \\                                const merged_self: NullishKind = if (cur_self == .null_only or cur_self == .null_or_undefined)
+        \\                                    .null_or_undefined
+        \\                                else
+        \\                                    .undefined_only;
+        \\                                break :blk rebuildSpecWithSelf(fm.nullish, merged_self);
+        \\                            }
+        \\                            break :blk wrapSpecAsOptional(fm.nullish, .undefined_only);
+        \\                        },
+        \\                        .make_required => blk: {
+        \\                            if (!fm_is_opt) break :blk fm.nullish;
+        \\                            if (isModuleNullableType(OrigFT) or cur_self == .null_only or cur_self == .null_or_undefined) {
+        \\                                break :blk rebuildSpecWithSelf(fm.nullish, .null_only);
+        \\                            }
+        \\                            break :blk unwrapSpecChild(fm.nullish);
+        \\                        },
+        \\                    };
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\    return if (mode == .make_partial) NullishKind.undefined_only else NullishKind.none;
+        \\}
+        \\
+        \\fn requiredFieldResolution(comptime T: type, comptime fname: []const u8, comptime OrigFT: type) struct {
+        \\    ty: type,
+        \\    preserve_default: bool,
+        \\} {
+        \\    if (hasStructZigarJsMeta(T)) {
+        \\        const meta = getStructZigarJsMeta(T);
+        \\        if (@hasField(@TypeOf(meta), "fields")) {
+        \\            inline for (meta.fields) |fm| {
+        \\                if (std.mem.eql(u8, fm.name, fname)) {
+        \\                    const FmT = @TypeOf(fm);
+        \\                    const fm_is_opt = @hasField(FmT, "is_optional") and fm.is_optional;
+        \\                    if (!fm_is_opt) {
+        \\                        return .{ .ty = OrigFT, .preserve_default = true };
+        \\                    }
+        \\                    if (isModuleNullableType(OrigFT)) {
+        \\                        return .{ .ty = ?OrigFT.Value, .preserve_default = false };
+        \\                    }
+        \\                    const cur_self = if (@hasField(FmT, "nullish")) specTopSelfNullish(fm.nullish) else NullishKind.none;
+        \\                    if (cur_self == .null_only or cur_self == .null_or_undefined) {
+        \\                        return .{ .ty = OrigFT, .preserve_default = false };
+        \\                    }
+        \\                    const unwrapped = if (@typeInfo(OrigFT) == .optional) @typeInfo(OrigFT).optional.child else OrigFT;
+        \\                    return .{ .ty = unwrapped, .preserve_default = false };
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\    if (@typeInfo(OrigFT) == .optional) {
+        \\        return .{ .ty = @typeInfo(OrigFT).optional.child, .preserve_default = false };
+        \\    }
+        \\    if (isModuleNullableType(OrigFT)) {
+        \\        return .{ .ty = OrigFT.Value, .preserve_default = false };
+        \\    }
+        \\    return .{ .ty = OrigFT, .preserve_default = true };
+        \\}
+        \\
+        \\fn TransformFieldEntryType(comptime T: type, comptime fname: []const u8, comptime mode: TransformMetaMode) type {
+        \\    if (hasStructZigarJsMeta(T)) {
+        \\        const meta = getStructZigarJsMeta(T);
+        \\        if (@hasField(@TypeOf(meta), "fields")) {
+        \\            inline for (meta.fields) |fm| {
+        \\                if (std.mem.eql(u8, fm.name, fname)) {
+        \\                    if (mode == .preserve) return @TypeOf(fm);
+        \\                    const FmT = @TypeOf(fm);
+        \\                    const NullishT = ComputedTransformedNullishType(T, fname, mode);
+        \\                    return buildConstraintPreservingDescriptorType(FmT, NullishT);
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\    return struct {
+        \\        name: []const u8,
+        \\        js_name: []const u8,
+        \\        is_optional: bool,
+        \\        nullish: NullishKind,
+        \\    };
+        \\}
+        \\
+        \\fn buildConstraintPreservingDescriptorType(comptime FmT: type, comptime NullishT: type) type {
+        \\    comptime var fnames: [10][]const u8 = undefined;
+        \\    comptime var ftypes: [10]type = undefined;
+        \\    comptime var fattrs: [10]std.builtin.Type.Struct.FieldAttributes = undefined;
+        \\    comptime var n: usize = 0;
+        \\
+        \\    fnames[n] = "name";
+        \\    ftypes[n] = []const u8;
+        \\    fattrs[n] = .{};
+        \\    n += 1;
+        \\
+        \\    fnames[n] = "js_name";
+        \\    ftypes[n] = []const u8;
+        \\    fattrs[n] = .{};
+        \\    n += 1;
+        \\
+        \\    fnames[n] = "is_optional";
+        \\    ftypes[n] = bool;
+        \\    fattrs[n] = .{};
+        \\    n += 1;
+        \\
+        \\    fnames[n] = "nullish";
+        \\    ftypes[n] = NullishT;
+        \\    fattrs[n] = .{};
+        \\    n += 1;
+        \\
+        \\    const extras = [_][]const u8{
+        \\        "expected_str",
+        \\        "expected_num",
+        \\        "expected_bool",
+        \\        "expected_bigint_i64",
+        \\        "expected_bigint_str",
+        \\        "expected_enum_tag",
+        \\    };
+        \\    inline for (extras) |ex| {
+        \\        if (@hasField(FmT, ex)) {
+        \\            fnames[n] = ex;
+        \\            ftypes[n] = @FieldType(FmT, ex);
+        \\            fattrs[n] = .{};
+        \\            n += 1;
+        \\        }
+        \\    }
+        \\    const names_fin = fnames[0..n].*;
+        \\    const types_fin = ftypes[0..n].*;
+        \\    const attrs_fin = fattrs[0..n].*;
+        \\    return @Struct(.auto, null, &names_fin, &types_fin, &attrs_fin);
+        \\}
+        \\
+        \\fn transformOneFieldDescriptor(
+        \\    comptime T: type,
+        \\    comptime fname: []const u8,
+        \\    comptime mode: TransformMetaMode,
+        \\) TransformFieldEntryType(T, fname, mode) {
+        \\    const OutT = TransformFieldEntryType(T, fname, mode);
+        \\    const wire = topStructFieldWireName(T, fname);
+        \\    if (hasStructZigarJsMeta(T)) {
+        \\        const meta = getStructZigarJsMeta(T);
+        \\        if (@hasField(@TypeOf(meta), "fields")) {
+        \\            inline for (meta.fields) |fm| {
+        \\                if (std.mem.eql(u8, fm.name, fname)) {
+        \\                    if (mode == .preserve) return fm;
+        \\                    const FmT = @TypeOf(fm);
+        \\                    var out: OutT = undefined;
+        \\                    out.name = fname;
+        \\                    out.js_name = wire;
+        \\                    out.is_optional = (mode == .make_partial);
+        \\                    out.nullish = computeTransformedNullish(T, fname, mode);
+        \\                    const extras = [_][]const u8{
+        \\                        "expected_str",
+        \\                        "expected_num",
+        \\                        "expected_bool",
+        \\                        "expected_bigint_i64",
+        \\                        "expected_bigint_str",
+        \\                        "expected_enum_tag",
+        \\                    };
+        \\                    inline for (extras) |ex| {
+        \\                        if (@hasField(FmT, ex)) {
+        \\                            @field(out, ex) = @field(fm, ex);
+        \\                        }
+        \\                    }
+        \\                    return out;
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\    return .{
+        \\        .name = fname,
+        \\        .js_name = wire,
+        \\        .is_optional = (mode == .make_partial),
+        \\        .nullish = if (mode == .make_partial) NullishKind.undefined_only else NullishKind.none,
+        \\    };
+        \\}
+        \\
+        \\fn buildStructMetaCarrier(
+        \\    comptime T: type,
+        \\    comptime kept_names: []const []const u8,
+        \\    comptime mode: TransformMetaMode,
+        \\) type {
+        \\    comptime var entry_types: [kept_names.len]type = undefined;
+        \\    inline for (kept_names, 0..) |fname, i| {
+        \\        entry_types[i] = TransformFieldEntryType(T, fname, mode);
+        \\    }
+        \\    const FieldsTuple = @Tuple(&entry_types);
+        \\    const fields_val = comptime blk: {
+        \\        var tup: FieldsTuple = undefined;
+        \\        for (kept_names, 0..) |fname, i| {
+        \\            tup[i] = transformOneFieldDescriptor(T, fname, mode);
+        \\        }
+        \\        break :blk tup;
+        \\    };
+        \\    return struct {
+        \\        pub const zigar_js = .{
+        \\            .fields = fields_val,
+        \\        };
+        \\    };
+        \\}
+        \\
+        \\fn defaultPtrForValue(comptime FieldT: type, comptime val: FieldT) *const anyopaque {
+        \\    const Holder = struct {
+        \\        const stored: FieldT = val;
+        \\    };
+        \\    return @ptrCast(&Holder.stored);
+        \\}
+        \\
+        \\fn isComptimeKeyStringType(comptime KT: type) bool {
+        \\    if (KT == []const u8) return true;
+        \\    return switch (@typeInfo(KT)) {
+        \\        .pointer => |pt| pt.size == .one and @typeInfo(pt.child) == .array and @typeInfo(pt.child).array.child == u8,
+        \\        else => false,
+        \\    };
+        \\}
+        \\
+        \\fn formatComptimeJsNumberKey(comptime n_any: anytype) []const u8 {
+        \\    const NT = @TypeOf(n_any);
+        \\    if (@typeInfo(NT) == .int or @typeInfo(NT) == .comptime_int) {
+        \\        return std.fmt.comptimePrint("{d}", .{n_any});
+        \\    }
+        \\    const n: f64 = @floatCast(n_any);
+        \\    if (n == 0.0) return "0";
+        \\    if (std.math.isFinite(n) and @trunc(n) == n and @abs(n) <= 9007199254740991.0) {
+        \\        return std.fmt.comptimePrint("{d}", .{@as(i64, @intFromFloat(n))});
+        \\    }
+        \\    return std.fmt.comptimePrint("{d}", .{n});
+        \\}
+        \\
+        \\fn enumMemberWireKey(comptime m: anytype) []const u8 {
+        \\    const MT = @TypeOf(m);
+        \\    if (@hasField(MT, "str_value")) return m.str_value;
+        \\    if (@hasField(MT, "num_value")) return formatComptimeJsNumberKey(m.num_value);
+        \\    if (@hasField(MT, "int_value")) return formatComptimeJsNumberKey(m.int_value);
+        \\    if (@hasField(MT, "float_value")) return formatComptimeJsNumberKey(m.float_value);
+        \\    if (@hasField(MT, "bool_value")) return if (m.bool_value) "true" else "false";
+        \\    if (@hasField(MT, "bigint_value")) return m.bigint_value;
+        \\    if (@hasField(MT, "js_name")) return m.js_name;
+        \\    return m.tag;
+        \\}
+        \\
+        \\fn comptimeSnakeFieldName(comptime raw: []const u8) []const u8 {
+        \\    if (raw.len == 0) return "_empty";
+        \\    comptime var buf: [raw.len * 2 + 1]u8 = undefined;
+        \\    comptime var out_len: usize = 0;
+        \\    comptime var word_count: usize = 0;
+        \\    comptime var i: usize = 0;
+        \\    while (i < raw.len) {
+        \\        while (i < raw.len and !std.ascii.isAlphanumeric(raw[i])) : (i += 1) {}
+        \\        if (i >= raw.len) break;
+        \\        const start = i;
+        \\        if (std.ascii.isDigit(raw[i])) {
+        \\            while (i < raw.len and std.ascii.isDigit(raw[i])) : (i += 1) {}
+        \\            if (start == 0 and i < raw.len and std.ascii.isAlphabetic(raw[i])) {
+        \\                while (i < raw.len and std.ascii.isAlphanumeric(raw[i]) and !std.ascii.isUpper(raw[i])) : (i += 1) {}
+        \\            }
+        \\        } else if (std.ascii.isUpper(raw[i])) {
+        \\            i += 1;
+        \\            if (i < raw.len and std.ascii.isUpper(raw[i])) {
+        \\                while (i < raw.len and std.ascii.isUpper(raw[i])) : (i += 1) {}
+        \\                if (i < raw.len and std.ascii.isLower(raw[i]) and (i - start) > 1) {
+        \\                    i -= 1;
+        \\                }
+        \\            } else {
+        \\                while (i < raw.len and (std.ascii.isLower(raw[i]) or std.ascii.isDigit(raw[i]))) : (i += 1) {}
+        \\            }
+        \\        } else {
+        \\            while (i < raw.len and (std.ascii.isLower(raw[i]) or std.ascii.isDigit(raw[i]))) : (i += 1) {}
+        \\        }
+        \\        if (word_count > 0) {
+        \\            buf[out_len] = '_';
+        \\            out_len += 1;
+        \\        }
+        \\        for (raw[start..i]) |ch| {
+        \\            buf[out_len] = std.ascii.toLower(ch);
+        \\            out_len += 1;
+        \\        }
+        \\        word_count += 1;
+        \\    }
+        \\    if (word_count == 0) return "_";
+        \\    const fin = buf[0..out_len].*;
+        \\    return &fin;
+        \\}
+        \\
+        \\fn isReservedRecordFieldName(comptime cand: []const u8, comptime used: []const []const u8) bool {
+        \\    if (isHiddenMetaField(cand) or std.mem.eql(u8, cand, "zigar_js") or std.mem.eql(u8, cand, "zigar_js_tuple")) {
+        \\        return true;
+        \\    }
+        \\    for (used) |u| {
+        \\        if (std.mem.eql(u8, u, cand)) return true;
+        \\    }
+        \\    return false;
+        \\}
+        \\
+        \\fn dedupeComptimeFieldName(comptime base: []const u8, comptime used: []const []const u8) []const u8 {
+        \\    if (!isReservedRecordFieldName(base, used)) return base;
+        \\    comptime var suffix: usize = 2;
+        \\    while (true) : (suffix += 1) {
+        \\        const cand = std.fmt.comptimePrint("{s}_{d}", .{ base, suffix });
+        \\        if (!isReservedRecordFieldName(cand, used)) return cand;
+        \\    }
+        \\}
+        \\
+        \\fn canExtractSingleComptimeKey(comptime ItemT: type) bool {
+        \\    if (isComptimeKeyStringType(ItemT)) return true;
+        \\    return switch (@typeInfo(ItemT)) {
+        \\        .enum_literal, .int, .comptime_int, .float, .comptime_float, .bool, .@"enum" => true,
+        \\        else => false,
+        \\    };
+        \\}
+        \\
+        \\fn extractSingleComptimeKey(comptime item: anytype) []const u8 {
+        \\    const ItemT = @TypeOf(item);
+        \\    if (isComptimeKeyStringType(ItemT)) return item;
+        \\    return switch (@typeInfo(ItemT)) {
+        \\        .enum_literal => @tagName(item),
+        \\        .int, .comptime_int, .float, .comptime_float => formatComptimeJsNumberKey(item),
+        \\        .bool => if (item) "true" else "false",
+        \\        .@"enum" => blk: {
+        \\            if (@hasDecl(ItemT, "zigar_js") and @hasField(@TypeOf(ItemT.zigar_js), "members")) {
+        \\                for (ItemT.zigar_js.members) |m| {
+        \\                    if (std.mem.eql(u8, m.tag, @tagName(item))) {
+        \\                        break :blk enumMemberWireKey(m);
+        \\                    }
+        \\                }
+        \\            }
+        \\            break :blk @tagName(item);
+        \\        },
+        \\        else => @compileError("Unsupported key item for Pick/Omit/IndexAccess: " ++ @typeName(ItemT)),
+        \\    };
+        \\}
+        \\
+        \\fn isNumericPropertyKeyString(comptime s: []const u8) bool {
+        \\    if (s.len == 0) return false;
+        \\    const parsed = std.fmt.parseFloat(f64, s) catch return false;
+        \\    return std.mem.eql(u8, formatComptimeJsNumberKey(parsed), s);
+        \\}
+        \\
+        \\fn extractKeyListFromSpec(comptime keys_spec: anytype) []const []const u8 {
+        \\    const SpecT = @TypeOf(keys_spec);
+        \\    if (SpecT == type) {
+        \\        if (keys_spec == void or keys_spec == noreturn) return &.{};
+        \\        if (keys_spec == []const u8) return &.{};
+        \\        switch (@typeInfo(keys_spec)) {
+        \\            .@"enum" => |en| {
+        \\                if (@hasDecl(keys_spec, "zigar_js") and @hasField(@TypeOf(keys_spec.zigar_js), "members")) {
+        \\                    comptime var count: usize = 0;
+        \\                    for (keys_spec.zigar_js.members) |m| {
+        \\                        if (@hasField(@TypeOf(m), "is_alias") and m.is_alias) continue;
+        \\                        count += 1;
+        \\                    }
+        \\                    comptime var arr: [count][]const u8 = undefined;
+        \\                    comptime var idx: usize = 0;
+        \\                    for (keys_spec.zigar_js.members) |m| {
+        \\                        if (@hasField(@TypeOf(m), "is_alias") and m.is_alias) continue;
+        \\                        arr[idx] = enumMemberWireKey(m);
+        \\                        idx += 1;
+        \\                    }
+        \\                    const fin = arr;
+        \\                    return &fin;
+        \\                }
+        \\                return en.field_names;
+        \\            },
+        \\            .@"union" => {
+        \\                if (@hasDecl(keys_spec, "zigar_js") and @hasField(@TypeOf(keys_spec.zigar_js), "variants")) {
+        \\                    comptime var count: usize = 0;
+        \\                    for (keys_spec.zigar_js.variants) |v| {
+        \\                        if (@hasField(@TypeOf(v), "is_unit_literal") and v.is_unit_literal) {
+        \\                            count += 1;
+        \\                        }
+        \\                    }
+        \\                    comptime var arr: [count][]const u8 = undefined;
+        \\                    comptime var idx: usize = 0;
+        \\                    for (keys_spec.zigar_js.variants) |v| {
+        \\                        if (@hasField(@TypeOf(v), "is_unit_literal") and v.is_unit_literal) {
+        \\                            arr[idx] = enumMemberWireKey(v);
+        \\                            idx += 1;
+        \\                        }
+        \\                    }
+        \\                    const fin = arr;
+        \\                    return &fin;
+        \\                }
+        \\                return &.{};
+        \\            },
+        \\            else => return &.{},
+        \\        }
+        \\    }
+        \\    if (canExtractSingleComptimeKey(SpecT)) {
+        \\        const fin = [_][]const u8{extractSingleComptimeKey(keys_spec)};
+        \\        return &fin;
+        \\    }
+        \\    switch (@typeInfo(SpecT)) {
+        \\        .pointer => |pt| {
+        \\            if (pt.size == .slice and canExtractSingleComptimeKey(pt.child)) {
+        \\                comptime var arr: [keys_spec.len][]const u8 = undefined;
+        \\                for (keys_spec, 0..) |item, i| {
+        \\                    arr[i] = extractSingleComptimeKey(item);
+        \\                }
+        \\                const fin = arr;
+        \\                return &fin;
+        \\            }
+        \\            if (pt.size == .one and @typeInfo(pt.child) == .@"struct" and @typeInfo(pt.child).@"struct".is_tuple) {
+        \\                return extractKeyListFromSpec(keys_spec.*);
+        \\            }
+        \\            if (pt.size == .one and @typeInfo(pt.child) == .array) {
+        \\                const ElemT = @typeInfo(pt.child).array.child;
+        \\                if (canExtractSingleComptimeKey(ElemT)) {
+        \\                    comptime var arr: [keys_spec.len][]const u8 = undefined;
+        \\                    for (keys_spec, 0..) |item, i| {
+        \\                        arr[i] = extractSingleComptimeKey(item);
+        \\                    }
+        \\                    const fin = arr;
+        \\                    return &fin;
+        \\                }
+        \\            }
+        \\        },
+        \\        .@"struct" => |st| {
+        \\            if (st.is_tuple) {
+        \\                comptime var arr: [st.field_types.len][]const u8 = undefined;
+        \\                inline for (0..st.field_types.len) |i| {
+        \\                    arr[i] = extractSingleComptimeKey(keys_spec[i]);
+        \\                }
+        \\                const fin = arr;
+        \\                return &fin;
+        \\            }
+        \\        },
+        \\        else => {},
+        \\    }
+        \\    @compileError("Unsupported key specification for Pick/Omit/IndexAccess: " ++ @typeName(SpecT));
+        \\}
+        \\
+        \\fn structHasExactWireKey(comptime T: type, comptime target_wire: []const u8) bool {
+        \\    const st = @typeInfo(T).@"struct";
+        \\    for (st.field_names) |other_fname| {
+        \\        if (isHiddenMetaField(other_fname)) continue;
+        \\        if (std.mem.eql(u8, topStructFieldWireName(T, other_fname), target_wire)) return true;
+        \\    }
+        \\    return false;
+        \\}
+        \\
+        \\fn fieldMatchesAnyKey(comptime T: type, comptime fname: []const u8, comptime keys: []const []const u8) bool {
+        \\    const wire = topStructFieldWireName(T, fname);
+        \\    for (keys) |k| {
+        \\        if (std.mem.eql(u8, wire, k)) return true;
+        \\        if (!structHasExactWireKey(T, k) and std.mem.eql(u8, fname, k)) return true;
+        \\    }
+        \\    return false;
+        \\}
+        \\
+        \\pub fn standalonePartial(comptime T: type) type {
+        \\    @setEvalBranchQuota(200_000);
+        \\    if (!isPlainValueStructForTransform(T)) return T;
+        \\    const st = @typeInfo(T).@"struct";
+        \\    const need_meta = hasStructZigarJsMeta(T);
+        \\    comptime var real_count: usize = 0;
+        \\    for (st.field_names) |fname| {
+        \\        if (!isHiddenMetaField(fname)) real_count += 1;
+        \\    }
+        \\    const total_count = real_count + @intFromBool(need_meta);
+        \\    comptime var kept_names: [real_count][]const u8 = undefined;
+        \\    comptime var fnames: [total_count][]const u8 = undefined;
+        \\    comptime var ftypes: [total_count]type = undefined;
+        \\    comptime var fattrs: [total_count]std.builtin.Type.Struct.FieldAttributes = undefined;
+        \\
+        \\    comptime var out_i: usize = 0;
+        \\    inline for (st.field_names, 0..) |fname, fi| {
+        \\        if (comptime isHiddenMetaField(fname)) continue;
+        \\        const OrigFT = st.field_types[fi];
+        \\        const NewFT = if (@typeInfo(OrigFT) == .optional or isModuleNullableType(OrigFT)) OrigFT else ?OrigFT;
+        \\        const def_ptr: *const anyopaque = if (isModuleNullableType(NewFT))
+        \\            defaultPtrForValue(NewFT, .@"undefined")
+        \\        else
+        \\            defaultPtrForValue(NewFT, null);
+        \\
+        \\        kept_names[out_i] = fname;
+        \\        fnames[out_i] = fname;
+        \\        ftypes[out_i] = NewFT;
+        \\        fattrs[out_i] = .{
+        \\            .default_value_ptr = def_ptr,
+        \\            .@"comptime" = false,
+        \\            .@"align" = @alignOf(NewFT),
+        \\        };
+        \\        out_i += 1;
+        \\    }
+        \\
+        \\    if (need_meta) {
+        \\        const Carrier = buildStructMetaCarrier(T, &kept_names, .make_partial);
+        \\        fnames[real_count] = hidden_meta_field_name;
+        \\        ftypes[real_count] = Carrier;
+        \\        fattrs[real_count] = .{
+        \\            .default_value_ptr = defaultPtrForValue(Carrier, .{}),
+        \\            .@"comptime" = false,
+        \\            .@"align" = @alignOf(Carrier),
+        \\        };
+        \\    }
+        \\
+        \\    const names_fin = fnames;
+        \\    const types_fin = ftypes;
+        \\    const attrs_fin = fattrs;
+        \\    return @Struct(.auto, null, &names_fin, &types_fin, &attrs_fin);
+        \\}
+        \\
+        \\pub fn standaloneRequired(comptime T: type) type {
+        \\    @setEvalBranchQuota(200_000);
+        \\    if (!isPlainValueStructForTransform(T)) return T;
+        \\    const st = @typeInfo(T).@"struct";
+        \\    const need_meta = hasStructZigarJsMeta(T);
+        \\    comptime var real_count: usize = 0;
+        \\    for (st.field_names) |fname| {
+        \\        if (!isHiddenMetaField(fname)) real_count += 1;
+        \\    }
+        \\    const total_count = real_count + @intFromBool(need_meta);
+        \\    comptime var kept_names: [real_count][]const u8 = undefined;
+        \\    comptime var fnames: [total_count][]const u8 = undefined;
+        \\    comptime var ftypes: [total_count]type = undefined;
+        \\    comptime var fattrs: [total_count]std.builtin.Type.Struct.FieldAttributes = undefined;
+        \\
+        \\    comptime var out_i: usize = 0;
+        \\    inline for (st.field_names, 0..) |fname, fi| {
+        \\        if (comptime isHiddenMetaField(fname)) continue;
+        \\        const OrigFT = st.field_types[fi];
+        \\        const req_res = comptime requiredFieldResolution(T, fname, OrigFT);
+        \\        const NewFT = req_res.ty;
+        \\        const preserve_default = req_res.preserve_default;
+        \\
+        \\        kept_names[out_i] = fname;
+        \\        fnames[out_i] = fname;
+        \\        ftypes[out_i] = NewFT;
+        \\        fattrs[out_i] = .{
+        \\            .default_value_ptr = if (preserve_default) st.field_attrs[fi].default_value_ptr else null,
+        \\            .@"comptime" = false,
+        \\            .@"align" = @alignOf(NewFT),
+        \\        };
+        \\        out_i += 1;
+        \\    }
+        \\
+        \\    if (need_meta) {
+        \\        const Carrier = buildStructMetaCarrier(T, &kept_names, .make_required);
+        \\        fnames[real_count] = hidden_meta_field_name;
+        \\        ftypes[real_count] = Carrier;
+        \\        fattrs[real_count] = .{
+        \\            .default_value_ptr = defaultPtrForValue(Carrier, .{}),
+        \\            .@"comptime" = false,
+        \\            .@"align" = @alignOf(Carrier),
+        \\        };
+        \\    }
+        \\
+        \\    const names_fin = fnames;
+        \\    const types_fin = ftypes;
+        \\    const attrs_fin = fattrs;
+        \\    return @Struct(.auto, null, &names_fin, &types_fin, &attrs_fin);
+        \\}
+        \\
+        \\pub fn standaloneReadonly(comptime T: type) type {
+        \\    @setEvalBranchQuota(200_000);
+        \\    return switch (@typeInfo(T)) {
+        \\        .pointer => |pt| switch (pt.size) {
+        \\            .slice => if (pt.attrs.@"const") T else []const pt.child,
+        \\            .one => if (pt.attrs.@"const") T else *const pt.child,
+        \\            else => T,
+        \\        },
+        \\        .@"struct" => |st| blk: {
+        \\            if (!isPlainValueStructForTransform(T)) break :blk T;
+        \\            const need_meta = hasStructZigarJsMeta(T);
+        \\            comptime var real_count: usize = 0;
+        \\            for (st.field_names) |fname| {
+        \\                if (!isHiddenMetaField(fname)) real_count += 1;
+        \\            }
+        \\            const total_count = real_count + @intFromBool(need_meta);
+        \\            comptime var kept_names: [real_count][]const u8 = undefined;
+        \\            comptime var fnames: [total_count][]const u8 = undefined;
+        \\            comptime var ftypes: [total_count]type = undefined;
+        \\            comptime var fattrs: [total_count]std.builtin.Type.Struct.FieldAttributes = undefined;
+        \\
+        \\            comptime var out_i: usize = 0;
+        \\            inline for (st.field_names, 0..) |fname, fi| {
+        \\                if (comptime isHiddenMetaField(fname)) continue;
+        \\                const OrigFT = st.field_types[fi];
+        \\                kept_names[out_i] = fname;
+        \\                fnames[out_i] = fname;
+        \\                ftypes[out_i] = OrigFT;
+        \\                fattrs[out_i] = st.field_attrs[fi];
+        \\                out_i += 1;
+        \\            }
+        \\
+        \\            if (need_meta) {
+        \\                const Carrier = buildStructMetaCarrier(T, &kept_names, .preserve);
+        \\                fnames[real_count] = hidden_meta_field_name;
+        \\                ftypes[real_count] = Carrier;
+        \\                fattrs[real_count] = .{
+        \\                    .default_value_ptr = defaultPtrForValue(Carrier, .{}),
+        \\                    .@"comptime" = false,
+        \\                    .@"align" = @alignOf(Carrier),
+        \\                };
+        \\            }
+        \\
+        \\            const names_fin = fnames;
+        \\            const types_fin = ftypes;
+        \\            const attrs_fin = fattrs;
+        \\            break :blk @Struct(.auto, null, &names_fin, &types_fin, &attrs_fin);
+        \\        },
+        \\        else => T,
+        \\    };
+        \\}
+        \\
+        \\fn filterStructFields(comptime T: type, comptime keys_spec: anytype, comptime include_matched: bool) type {
+        \\    @setEvalBranchQuota(200_000);
+        \\    if (!isPlainValueStructForTransform(T)) return T;
+        \\    const st = @typeInfo(T).@"struct";
+        \\    const keys = comptime extractKeyListFromSpec(keys_spec);
+        \\    const need_meta = hasStructZigarJsMeta(T);
+        \\
+        \\    comptime var real_count: usize = 0;
+        \\    inline for (st.field_names) |fname| {
+        \\        if (comptime isHiddenMetaField(fname)) continue;
+        \\        const matched = comptime fieldMatchesAnyKey(T, fname, keys);
+        \\        if (matched == include_matched) real_count += 1;
+        \\    }
+        \\
+        \\    const total_count = real_count + @intFromBool(need_meta and real_count > 0);
+        \\    comptime var kept_names: [real_count][]const u8 = undefined;
+        \\    comptime var fnames: [total_count][]const u8 = undefined;
+        \\    comptime var ftypes: [total_count]type = undefined;
+        \\    comptime var fattrs: [total_count]std.builtin.Type.Struct.FieldAttributes = undefined;
+        \\
+        \\    comptime var out_i: usize = 0;
+        \\    inline for (st.field_names, 0..) |fname, fi| {
+        \\        if (comptime isHiddenMetaField(fname)) continue;
+        \\        const matched = comptime fieldMatchesAnyKey(T, fname, keys);
+        \\        if (matched != include_matched) continue;
+        \\        kept_names[out_i] = fname;
+        \\        fnames[out_i] = fname;
+        \\        ftypes[out_i] = st.field_types[fi];
+        \\        fattrs[out_i] = st.field_attrs[fi];
+        \\        out_i += 1;
+        \\    }
+        \\
+        \\    if (need_meta and real_count > 0) {
+        \\        const Carrier = buildStructMetaCarrier(T, &kept_names, .preserve);
+        \\        fnames[real_count] = hidden_meta_field_name;
+        \\        ftypes[real_count] = Carrier;
+        \\        fattrs[real_count] = .{
+        \\            .default_value_ptr = defaultPtrForValue(Carrier, .{}),
+        \\            .@"comptime" = false,
+        \\            .@"align" = @alignOf(Carrier),
+        \\        };
+        \\    }
+        \\
+        \\    const names_fin = fnames;
+        \\    const types_fin = ftypes;
+        \\    const attrs_fin = fattrs;
+        \\    return @Struct(.auto, null, &names_fin, &types_fin, &attrs_fin);
+        \\}
+        \\
+        \\pub fn standalonePick(comptime T: type, comptime keys_spec: anytype) type {
+        \\    return filterStructFields(T, keys_spec, true);
+        \\}
+        \\
+        \\pub fn standaloneOmit(comptime T: type, comptime keys_spec: anytype) type {
+        \\    return filterStructFields(T, keys_spec, false);
+        \\}
+        \\
+        \\pub fn standaloneEnumRecord(comptime K: type, comptime V: type) type {
+        \\    @setEvalBranchQuota(200_000);
+        \\    const en = @typeInfo(K).@"enum";
+        \\    const ValIsOptional = (@typeInfo(V) == .optional or isModuleNullableType(V));
+        \\
+        \\    const MetaEntry = struct {
+        \\        name: []const u8,
+        \\        js_name: []const u8,
+        \\        is_optional: bool,
+        \\        nullish: NullishKind,
+        \\    };
+        \\
+        \\    if (@hasDecl(K, "zigar_js") and @hasField(@TypeOf(K.zigar_js), "members")) {
+        \\        comptime var real_count: usize = 0;
+        \\        for (K.zigar_js.members) |m| {
+        \\            if (@hasField(@TypeOf(m), "is_alias") and m.is_alias) continue;
+        \\            real_count += 1;
+        \\        }
+        \\        comptime var chosen_names: [real_count][]const u8 = undefined;
+        \\        comptime var chosen_wires: [real_count][]const u8 = undefined;
+        \\        comptime var any_renamed = false;
+        \\        comptime var pass_i: usize = 0;
+        \\        for (K.zigar_js.members) |m| {
+        \\            if (@hasField(@TypeOf(m), "is_alias") and m.is_alias) continue;
+        \\            const wire = enumMemberWireKey(m);
+        \\            const fname = dedupeComptimeFieldName(comptimeSnakeFieldName(wire), chosen_names[0..pass_i]);
+        \\            chosen_names[pass_i] = fname;
+        \\            chosen_wires[pass_i] = wire;
+        \\            if (!std.mem.eql(u8, wire, fname)) {
+        \\                any_renamed = true;
+        \\            }
+        \\            pass_i += 1;
+        \\        }
+        \\        const need_meta = any_renamed or ValIsOptional;
+        \\        const total_count = real_count + @intFromBool(need_meta);
+        \\        comptime var fnames: [total_count][]const u8 = undefined;
+        \\        comptime var ftypes: [total_count]type = undefined;
+        \\        comptime var fattrs: [total_count]std.builtin.Type.Struct.FieldAttributes = undefined;
+        \\
+        \\        comptime var meta_entries: [real_count]MetaEntry = undefined;
+        \\        for (0..real_count) |out_i| {
+        \\            const fname = chosen_names[out_i];
+        \\            const wire = chosen_wires[out_i];
+        \\            fnames[out_i] = fname;
+        \\            ftypes[out_i] = V;
+        \\            fattrs[out_i] = .{
+        \\                .default_value_ptr = null,
+        \\                .@"comptime" = false,
+        \\                .@"align" = @alignOf(V),
+        \\            };
+        \\            meta_entries[out_i] = .{
+        \\                .name = fname,
+        \\                .js_name = wire,
+        \\                .is_optional = false,
+        \\                .nullish = if (ValIsOptional) NullishKind.null_only else NullishKind.none,
+        \\            };
+        \\        }
+        \\        if (need_meta) {
+        \\            const entries_fin = meta_entries;
+        \\            const Carrier = struct {
+        \\                pub const zigar_js = .{
+        \\                    .fields = entries_fin,
+        \\                };
+        \\            };
+        \\            fnames[real_count] = hidden_meta_field_name;
+        \\            ftypes[real_count] = Carrier;
+        \\            fattrs[real_count] = .{
+        \\                .default_value_ptr = defaultPtrForValue(Carrier, .{}),
+        \\                .@"comptime" = false,
+        \\                .@"align" = @alignOf(Carrier),
+        \\            };
+        \\        }
+        \\        const names_fin = fnames;
+        \\        const types_fin = ftypes;
+        \\        const attrs_fin = fattrs;
+        \\        return @Struct(.auto, null, &names_fin, &types_fin, &attrs_fin);
+        \\    }
+        \\
+        \\    const real_count = en.field_names.len;
+        \\    const need_meta = ValIsOptional;
+        \\    const total_count = real_count + @intFromBool(need_meta);
+        \\    comptime var fnames: [total_count][]const u8 = undefined;
+        \\    comptime var ftypes: [total_count]type = undefined;
+        \\    comptime var fattrs: [total_count]std.builtin.Type.Struct.FieldAttributes = undefined;
+        \\    comptime var meta_entries: [real_count]MetaEntry = undefined;
+        \\    for (en.field_names, 0..) |fname, i| {
+        \\        fnames[i] = fname;
+        \\        ftypes[i] = V;
+        \\        fattrs[i] = .{
+        \\            .default_value_ptr = null,
+        \\            .@"comptime" = false,
+        \\            .@"align" = @alignOf(V),
+        \\        };
+        \\        meta_entries[i] = .{
+        \\            .name = fname,
+        \\            .js_name = fname,
+        \\            .is_optional = false,
+        \\            .nullish = if (ValIsOptional) NullishKind.null_only else NullishKind.none,
+        \\        };
+        \\    }
+        \\    if (need_meta) {
+        \\        const entries_fin = meta_entries;
+        \\        const Carrier = struct {
+        \\            pub const zigar_js = .{
+        \\                .fields = entries_fin,
+        \\            };
+        \\        };
+        \\        fnames[real_count] = hidden_meta_field_name;
+        \\        ftypes[real_count] = Carrier;
+        \\        fattrs[real_count] = .{
+        \\            .default_value_ptr = defaultPtrForValue(Carrier, .{}),
+        \\            .@"comptime" = false,
+        \\            .@"align" = @alignOf(Carrier),
+        \\        };
+        \\    }
+        \\    const names_fin = fnames;
+        \\    const types_fin = ftypes;
+        \\    const attrs_fin = fattrs;
+        \\    return @Struct(.auto, null, &names_fin, &types_fin, &attrs_fin);
+        \\}
+        \\
+        \\pub fn standaloneMappedValues(comptime T: type, comptime V: type) type {
+        \\    return standaloneMappedValuesSpec(T, V, .auto);
+        \\}
+        \\
+        \\pub fn standaloneMappedValuesSpec(
+        \\    comptime T: type,
+        \\    comptime V: type,
+        \\    comptime v_spec: anytype,
+        \\) type {
+        \\    @setEvalBranchQuota(200_000);
+        \\    switch (@typeInfo(T)) {
+        \\        .pointer => |pt| {
+        \\            if (pt.size == .slice) {
+        \\                if (pt.child == u8) return T;
+        \\                return if (pt.attrs.@"const") []const V else []V;
+        \\            }
+        \\            return StubRecord(standaloneKeyOf(T), V);
+        \\        },
+        \\        .array => |ar| return [ar.len]V,
+        \\        .int, .float, .bool, .void => return T,
+        \\        .@"struct" => |st| {
+        \\            if (st.is_tuple) return [st.field_types.len]V;
+        \\            if (@hasDecl(T, "is_js_array") and T.is_js_array) return []const V;
+        \\            if (@hasDecl(T, "is_js_bigint") and T.is_js_bigint) return T;
+        \\            if (@hasDecl(T, "zigar_js_tuple")) {
+        \\                const has_var = @hasField(@TypeOf(T.zigar_js_tuple), "variadic_index") and T.zigar_js_tuple.variadic_index != null;
+        \\                const has_opt = blk: {
+        \\                    for (st.field_attrs) |fa| {
+        \\                        if (fa.default_value_ptr != null) break :blk true;
+        \\                    }
+        \\                    if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "fields")) {
+        \\                        inline for (T.zigar_js.fields) |fm| {
+        \\                            if (@hasField(@TypeOf(fm), "is_optional") and fm.is_optional) break :blk true;
+        \\                        }
+        \\                    }
+        \\                    break :blk false;
+        \\                };
+        \\                if (has_var or has_opt) return []const V;
+        \\                return [st.field_types.len]V;
+        \\            }
+        \\            if (isPlainValueStructForTransform(T)) {
+        \\                comptime var real_count: usize = 0;
+        \\                for (st.field_names) |fname| {
+        \\                    if (!isHiddenMetaField(fname)) real_count += 1;
+        \\                }
+        \\                if (real_count == 0) return struct {};
+        \\
+        \\                const req_spec = comptime blk: {
+        \\                    const VSpecT = @TypeOf(v_spec);
+        \\                    if (@typeInfo(VSpecT) == .enum_literal) {
+        \\                        if (v_spec == .auto) {
+        \\                            break :blk if (isModuleNullableType(V))
+        \\                                NullishKind.null_or_undefined
+        \\                            else if (@typeInfo(V) == .optional)
+        \\                                NullishKind.null_only
+        \\                            else
+        \\                                NullishKind.none;
+        \\                        }
+        \\                        break :blk @as(NullishKind, v_spec);
+        \\                    }
+        \\                    break :blk v_spec;
+        \\                };
+        \\                const opt_spec = comptime blk: {
+        \\                    if (@typeInfo(V) == .optional or isModuleNullableType(V)) {
+        \\                        const cur_self = specTopSelfNullish(req_spec);
+        \\                        const merged_self: NullishKind = if (isModuleNullableType(V) or cur_self == .null_only or cur_self == .null_or_undefined)
+        \\                            .null_or_undefined
+        \\                        else
+        \\                            .undefined_only;
+        \\                        break :blk rebuildSpecWithSelf(req_spec, merged_self);
+        \\                    }
+        \\                    break :blk wrapSpecAsOptional(req_spec, .undefined_only);
+        \\                };
+        \\
+        \\                const ReqEntryT = struct {
+        \\                    name: []const u8,
+        \\                    js_name: []const u8,
+        \\                    is_optional: bool,
+        \\                    nullish: @TypeOf(req_spec),
+        \\                };
+        \\                const OptEntryT = struct {
+        \\                    name: []const u8,
+        \\                    js_name: []const u8,
+        \\                    is_optional: bool,
+        \\                    nullish: @TypeOf(opt_spec),
+        \\                };
+        \\
+        \\                comptime var any_opt = false;
+        \\                inline for (st.field_names, 0..) |fname, fi| {
+        \\                    if (comptime isHiddenMetaField(fname)) continue;
+        \\                    if (comptime topStructFieldIsOptional(T, fname, st.field_attrs[fi].default_value_ptr != null)) {
+        \\                        any_opt = true;
+        \\                    }
+        \\                }
+        \\
+        \\                const req_needs_meta = (@TypeOf(req_spec) != NullishKind) or (req_spec != NullishKind.none);
+        \\                const need_meta = hasStructZigarJsMeta(T) or any_opt or req_needs_meta;
+        \\                const total_count = real_count + @intFromBool(need_meta);
+        \\
+        \\                comptime var fnames: [total_count][]const u8 = undefined;
+        \\                comptime var ftypes: [total_count]type = undefined;
+        \\                comptime var fattrs: [total_count]std.builtin.Type.Struct.FieldAttributes = undefined;
+        \\                comptime var entry_types: [real_count]type = undefined;
+        \\
+        \\                comptime var out_i: usize = 0;
+        \\                inline for (st.field_names, 0..) |fname, fi| {
+        \\                    if (comptime isHiddenMetaField(fname)) continue;
+        \\                    const src_is_opt = comptime topStructFieldIsOptional(T, fname, st.field_attrs[fi].default_value_ptr != null);
+        \\                    if (src_is_opt) {
+        \\                        const NewFT = if (@typeInfo(V) == .optional or isModuleNullableType(V)) V else ?V;
+        \\                        const def_ptr: *const anyopaque = if (isModuleNullableType(NewFT))
+        \\                            defaultPtrForValue(NewFT, .@"undefined")
+        \\                        else
+        \\                            defaultPtrForValue(NewFT, null);
+        \\                        fnames[out_i] = fname;
+        \\                        ftypes[out_i] = NewFT;
+        \\                        fattrs[out_i] = .{
+        \\                            .default_value_ptr = def_ptr,
+        \\                            .@"comptime" = false,
+        \\                            .@"align" = @alignOf(NewFT),
+        \\                        };
+        \\                        entry_types[out_i] = OptEntryT;
+        \\                    } else {
+        \\                        fnames[out_i] = fname;
+        \\                        ftypes[out_i] = V;
+        \\                        fattrs[out_i] = .{
+        \\                            .default_value_ptr = null,
+        \\                            .@"comptime" = false,
+        \\                            .@"align" = @alignOf(V),
+        \\                        };
+        \\                        entry_types[out_i] = ReqEntryT;
+        \\                    }
+        \\                    out_i += 1;
+        \\                }
+        \\
+        \\                if (need_meta) {
+        \\                    const FieldsTuple = @Tuple(&entry_types);
+        \\                    const fields_val = comptime blk: {
+        \\                        var tup: FieldsTuple = undefined;
+        \\                        var ti: usize = 0;
+        \\                        for (st.field_names, 0..) |fname, fi| {
+        \\                            if (isHiddenMetaField(fname)) continue;
+        \\                            const wire = topStructFieldWireName(T, fname);
+        \\                            const src_is_opt = topStructFieldIsOptional(T, fname, st.field_attrs[fi].default_value_ptr != null);
+        \\                            if (src_is_opt) {
+        \\                                tup[ti] = OptEntryT{
+        \\                                    .name = fname,
+        \\                                    .js_name = wire,
+        \\                                    .is_optional = true,
+        \\                                    .nullish = opt_spec,
+        \\                                };
+        \\                            } else {
+        \\                                tup[ti] = ReqEntryT{
+        \\                                    .name = fname,
+        \\                                    .js_name = wire,
+        \\                                    .is_optional = false,
+        \\                                    .nullish = req_spec,
+        \\                                };
+        \\                            }
+        \\                            ti += 1;
+        \\                        }
+        \\                        break :blk tup;
+        \\                    };
+        \\                    const Carrier = struct {
+        \\                        pub const zigar_js = .{
+        \\                            .fields = fields_val,
+        \\                        };
+        \\                    };
+        \\                    fnames[real_count] = hidden_meta_field_name;
+        \\                    ftypes[real_count] = Carrier;
+        \\                    fattrs[real_count] = .{
+        \\                        .default_value_ptr = defaultPtrForValue(Carrier, .{}),
+        \\                        .@"comptime" = false,
+        \\                        .@"align" = @alignOf(Carrier),
+        \\                    };
+        \\                }
+        \\
+        \\                const names_fin = fnames;
+        \\                const types_fin = ftypes;
+        \\                const attrs_fin = fattrs;
+        \\                return @Struct(.auto, null, &names_fin, &types_fin, &attrs_fin);
+        \\            }
+        \\            return StubRecord(standaloneKeyOf(T), V);
+        \\        },
+        \\        else => return StubRecord(standaloneKeyOf(T), V),
+        \\    }
+        \\}
+        \\
+        \\pub fn standaloneNonNullable(comptime T: type) type {
+        \\    if (@typeInfo(T) == .optional) return standaloneNonNullable(@typeInfo(T).optional.child);
+        \\    if (isModuleNullableType(T)) return standaloneNonNullable(T.Value);
+        \\    return T;
+        \\}
+        \\
+        \\fn buildSynthesizedUnion(comptime member_types: []const type) type {
+        \\    const count = member_types.len;
+        \\    if (count == 0) return noreturn;
+        \\    if (count == 1) return member_types[0];
+        \\    const TagInt = std.math.IntFittingRange(0, count - 1);
+        \\    comptime var fnames: [count][]const u8 = undefined;
+        \\    comptime var ftypes: [count]type = undefined;
+        \\    comptime var fattrs: [count]std.builtin.Type.Union.FieldAttributes = undefined;
+        \\    comptime var tag_vals: [count]TagInt = undefined;
+        \\    for (member_types, 0..) |mt, i| {
+        \\        fnames[i] = std.fmt.comptimePrint("v{d}", .{i});
+        \\        ftypes[i] = mt;
+        \\        fattrs[i] = .{};
+        \\        tag_vals[i] = i;
+        \\    }
+        \\    const names_fin = fnames;
+        \\    const types_fin = ftypes;
+        \\    const attrs_fin = fattrs;
+        \\    const vals_fin = tag_vals;
+        \\    const Tag = @Enum(TagInt, .exhaustive, &names_fin, &vals_fin);
+        \\    return @Union(.auto, Tag, &names_fin, &types_fin, &attrs_fin);
+        \\}
+        \\
+        \\pub fn standaloneAwaited(comptime T: type) type {
+        \\    if (@typeInfo(T) == .@"struct") {
+        \\        if (@hasDecl(T, "is_js_promise") and T.is_js_promise and @hasDecl(T, "Payload")) {
+        \\            return standaloneAwaited(T.Payload);
+        \\        }
+        \\        if (@hasDecl(T, "Target") and @TypeOf(T.Target) == type and @typeInfo(T.Target) == .@"struct") {
+        \\            if (@hasDecl(T.Target, "is_js_promise") and T.Target.is_js_promise and @hasDecl(T.Target, "Payload")) {
+        \\                return standaloneAwaited(T.Target.Payload);
+        \\            }
+        \\        }
+        \\    }
+        \\    if (@typeInfo(T) == .@"union" and @typeInfo(T).@"union".tag_type != null and !isModuleNullableType(T)) {
+        \\        const un = @typeInfo(T).@"union";
+        \\        comptime var any_changed = false;
+        \\        comptime var distinct: [un.field_types.len]type = undefined;
+        \\        comptime var d_len: usize = 0;
+        \\        for (un.field_types) |ft| {
+        \\            const aw = standaloneAwaited(ft);
+        \\            if (aw != ft) any_changed = true;
+        \\            var seen = false;
+        \\            for (distinct[0..d_len]) |prev| {
+        \\                if (prev == aw) {
+        \\                    seen = true;
+        \\                    break;
+        \\                }
+        \\            }
+        \\            if (!seen) {
+        \\                distinct[d_len] = aw;
+        \\                d_len += 1;
+        \\            }
+        \\        }
+        \\        if (any_changed) {
+        \\            if (d_len == 1) return distinct[0];
+        \\            return buildSynthesizedUnion(distinct[0..d_len]);
+        \\        }
+        \\    }
+        \\    return T;
+        \\}
+        \\
+        \\pub fn standaloneKeyOf(comptime T: type) type {
+        \\    @setEvalBranchQuota(200_000);
+        \\    switch (@typeInfo(T)) {
+        \\        .@"struct" => |st| {
+        \\            if (isPlainValueStructForTransform(T)) {
+        \\                comptime var max_count: usize = 0;
+        \\                for (st.field_names) |fname| {
+        \\                    if (!isHiddenMetaField(fname)) max_count += 1;
+        \\                }
+        \\                if (max_count == 0) return noreturn;
+        \\                comptime var names_buf: [max_count][]const u8 = undefined;
+        \\                comptime var count: usize = 0;
+        \\                for (st.field_names) |fname| {
+        \\                    if (isHiddenMetaField(fname)) continue;
+        \\                    const w = topStructFieldWireName(T, fname);
+        \\                    var dup = false;
+        \\                    for (names_buf[0..count]) |prev| {
+        \\                        if (std.mem.eql(u8, prev, w)) {
+        \\                            dup = true;
+        \\                            break;
+        \\                        }
+        \\                    }
+        \\                    if (!dup) {
+        \\                        names_buf[count] = w;
+        \\                        count += 1;
+        \\                    }
+        \\                }
+        \\                if (count == 0) return noreturn;
+        \\                const TagInt = std.math.IntFittingRange(0, count - 1);
+        \\                comptime var vals: [count]TagInt = undefined;
+        \\                for (0..count) |i| vals[i] = i;
+        \\                const names_fin = names_buf[0..count].*;
+        \\                const vals_fin = vals;
+        \\                return @Enum(TagInt, .exhaustive, &names_fin, &vals_fin);
+        \\            }
+        \\            if (isGeneratedHandleStruct(T) and @hasField(@TypeOf(T.zigar_js), "fields")) {
+        \\                const fmeta = T.zigar_js.fields;
+        \\                const mmeta = if (@hasField(@TypeOf(T.zigar_js), "methods")) T.zigar_js.methods else .{};
+        \\                const max_len = fmeta.len + mmeta.len;
+        \\                if (max_len == 0) return []const u8;
+        \\                comptime var names_buf: [max_len][]const u8 = undefined;
+        \\                comptime var count: usize = 0;
+        \\                for (fmeta) |fm| {
+        \\                    const w = if (@hasField(@TypeOf(fm), "js_name")) fm.js_name else fm.name;
+        \\                    var dup = false;
+        \\                    for (names_buf[0..count]) |prev| {
+        \\                        if (std.mem.eql(u8, prev, w)) {
+        \\                            dup = true;
+        \\                            break;
+        \\                        }
+        \\                    }
+        \\                    if (!dup) {
+        \\                        names_buf[count] = w;
+        \\                        count += 1;
+        \\                    }
+        \\                }
+        \\                for (mmeta) |mm| {
+        \\                    if (@hasField(@TypeOf(mm), "is_static") and mm.is_static) continue;
+        \\                    const w = if (@hasField(@TypeOf(mm), "js_name")) mm.js_name else mm.name;
+        \\                    var dup = false;
+        \\                    for (names_buf[0..count]) |prev| {
+        \\                        if (std.mem.eql(u8, prev, w)) {
+        \\                            dup = true;
+        \\                            break;
+        \\                        }
+        \\                    }
+        \\                    if (!dup) {
+        \\                        names_buf[count] = w;
+        \\                        count += 1;
+        \\                    }
+        \\                }
+        \\                if (count == 0) return []const u8;
+        \\                const TagInt = std.math.IntFittingRange(0, count - 1);
+        \\                comptime var vals: [count]TagInt = undefined;
+        \\                for (0..count) |i| vals[i] = i;
+        \\                const names_fin = names_buf[0..count].*;
+        \\                const vals_fin = vals;
+        \\                return @Enum(TagInt, .exhaustive, &names_fin, &vals_fin);
+        \\            }
+        \\            if (@hasDecl(T, "is_js_record") and T.is_js_record and @hasDecl(T, "Key")) {
+        \\                return T.Key;
+        \\            }
+        \\            return []const u8;
+        \\        },
+        \\        .pointer => |pt| {
+        \\            if (pt.size == .slice) return f64;
+        \\            return []const u8;
+        \\        },
+        \\        else => return []const u8,
+        \\    }
+        \\}
+        \\
+        \\fn isNumericIndexKeySpec(comptime keys_spec: anytype) ?usize {
+        \\    const SpecT = @TypeOf(keys_spec);
+        \\    if (SpecT == comptime_int or @typeInfo(SpecT) == .int) {
+        \\        if (keys_spec < 0) @compileError("Negative tuple/array index in IndexAccess");
+        \\        return @intCast(keys_spec);
+        \\    }
+        \\    return null;
+        \\}
+        \\
+        \\fn isBroadNumericIndexType(comptime keys_spec: anytype) bool {
+        \\    if (@TypeOf(keys_spec) != type) return false;
+        \\    return switch (@typeInfo(keys_spec)) {
+        \\        .int, .float => true,
+        \\        else => false,
+        \\    };
+        \\}
+        \\
+        \\pub fn standaloneIndexAccess(comptime T: type, comptime keys_spec: anytype) type {
+        \\    @setEvalBranchQuota(200_000);
+        \\    switch (@typeInfo(T)) {
+        \\        .pointer => |pt| {
+        \\            if (pt.size == .slice) {
+        \\                if (isNumericIndexKeySpec(keys_spec) != null or isBroadNumericIndexType(keys_spec)) {
+        \\                    return pt.child;
+        \\                }
+        \\            }
+        \\        },
+        \\        .array => |ar| {
+        \\            if (isNumericIndexKeySpec(keys_spec) != null or isBroadNumericIndexType(keys_spec)) {
+        \\                return ar.child;
+        \\            }
+        \\        },
+        \\        .@"struct" => |st| {
+        \\            if (@hasDecl(T, "is_js_record") and T.is_js_record and @hasDecl(T, "Value")) {
+        \\                return T.Value;
+        \\            }
+        \\            if (@hasDecl(T, "is_js_array") and T.is_js_array and (@hasDecl(T, "Elem") or @hasDecl(T, "Element"))) {
+        \\                if (isNumericIndexKeySpec(keys_spec) != null or isBroadNumericIndexType(keys_spec)) {
+        \\                    return if (@hasDecl(T, "Elem")) T.Elem else T.Element;
+        \\                }
+        \\            }
+        \\            if (st.is_tuple or @hasDecl(T, "zigar_js_tuple")) {
+        \\                if (isNumericIndexKeySpec(keys_spec)) |idx| {
+        \\                    if (idx < st.field_types.len) return st.field_types[idx];
+        \\                    @compileError("Tuple index out of bounds in IndexAccess");
+        \\                }
+        \\                if (isBroadNumericIndexType(keys_spec)) {
+        \\                    comptime var distinct: [st.field_types.len]type = undefined;
+        \\                    comptime var d_len: usize = 0;
+        \\                    for (st.field_types, 0..) |ft, fi| {
+        \\                        const elem_t = if (@hasDecl(T, "zigar_js_tuple") and @hasField(@TypeOf(T.zigar_js_tuple), "variadic_index") and T.zigar_js_tuple.variadic_index != null and T.zigar_js_tuple.variadic_index.? == fi and @typeInfo(ft) == .pointer and @typeInfo(ft).pointer.size == .slice)
+        \\                            @typeInfo(ft).pointer.child
+        \\                        else
+        \\                            ft;
+        \\                        var seen = false;
+        \\                        for (distinct[0..d_len]) |prev| {
+        \\                            if (prev == elem_t) {
+        \\                                seen = true;
+        \\                                break;
+        \\                            }
+        \\                        }
+        \\                        if (!seen) {
+        \\                            distinct[d_len] = elem_t;
+        \\                            d_len += 1;
+        \\                        }
+        \\                    }
+        \\                    return buildSynthesizedUnion(distinct[0..d_len]);
+        \\                }
+        \\            }
+        \\            if (isPlainValueStructForTransform(T)) {
+        \\                if (@TypeOf(keys_spec) == type and keys_spec == []const u8) {
+        \\                    return Any;
+        \\                }
+        \\                if (isBroadNumericIndexType(keys_spec)) {
+        \\                    comptime var distinct_num: [st.field_types.len]type = undefined;
+        \\                    comptime var dn_len: usize = 0;
+        \\                    for (st.field_names, 0..) |fname, fi| {
+        \\                        if (isHiddenMetaField(fname)) continue;
+        \\                        if (!isNumericPropertyKeyString(topStructFieldWireName(T, fname))) continue;
+        \\                        const ft = st.field_types[fi];
+        \\                        var seen = false;
+        \\                        for (distinct_num[0..dn_len]) |prev| {
+        \\                            if (prev == ft) {
+        \\                                seen = true;
+        \\                                break;
+        \\                            }
+        \\                        }
+        \\                        if (!seen) {
+        \\                            distinct_num[dn_len] = ft;
+        \\                            dn_len += 1;
+        \\                        }
+        \\                    }
+        \\                    if (dn_len > 0) return buildSynthesizedUnion(distinct_num[0..dn_len]);
+        \\                    return Any;
+        \\                }
+        \\                const keys = comptime extractKeyListFromSpec(keys_spec);
+        \\                if (keys.len == 0) return noreturn;
+        \\                comptime var distinct: [st.field_types.len]type = undefined;
+        \\                comptime var d_len: usize = 0;
+        \\                for (st.field_names, 0..) |fname, fi| {
+        \\                    if (isHiddenMetaField(fname)) continue;
+        \\                    if (!fieldMatchesAnyKey(T, fname, keys)) continue;
+        \\                    const ft = st.field_types[fi];
+        \\                    var seen = false;
+        \\                    for (distinct[0..d_len]) |prev| {
+        \\                        if (prev == ft) {
+        \\                            seen = true;
+        \\                            break;
+        \\                        }
+        \\                    }
+        \\                    if (!seen) {
+        \\                        distinct[d_len] = ft;
+        \\                        d_len += 1;
+        \\                    }
+        \\                }
+        \\                if (d_len > 0) return buildSynthesizedUnion(distinct[0..d_len]);
+        \\                return Any;
+        \\            }
+        \\        },
+        \\        else => {},
+        \\    }
+        \\    return Any;
+        \\}
+        \\
+        \\pub fn standaloneInferJsType(comptime Arg: type) type {
+        \\    if (Arg == comptime_int or Arg == comptime_float) return f64;
+        \\    if (Arg == @TypeOf(null) or Arg == @TypeOf(undefined)) return Any;
+        \\    return switch (@typeInfo(Arg)) {
+        \\        .enum_literal => @compileError("zigar.js: pass a concrete enum value or string slice instead of an untyped enum literal"),
+        \\        .pointer => |pt| blk: {
+        \\            if (pt.size == .one and @typeInfo(pt.child) == .array) {
+        \\                const elem = @typeInfo(pt.child).array.child;
+        \\                if (elem == comptime_int or elem == comptime_float) break :blk []const f64;
+        \\                break :blk []const elem;
+        \\            }
+        \\            break :blk Arg;
+        \\        },
+        \\        else => Arg,
+        \\    };
+        \\}
+        \\
+        \\pub fn standaloneInferConstJsType(comptime Arg: type) type {
+        \\    if (Arg == comptime_int or Arg == comptime_float) return f64;
+        \\    if (Arg == @TypeOf(null) or Arg == @TypeOf(undefined)) return Any;
+        \\    return switch (@typeInfo(Arg)) {
+        \\        .enum_literal => @compileError("zigar.js: pass a concrete enum value or string slice instead of an untyped enum literal"),
+        \\        .pointer => |pt| blk: {
+        \\            if (pt.size == .one and @typeInfo(pt.child) == .array) {
+        \\                const ar = @typeInfo(pt.child).array;
+        \\                if (ar.child == u8 and ar.sentinel() != null) break :blk []const u8;
+        \\                const elem = if (ar.child == comptime_int or ar.child == comptime_float) f64 else ar.child;
+        \\                break :blk [ar.len]elem;
+        \\            }
+        \\            break :blk Arg;
+        \\        },
+        \\        .array => |ar| blk: {
+        \\            const elem = if (ar.child == comptime_int or ar.child == comptime_float) f64 else ar.child;
+        \\            break :blk [ar.len]elem;
+        \\        },
+        \\        else => Arg,
+        \\    };
+        \\}
+        \\
+        \\pub fn standaloneIsConstArrayPtr(comptime Arg: type) bool {
+        \\    return switch (@typeInfo(Arg)) {
+        \\        .pointer => |pt| blk: {
+        \\            if (pt.size == .one and @typeInfo(pt.child) == .array) {
+        \\                const ar = @typeInfo(pt.child).array;
+        \\                if (ar.child == u8 and ar.sentinel() != null) break :blk false;
+        \\                break :blk true;
+        \\            }
+        \\            break :blk false;
+        \\        },
+        \\        else => false,
+        \\    };
+        \\}
+        \\
+        \\pub fn standaloneInferSliceElem(comptime S: type) type {
+        \\    return switch (@typeInfo(S)) {
+        \\        .pointer => |pt| blk: {
+        \\            if (pt.size == .slice) {
+        \\                if (pt.child == comptime_int or pt.child == comptime_float) break :blk f64;
+        \\                break :blk pt.child;
+        \\            }
+        \\            if (pt.size == .one and @typeInfo(pt.child) == .array) {
+        \\                const elem = @typeInfo(pt.child).array.child;
+        \\                if (elem == comptime_int or elem == comptime_float) break :blk f64;
+        \\                break :blk elem;
+        \\            }
+        \\            @compileError("zigar.js: expected slice or array pointer argument for generic element inference, got " ++ @typeName(S));
+        \\        },
+        \\        .array => |ar| if (ar.child == comptime_int or ar.child == comptime_float) f64 else ar.child,
+        \\        else => @compileError("zigar.js: expected slice or array argument for generic element inference, got " ++ @typeName(S)),
+        \\    };
+        \\}
+        \\
+        \\pub fn standaloneInferOptionalChild(comptime Opt: type) type {
+        \\    if (Opt == @TypeOf(null) or Opt == @TypeOf(undefined)) return Any;
+        \\    return switch (@typeInfo(Opt)) {
+        \\        .optional => |op| standaloneInferJsType(op.child),
+        \\        else => standaloneInferJsType(Opt),
+        \\    };
+        \\}
+        \\
+        \\fn isRefToTarget(comptime T: type, comptime TargetMarker: type) bool {
+        \\    return @typeInfo(T) == .@"struct" and @hasDecl(T, "Target") and @TypeOf(T.Target) == type and T.Target == TargetMarker;
+        \\}
+        \\
+        \\fn isUnconstrainedJsAnyOrUnknown(comptime T: type) bool {
+        \\    if (T == Any or T == Unknown) return true;
+        \\    if (isRefToTarget(T, Any) or isRefToTarget(T, Unknown)) return true;
+        \\    if (@typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_any_or_unknown") and T.is_js_any_or_unknown) return true;
+        \\    return false;
+        \\}
+        \\
+        \\fn isJsObjectConstraintMarker(comptime T: type) bool {
+        \\    if (T == Object or isRefToTarget(T, Object)) return true;
+        \\    return @typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_object") and T.is_js_object;
+        \\}
+        \\
+        \\fn isJsFunctionConstraintMarker(comptime T: type) bool {
+        \\    if (T == Function or isRefToTarget(T, Function)) return true;
+        \\    return @typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_function") and T.is_js_function;
+        \\}
+        \\
+        \\fn isJsSymbolConstraintMarker(comptime T: type) bool {
+        \\    if (T == Symbol or isRefToTarget(T, Symbol)) return true;
+        \\    return @typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_symbol") and T.is_js_symbol;
+        \\}
+        \\
+        \\fn isStringLikeConstraintCandidate(comptime T: type) bool {
+        \\    if (T == []const u8 or T == []u8 or T == [:0]const u8 or T == [:0]u8) return true;
+        \\    return switch (@typeInfo(T)) {
+        \\        .pointer => |pt| (pt.size == .slice and pt.child == u8) or
+        \\            (pt.size == .one and @typeInfo(pt.child) == .array and @typeInfo(pt.child).array.child == u8),
+        \\        .@"enum" => @hasDecl(T, "toSlice"),
+        \\        .@"struct" => isTemplateLiteralStruct(T) or (@hasDecl(T, "is_js_string") and T.is_js_string),
+        \\        .@"union" => @hasDecl(T, "zigar_js") and
+        \\            @hasField(@TypeOf(T.zigar_js), "is_open_literal") and
+        \\            T.zigar_js.is_open_literal and
+        \\            @hasDecl(T, "fromSlice"),
+        \\        else => false,
+        \\    };
+        \\}
+        \\
+        \\fn isNumberLikeConstraintCandidate(comptime T: type) bool {
+        \\    return switch (@typeInfo(T)) {
+        \\        .float, .comptime_float, .int, .comptime_int => true,
+        \\        .@"enum" => !@hasDecl(T, "toSlice"),
+        \\        .@"union" => @hasDecl(T, "zigar_js") and
+        \\            @hasField(@TypeOf(T.zigar_js), "is_open_literal") and
+        \\            T.zigar_js.is_open_literal and
+        \\            !@hasDecl(T, "fromSlice"),
+        \\        else => false,
+        \\    };
+        \\}
+        \\
+        \\fn isFunctionLikeConstraintCandidate(comptime T: type) bool {
+        \\    return switch (@typeInfo(T)) {
+        \\        .@"fn" => true,
+        \\        .pointer => |pt| pt.size == .one and @typeInfo(pt.child) == .@"fn",
+        \\        .@"struct" => (@hasDecl(T, "is_zig_callback") and T.is_zig_callback) or
+        \\            isJsFunctionConstraintMarker(T) or
+        \\            (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_callable_handle") and T.zigar_js.is_callable_handle),
+        \\        else => false,
+        \\    };
+        \\}
+        \\
+        \\fn structDerivesFrom(comptime T: type, comptime Base: type, comptime depth: usize) bool {
+        \\    if (T == Base) return true;
+        \\    if (depth > 8) return false;
+        \\    if (@typeInfo(T) != .@"struct") return false;
+        \\    if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "bases"))) {
+        \\        const bases = T.zigar_js.bases;
+        \\        inline for (@typeInfo(@TypeOf(bases)).@"struct".field_names) |bf_name| {
+        \\            const B = @field(bases, bf_name);
+        \\            if (comptime (@TypeOf(B) == type)) {
+        \\                if (B == Base or structDerivesFrom(B, Base, depth + 1)) return true;
+        \\            }
+        \\        }
+        \\    }
+        \\    return false;
+        \\}
+        \\
+        \\fn structProvidesMember(comptime T: type, comptime wire_or_zig: []const u8) bool {
+        \\    if (@typeInfo(T) != .@"struct") return false;
+        \\    if (@hasField(T, wire_or_zig) or @hasDecl(T, wire_or_zig)) return true;
+        \\    if (comptime @hasDecl(T, "zigar_js")) {
+        \\        const meta = T.zigar_js;
+        \\        if (comptime @hasField(@TypeOf(meta), "fields")) {
+        \\            inline for (@typeInfo(@TypeOf(meta.fields)).@"struct".field_names) |mf_name| {
+        \\                const entry = @field(meta.fields, mf_name);
+        \\                if (comptime @hasField(@TypeOf(entry), "js_name")) {
+        \\                    if (std.mem.eql(u8, entry.js_name, wire_or_zig)) return true;
+        \\                }
+        \\                if (comptime @hasField(@TypeOf(entry), "name")) {
+        \\                    if (std.mem.eql(u8, entry.name, wire_or_zig)) return true;
+        \\                }
+        \\            }
+        \\        }
+        \\        if (comptime @hasField(@TypeOf(meta), "methods")) {
+        \\            inline for (@typeInfo(@TypeOf(meta.methods)).@"struct".field_names) |mf_name| {
+        \\                const entry = @field(meta.methods, mf_name);
+        \\                if (comptime @hasField(@TypeOf(entry), "js_name")) {
+        \\                    if (std.mem.eql(u8, entry.js_name, wire_or_zig)) return true;
+        \\                }
+        \\                if (comptime @hasField(@TypeOf(entry), "name")) {
+        \\                    if (std.mem.eql(u8, entry.name, wire_or_zig)) return true;
+        \\                }
+        \\            }
+        \\        }
+        \\        if (comptime @hasField(@TypeOf(meta), "bases")) {
+        \\            inline for (@typeInfo(@TypeOf(meta.bases)).@"struct".field_names) |bf_name| {
+        \\                const B = @field(meta.bases, bf_name);
+        \\                if (comptime (@TypeOf(B) == type)) {
+        \\                    if (structProvidesMember(B, wire_or_zig)) return true;
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\    return false;
+        \\}
+        \\
+        \\fn lookupStructFieldType(comptime T: type, comptime zig_name: []const u8, comptime wire_name: []const u8) ?type {
+        \\    if (@typeInfo(T) != .@"struct") return null;
+        \\    if (@hasField(T, zig_name)) return @FieldType(T, zig_name);
+        \\    if (!std.mem.eql(u8, wire_name, zig_name) and @hasField(T, wire_name)) return @FieldType(T, wire_name);
+        \\    if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "fields"))) {
+        \\        inline for (@typeInfo(@TypeOf(T.zigar_js.fields)).@"struct".field_names) |mf_name| {
+        \\            const entry = @field(T.zigar_js.fields, mf_name);
+        \\            if (comptime (@hasField(@TypeOf(entry), "js_name") and @hasField(@TypeOf(entry), "name"))) {
+        \\                if (comptime (std.mem.eql(u8, entry.js_name, wire_name) and @hasField(T, entry.name))) {
+        \\                    return @FieldType(T, entry.name);
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\    return null;
+        \\}
+        \\
+        \\fn enumMemberWireName(comptime EnumT: type, comptime field_name: []const u8) []const u8 {
+        \\    if (comptime (@hasDecl(EnumT, "zigar_js") and @hasField(@TypeOf(EnumT.zigar_js), "members"))) {
+        \\        const members = EnumT.zigar_js.members;
+        \\        inline for (@typeInfo(@TypeOf(members)).@"struct".field_names) |mf_name| {
+        \\            const entry = @field(members, mf_name);
+        \\            if (comptime @hasField(@TypeOf(entry), "tag")) {
+        \\                if (std.mem.eql(u8, entry.tag, field_name)) {
+        \\                    if (comptime @hasField(@TypeOf(entry), "str_value")) return entry.str_value;
+        \\                    if (comptime @hasField(@TypeOf(entry), "js_name")) return entry.js_name;
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\    return field_name;
+        \\}
+        \\
+        \\fn standaloneUnitLiteralSatisfiesConstraint(comptime vd: anytype, comptime Constraint: type, comptime depth: usize) bool {
+        \\    if (depth > 8) return true;
+        \\    const VD = @TypeOf(vd);
+        \\    if (@typeInfo(Constraint) == .optional) {
+        \\        return standaloneUnitLiteralSatisfiesConstraint(vd, @typeInfo(Constraint).optional.child, depth + 1);
+        \\    }
+        \\    if (@typeInfo(Constraint) == .@"union") {
+        \\        if (comptime (@hasDecl(Constraint, "is_zigar_nullable") and Constraint.is_zigar_nullable)) {
+        \\            return standaloneUnitLiteralSatisfiesConstraint(vd, Constraint.Value, depth + 1);
+        \\        }
+        \\        if (comptime (@hasDecl(Constraint, "zigar_js") and
+        \\            @hasField(@TypeOf(Constraint.zigar_js), "is_open_literal") and
+        \\            Constraint.zigar_js.is_open_literal))
+        \\        {
+        \\            if (comptime @hasDecl(Constraint, "fromSlice")) return @hasField(VD, "str_value");
+        \\            return @hasField(VD, "int_value") or @hasField(VD, "float_value");
+        \\        }
+        \\        const c_types = @typeInfo(Constraint).@"union".field_types;
+        \\        if (comptime (@hasDecl(Constraint, "zigar_js") and @hasField(@TypeOf(Constraint.zigar_js), "variants"))) {
+        \\            const cvs = Constraint.zigar_js.variants;
+        \\            inline for (c_types, 0..) |cf_ty, ci| {
+        \\                if (ci < cvs.len and @hasField(@TypeOf(cvs[ci]), "is_unit_literal") and cvs[ci].is_unit_literal) {
+        \\                    const cvd = cvs[ci];
+        \\                    const CVD = @TypeOf(cvd);
+        \\                    if (@hasField(VD, "str_value") and @hasField(CVD, "str_value") and std.mem.eql(u8, vd.str_value, cvd.str_value)) return true;
+        \\                    if (@hasField(VD, "bool_value") and @hasField(CVD, "bool_value") and vd.bool_value == cvd.bool_value) return true;
+        \\                    if (@hasField(VD, "num_value") and @hasField(CVD, "num_value") and vd.num_value == cvd.num_value) return true;
+        \\                    if (@hasField(VD, "int_value") and @hasField(CVD, "int_value") and vd.int_value == cvd.int_value) return true;
+        \\                    if (@hasField(VD, "float_value") and @hasField(CVD, "float_value") and vd.float_value == cvd.float_value) return true;
+        \\                    if (@hasField(VD, "bigint_value") and @hasField(CVD, "bigint_value") and std.mem.eql(u8, vd.bigint_value, cvd.bigint_value)) return true;
+        \\                } else if (cf_ty != void and standaloneUnitLiteralSatisfiesConstraint(vd, cf_ty, depth + 1)) {
+        \\                    return true;
+        \\                }
+        \\            }
+        \\            return false;
+        \\        }
+        \\        inline for (c_types) |cf_ty| {
+        \\            if (cf_ty != void and standaloneUnitLiteralSatisfiesConstraint(vd, cf_ty, depth + 1)) return true;
+        \\        }
+        \\        return false;
+        \\    }
+        \\    if (@hasField(VD, "str_value")) {
+        \\        if (@typeInfo(Constraint) == .@"enum") {
+        \\            inline for (@typeInfo(Constraint).@"enum".field_names) |cf_name| {
+        \\                if (std.mem.eql(u8, vd.str_value, comptime enumMemberWireName(Constraint, cf_name))) return true;
+        \\            }
+        \\            return false;
+        \\        }
+        \\        return standaloneSatisfiesTypeConstraint([]const u8, Constraint, depth + 1);
+        \\    }
+        \\    if (@hasField(VD, "bool_value")) return standaloneSatisfiesTypeConstraint(bool, Constraint, depth + 1);
+        \\    if (@hasField(VD, "num_value") or @hasField(VD, "int_value") or @hasField(VD, "float_value")) return standaloneSatisfiesTypeConstraint(f64, Constraint, depth + 1);
+        \\    if (@hasField(VD, "bigint_value")) return standaloneSatisfiesTypeConstraint(i64, Constraint, depth + 1);
+        \\    return false;
+        \\}
+        \\
+        \\pub fn standaloneSatisfiesTypeConstraint(comptime T: type, comptime Constraint: type, comptime depth: usize) bool {
+        \\    @setEvalBranchQuota(200_000);
+        \\    if (T == Constraint or T == noreturn) return true;
+        \\    if (depth > 8) return true;
+        \\    if (comptime isUnconstrainedJsAnyOrUnknown(T)) return true;
+        \\    if (comptime isUnconstrainedJsAnyOrUnknown(Constraint)) return true;
+        \\
+        \\    if (comptime isJsObjectConstraintMarker(Constraint)) {
+        \\        return switch (@typeInfo(T)) {
+        \\            .bool, .int, .comptime_int, .float, .comptime_float, .void => false,
+        \\            else => true,
+        \\        };
+        \\    }
+        \\
+        \\    if (comptime isJsSymbolConstraintMarker(Constraint)) {
+        \\        return isJsSymbolConstraintMarker(T);
+        \\    }
+        \\
+        \\    if (comptime (isJsFunctionConstraintMarker(Constraint) or
+        \\        (@typeInfo(Constraint) == .@"struct" and @hasDecl(Constraint, "is_zig_callback") and Constraint.is_zig_callback) or
+        \\        (@typeInfo(Constraint) == .@"struct" and @hasDecl(Constraint, "zigar_js") and @hasField(@TypeOf(Constraint.zigar_js), "is_callable_handle") and Constraint.zigar_js.is_callable_handle) or
+        \\        @typeInfo(Constraint) == .@"fn" or
+        \\        (@typeInfo(Constraint) == .pointer and @typeInfo(Constraint).pointer.size == .one and @typeInfo(@typeInfo(Constraint).pointer.child) == .@"fn")))
+        \\    {
+        \\        return isFunctionLikeConstraintCandidate(T);
+        \\    }
+        \\
+        \\    if (comptime (Constraint == []const u8 or isTemplateLiteralStruct(Constraint) or
+        \\        (@typeInfo(Constraint) == .@"struct" and @hasDecl(Constraint, "is_js_string") and Constraint.is_js_string)))
+        \\    {
+        \\        return isStringLikeConstraintCandidate(T);
+        \\    }
+        \\
+        \\    if (Constraint == bool) return T == bool;
+        \\
+        \\    if (comptime (Constraint == i64 or Constraint == u64 or
+        \\        (@typeInfo(Constraint) == .@"struct" and @hasDecl(Constraint, "is_js_bigint") and Constraint.is_js_bigint)))
+        \\    {
+        \\        return switch (@typeInfo(T)) {
+        \\            .int, .comptime_int => true,
+        \\            .@"struct" => @hasDecl(T, "is_js_bigint") and T.is_js_bigint,
+        \\            else => false,
+        \\        };
+        \\    }
+        \\
+        \\    if (comptime (@typeInfo(Constraint) == .float or @typeInfo(Constraint) == .int)) {
+        \\        return isNumberLikeConstraintCandidate(T);
+        \\    }
+        \\
+        \\    if (comptime (@typeInfo(T) == .@"union")) {
+        \\        if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_open_literal") and T.zigar_js.is_open_literal)) {
+        \\            // Handled below if Constraint is open literal or union.
+        \\        } else if (comptime (@hasDecl(T, "is_zigar_nullable") and T.is_zigar_nullable)) {
+        \\            return standaloneSatisfiesTypeConstraint(@TypeOf(null), Constraint, depth + 1) and
+        \\                standaloneSatisfiesTypeConstraint(T.Value, Constraint, depth + 1);
+        \\        } else {
+        \\            const u_types = @typeInfo(T).@"union".field_types;
+        \\            if (comptime (u_types.len > 0)) {
+        \\                const has_t_vars = comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "variants"));
+        \\                inline for (u_types, 0..) |uf_ty, ui| {
+        \\                    if (uf_ty != void) {
+        \\                        if (!standaloneSatisfiesTypeConstraint(uf_ty, Constraint, depth + 1)) return false;
+        \\                    } else if (has_t_vars and ui < T.zigar_js.variants.len and
+        \\                        @hasField(@TypeOf(T.zigar_js.variants[ui]), "is_unit_literal") and
+        \\                        T.zigar_js.variants[ui].is_unit_literal)
+        \\                    {
+        \\                        if (!standaloneUnitLiteralSatisfiesConstraint(T.zigar_js.variants[ui], Constraint, depth + 1)) return false;
+        \\                    } else {
+        \\                        if (!standaloneSatisfiesTypeConstraint(void, Constraint, depth + 1)) return false;
+        \\                    }
+        \\                }
+        \\                return true;
+        \\            }
+        \\        }
+        \\    }
+        \\
+        \\    return switch (@typeInfo(Constraint)) {
+        \\        .optional => |op| blk: {
+        \\            if (T == @TypeOf(null) or T == @TypeOf(undefined)) break :blk true;
+        \\            if (@typeInfo(T) == .optional) {
+        \\                break :blk standaloneSatisfiesTypeConstraint(@typeInfo(T).optional.child, op.child, depth + 1);
+        \\            }
+        \\            break :blk standaloneSatisfiesTypeConstraint(T, op.child, depth + 1);
+        \\        },
+        \\        .pointer => |cpt| blk: {
+        \\            if (cpt.size == .slice) {
+        \\                if (cpt.child == u8) {
+        \\                    if (isStringLikeConstraintCandidate(T)) break :blk true;
+        \\                    if (@typeInfo(T) == .@"struct" and isGeneratedHandleStruct(T)) break :blk true;
+        \\                }
+        \\                break :blk switch (@typeInfo(T)) {
+        \\                    .pointer => |tpt| if (tpt.size == .slice)
+        \\                        standaloneSatisfiesTypeConstraint(tpt.child, cpt.child, depth + 1)
+        \\                    else if (tpt.size == .one and @typeInfo(tpt.child) == .array)
+        \\                        standaloneSatisfiesTypeConstraint(@typeInfo(tpt.child).array.child, cpt.child, depth + 1)
+        \\                    else
+        \\                        false,
+        \\                    .array => |tar| standaloneSatisfiesTypeConstraint(tar.child, cpt.child, depth + 1),
+        \\                    else => false,
+        \\                };
+        \\            }
+        \\            break :blk false;
+        \\        },
+        \\        .@"enum" => |cen| blk: {
+        \\            if (@typeInfo(T) != .@"enum") break :blk false;
+        \\            const ten = @typeInfo(T).@"enum";
+        \\            inline for (ten.field_names) |tf_name| {
+        \\                const tw = comptime enumMemberWireName(T, tf_name);
+        \\                var found = false;
+        \\                inline for (cen.field_names) |cf_name| {
+        \\                    const cw = comptime enumMemberWireName(Constraint, cf_name);
+        \\                    if (std.mem.eql(u8, tw, cw)) {
+        \\                        found = true;
+        \\                        break;
+        \\                    }
+        \\                }
+        \\                if (!found) break :blk false;
+        \\            }
+        \\            break :blk true;
+        \\        },
+        \\        .@"union" => |cun| blk: {
+        \\            if (comptime (@hasDecl(Constraint, "is_zigar_nullable") and Constraint.is_zigar_nullable)) {
+        \\                if (T == @TypeOf(null) or T == @TypeOf(undefined) or T == void) break :blk true;
+        \\                if (@typeInfo(T) == .optional) {
+        \\                    break :blk standaloneSatisfiesTypeConstraint(@typeInfo(T).optional.child, Constraint.Value, depth + 1);
+        \\                }
+        \\                break :blk standaloneSatisfiesTypeConstraint(T, Constraint.Value, depth + 1);
+        \\            }
+        \\            if (comptime (@hasDecl(Constraint, "zigar_js") and
+        \\                @hasField(@TypeOf(Constraint.zigar_js), "is_open_literal") and
+        \\                Constraint.zigar_js.is_open_literal))
+        \\            {
+        \\                if (comptime @hasDecl(Constraint, "fromSlice")) break :blk isStringLikeConstraintCandidate(T);
+        \\                break :blk isNumberLikeConstraintCandidate(T);
+        \\            }
+        \\            const has_c_vars = comptime (@hasDecl(Constraint, "zigar_js") and @hasField(@TypeOf(Constraint.zigar_js), "variants"));
+        \\            inline for (cun.field_types, 0..) |cf_ty, ci| {
+        \\                if (cf_ty != void) {
+        \\                    if (standaloneSatisfiesTypeConstraint(T, cf_ty, depth + 1)) break :blk true;
+        \\                } else if (T == void) {
+        \\                    const is_ul = has_c_vars and ci < Constraint.zigar_js.variants.len and
+        \\                        @hasField(@TypeOf(Constraint.zigar_js.variants[ci]), "is_unit_literal") and
+        \\                        Constraint.zigar_js.variants[ci].is_unit_literal;
+        \\                    if (!is_ul) break :blk true;
+        \\                }
+        \\            }
+        \\            if (@typeInfo(T) == .@"enum") {
+        \\                const ten = @typeInfo(T).@"enum";
+        \\                if (ten.field_names.len > 0) {
+        \\                    var all_ok = true;
+        \\                    inline for (ten.field_names) |tf_name| {
+        \\                        const tw = comptime enumMemberWireName(T, tf_name);
+        \\                        if (!standaloneUnitLiteralSatisfiesConstraint(.{ .str_value = tw }, Constraint, depth + 1)) {
+        \\                            all_ok = false;
+        \\                            break;
+        \\                        }
+        \\                    }
+        \\                    if (all_ok) break :blk true;
+        \\                }
+        \\            }
+        \\            break :blk false;
+        \\        },
+        \\        .@"struct" => |cst| blk: {
+        \\            if (comptime ((@hasDecl(Constraint, "is_js_map") and Constraint.is_js_map) or
+        \\                (@hasDecl(Constraint, "is_js_record") and Constraint.is_js_record)))
+        \\            {
+        \\                break :blk @typeInfo(T) == .@"struct";
+        \\            }
+        \\            if (comptime (@hasDecl(Constraint, "is_js_set") and Constraint.is_js_set)) {
+        \\                if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_set") and T.is_js_set)) {
+        \\                    const TElem = if (@hasDecl(T, "Elem")) T.Elem else T.Element;
+        \\                    const CElem = if (@hasDecl(Constraint, "Elem")) Constraint.Elem else Constraint.Element;
+        \\                    break :blk standaloneSatisfiesTypeConstraint(TElem, CElem, depth + 1);
+        \\                }
+        \\                break :blk false;
+        \\            }
+        \\            if (comptime (@hasDecl(Constraint, "is_js_promise") and Constraint.is_js_promise)) {
+        \\                if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_promise") and T.is_js_promise)) {
+        \\                    if (comptime (@hasDecl(T, "Payload") and @hasDecl(Constraint, "Payload"))) {
+        \\                        break :blk standaloneSatisfiesTypeConstraint(T.Payload, Constraint.Payload, depth + 1);
+        \\                    }
+        \\                    break :blk true;
+        \\                }
+        \\                break :blk structProvidesMember(T, "then");
+        \\            }
+        \\            if (comptime @hasDecl(Constraint, "zigar_js_tuple")) {
+        \\                if (@typeInfo(T) != .@"struct" and @typeInfo(T) != .array) break :blk false;
+        \\                break :blk true;
+        \\            }
+        \\            if (comptime isGeneratedHandleStruct(Constraint)) {
+        \\                if (structDerivesFrom(T, Constraint, 0)) break :blk true;
+        \\                const is_nom_class = comptime (@hasField(@TypeOf(Constraint.zigar_js), "is_class") and Constraint.zigar_js.is_class);
+        \\                if (is_nom_class) {
+        \\                    const has_priv = comptime ((@hasField(@TypeOf(Constraint.zigar_js), "has_private_constructor") and Constraint.zigar_js.has_private_constructor) or
+        \\                        (@hasField(@TypeOf(Constraint.zigar_js), "has_non_public_members") and Constraint.zigar_js.has_non_public_members));
+        \\                    if (has_priv or !isGeneratedHandleStruct(T)) break :blk false;
+        \\                    if (comptime @hasField(@TypeOf(Constraint.zigar_js), "fields")) {
+        \\                        inline for (@typeInfo(@TypeOf(Constraint.zigar_js.fields)).@"struct".field_names) |mf_name| {
+        \\                            const entry = @field(Constraint.zigar_js.fields, mf_name);
+        \\                            const opt = comptime (@hasField(@TypeOf(entry), "is_optional") and entry.is_optional);
+        \\                            if (!opt and !structProvidesMember(T, entry.js_name)) break :blk false;
+        \\                        }
+        \\                    }
+        \\                    if (comptime @hasField(@TypeOf(Constraint.zigar_js), "methods")) {
+        \\                        inline for (@typeInfo(@TypeOf(Constraint.zigar_js.methods)).@"struct".field_names) |mf_name| {
+        \\                            const entry = @field(Constraint.zigar_js.methods, mf_name);
+        \\                            const is_stat = comptime (@hasField(@TypeOf(entry), "is_static") and entry.is_static);
+        \\                            if (!is_stat and !structProvidesMember(T, entry.js_name)) break :blk false;
+        \\                        }
+        \\                    }
+        \\                    break :blk true;
+        \\                }
+        \\                if (@typeInfo(T) != .@"struct") break :blk false;
+        \\                if (isJsObjectConstraintMarker(T)) break :blk true;
+        \\                if (comptime @hasField(@TypeOf(Constraint.zigar_js), "required_methods")) {
+        \\                    inline for (Constraint.zigar_js.required_methods) |rm| {
+        \\                        if (!structProvidesMember(T, rm)) break :blk false;
+        \\                    }
+        \\                }
+        \\                if (comptime @hasField(@TypeOf(Constraint.zigar_js), "required_props")) {
+        \\                    inline for (Constraint.zigar_js.required_props) |rp| {
+        \\                        if (!structProvidesMember(T, rp)) break :blk false;
+        \\                    }
+        \\                }
+        \\                break :blk true;
+        \\            }
+        \\            if (@typeInfo(T) != .@"struct") break :blk false;
+        \\            if (isJsObjectConstraintMarker(T)) break :blk true;
+        \\            inline for (cst.field_names, 0..) |cf_name, cf_idx| {
+        \\                if (comptime isHiddenMetaField(cf_name)) continue;
+        \\                const cf_ty = cst.field_types[cf_idx];
+        \\                const cf_attr = cst.field_attrs[cf_idx];
+        \\                const is_opt = comptime (cf_attr.default_value_ptr != null or @typeInfo(cf_ty) == .optional or isModuleNullableType(cf_ty));
+        \\                if (!is_opt) {
+        \\                    const wire = comptime topStructFieldWireName(Constraint, cf_name);
+        \\                    if (comptime lookupStructFieldType(T, cf_name, wire)) |tf_ty| {
+        \\                        if (!standaloneSatisfiesTypeConstraint(tf_ty, cf_ty, depth + 1)) break :blk false;
+        \\                    } else if (comptime (isGeneratedHandleStruct(T) and structProvidesMember(T, wire))) {
+        \\                        // Handle struct exposes this property via getter/accessor.
+        \\                    } else {
+        \\                        break :blk false;
+        \\                    }
+        \\                }
+        \\            }
+        \\            break :blk true;
+        \\        },
+        \\        else => true,
+        \\    };
+        \\}
+        \\
+        \\pub fn standaloneCheckTypeConstraint(comptime T: type, comptime Constraint: type) void {
+        \\    if (!comptime standaloneSatisfiesTypeConstraint(T, Constraint, 0)) {
+        \\        @compileError("zigar.js: type '" ++ @typeName(T) ++ "' does not satisfy TypeScript constraint '" ++ @typeName(Constraint) ++ "'");
+        \\    }
         \\}
         \\
     );

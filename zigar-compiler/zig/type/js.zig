@@ -534,6 +534,2091 @@ pub const reserved_global_this_handle: u32 = 4;
 pub const no_captured_error_handle: u32 = 7;
 pub const first_dynamic_slot: u32 = 8;
 
+pub const hidden_meta_field_name = "__zigar_js_meta";
+
+pub fn isHiddenMetaField(comptime fname: []const u8) bool {
+    return std.mem.eql(u8, fname, hidden_meta_field_name);
+}
+
+pub fn hasStructZigarJsMeta(comptime T: type) bool {
+    if (@typeInfo(T) != .@"struct") return false;
+    if (@hasDecl(T, "zigar_js")) return true;
+    if (@hasField(T, hidden_meta_field_name)) {
+        const Carrier = @FieldType(T, hidden_meta_field_name);
+        return @typeInfo(Carrier) == .@"struct" and @hasDecl(Carrier, "zigar_js");
+    }
+    return false;
+}
+
+fn StructZigarJsMetaType(comptime T: type) type {
+    if (@hasDecl(T, "zigar_js")) return @TypeOf(T.zigar_js);
+    return @TypeOf(@FieldType(T, hidden_meta_field_name).zigar_js);
+}
+
+pub fn getStructZigarJsMeta(comptime T: type) StructZigarJsMetaType(T) {
+    if (@hasDecl(T, "zigar_js")) return T.zigar_js;
+    return @FieldType(T, hidden_meta_field_name).zigar_js;
+}
+
+fn isModuleNullableType(comptime T: type) bool {
+    return @typeInfo(T) == .@"union" and @hasDecl(T, "is_zigar_nullable") and T.is_zigar_nullable;
+}
+
+fn isPlainValueStructForTransform(comptime T: type) bool {
+    if (@typeInfo(T) != .@"struct") return false;
+    if (@typeInfo(T).@"struct".is_tuple) return false;
+    if (util.getInternalType(T) == .js_value) return false;
+    if (isGeneratedHandleStruct(T)) return false;
+    if (@hasDecl(T, "zigar_js_tuple")) return false;
+    if (hasStructZigarJsMeta(T)) {
+        const meta = getStructZigarJsMeta(T);
+        const MetaT = @TypeOf(meta);
+        if (@hasField(MetaT, "is_template_literal") and meta.is_template_literal) return false;
+        if (@hasField(MetaT, "is_enum") and meta.is_enum) return false;
+        if (@hasField(MetaT, "is_open_literal") and meta.is_open_literal) return false;
+    }
+    return true;
+}
+
+fn topStructFieldWireName(comptime T: type, comptime field_name: []const u8) []const u8 {
+    if (hasStructZigarJsMeta(T)) {
+        const meta = getStructZigarJsMeta(T);
+        if (@hasField(@TypeOf(meta), "fields")) {
+            inline for (meta.fields) |fm| {
+                if (std.mem.eql(u8, fm.name, field_name)) {
+                    if (@hasField(@TypeOf(fm), "js_name")) return fm.js_name;
+                    return field_name;
+                }
+            }
+        }
+    }
+    return field_name;
+}
+
+fn topStructFieldIsOptional(comptime T: type, comptime field_name: []const u8, comptime has_default: bool) bool {
+    if (hasStructZigarJsMeta(T)) {
+        const meta = getStructZigarJsMeta(T);
+        if (@hasField(@TypeOf(meta), "fields")) {
+            inline for (meta.fields) |fm| {
+                if (std.mem.eql(u8, fm.name, field_name)) {
+                    if (@hasField(@TypeOf(fm), "is_optional")) return fm.is_optional;
+                    return has_default;
+                }
+            }
+        }
+    }
+    return has_default;
+}
+
+const TransformMetaMode = enum {
+    preserve,
+    make_partial,
+    make_required,
+};
+
+fn specTopSelfNullish(comptime spec: anytype) NullishKind {
+    const SpecT = @TypeOf(spec);
+    if (SpecT == NullishKind) return spec;
+    return switch (@typeInfo(SpecT)) {
+        .enum_literal => @field(NullishKind, @tagName(spec)),
+        .@"struct" => if (@hasField(SpecT, "self")) specTopSelfNullish(spec.self) else .none,
+        else => .none,
+    };
+}
+
+fn RebuildSpecWithSelfType(comptime SpecT: type) type {
+    if (@typeInfo(SpecT) != .@"struct" or !@hasField(SpecT, "self")) return NullishKind;
+    if (@hasField(SpecT, "child")) {
+        return if (@hasField(SpecT, "id"))
+            struct { id: @FieldType(SpecT, "id"), self: NullishKind, child: @FieldType(SpecT, "child") }
+        else
+            struct { self: NullishKind, child: @FieldType(SpecT, "child") };
+    }
+    if (@hasField(SpecT, "elem")) {
+        return struct { self: NullishKind, elem: @FieldType(SpecT, "elem") };
+    }
+    if (@hasField(SpecT, "fields")) {
+        return if (@hasField(SpecT, "id"))
+            struct { id: @FieldType(SpecT, "id"), self: NullishKind, fields: @FieldType(SpecT, "fields") }
+        else
+            struct { self: NullishKind, fields: @FieldType(SpecT, "fields") };
+    }
+    if (@hasField(SpecT, "variants")) {
+        return if (@hasField(SpecT, "id"))
+            struct { id: @FieldType(SpecT, "id"), self: NullishKind, variants: @FieldType(SpecT, "variants") }
+        else
+            struct { self: NullishKind, variants: @FieldType(SpecT, "variants") };
+    }
+    if (@hasField(SpecT, "tuple")) {
+        return if (@hasField(SpecT, "id"))
+            struct { id: @FieldType(SpecT, "id"), self: NullishKind, tuple: @FieldType(SpecT, "tuple") }
+        else
+            struct { self: NullishKind, tuple: @FieldType(SpecT, "tuple") };
+    }
+    return NullishKind;
+}
+
+fn rebuildSpecWithSelf(comptime spec: anytype, comptime new_self: NullishKind) RebuildSpecWithSelfType(@TypeOf(spec)) {
+    const SpecT = @TypeOf(spec);
+    if (@typeInfo(SpecT) != .@"struct" or !@hasField(SpecT, "self")) return new_self;
+    if (@hasField(SpecT, "child")) {
+        return if (@hasField(SpecT, "id"))
+            .{ .id = spec.id, .self = new_self, .child = spec.child }
+        else
+            .{ .self = new_self, .child = spec.child };
+    }
+    if (@hasField(SpecT, "elem")) {
+        return .{ .self = new_self, .elem = spec.elem };
+    }
+    if (@hasField(SpecT, "fields")) {
+        return if (@hasField(SpecT, "id"))
+            .{ .id = spec.id, .self = new_self, .fields = spec.fields }
+        else
+            .{ .self = new_self, .fields = spec.fields };
+    }
+    if (@hasField(SpecT, "variants")) {
+        return if (@hasField(SpecT, "id"))
+            .{ .id = spec.id, .self = new_self, .variants = spec.variants }
+        else
+            .{ .self = new_self, .variants = spec.variants };
+    }
+    if (@hasField(SpecT, "tuple")) {
+        return if (@hasField(SpecT, "id"))
+            .{ .id = spec.id, .self = new_self, .tuple = spec.tuple }
+        else
+            .{ .self = new_self, .tuple = spec.tuple };
+    }
+    return new_self;
+}
+
+fn UnwrapSpecChildType(comptime SpecT: type) type {
+    if (@typeInfo(SpecT) == .@"struct" and @hasField(SpecT, "child")) {
+        return @FieldType(SpecT, "child");
+    }
+    return NullishKind;
+}
+
+fn unwrapSpecChild(comptime spec: anytype) UnwrapSpecChildType(@TypeOf(spec)) {
+    const SpecT = @TypeOf(spec);
+    if (@typeInfo(SpecT) == .@"struct" and @hasField(SpecT, "child")) {
+        return spec.child;
+    }
+    return .none;
+}
+
+fn WrapSpecAsOptionalType(comptime spec: anytype) type {
+    const SpecT = @TypeOf(spec);
+    if (@typeInfo(SpecT) == .@"struct") {
+        return struct { self: NullishKind, child: SpecT };
+    }
+    const cur = specTopSelfNullish(spec);
+    if (cur == .none) return NullishKind;
+    return struct { self: NullishKind, child: NullishKind };
+}
+
+fn wrapSpecAsOptional(comptime spec: anytype, comptime outer_self: NullishKind) WrapSpecAsOptionalType(spec) {
+    const SpecT = @TypeOf(spec);
+    if (@typeInfo(SpecT) == .@"struct") {
+        return .{ .self = outer_self, .child = spec };
+    }
+    const cur = specTopSelfNullish(spec);
+    if (cur == .none) return outer_self;
+    return .{ .self = outer_self, .child = cur };
+}
+
+fn ComputedTransformedNullishType(comptime T: type, comptime fname: []const u8, comptime mode: TransformMetaMode) type {
+    const OrigFT = @FieldType(T, fname);
+    if (hasStructZigarJsMeta(T)) {
+        const meta = getStructZigarJsMeta(T);
+        if (@hasField(@TypeOf(meta), "fields")) {
+            inline for (meta.fields) |fm| {
+                if (std.mem.eql(u8, fm.name, fname)) {
+                    const FmT = @TypeOf(fm);
+                    const has_nullish = @hasField(FmT, "nullish");
+                    if (!has_nullish) return NullishKind;
+                    const fm_is_opt = @hasField(FmT, "is_optional") and fm.is_optional;
+                    const cur_self = specTopSelfNullish(fm.nullish);
+                    return switch (mode) {
+                        .preserve => @TypeOf(fm.nullish),
+                        .make_partial => if (@typeInfo(OrigFT) == .optional or isModuleNullableType(OrigFT))
+                            RebuildSpecWithSelfType(@TypeOf(fm.nullish))
+                        else
+                            WrapSpecAsOptionalType(fm.nullish),
+                        .make_required => if (!fm_is_opt)
+                            @TypeOf(fm.nullish)
+                        else if (isModuleNullableType(OrigFT) or cur_self == .null_only or cur_self == .null_or_undefined)
+                            RebuildSpecWithSelfType(@TypeOf(fm.nullish))
+                        else
+                            UnwrapSpecChildType(@TypeOf(fm.nullish)),
+                    };
+                }
+            }
+        }
+    }
+    return NullishKind;
+}
+
+fn computeTransformedNullish(
+    comptime T: type,
+    comptime fname: []const u8,
+    comptime mode: TransformMetaMode,
+) ComputedTransformedNullishType(T, fname, mode) {
+    const OrigFT = @FieldType(T, fname);
+    if (hasStructZigarJsMeta(T)) {
+        const meta = getStructZigarJsMeta(T);
+        if (@hasField(@TypeOf(meta), "fields")) {
+            inline for (meta.fields) |fm| {
+                if (std.mem.eql(u8, fm.name, fname)) {
+                    const FmT = @TypeOf(fm);
+                    const has_nullish = @hasField(FmT, "nullish");
+                    if (!has_nullish) {
+                        return if (mode == .make_partial) NullishKind.undefined_only else NullishKind.none;
+                    }
+                    const fm_is_opt = @hasField(FmT, "is_optional") and fm.is_optional;
+                    const cur_self = specTopSelfNullish(fm.nullish);
+                    return switch (mode) {
+                        .preserve => fm.nullish,
+                        .make_partial => blk: {
+                            if (@typeInfo(OrigFT) == .optional or isModuleNullableType(OrigFT)) {
+                                const merged_self: NullishKind = if (cur_self == .null_only or cur_self == .null_or_undefined)
+                                    .null_or_undefined
+                                else
+                                    .undefined_only;
+                                break :blk rebuildSpecWithSelf(fm.nullish, merged_self);
+                            }
+                            break :blk wrapSpecAsOptional(fm.nullish, .undefined_only);
+                        },
+                        .make_required => blk: {
+                            if (!fm_is_opt) break :blk fm.nullish;
+                            if (isModuleNullableType(OrigFT) or cur_self == .null_only or cur_self == .null_or_undefined) {
+                                break :blk rebuildSpecWithSelf(fm.nullish, .null_only);
+                            }
+                            break :blk unwrapSpecChild(fm.nullish);
+                        },
+                    };
+                }
+            }
+        }
+    }
+    return if (mode == .make_partial) NullishKind.undefined_only else NullishKind.none;
+}
+
+fn requiredFieldResolution(comptime T: type, comptime fname: []const u8, comptime OrigFT: type) struct {
+    ty: type,
+    preserve_default: bool,
+} {
+    if (hasStructZigarJsMeta(T)) {
+        const meta = getStructZigarJsMeta(T);
+        if (@hasField(@TypeOf(meta), "fields")) {
+            inline for (meta.fields) |fm| {
+                if (std.mem.eql(u8, fm.name, fname)) {
+                    const FmT = @TypeOf(fm);
+                    const fm_is_opt = @hasField(FmT, "is_optional") and fm.is_optional;
+                    if (!fm_is_opt) {
+                        return .{ .ty = OrigFT, .preserve_default = true };
+                    }
+                    if (isModuleNullableType(OrigFT)) {
+                        return .{ .ty = ?OrigFT.Value, .preserve_default = false };
+                    }
+                    const cur_self = if (@hasField(FmT, "nullish")) specTopSelfNullish(fm.nullish) else NullishKind.none;
+                    if (cur_self == .null_only or cur_self == .null_or_undefined) {
+                        return .{ .ty = OrigFT, .preserve_default = false };
+                    }
+                    const unwrapped = if (@typeInfo(OrigFT) == .optional) @typeInfo(OrigFT).optional.child else OrigFT;
+                    return .{ .ty = unwrapped, .preserve_default = false };
+                }
+            }
+        }
+    }
+    if (@typeInfo(OrigFT) == .optional) {
+        return .{ .ty = @typeInfo(OrigFT).optional.child, .preserve_default = false };
+    }
+    if (isModuleNullableType(OrigFT)) {
+        return .{ .ty = OrigFT.Value, .preserve_default = false };
+    }
+    return .{ .ty = OrigFT, .preserve_default = true };
+}
+
+fn TransformFieldEntryType(comptime T: type, comptime fname: []const u8, comptime mode: TransformMetaMode) type {
+    const wire = topStructFieldWireName(T, fname);
+    if (hasStructZigarJsMeta(T)) {
+        const meta = getStructZigarJsMeta(T);
+        if (@hasField(@TypeOf(meta), "fields")) {
+            inline for (meta.fields) |fm| {
+                if (std.mem.eql(u8, fm.name, fname)) {
+                    if (mode == .preserve) return @TypeOf(fm);
+                    const FmT = @TypeOf(fm);
+                    const NullishT = ComputedTransformedNullishType(T, fname, mode);
+                    return buildConstraintPreservingDescriptorType(FmT, NullishT);
+                }
+            }
+        }
+    }
+    _ = wire;
+    return struct {
+        name: []const u8,
+        js_name: []const u8,
+        is_optional: bool,
+        nullish: NullishKind,
+    };
+}
+
+fn buildConstraintPreservingDescriptorType(comptime FmT: type, comptime NullishT: type) type {
+    comptime var fnames: [10][]const u8 = undefined;
+    comptime var ftypes: [10]type = undefined;
+    comptime var fattrs: [10]std.builtin.Type.Struct.FieldAttributes = undefined;
+    comptime var n: usize = 0;
+
+    fnames[n] = "name";
+    ftypes[n] = []const u8;
+    fattrs[n] = .{};
+    n += 1;
+
+    fnames[n] = "js_name";
+    ftypes[n] = []const u8;
+    fattrs[n] = .{};
+    n += 1;
+
+    fnames[n] = "is_optional";
+    ftypes[n] = bool;
+    fattrs[n] = .{};
+    n += 1;
+
+    fnames[n] = "nullish";
+    ftypes[n] = NullishT;
+    fattrs[n] = .{};
+    n += 1;
+
+    const extras = [_][]const u8{
+        "expected_str",
+        "expected_num",
+        "expected_bool",
+        "expected_bigint_i64",
+        "expected_bigint_str",
+        "expected_enum_tag",
+    };
+    inline for (extras) |ex| {
+        if (@hasField(FmT, ex)) {
+            fnames[n] = ex;
+            ftypes[n] = @FieldType(FmT, ex);
+            fattrs[n] = .{};
+            n += 1;
+        }
+    }
+    const names_fin = fnames[0..n].*;
+    const types_fin = ftypes[0..n].*;
+    const attrs_fin = fattrs[0..n].*;
+    return @Struct(.auto, null, &names_fin, &types_fin, &attrs_fin);
+}
+
+fn transformOneFieldDescriptor(
+    comptime T: type,
+    comptime fname: []const u8,
+    comptime mode: TransformMetaMode,
+) TransformFieldEntryType(T, fname, mode) {
+    const OutT = TransformFieldEntryType(T, fname, mode);
+    const wire = topStructFieldWireName(T, fname);
+    if (hasStructZigarJsMeta(T)) {
+        const meta = getStructZigarJsMeta(T);
+        if (@hasField(@TypeOf(meta), "fields")) {
+            inline for (meta.fields) |fm| {
+                if (std.mem.eql(u8, fm.name, fname)) {
+                    if (mode == .preserve) return fm;
+                    const FmT = @TypeOf(fm);
+                    var out: OutT = undefined;
+                    out.name = fname;
+                    out.js_name = wire;
+                    out.is_optional = (mode == .make_partial);
+                    out.nullish = computeTransformedNullish(T, fname, mode);
+                    const extras = [_][]const u8{
+                        "expected_str",
+                        "expected_num",
+                        "expected_bool",
+                        "expected_bigint_i64",
+                        "expected_bigint_str",
+                        "expected_enum_tag",
+                    };
+                    inline for (extras) |ex| {
+                        if (@hasField(FmT, ex)) {
+                            @field(out, ex) = @field(fm, ex);
+                        }
+                    }
+                    return out;
+                }
+            }
+        }
+    }
+    return .{
+        .name = fname,
+        .js_name = wire,
+        .is_optional = (mode == .make_partial),
+        .nullish = if (mode == .make_partial) NullishKind.undefined_only else NullishKind.none,
+    };
+}
+
+fn buildStructMetaCarrier(
+    comptime T: type,
+    comptime kept_names: []const []const u8,
+    comptime mode: TransformMetaMode,
+) type {
+    comptime var entry_types: [kept_names.len]type = undefined;
+    inline for (kept_names, 0..) |fname, i| {
+        entry_types[i] = TransformFieldEntryType(T, fname, mode);
+    }
+    const FieldsTuple = @Tuple(&entry_types);
+    const fields_val = comptime blk: {
+        var tup: FieldsTuple = undefined;
+        for (kept_names, 0..) |fname, i| {
+            tup[i] = transformOneFieldDescriptor(T, fname, mode);
+        }
+        break :blk tup;
+    };
+    return struct {
+        pub const zigar_js = .{
+            .fields = fields_val,
+        };
+    };
+}
+
+fn defaultPtrForValue(comptime FieldT: type, comptime val: FieldT) *const anyopaque {
+    const Holder = struct {
+        const stored: FieldT = val;
+    };
+    return @ptrCast(&Holder.stored);
+}
+
+fn isComptimeKeyStringType(comptime KT: type) bool {
+    if (KT == []const u8) return true;
+    return switch (@typeInfo(KT)) {
+        .pointer => |pt| pt.size == .one and @typeInfo(pt.child) == .array and @typeInfo(pt.child).array.child == u8,
+        else => false,
+    };
+}
+
+fn formatComptimeJsNumberKey(comptime n_any: anytype) []const u8 {
+    const NT = @TypeOf(n_any);
+    if (@typeInfo(NT) == .int or @typeInfo(NT) == .comptime_int) {
+        return std.fmt.comptimePrint("{d}", .{n_any});
+    }
+    const n: f64 = @floatCast(n_any);
+    if (n == 0.0) return "0";
+    if (std.math.isFinite(n) and @trunc(n) == n and @abs(n) <= 9007199254740991.0) {
+        return std.fmt.comptimePrint("{d}", .{@as(i64, @intFromFloat(n))});
+    }
+    return std.fmt.comptimePrint("{d}", .{n});
+}
+
+fn enumMemberWireKey(comptime m: anytype) []const u8 {
+    const MT = @TypeOf(m);
+    if (@hasField(MT, "str_value")) return m.str_value;
+    if (@hasField(MT, "num_value")) return formatComptimeJsNumberKey(m.num_value);
+    if (@hasField(MT, "int_value")) return formatComptimeJsNumberKey(m.int_value);
+    if (@hasField(MT, "float_value")) return formatComptimeJsNumberKey(m.float_value);
+    if (@hasField(MT, "bool_value")) return if (m.bool_value) "true" else "false";
+    if (@hasField(MT, "bigint_value")) return m.bigint_value;
+    if (@hasField(MT, "js_name")) return m.js_name;
+    return m.tag;
+}
+
+fn comptimeSnakeFieldName(comptime raw: []const u8) []const u8 {
+    if (raw.len == 0) return "_empty";
+    comptime var buf: [raw.len * 2 + 1]u8 = undefined;
+    comptime var out_len: usize = 0;
+    comptime var word_count: usize = 0;
+    comptime var i: usize = 0;
+    while (i < raw.len) {
+        while (i < raw.len and !std.ascii.isAlphanumeric(raw[i])) : (i += 1) {}
+        if (i >= raw.len) break;
+        const start = i;
+        if (std.ascii.isDigit(raw[i])) {
+            while (i < raw.len and std.ascii.isDigit(raw[i])) : (i += 1) {}
+            if (start == 0 and i < raw.len and std.ascii.isAlphabetic(raw[i])) {
+                while (i < raw.len and std.ascii.isAlphanumeric(raw[i]) and !std.ascii.isUpper(raw[i])) : (i += 1) {}
+            }
+        } else if (std.ascii.isUpper(raw[i])) {
+            i += 1;
+            if (i < raw.len and std.ascii.isUpper(raw[i])) {
+                while (i < raw.len and std.ascii.isUpper(raw[i])) : (i += 1) {}
+                if (i < raw.len and std.ascii.isLower(raw[i]) and (i - start) > 1) {
+                    i -= 1;
+                }
+            } else {
+                while (i < raw.len and (std.ascii.isLower(raw[i]) or std.ascii.isDigit(raw[i]))) : (i += 1) {}
+            }
+        } else {
+            while (i < raw.len and (std.ascii.isLower(raw[i]) or std.ascii.isDigit(raw[i]))) : (i += 1) {}
+        }
+        if (word_count > 0) {
+            buf[out_len] = '_';
+            out_len += 1;
+        }
+        for (raw[start..i]) |ch| {
+            buf[out_len] = std.ascii.toLower(ch);
+            out_len += 1;
+        }
+        word_count += 1;
+    }
+    if (word_count == 0) return "_";
+    const fin = buf[0..out_len].*;
+    return &fin;
+}
+
+fn isReservedRecordFieldName(comptime cand: []const u8, comptime used: []const []const u8) bool {
+    if (isHiddenMetaField(cand) or std.mem.eql(u8, cand, "zigar_js") or std.mem.eql(u8, cand, "zigar_js_tuple")) {
+        return true;
+    }
+    for (used) |u| {
+        if (std.mem.eql(u8, u, cand)) return true;
+    }
+    return false;
+}
+
+fn dedupeComptimeFieldName(comptime base: []const u8, comptime used: []const []const u8) []const u8 {
+    if (!isReservedRecordFieldName(base, used)) return base;
+    comptime var suffix: usize = 2;
+    while (true) : (suffix += 1) {
+        const cand = std.fmt.comptimePrint("{s}_{d}", .{ base, suffix });
+        if (!isReservedRecordFieldName(cand, used)) return cand;
+    }
+}
+
+fn canExtractSingleComptimeKey(comptime ItemT: type) bool {
+    if (isComptimeKeyStringType(ItemT)) return true;
+    return switch (@typeInfo(ItemT)) {
+        .enum_literal, .int, .comptime_int, .float, .comptime_float, .bool, .@"enum" => true,
+        else => false,
+    };
+}
+
+fn extractSingleComptimeKey(comptime item: anytype) []const u8 {
+    const ItemT = @TypeOf(item);
+    if (isComptimeKeyStringType(ItemT)) return item;
+    return switch (@typeInfo(ItemT)) {
+        .enum_literal => @tagName(item),
+        .int, .comptime_int, .float, .comptime_float => formatComptimeJsNumberKey(item),
+        .bool => if (item) "true" else "false",
+        .@"enum" => blk: {
+            if (@hasDecl(ItemT, "zigar_js") and @hasField(@TypeOf(ItemT.zigar_js), "members")) {
+                for (ItemT.zigar_js.members) |m| {
+                    if (std.mem.eql(u8, m.tag, @tagName(item))) {
+                        break :blk enumMemberWireKey(m);
+                    }
+                }
+            }
+            break :blk @tagName(item);
+        },
+        else => @compileError("Unsupported key item for Pick/Omit/IndexAccess: " ++ @typeName(ItemT)),
+    };
+}
+
+fn isNumericPropertyKeyString(comptime s: []const u8) bool {
+    if (s.len == 0) return false;
+    const parsed = std.fmt.parseFloat(f64, s) catch return false;
+    return std.mem.eql(u8, formatComptimeJsNumberKey(parsed), s);
+}
+
+fn extractKeyListFromSpec(comptime keys_spec: anytype) []const []const u8 {
+    const SpecT = @TypeOf(keys_spec);
+    if (SpecT == type) {
+        if (keys_spec == void or keys_spec == noreturn) return &.{};
+        if (keys_spec == []const u8) return &.{};
+        switch (@typeInfo(keys_spec)) {
+            .@"enum" => |en| {
+                if (@hasDecl(keys_spec, "zigar_js") and @hasField(@TypeOf(keys_spec.zigar_js), "members")) {
+                    comptime var count: usize = 0;
+                    for (keys_spec.zigar_js.members) |m| {
+                        if (@hasField(@TypeOf(m), "is_alias") and m.is_alias) continue;
+                        count += 1;
+                    }
+                    comptime var arr: [count][]const u8 = undefined;
+                    comptime var idx: usize = 0;
+                    for (keys_spec.zigar_js.members) |m| {
+                        if (@hasField(@TypeOf(m), "is_alias") and m.is_alias) continue;
+                        arr[idx] = enumMemberWireKey(m);
+                        idx += 1;
+                    }
+                    const fin = arr;
+                    return &fin;
+                }
+                return en.field_names;
+            },
+            .@"union" => {
+                if (@hasDecl(keys_spec, "zigar_js") and @hasField(@TypeOf(keys_spec.zigar_js), "variants")) {
+                    comptime var count: usize = 0;
+                    for (keys_spec.zigar_js.variants) |v| {
+                        if (@hasField(@TypeOf(v), "is_unit_literal") and v.is_unit_literal) {
+                            count += 1;
+                        }
+                    }
+                    comptime var arr: [count][]const u8 = undefined;
+                    comptime var idx: usize = 0;
+                    for (keys_spec.zigar_js.variants) |v| {
+                        if (@hasField(@TypeOf(v), "is_unit_literal") and v.is_unit_literal) {
+                            arr[idx] = enumMemberWireKey(v);
+                            idx += 1;
+                        }
+                    }
+                    const fin = arr;
+                    return &fin;
+                }
+                return &.{};
+            },
+            else => return &.{},
+        }
+    }
+    if (canExtractSingleComptimeKey(SpecT)) {
+        const fin = [_][]const u8{extractSingleComptimeKey(keys_spec)};
+        return &fin;
+    }
+    switch (@typeInfo(SpecT)) {
+        .pointer => |pt| {
+            if (pt.size == .slice and canExtractSingleComptimeKey(pt.child)) {
+                comptime var arr: [keys_spec.len][]const u8 = undefined;
+                for (keys_spec, 0..) |item, i| {
+                    arr[i] = extractSingleComptimeKey(item);
+                }
+                const fin = arr;
+                return &fin;
+            }
+            if (pt.size == .one and @typeInfo(pt.child) == .@"struct" and @typeInfo(pt.child).@"struct".is_tuple) {
+                return extractKeyListFromSpec(keys_spec.*);
+            }
+            if (pt.size == .one and @typeInfo(pt.child) == .array) {
+                const ElemT = @typeInfo(pt.child).array.child;
+                if (canExtractSingleComptimeKey(ElemT)) {
+                    comptime var arr: [keys_spec.len][]const u8 = undefined;
+                    for (keys_spec, 0..) |item, i| {
+                        arr[i] = extractSingleComptimeKey(item);
+                    }
+                    const fin = arr;
+                    return &fin;
+                }
+            }
+        },
+        .@"struct" => |st| {
+            if (st.is_tuple) {
+                comptime var arr: [st.field_types.len][]const u8 = undefined;
+                inline for (0..st.field_types.len) |i| {
+                    arr[i] = extractSingleComptimeKey(keys_spec[i]);
+                }
+                const fin = arr;
+                return &fin;
+            }
+        },
+        else => {},
+    }
+    @compileError("Unsupported key specification for Pick/Omit/IndexAccess: " ++ @typeName(SpecT));
+}
+
+fn structHasExactWireKey(comptime T: type, comptime target_wire: []const u8) bool {
+    const st = @typeInfo(T).@"struct";
+    for (st.field_names) |other_fname| {
+        if (isHiddenMetaField(other_fname)) continue;
+        if (std.mem.eql(u8, topStructFieldWireName(T, other_fname), target_wire)) return true;
+    }
+    return false;
+}
+
+fn fieldMatchesAnyKey(comptime T: type, comptime fname: []const u8, comptime keys: []const []const u8) bool {
+    const wire = topStructFieldWireName(T, fname);
+    for (keys) |k| {
+        if (std.mem.eql(u8, wire, k)) return true;
+        if (!structHasExactWireKey(T, k) and std.mem.eql(u8, fname, k)) return true;
+    }
+    return false;
+}
+
+pub fn Partial(comptime T: type) type {
+    @setEvalBranchQuota(200_000);
+    if (!isPlainValueStructForTransform(T)) return T;
+    const st = @typeInfo(T).@"struct";
+    const need_meta = hasStructZigarJsMeta(T);
+    comptime var real_count: usize = 0;
+    for (st.field_names) |fname| {
+        if (!isHiddenMetaField(fname)) real_count += 1;
+    }
+    const total_count = real_count + @intFromBool(need_meta);
+    comptime var kept_names: [real_count][]const u8 = undefined;
+    comptime var fnames: [total_count][]const u8 = undefined;
+    comptime var ftypes: [total_count]type = undefined;
+    comptime var fattrs: [total_count]std.builtin.Type.Struct.FieldAttributes = undefined;
+
+    comptime var out_i: usize = 0;
+    inline for (st.field_names, 0..) |fname, fi| {
+        if (comptime isHiddenMetaField(fname)) continue;
+        const OrigFT = st.field_types[fi];
+        const NewFT = if (@typeInfo(OrigFT) == .optional or isModuleNullableType(OrigFT)) OrigFT else ?OrigFT;
+        const def_ptr: *const anyopaque = if (isModuleNullableType(NewFT))
+            defaultPtrForValue(NewFT, .@"undefined")
+        else
+            defaultPtrForValue(NewFT, null);
+
+        kept_names[out_i] = fname;
+        fnames[out_i] = fname;
+        ftypes[out_i] = NewFT;
+        fattrs[out_i] = .{
+            .default_value_ptr = def_ptr,
+            .@"comptime" = false,
+            .@"align" = @alignOf(NewFT),
+        };
+        out_i += 1;
+    }
+
+    if (need_meta) {
+        const Carrier = buildStructMetaCarrier(T, &kept_names, .make_partial);
+        fnames[real_count] = hidden_meta_field_name;
+        ftypes[real_count] = Carrier;
+        fattrs[real_count] = .{
+            .default_value_ptr = defaultPtrForValue(Carrier, .{}),
+            .@"comptime" = false,
+            .@"align" = @alignOf(Carrier),
+        };
+    }
+
+    const names_fin = fnames;
+    const types_fin = ftypes;
+    const attrs_fin = fattrs;
+    return @Struct(.auto, null, &names_fin, &types_fin, &attrs_fin);
+}
+
+pub fn Required(comptime T: type) type {
+    @setEvalBranchQuota(200_000);
+    if (!isPlainValueStructForTransform(T)) return T;
+    const st = @typeInfo(T).@"struct";
+    const need_meta = hasStructZigarJsMeta(T);
+    comptime var real_count: usize = 0;
+    for (st.field_names) |fname| {
+        if (!isHiddenMetaField(fname)) real_count += 1;
+    }
+    const total_count = real_count + @intFromBool(need_meta);
+    comptime var kept_names: [real_count][]const u8 = undefined;
+    comptime var fnames: [total_count][]const u8 = undefined;
+    comptime var ftypes: [total_count]type = undefined;
+    comptime var fattrs: [total_count]std.builtin.Type.Struct.FieldAttributes = undefined;
+
+    comptime var out_i: usize = 0;
+    inline for (st.field_names, 0..) |fname, fi| {
+        if (comptime isHiddenMetaField(fname)) continue;
+        const OrigFT = st.field_types[fi];
+        const req_res = comptime requiredFieldResolution(T, fname, OrigFT);
+        const NewFT = req_res.ty;
+        const preserve_default = req_res.preserve_default;
+
+        kept_names[out_i] = fname;
+        fnames[out_i] = fname;
+        ftypes[out_i] = NewFT;
+        fattrs[out_i] = .{
+            .default_value_ptr = if (preserve_default) st.field_attrs[fi].default_value_ptr else null,
+            .@"comptime" = false,
+            .@"align" = @alignOf(NewFT),
+        };
+        out_i += 1;
+    }
+
+    if (need_meta) {
+        const Carrier = buildStructMetaCarrier(T, &kept_names, .make_required);
+        fnames[real_count] = hidden_meta_field_name;
+        ftypes[real_count] = Carrier;
+        fattrs[real_count] = .{
+            .default_value_ptr = defaultPtrForValue(Carrier, .{}),
+            .@"comptime" = false,
+            .@"align" = @alignOf(Carrier),
+        };
+    }
+
+    const names_fin = fnames;
+    const types_fin = ftypes;
+    const attrs_fin = fattrs;
+    return @Struct(.auto, null, &names_fin, &types_fin, &attrs_fin);
+}
+
+pub fn Readonly(comptime T: type) type {
+    @setEvalBranchQuota(200_000);
+    return switch (@typeInfo(T)) {
+        .pointer => |pt| switch (pt.size) {
+            .slice => if (pt.attrs.@"const") T else []const pt.child,
+            .one => if (pt.attrs.@"const") T else *const pt.child,
+            else => T,
+        },
+        .@"struct" => |st| blk: {
+            if (!isPlainValueStructForTransform(T)) break :blk T;
+            const need_meta = hasStructZigarJsMeta(T);
+            comptime var real_count: usize = 0;
+            for (st.field_names) |fname| {
+                if (!isHiddenMetaField(fname)) real_count += 1;
+            }
+            const total_count = real_count + @intFromBool(need_meta);
+            comptime var kept_names: [real_count][]const u8 = undefined;
+            comptime var fnames: [total_count][]const u8 = undefined;
+            comptime var ftypes: [total_count]type = undefined;
+            comptime var fattrs: [total_count]std.builtin.Type.Struct.FieldAttributes = undefined;
+
+            comptime var out_i: usize = 0;
+            inline for (st.field_names, 0..) |fname, fi| {
+                if (comptime isHiddenMetaField(fname)) continue;
+                const OrigFT = st.field_types[fi];
+                kept_names[out_i] = fname;
+                fnames[out_i] = fname;
+                ftypes[out_i] = OrigFT;
+                fattrs[out_i] = st.field_attrs[fi];
+                out_i += 1;
+            }
+
+            if (need_meta) {
+                const Carrier = buildStructMetaCarrier(T, &kept_names, .preserve);
+                fnames[real_count] = hidden_meta_field_name;
+                ftypes[real_count] = Carrier;
+                fattrs[real_count] = .{
+                    .default_value_ptr = defaultPtrForValue(Carrier, .{}),
+                    .@"comptime" = false,
+                    .@"align" = @alignOf(Carrier),
+                };
+            }
+
+            const names_fin = fnames;
+            const types_fin = ftypes;
+            const attrs_fin = fattrs;
+            break :blk @Struct(.auto, null, &names_fin, &types_fin, &attrs_fin);
+        },
+        else => T,
+    };
+}
+
+fn filterStructFields(comptime T: type, comptime keys_spec: anytype, comptime include_matched: bool) type {
+    @setEvalBranchQuota(200_000);
+    if (!isPlainValueStructForTransform(T)) return T;
+    const st = @typeInfo(T).@"struct";
+    const keys = comptime extractKeyListFromSpec(keys_spec);
+    const need_meta = hasStructZigarJsMeta(T);
+
+    comptime var real_count: usize = 0;
+    inline for (st.field_names) |fname| {
+        if (comptime isHiddenMetaField(fname)) continue;
+        const matched = comptime fieldMatchesAnyKey(T, fname, keys);
+        if (matched == include_matched) real_count += 1;
+    }
+
+    const total_count = real_count + @intFromBool(need_meta and real_count > 0);
+    comptime var kept_names: [real_count][]const u8 = undefined;
+    comptime var fnames: [total_count][]const u8 = undefined;
+    comptime var ftypes: [total_count]type = undefined;
+    comptime var fattrs: [total_count]std.builtin.Type.Struct.FieldAttributes = undefined;
+
+    comptime var out_i: usize = 0;
+    inline for (st.field_names, 0..) |fname, fi| {
+        if (comptime isHiddenMetaField(fname)) continue;
+        const matched = comptime fieldMatchesAnyKey(T, fname, keys);
+        if (matched != include_matched) continue;
+        kept_names[out_i] = fname;
+        fnames[out_i] = fname;
+        ftypes[out_i] = st.field_types[fi];
+        fattrs[out_i] = st.field_attrs[fi];
+        out_i += 1;
+    }
+
+    if (need_meta and real_count > 0) {
+        const Carrier = buildStructMetaCarrier(T, &kept_names, .preserve);
+        fnames[real_count] = hidden_meta_field_name;
+        ftypes[real_count] = Carrier;
+        fattrs[real_count] = .{
+            .default_value_ptr = defaultPtrForValue(Carrier, .{}),
+            .@"comptime" = false,
+            .@"align" = @alignOf(Carrier),
+        };
+    }
+
+    const names_fin = fnames;
+    const types_fin = ftypes;
+    const attrs_fin = fattrs;
+    return @Struct(.auto, null, &names_fin, &types_fin, &attrs_fin);
+}
+
+pub fn Pick(comptime T: type, comptime keys_spec: anytype) type {
+    return filterStructFields(T, keys_spec, true);
+}
+
+pub fn Omit(comptime T: type, comptime keys_spec: anytype) type {
+    return filterStructFields(T, keys_spec, false);
+}
+
+pub fn EnumRecord(comptime K: type, comptime V: type) type {
+    @setEvalBranchQuota(200_000);
+    const en = @typeInfo(K).@"enum";
+    const ValIsOptional = (@typeInfo(V) == .optional or isModuleNullableType(V));
+
+    const MetaEntry = struct {
+        name: []const u8,
+        js_name: []const u8,
+        is_optional: bool,
+        nullish: NullishKind,
+    };
+
+    if (@hasDecl(K, "zigar_js") and @hasField(@TypeOf(K.zigar_js), "members")) {
+        comptime var real_count: usize = 0;
+        for (K.zigar_js.members) |m| {
+            if (@hasField(@TypeOf(m), "is_alias") and m.is_alias) continue;
+            real_count += 1;
+        }
+        comptime var chosen_names: [real_count][]const u8 = undefined;
+        comptime var chosen_wires: [real_count][]const u8 = undefined;
+        comptime var any_renamed = false;
+        comptime var pass_i: usize = 0;
+        for (K.zigar_js.members) |m| {
+            if (@hasField(@TypeOf(m), "is_alias") and m.is_alias) continue;
+            const wire = enumMemberWireKey(m);
+            const fname = dedupeComptimeFieldName(comptimeSnakeFieldName(wire), chosen_names[0..pass_i]);
+            chosen_names[pass_i] = fname;
+            chosen_wires[pass_i] = wire;
+            if (!std.mem.eql(u8, wire, fname)) {
+                any_renamed = true;
+            }
+            pass_i += 1;
+        }
+        const need_meta = any_renamed or ValIsOptional;
+        const total_count = real_count + @intFromBool(need_meta);
+        comptime var fnames: [total_count][]const u8 = undefined;
+        comptime var ftypes: [total_count]type = undefined;
+        comptime var fattrs: [total_count]std.builtin.Type.Struct.FieldAttributes = undefined;
+
+        comptime var meta_entries: [real_count]MetaEntry = undefined;
+        for (0..real_count) |out_i| {
+            const fname = chosen_names[out_i];
+            const wire = chosen_wires[out_i];
+            fnames[out_i] = fname;
+            ftypes[out_i] = V;
+            fattrs[out_i] = .{
+                .default_value_ptr = null,
+                .@"comptime" = false,
+                .@"align" = @alignOf(V),
+            };
+            meta_entries[out_i] = .{
+                .name = fname,
+                .js_name = wire,
+                .is_optional = false,
+                .nullish = if (ValIsOptional) NullishKind.null_only else NullishKind.none,
+            };
+        }
+        if (need_meta) {
+            const entries_fin = meta_entries;
+            const Carrier = struct {
+                pub const zigar_js = .{
+                    .fields = entries_fin,
+                };
+            };
+            fnames[real_count] = hidden_meta_field_name;
+            ftypes[real_count] = Carrier;
+            fattrs[real_count] = .{
+                .default_value_ptr = defaultPtrForValue(Carrier, .{}),
+                .@"comptime" = false,
+                .@"align" = @alignOf(Carrier),
+            };
+        }
+        const names_fin = fnames;
+        const types_fin = ftypes;
+        const attrs_fin = fattrs;
+        return @Struct(.auto, null, &names_fin, &types_fin, &attrs_fin);
+    }
+
+    const real_count = en.field_names.len;
+    const need_meta = ValIsOptional;
+    const total_count = real_count + @intFromBool(need_meta);
+    comptime var fnames: [total_count][]const u8 = undefined;
+    comptime var ftypes: [total_count]type = undefined;
+    comptime var fattrs: [total_count]std.builtin.Type.Struct.FieldAttributes = undefined;
+    comptime var meta_entries: [real_count]MetaEntry = undefined;
+    for (en.field_names, 0..) |fname, i| {
+        fnames[i] = fname;
+        ftypes[i] = V;
+        fattrs[i] = .{
+            .default_value_ptr = null,
+            .@"comptime" = false,
+            .@"align" = @alignOf(V),
+        };
+        meta_entries[i] = .{
+            .name = fname,
+            .js_name = fname,
+            .is_optional = false,
+            .nullish = if (ValIsOptional) NullishKind.null_only else NullishKind.none,
+        };
+    }
+    if (need_meta) {
+        const entries_fin = meta_entries;
+        const Carrier = struct {
+            pub const zigar_js = .{
+                .fields = entries_fin,
+            };
+        };
+        fnames[real_count] = hidden_meta_field_name;
+        ftypes[real_count] = Carrier;
+        fattrs[real_count] = .{
+            .default_value_ptr = defaultPtrForValue(Carrier, .{}),
+            .@"comptime" = false,
+            .@"align" = @alignOf(Carrier),
+        };
+    }
+    const names_fin = fnames;
+    const types_fin = ftypes;
+    const attrs_fin = fattrs;
+    return @Struct(.auto, null, &names_fin, &types_fin, &attrs_fin);
+}
+
+pub fn MappedValuesSpecWithFallback(
+    comptime FallbackRecordFn: fn (comptime type, comptime type) type,
+    comptime T: type,
+    comptime V: type,
+    comptime v_spec: anytype,
+) type {
+    @setEvalBranchQuota(200_000);
+    switch (@typeInfo(T)) {
+        .pointer => |pt| {
+            if (pt.size == .slice) {
+                if (pt.child == u8) return T;
+                return if (pt.attrs.@"const") []const V else []V;
+            }
+            return FallbackRecordFn(KeyOf(T), V);
+        },
+        .array => |ar| return [ar.len]V,
+        .int, .float, .bool, .void => return T,
+        .@"struct" => |st| {
+            if (st.is_tuple) return [st.field_types.len]V;
+            if (@hasDecl(T, "is_js_array") and T.is_js_array) return []const V;
+            if (@hasDecl(T, "is_js_bigint") and T.is_js_bigint) return T;
+            if (@hasDecl(T, "zigar_js_tuple")) {
+                const has_var = @hasField(@TypeOf(T.zigar_js_tuple), "variadic_index") and T.zigar_js_tuple.variadic_index != null;
+                const has_opt = blk: {
+                    for (st.field_attrs) |fa| {
+                        if (fa.default_value_ptr != null) break :blk true;
+                    }
+                    if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "fields")) {
+                        inline for (T.zigar_js.fields) |fm| {
+                            if (@hasField(@TypeOf(fm), "is_optional") and fm.is_optional) break :blk true;
+                        }
+                    }
+                    break :blk false;
+                };
+                if (has_var or has_opt) return []const V;
+                return [st.field_types.len]V;
+            }
+            if (isPlainValueStructForTransform(T)) {
+                comptime var real_count: usize = 0;
+                for (st.field_names) |fname| {
+                    if (!isHiddenMetaField(fname)) real_count += 1;
+                }
+                if (real_count == 0) return struct {};
+
+                const req_spec = comptime blk: {
+                    const VSpecT = @TypeOf(v_spec);
+                    if (@typeInfo(VSpecT) == .enum_literal) {
+                        if (v_spec == .auto) {
+                            break :blk if (isModuleNullableType(V))
+                                NullishKind.null_or_undefined
+                            else if (@typeInfo(V) == .optional)
+                                NullishKind.null_only
+                            else
+                                NullishKind.none;
+                        }
+                        break :blk @as(NullishKind, v_spec);
+                    }
+                    break :blk v_spec;
+                };
+                const opt_spec = comptime blk: {
+                    if (@typeInfo(V) == .optional or isModuleNullableType(V)) {
+                        const cur_self = specTopSelfNullish(req_spec);
+                        const merged_self: NullishKind = if (isModuleNullableType(V) or cur_self == .null_only or cur_self == .null_or_undefined)
+                            .null_or_undefined
+                        else
+                            .undefined_only;
+                        break :blk rebuildSpecWithSelf(req_spec, merged_self);
+                    }
+                    break :blk wrapSpecAsOptional(req_spec, .undefined_only);
+                };
+
+                const ReqEntryT = struct {
+                    name: []const u8,
+                    js_name: []const u8,
+                    is_optional: bool,
+                    nullish: @TypeOf(req_spec),
+                };
+                const OptEntryT = struct {
+                    name: []const u8,
+                    js_name: []const u8,
+                    is_optional: bool,
+                    nullish: @TypeOf(opt_spec),
+                };
+
+                comptime var any_opt = false;
+                inline for (st.field_names, 0..) |fname, fi| {
+                    if (comptime isHiddenMetaField(fname)) continue;
+                    if (comptime topStructFieldIsOptional(T, fname, st.field_attrs[fi].default_value_ptr != null)) {
+                        any_opt = true;
+                    }
+                }
+
+                const req_needs_meta = (@TypeOf(req_spec) != NullishKind) or (req_spec != NullishKind.none);
+                const need_meta = hasStructZigarJsMeta(T) or any_opt or req_needs_meta;
+                const total_count = real_count + @intFromBool(need_meta);
+
+                comptime var fnames: [total_count][]const u8 = undefined;
+                comptime var ftypes: [total_count]type = undefined;
+                comptime var fattrs: [total_count]std.builtin.Type.Struct.FieldAttributes = undefined;
+                comptime var entry_types: [real_count]type = undefined;
+
+                comptime var out_i: usize = 0;
+                inline for (st.field_names, 0..) |fname, fi| {
+                    if (comptime isHiddenMetaField(fname)) continue;
+                    const src_is_opt = comptime topStructFieldIsOptional(T, fname, st.field_attrs[fi].default_value_ptr != null);
+                    if (src_is_opt) {
+                        const NewFT = if (@typeInfo(V) == .optional or isModuleNullableType(V)) V else ?V;
+                        const def_ptr: *const anyopaque = if (isModuleNullableType(NewFT))
+                            defaultPtrForValue(NewFT, .@"undefined")
+                        else
+                            defaultPtrForValue(NewFT, null);
+                        fnames[out_i] = fname;
+                        ftypes[out_i] = NewFT;
+                        fattrs[out_i] = .{
+                            .default_value_ptr = def_ptr,
+                            .@"comptime" = false,
+                            .@"align" = @alignOf(NewFT),
+                        };
+                        entry_types[out_i] = OptEntryT;
+                    } else {
+                        fnames[out_i] = fname;
+                        ftypes[out_i] = V;
+                        fattrs[out_i] = .{
+                            .default_value_ptr = null,
+                            .@"comptime" = false,
+                            .@"align" = @alignOf(V),
+                        };
+                        entry_types[out_i] = ReqEntryT;
+                    }
+                    out_i += 1;
+                }
+
+                if (need_meta) {
+                    const FieldsTuple = @Tuple(&entry_types);
+                    const fields_val = comptime blk: {
+                        var tup: FieldsTuple = undefined;
+                        var ti: usize = 0;
+                        for (st.field_names, 0..) |fname, fi| {
+                            if (isHiddenMetaField(fname)) continue;
+                            const wire = topStructFieldWireName(T, fname);
+                            const src_is_opt = topStructFieldIsOptional(T, fname, st.field_attrs[fi].default_value_ptr != null);
+                            if (src_is_opt) {
+                                tup[ti] = OptEntryT{
+                                    .name = fname,
+                                    .js_name = wire,
+                                    .is_optional = true,
+                                    .nullish = opt_spec,
+                                };
+                            } else {
+                                tup[ti] = ReqEntryT{
+                                    .name = fname,
+                                    .js_name = wire,
+                                    .is_optional = false,
+                                    .nullish = req_spec,
+                                };
+                            }
+                            ti += 1;
+                        }
+                        break :blk tup;
+                    };
+                    const Carrier = struct {
+                        pub const zigar_js = .{
+                            .fields = fields_val,
+                        };
+                    };
+                    fnames[real_count] = hidden_meta_field_name;
+                    ftypes[real_count] = Carrier;
+                    fattrs[real_count] = .{
+                        .default_value_ptr = defaultPtrForValue(Carrier, .{}),
+                        .@"comptime" = false,
+                        .@"align" = @alignOf(Carrier),
+                    };
+                }
+
+                const names_fin = fnames;
+                const types_fin = ftypes;
+                const attrs_fin = fattrs;
+                return @Struct(.auto, null, &names_fin, &types_fin, &attrs_fin);
+            }
+            return FallbackRecordFn(KeyOf(T), V);
+        },
+        else => return FallbackRecordFn(KeyOf(T), V),
+    }
+}
+
+pub fn NonNullable(comptime T: type) type {
+    if (@typeInfo(T) == .optional) return NonNullable(@typeInfo(T).optional.child);
+    if (isModuleNullableType(T)) return NonNullable(T.Value);
+    return T;
+}
+
+pub fn Awaited(comptime T: type) type {
+    if (@typeInfo(T) == .@"struct") {
+        if (@hasDecl(T, "is_js_promise") and T.is_js_promise and @hasDecl(T, "Payload")) {
+            return Awaited(T.Payload);
+        }
+        if (@hasDecl(T, "Target") and @TypeOf(T.Target) == type and @typeInfo(T.Target) == .@"struct") {
+            if (@hasDecl(T.Target, "is_js_promise") and T.Target.is_js_promise and @hasDecl(T.Target, "Payload")) {
+                return Awaited(T.Target.Payload);
+            }
+        }
+    }
+    if (@typeInfo(T) == .@"union" and @typeInfo(T).@"union".tag_type != null and !isModuleNullableType(T)) {
+        const un = @typeInfo(T).@"union";
+        comptime var any_changed = false;
+        comptime var distinct: [un.field_types.len]type = undefined;
+        comptime var d_len: usize = 0;
+        for (un.field_types) |ft| {
+            const aw = Awaited(ft);
+            if (aw != ft) any_changed = true;
+            var seen = false;
+            for (distinct[0..d_len]) | prev | {
+                if (prev == aw) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                distinct[d_len] = aw;
+                d_len += 1;
+            }
+        }
+        if (any_changed) {
+            if (d_len == 1) return distinct[0];
+            return buildSynthesizedUnion(distinct[0..d_len]);
+        }
+    }
+    return T;
+}
+
+fn buildSynthesizedUnion(comptime member_types: []const type) type {
+    const count = member_types.len;
+    if (count == 0) return noreturn;
+    if (count == 1) return member_types[0];
+    const TagInt = std.math.IntFittingRange(0, count - 1);
+    comptime var fnames: [count][]const u8 = undefined;
+    comptime var ftypes: [count]type = undefined;
+    comptime var fattrs: [count]std.builtin.Type.Union.FieldAttributes = undefined;
+    comptime var tag_vals: [count]TagInt = undefined;
+    for (member_types, 0..) |mt, i| {
+        fnames[i] = std.fmt.comptimePrint("v{d}", .{i});
+        ftypes[i] = mt;
+        fattrs[i] = .{};
+        tag_vals[i] = i;
+    }
+    const names_fin = fnames;
+    const types_fin = ftypes;
+    const attrs_fin = fattrs;
+    const vals_fin = tag_vals;
+    const Tag = @Enum(TagInt, .exhaustive, &names_fin, &vals_fin);
+    return @Union(.auto, Tag, &names_fin, &types_fin, &attrs_fin);
+}
+
+pub fn KeyOf(comptime T: type) type {
+    @setEvalBranchQuota(200_000);
+    switch (@typeInfo(T)) {
+        .@"struct" => |st| {
+            if (isPlainValueStructForTransform(T)) {
+                comptime var max_count: usize = 0;
+                for (st.field_names) |fname| {
+                    if (!isHiddenMetaField(fname)) max_count += 1;
+                }
+                if (max_count == 0) return noreturn;
+                comptime var names_buf: [max_count][]const u8 = undefined;
+                comptime var count: usize = 0;
+                for (st.field_names) |fname| {
+                    if (isHiddenMetaField(fname)) continue;
+                    const w = topStructFieldWireName(T, fname);
+                    var dup = false;
+                    for (names_buf[0..count]) |prev| {
+                        if (std.mem.eql(u8, prev, w)) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) {
+                        names_buf[count] = w;
+                        count += 1;
+                    }
+                }
+                if (count == 0) return noreturn;
+                const TagInt = std.math.IntFittingRange(0, count - 1);
+                comptime var vals: [count]TagInt = undefined;
+                for (0..count) |i| vals[i] = i;
+                const names_fin = names_buf[0..count].*;
+                const vals_fin = vals;
+                return @Enum(TagInt, .exhaustive, &names_fin, &vals_fin);
+            }
+            if (isGeneratedHandleStruct(T) and @hasField(@TypeOf(T.zigar_js), "fields")) {
+                const fmeta = T.zigar_js.fields;
+                const mmeta = if (@hasField(@TypeOf(T.zigar_js), "methods")) T.zigar_js.methods else .{};
+                const max_len = fmeta.len + mmeta.len;
+                if (max_len == 0) return []const u8;
+                comptime var names_buf: [max_len][]const u8 = undefined;
+                comptime var count: usize = 0;
+                for (fmeta) |fm| {
+                    const w = if (@hasField(@TypeOf(fm), "js_name")) fm.js_name else fm.name;
+                    var dup = false;
+                    for (names_buf[0..count]) |prev| {
+                        if (std.mem.eql(u8, prev, w)) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) {
+                        names_buf[count] = w;
+                        count += 1;
+                    }
+                }
+                for (mmeta) |mm| {
+                    if (@hasField(@TypeOf(mm), "is_static") and mm.is_static) continue;
+                    const w = if (@hasField(@TypeOf(mm), "js_name")) mm.js_name else mm.name;
+                    var dup = false;
+                    for (names_buf[0..count]) |prev| {
+                        if (std.mem.eql(u8, prev, w)) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) {
+                        names_buf[count] = w;
+                        count += 1;
+                    }
+                }
+                if (count == 0) return []const u8;
+                const TagInt = std.math.IntFittingRange(0, count - 1);
+                comptime var vals: [count]TagInt = undefined;
+                for (0..count) |i| vals[i] = i;
+                const names_fin = names_buf[0..count].*;
+                const vals_fin = vals;
+                return @Enum(TagInt, .exhaustive, &names_fin, &vals_fin);
+            }
+            if (@hasDecl(T, "is_js_record") and T.is_js_record and @hasDecl(T, "Key")) {
+                return T.Key;
+            }
+            return []const u8;
+        },
+        .pointer => |pt| {
+            if (pt.size == .slice) return f64;
+            return []const u8;
+        },
+        else => return []const u8,
+    }
+}
+
+fn isNumericIndexKeySpec(comptime keys_spec: anytype) ?usize {
+    const SpecT = @TypeOf(keys_spec);
+    if (SpecT == comptime_int or @typeInfo(SpecT) == .int) {
+        if (keys_spec < 0) @compileError("Negative tuple/array index in IndexAccess");
+        return @intCast(keys_spec);
+    }
+    return null;
+}
+
+fn isBroadNumericIndexType(comptime keys_spec: anytype) bool {
+    if (@TypeOf(keys_spec) != type) return false;
+    return switch (@typeInfo(keys_spec)) {
+        .int, .float => true,
+        else => false,
+    };
+}
+
+pub fn IndexAccessWithFallback(comptime FallbackValue: type, comptime T: type, comptime keys_spec: anytype) type {
+    @setEvalBranchQuota(200_000);
+    switch (@typeInfo(T)) {
+        .pointer => |pt| {
+            if (pt.size == .slice) {
+                if (isNumericIndexKeySpec(keys_spec) != null or isBroadNumericIndexType(keys_spec)) {
+                    return pt.child;
+                }
+            }
+        },
+        .array => |ar| {
+            if (isNumericIndexKeySpec(keys_spec) != null or isBroadNumericIndexType(keys_spec)) {
+                return ar.child;
+            }
+        },
+        .@"struct" => |st| {
+            if (@hasDecl(T, "is_js_record") and T.is_js_record and @hasDecl(T, "Value")) {
+                return T.Value;
+            }
+            if (@hasDecl(T, "is_js_array") and T.is_js_array and (@hasDecl(T, "Elem") or @hasDecl(T, "Element"))) {
+                if (isNumericIndexKeySpec(keys_spec) != null or isBroadNumericIndexType(keys_spec)) {
+                    return if (@hasDecl(T, "Elem")) T.Elem else T.Element;
+                }
+            }
+            if (st.is_tuple or @hasDecl(T, "zigar_js_tuple")) {
+                if (isNumericIndexKeySpec(keys_spec)) |idx| {
+                    if (idx < st.field_types.len) return st.field_types[idx];
+                    @compileError("Tuple index out of bounds in IndexAccess");
+                }
+                if (isBroadNumericIndexType(keys_spec)) {
+                    comptime var distinct: [st.field_types.len]type = undefined;
+                    comptime var d_len: usize = 0;
+                    for (st.field_types, 0..) |ft, fi| {
+                        const elem_t = if (@hasDecl(T, "zigar_js_tuple") and @hasField(@TypeOf(T.zigar_js_tuple), "variadic_index") and T.zigar_js_tuple.variadic_index != null and T.zigar_js_tuple.variadic_index.? == fi and @typeInfo(ft) == .pointer and @typeInfo(ft).pointer.size == .slice)
+                            @typeInfo(ft).pointer.child
+                        else
+                            ft;
+                        var seen = false;
+                        for (distinct[0..d_len]) |prev| {
+                            if (prev == elem_t) {
+                                seen = true;
+                                break;
+                            }
+                        }
+                        if (!seen) {
+                            distinct[d_len] = elem_t;
+                            d_len += 1;
+                        }
+                    }
+                    return buildSynthesizedUnion(distinct[0..d_len]);
+                }
+            }
+            if (isPlainValueStructForTransform(T)) {
+                if (@TypeOf(keys_spec) == type and keys_spec == []const u8) {
+                    return FallbackValue;
+                }
+                if (isBroadNumericIndexType(keys_spec)) {
+                    comptime var distinct_num: [st.field_types.len]type = undefined;
+                    comptime var dn_len: usize = 0;
+                    for (st.field_names, 0..) |fname, fi| {
+                        if (isHiddenMetaField(fname)) continue;
+                        if (!isNumericPropertyKeyString(topStructFieldWireName(T, fname))) continue;
+                        const ft = st.field_types[fi];
+                        var seen = false;
+                        for (distinct_num[0..dn_len]) |prev| {
+                            if (prev == ft) {
+                                seen = true;
+                                break;
+                            }
+                        }
+                        if (!seen) {
+                            distinct_num[dn_len] = ft;
+                            dn_len += 1;
+                        }
+                    }
+                    if (dn_len > 0) return buildSynthesizedUnion(distinct_num[0..dn_len]);
+                    return FallbackValue;
+                }
+                const keys = comptime extractKeyListFromSpec(keys_spec);
+                if (keys.len == 0) return noreturn;
+                comptime var distinct: [st.field_types.len]type = undefined;
+                comptime var d_len: usize = 0;
+                for (st.field_names, 0..) |fname, fi| {
+                    if (isHiddenMetaField(fname)) continue;
+                    if (!fieldMatchesAnyKey(T, fname, keys)) continue;
+                    const ft = st.field_types[fi];
+                    var seen = false;
+                    for (distinct[0..d_len]) |prev| {
+                        if (prev == ft) {
+                            seen = true;
+                            break;
+                        }
+                    }
+                    if (!seen) {
+                        distinct[d_len] = ft;
+                        d_len += 1;
+                    }
+                }
+                if (d_len > 0) return buildSynthesizedUnion(distinct[0..d_len]);
+                return FallbackValue;
+            }
+        },
+        else => {},
+    }
+    return FallbackValue;
+}
+
+pub fn IndexAccess(comptime T: type, comptime keys_spec: anytype) type {
+    return IndexAccessWithFallback(Any, T, keys_spec);
+}
+
+/// Normalizes a caller value argument type `Arg` (`@TypeOf(arg)`) into a runtime-representable
+/// Zig parameter type for generic `<fn>Infer` deduction (`"hi"` -> `[]const u8`, `42` -> `f64`,
+/// `&[_]T{...}` -> `[]const T`).
+pub fn InferJsTypeWithFallback(comptime FallbackValue: type, comptime Arg: type) type {
+    if (Arg == comptime_int or Arg == comptime_float) return f64;
+    if (Arg == @TypeOf(null) or Arg == @TypeOf(undefined)) return FallbackValue;
+    return switch (@typeInfo(Arg)) {
+        .enum_literal => @compileError("zigar.js: pass a concrete enum value or string slice instead of an untyped enum literal"),
+        .pointer => |pt| blk: {
+            if (pt.size == .one and @typeInfo(pt.child) == .array) {
+                const elem = @typeInfo(pt.child).array.child;
+                if (elem == comptime_int or elem == comptime_float) break :blk []const f64;
+                break :blk []const elem;
+            }
+            break :blk Arg;
+        },
+        else => Arg,
+    };
+}
+
+pub fn InferJsType(comptime Arg: type) type {
+    return InferJsTypeWithFallback(Any, Arg);
+}
+
+/// Normalizes a caller value argument type `Arg` (`@TypeOf(arg)`) into a runtime-representable
+/// Zig parameter type for `const T` TypeScript 5.0 type parameters, preserving fixed-length
+/// non-string tuple arrays (`&[_]f64{ 1, 2 }` -> `[2]f64`) while normalizing string literals
+/// (`"hi"` -> `[]const u8`) and comptime scalars (`42` -> `f64`).
+pub fn InferConstJsTypeWithFallback(comptime FallbackValue: type, comptime Arg: type) type {
+    if (Arg == comptime_int or Arg == comptime_float) return f64;
+    if (Arg == @TypeOf(null) or Arg == @TypeOf(undefined)) return FallbackValue;
+    return switch (@typeInfo(Arg)) {
+        .enum_literal => @compileError("zigar.js: pass a concrete enum value or string slice instead of an untyped enum literal"),
+        .pointer => |pt| blk: {
+            if (pt.size == .one and @typeInfo(pt.child) == .array) {
+                const ar = @typeInfo(pt.child).array;
+                if (ar.child == u8 and ar.sentinel() != null) break :blk []const u8;
+                const elem = if (ar.child == comptime_int or ar.child == comptime_float) f64 else ar.child;
+                break :blk [ar.len]elem;
+            }
+            break :blk Arg;
+        },
+        .array => |ar| blk: {
+            const elem = if (ar.child == comptime_int or ar.child == comptime_float) f64 else ar.child;
+            break :blk [ar.len]elem;
+        },
+        else => Arg,
+    };
+}
+
+pub fn InferConstJsType(comptime Arg: type) type {
+    return InferConstJsTypeWithFallback(Any, Arg);
+}
+
+/// Returns true when `Arg` is `*const [N]Elem` for a non-sentinel-`u8` array so `const T`
+/// inference companions can dereference `&[_]Elem{ ... }` into `[N]Elem`.
+pub fn isConstArrayPtr(comptime Arg: type) bool {
+    return switch (@typeInfo(Arg)) {
+        .pointer => |pt| blk: {
+            if (pt.size == .one and @typeInfo(pt.child) == .array) {
+                const ar = @typeInfo(pt.child).array;
+                if (ar.child == u8 and ar.sentinel() != null) break :blk false;
+                break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+/// Deduces `T` from a slice, array, or pointer-to-array argument passed for `[]const T`.
+pub fn InferSliceElem(comptime S: type) type {
+    return switch (@typeInfo(S)) {
+        .pointer => |pt| blk: {
+            if (pt.size == .slice) {
+                if (pt.child == comptime_int or pt.child == comptime_float) break :blk f64;
+                break :blk pt.child;
+            }
+            if (pt.size == .one and @typeInfo(pt.child) == .array) {
+                const elem = @typeInfo(pt.child).array.child;
+                if (elem == comptime_int or elem == comptime_float) break :blk f64;
+                break :blk elem;
+            }
+            @compileError("zigar.js: expected slice or array pointer argument for generic element inference, got " ++ @typeName(S));
+        },
+        .array => |ar| if (ar.child == comptime_int or ar.child == comptime_float) f64 else ar.child,
+        else => @compileError("zigar.js: expected slice or array argument for generic element inference, got " ++ @typeName(S)),
+    };
+}
+
+/// Deduces `T` from a nullable/non-nullable argument passed for `?T`.
+pub fn InferOptionalChildWithFallback(comptime FallbackValue: type, comptime Opt: type) type {
+    if (Opt == @TypeOf(null) or Opt == @TypeOf(undefined)) return FallbackValue;
+    return switch (@typeInfo(Opt)) {
+        .optional => |op| InferJsTypeWithFallback(FallbackValue, op.child),
+        else => InferJsTypeWithFallback(FallbackValue, Opt),
+    };
+}
+
+pub fn InferOptionalChild(comptime Opt: type) type {
+    return InferOptionalChildWithFallback(Any, Opt);
+}
+
+fn isRefToTarget(comptime T: type, comptime TargetMarker: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "Target") and @TypeOf(T.Target) == type and T.Target == TargetMarker;
+}
+
+fn isUnconstrainedJsAnyOrUnknown(comptime T: type) bool {
+    if (T == Any or T == Unknown) return true;
+    if (isRefToTarget(T, Any) or isRefToTarget(T, Unknown)) return true;
+    if (@typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_any_or_unknown") and T.is_js_any_or_unknown) return true;
+    return false;
+}
+
+fn isJsObjectConstraintMarker(comptime T: type) bool {
+    if (T == Object or isRefToTarget(T, Object)) return true;
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_object") and T.is_js_object;
+}
+
+fn isJsFunctionConstraintMarker(comptime T: type) bool {
+    if (T == Function or isRefToTarget(T, Function)) return true;
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_function") and T.is_js_function;
+}
+
+fn isJsSymbolConstraintMarker(comptime T: type) bool {
+    if (T == Symbol or isRefToTarget(T, Symbol)) return true;
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_symbol") and T.is_js_symbol;
+}
+
+fn isStringLikeConstraintCandidate(comptime T: type) bool {
+    if (T == []const u8 or T == []u8 or T == [:0]const u8 or T == [:0]u8) return true;
+    return switch (@typeInfo(T)) {
+        .pointer => |pt| (pt.size == .slice and pt.child == u8) or
+            (pt.size == .one and @typeInfo(pt.child) == .array and @typeInfo(pt.child).array.child == u8),
+        .@"enum" => @hasDecl(T, "toSlice"),
+        .@"struct" => isTemplateLiteralStruct(T) or (@hasDecl(T, "is_js_string") and T.is_js_string),
+        .@"union" => @hasDecl(T, "zigar_js") and
+            @hasField(@TypeOf(T.zigar_js), "is_open_literal") and
+            T.zigar_js.is_open_literal and
+            @hasDecl(T, "fromSlice"),
+        else => false,
+    };
+}
+
+fn isNumberLikeConstraintCandidate(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .float, .comptime_float, .int, .comptime_int => true,
+        .@"enum" => !@hasDecl(T, "toSlice"),
+        .@"union" => @hasDecl(T, "zigar_js") and
+            @hasField(@TypeOf(T.zigar_js), "is_open_literal") and
+            T.zigar_js.is_open_literal and
+            !@hasDecl(T, "fromSlice"),
+        else => false,
+    };
+}
+
+fn isFunctionLikeConstraintCandidate(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"fn" => true,
+        .pointer => |pt| pt.size == .one and @typeInfo(pt.child) == .@"fn",
+        .@"struct" => isCallbackWrapper(T) or
+            isJsFunctionConstraintMarker(T) or
+            (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_callable_handle") and T.zigar_js.is_callable_handle),
+        else => false,
+    };
+}
+
+fn structDerivesFrom(comptime T: type, comptime Base: type, comptime depth: usize) bool {
+    if (T == Base) return true;
+    if (depth > 8) return false;
+    if (@typeInfo(T) != .@"struct") return false;
+    if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "bases"))) {
+        const bases = T.zigar_js.bases;
+        inline for (@typeInfo(@TypeOf(bases)).@"struct".field_names) |bf_name| {
+            const B = @field(bases, bf_name);
+            if (comptime (@TypeOf(B) == type)) {
+                if (B == Base or structDerivesFrom(B, Base, depth + 1)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn structProvidesMember(comptime T: type, comptime wire_or_zig: []const u8) bool {
+    if (@typeInfo(T) != .@"struct") return false;
+    if (@hasField(T, wire_or_zig) or @hasDecl(T, wire_or_zig)) return true;
+    if (comptime @hasDecl(T, "zigar_js")) {
+        const meta = T.zigar_js;
+        if (comptime @hasField(@TypeOf(meta), "fields")) {
+            inline for (@typeInfo(@TypeOf(meta.fields)).@"struct".field_names) |mf_name| {
+                const entry = @field(meta.fields, mf_name);
+                if (comptime @hasField(@TypeOf(entry), "js_name")) {
+                    if (std.mem.eql(u8, entry.js_name, wire_or_zig)) return true;
+                }
+                if (comptime @hasField(@TypeOf(entry), "name")) {
+                    if (std.mem.eql(u8, entry.name, wire_or_zig)) return true;
+                }
+            }
+        }
+        if (comptime @hasField(@TypeOf(meta), "methods")) {
+            inline for (@typeInfo(@TypeOf(meta.methods)).@"struct".field_names) |mf_name| {
+                const entry = @field(meta.methods, mf_name);
+                if (comptime @hasField(@TypeOf(entry), "js_name")) {
+                    if (std.mem.eql(u8, entry.js_name, wire_or_zig)) return true;
+                }
+                if (comptime @hasField(@TypeOf(entry), "name")) {
+                    if (std.mem.eql(u8, entry.name, wire_or_zig)) return true;
+                }
+            }
+        }
+        if (comptime @hasField(@TypeOf(meta), "bases")) {
+            inline for (@typeInfo(@TypeOf(meta.bases)).@"struct".field_names) |bf_name| {
+                const B = @field(meta.bases, bf_name);
+                if (comptime (@TypeOf(B) == type)) {
+                    if (structProvidesMember(B, wire_or_zig)) return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+fn lookupStructFieldType(comptime T: type, comptime zig_name: []const u8, comptime wire_name: []const u8) ?type {
+    if (@typeInfo(T) != .@"struct") return null;
+    if (@hasField(T, zig_name)) return @FieldType(T, zig_name);
+    if (!std.mem.eql(u8, wire_name, zig_name) and @hasField(T, wire_name)) return @FieldType(T, wire_name);
+    if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "fields"))) {
+        inline for (@typeInfo(@TypeOf(T.zigar_js.fields)).@"struct".field_names) |mf_name| {
+            const entry = @field(T.zigar_js.fields, mf_name);
+            if (comptime (@hasField(@TypeOf(entry), "js_name") and @hasField(@TypeOf(entry), "name"))) {
+                if (comptime (std.mem.eql(u8, entry.js_name, wire_name) and @hasField(T, entry.name))) {
+                    return @FieldType(T, entry.name);
+                }
+            }
+        }
+    }
+    return null;
+}
+
+fn enumMemberWireName(comptime EnumT: type, comptime field_name: []const u8) []const u8 {
+    if (comptime (@hasDecl(EnumT, "zigar_js") and @hasField(@TypeOf(EnumT.zigar_js), "members"))) {
+        const members = EnumT.zigar_js.members;
+        inline for (@typeInfo(@TypeOf(members)).@"struct".field_names) |mf_name| {
+            const entry = @field(members, mf_name);
+            if (comptime @hasField(@TypeOf(entry), "tag")) {
+                if (std.mem.eql(u8, entry.tag, field_name)) {
+                    if (comptime @hasField(@TypeOf(entry), "str_value")) return entry.str_value;
+                    if (comptime @hasField(@TypeOf(entry), "js_name")) return entry.js_name;
+                }
+            }
+        }
+    }
+    return field_name;
+}
+
+fn unitLiteralSatisfiesConstraint(comptime vd: anytype, comptime Constraint: type, comptime depth: usize) bool {
+    if (depth > 8) return true;
+    const VD = @TypeOf(vd);
+    if (@typeInfo(Constraint) == .optional) {
+        return unitLiteralSatisfiesConstraint(vd, @typeInfo(Constraint).optional.child, depth + 1);
+    }
+    if (@typeInfo(Constraint) == .@"union") {
+        if (comptime (@hasDecl(Constraint, "is_zigar_nullable") and Constraint.is_zigar_nullable)) {
+            return unitLiteralSatisfiesConstraint(vd, Constraint.Value, depth + 1);
+        }
+        if (comptime (@hasDecl(Constraint, "zigar_js") and
+            @hasField(@TypeOf(Constraint.zigar_js), "is_open_literal") and
+            Constraint.zigar_js.is_open_literal))
+        {
+            if (comptime @hasDecl(Constraint, "fromSlice")) return @hasField(VD, "str_value");
+            return @hasField(VD, "int_value") or @hasField(VD, "float_value");
+        }
+        const c_types = @typeInfo(Constraint).@"union".field_types;
+        if (comptime (@hasDecl(Constraint, "zigar_js") and @hasField(@TypeOf(Constraint.zigar_js), "variants"))) {
+            const cvs = Constraint.zigar_js.variants;
+            inline for (c_types, 0..) |cf_ty, ci| {
+                if (ci < cvs.len and @hasField(@TypeOf(cvs[ci]), "is_unit_literal") and cvs[ci].is_unit_literal) {
+                    const cvd = cvs[ci];
+                    const CVD = @TypeOf(cvd);
+                    if (@hasField(VD, "str_value") and @hasField(CVD, "str_value") and std.mem.eql(u8, vd.str_value, cvd.str_value)) return true;
+                    if (@hasField(VD, "bool_value") and @hasField(CVD, "bool_value") and vd.bool_value == cvd.bool_value) return true;
+                    if (@hasField(VD, "num_value") and @hasField(CVD, "num_value") and vd.num_value == cvd.num_value) return true;
+                    if (@hasField(VD, "int_value") and @hasField(CVD, "int_value") and vd.int_value == cvd.int_value) return true;
+                    if (@hasField(VD, "float_value") and @hasField(CVD, "float_value") and vd.float_value == cvd.float_value) return true;
+                    if (@hasField(VD, "bigint_value") and @hasField(CVD, "bigint_value") and std.mem.eql(u8, vd.bigint_value, cvd.bigint_value)) return true;
+                } else if (cf_ty != void and unitLiteralSatisfiesConstraint(vd, cf_ty, depth + 1)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        inline for (c_types) |cf_ty| {
+            if (cf_ty != void and unitLiteralSatisfiesConstraint(vd, cf_ty, depth + 1)) return true;
+        }
+        return false;
+    }
+    if (@hasField(VD, "str_value")) {
+        if (@typeInfo(Constraint) == .@"enum") {
+            inline for (@typeInfo(Constraint).@"enum".field_names) |cf_name| {
+                if (std.mem.eql(u8, vd.str_value, comptime enumMemberWireName(Constraint, cf_name))) return true;
+            }
+            return false;
+        }
+        return satisfiesTypeConstraint([]const u8, Constraint, depth + 1);
+    }
+    if (@hasField(VD, "bool_value")) return satisfiesTypeConstraint(bool, Constraint, depth + 1);
+    if (@hasField(VD, "num_value") or @hasField(VD, "int_value") or @hasField(VD, "float_value")) return satisfiesTypeConstraint(f64, Constraint, depth + 1);
+    if (@hasField(VD, "bigint_value")) return satisfiesTypeConstraint(i64, Constraint, depth + 1);
+    return false;
+}
+
+pub fn satisfiesTypeConstraint(comptime T: type, comptime Constraint: type, comptime depth: usize) bool {
+    @setEvalBranchQuota(200_000);
+    if (T == Constraint or T == noreturn) return true;
+    if (depth > 8) return true;
+    // Check `T` BEFORE `Constraint` so mutually-recursive generic type aliases
+    // instantiated with `Any` / `Unknown` short-circuit without querying `@typeInfo(Constraint)`
+    // while `Constraint` is still resolving its own fields.
+    if (comptime isUnconstrainedJsAnyOrUnknown(T)) return true;
+    if (comptime isUnconstrainedJsAnyOrUnknown(Constraint)) return true;
+
+    // `T extends object`: reject scalar primitives (`bool`, numbers), allow structs, handles, slices, arrays, functions.
+    if (comptime isJsObjectConstraintMarker(Constraint)) {
+        return switch (@typeInfo(T)) {
+            .bool, .int, .comptime_int, .float, .comptime_float, .void => false,
+            else => true,
+        };
+    }
+
+    // `T extends symbol`
+    if (comptime isJsSymbolConstraintMarker(Constraint)) {
+        return isJsSymbolConstraintMarker(T);
+    }
+
+    // `T extends Function` / callback signature constraint
+    if (comptime (isJsFunctionConstraintMarker(Constraint) or
+        isCallbackWrapper(Constraint) or
+        (@typeInfo(Constraint) == .@"struct" and @hasDecl(Constraint, "zigar_js") and @hasField(@TypeOf(Constraint.zigar_js), "is_callable_handle") and Constraint.zigar_js.is_callable_handle) or
+        @typeInfo(Constraint) == .@"fn" or
+        (@typeInfo(Constraint) == .pointer and @typeInfo(Constraint).pointer.size == .one and @typeInfo(@typeInfo(Constraint).pointer.child) == .@"fn")))
+    {
+        return isFunctionLikeConstraintCandidate(T);
+    }
+
+    // `T extends string` or template-literal / `js.String`
+    if (comptime (Constraint == []const u8 or isTemplateLiteralStruct(Constraint) or
+        (@typeInfo(Constraint) == .@"struct" and @hasDecl(Constraint, "is_js_string") and Constraint.is_js_string)))
+    {
+        return isStringLikeConstraintCandidate(T);
+    }
+
+    // `T extends boolean`
+    if (Constraint == bool) return T == bool;
+
+    // `T extends bigint`
+    if (comptime (Constraint == i64 or Constraint == u64 or
+        (@typeInfo(Constraint) == .@"struct" and @hasDecl(Constraint, "is_js_bigint") and Constraint.is_js_bigint)))
+    {
+        return switch (@typeInfo(T)) {
+            .int, .comptime_int => true,
+            .@"struct" => @hasDecl(T, "is_js_bigint") and T.is_js_bigint,
+            else => false,
+        };
+    }
+
+    // `T extends number`
+    if (comptime (@typeInfo(Constraint) == .float or @typeInfo(Constraint) == .int)) {
+        return isNumberLikeConstraintCandidate(T);
+    }
+
+    // If `T` itself is a tagged union, every variant payload must satisfy `Constraint`.
+    if (comptime (@typeInfo(T) == .@"union")) {
+        if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_open_literal") and T.zigar_js.is_open_literal)) {
+            // Handled below if Constraint is open literal or union.
+        } else if (comptime (@hasDecl(T, "is_zigar_nullable") and T.is_zigar_nullable)) {
+            return satisfiesTypeConstraint(@TypeOf(null), Constraint, depth + 1) and
+                satisfiesTypeConstraint(T.Value, Constraint, depth + 1);
+        } else {
+            const u_types = @typeInfo(T).@"union".field_types;
+            if (comptime (u_types.len > 0)) {
+                const has_t_vars = comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "variants"));
+                inline for (u_types, 0..) |uf_ty, ui| {
+                    if (uf_ty != void) {
+                        if (!satisfiesTypeConstraint(uf_ty, Constraint, depth + 1)) return false;
+                    } else if (has_t_vars and ui < T.zigar_js.variants.len and
+                        @hasField(@TypeOf(T.zigar_js.variants[ui]), "is_unit_literal") and
+                        T.zigar_js.variants[ui].is_unit_literal)
+                    {
+                        if (!unitLiteralSatisfiesConstraint(T.zigar_js.variants[ui], Constraint, depth + 1)) return false;
+                    } else {
+                        if (!satisfiesTypeConstraint(void, Constraint, depth + 1)) return false;
+                    }
+                }
+                return true;
+            }
+        }
+    }
+
+    return switch (@typeInfo(Constraint)) {
+        .optional => |op| blk: {
+            if (T == @TypeOf(null) or T == @TypeOf(undefined)) break :blk true;
+            if (@typeInfo(T) == .optional) {
+                break :blk satisfiesTypeConstraint(@typeInfo(T).optional.child, op.child, depth + 1);
+            }
+            break :blk satisfiesTypeConstraint(T, op.child, depth + 1);
+        },
+        .pointer => |cpt| blk: {
+            if (cpt.size == .slice) {
+                if (cpt.child == u8) {
+                    if (isStringLikeConstraintCandidate(T)) break :blk true;
+                    if (@typeInfo(T) == .@"struct" and isGeneratedHandleStruct(T)) break :blk true;
+                }
+                break :blk switch (@typeInfo(T)) {
+                    .pointer => |tpt| if (tpt.size == .slice)
+                        satisfiesTypeConstraint(tpt.child, cpt.child, depth + 1)
+                    else if (tpt.size == .one and @typeInfo(tpt.child) == .array)
+                        satisfiesTypeConstraint(@typeInfo(tpt.child).array.child, cpt.child, depth + 1)
+                    else
+                        false,
+                    .array => |tar| satisfiesTypeConstraint(tar.child, cpt.child, depth + 1),
+                    else => false,
+                };
+            }
+            break :blk false;
+        },
+        .@"enum" => |cen| blk: {
+            if (@typeInfo(T) != .@"enum") break :blk false;
+            const ten = @typeInfo(T).@"enum";
+            inline for (ten.field_names) |tf_name| {
+                const tw = comptime enumMemberWireName(T, tf_name);
+                var found = false;
+                inline for (cen.field_names) |cf_name| {
+                    const cw = comptime enumMemberWireName(Constraint, cf_name);
+                    if (std.mem.eql(u8, tw, cw)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) break :blk false;
+            }
+            break :blk true;
+        },
+        .@"union" => |cun| blk: {
+            if (comptime (@hasDecl(Constraint, "is_zigar_nullable") and Constraint.is_zigar_nullable)) {
+                if (T == @TypeOf(null) or T == @TypeOf(undefined) or T == void) break :blk true;
+                if (@typeInfo(T) == .optional) {
+                    break :blk satisfiesTypeConstraint(@typeInfo(T).optional.child, Constraint.Value, depth + 1);
+                }
+                break :blk satisfiesTypeConstraint(T, Constraint.Value, depth + 1);
+            }
+            if (comptime (@hasDecl(Constraint, "zigar_js") and
+                @hasField(@TypeOf(Constraint.zigar_js), "is_open_literal") and
+                Constraint.zigar_js.is_open_literal))
+            {
+                if (comptime @hasDecl(Constraint, "fromSlice")) break :blk isStringLikeConstraintCandidate(T);
+                break :blk isNumberLikeConstraintCandidate(T);
+            }
+            const has_c_vars = comptime (@hasDecl(Constraint, "zigar_js") and @hasField(@TypeOf(Constraint.zigar_js), "variants"));
+            inline for (cun.field_types, 0..) |cf_ty, ci| {
+                if (cf_ty != void) {
+                    if (satisfiesTypeConstraint(T, cf_ty, depth + 1)) break :blk true;
+                } else if (T == void) {
+                    const is_ul = has_c_vars and ci < Constraint.zigar_js.variants.len and
+                        @hasField(@TypeOf(Constraint.zigar_js.variants[ci]), "is_unit_literal") and
+                        Constraint.zigar_js.variants[ci].is_unit_literal;
+                    if (!is_ul) break :blk true;
+                }
+            }
+            if (@typeInfo(T) == .@"enum") {
+                const ten = @typeInfo(T).@"enum";
+                if (ten.field_names.len > 0) {
+                    var all_ok = true;
+                    inline for (ten.field_names) |tf_name| {
+                        const tw = comptime enumMemberWireName(T, tf_name);
+                        if (!unitLiteralSatisfiesConstraint(.{ .str_value = tw }, Constraint, depth + 1)) {
+                            all_ok = false;
+                            break;
+                        }
+                    }
+                    if (all_ok) break :blk true;
+                }
+            }
+            break :blk false;
+        },
+        .@"struct" => |cst| blk: {
+            // `Record<string, V>` / `Map<K, V>` constraint: any struct / object / map / handle satisfies object-record constraints.
+            if (comptime ((@hasDecl(Constraint, "is_js_map") and Constraint.is_js_map) or
+                (@hasDecl(Constraint, "is_js_record") and Constraint.is_js_record)))
+            {
+                break :blk @typeInfo(T) == .@"struct";
+            }
+            if (comptime (@hasDecl(Constraint, "is_js_set") and Constraint.is_js_set)) {
+                if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_set") and T.is_js_set)) {
+                    const TElem = if (@hasDecl(T, "Elem")) T.Elem else T.Element;
+                    const CElem = if (@hasDecl(Constraint, "Elem")) Constraint.Elem else Constraint.Element;
+                    break :blk satisfiesTypeConstraint(TElem, CElem, depth + 1);
+                }
+                break :blk false;
+            }
+            // `Promise<U>` constraint: accept `Promise<X>` where `X` satisfies `U`, or structural `then` handle.
+            if (comptime (@hasDecl(Constraint, "is_js_promise") and Constraint.is_js_promise)) {
+                if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_promise") and T.is_js_promise)) {
+                    if (comptime (@hasDecl(T, "Payload") and @hasDecl(Constraint, "Payload"))) {
+                        break :blk satisfiesTypeConstraint(T.Payload, Constraint.Payload, depth + 1);
+                    }
+                    break :blk true;
+                }
+                break :blk structProvidesMember(T, "then");
+            }
+            // Tuple constraint (`zigar_js_tuple`): check fixed array or tuple struct.
+            if (comptime @hasDecl(Constraint, "zigar_js_tuple")) {
+                if (@typeInfo(T) != .@"struct" and @typeInfo(T) != .array) break :blk false;
+                break :blk true;
+            }
+            // Nominal JS class (`is_handle && is_class`) or structural handle interface:
+            if (comptime isGeneratedHandleStruct(Constraint)) {
+                if (structDerivesFrom(T, Constraint, 0)) break :blk true;
+                const is_nom_class = comptime (@hasField(@TypeOf(Constraint.zigar_js), "is_class") and Constraint.zigar_js.is_class);
+                if (is_nom_class) {
+                    const has_priv = comptime ((@hasField(@TypeOf(Constraint.zigar_js), "has_private_constructor") and Constraint.zigar_js.has_private_constructor) or
+                        (@hasField(@TypeOf(Constraint.zigar_js), "has_non_public_members") and Constraint.zigar_js.has_non_public_members));
+                    if (has_priv or !isGeneratedHandleStruct(T)) break :blk false;
+                    if (comptime @hasField(@TypeOf(Constraint.zigar_js), "fields")) {
+                        inline for (@typeInfo(@TypeOf(Constraint.zigar_js.fields)).@"struct".field_names) |mf_name| {
+                            const entry = @field(Constraint.zigar_js.fields, mf_name);
+                            const opt = comptime (@hasField(@TypeOf(entry), "is_optional") and entry.is_optional);
+                            if (!opt and !structProvidesMember(T, entry.js_name)) break :blk false;
+                        }
+                    }
+                    if (comptime @hasField(@TypeOf(Constraint.zigar_js), "methods")) {
+                        inline for (@typeInfo(@TypeOf(Constraint.zigar_js.methods)).@"struct".field_names) |mf_name| {
+                            const entry = @field(Constraint.zigar_js.methods, mf_name);
+                            const is_stat = comptime (@hasField(@TypeOf(entry), "is_static") and entry.is_static);
+                            if (!is_stat and !structProvidesMember(T, entry.js_name)) break :blk false;
+                        }
+                    }
+                    break :blk true;
+                }
+                if (@typeInfo(T) != .@"struct") break :blk false;
+                if (isJsObjectConstraintMarker(T)) break :blk true;
+                if (comptime @hasField(@TypeOf(Constraint.zigar_js), "required_methods")) {
+                    inline for (Constraint.zigar_js.required_methods) |rm| {
+                        if (!structProvidesMember(T, rm)) break :blk false;
+                    }
+                }
+                if (comptime @hasField(@TypeOf(Constraint.zigar_js), "required_props")) {
+                    inline for (Constraint.zigar_js.required_props) |rp| {
+                        if (!structProvidesMember(T, rp)) break :blk false;
+                    }
+                }
+                break :blk true;
+            }
+            // Plain value struct constraint (`T extends HasId`):
+            if (@typeInfo(T) != .@"struct") break :blk false;
+            if (isJsObjectConstraintMarker(T)) break :blk true;
+            inline for (cst.field_names, 0..) |cf_name, cf_idx| {
+                if (comptime isHiddenMetaField(cf_name)) continue;
+                const cf_ty = cst.field_types[cf_idx];
+                const cf_attr = cst.field_attrs[cf_idx];
+                const is_opt = comptime (cf_attr.default_value_ptr != null or @typeInfo(cf_ty) == .optional or isModuleNullableType(cf_ty));
+                if (!is_opt) {
+                    const wire = comptime topStructFieldWireName(Constraint, cf_name);
+                    if (comptime lookupStructFieldType(T, cf_name, wire)) |tf_ty| {
+                        if (!satisfiesTypeConstraint(tf_ty, cf_ty, depth + 1)) break :blk false;
+                    } else if (comptime (isGeneratedHandleStruct(T) and structProvidesMember(T, wire))) {
+                        // Handle struct exposes this property via getter/accessor.
+                    } else {
+                        break :blk false;
+                    }
+                }
+            }
+            break :blk true;
+        },
+        else => true,
+    };
+}
+
+/// Enforces TypeScript `T extends Constraint` at Zig `comptime` with a clear diagnostic.
+pub fn checkTypeConstraint(comptime T: type, comptime Constraint: type) void {
+    if (!comptime satisfiesTypeConstraint(T, Constraint, 0)) {
+        @compileError("zigar.js: type '" ++ @typeName(T) ++ "' does not satisfy TypeScript constraint '" ++ @typeName(Constraint) ++ "'");
+    }
+}
+
 fn isCallbackWrapper(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .@"struct" => @hasDecl(T, "is_zig_callback") and T.is_zig_callback,
@@ -815,6 +2900,37 @@ pub fn Js(comptime host: type) type {
         pub const TemplatePlaceholderKind = module.TemplatePlaceholderKind;
         pub const matchTemplatePattern = module.matchTemplatePattern;
         pub const coerceUnion = module.coerceUnion;
+        pub const Partial = module.Partial;
+        pub const Required = module.Required;
+        pub const Readonly = module.Readonly;
+        pub const Pick = module.Pick;
+        pub const Omit = module.Omit;
+        pub const EnumRecord = module.EnumRecord;
+        pub fn MappedValues(comptime T: type, comptime V: type) type {
+            return module.MappedValuesSpecWithFallback(Record, T, V, .auto);
+        }
+        pub fn MappedValuesSpec(comptime T: type, comptime V: type, comptime v_spec: anytype) type {
+            return module.MappedValuesSpecWithFallback(Record, T, V, v_spec);
+        }
+        pub const NonNullable = module.NonNullable;
+        pub const Awaited = module.Awaited;
+        pub const KeyOf = module.KeyOf;
+        pub fn IndexAccess(comptime T: type, comptime keys_spec: anytype) type {
+            return module.IndexAccessWithFallback(Ref(module.Any), T, keys_spec);
+        }
+        pub fn InferJsType(comptime Arg: type) type {
+            return module.InferJsTypeWithFallback(Ref(module.Any), Arg);
+        }
+        pub fn InferConstJsType(comptime Arg: type) type {
+            return module.InferConstJsTypeWithFallback(Ref(module.Any), Arg);
+        }
+        pub const isConstArrayPtr = module.isConstArrayPtr;
+        pub const InferSliceElem = module.InferSliceElem;
+        pub fn InferOptionalChild(comptime Opt: type) type {
+            return module.InferOptionalChildWithFallback(Ref(module.Any), Opt);
+        }
+        pub const satisfiesTypeConstraint = module.satisfiesTypeConstraint;
+        pub const checkTypeConstraint = module.checkTypeConstraint;
 
         pub const reserved_undefined_handle = module.reserved_undefined_handle;
         pub const reserved_null_handle = module.reserved_null_handle;
@@ -2029,7 +4145,7 @@ pub fn Js(comptime host: type) type {
             return switch (@typeInfo(T)) {
                 .optional => true,
                 .@"struct" => |st| blk: {
-                    if (isTupleStructType(T) or @hasDecl(T, "zigar_js")) break :blk true;
+                    if (isTupleStructType(T) or module.hasStructZigarJsMeta(T)) break :blk true;
                     for (st.field_types) |ft| {
                         if (typeUsesTsZigarCallbackCodec(ft, depth + 1)) break :blk true;
                     }
@@ -2037,6 +4153,9 @@ pub fn Js(comptime host: type) type {
                 },
                 .@"union" => |un| blk: {
                     if (@hasDecl(T, "zigar_js")) break :blk true;
+                    if (un.field_names.len >= 2 and std.mem.eql(u8, un.field_names[0], "v0") and std.mem.eql(u8, un.field_names[1], "v1")) {
+                        break :blk true;
+                    }
                     for (un.field_types) |ft| {
                         if (typeUsesTsZigarCallbackCodec(ft, depth + 1)) break :blk true;
                     }
@@ -2082,6 +4201,12 @@ pub fn Js(comptime host: type) type {
                     },
                     .one => if (@typeInfo(pt.child) != .@"fn") valueContainsHandle(pt.child, value.*, target_handle) else false,
                     else => false,
+                },
+                .array => |ar| blk: {
+                    for (value) |elem| {
+                        if (valueContainsHandle(ar.child, elem, target_handle)) break :blk true;
+                    }
+                    break :blk false;
                 },
                 else => false,
             };
@@ -4452,6 +6577,7 @@ pub fn Js(comptime host: type) type {
             return extern struct {
                 const Self = @This();
                 pub const Element = T;
+                pub const Elem = T;
                 pub const is_js_array = true;
                 pub const internal_type: util.InternalType = .js_value;
 
@@ -4617,6 +6743,7 @@ pub fn Js(comptime host: type) type {
                 pub const Key = K;
                 pub const Value = V;
                 pub const Entry = struct { K, V };
+                pub const is_js_map = true;
                 pub const js_builtin_ctor = "Map";
                 pub const internal_type: util.InternalType = .js_value;
 
@@ -4754,6 +6881,8 @@ pub fn Js(comptime host: type) type {
             return extern struct {
                 const Self = @This();
                 pub const Element = T;
+                pub const Elem = T;
+                pub const is_js_set = true;
                 pub const js_builtin_ctor = "Set";
                 pub const internal_type: util.InternalType = .js_value;
 
@@ -4854,6 +6983,9 @@ pub fn Js(comptime host: type) type {
         }
 
         pub fn Record(comptime K: type, comptime V: type) type {
+            if (@typeInfo(K) == .@"enum" and @typeInfo(K).@"enum".mode == .exhaustive) {
+                return module.EnumRecord(K, V);
+            }
             return extern struct {
                 const Self = @This();
                 pub const Key = K;
@@ -4981,6 +7113,7 @@ pub fn Js(comptime host: type) type {
         pub const BigInt = extern struct {
             const Self = @This();
             pub const internal_type: util.InternalType = .js_value;
+            pub const is_js_bigint = true;
 
             handle: u32,
 
@@ -5293,6 +7426,7 @@ pub fn Js(comptime host: type) type {
         pub const String = extern struct {
             const Self = @This();
             pub const internal_type: util.InternalType = .js_value;
+            pub const is_js_string = true;
 
             handle: u32,
 
@@ -5442,6 +7576,7 @@ pub fn Js(comptime host: type) type {
                     else => false,
                 },
                 .optional => |op| needsDecodeAllocatorInner(op.child, next_seen),
+                .array => |ar| needsDecodeAllocatorInner(ar.child, next_seen),
                 .@"union" => |un| blk: {
                     if (isNullableType(T)) {
                         break :blk needsDecodeAllocatorInner(T.Value, next_seen);
@@ -5492,6 +7627,11 @@ pub fn Js(comptime host: type) type {
                 .optional => |op| {
                     if (value) |v| {
                         freeDecoded(op.child, allocator, v);
+                    }
+                },
+                .array => |ar| {
+                    for (value) |elem| {
+                        freeDecoded(ar.child, allocator, elem);
                     }
                 },
                 .@"union" => {
@@ -5567,8 +7707,8 @@ pub fn Js(comptime host: type) type {
         }
 
         fn structFieldWireName(comptime T: type, comptime field_name: []const u8) []const u8 {
-            if (@hasDecl(T, "zigar_js")) {
-                const meta = T.zigar_js;
+            if (module.hasStructZigarJsMeta(T)) {
+                const meta = module.getStructZigarJsMeta(T);
                 if (@hasField(@TypeOf(meta), "fields")) {
                     inline for (meta.fields) |fm| {
                         if (std.mem.eql(u8, fm.name, field_name)) {
@@ -5584,8 +7724,8 @@ pub fn Js(comptime host: type) type {
         fn structFieldIsOptional(comptime T: type, comptime field_idx: usize) bool {
             const st = @typeInfo(T).@"struct";
             const field_name = st.field_names[field_idx];
-            if (@hasDecl(T, "zigar_js")) {
-                const meta = T.zigar_js;
+            if (module.hasStructZigarJsMeta(T)) {
+                const meta = module.getStructZigarJsMeta(T);
                 if (@hasField(@TypeOf(meta), "fields")) {
                     inline for (meta.fields) |fm| {
                         if (std.mem.eql(u8, fm.name, field_name)) {
@@ -5612,14 +7752,15 @@ pub fn Js(comptime host: type) type {
         fn structHasWireField(comptime T: type, comptime wire_target: []const u8) bool {
             const st = @typeInfo(T).@"struct";
             inline for (st.field_names) |fname| {
+                if (comptime module.isHiddenMetaField(fname)) continue;
                 if (std.mem.eql(u8, structFieldWireName(T, fname), wire_target)) return true;
             }
             return false;
         }
 
         fn structFieldHasConstraint(comptime T: type, comptime field_name: []const u8) bool {
-            if (!@hasDecl(T, "zigar_js")) return false;
-            const meta = T.zigar_js;
+            if (!module.hasStructZigarJsMeta(T)) return false;
+            const meta = module.getStructZigarJsMeta(T);
             if (!@hasField(@TypeOf(meta), "fields")) return false;
             inline for (meta.fields) |fm| {
                 if (std.mem.eql(u8, fm.name, field_name)) {
@@ -5636,8 +7777,8 @@ pub fn Js(comptime host: type) type {
         }
 
         fn structFieldDisallowsNull(comptime T: type, comptime field_name: []const u8) bool {
-            if (!@hasDecl(T, "zigar_js")) return false;
-            const meta = T.zigar_js;
+            if (!module.hasStructZigarJsMeta(T)) return false;
+            const meta = module.getStructZigarJsMeta(T);
             if (!@hasField(@TypeOf(meta), "fields")) return false;
             inline for (meta.fields) |fm| {
                 if (std.mem.eql(u8, fm.name, field_name)) {
@@ -5720,7 +7861,8 @@ pub fn Js(comptime host: type) type {
                     else => true,
                 };
             }
-            inline for (T.zigar_js.fields) |fm| {
+            const meta = module.getStructZigarJsMeta(T);
+            inline for (meta.fields) |fm| {
                 if (comptime std.mem.eql(u8, fm.name, field_name)) {
                     return validateConcreteFieldConstraint(fm, val);
                 }
@@ -6486,6 +8628,7 @@ pub fn Js(comptime host: type) type {
                         }
                     }
                     inline for (st.field_names, 0..) |fname, fi| {
+                        if (comptime module.isHiddenMetaField(fname)) continue;
                         const ftype = st.field_types[fi];
                         const fval = @field(value, fname);
                         if (!(try validateStructFieldConstraint(T, fname, fval))) return error.TypeError;
@@ -6500,11 +8643,14 @@ pub fn Js(comptime host: type) type {
                                     }
                                 }
                             }
-                            if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "fields")) {
-                                for (T.zigar_js.fields) |fm| {
-                                    if (std.mem.eql(u8, fm.name, fname)) {
-                                        if (@hasField(@TypeOf(fm), "nullish")) break :blk fm.nullish;
-                                        break;
+                            if (module.hasStructZigarJsMeta(T)) {
+                                const meta = module.getStructZigarJsMeta(T);
+                                if (@hasField(@TypeOf(meta), "fields")) {
+                                    for (meta.fields) |fm| {
+                                        if (std.mem.eql(u8, fm.name, fname)) {
+                                            if (@hasField(@TypeOf(fm), "nullish")) break :blk fm.nullish;
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -6578,6 +8724,22 @@ pub fn Js(comptime host: type) type {
                         }
                     }
                     unreachable;
+                },
+                .array => |ar| {
+                    const elem_spec = comptime blk: {
+                        if (@typeInfo(@TypeOf(spec)) == .@"struct" and @hasField(@TypeOf(spec), "elem")) {
+                            break :blk spec.elem;
+                        }
+                        break :blk module.NullishKind.none;
+                    };
+                    const js_arr = try Array(Ref(module.Any)).withCapacity(ar.len);
+                    errdefer js_arr.deinit();
+                    for (value, 0..) |elem, idx| {
+                        const elem_ref = try toJsRefWithSpecImpl(ar.child, elem, elem_spec, next_stack);
+                        defer elem_ref.deinit();
+                        try js_arr.set(idx, elem_ref);
+                    }
+                    return .{ .handle = js_arr.handle };
                 },
                 else => @compileError("Unsupported Zig type for JS conversion: " ++ @typeName(T)),
             }
@@ -6959,6 +9121,10 @@ pub fn Js(comptime host: type) type {
                         }
                     }
                     inline for (st.field_names, 0..) |fname, fi| {
+                        if (comptime module.isHiddenMetaField(fname)) {
+                            @field(out, fname) = .{};
+                            continue;
+                        }
                         const ftype = st.field_types[fi];
                         const wire_key = comptime structFieldWireName(T, fname);
                         const prop_ref = try getProp(module.CallError!Ref(module.Any), obj, wire_key);
@@ -7045,8 +9211,8 @@ pub fn Js(comptime host: type) type {
                     if (jt == .string) {
                         const max_tag_len = comptime blk: {
                             var ml: usize = 0;
-                            for (en_info.fields) |ef| {
-                                if (ef.name.len > ml) ml = ef.name.len;
+                            for (en_info.field_names) |fname| {
+                                if (fname.len > ml) ml = fname.len;
                             }
                             break :blk ml;
                         };
@@ -7102,6 +9268,25 @@ pub fn Js(comptime host: type) type {
                         }
                     }
                     return error.TypeError;
+                },
+                .array => |ar| {
+                    if (!(try Array(Ref(module.Any)).isArray(raw))) return error.TypeError;
+                    const arr = Array(Ref(module.Any)).fromRef(raw);
+                    const count = try arr.len();
+                    if (count != ar.len) return error.TypeError;
+                    var out: T = undefined;
+                    var initialized: usize = 0;
+                    errdefer {
+                        for (out[0..initialized]) |elem| {
+                            freeDecoded(ar.child, allocator, elem);
+                        }
+                    }
+                    while (initialized < ar.len) : (initialized += 1) {
+                        const elem_ref = try arr.get(initialized);
+                        defer elem_ref.deinit();
+                        out[initialized] = try fromJsRefAlloc(ar.child, allocator, elem_ref);
+                    }
+                    return out;
                 },
                 else => @compileError("Unsupported Zig type for JS decode: " ++ @typeName(T)),
             }
@@ -7213,20 +9398,29 @@ pub fn Js(comptime host: type) type {
         }
 
         fn structWireNameForField(comptime T: type, comptime zig_field_name: []const u8) []const u8 {
-            if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "fields")) {
-                for (T.zigar_js.fields) |fm| {
-                    const fm_zig = if (@hasField(@TypeOf(fm), "zig_name")) fm.zig_name else fm.name;
-                    if (std.mem.eql(u8, fm_zig, zig_field_name)) return fm.name;
+            if (module.hasStructZigarJsMeta(T)) {
+                const meta = module.getStructZigarJsMeta(T);
+                if (@hasField(@TypeOf(meta), "fields")) {
+                    for (meta.fields) |fm| {
+                        const fm_zig = if (@hasField(@TypeOf(fm), "zig_name")) fm.zig_name else fm.name;
+                        if (std.mem.eql(u8, fm_zig, zig_field_name)) {
+                            return if (@hasField(@TypeOf(fm), "js_name")) fm.js_name else fm.name;
+                        }
+                    }
                 }
             }
             return zig_field_name;
         }
 
         fn findStructFieldByWireName(comptime T: type, comptime wire_name: []const u8) ?[]const u8 {
-            if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "fields")) {
-                for (T.zigar_js.fields) |fm| {
-                    if (std.mem.eql(u8, fm.name, wire_name)) {
-                        return if (@hasField(@TypeOf(fm), "zig_name")) fm.zig_name else fm.name;
+            if (module.hasStructZigarJsMeta(T)) {
+                const meta = module.getStructZigarJsMeta(T);
+                if (@hasField(@TypeOf(meta), "fields")) {
+                    for (meta.fields) |fm| {
+                        const fm_wire = if (@hasField(@TypeOf(fm), "js_name")) fm.js_name else fm.name;
+                        if (std.mem.eql(u8, fm_wire, wire_name)) {
+                            return if (@hasField(@TypeOf(fm), "zig_name")) fm.zig_name else fm.name;
+                        }
                     }
                 }
             }
@@ -7276,6 +9470,10 @@ pub fn Js(comptime host: type) type {
                 var out_s: DstT = undefined;
                 const dst_info = @typeInfo(DstT).@"struct";
                 inline for (dst_info.field_names, 0..) |df_name, dfi| {
+                    if (comptime module.isHiddenMetaField(df_name)) {
+                        @field(out_s, df_name) = .{};
+                        continue;
+                    }
                     const FieldT = dst_info.field_types[dfi];
                     const wire = comptime structWireNameForField(DstT, df_name);
                     if (comptime findStructFieldByWireName(SrcT, wire)) |src_fname| {
@@ -10370,6 +12568,383 @@ test "Js.String, Nullable(T), needsDecodeAllocator, and tuple/slice marshaling h
         try expect(!echo_frame.retval.isUndefined());
         echo_frame.retval.deinit();
         echo_cb.deinit();
+
+        // 9. M3.3b: Comptime utility type transformers (`Partial`, `Required`, `Readonly`, `Pick`, `Omit`,
+        //    enum-keyed `Record`, `NonNullable`, `Awaited`, `KeyOf`, `IndexAccess`) + wire metadata preservation
+        const PlainCfg = struct {
+            host: []const u8,
+            port: i32,
+            tls: ?bool = null,
+        };
+        const PickedPlain = js.Pick(PlainCfg, &.{ "host", "port" });
+        try expectEqual(@as(usize, 2), @typeInfo(PickedPlain).@"struct".field_names.len);
+        const OmittedPlain = js.Omit(PlainCfg, .tls);
+        try expectEqual(@as(usize, 2), @typeInfo(OmittedPlain).@"struct".field_names.len);
+        const PartialPlain = js.Partial(PlainCfg);
+        const pp_val: PartialPlain = .{ .port = 8080 };
+        try expectEqual(@as(?[]const u8, null), pp_val.host);
+        try expectEqual(@as(?i32, 8080), pp_val.port);
+        const ReqPlain = js.Required(PlainCfg);
+        const rp_val: ReqPlain = .{ .host = "localhost", .port = 443, .tls = true };
+        try expect(rp_val.tls);
+        try expect(js.Readonly([]u8) == []const u8);
+        try expect(js.NonNullable(?js.Nullable(i32)) == i32);
+        try expect(js.Awaited(js.Promise(js.Promise([]const u8))) == []const u8);
+        try expect(js.Awaited(i32) == i32);
+        try expect(js.IndexAccess([]const []const u8, f64) == []const u8);
+        try expect(js.IndexAccess(PlainCfg, "port") == i32);
+        try expect(js.IndexAccess(PlainCfg, .host) == []const u8);
+
+        const PlainKey = js.KeyOf(PlainCfg);
+        const pk_ref = try js.toJsRef(PlainKey, .port);
+        try expectEqual(PlainKey.port, try js.fromJsRefAlloc(PlainKey, alloc, pk_ref));
+        pk_ref.deinit();
+        const PlainRec = js.Record(PlainKey, ?i32);
+        const pr_val: PlainRec = .{ .host = null, .port = 8080, .tls = null };
+        try expectEqual(@as(?i32, null), pr_val.host);
+        try expectEqual(@as(?i32, 8080), pr_val.port);
+        const PartialPlainRec = js.Partial(PlainRec);
+        const p_pr_val: PartialPlainRec = .{ .port = 8080 };
+        try expectEqual(@as(?i32, null), p_pr_val.host);
+        try expectEqual(@as(?i32, 8080), p_pr_val.port);
+
+        const RoleEnum = enum {
+            admin,
+            content_type,
+            pub const zigar_js = .{
+                .is_enum = true,
+                .members = .{
+                    .{ .tag = "admin", .js_name = "admin", .str_value = "admin" },
+                    .{ .tag = "content_type", .js_name = "content-type", .str_value = "content-type" },
+                },
+            };
+        };
+        const RoleFlags = js.Record(RoleEnum, bool);
+        const rf_in: RoleFlags = .{ .admin = true, .content_type = false };
+        const rf_ref = try js.toJsRef(RoleFlags, rf_in);
+        const rf_raw = js.Record([]const u8, js.Ref(js.Any)).fromRef(rf_ref);
+        try expect(try rf_raw.has("content-type"));
+        try expect(!try rf_raw.has("content_type"));
+        const rf_out = try js.fromJsRefAlloc(RoleFlags, alloc, rf_ref);
+        rf_ref.deinit();
+        try expect(rf_out.admin);
+        try expect(!rf_out.content_type);
+
+        // Wire-renamed struct (`max_retries` <-> `"maxRetries"`) through `Partial`, `Pick`, `Omit`, `Required`, `KeyOf`
+        const WireConfig = struct {
+            host_name: []const u8,
+            max_retries: f64,
+            opt_mode: ?[]const u8 = null,
+            pub const zigar_js = .{
+                .fields = .{
+                    .{ .name = "host_name", .js_name = "hostName", .is_optional = false, .nullish = .none },
+                    .{ .name = "max_retries", .js_name = "maxRetries", .is_optional = false, .nullish = .none },
+                    .{ .name = "opt_mode", .js_name = "optMode", .is_optional = true, .nullish = .undefined_only },
+                },
+            };
+        };
+        try expect(js.IndexAccess(WireConfig, "maxRetries") == f64);
+        const WireKey = js.KeyOf(WireConfig);
+        const wk_ref = try js.toJsRef(WireKey, .maxRetries);
+        try expectEqual(WireKey.maxRetries, try js.fromJsRefAlloc(WireKey, alloc, wk_ref));
+        wk_ref.deinit();
+
+        const PartialWire = js.Partial(WireConfig);
+        const pw_ref = try js.toJsRef(PartialWire, .{ .max_retries = 3 });
+        const pw_raw = js.Record([]const u8, js.Ref(js.Any)).fromRef(pw_ref);
+        try expect(try pw_raw.has("maxRetries"));
+        try expect(!try pw_raw.has("hostName"));
+        try expect(!try pw_raw.has("__zigar_js_meta"));
+        const pw_out = try js.fromJsRefAlloc(PartialWire, alloc, pw_ref);
+        pw_ref.deinit();
+        try expectEqual(@as(?[]const u8, null), pw_out.host_name);
+        try expectEqual(@as(?f64, 3), pw_out.max_retries);
+        js.freeDecoded(PartialWire, alloc, pw_out);
+
+        const PickedWire = js.Pick(WireConfig, enum { hostName, optMode });
+        const ReqPicked = js.Required(PickedWire);
+        const rpw_ref = try js.toJsRef(ReqPicked, .{ .host_name = "db.internal", .opt_mode = "strict" });
+        const rpw_out = try js.fromJsRefAlloc(ReqPicked, alloc, rpw_ref);
+        rpw_ref.deinit();
+        try std.testing.expectEqualStrings("db.internal", rpw_out.host_name);
+        try std.testing.expectEqualStrings("strict", rpw_out.opt_mode);
+        js.freeDecoded(ReqPicked, alloc, rpw_out);
+
+        // Inference & comptime constraint verification (`InferJsType`, `InferSliceElem`, `InferOptionalChild`, `satisfiesTypeConstraint`)
+        try expect(js.InferJsType(@TypeOf("hello")) == []const u8);
+        try expect(js.InferJsType(@TypeOf(42)) == f64);
+        try expect(js.InferJsType(@TypeOf(&[_]i32{ 1, 2 })) == []const i32);
+        try expect(js.InferConstJsType(@TypeOf("hello")) == []const u8);
+        try expect(js.InferConstJsType(@TypeOf(&[_]i32{ 1, 2 })) == [2]i32);
+        try expect(!js.isConstArrayPtr(@TypeOf("hello")));
+        try expect(js.isConstArrayPtr(@TypeOf(&[_]i32{ 1, 2 })));
+        try expect(!js.isConstArrayPtr([2]i32));
+
+        // Fixed-length `[N]Elem` tuple array JS round-trip (`const T` deduced arrays)
+        const fixed_in: [2][]const u8 = .{ "alpha", "beta" };
+        const fixed_ref = try js.toJsRef([2][]const u8, fixed_in);
+        const fixed_out = try js.fromJsRefAlloc([2][]const u8, alloc, fixed_ref);
+        fixed_ref.deinit();
+        try std.testing.expectEqualStrings("alpha", fixed_out[0]);
+        try std.testing.expectEqualStrings("beta", fixed_out[1]);
+        js.freeDecoded([2][]const u8, alloc, fixed_out);
+
+        const short_arr_ref = try js.toJsRef([]const []const u8, &.{"only-one"});
+        try std.testing.expectError(error.TypeError, js.fromJsRefAlloc([2][]const u8, alloc, short_arr_ref));
+        short_arr_ref.deinit();
+        try expect(js.InferSliceElem([]const []const u8) == []const u8);
+        try expect(js.InferSliceElem(@TypeOf(&[_]i32{ 10, 20 })) == i32);
+        try expect(js.InferOptionalChild(?[]const u8) == []const u8);
+        try expect(js.InferOptionalChild(@TypeOf("direct")) == []const u8);
+        try expect(js.InferOptionalChild(@TypeOf(null)) == js.Ref(js.Any));
+
+        const HasId = struct { id: f64, tag: ?[]const u8 = null };
+        try expect(js.satisfiesTypeConstraint(struct { id: f64, extra: bool }, HasId, 0));
+        try expect(js.satisfiesTypeConstraint(struct { id: i32 }, HasId, 0));
+        try expect(!js.satisfiesTypeConstraint(struct { extra: bool }, HasId, 0));
+        try expect(js.satisfiesTypeConstraint(enum { hostName, maxRetries }, js.KeyOf(WireConfig), 0));
+        try expect(!js.satisfiesTypeConstraint(enum { missingKey }, js.KeyOf(WireConfig), 0));
+        try expect(js.satisfiesTypeConstraint([]const u8, []const u8, 0));
+        try expect(js.satisfiesTypeConstraint(js.String, []const u8, 0));
+        try expect(!js.satisfiesTypeConstraint(f64, []const u8, 0));
+        try expect(js.satisfiesTypeConstraint(HasId, js.Ref(js.Object), 0));
+        try expect(!js.satisfiesTypeConstraint(f64, js.Ref(js.Object), 0));
+        try expect(js.satisfiesTypeConstraint(HasId, js.Record([]const u8, js.Ref(js.Any)), 0));
+
+        // Structural union-to-union & unit-literal constraint satisfaction (`(A | B) extends (A | B | C)`)
+        const UnionAB1 = union(enum) { str: []const u8, item: HasId };
+        const UnionAB2 = union(enum) { str: []const u8, item: HasId };
+        const UnionBad = union(enum) { str: []const u8, flag: bool };
+        try expect(js.satisfiesTypeConstraint(UnionAB1, UnionAB2, 0));
+        try expect(!js.satisfiesTypeConstraint(UnionBad, UnionAB2, 0));
+
+        const UnitConstraint = union(enum) {
+            auto,
+            code_200,
+            obj: HasId,
+            pub const zigar_js = .{
+                .variants = .{
+                    .{ .tag = "auto", .js_name = "auto", .is_unit_literal = true, .str_value = "auto" },
+                    .{ .tag = "code_200", .js_name = "200", .is_unit_literal = true, .num_value = @as(f64, 200) },
+                    .{ .tag = "obj", .js_name = "obj" },
+                },
+            };
+        };
+        const UnitSame = union(enum) {
+            auto,
+            code_200,
+            pub const zigar_js = .{
+                .variants = .{
+                    .{ .tag = "auto", .js_name = "auto", .is_unit_literal = true, .str_value = "auto" },
+                    .{ .tag = "code_200", .js_name = "200", .is_unit_literal = true, .num_value = @as(f64, 200) },
+                },
+            };
+        };
+        const UnitWrong = union(enum) {
+            manual,
+            pub const zigar_js = .{
+                .variants = .{
+                    .{ .tag = "manual", .js_name = "manual", .is_unit_literal = true, .str_value = "manual" },
+                },
+            };
+        };
+        try expect(js.satisfiesTypeConstraint(UnitSame, UnitConstraint, 0));
+        try expect(!js.satisfiesTypeConstraint(UnitWrong, UnitConstraint, 0));
+        try expect(js.satisfiesTypeConstraint(enum { auto }, UnitConstraint, 0));
+        try expect(!js.satisfiesTypeConstraint(void, UnitConstraint, 0));
+
+        // `Required(T)` preserves `| null` and `: T | undefined` while removing `?` optionality
+        const NullishFields = struct {
+            a: ?[]const u8,
+            b: ?[]const u8 = null,
+            c: ?[]const u8,
+            d: ?[]const u8 = null,
+            pub const zigar_js = .{
+                .fields = .{
+                    .{ .name = "a", .js_name = "a", .is_optional = false, .nullish = .null_only },
+                    .{ .name = "b", .js_name = "b", .is_optional = true, .nullish = .null_or_undefined },
+                    .{ .name = "c", .js_name = "c", .is_optional = false, .nullish = .undefined_only },
+                    .{ .name = "d", .js_name = "d", .is_optional = true, .nullish = .undefined_only },
+                },
+            };
+        };
+        const ReqNul = js.Required(NullishFields);
+        try expect(@FieldType(ReqNul, "a") == ?[]const u8);
+        try expect(@FieldType(ReqNul, "b") == ?[]const u8);
+        try expect(@FieldType(ReqNul, "c") == ?[]const u8);
+        try expect(@FieldType(ReqNul, "d") == []const u8);
+        inline for (@typeInfo(ReqNul).@"struct".field_names, 0..) |fnm, fi| {
+            if (comptime !isHiddenMetaField(fnm)) {
+                try expect(@typeInfo(ReqNul).@"struct".field_attrs[fi].default_value_ptr == null);
+            }
+        }
+        const req_nul_in: ReqNul = .{ .a = null, .b = null, .c = null, .d = "req" };
+        const req_nul_ref = try js.toJsRef(ReqNul, req_nul_in);
+        const prop_a = try js.getProp(js.CallError!js.Ref(js.Any), req_nul_ref, "a");
+        const prop_b = try js.getProp(js.CallError!js.Ref(js.Any), req_nul_ref, "b");
+        const prop_c = try js.getProp(js.CallError!js.Ref(js.Any), req_nul_ref, "c");
+        try expect(prop_a.isNull() and !prop_a.isUndefined());
+        try expect(prop_b.isNull() and !prop_b.isUndefined());
+        try expect(prop_c.isUndefined() and !prop_c.isNull());
+        prop_a.deinit();
+        prop_b.deinit();
+        prop_c.deinit();
+        const req_nul_out = try js.fromJsRefAlloc(ReqNul, alloc, req_nul_ref);
+        req_nul_ref.deinit();
+        try expect(req_nul_out.a == null and req_nul_out.b == null and req_nul_out.c == null);
+        try std.testing.expectEqualStrings("req", req_nul_out.d);
+        js.freeDecoded(ReqNul, alloc, req_nul_out);
+
+        // `EnumRecord(K, ?V)` keeps every key required and serializes `null` as explicit JS `null` (not omitted)
+        const PlainNullableRec = js.EnumRecord(enum { a, b }, ?[]const u8);
+        inline for (@typeInfo(PlainNullableRec).@"struct".field_names, 0..) |fnm, fi| {
+            if (comptime !isHiddenMetaField(fnm)) {
+                try expect(@typeInfo(PlainNullableRec).@"struct".field_attrs[fi].default_value_ptr == null);
+            }
+        }
+        const rec_nul_in: PlainNullableRec = .{ .a = null, .b = "x" };
+        const rec_nul_ref = try js.toJsRef(PlainNullableRec, rec_nul_in);
+        const rec_prop_a = try js.getProp(js.CallError!js.Ref(js.Any), rec_nul_ref, "a");
+        try expect(rec_prop_a.isNull() and !rec_prop_a.isUndefined());
+        rec_prop_a.deinit();
+        const rec_nul_out = try js.fromJsRefAlloc(PlainNullableRec, alloc, rec_nul_ref);
+        rec_nul_ref.deinit();
+        try expect(rec_nul_out.a == null);
+        try std.testing.expectEqualStrings("x", rec_nul_out.b.?);
+        js.freeDecoded(PlainNullableRec, alloc, rec_nul_out);
+
+        // Numeric enum `Record<Dir, V>`, `Pick`, and `IndexAccess` use JS numeric runtime keys ("0", "1", "-1")
+        const NumDir = enum(i32) {
+            up = 0,
+            down = 1,
+            neg = -1,
+            pub const zigar_js = .{
+                .is_enum = true,
+                .members = .{
+                    .{ .tag = "up", .js_name = "Up", .num_value = @as(f64, 0) },
+                    .{ .tag = "down", .js_name = "Down", .num_value = @as(f64, 1) },
+                    .{ .tag = "neg", .js_name = "Neg", .num_value = @as(f64, -1) },
+                },
+            };
+        };
+        const NumDirRec = js.Record(NumDir, []const u8);
+        try expect(@hasField(NumDirRec, "0") and @hasField(NumDirRec, "1") and @hasField(NumDirRec, "1_2"));
+        const nd_in: NumDirRec = .{ .@"0" = "north", .@"1" = "south", .@"1_2" = "west" };
+        const nd_ref = try js.toJsRef(NumDirRec, nd_in);
+        const nd_p0 = try js.getProp(js.CallError!js.String, nd_ref, "0");
+        const nd_p1 = try js.getProp(js.CallError!js.String, nd_ref, "1");
+        const nd_pn = try js.getProp(js.CallError!js.String, nd_ref, "-1");
+        const nd_s0 = try nd_p0.toSliceAlloc(alloc);
+        defer alloc.free(nd_s0);
+        const nd_s1 = try nd_p1.toSliceAlloc(alloc);
+        defer alloc.free(nd_s1);
+        const nd_sn = try nd_pn.toSliceAlloc(alloc);
+        defer alloc.free(nd_sn);
+        nd_p0.deinit();
+        nd_p1.deinit();
+        nd_pn.deinit();
+        try std.testing.expectEqualStrings("north", nd_s0);
+        try std.testing.expectEqualStrings("south", nd_s1);
+        try std.testing.expectEqualStrings("west", nd_sn);
+        const nd_out = try js.fromJsRefAlloc(NumDirRec, alloc, nd_ref);
+        nd_ref.deinit();
+        try std.testing.expectEqualStrings("north", nd_out.@"0");
+        try std.testing.expectEqualStrings("south", nd_out.@"1");
+        try std.testing.expectEqualStrings("west", nd_out.@"1_2");
+        js.freeDecoded(NumDirRec, alloc, nd_out);
+        try expect(js.IndexAccess(NumDirRec, NumDir) == []const u8);
+        try expect(js.IndexAccess(NumDirRec, 0) == []const u8);
+        try expect(js.IndexAccess(NumDirRec, NumDir.up) == []const u8);
+        try expect(js.IndexAccess(NumDirRec, -1) == []const u8);
+        const PickedNumDir = js.Pick(NumDirRec, enum(i32) {
+            up = 0,
+            pub const zigar_js = .{
+                .is_enum = true,
+                .members = .{.{ .tag = "up", .js_name = "Up", .num_value = @as(f64, 0) }},
+            };
+        });
+        try expect(@hasField(PickedNumDir, "0") and !@hasField(PickedNumDir, "1"));
+
+        // Wire-first disambiguation when snake-cased `"-1"` (`@"1"`) collides with `"1"` (`@"1_2"`)
+        const SignedDistinct = struct {
+            @"1": []const u8,
+            @"1_2": f64,
+            host: bool,
+            pub const zigar_js = .{
+                .fields = .{
+                    .{ .name = "1", .js_name = "-1", .is_optional = false, .nullish = .none },
+                    .{ .name = "1_2", .js_name = "1", .is_optional = false, .nullish = .none },
+                    .{ .name = "host", .js_name = "host", .is_optional = false, .nullish = .none },
+                },
+            };
+        };
+        try expect(js.IndexAccess(SignedDistinct, 1) == f64);
+        try expect(js.IndexAccess(SignedDistinct, -1) == []const u8);
+        const PickPosOne = js.Pick(SignedDistinct, 1);
+        try expect(@hasField(PickPosOne, "1_2") and !@hasField(PickPosOne, "1"));
+        const NumericIndexed = js.IndexAccess(SignedDistinct, f64);
+        try expect(@typeInfo(NumericIndexed) == .@"union" and @typeInfo(NumericIndexed).@"union".field_types.len == 2);
+
+        // Mixed unit-literal union key spec (`0 | "host"`) in `Pick` and `IndexAccess`
+        const MixedKeyUnion = union(enum) {
+            num_1,
+            str_host,
+            pub const zigar_js = .{
+                .variants = .{
+                    .{ .tag = "num_1", .js_name = "1", .is_unit_literal = true, .num_value = @as(f64, 1) },
+                    .{ .tag = "str_host", .js_name = "host", .is_unit_literal = true, .str_value = "host" },
+                },
+            };
+        };
+        const PickMixed = js.Pick(SignedDistinct, MixedKeyUnion);
+        try expect(@hasField(PickMixed, "1_2") and @hasField(PickMixed, "host") and !@hasField(PickMixed, "1"));
+
+        // Homomorphic `MappedValues(T, V)` (`{ [P in keyof T]: V }`) preserves optionality and wire names
+        const WireFlags = js.MappedValues(WireConfig, bool);
+        try expect(@FieldType(WireFlags, "host_name") == bool);
+        try expect(@FieldType(WireFlags, "max_retries") == bool);
+        try expect(@FieldType(WireFlags, "opt_mode") == ?bool);
+        const wf_ref = try js.toJsRef(WireFlags, .{ .host_name = true, .max_retries = false });
+        const wf_raw = js.Record([]const u8, js.Ref(js.Any)).fromRef(wf_ref);
+        try expect(try wf_raw.has("hostName"));
+        try expect(try wf_raw.has("maxRetries"));
+        try expect(!try wf_raw.has("optMode"));
+        const wf_out = try js.fromJsRefAlloc(WireFlags, alloc, wf_ref);
+        try expect(wf_out.host_name and !wf_out.max_retries and wf_out.opt_mode == null);
+        // Whereas `Required(WireFlags)` (`{ [P in keyof T]-?: boolean }`) requires `optMode` (`error.TypeError` when omitted)
+        const ReqWireFlags = js.Required(WireFlags);
+        try expect(@FieldType(ReqWireFlags, "opt_mode") == bool);
+        try std.testing.expectError(error.TypeError, js.fromJsRefAlloc(ReqWireFlags, alloc, wf_ref));
+        wf_ref.deinit();
+
+        const OptWireFlags = js.Partial(WireFlags);
+        const owf_val: OptWireFlags = .{ .host_name = true };
+        try expectEqual(@as(?bool, true), owf_val.host_name);
+        try expectEqual(@as(?bool, null), owf_val.max_retries);
+
+        const ReqNullableWire = js.Required(js.MappedValues(WireConfig, ?[]const u8));
+        try expect(@FieldType(ReqNullableWire, "opt_mode") == ?[]const u8);
+        inline for (@typeInfo(ReqNullableWire).@"struct".field_names, 0..) |fnm, fi| {
+            if (comptime !isHiddenMetaField(fnm)) {
+                try expect(@typeInfo(ReqNullableWire).@"struct".field_attrs[fi].default_value_ptr == null);
+            }
+        }
+        const rnw_ref = try js.toJsRef(ReqNullableWire, .{ .host_name = "h", .max_retries = null, .opt_mode = null });
+        const rnw_opt = try js.getProp(js.CallError!js.Ref(js.Any), rnw_ref, "optMode");
+        try expect(rnw_opt.isNull() and !rnw_opt.isUndefined());
+        rnw_opt.deinit();
+        rnw_ref.deinit();
+
+        // Homomorphic `MappedValues` on slices, fixed arrays, tuples, and primitives
+        try expect(js.MappedValues([]const f64, bool) == []const bool);
+        try expect(js.MappedValues([]f64, bool) == []bool);
+        try expect(js.MappedValues([3]f64, bool) == [3]bool);
+        try expect(js.MappedValues(struct { f64, []const u8 }, bool) == [2]bool);
+        try expect(js.MappedValues([]const u8, bool) == []const u8);
+        try expect(js.MappedValues(f64, bool) == f64);
+        try expect(js.MappedValues(js.BigInt, bool) == js.BigInt);
+        try expect(js.IndexAccess(js.Array(f64), 0) == f64);
+        comptime js.checkTypeConstraint(js.BigInt, i64);
     }
     try expectEqual(@as(u32, 0), js.activeHandleCount());
 }
