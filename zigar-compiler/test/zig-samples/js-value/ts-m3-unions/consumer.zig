@@ -385,11 +385,16 @@ pub fn exerciseHeteroRecursiveAndGenericUnions(out_alloc: std.mem.Allocator) ![]
         if (!std.mem.eql(u8, soa5_desc, "thenable:object:true")) return std.fmt.allocPrint(out_alloc, "fail:soa5_desc:{s}", .{soa5_desc});
 
         // `{ then: "not-a-function" }` MUST be rejected for `PromiseLike<number>` without leaking handles
-        if (m.badPromiseLikeReturn()) |bad_p| {
-            bad_p.deinit();
+        if (m.badPromiseLikeReturn()) |_| {
             return out_alloc.dupe(u8, "fail:bad_promise_accepted");
         } else |err| {
             if (err != error.TypeError) return out_alloc.dupe(u8, "fail:bad_promise_wrong_err");
+        }
+        if (m.badPromiseLikeReturnPromise()) |bad_p| {
+            bad_p.deinit();
+            return out_alloc.dupe(u8, "fail:bad_promise_comp_accepted");
+        } else |err| {
+            if (err != error.TypeError) return out_alloc.dupe(u8, "fail:bad_promise_comp_wrong_err");
         }
     }
 

@@ -1711,6 +1711,18 @@ const ModuleEmitCtx = struct {
                 try self.emitType(inner);
                 try self.out.append(self.allocator, ')');
             },
+            .js_disposable => try self.out.appendSlice(self.allocator, "__zigar_js.Disposable"),
+            .js_async_disposable => try self.out.appendSlice(self.allocator, "__zigar_js.AsyncDisposable"),
+            .js_iterator => |inner| {
+                try self.out.appendSlice(self.allocator, "__zigar_js.Iterator(");
+                try self.emitType(inner);
+                try self.out.append(self.allocator, ')');
+            },
+            .js_async_iterator => |inner| {
+                try self.out.appendSlice(self.allocator, "__zigar_js.AsyncIterator(");
+                try self.emitType(inner);
+                try self.out.append(self.allocator, ')');
+            },
             .js_map => |m| {
                 try self.out.appendSlice(self.allocator, "__zigar_js.Map(");
                 try self.emitType(m.key);
@@ -2551,6 +2563,11 @@ const ModuleEmitCtx = struct {
                             "__zigar_js.Awaited(@TypeOf({s}))",
                             .{sig.params[b.param_index].zig_ident},
                         ),
+                        .iterator_elem => try std.fmt.allocPrint(
+                            self.allocator,
+                            "__zigar_js.InferIteratorElem(@TypeOf({s}))",
+                            .{sig.params[b.param_index].zig_ident},
+                        ),
                         .optional_child => blk: {
                             const p_ident = sig.params[b.param_index].zig_ident;
                             if (tp.default_type) |dt| {
@@ -2903,6 +2920,32 @@ const ModuleEmitCtx = struct {
         }
     }
 
+    fn emitAwaitPromiseTail(
+        self: *ModuleEmitCtx,
+        alloc_ident_opt: ?[]const u8,
+    ) error{OutOfMemory}!void {
+        try self.out.appendSlice(self.allocator, "defer __zigar_prom.deinit();\n");
+        if (alloc_ident_opt) |alloc_param| {
+            try self.out.print(self.allocator, "return __zigar_prom.awaitAlloc({s});\n", .{alloc_param});
+        } else {
+            try self.out.appendSlice(self.allocator, "return __zigar_prom.@\"await\"();\n");
+        }
+    }
+
+    fn emitPromiseWrappedRetExpr(
+        self: *ModuleEmitCtx,
+        sig: ir.SignatureIr,
+        ret_type_expr_opt: ?[]const u8,
+    ) error{OutOfMemory}!void {
+        try self.out.appendSlice(self.allocator, "__zigar_js.Promise(");
+        if (ret_type_expr_opt) |rtexpr| {
+            try self.out.appendSlice(self.allocator, rtexpr);
+        } else {
+            try self.emitType(sig.return_type);
+        }
+        try self.out.append(self.allocator, ')');
+    }
+
     fn emitCallableFunctionBody(
         self: *ModuleEmitCtx,
         d: ir.DeclIr,
@@ -2913,6 +2956,26 @@ const ModuleEmitCtx = struct {
         is_default_call: bool,
     ) !void {
         try self.emitPackedArgsPrologue(sig, is_slice_companion);
+
+        if (sig.awaits_promise) {
+            if (sig.this_param) |thp| {
+                try self.out.appendSlice(self.allocator, "const __zigar_prom = try __zigar_js.invokeTargetWithThis(");
+                try self.emitPromiseWrappedRetExpr(sig, ret_type_expr_opt);
+                try self.out.appendSlice(self.allocator, ", ");
+                try self.emitCallTargetLiteral(d.is_global_scope, d.wire_name, is_default_call, null);
+                try self.out.print(self.allocator, ", {s}, ", .{thp.zig_ident});
+                try self.emitNullishSpec(thp.ty, false);
+                try self.out.appendSlice(self.allocator, ", __zigar_args);\n");
+            } else {
+                try self.out.appendSlice(self.allocator, "const __zigar_prom = try __zigar_js.invokeTarget(");
+                try self.emitPromiseWrappedRetExpr(sig, ret_type_expr_opt);
+                try self.out.appendSlice(self.allocator, ", ");
+                try self.emitCallTargetLiteral(d.is_global_scope, d.wire_name, is_default_call, null);
+                try self.out.appendSlice(self.allocator, ", __zigar_args);\n");
+            }
+            try self.emitAwaitPromiseTail(alloc_ident_opt);
+            return;
+        }
 
         if (sig.this_param) |thp| {
             if (alloc_ident_opt) |alloc_param| {
@@ -3285,6 +3348,58 @@ const ModuleEmitCtx = struct {
     ) error{OutOfMemory}!void {
         const sig = m.signature;
         try self.emitPackedArgsPrologue(sig, is_slice_companion);
+
+        if (sig.awaits_promise) {
+            if (m.is_static) {
+                if (sig.this_param) |thp| {
+                    try self.out.appendSlice(self.allocator, "const __zigar_prom = try __zigar_js.invokeTargetWithThis(");
+                    try self.emitPromiseWrappedRetExpr(sig, ret_type_expr_opt);
+                    try self.out.appendSlice(self.allocator, ", ");
+                    try self.emitCallTargetLiteral(is_global_scope, m.wire_name, false, if (push_owner_seg) wire_name else null);
+                    try self.out.print(self.allocator, ", {s}, ", .{thp.zig_ident});
+                    try self.emitNullishSpec(thp.ty, false);
+                    try self.out.appendSlice(self.allocator, ", __zigar_args);\n");
+                } else {
+                    try self.out.appendSlice(self.allocator, "const __zigar_prom = try __zigar_js.invokeTarget(");
+                    try self.emitPromiseWrappedRetExpr(sig, ret_type_expr_opt);
+                    try self.out.appendSlice(self.allocator, ", ");
+                    try self.emitCallTargetLiteral(is_global_scope, m.wire_name, false, if (push_owner_seg) wire_name else null);
+                    try self.out.appendSlice(self.allocator, ", __zigar_args);\n");
+                }
+                try self.emitAwaitPromiseTail(alloc_ident_opt);
+                return;
+            }
+
+            switch (m.call_kind) {
+                .method => {
+                    try self.out.appendSlice(self.allocator, "const __zigar_prom = try __zigar_js.invokeMethod(");
+                    try self.emitPromiseWrappedRetExpr(sig, ret_type_expr_opt);
+                    try self.out.print(self.allocator, ", {s}.{s}, ", .{ recv_ident, st.ref_field_ident });
+                    try self.emitStringLit(m.wire_name);
+                    try self.out.appendSlice(self.allocator, ", __zigar_args);\n");
+                },
+                .call_sig => {
+                    if (sig.this_param) |thp| {
+                        try self.out.appendSlice(self.allocator, "const __zigar_prom = try __zigar_js.invokeCallableWithThis(");
+                        try self.emitPromiseWrappedRetExpr(sig, ret_type_expr_opt);
+                        try self.out.print(self.allocator, ", {s}.{s}, {s}, ", .{ recv_ident, st.ref_field_ident, thp.zig_ident });
+                        try self.emitNullishSpec(thp.ty, false);
+                        try self.out.appendSlice(self.allocator, ", __zigar_args);\n");
+                    } else {
+                        try self.out.appendSlice(self.allocator, "const __zigar_prom = try __zigar_js.invokeCallable(");
+                        try self.emitPromiseWrappedRetExpr(sig, ret_type_expr_opt);
+                        try self.out.print(self.allocator, ", {s}.{s}, __zigar_args);\n", .{ recv_ident, st.ref_field_ident });
+                    }
+                },
+                .construct_sig => {
+                    try self.out.appendSlice(self.allocator, "const __zigar_prom = try __zigar_js.constructCallable(");
+                    try self.emitPromiseWrappedRetExpr(sig, ret_type_expr_opt);
+                    try self.out.print(self.allocator, ", {s}.{s}, __zigar_args);\n", .{ recv_ident, st.ref_field_ident });
+                },
+            }
+            try self.emitAwaitPromiseTail(alloc_ident_opt);
+            return;
+        }
 
         if (m.is_static) {
             if (sig.this_param) |thp| {
@@ -3933,6 +4048,12 @@ const ModuleEmitCtx = struct {
         if (st.to_js_ref_ident) |ti| try frame_list.append(self.allocator, ti);
         if (st.from_js_ref_ident) |fi_id| try frame_list.append(self.allocator, fi_id);
         if (st.from_js_ref_alloc_ident) |fai_id| try frame_list.append(self.allocator, fai_id);
+        if (st.iterator_ident) |ii| try frame_list.append(self.allocator, ii);
+        if (st.async_iterator_ident) |aii| try frame_list.append(self.allocator, aii);
+        if (st.dispose_ident) |dpi| try frame_list.append(self.allocator, dpi);
+        if (st.try_dispose_ident) |tdpi| try frame_list.append(self.allocator, tdpi);
+        if (st.async_dispose_ident) |adpi| try frame_list.append(self.allocator, adpi);
+        if (st.try_async_dispose_ident) |tadpi| try frame_list.append(self.allocator, tadpi);
         for (st.merged_call_fns) |cf| {
             try appendDeclIdentsToScopeFrame(&frame_list, self.allocator, cf);
         }
@@ -4044,12 +4165,131 @@ const ModuleEmitCtx = struct {
             try self.emitStructIndexAccessor(st, ia);
         }
 
+        var shared_iter_elem_expr_opt: ?[]u8 = null;
+        defer if (shared_iter_elem_expr_opt) |buf| self.allocator.free(buf);
+        if (st.iterator_elem_ty) |elem_ty| {
+            if (typeHasInlineNominal(elem_ty)) {
+                shared_iter_elem_expr_opt = try self.emitSharedNominalTypeExpr(elem_ty, .{
+                    .type_params = &.{},
+                    .self_param_ident = st.self_param_ident,
+                    .alloc_param_ident = null,
+                    .params = &.{},
+                    .return_type = elem_ty,
+                    .has_type_predicate = false,
+                    .type_predicate_asserts = false,
+                    .jsdoc = null,
+                });
+            }
+        }
+
+        var shared_async_iter_elem_expr_opt: ?[]u8 = null;
+        defer if (shared_async_iter_elem_expr_opt) |buf| self.allocator.free(buf);
+        if (st.async_iterator_elem_ty) |elem_ty| {
+            if (typeHasInlineNominal(elem_ty)) {
+                shared_async_iter_elem_expr_opt = try self.emitSharedNominalTypeExpr(elem_ty, .{
+                    .type_params = &.{},
+                    .self_param_ident = st.self_param_ident,
+                    .alloc_param_ident = null,
+                    .params = &.{},
+                    .return_type = elem_ty,
+                    .has_type_predicate = false,
+                    .type_predicate_asserts = false,
+                    .jsdoc = null,
+                });
+            }
+        }
+
         if (st.repr == .handle_wrapper) {
             if (st.deinit_ident) |di| {
+                if (st.has_sync_dispose) {
+                    try self.out.print(
+                        self.allocator,
+                        "pub fn {s}({s}: {s}) void {{\n__zigar_js.dispose({s});\n}}\n",
+                        .{ di, st.self_param_ident, st.self_ident, st.self_param_ident },
+                    );
+                } else {
+                    try self.out.print(
+                        self.allocator,
+                        "pub fn {s}({s}: {s}) void {{\n{s}.{s}.deinit();\n}}\n",
+                        .{ di, st.self_param_ident, st.self_ident, st.self_param_ident, st.ref_field_ident },
+                    );
+                }
+            }
+            if (st.release_handle_only_ident) |rho| {
                 try self.out.print(
                     self.allocator,
                     "pub fn {s}({s}: {s}) void {{\n{s}.{s}.deinit();\n}}\n",
-                    .{ di, st.self_param_ident, st.self_ident, st.self_param_ident, st.ref_field_ident },
+                    .{ rho, st.self_param_ident, st.self_ident, st.self_param_ident, st.ref_field_ident },
+                );
+            }
+            if (st.iterator_ident) |ii| {
+                if (st.iterator_elem_ty) |elem_ty| {
+                    try self.out.print(
+                        self.allocator,
+                        "pub fn {s}({s}: {s}) __zigar_js.CallError!__zigar_js.Iterator(",
+                        .{ ii, st.self_param_ident, st.self_ident },
+                    );
+                    if (shared_iter_elem_expr_opt) |sexpr| {
+                        try self.out.appendSlice(self.allocator, sexpr);
+                    } else {
+                        try self.emitType(elem_ty);
+                    }
+                    try self.out.appendSlice(self.allocator, ") {\nreturn __zigar_js.openIterator(");
+                    if (shared_iter_elem_expr_opt) |sexpr| {
+                        try self.out.appendSlice(self.allocator, sexpr);
+                    } else {
+                        try self.emitType(elem_ty);
+                    }
+                    try self.out.print(self.allocator, ", {s});\n}}\n", .{st.self_param_ident});
+                }
+            }
+            if (st.async_iterator_ident) |aii| {
+                if (st.async_iterator_elem_ty) |elem_ty| {
+                    try self.out.print(
+                        self.allocator,
+                        "pub fn {s}({s}: {s}) __zigar_js.CallError!__zigar_js.AsyncIterator(",
+                        .{ aii, st.self_param_ident, st.self_ident },
+                    );
+                    if (shared_async_iter_elem_expr_opt) |sexpr| {
+                        try self.out.appendSlice(self.allocator, sexpr);
+                    } else {
+                        try self.emitType(elem_ty);
+                    }
+                    try self.out.appendSlice(self.allocator, ") {\nreturn __zigar_js.openAsyncIterator(");
+                    if (shared_async_iter_elem_expr_opt) |sexpr| {
+                        try self.out.appendSlice(self.allocator, sexpr);
+                    } else {
+                        try self.emitType(elem_ty);
+                    }
+                    try self.out.print(self.allocator, ", {s});\n}}\n", .{st.self_param_ident});
+                }
+            }
+            if (st.dispose_ident) |dpi| {
+                try self.out.print(
+                    self.allocator,
+                    "pub fn {s}({s}: {s}) void {{\n__zigar_js.dispose({s});\n}}\n",
+                    .{ dpi, st.self_param_ident, st.self_ident, st.self_param_ident },
+                );
+            }
+            if (st.try_dispose_ident) |tdpi| {
+                try self.out.print(
+                    self.allocator,
+                    "pub fn {s}({s}: {s}) __zigar_js.CallError!void {{\nreturn __zigar_js.tryDispose({s});\n}}\n",
+                    .{ tdpi, st.self_param_ident, st.self_ident, st.self_param_ident },
+                );
+            }
+            if (st.async_dispose_ident) |adpi| {
+                try self.out.print(
+                    self.allocator,
+                    "pub fn {s}({s}: {s}) void {{\n__zigar_js.asyncDispose({s});\n}}\n",
+                    .{ adpi, st.self_param_ident, st.self_ident, st.self_param_ident },
+                );
+            }
+            if (st.try_async_dispose_ident) |tadpi| {
+                try self.out.print(
+                    self.allocator,
+                    "pub fn {s}({s}: {s}) __zigar_js.CallError!void {{\nreturn __zigar_js.tryAsyncDispose({s});\n}}\n",
+                    .{ tadpi, st.self_param_ident, st.self_ident, st.self_param_ident },
                 );
             }
             if (st.clone_ident) |ci| {
@@ -4189,12 +4429,35 @@ const ModuleEmitCtx = struct {
         if (st.has_non_public_members) {
             try self.out.appendSlice(self.allocator, ",\n.has_non_public_members = true");
         }
+        if (st.iterator_elem_ty) |elem_ty| {
+            try self.out.appendSlice(self.allocator, ",\n.has_iterator = true,\n.iterator_elem = ");
+            if (shared_iter_elem_expr_opt) |sexpr| {
+                try self.out.appendSlice(self.allocator, sexpr);
+            } else {
+                try self.emitType(elem_ty);
+            }
+        }
+        if (st.async_iterator_elem_ty) |elem_ty| {
+            try self.out.appendSlice(self.allocator, ",\n.has_async_iterator = true,\n.async_iterator_elem = ");
+            if (shared_async_iter_elem_expr_opt) |sexpr| {
+                try self.out.appendSlice(self.allocator, sexpr);
+            } else {
+                try self.emitType(elem_ty);
+            }
+        }
+        if (st.has_sync_dispose) {
+            try self.out.appendSlice(self.allocator, ",\n.has_dispose = true");
+        }
+        if (st.has_async_dispose) {
+            try self.out.appendSlice(self.allocator, ",\n.has_async_dispose = true");
+        }
         try self.out.appendSlice(self.allocator, ",\n.fields = .{\n");
         for (st.fields) |f| {
             try self.emitFieldDescriptorEntry(f);
         }
         try self.out.appendSlice(self.allocator, "},\n.methods = .{\n");
         for (st.methods) |m| {
+            if (m.is_synthetic_companion) continue;
             try self.out.appendSlice(self.allocator, ".{ .name = ");
             try self.emitStringLit(m.logical_name);
             try self.out.appendSlice(self.allocator, ", .js_name = ");
@@ -4932,7 +5195,7 @@ fn typeHasInlineNominal(ty: *const ir.TypeIr) bool {
     return switch (ty.*) {
         .tuple, .anon_struct, .tagged_union, .inline_enum, .open_literal_union, .template_pattern => true,
         .optional => |opt| typeHasInlineNominal(opt.child),
-        .pointer_const, .slice, .promise => |inner| typeHasInlineNominal(inner),
+        .pointer_const, .slice, .promise, .js_iterator, .js_async_iterator => |inner| typeHasInlineNominal(inner),
         .js_map => |m| typeHasInlineNominal(m.key) or typeHasInlineNominal(m.value),
         .js_record => |r| typeHasInlineNominal(r.key) or typeHasInlineNominal(r.value),
         .mapped_values_op => |mv| typeHasInlineNominal(mv.target) or typeHasInlineNominal(mv.value),
@@ -4999,6 +5262,24 @@ fn classifyOverloadGenericParam(
                 }
             }
         },
+        .js_iterator => |it_ty| {
+            if (it_ty.* == .type_param_ref) {
+                for (tps, 0..) |tp, idx| {
+                    if (std.mem.eql(u8, tp.zig_ident, it_ty.type_param_ref)) {
+                        return .{ .tp_idx = idx, .mode = .iterator_elem };
+                    }
+                }
+            }
+        },
+        .js_async_iterator => |ait_ty| {
+            if (ait_ty.* == .type_param_ref) {
+                for (tps, 0..) |tp, idx| {
+                    if (std.mem.eql(u8, tp.zig_ident, ait_ty.type_param_ref)) {
+                        return .{ .tp_idx = idx, .mode = .async_iterator_elem };
+                    }
+                }
+            }
+        },
         else => {},
     }
     return .{};
@@ -5037,7 +5318,7 @@ fn typeUsesTypeParam(ty: *const ir.TypeIr, tp_ident: []const u8) bool {
     return switch (ty.*) {
         .type_param_ref => |ref_id| std.mem.eql(u8, ref_id, tp_ident),
         .optional => |opt| typeUsesTypeParam(opt.child, tp_ident),
-        .pointer_const, .slice, .promise => |inner| typeUsesTypeParam(inner, tp_ident),
+        .pointer_const, .slice, .promise, .js_iterator, .js_async_iterator => |inner| typeUsesTypeParam(inner, tp_ident),
         .js_map => |m| typeUsesTypeParam(m.key, tp_ident) or typeUsesTypeParam(m.value, tp_ident),
         .js_record => |r| typeUsesTypeParam(r.key, tp_ident) or typeUsesTypeParam(r.value, tp_ident),
         .mapped_values_op => |mv| typeUsesTypeParam(mv.target, tp_ident) or typeUsesTypeParam(mv.value, tp_ident),
@@ -5183,7 +5464,7 @@ fn renderRootRaw(
     if (barrel_mod) |bm| {
         for (bm.decls) |d| {
             const is_barrel_visible = d.is_exported and
-                (d.is_js_exported or (d.kind == .overload_dispatch and !d.is_global_scope));
+                (d.is_js_exported or d.is_synthetic_companion or (d.kind == .overload_dispatch and !d.is_global_scope));
             if (!is_barrel_visible) continue;
             if (!root_scope.isTaken(d.logical_name)) {
                 try root_scope.reserve(d.logical_name);
@@ -5195,6 +5476,11 @@ fn renderRootRaw(
                 d.slice_alloc_companion_ident,
                 d.narrow_companion_ident,
                 d.narrow_alloc_companion_ident,
+                d.default_companion_ident,
+                d.default_alloc_companion_ident,
+                d.with_companion_ident,
+                d.infer_companion_ident,
+                d.infer_alloc_companion_ident,
             };
             for (companions) |comp_opt| {
                 if (comp_opt) |ci| {
@@ -5622,6 +5908,26 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\        }
         \\
         \\        pub fn deinit(_: Self) void {}
+        \\
+        \\        pub fn @"await"(_: Self) CallError!T {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub const wait = @"await";
+        \\
+        \\        pub fn awaitAlloc(_: Self, _: std.mem.Allocator) CallError!T {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub const waitAlloc = awaitAlloc;
+        \\
+        \\        pub fn resolve(_: anytype) CallError!Self {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn resolveVoid() CallError!StubPromise(void) {
+        \\            return error.HostUnavailable;
+        \\        }
         \\    };
         \\}
         \\
@@ -5728,10 +6034,96 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    };
         \\}
         \\
+        \\pub const StubDisposable = extern struct {
+        \\    const Self = @This();
+        \\    pub const is_js_disposable = true;
+        \\    pub const is_js_value = true;
+        \\
+        \\    handle: u32 = 0,
+        \\
+        \\    pub const @"undefined": Self = .{ .handle = 0 };
+        \\    pub const @"null": Self = .{ .handle = 1 };
+        \\
+        \\    pub fn clone(self: Self) Self {
+        \\        return self;
+        \\    }
+        \\
+        \\    pub fn tryClone(self: Self) Error!Self {
+        \\        return self;
+        \\    }
+        \\
+        \\    pub fn dispose(_: Self) void {}
+        \\
+        \\    pub fn tryDispose(_: Self) Error!void {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn deinit(_: Self) void {}
+        \\
+        \\    pub fn tryDeinit(_: Self) Error!void {}
+        \\
+        \\    pub fn releaseHandleOnly(_: Self) void {}
+        \\
+        \\    pub fn ref(self: Self) Any {
+        \\        return .{ .handle = self.handle };
+        \\    }
+        \\
+        \\    pub fn toRef(self: Self) Any {
+        \\        return .{ .handle = self.handle };
+        \\    }
+        \\
+        \\    pub fn fromRef(v: anytype) Self {
+        \\        return .{ .handle = v.handle };
+        \\    }
+        \\};
+        \\
+        \\pub const StubAsyncDisposable = extern struct {
+        \\    const Self = @This();
+        \\    pub const is_js_async_disposable = true;
+        \\    pub const is_js_value = true;
+        \\
+        \\    handle: u32 = 0,
+        \\
+        \\    pub const @"undefined": Self = .{ .handle = 0 };
+        \\    pub const @"null": Self = .{ .handle = 1 };
+        \\
+        \\    pub fn clone(self: Self) Self {
+        \\        return self;
+        \\    }
+        \\
+        \\    pub fn tryClone(self: Self) Error!Self {
+        \\        return self;
+        \\    }
+        \\
+        \\    pub fn asyncDispose(_: Self) void {}
+        \\
+        \\    pub fn tryAsyncDispose(_: Self) Error!void {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn deinit(_: Self) void {}
+        \\
+        \\    pub fn tryDeinit(_: Self) Error!void {}
+        \\
+        \\    pub fn ref(self: Self) Any {
+        \\        return .{ .handle = self.handle };
+        \\    }
+        \\
+        \\    pub fn toRef(self: Self) Any {
+        \\        return .{ .handle = self.handle };
+        \\    }
+        \\
+        \\    pub fn fromRef(v: anytype) Self {
+        \\        return .{ .handle = v.handle };
+        \\    }
+        \\};
+        \\
         \\pub fn StubIterator(comptime T: type) type {
         \\    return extern struct {
         \\        const Self = @This();
+        \\        pub const Element = T;
         \\        pub const Elem = T;
+        \\        pub const is_js_iterator = true;
         \\        pub const is_js_value = true;
         \\
         \\        handle: u32 = 0,
@@ -5741,13 +6133,41 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\        }
         \\
         \\        pub fn deinit(_: Self) void {}
+        \\
+        \\        pub fn from(_: anytype) CallError!Self {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn next(_: Self) CallError!?T {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn nextAlloc(_: Self, _: std.mem.Allocator) CallError!?T {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn returnEarly(_: Self) CallError!void {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub const close = returnEarly;
+        \\
+        \\        pub fn toRef(self: Self) Any {
+        \\            return .{ .handle = self.handle };
+        \\        }
+        \\
+        \\        pub fn fromRef(v: anytype) Self {
+        \\            return .{ .handle = v.handle };
+        \\        }
         \\    };
         \\}
         \\
         \\pub fn StubAsyncIterator(comptime T: type) type {
         \\    return extern struct {
         \\        const Self = @This();
+        \\        pub const Element = T;
         \\        pub const Elem = T;
+        \\        pub const is_js_async_iterator = true;
         \\        pub const is_js_value = true;
         \\
         \\        handle: u32 = 0,
@@ -5757,6 +6177,32 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\        }
         \\
         \\        pub fn deinit(_: Self) void {}
+        \\
+        \\        pub fn from(_: anytype) CallError!Self {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn next(_: Self) CallError!?T {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn nextAlloc(_: Self, _: std.mem.Allocator) CallError!?T {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn returnEarly(_: Self) CallError!void {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub const close = returnEarly;
+        \\
+        \\        pub fn toRef(self: Self) Any {
+        \\            return .{ .handle = self.handle };
+        \\        }
+        \\
+        \\        pub fn fromRef(v: anytype) Self {
+        \\            return .{ .handle = v.handle };
+        \\        }
         \\    };
         \\}
         \\
@@ -5794,7 +6240,10 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\pub const Record = if (has_host) raw_js.Record else StubRecord;
         \\pub const Iterator = if (has_host) raw_js.Iterator else StubIterator;
         \\pub const AsyncIterator = if (has_host) raw_js.AsyncIterator else StubAsyncIterator;
+        \\pub const Disposable = if (has_host) raw_js.Disposable else StubDisposable;
+        \\pub const AsyncDisposable = if (has_host) raw_js.AsyncDisposable else StubAsyncDisposable;
         \\pub const JsException = if (has_host) raw_js.JsException else StubJsException;
+        \\pub const PromiseAllResult = if (has_host) raw_js.PromiseAllResult else standalonePromiseAllResult;
         \\pub const Partial = if (has_host) raw_js.Partial else standalonePartial;
         \\pub const Required = if (has_host) raw_js.Required else standaloneRequired;
         \\pub const Readonly = if (has_host) raw_js.Readonly else standaloneReadonly;
@@ -5811,6 +6260,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\pub const InferConstJsType = if (has_host) raw_js.InferConstJsType else standaloneInferConstJsType;
         \\pub const isConstArrayPtr = if (has_host) raw_js.isConstArrayPtr else standaloneIsConstArrayPtr;
         \\pub const InferSliceElem = if (has_host) raw_js.InferSliceElem else standaloneInferSliceElem;
+        \\pub const InferIteratorElem = if (has_host) raw_js.InferIteratorElem else standaloneInferIteratorElem;
         \\pub const InferOptionalChild = if (has_host) raw_js.InferOptionalChild else standaloneInferOptionalChild;
         \\pub const satisfiesTypeConstraint = if (has_host) raw_js.satisfiesTypeConstraint else standaloneSatisfiesTypeConstraint;
         \\pub const checkTypeConstraint = if (has_host) raw_js.checkTypeConstraint else standaloneCheckTypeConstraint;
@@ -5820,9 +6270,19 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    return 0;
         \\}
         \\
+        \\pub fn tryLastError() Error!?JsException {
+        \\    if (has_host) return raw_js.tryLastError();
+        \\    return error.HostUnavailable;
+        \\}
+        \\
         \\pub fn lastError() ?JsException {
         \\    if (has_host) return raw_js.lastError();
         \\    return null;
+        \\}
+        \\
+        \\pub fn tryTakeLastError() Error!?JsException {
+        \\    if (has_host) return raw_js.tryTakeLastError();
+        \\    return error.HostUnavailable;
         \\}
         \\
         \\pub fn takeLastError() ?JsException {
@@ -5837,6 +6297,44 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\
         \\pub fn clearLastError() void {
         \\    if (has_host) raw_js.clearLastError();
+        \\}
+        \\
+        \\pub fn dispose(resource: anytype) void {
+        \\    if (has_host) raw_js.dispose(resource);
+        \\}
+        \\
+        \\pub fn tryDispose(resource: anytype) CallError!void {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    return try raw_js.tryDispose(resource);
+        \\}
+        \\
+        \\pub fn asyncDispose(resource: anytype) void {
+        \\    if (has_host) raw_js.asyncDispose(resource);
+        \\}
+        \\
+        \\pub fn tryAsyncDispose(resource: anytype) CallError!void {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    return try raw_js.tryAsyncDispose(resource);
+        \\}
+        \\
+        \\pub fn openIterator(comptime ElemT: type, target: anytype) CallError!Iterator(ElemT) {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    return try raw_js.openIterator(ElemT, target);
+        \\}
+        \\
+        \\pub fn openAsyncIterator(comptime ElemT: type, target: anytype) CallError!AsyncIterator(ElemT) {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    return try raw_js.openAsyncIterator(ElemT, target);
+        \\}
+        \\
+        \\pub fn promiseAll(promises: anytype) CallError!PromiseAllResult(@TypeOf(promises)) {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    return try raw_js.promiseAll(promises);
+        \\}
+        \\
+        \\pub fn promiseAllAlloc(allocator: std.mem.Allocator, promises: anytype) CallError!PromiseAllResult(@TypeOf(promises)) {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    return try raw_js.promiseAllAlloc(allocator, promises);
         \\}
         \\
         \\pub fn symbolFor(key: []const u8) CallError!Symbol {
@@ -8033,6 +8531,29 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\            ArgT.Payload
         \\        else
         \\            null,
+        \\        .iterator_elem => switch (@typeInfo(ArgT)) {
+        \\            .@"struct" => if ((@hasDecl(ArgT, "is_js_iterator") and ArgT.is_js_iterator) or
+        \\                (@hasDecl(ArgT, "is_js_array") and ArgT.is_js_array) or
+        \\                (@hasDecl(ArgT, "is_js_set") and ArgT.is_js_set))
+        \\                (if (@hasDecl(ArgT, "Elem")) ArgT.Elem else ArgT.Element)
+        \\            else
+        \\                standaloneStructProtocolElemType(ArgT, "iterator_elem", 0),
+        \\            .pointer => |p| if (p.size == .slice)
+        \\                (if (p.child == comptime_int or p.child == comptime_float) f64 else p.child)
+        \\            else if (p.size == .one and @typeInfo(p.child) == .array) blk_itp: {
+        \\                const el = @typeInfo(p.child).array.child;
+        \\                break :blk_itp if (el == comptime_int or el == comptime_float) f64 else el;
+        \\            } else null,
+        \\            .array => |a| if (a.child == comptime_int or a.child == comptime_float) f64 else a.child,
+        \\            else => null,
+        \\        },
+        \\        .async_iterator_elem => if (@typeInfo(ArgT) == .@"struct")
+        \\            (if (@hasDecl(ArgT, "is_js_async_iterator") and ArgT.is_js_async_iterator)
+        \\                (if (@hasDecl(ArgT, "Elem")) ArgT.Elem else ArgT.Element)
+        \\            else
+        \\                standaloneStructProtocolElemType(ArgT, "async_iterator_elem", 0))
+        \\        else
+        \\            null,
         \\        else => null,
         \\    };
         \\}
@@ -8107,6 +8628,8 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                            .optional_child => if (@typeInfo(TpT) == .optional) TpT else ?TpT,
         \\                            .slice_elem => []const TpT,
         \\                            .promise_payload => Promise(TpT),
+        \\                            .iterator_elem => Iterator(TpT),
+        \\                            .async_iterator_elem => AsyncIterator(TpT),
         \\                            else => TpT,
         \\                        };
         \\                        switch (argMatchTier(ExpectedT, ArgT, arg_attr)) {
@@ -9737,7 +10260,45 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    return @Union(.auto, Tag, &names_fin, &types_fin, &attrs_fin);
         \\}
         \\
+        \\fn standalonePromisePayloadOf(comptime P: type) type {
+        \\    if (@typeInfo(P) == .@"struct" and @hasDecl(P, "is_js_promise") and P.is_js_promise and @hasDecl(P, "Payload")) {
+        \\        return P.Payload;
+        \\    }
+        \\    @compileError("Expected a js.Promise(T) type in promiseAll, received " ++ @typeName(P));
+        \\}
+        \\
+        \\pub fn standalonePromiseAllResult(comptime PromisesT: type) type {
+        \\    return switch (@typeInfo(PromisesT)) {
+        \\        .@"struct" => |st| blk: {
+        \\            comptime var payloads: [st.field_types.len]type = undefined;
+        \\            for (st.field_types, 0..) |FT, i| {
+        \\                payloads[i] = standalonePromisePayloadOf(FT);
+        \\            }
+        \\            break :blk @Tuple(&payloads);
+        \\        },
+        \\        .array => |ar| [ar.len]standalonePromisePayloadOf(ar.child),
+        \\        .pointer => |pt| switch (pt.size) {
+        \\            .slice => []standalonePromisePayloadOf(pt.child),
+        \\            .one => if (@typeInfo(pt.child) == .array)
+        \\                [@typeInfo(pt.child).array.len]standalonePromisePayloadOf(@typeInfo(pt.child).array.child)
+        \\            else
+        \\                @compileError("Unsupported pointer input to promiseAll: " ++ @typeName(PromisesT)),
+        \\            else => @compileError("Unsupported pointer input to promiseAll: " ++ @typeName(PromisesT)),
+        \\        },
+        \\        else => @compileError("Expected tuple, array, or slice of js.Promise(T) in promiseAll, received " ++ @typeName(PromisesT)),
+        \\    };
+        \\}
+        \\
         \\pub fn standaloneAwaited(comptime T: type) type {
+        \\    if (@typeInfo(T) == .optional) {
+        \\        const Child = @typeInfo(T).optional.child;
+        \\        const Aw = standaloneAwaited(Child);
+        \\        return if (Aw == Child) T else ?Aw;
+        \\    }
+        \\    if (isModuleNullableType(T)) {
+        \\        const Aw = standaloneAwaited(T.Value);
+        \\        return if (Aw == T.Value) T else Nullable(Aw);
+        \\    }
         \\    if (@typeInfo(T) == .@"struct") {
         \\        if (@hasDecl(T, "is_js_promise") and T.is_js_promise and @hasDecl(T, "Payload")) {
         \\            return standaloneAwaited(T.Payload);
@@ -10064,6 +10625,26 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    };
         \\}
         \\
+        \\pub fn standaloneInferIteratorElem(comptime IterT: type) type {
+        \\    return switch (@typeInfo(IterT)) {
+        \\        .pointer, .array => standaloneInferSliceElem(IterT),
+        \\        .@"struct" => blk: {
+        \\            if ((@hasDecl(IterT, "is_js_iterator") and IterT.is_js_iterator) or
+        \\                (@hasDecl(IterT, "is_js_async_iterator") and IterT.is_js_async_iterator) or
+        \\                (@hasDecl(IterT, "is_js_array") and IterT.is_js_array) or
+        \\                (@hasDecl(IterT, "is_js_set") and IterT.is_js_set))
+        \\            {
+        \\                break :blk if (@hasDecl(IterT, "Elem")) IterT.Elem else IterT.Element;
+        \\            }
+        \\            if (standaloneStructProtocolElemType(IterT, "iterator_elem", 0)) |et| break :blk et;
+        \\            if (standaloneStructProtocolElemType(IterT, "async_iterator_elem", 0)) |et| break :blk et;
+        \\            if (standaloneStructProtocolElemType(IterT, "set_elem", 0)) |et| break :blk et;
+        \\            @compileError("zigar.js: expected Iterator, AsyncIterator, Iterable, or slice argument for generic element inference, got " ++ @typeName(IterT));
+        \\        },
+        \\        else => @compileError("zigar.js: expected Iterator, AsyncIterator, Iterable, or slice argument for generic element inference, got " ++ @typeName(IterT)),
+        \\    };
+        \\}
+        \\
         \\pub fn standaloneInferOptionalChild(comptime Opt: type) type {
         \\    if (Opt == @TypeOf(null) or Opt == @TypeOf(undefined)) return Any;
         \\    return switch (@typeInfo(Opt)) {
@@ -10280,6 +10861,32 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    return false;
         \\}
         \\
+        \\fn standaloneStructHasProtocolFlag(comptime T: type, comptime flag_field: []const u8, comptime depth: usize) bool {
+        \\    if (depth >= 16 or @typeInfo(T) != .@"struct") return false;
+        \\    if (!isGeneratedHandleStruct(T)) return false;
+        \\    const MetaT = @TypeOf(T.zigar_js);
+        \\    if (@hasField(MetaT, flag_field) and @field(T.zigar_js, flag_field)) return true;
+        \\    if (@hasField(MetaT, "bases")) {
+        \\        inline for (T.zigar_js.bases) |BaseT| {
+        \\            if (standaloneStructHasProtocolFlag(BaseT, flag_field, depth + 1)) return true;
+        \\        }
+        \\    }
+        \\    return false;
+        \\}
+        \\
+        \\fn standaloneStructProtocolElemType(comptime T: type, comptime elem_field: []const u8, comptime depth: usize) ?type {
+        \\    if (depth >= 16 or @typeInfo(T) != .@"struct") return null;
+        \\    if (!isGeneratedHandleStruct(T)) return null;
+        \\    const MetaT = @TypeOf(T.zigar_js);
+        \\    if (@hasField(MetaT, elem_field)) return @field(T.zigar_js, elem_field);
+        \\    if (@hasField(MetaT, "bases")) {
+        \\        inline for (T.zigar_js.bases) |BaseT| {
+        \\            if (standaloneStructProtocolElemType(BaseT, elem_field, depth + 1)) |et| return et;
+        \\        }
+        \\    }
+        \\    return null;
+        \\}
+        \\
         \\pub fn standaloneSatisfiesTypeConstraint(comptime T: type, comptime Constraint: type, comptime depth: usize) bool {
         \\    @setEvalBranchQuota(200_000);
         \\    if (T == Constraint or T == noreturn) return true;
@@ -10378,6 +10985,10 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                    else
         \\                        false,
         \\                    .array => |tar| standaloneSatisfiesTypeConstraint(tar.child, cpt.child, depth + 1),
+        \\                    .@"struct" => if (@hasDecl(T, "is_js_array") and T.is_js_array) blk_arr: {
+        \\                        const TElem = if (@hasDecl(T, "Elem")) T.Elem else T.Element;
+        \\                        break :blk_arr standaloneSatisfiesTypeConstraint(TElem, cpt.child, depth + 1);
+        \\                    } else false,
         \\                    else => false,
         \\                };
         \\            }
@@ -10456,6 +11067,60 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                }
         \\                break :blk false;
         \\            }
+        \\            if (comptime (@hasDecl(Constraint, "is_js_disposable") and Constraint.is_js_disposable)) {
+        \\                if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_disposable") and T.is_js_disposable)) break :blk true;
+        \\                if (comptime standaloneStructHasProtocolFlag(T, "has_dispose", 0)) break :blk true;
+        \\                break :blk false;
+        \\            }
+        \\            if (comptime (@hasDecl(Constraint, "is_js_async_disposable") and Constraint.is_js_async_disposable)) {
+        \\                if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_async_disposable") and T.is_js_async_disposable)) break :blk true;
+        \\                if (comptime standaloneStructHasProtocolFlag(T, "has_async_dispose", 0)) break :blk true;
+        \\                break :blk false;
+        \\            }
+        \\            if (comptime (@hasDecl(Constraint, "is_js_iterator") and Constraint.is_js_iterator)) {
+        \\                const CElem = if (@hasDecl(Constraint, "Elem")) Constraint.Elem else Constraint.Element;
+        \\                if (comptime (@typeInfo(T) == .@"struct" and ((@hasDecl(T, "is_js_iterator") and T.is_js_iterator) or
+        \\                    (@hasDecl(T, "is_js_array") and T.is_js_array) or
+        \\                    (@hasDecl(T, "is_js_set") and T.is_js_set))))
+        \\                {
+        \\                    const TElem = if (@hasDecl(T, "Elem")) T.Elem else T.Element;
+        \\                    break :blk standaloneSatisfiesTypeConstraint(TElem, CElem, depth + 1);
+        \\                }
+        \\                if (comptime (@typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .slice)) {
+        \\                    const ChildT = @typeInfo(T).pointer.child;
+        \\                    if (ChildT == u8) {
+        \\                        break :blk standaloneSatisfiesTypeConstraint([]const u8, CElem, depth + 1) or standaloneSatisfiesTypeConstraint(u8, CElem, depth + 1);
+        \\                    }
+        \\                    break :blk standaloneSatisfiesTypeConstraint(ChildT, CElem, depth + 1);
+        \\                }
+        \\                if (comptime (@typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .one and @typeInfo(@typeInfo(T).pointer.child) == .array)) {
+        \\                    break :blk standaloneSatisfiesTypeConstraint(@typeInfo(@typeInfo(T).pointer.child).array.child, CElem, depth + 1);
+        \\                }
+        \\                if (comptime (@typeInfo(T) == .array)) {
+        \\                    break :blk standaloneSatisfiesTypeConstraint(@typeInfo(T).array.child, CElem, depth + 1);
+        \\                }
+        \\                if (comptime standaloneStructHasProtocolFlag(T, "has_iterator", 0)) {
+        \\                    if (comptime standaloneStructProtocolElemType(T, "iterator_elem", 0)) |te| {
+        \\                        break :blk standaloneSatisfiesTypeConstraint(te, CElem, depth + 1);
+        \\                    }
+        \\                    break :blk true;
+        \\                }
+        \\                break :blk false;
+        \\            }
+        \\            if (comptime (@hasDecl(Constraint, "is_js_async_iterator") and Constraint.is_js_async_iterator)) {
+        \\                const CElem = if (@hasDecl(Constraint, "Elem")) Constraint.Elem else Constraint.Element;
+        \\                if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_async_iterator") and T.is_js_async_iterator)) {
+        \\                    const TElem = if (@hasDecl(T, "Elem")) T.Elem else T.Element;
+        \\                    break :blk standaloneSatisfiesTypeConstraint(TElem, CElem, depth + 1);
+        \\                }
+        \\                if (comptime standaloneStructHasProtocolFlag(T, "has_async_iterator", 0)) {
+        \\                    if (comptime standaloneStructProtocolElemType(T, "async_iterator_elem", 0)) |te| {
+        \\                        break :blk standaloneSatisfiesTypeConstraint(te, CElem, depth + 1);
+        \\                    }
+        \\                    break :blk true;
+        \\                }
+        \\                break :blk false;
+        \\            }
         \\            if (comptime (@hasDecl(Constraint, "is_js_promise") and Constraint.is_js_promise)) {
         \\                if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "is_js_promise") and T.is_js_promise)) {
         \\                    if (comptime (@hasDecl(T, "Payload") and @hasDecl(Constraint, "Payload"))) {
@@ -10503,6 +11168,18 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                    inline for (Constraint.zigar_js.required_props) |rp| {
         \\                        if (!structProvidesMember(T, rp)) break :blk false;
         \\                    }
+        \\                }
+        \\                if (comptime standaloneStructHasProtocolFlag(Constraint, "has_dispose", 0)) {
+        \\                    if (!((@hasDecl(T, "is_js_disposable") and T.is_js_disposable) or standaloneStructHasProtocolFlag(T, "has_dispose", 0))) break :blk false;
+        \\                }
+        \\                if (comptime standaloneStructHasProtocolFlag(Constraint, "has_async_dispose", 0)) {
+        \\                    if (!((@hasDecl(T, "is_js_async_disposable") and T.is_js_async_disposable) or standaloneStructHasProtocolFlag(T, "has_async_dispose", 0))) break :blk false;
+        \\                }
+        \\                if (comptime standaloneStructHasProtocolFlag(Constraint, "has_iterator", 0)) {
+        \\                    if (!((@hasDecl(T, "is_js_iterator") and T.is_js_iterator) or standaloneStructHasProtocolFlag(T, "has_iterator", 0))) break :blk false;
+        \\                }
+        \\                if (comptime standaloneStructHasProtocolFlag(Constraint, "has_async_iterator", 0)) {
+        \\                    if (!((@hasDecl(T, "is_js_async_iterator") and T.is_js_async_iterator) or standaloneStructHasProtocolFlag(T, "has_async_iterator", 0))) break :blk false;
         \\                }
         \\                break :blk true;
         \\            }

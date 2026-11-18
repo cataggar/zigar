@@ -53,6 +53,8 @@ pub fn typeIrEqlWithTypeParams(
         .js_symbol,
         .js_bigint,
         .js_string,
+        .js_disposable,
+        .js_async_disposable,
         => true,
         .typed_slice => |ea| ea == b.typed_slice,
         .binary_view => |ba| ba == b.binary_view,
@@ -74,6 +76,8 @@ pub fn typeIrEqlWithTypeParams(
         .pointer_const => |pa| typeIrEqlWithTypeParams(pa, b.pointer_const, tp_names_a, tp_names_b, depth + 1),
         .slice => |sa| typeIrEqlWithTypeParams(sa, b.slice, tp_names_a, tp_names_b, depth + 1),
         .promise => |pa| typeIrEqlWithTypeParams(pa, b.promise, tp_names_a, tp_names_b, depth + 1),
+        .js_iterator => |ia| typeIrEqlWithTypeParams(ia, b.js_iterator, tp_names_a, tp_names_b, depth + 1),
+        .js_async_iterator => |ia| typeIrEqlWithTypeParams(ia, b.js_async_iterator, tp_names_a, tp_names_b, depth + 1),
         .js_map => |ma| typeIrEqlWithTypeParams(ma.key, b.js_map.key, tp_names_a, tp_names_b, depth + 1) and
             typeIrEqlWithTypeParams(ma.value, b.js_map.value, tp_names_a, tp_names_b, depth + 1),
         .js_record => |ra| typeIrEqlWithTypeParams(ra.key, b.js_record.key, tp_names_a, tp_names_b, depth + 1) and
@@ -462,6 +466,8 @@ fn appendTypeSlug(
         .js_function => try buf.appendSlice(alloc, "Callback"),
         .js_symbol => try buf.appendSlice(alloc, "Symbol"),
         .js_bigint => try buf.appendSlice(alloc, "JsBigInt"),
+        .js_disposable => try buf.appendSlice(alloc, "Disposable"),
+        .js_async_disposable => try buf.appendSlice(alloc, "AsyncDisposable"),
         .self_type => |sid| try appendPascalClean(buf, alloc, scratch, sid),
         .type_param_ref => |tp| try appendPascalClean(buf, alloc, scratch, tp),
         .optional => |opt| {
@@ -488,6 +494,18 @@ fn appendTypeSlug(
                 try appendTypeSlug(buf, alloc, scratch, inner, null, false, false, depth + 1);
             }
             try buf.appendSlice(alloc, "Promise");
+        },
+        .js_iterator => |inner| {
+            if (detailed) {
+                try appendTypeSlug(buf, alloc, scratch, inner, null, false, false, depth + 1);
+            }
+            try buf.appendSlice(alloc, "Iterator");
+        },
+        .js_async_iterator => |inner| {
+            if (detailed) {
+                try appendTypeSlug(buf, alloc, scratch, inner, null, false, false, depth + 1);
+            }
+            try buf.appendSlice(alloc, "AsyncIterator");
         },
         .js_map => |m| {
             if (detailed) {
@@ -1024,6 +1042,8 @@ test "overloads: subsumption deduplication and deterministic semantic naming wit
         js_symbol,
         js_bigint,
         js_string,
+        js_disposable,
+        js_async_disposable,
         binary_view: lower_types.BinaryViewKind,
         self_type: []const u8,
         type_param_ref: []const u8,
@@ -1035,6 +1055,8 @@ test "overloads: subsumption deduplication and deterministic semantic naming wit
         pointer_const: *const SelfT,
         slice: *const SelfT,
         promise: *const SelfT,
+        js_iterator: *const SelfT,
+        js_async_iterator: *const SelfT,
         js_map: struct { key: *const SelfT, value: *const SelfT },
         js_record: struct { key: *const SelfT, value: *const SelfT },
         mapped_values_op: struct { target: *const SelfT, value: *const SelfT },

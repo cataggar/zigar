@@ -70,6 +70,8 @@ pub const InferMode = enum {
     slice_elem,
     /// Parameter has type `Promise(T)`; deduce via `__zigar_js.Awaited(@TypeOf(arg))`.
     promise_payload,
+    /// Parameter has type `Iterator(T)` or `AsyncIterator(T)`; deduce via `__zigar_js.InferIteratorElem(@TypeOf(arg))`.
+    iterator_elem,
     /// Type parameter not present in value params, resolved from its TypeScript default (`= DefaultT`).
     from_default,
 };
@@ -80,6 +82,7 @@ pub const ParamTypeParamShape = union(enum) {
     optional_child: usize,
     slice_elem: usize,
     promise_payload: usize,
+    iterator_elem: usize,
 };
 
 pub const InferBinding = struct {
@@ -124,6 +127,11 @@ pub fn solveTypeParamInference(
             .promise_payload => |tp_idx| {
                 if (tp_idx < tp_count and chosen[tp_idx] == null) {
                     chosen[tp_idx] = .{ .param_index = pidx, .mode = .promise_payload };
+                }
+            },
+            .iterator_elem => |tp_idx| {
+                if (tp_idx < tp_count and chosen[tp_idx] == null) {
+                    chosen[tp_idx] = .{ .param_index = pidx, .mode = .iterator_elem };
                 }
             },
         }
@@ -178,6 +186,11 @@ pub fn solveTypeParamInferenceWithDefaults(
                     chosen[tp_idx] = .{ .param_index = pidx, .mode = .promise_payload };
                 }
             },
+            .iterator_elem => |tp_idx| {
+                if (tp_idx < tp_count and chosen[tp_idx] == null) {
+                    chosen[tp_idx] = .{ .param_index = pidx, .mode = .iterator_elem };
+                }
+            },
         }
     }
 
@@ -208,6 +221,8 @@ pub const OverloadGenericParamMode = enum {
     optional_child,
     slice_elem,
     promise_payload,
+    iterator_elem,
+    async_iterator_elem,
 };
 
 pub const OverloadGenericParamRef = struct {

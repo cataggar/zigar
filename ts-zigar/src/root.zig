@@ -16,6 +16,7 @@ pub const merge_decls = @import("merge_decls.zig");
 pub const lower_functions = @import("lower_functions.zig");
 pub const overloads = @import("overloads.zig");
 pub const lower_generics = @import("lower_generics.zig");
+pub const lower_protocols = @import("lower_protocols.zig");
 pub const type_ops = @import("type_ops.zig");
 pub const ir = @import("ir.zig");
 pub const emit = @import("emit.zig");
@@ -43,6 +44,7 @@ test {
     _ = lower_functions;
     _ = overloads;
     _ = lower_generics;
+    _ = lower_protocols;
     _ = type_ops;
     _ = ir;
     _ = emit;

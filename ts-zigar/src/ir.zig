@@ -10,6 +10,7 @@ const merge_decls = @import("merge_decls.zig");
 const lower_functions = @import("lower_functions.zig");
 const overloads = @import("overloads.zig");
 const lower_generics = @import("lower_generics.zig");
+const lower_protocols = @import("lower_protocols.zig");
 const type_ops = @import("type_ops.zig");
 
 /// Lowering configuration for `lowerGraph`.
@@ -82,6 +83,7 @@ pub const SignatureIr = struct {
     type_params: []const TypeParamIr,
     params: []const ParamIr,
     return_type: *const TypeIr,
+    awaits_promise: bool = false,
     has_type_predicate: bool,
     type_predicate_asserts: bool,
     type_predicate_target: ?TypePredicateTargetIr = null,
@@ -133,6 +135,7 @@ pub const MethodIr = struct {
     logical_name: []const u8,
     wire_name: []const u8,
     is_static: bool,
+    is_synthetic_companion: bool = false,
     call_kind: lower_objects.MethodCallKind = .method,
     signature: SignatureIr,
     jsdoc: ?JsDocIr,
@@ -281,6 +284,8 @@ pub const TypeIr = union(enum) {
     js_symbol,
     js_bigint,
     js_string,
+    js_disposable,
+    js_async_disposable,
     binary_view: lower_types.BinaryViewKind,
     self_type: []const u8,
     type_param_ref: []const u8,
@@ -288,6 +293,8 @@ pub const TypeIr = union(enum) {
     pointer_const: *const TypeIr,
     slice: *const TypeIr,
     promise: *const TypeIr,
+    js_iterator: *const TypeIr,
+    js_async_iterator: *const TypeIr,
     js_map: struct {
         key: *const TypeIr,
         value: *const TypeIr,
@@ -418,6 +425,17 @@ pub const StructDeclIr = struct {
     try_as_ident: ?[]const u8 = null,
     clone_ident: ?[]const u8 = null,
     empty_init_ident: ?[]const u8 = null,
+    iterator_ident: ?[]const u8 = null,
+    iterator_elem_ty: ?*const TypeIr = null,
+    async_iterator_ident: ?[]const u8 = null,
+    async_iterator_elem_ty: ?*const TypeIr = null,
+    has_sync_dispose: bool = false,
+    dispose_ident: ?[]const u8 = null,
+    try_dispose_ident: ?[]const u8 = null,
+    release_handle_only_ident: ?[]const u8 = null,
+    has_async_dispose: bool = false,
+    async_dispose_ident: ?[]const u8 = null,
+    try_async_dispose_ident: ?[]const u8 = null,
     required_methods: []const []const u8 = &.{},
     required_props: []const []const u8 = &.{},
     bases: []const *const TypeIr = &.{},
@@ -483,6 +501,7 @@ pub const DeclIr = struct {
     is_js_exported: bool = true,
     is_default_export: bool,
     is_global_scope: bool = false,
+    is_synthetic_companion: bool = false,
     alloc_companion_ident: ?[]const u8 = null,
     slice_companion_ident: ?[]const u8 = null,
     slice_alloc_companion_ident: ?[]const u8 = null,
@@ -1070,6 +1089,696 @@ fn LowerCtx(comptime GraphType: type) type {
                 return true;
             }
             return false;
+        }
+
+        fn isBuiltinProtocolTarget(self: *const Self, target_decl: ?u32) bool {
+            const td = target_decl orelse return true;
+            if (td >= self.graph.decls.len) return true;
+            if (self.global_aug_decls.contains(td)) return true;
+
+            if (self.decl_to_cand.get(td)) |c_idx| {
+                if (c_idx < self.candidates.items.len and self.candidates.items[c_idx].source_mod_ids.items.len == 0) {
+                    const cand_spec = self.candidates.items[c_idx].wire_specifier;
+                    if (lower_types.isBuiltinBufferOrGlobalsModule(cand_spec, "")) return true;
+                }
+            }
+
+            var cur_ns_opt = self.child_to_parent_ns.get(td);
+            var ns_depth: usize = 0;
+            while (cur_ns_opt) |ns_id| : (ns_depth += 1) {
+                if (ns_depth >= 32 or ns_id >= self.graph.decls.len) break;
+                const ns_name = self.str(self.graph.decls[ns_id].name);
+                if (lower_types.isBuiltinBufferOrGlobalsModule(ns_name, "")) return true;
+                cur_ns_opt = self.child_to_parent_ns.get(ns_id);
+            }
+
+            const owner_mid = self.findGraphModuleIndexById(self.graph.decls[td].module) orelse return true;
+            const owner_mod = self.graph.modules[owner_mid];
+            if (self.isBundledLibModule(owner_mod)) return true;
+            const fpath = self.str(owner_mod.file_path);
+            if (lower_types.isBuiltinBufferOrGlobalsModule(self.str(owner_mod.specifier), fpath)) return true;
+            if (std.mem.endsWith(u8, fpath, "/disposable.d.ts") or std.mem.endsWith(u8, fpath, "/iterators.d.ts")) return true;
+            return false;
+        }
+
+        fn classifyBuiltinProtocolReference(
+            self: *const Self,
+            ref_name: []const u8,
+            target_decl: ?u32,
+        ) ?lower_protocols.BuiltinProtocolKind {
+            const kind = lower_protocols.classifyBuiltinProtocolRef(ref_name) orelse return null;
+            if (!self.isBuiltinProtocolTarget(target_decl)) return null;
+            return kind;
+        }
+
+        fn typeShouldUnwrapAliasInReturnPos(self: *const Self, ty_id: u32, depth: usize) bool {
+            if (depth >= 8 or ty_id >= self.graph.types.len) return false;
+            const tn = self.graph.types[ty_id];
+            return switch (tn.kind) {
+                .reference => |ref| blk: {
+                    if (self.classifyBuiltinProtocolReference(self.str(ref.target_name), ref.target_decl)) |pk| {
+                        if (pk == .iterable) break :blk true;
+                    }
+                    const stripped = lower_types.stripGlobalQualifier(self.str(ref.target_name));
+                    if (std.mem.eql(u8, stripped, "Promise") or std.mem.eql(u8, stripped, "PromiseLike")) {
+                        if (ref.target_decl == null or self.isBundledLibDecl(ref.target_decl.?)) {
+                            break :blk true;
+                        }
+                    }
+                    if (std.mem.eql(u8, stripped, "NoInfer") and ref.type_args.len > 0) {
+                        break :blk self.typeShouldUnwrapAliasInReturnPos(ref.type_args[0], depth + 1);
+                    }
+                    if (ref.target_decl) |td| {
+                        if (td < self.graph.decls.len and self.graph.decls[td].kind == .type_alias_decl) {
+                            const alias_rhs = self.graph.decls[td].kind.type_alias_decl;
+                            if (alias_rhs != ty_id and self.typeShouldUnwrapAliasInReturnPos(alias_rhs, depth + 1)) break :blk true;
+                        }
+                    }
+                    break :blk false;
+                },
+                else => false,
+            };
+        }
+
+        fn typeHasTopLevelPositionalIterable(self: *const Self, ty_id: u32, depth: usize) bool {
+            if (depth >= 8 or ty_id >= self.graph.types.len) return false;
+            const tn = self.graph.types[ty_id];
+            return switch (tn.kind) {
+                .reference => |ref| blk: {
+                    if (self.classifyBuiltinProtocolReference(self.str(ref.target_name), ref.target_decl)) |pk| {
+                        if (pk == .iterable) break :blk true;
+                        if (std.mem.eql(u8, lower_types.stripGlobalQualifier(self.str(ref.target_name)), "Promise") or
+                            std.mem.eql(u8, lower_types.stripGlobalQualifier(self.str(ref.target_name)), "PromiseLike"))
+                        {
+                            if (ref.type_args.len > 0 and self.typeHasTopLevelPositionalIterable(ref.type_args[0], depth + 1)) break :blk true;
+                        }
+                    } else {
+                        const stripped = lower_types.stripGlobalQualifier(self.str(ref.target_name));
+                        if (std.mem.eql(u8, stripped, "Promise") or std.mem.eql(u8, stripped, "PromiseLike") or std.mem.eql(u8, stripped, "NoInfer")) {
+                            if (ref.type_args.len > 0 and self.typeHasTopLevelPositionalIterable(ref.type_args[0], depth + 1)) break :blk true;
+                        } else if (ref.target_decl) |td| {
+                            if (td < self.graph.decls.len and self.graph.decls[td].kind == .type_alias_decl) {
+                                const alias_rhs = self.graph.decls[td].kind.type_alias_decl;
+                                if (alias_rhs != ty_id and self.typeHasTopLevelPositionalIterable(alias_rhs, depth + 1)) break :blk true;
+                                if (tn.resolved_type) |rt| {
+                                    if (rt != ty_id and self.typeHasTopLevelPositionalIterable(rt, depth + 1)) break :blk true;
+                                }
+                            }
+                        }
+                    }
+                    break :blk false;
+                },
+                .union_type => |arms| blk: {
+                    for (arms) |aid| {
+                        if (self.typeHasTopLevelPositionalIterable(aid, depth + 1)) break :blk true;
+                    }
+                    break :blk false;
+                },
+                else => false,
+            };
+        }
+
+        fn hasProtocolInGraphTypes(self: *const Self, ty_ids: []const u32, depth: usize) bool {
+            if (depth > 12) return false;
+            for (ty_ids) |tid| {
+                if (tid >= self.graph.types.len) continue;
+                const tn = self.graph.types[tid];
+                switch (tn.kind) {
+                    .reference => |ref| {
+                        if (self.classifyBuiltinProtocolReference(self.str(ref.target_name), ref.target_decl) != null) {
+                            return true;
+                        }
+                        if (ref.target_decl) |td| {
+                            if (td < self.graph.decls.len) {
+                                const bd = self.graph.decls[td];
+                                switch (bd.kind) {
+                                    .type_alias_decl => |ta_ty| {
+                                        if (ta_ty != tid and self.hasProtocolInGraphTypes(&.{ta_ty}, depth + 1)) return true;
+                                    },
+                                    .interface_decl => |iface| {
+                                        for (iface.methods) |m| {
+                                            if (m.computed_symbol) |cs| {
+                                                if (lower_protocols.classifyProtocolSymbolKey(cs, if (cs == .custom) self.str(cs.custom) else "") != null) return true;
+                                            }
+                                        }
+                                        for (iface.properties) |pid| {
+                                            if (pid < self.graph.properties.len) {
+                                                if (self.graph.properties[pid].computed_symbol) |cs| {
+                                                    if (lower_protocols.classifyProtocolSymbolKey(cs, if (cs == .custom) self.str(cs.custom) else "") != null) return true;
+                                                }
+                                            }
+                                        }
+                                    },
+                                    .class_decl => |cls| {
+                                        for (cls.methods) |m| {
+                                            if (m.computed_symbol) |cs| {
+                                                if (lower_protocols.classifyProtocolSymbolKey(cs, if (cs == .custom) self.str(cs.custom) else "") != null) return true;
+                                            }
+                                        }
+                                        for (cls.properties) |pid| {
+                                            if (pid < self.graph.properties.len) {
+                                                if (self.graph.properties[pid].computed_symbol) |cs| {
+                                                    if (lower_protocols.classifyProtocolSymbolKey(cs, if (cs == .custom) self.str(cs.custom) else "") != null) return true;
+                                                }
+                                            }
+                                        }
+                                    },
+                                    else => {},
+                                }
+                            }
+                        }
+                    },
+                    .object_literal => |obj| {
+                        for (obj.properties) |pid| {
+                            if (pid < self.graph.properties.len) {
+                                if (self.graph.properties[pid].computed_symbol) |cs| {
+                                    if (lower_protocols.classifyProtocolSymbolKey(cs, if (cs == .custom) self.str(cs.custom) else "") != null) return true;
+                                }
+                            }
+                        }
+                    },
+                    .intersection => |parts| {
+                        if (self.hasProtocolInGraphTypes(parts, depth + 1)) return true;
+                    },
+                    else => {},
+                }
+            }
+            return false;
+        }
+
+        const ExtractedStructProtocols = struct {
+            iterator_elem_ty: ?*const TypeIr = null,
+            async_iterator_elem_ty: ?*const TypeIr = null,
+            has_sync_dispose: bool = false,
+            has_async_dispose: bool = false,
+
+            fn hasAny(self: ExtractedStructProtocols) bool {
+                return self.iterator_elem_ty != null or
+                    self.async_iterator_elem_ty != null or
+                    self.has_sync_dispose or
+                    self.has_async_dispose;
+            }
+        };
+
+        fn tryExtractIteratorResultPayload(
+            self: *Self,
+            res_tid: u32,
+            active_tps: []const ActiveTypeParam,
+            self_ident_opt: ?[]const u8,
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+            depth: usize,
+        ) error{OutOfMemory}!?*const TypeIr {
+            if (depth > 8 or res_tid >= self.graph.types.len) return null;
+            const tn = self.graph.types[res_tid];
+            switch (tn.kind) {
+                .reference => |ref| {
+                    const rname = self.str(ref.target_name);
+                    if (lower_protocols.isIteratorResultWrapperName(rname) and ref.type_args.len > 0) {
+                        var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                        defer visited.deinit(self.scratch);
+                        return try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, &visited, imports_used, needs_runtime);
+                    }
+                    if (ref.target_decl) |td| {
+                        if (td < self.graph.decls.len and self.graph.decls[td].kind == .type_alias_decl) {
+                            if (tn.resolved_type) |rt| {
+                                if (rt != res_tid) {
+                                    return self.tryExtractIteratorResultPayload(rt, active_tps, self_ident_opt, imports_used, needs_runtime, depth + 1);
+                                }
+                            }
+                        }
+                    }
+                },
+                .union_type => |arms| {
+                    for (arms) |aid| {
+                        if (aid >= self.graph.types.len) continue;
+                        const atn = self.graph.types[aid];
+                        if (atn.kind == .reference) {
+                            const arname = lower_types.stripGlobalQualifier(self.str(atn.kind.reference.target_name));
+                            if (std.mem.eql(u8, arname, "IteratorReturnResult") or std.mem.eql(u8, arname, "BuiltinIteratorReturn")) continue;
+                        }
+                        if (atn.kind == .object_literal) {
+                            var is_done_true = false;
+                            for (atn.kind.object_literal.properties) |pid| {
+                                if (pid >= self.graph.properties.len) continue;
+                                const p = self.graph.properties[pid];
+                                if (std.mem.eql(u8, self.str(p.name), "done") and p.ty < self.graph.types.len) {
+                                    const dtk = self.graph.types[p.ty].kind;
+                                    if (dtk == .literal and dtk.literal == .boolean and dtk.literal.boolean) {
+                                        is_done_true = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (is_done_true) continue;
+                        }
+                        if (try self.tryExtractIteratorResultPayload(aid, active_tps, self_ident_opt, imports_used, needs_runtime, depth + 1)) |found| {
+                            return found;
+                        }
+                    }
+                },
+                .object_literal => |obj| {
+                    for (obj.properties) |pid| {
+                        if (pid >= self.graph.properties.len) continue;
+                        const p = self.graph.properties[pid];
+                        if (p.computed_symbol == null and std.mem.eql(u8, self.str(p.name), "value")) {
+                            var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                            defer visited.deinit(self.scratch);
+                            return try self.lowerType(p.ty, false, active_tps, self_ident_opt, &visited, imports_used, needs_runtime);
+                        }
+                    }
+                },
+                else => {},
+            }
+            return null;
+        }
+
+        fn extractIteratorElemFromReturnType(
+            self: *Self,
+            ret_tid: u32,
+            is_async: bool,
+            env: ?*const HeritageEnv,
+            owner_active_tps: []const ActiveTypeParam,
+            self_ident_opt: ?[]const u8,
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+            env_cache: *std.AutoHashMapUnmanaged(*const HeritageEnv, []const ActiveTypeParam),
+            depth: usize,
+        ) error{OutOfMemory}!*const TypeIr {
+            needs_runtime.* = true;
+            if (depth > 8 or ret_tid >= self.graph.types.len) {
+                return self.makeType(.js_value);
+            }
+            const active_tps = try self.resolveHeritageActiveTps(
+                env,
+                owner_active_tps,
+                self_ident_opt,
+                imports_used,
+                needs_runtime,
+                env_cache,
+                0,
+            );
+
+            {
+                var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                defer visited.deinit(self.scratch);
+                const lowered = try self.lowerType(ret_tid, true, active_tps, self_ident_opt, &visited, imports_used, needs_runtime);
+                if (!is_async and lowered.* == .js_iterator) return lowered.js_iterator;
+                if (is_async and lowered.* == .js_async_iterator) return lowered.js_async_iterator;
+            }
+
+            const tn = self.graph.types[ret_tid];
+            switch (tn.kind) {
+                .reference => |ref| {
+                    if (ref.target_decl) |td| {
+                        if (td < self.graph.decls.len) {
+                            const bd = self.graph.decls[td];
+                            const child_env = try self.buildHeritageEnv(env, bd.type_params, ref.type_args);
+                            const child_tps = try self.resolveHeritageActiveTps(
+                                child_env,
+                                owner_active_tps,
+                                self_ident_opt,
+                                imports_used,
+                                needs_runtime,
+                                env_cache,
+                                0,
+                            );
+                            switch (bd.kind) {
+                                .type_alias_decl => |ta_ty| {
+                                    if (ta_ty != ret_tid) {
+                                        return self.extractIteratorElemFromReturnType(ta_ty, is_async, child_env, owner_active_tps, self_ident_opt, imports_used, needs_runtime, env_cache, depth + 1);
+                                    }
+                                },
+                                .interface_decl => |iface| {
+                                    for (iface.methods) |m| {
+                                        if (m.computed_symbol == null and std.mem.eql(u8, self.str(m.name), "next") and m.signatures.len > 0) {
+                                            const sid = m.signatures[0];
+                                            if (sid < self.graph.signatures.len) {
+                                                var nret = self.graph.signatures[sid].return_type;
+                                                if (is_async and nret < self.graph.types.len and self.graph.types[nret].kind == .reference) {
+                                                    const pr = self.graph.types[nret].kind.reference;
+                                                    const prn = lower_types.stripGlobalQualifier(self.str(pr.target_name));
+                                                    if ((std.mem.eql(u8, prn, "Promise") or std.mem.eql(u8, prn, "PromiseLike")) and pr.type_args.len > 0) {
+                                                        nret = pr.type_args[0];
+                                                    }
+                                                }
+                                                if (try self.tryExtractIteratorResultPayload(nret, child_tps, self_ident_opt, imports_used, needs_runtime, 0)) |el| {
+                                                    return el;
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                .class_decl => |cls| {
+                                    for (cls.methods) |m| {
+                                        if (m.computed_symbol == null and std.mem.eql(u8, self.str(m.name), "next") and m.signatures.len > 0) {
+                                            const sid = m.signatures[0];
+                                            if (sid < self.graph.signatures.len) {
+                                                var nret = self.graph.signatures[sid].return_type;
+                                                if (is_async and nret < self.graph.types.len and self.graph.types[nret].kind == .reference) {
+                                                    const pr = self.graph.types[nret].kind.reference;
+                                                    const prn = lower_types.stripGlobalQualifier(self.str(pr.target_name));
+                                                    if ((std.mem.eql(u8, prn, "Promise") or std.mem.eql(u8, prn, "PromiseLike")) and pr.type_args.len > 0) {
+                                                        nret = pr.type_args[0];
+                                                    }
+                                                }
+                                                if (try self.tryExtractIteratorResultPayload(nret, child_tps, self_ident_opt, imports_used, needs_runtime, 0)) |el| {
+                                                    return el;
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                },
+                .object_literal => |obj| {
+                    const split = try self.splitObjectLiteralPropsAndMethodsWithEnv(obj.properties, env);
+                    for (split.methods) |sm| {
+                        if (sm.method.computed_symbol == null and std.mem.eql(u8, self.str(sm.method.name), "next") and sm.method.signatures.len > 0) {
+                            const sid = sm.method.signatures[0];
+                            if (sid < self.graph.signatures.len) {
+                                var nret = self.graph.signatures[sid].return_type;
+                                if (is_async and nret < self.graph.types.len and self.graph.types[nret].kind == .reference) {
+                                    const pr = self.graph.types[nret].kind.reference;
+                                    const prn = lower_types.stripGlobalQualifier(self.str(pr.target_name));
+                                    if ((std.mem.eql(u8, prn, "Promise") or std.mem.eql(u8, prn, "PromiseLike")) and pr.type_args.len > 0) {
+                                        nret = pr.type_args[0];
+                                    }
+                                }
+                                if (try self.tryExtractIteratorResultPayload(nret, active_tps, self_ident_opt, imports_used, needs_runtime, 0)) |el| {
+                                    return el;
+                                }
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+            return self.makeType(.js_value);
+        }
+
+        fn applyProtocolSymbolMethod(
+            self: *Self,
+            cs: @TypeOf(self.graph.properties[0].computed_symbol.?),
+            sig_ids: []const u32,
+            env: ?*const HeritageEnv,
+            owner_active_tps: []const ActiveTypeParam,
+            self_ident_opt: ?[]const u8,
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+            env_cache: *std.AutoHashMapUnmanaged(*const HeritageEnv, []const ActiveTypeParam),
+            out: *ExtractedStructProtocols,
+        ) error{OutOfMemory}!void {
+            const custom_txt = if (cs == .custom) self.str(cs.custom) else "";
+            const psk = lower_protocols.classifyProtocolSymbolKey(cs, custom_txt) orelse return;
+            needs_runtime.* = true;
+            switch (psk) {
+                .dispose => out.has_sync_dispose = true,
+                .async_dispose => out.has_async_dispose = true,
+                .iterator => {
+                    if (out.iterator_elem_ty == null) {
+                        if (sig_ids.len > 0 and sig_ids[0] < self.graph.signatures.len) {
+                            out.iterator_elem_ty = try self.extractIteratorElemFromReturnType(
+                                self.graph.signatures[sig_ids[0]].return_type,
+                                false,
+                                env,
+                                owner_active_tps,
+                                self_ident_opt,
+                                imports_used,
+                                needs_runtime,
+                                env_cache,
+                                0,
+                            );
+                        } else {
+                            out.iterator_elem_ty = try self.makeType(.js_value);
+                        }
+                    }
+                },
+                .async_iterator => {
+                    if (out.async_iterator_elem_ty == null) {
+                        if (sig_ids.len > 0 and sig_ids[0] < self.graph.signatures.len) {
+                            out.async_iterator_elem_ty = try self.extractIteratorElemFromReturnType(
+                                self.graph.signatures[sig_ids[0]].return_type,
+                                true,
+                                env,
+                                owner_active_tps,
+                                self_ident_opt,
+                                imports_used,
+                                needs_runtime,
+                                env_cache,
+                                0,
+                            );
+                        } else {
+                            out.async_iterator_elem_ty = try self.makeType(.js_value);
+                        }
+                    }
+                },
+            }
+        }
+
+        fn applyProtocolSymbolProp(
+            self: *Self,
+            pid: u32,
+            env: ?*const HeritageEnv,
+            owner_active_tps: []const ActiveTypeParam,
+            self_ident_opt: ?[]const u8,
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+            env_cache: *std.AutoHashMapUnmanaged(*const HeritageEnv, []const ActiveTypeParam),
+            out: *ExtractedStructProtocols,
+        ) error{OutOfMemory}!void {
+            if (pid >= self.graph.properties.len) return;
+            const p = self.graph.properties[pid];
+            if (p.modifiers.static_mod or p.modifiers.private_mod or p.modifiers.protected_mod or p.modifiers.optional_mod) return;
+            const cs = p.computed_symbol orelse return;
+            var sigs: std.ArrayList(u32) = .empty;
+            defer sigs.deinit(self.scratch);
+            try self.collectMethodSigsFromType(p.ty, &sigs, 0);
+            try self.applyProtocolSymbolMethod(cs, sigs.items, env, owner_active_tps, self_ident_opt, imports_used, needs_runtime, env_cache, out);
+        }
+
+        fn collectProtocolsFromGraphType(
+            self: *Self,
+            ty_id: u32,
+            env: ?*const HeritageEnv,
+            owner_active_tps: []const ActiveTypeParam,
+            self_ident_opt: ?[]const u8,
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+            env_cache: *std.AutoHashMapUnmanaged(*const HeritageEnv, []const ActiveTypeParam),
+            visited_decls: *std.AutoHashMapUnmanaged(u32, void),
+            out: *ExtractedStructProtocols,
+            depth: usize,
+        ) error{OutOfMemory}!void {
+            if (depth > 12 or ty_id >= self.graph.types.len) return;
+            const tn = self.graph.types[ty_id];
+            switch (tn.kind) {
+                .intersection => |parts| {
+                    if (self.detectOpenPrimitiveIntersection(parts) != null or
+                        self.detectBrandedPrimitiveIntersection(parts, 0) != null) return;
+                    for (parts) |part_id| {
+                        try self.collectProtocolsFromGraphType(part_id, env, owner_active_tps, self_ident_opt, imports_used, needs_runtime, env_cache, visited_decls, out, depth + 1);
+                    }
+                },
+                .object_literal => |obj| {
+                    const split = try self.splitObjectLiteralPropsAndMethodsWithEnv(obj.properties, env);
+                    for (split.methods) |sm| {
+                        if (sm.method.modifiers.static_mod or sm.method.modifiers.private_mod or sm.method.modifiers.protected_mod or sm.method.modifiers.optional_mod) continue;
+                        if (sm.method.computed_symbol) |cs| {
+                            try self.applyProtocolSymbolMethod(cs, sm.method.signatures, sm.env, owner_active_tps, self_ident_opt, imports_used, needs_runtime, env_cache, out);
+                        }
+                    }
+                    for (split.props) |sp| {
+                        try self.applyProtocolSymbolProp(sp.pid, sp.env, owner_active_tps, self_ident_opt, imports_used, needs_runtime, env_cache, out);
+                    }
+                },
+                .reference => |ref| {
+                    const rname = self.str(ref.target_name);
+                    if (self.classifyBuiltinProtocolReference(rname, ref.target_decl)) |pk| {
+                        needs_runtime.* = true;
+                        const active_tps = try self.resolveHeritageActiveTps(env, owner_active_tps, self_ident_opt, imports_used, needs_runtime, env_cache, 0);
+                        switch (pk) {
+                            .disposable => out.has_sync_dispose = true,
+                            .async_disposable => out.has_async_dispose = true,
+                            .iterable, .iterator => {
+                                if (out.iterator_elem_ty == null) {
+                                    if (ref.type_args.len > 0) {
+                                        var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                                        defer visited.deinit(self.scratch);
+                                        out.iterator_elem_ty = try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, &visited, imports_used, needs_runtime);
+                                    } else {
+                                        out.iterator_elem_ty = try self.makeType(.js_value);
+                                    }
+                                }
+                            },
+                            .async_iterable, .async_iterator => {
+                                if (out.async_iterator_elem_ty == null) {
+                                    if (ref.type_args.len > 0) {
+                                        var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                                        defer visited.deinit(self.scratch);
+                                        out.async_iterator_elem_ty = try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, &visited, imports_used, needs_runtime);
+                                    } else {
+                                        out.async_iterator_elem_ty = try self.makeType(.js_value);
+                                    }
+                                }
+                            },
+                        }
+                        return;
+                    }
+
+                    const td = ref.target_decl orelse return;
+                    if (td >= self.graph.decls.len) return;
+                    const bd = self.graph.decls[td];
+                    const child_env = try self.buildHeritageEnv(env, bd.type_params, ref.type_args);
+
+                    switch (bd.kind) {
+                        .type_alias_decl => |ta_ty| {
+                            if (ta_ty != ty_id) {
+                                try self.collectProtocolsFromGraphType(ta_ty, child_env, owner_active_tps, self_ident_opt, imports_used, needs_runtime, env_cache, visited_decls, out, depth + 1);
+                            }
+                        },
+                        .interface_decl, .class_decl => {
+                            const was_visited = visited_decls.contains(td);
+                            if (!was_visited) {
+                                try visited_decls.put(self.scratch, td, {});
+                            }
+                            defer if (!was_visited) {
+                                _ = visited_decls.remove(td);
+                            };
+                            if (was_visited and bd.type_params.len == 0) return;
+
+                            const bd_wire = if (bd.export_name) |esid| self.str(esid) else self.str(bd.name);
+                            const inspectDecl = struct {
+                                fn run(
+                                    s: *Self,
+                                    did: u32,
+                                    c_env: ?*const HeritageEnv,
+                                    o_tps: []const ActiveTypeParam,
+                                    sid_opt: ?[]const u8,
+                                    imp: *std.AutoHashMapUnmanaged(u32, void),
+                                    nr: *bool,
+                                    ec: *std.AutoHashMapUnmanaged(*const HeritageEnv, []const ActiveTypeParam),
+                                    vd: *std.AutoHashMapUnmanaged(u32, void),
+                                    res_out: *ExtractedStructProtocols,
+                                    d_lvl: usize,
+                                ) error{OutOfMemory}!void {
+                                    const cd = s.graph.decls[did];
+                                    switch (cd.kind) {
+                                        .interface_decl => |cif| {
+                                            for (cif.methods) |m| {
+                                                if (m.modifiers.static_mod or m.modifiers.private_mod or m.modifiers.protected_mod or m.modifiers.optional_mod) continue;
+                                                if (m.computed_symbol) |cs| {
+                                                    try s.applyProtocolSymbolMethod(cs, m.signatures, c_env, o_tps, sid_opt, imp, nr, ec, res_out);
+                                                }
+                                            }
+                                            for (cif.properties) |pid| {
+                                                try s.applyProtocolSymbolProp(pid, c_env, o_tps, sid_opt, imp, nr, ec, res_out);
+                                            }
+                                            for (cif.extends_clauses) |hc| {
+                                                try s.collectProtocolsFromGraphType(hc.target_type, c_env, o_tps, sid_opt, imp, nr, ec, vd, res_out, d_lvl + 1);
+                                            }
+                                        },
+                                        .class_decl => |ccls| {
+                                            for (ccls.methods) |m| {
+                                                if (m.modifiers.static_mod or m.modifiers.private_mod or m.modifiers.protected_mod or m.modifiers.optional_mod) continue;
+                                                if (m.computed_symbol) |cs| {
+                                                    try s.applyProtocolSymbolMethod(cs, m.signatures, c_env, o_tps, sid_opt, imp, nr, ec, res_out);
+                                                }
+                                            }
+                                            for (ccls.properties) |pid| {
+                                                try s.applyProtocolSymbolProp(pid, c_env, o_tps, sid_opt, imp, nr, ec, res_out);
+                                            }
+                                            if (ccls.extends_clause) |hc| {
+                                                try s.collectProtocolsFromGraphType(hc.target_type, c_env, o_tps, sid_opt, imp, nr, ec, vd, res_out, d_lvl + 1);
+                                            }
+                                            for (ccls.implements_clauses) |hc| {
+                                                try s.collectProtocolsFromGraphType(hc.target_type, c_env, o_tps, sid_opt, imp, nr, ec, vd, res_out, d_lvl + 1);
+                                            }
+                                        },
+                                        else => {},
+                                    }
+                                }
+                            }.run;
+
+                            try inspectDecl(self, td, child_env, owner_active_tps, self_ident_opt, imports_used, needs_runtime, env_cache, visited_decls, out, depth);
+                            for (bd.merged_with) |mid| {
+                                if (mid == td or mid >= self.graph.decls.len) continue;
+                                const md = self.graph.decls[mid];
+                                if (md.kind != .interface_decl and md.kind != .class_decl) continue;
+                                const m_wire = if (md.export_name) |esid| self.str(esid) else self.str(md.name);
+                                if (!merge_decls.sameWireName(bd_wire, m_wire)) continue;
+                                const peer_env = try self.buildHeritageEnv(env, md.type_params, ref.type_args);
+                                try inspectDecl(self, mid, peer_env, owner_active_tps, self_ident_opt, imports_used, needs_runtime, env_cache, visited_decls, out, depth);
+                            }
+                        },
+                        else => {},
+                    }
+                },
+                else => {},
+            }
+        }
+
+        fn extractStructProtocols(
+            self: *Self,
+            raw_props: []const SourcedProp,
+            raw_methods: []const SourcedMethod,
+            sourced_bases: []const SourcedBaseClause,
+            owner_active_tps: []const ActiveTypeParam,
+            self_ident_opt: ?[]const u8,
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+            env_cache: *std.AutoHashMapUnmanaged(*const HeritageEnv, []const ActiveTypeParam),
+        ) error{OutOfMemory}!ExtractedStructProtocols {
+            var out: ExtractedStructProtocols = .{};
+            for (raw_methods) |sm| {
+                if (sm.method.modifiers.static_mod or sm.method.modifiers.private_mod or
+                    sm.method.modifiers.protected_mod or sm.method.modifiers.optional_mod) continue;
+                if (sm.method.computed_symbol) |cs| {
+                    try self.applyProtocolSymbolMethod(
+                        cs,
+                        sm.method.signatures,
+                        sm.env,
+                        owner_active_tps,
+                        self_ident_opt,
+                        imports_used,
+                        needs_runtime,
+                        env_cache,
+                        &out,
+                    );
+                }
+            }
+            for (raw_props) |sp| {
+                try self.applyProtocolSymbolProp(
+                    sp.pid,
+                    sp.env,
+                    owner_active_tps,
+                    self_ident_opt,
+                    imports_used,
+                    needs_runtime,
+                    env_cache,
+                    &out,
+                );
+            }
+            var visited_decls: std.AutoHashMapUnmanaged(u32, void) = .empty;
+            defer visited_decls.deinit(self.scratch);
+            for (sourced_bases) |sb| {
+                try self.collectProtocolsFromGraphType(
+                    sb.target_type,
+                    sb.env,
+                    owner_active_tps,
+                    self_ident_opt,
+                    imports_used,
+                    needs_runtime,
+                    env_cache,
+                    &visited_decls,
+                    &out,
+                    0,
+                );
+            }
+            return out;
         }
 
         fn findGraphModuleIndexById(self: *const Self, mod_id: u32) ?usize {
@@ -3188,11 +3897,15 @@ fn LowerCtx(comptime GraphType: type) type {
                 .js_symbol,
                 .js_bigint,
                 .js_string,
+                .js_disposable,
+                .js_async_disposable,
                 .binary_view,
                 .slice,
                 .pointer_const,
                 .fn_ptr,
                 .promise,
+                .js_iterator,
+                .js_async_iterator,
                 .js_map,
                 .js_record,
                 .mapped_values_op,
@@ -3356,7 +4069,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     break :blk false;
                 },
                 .optional => |opt| typeIrMentionsSelfOrTypeParamsFrom(opt.child, tps, from_idx, depth + 1),
-                .pointer_const, .slice, .promise => |inner| typeIrMentionsSelfOrTypeParamsFrom(inner, tps, from_idx, depth + 1),
+                .pointer_const, .slice, .promise, .js_iterator, .js_async_iterator => |inner| typeIrMentionsSelfOrTypeParamsFrom(inner, tps, from_idx, depth + 1),
                 .js_map => |m| typeIrMentionsSelfOrTypeParamsFrom(m.key, tps, from_idx, depth + 1) or
                     typeIrMentionsSelfOrTypeParamsFrom(m.value, tps, from_idx, depth + 1),
                 .js_record => |r| typeIrMentionsSelfOrTypeParamsFrom(r.key, tps, from_idx, depth + 1) or
@@ -3469,7 +4182,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     visited.clearRetainingCapacity();
                     const lowered_ct = try self.lowerType(
                         ct,
-                        false,
+                        true,
                         combined_active,
                         self_ident_opt,
                         &visited,
@@ -3559,6 +4272,13 @@ fn LowerCtx(comptime GraphType: type) type {
                     if (inner.* == .type_param_ref) {
                         for (tps, 0..) |tp, idx| {
                             if (std.mem.eql(u8, tp.zig_ident, inner.type_param_ref)) return .{ .promise_payload = idx };
+                        }
+                    }
+                },
+                .js_iterator, .js_async_iterator => |inner| {
+                    if (inner.* == .type_param_ref) {
+                        for (tps, 0..) |tp, idx| {
+                            if (std.mem.eql(u8, tp.zig_ident, inner.type_param_ref)) return .{ .iterator_elem = idx };
                         }
                     }
                 },
@@ -3837,8 +4557,10 @@ fn LowerCtx(comptime GraphType: type) type {
                 needs_runtime.* = true;
                 return self.makeType(.js_any);
             }
-            if (self.cur_mod_hoisted_locs.get(ty_id)) |hloc| {
-                return self.makeHoistedDeclRef(hloc);
+            if (!is_return_pos or !self.typeHasTopLevelPositionalIterable(ty_id, 0)) {
+                if (self.cur_mod_hoisted_locs.get(ty_id)) |hloc| {
+                    return self.makeHoistedDeclRef(hloc);
+                }
             }
             if (!is_return_pos) {
                 if (self.cur_mod_closed_types.get(ty_id)) |cached_ty| {
@@ -4009,6 +4731,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     return self.lowerUnionTypeInline(
                         ty_id,
                         arms,
+                        is_return_pos,
                         ref_cnt,
                         can_hoist_in_mod,
                         no_free_vars,
@@ -4059,6 +4782,70 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                     }
 
+                    // Built-in ES iteration & resource disposal protocols (`Iterable<T>`, `Iterator<T>`,
+                    // `AsyncIterable<T>`, `AsyncIterator<T>`, `Disposable`, `AsyncDisposable`, etc.).
+                    if (self.classifyBuiltinProtocolReference(ref_name, ref.target_decl)) |pkind| {
+                        switch (pkind) {
+                            .disposable => {
+                                needs_runtime.* = true;
+                                const res = try self.makeType(.js_disposable);
+                                if (!is_return_pos and ref_cnt > 1 and can_hoist_in_mod and no_free_vars) {
+                                    try self.cur_mod_closed_types.put(self.scratch, ty_id, res);
+                                }
+                                return res;
+                            },
+                            .async_disposable => {
+                                needs_runtime.* = true;
+                                const res = try self.makeType(.js_async_disposable);
+                                if (!is_return_pos and ref_cnt > 1 and can_hoist_in_mod and no_free_vars) {
+                                    try self.cur_mod_closed_types.put(self.scratch, ty_id, res);
+                                }
+                                return res;
+                            },
+                            .iterable => {
+                                const elem = if (ref.type_args.len > 0)
+                                    try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
+                                else blk: {
+                                    needs_runtime.* = true;
+                                    break :blk try self.makeType(.js_value);
+                                };
+                                if (is_return_pos) {
+                                    needs_runtime.* = true;
+                                    return self.makeType(.{ .js_iterator = elem });
+                                }
+                                const res = try self.makeType(.{ .slice = elem });
+                                if (ref_cnt > 1 and can_hoist_in_mod and (no_free_vars or try self.isClosedTypeSubgraph(ty_id))) {
+                                    try self.cur_mod_closed_types.put(self.scratch, ty_id, res);
+                                }
+                                return res;
+                            },
+                            .iterator => {
+                                needs_runtime.* = true;
+                                const elem = if (ref.type_args.len > 0)
+                                    try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
+                                else
+                                    try self.makeType(.js_value);
+                                const res = try self.makeType(.{ .js_iterator = elem });
+                                if (!is_return_pos and ref_cnt > 1 and can_hoist_in_mod and (no_free_vars or try self.isClosedTypeSubgraph(ty_id))) {
+                                    try self.cur_mod_closed_types.put(self.scratch, ty_id, res);
+                                }
+                                return res;
+                            },
+                            .async_iterable, .async_iterator => {
+                                needs_runtime.* = true;
+                                const elem = if (ref.type_args.len > 0)
+                                    try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
+                                else
+                                    try self.makeType(.js_value);
+                                const res = try self.makeType(.{ .js_async_iterator = elem });
+                                if (!is_return_pos and ref_cnt > 1 and can_hoist_in_mod and (no_free_vars or try self.isClosedTypeSubgraph(ty_id))) {
+                                    try self.cur_mod_closed_types.put(self.scratch, ty_id, res);
+                                }
+                                return res;
+                            },
+                        }
+                    }
+
                     if (ref.target_decl) |td| {
                         if (self.lookupDeclLocation(td)) |found| {
                             const loc = found.loc;
@@ -4092,6 +4879,30 @@ fn LowerCtx(comptime GraphType: type) type {
                                 }
                             }
 
+                            if (is_return_pos and found.id < self.graph.decls.len and self.graph.decls[found.id].kind == .type_alias_decl) {
+                                const bd = self.graph.decls[found.id];
+                                const alias_rhs = bd.kind.type_alias_decl;
+                                if (!visited.contains(alias_rhs) and self.typeShouldUnwrapAliasInReturnPos(alias_rhs, 0)) {
+                                    const alias_tps = try self.scratch.alloc(ActiveTypeParam, bd.type_params.len);
+                                    defer self.scratch.free(alias_tps);
+                                    for (bd.type_params, 0..) |tp_id, i| {
+                                        const tp_name = if (tp_id < self.graph.type_params.len)
+                                            self.str(self.graph.type_params[tp_id].name)
+                                        else
+                                            "";
+                                        alias_tps[i] = .{
+                                            .ts_name = tp_name,
+                                            .zig_ident = "",
+                                            .subst_ty = if (i < lowered_args.len)
+                                                @constCast(lowered_args[i])
+                                            else
+                                                try self.makeType(.js_any),
+                                        };
+                                    }
+                                    return self.lowerType(alias_rhs, true, alias_tps, null, visited, imports_used, needs_runtime);
+                                }
+                            }
+
                             return self.makeType(.{
                                 .decl_ref = .{
                                     .module_index = loc.module_index,
@@ -4104,9 +4915,9 @@ fn LowerCtx(comptime GraphType: type) type {
                     }
 
                     // Built-in JS / TypeScript standard library types.
-                    if (std.mem.eql(u8, ref_name, "Array") or std.mem.eql(u8, ref_name, "ReadonlyArray") or
-                        std.mem.eql(u8, ref_name, "Iterable") or std.mem.eql(u8, ref_name, "IterableIterator") or
-                        std.mem.eql(u8, ref_name, "Set") or std.mem.eql(u8, ref_name, "ReadonlySet"))
+                    const stripped_stdlib_name = lower_types.stripGlobalQualifier(ref_name);
+                    if (std.mem.eql(u8, stripped_stdlib_name, "Array") or std.mem.eql(u8, stripped_stdlib_name, "ReadonlyArray") or
+                        std.mem.eql(u8, stripped_stdlib_name, "Set") or std.mem.eql(u8, stripped_stdlib_name, "ReadonlySet"))
                     {
                         const elem = if (ref.type_args.len > 0)
                             try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
@@ -4115,19 +4926,19 @@ fn LowerCtx(comptime GraphType: type) type {
                             break :blk try self.makeType(.js_value);
                         };
                         const res = try self.makeType(.{ .slice = elem });
-                        if (ref_cnt > 1 and can_hoist_in_mod and (no_free_vars or try self.isClosedTypeSubgraph(ty_id))) {
+                        if (!is_return_pos and ref_cnt > 1 and can_hoist_in_mod and (no_free_vars or try self.isClosedTypeSubgraph(ty_id))) {
                             try self.cur_mod_closed_types.put(self.scratch, ty_id, res);
                         }
                         return res;
                     }
-                    if (std.mem.eql(u8, ref_name, "Promise") or std.mem.eql(u8, ref_name, "PromiseLike")) {
+                    if (std.mem.eql(u8, stripped_stdlib_name, "Promise") or std.mem.eql(u8, stripped_stdlib_name, "PromiseLike")) {
                         needs_runtime.* = true;
                         const inner = if (ref.type_args.len > 0)
-                            try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
+                            try self.lowerType(ref.type_args[0], is_return_pos, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
                         else
                             try self.makeType(.void_type);
                         const res = try self.makeType(.{ .promise = inner });
-                        if (ref_cnt > 1 and can_hoist_in_mod and (no_free_vars or try self.isClosedTypeSubgraph(ty_id))) {
+                        if (!is_return_pos and ref_cnt > 1 and can_hoist_in_mod and (no_free_vars or try self.isClosedTypeSubgraph(ty_id))) {
                             try self.cur_mod_closed_types.put(self.scratch, ty_id, res);
                         }
                         return res;
@@ -5137,6 +5948,38 @@ fn LowerCtx(comptime GraphType: type) type {
             return res;
         }
 
+        const SplitPromiseSig = struct {
+            awaited: SignatureIr,
+            promise_companion: SignatureIr,
+        };
+
+        /// Splits an async signature returning `Promise<T>` (or nested `Promise<Promise<T>>`)
+        /// into an auto-awaiting primary signature (`return_type = T`, `awaits_promise = true`)
+        /// and a non-awaiting `*Promise` companion signature (`return_type = Promise<T>`).
+        fn prepareAwaitedAndPromiseSig(
+            self: *Self,
+            raw_sig: SignatureIr,
+        ) error{OutOfMemory}!?SplitPromiseSig {
+            if (raw_sig.has_type_predicate or raw_sig.return_type.* != .promise) return null;
+            var payload = raw_sig.return_type.promise;
+            while (payload.* == .promise) {
+                payload = payload.promise;
+            }
+            var awaited = raw_sig;
+            awaited.return_type = payload;
+            awaited.awaits_promise = true;
+
+            var prom_comp = raw_sig;
+            prom_comp.params = try self.alloc.dupe(ParamIr, raw_sig.params);
+            prom_comp.return_type = if (raw_sig.return_type.promise == payload)
+                raw_sig.return_type
+            else
+                try self.makeType(.{ .promise = payload });
+            prom_comp.awaits_promise = false;
+
+            return .{ .awaited = awaited, .promise_companion = prom_comp };
+        }
+
         fn refreshSigParamsAgainstScope(
             self: *Self,
             sig_ir: *SignatureIr,
@@ -5146,6 +5989,7 @@ fn LowerCtx(comptime GraphType: type) type {
             defer fn_scope.deinit();
             try fn_scope.reserve("zigar_js");
             try fn_scope.reserve("zigar_js_tuple");
+            try fn_scope.reserve("__zigar_prom");
             for (sig_ir.type_params) |tp| {
                 try fn_scope.reserve(tp.logical_name);
             }
@@ -5217,6 +6061,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     defer fn_scope_fb.deinit();
                     try fn_scope_fb.reserve("zigar_js");
                     try fn_scope_fb.reserve("zigar_js_tuple");
+                    try fn_scope_fb.reserve("__zigar_prom");
                     const sb = try fn_scope_fb.bindWithFallbackSuffix("self", .snake, "arg");
                     fallback_self_ident = try self.alloc.dupe(u8, sb.zig_ident);
                     sb.deinit(self.scratch);
@@ -5237,6 +6082,7 @@ fn LowerCtx(comptime GraphType: type) type {
             defer fn_scope.deinit();
             try fn_scope.reserve("zigar_js");
             try fn_scope.reserve("zigar_js_tuple");
+            try fn_scope.reserve("__zigar_prom");
 
             var self_param_ident: ?[]const u8 = null;
             if (has_self_receiver) {
@@ -6325,6 +7171,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     for (obj.properties) |pid| {
                         if (pid >= self.graph.properties.len) continue;
                         const p = self.graph.properties[pid];
+                        if (p.computed_symbol != null) return false;
                         if (p.modifiers.method_mod or p.modifiers.private_mod or p.modifiers.protected_mod or p.modifiers.static_mod) continue;
                         try self.mergePropIntoList(out, .{
                             .name_sid = p.name,
@@ -6347,6 +7194,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 .reference => |ref| {
                     if (self.isBuiltinMappedReference(self.str(ref.target_name), ref.type_args.len, ref.target_decl)) return false;
                     const rname = self.str(ref.target_name);
+                    if (self.classifyBuiltinProtocolReference(rname, ref.target_decl) != null) return false;
                     if (std.mem.eql(u8, rname, "Array") or std.mem.eql(u8, rname, "ReadonlyArray") or
                         std.mem.eql(u8, rname, "Promise") or std.mem.eql(u8, rname, "PromiseLike") or
                         std.mem.eql(u8, rname, "Map") or std.mem.eql(u8, rname, "ReadonlyMap") or
@@ -6598,7 +7446,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     &inter_index_sigs,
                 ) and (inter_props.items.len > 0 or inter_methods.items.len > 0 or
                     inter_calls.items.len > 0 or inter_ctors.items.len > 0 or
-                    inter_index_sigs.items.len > 0))
+                    inter_index_sigs.items.len > 0 or self.hasProtocolInGraphTypes(parts, 0)))
                 {
                     const is_closed = no_free_vars or try self.isClosedTypeSubgraph(ty_id);
                     if (can_hoist_in_mod and is_closed and self.cur_mod_root_scope != null) {
@@ -7010,6 +7858,8 @@ fn LowerCtx(comptime GraphType: type) type {
                 .js_symbol,
                 .js_bigint,
                 .js_string,
+                .js_disposable,
+                .js_async_disposable,
                 => true,
                 .typed_slice => |pa| pa == b.typed_slice,
                 .binary_view => |ba| ba == b.binary_view,
@@ -7019,6 +7869,8 @@ fn LowerCtx(comptime GraphType: type) type {
                 .pointer_const => |ia| typeIrEql(ia, b.pointer_const, depth + 1),
                 .slice => |sa| typeIrEql(sa, b.slice, depth + 1),
                 .promise => |pa| typeIrEql(pa, b.promise, depth + 1),
+                .js_iterator => |ia| typeIrEql(ia, b.js_iterator, depth + 1),
+                .js_async_iterator => |ia| typeIrEql(ia, b.js_async_iterator, depth + 1),
                 .js_map => |ma| typeIrEql(ma.key, b.js_map.key, depth + 1) and typeIrEql(ma.value, b.js_map.value, depth + 1),
                 .js_record => |ra| typeIrEql(ra.key, b.js_record.key, depth + 1) and typeIrEql(ra.value, b.js_record.value, depth + 1),
                 .mapped_values_op => |ma| typeIrEql(ma.target, b.mapped_values_op.target, depth + 1) and typeIrEql(ma.value, b.mapped_values_op.value, depth + 1),
@@ -7161,6 +8013,7 @@ fn LowerCtx(comptime GraphType: type) type {
         fn buildGeneralUnionOutcome(
             self: *Self,
             non_null_arms: []const u32,
+            is_return_pos: bool,
             active_tps: []const ActiveTypeParam,
             self_ident_opt: ?[]const u8,
             visited: *std.AutoHashMapUnmanaged(u32, void),
@@ -7250,7 +8103,7 @@ fn LowerCtx(comptime GraphType: type) type {
             for (other_arm_ids.items) |aid| {
                 var arm_visited = try visited.clone(self.scratch);
                 defer arm_visited.deinit(self.scratch);
-                var payload = try self.lowerType(aid, false, active_tps, self_ident_opt, &arm_visited, imports_used, needs_runtime);
+                var payload = try self.lowerType(aid, is_return_pos, active_tps, self_ident_opt, &arm_visited, imports_used, needs_runtime);
                 if (payload.* == .noreturn_type) continue;
                 if (payload.* == .void_type) {
                     extra_nullish = extra_nullish.merge(.undefined_only);
@@ -7433,6 +8286,7 @@ fn LowerCtx(comptime GraphType: type) type {
             self: *Self,
             ty_id: u32,
             arms: []const u32,
+            is_return_pos: bool,
             ref_cnt: u32,
             can_hoist_in_mod: bool,
             no_free_vars: bool,
@@ -7457,9 +8311,9 @@ fn LowerCtx(comptime GraphType: type) type {
             }
 
             if (non_null.items.len == 1) {
-                const base_ty = try self.lowerType(non_null.items[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                const base_ty = try self.lowerType(non_null.items[0], is_return_pos, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                 const final_u = if (nullish != .none) try self.wrapOptionalWithNullish(base_ty, nullish) else base_ty;
-                if (ref_cnt > 1 and can_hoist_in_mod and isSafeToShareTypeIrPtr(final_u) and (no_free_vars or try self.isClosedTypeSubgraph(ty_id))) {
+                if (!is_return_pos and ref_cnt > 1 and can_hoist_in_mod and isSafeToShareTypeIrPtr(final_u) and (no_free_vars or try self.isClosedTypeSubgraph(ty_id))) {
                     try self.cur_mod_closed_types.put(self.scratch, ty_id, final_u);
                 }
                 return final_u;
@@ -7549,7 +8403,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 return if (nullish != .none) try self.wrapOptionalWithNullish(jv, nullish) else jv;
             }
 
-            const can_hoist_union = can_hoist_in_mod and ref_cnt > 1 and (no_free_vars or try self.isClosedTypeSubgraph(ty_id));
+            const can_hoist_union = can_hoist_in_mod and ref_cnt > 1 and !is_return_pos and !self.typeHasTopLevelPositionalIterable(ty_id, 0) and (no_free_vars or try self.isClosedTypeSubgraph(ty_id));
             if (can_hoist_union and nullish == .none) {
                 const h = try self.allocFreshAnonHelperName("__zigar_AnonUnion", active_tps);
                 const hloc = DeclLocation{
@@ -7565,7 +8419,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 self.inline_anon_depth = 0;
                 defer self.inline_anon_depth = saved_depth;
 
-                const outcome = try self.buildGeneralUnionOutcome(non_null.items, &.{}, null, &fresh_visited, imports_used, needs_runtime);
+                const outcome = try self.buildGeneralUnionOutcome(non_null.items, false, &.{}, null, &fresh_visited, imports_used, needs_runtime);
                 switch (outcome.body) {
                     .single => |single_ty| {
                         const eff_single = if (outcome.extra_nullish != .none)
@@ -7622,7 +8476,7 @@ fn LowerCtx(comptime GraphType: type) type {
             self.inline_anon_depth += 1;
             defer self.inline_anon_depth -= 1;
 
-            const outcome = try self.buildGeneralUnionOutcome(non_null.items, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+            const outcome = try self.buildGeneralUnionOutcome(non_null.items, is_return_pos, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
             const eff_nullish = nullish.merge(outcome.extra_nullish);
             const base_ty: *TypeIr = switch (outcome.body) {
                 .single => |single_ty| single_ty,
@@ -7687,7 +8541,7 @@ fn LowerCtx(comptime GraphType: type) type {
 
             var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
             defer visited.deinit(self.scratch);
-            const outcome = try self.buildGeneralUnionOutcome(non_null.items, active_tps, null, &visited, imports_used, needs_runtime);
+            const outcome = try self.buildGeneralUnionOutcome(non_null.items, false, active_tps, null, &visited, imports_used, needs_runtime);
             if (outcome.extra_nullish != .none) return null;
             return switch (outcome.body) {
                 .single => null,
@@ -7761,6 +8615,10 @@ fn LowerCtx(comptime GraphType: type) type {
                 .js_map => return "map",
                 .js_record, .mapped_values_op => return "record",
                 .promise => return "promise",
+                .js_iterator => return "iterator",
+                .js_async_iterator => return "async_iterator",
+                .js_disposable => return "disposable",
+                .js_async_disposable => return "async_disposable",
                 else => {},
             }
             return std.fmt.allocPrint(self.alloc, "variant_{d}", .{idx}) catch "variant";
@@ -7903,8 +8761,46 @@ fn LowerCtx(comptime GraphType: type) type {
                     defer self.scratch.free(kept);
 
                     if (kept.len == 1) {
-                        var sig_ir = raw_sigs[kept[0]];
+                        const raw_one = raw_sigs[kept[0]];
+                        const split_opt = try self.prepareAwaitedAndPromiseSig(raw_one);
+                        var sig_ir = if (split_opt) |sp| sp.awaited else raw_one;
                         const comps = try self.bindSigCompanions(scope, bound.logical_name, &sig_ir);
+
+                        var prom_decl_opt: ?DeclIr = null;
+                        if (split_opt) |sp| {
+                            var prom_sig = sp.promise_companion;
+                            const raw_prom = try std.fmt.allocPrint(self.scratch, "{s}Promise", .{bound.logical_name});
+                            defer self.scratch.free(raw_prom);
+                            const pb = try scope.bind(raw_prom, .camel);
+                            const prom_zig = try self.alloc.dupe(u8, pb.zig_ident);
+                            const prom_logical = try self.alloc.dupe(u8, pb.logical_name);
+                            pb.deinit(self.scratch);
+                            const prom_comps = try self.bindSigCompanions(scope, prom_logical, &prom_sig);
+                            try self.refreshSigParamsAgainstScope(&prom_sig, scope);
+                            prom_decl_opt = .{
+                                .source_decl_id = decl_id,
+                                .zig_ident = prom_zig,
+                                .logical_name = prom_logical,
+                                .wire_name = bound.wire_name,
+                                .is_exported = is_exported,
+                                .is_js_exported = false,
+                                .is_default_export = is_default_export,
+                                .is_global_scope = is_global_scope,
+                                .is_synthetic_companion = is_js_exported and !is_global_scope,
+                                .alloc_companion_ident = prom_comps.alloc_ident,
+                                .slice_companion_ident = prom_comps.slice_ident,
+                                .slice_alloc_companion_ident = prom_comps.slice_alloc_ident,
+                                .narrow_companion_ident = prom_comps.narrow_ident,
+                                .narrow_alloc_companion_ident = prom_comps.narrow_alloc_ident,
+                                .default_companion_ident = prom_comps.default_ident,
+                                .default_alloc_companion_ident = prom_comps.default_alloc_ident,
+                                .infer_companion_ident = prom_comps.infer_ident,
+                                .infer_alloc_companion_ident = prom_comps.infer_alloc_ident,
+                                .jsdoc = prom_sig.jsdoc orelse top_jsdoc,
+                                .kind = .{ .function_decl = prom_sig },
+                            };
+                        }
+
                         try self.refreshSigParamsAgainstScope(&sig_ir, scope);
                         try out_list.append(self.alloc, .{
                             .source_decl_id = decl_id,
@@ -7927,10 +8823,23 @@ fn LowerCtx(comptime GraphType: type) type {
                             .jsdoc = sig_ir.jsdoc orelse top_jsdoc,
                             .kind = .{ .function_decl = sig_ir },
                         });
+                        if (prom_decl_opt) |pd| {
+                            try out_list.append(self.alloc, pd);
+                        }
                     } else {
                         var kept_sigs = try self.scratch.alloc(SignatureIr, kept.len);
                         defer self.scratch.free(kept_sigs);
-                        for (kept, 0..) |orig_idx, ki| kept_sigs[ki] = raw_sigs[orig_idx];
+                        var prom_sigs_list: std.ArrayList(SignatureIr) = .empty;
+                        defer prom_sigs_list.deinit(self.scratch);
+
+                        for (kept, 0..) |orig_idx, ki| {
+                            if (try self.prepareAwaitedAndPromiseSig(raw_sigs[orig_idx])) |sp| {
+                                kept_sigs[ki] = sp.awaited;
+                                try prom_sigs_list.append(self.scratch, sp.promise_companion);
+                            } else {
+                                kept_sigs[ki] = raw_sigs[orig_idx];
+                            }
+                        }
 
                         const sem_names = try overloads.assignSemanticOverloadNames(
                             self.alloc,
@@ -7954,6 +8863,50 @@ fn LowerCtx(comptime GraphType: type) type {
                             disp_alloc_ident = try self.alloc.dupe(u8, dab.zig_ident);
                             dab.deinit(self.scratch);
                         }
+
+                        // Pre-bind `*Promise` companion names into `scope` BEFORE `refreshSigParamsAgainstScope`!
+                        var prom_primary_zig: ?[]const u8 = null;
+                        var prom_primary_logical: ?[]const u8 = null;
+                        var prom_sem_names: []overloads.BoundOverloadIdent = &.{};
+                        var prom_comps: []BoundSigCompanions = &.{};
+                        defer if (prom_comps.len > 0) self.scratch.free(prom_comps);
+                        var prom_disp_alloc_ident: ?[]const u8 = null;
+
+                        if (prom_sigs_list.items.len > 0) {
+                            const raw_prom = try std.fmt.allocPrint(self.scratch, "{s}Promise", .{bound.logical_name});
+                            defer self.scratch.free(raw_prom);
+                            const pb = try scope.bind(raw_prom, .camel);
+                            prom_primary_zig = try self.alloc.dupe(u8, pb.zig_ident);
+                            prom_primary_logical = try self.alloc.dupe(u8, pb.logical_name);
+                            pb.deinit(self.scratch);
+
+                            if (prom_sigs_list.items.len == 1) {
+                                prom_comps = try self.scratch.alloc(BoundSigCompanions, 1);
+                                prom_comps[0] = try self.bindSigCompanions(scope, prom_primary_logical.?, &prom_sigs_list.items[0]);
+                            } else {
+                                prom_sem_names = try overloads.assignSemanticOverloadNames(
+                                    self.alloc,
+                                    self.scratch,
+                                    scope,
+                                    prom_primary_logical.?,
+                                    prom_sigs_list.items,
+                                );
+                                prom_comps = try self.scratch.alloc(BoundSigCompanions, prom_sigs_list.items.len);
+                                var prom_any_alloc = false;
+                                for (0..prom_sigs_list.items.len) |pi| {
+                                    prom_comps[pi] = try self.bindSigCompanions(scope, prom_sem_names[pi].logical_name, &prom_sigs_list.items[pi]);
+                                    if (prom_comps[pi].alloc_ident != null) prom_any_alloc = true;
+                                }
+                                if (prom_any_alloc) {
+                                    const raw_pda = try std.fmt.allocPrint(self.scratch, "{s}Alloc", .{prom_primary_logical.?});
+                                    defer self.scratch.free(raw_pda);
+                                    const pdab = try scope.bind(raw_pda, .camel);
+                                    prom_disp_alloc_ident = try self.alloc.dupe(u8, pdab.zig_ident);
+                                    pdab.deinit(self.scratch);
+                                }
+                            }
+                        }
+
                         const disp_alloc_param = try lower_objects.chooseNonShadowingParamIdent(
                             scope,
                             self.scratch,
@@ -8020,6 +8973,97 @@ fn LowerCtx(comptime GraphType: type) type {
                                 },
                             },
                         });
+
+                        if (prom_sigs_list.items.len == 1) {
+                            var psig = prom_sigs_list.items[0];
+                            try self.refreshSigParamsAgainstScope(&psig, scope);
+                            const pc = prom_comps[0];
+                            try out_list.append(self.alloc, .{
+                                .source_decl_id = decl_id,
+                                .zig_ident = prom_primary_zig.?,
+                                .logical_name = prom_primary_logical.?,
+                                .wire_name = bound.wire_name,
+                                .is_exported = is_exported,
+                                .is_js_exported = false,
+                                .is_default_export = is_default_export,
+                                .is_global_scope = is_global_scope,
+                                .is_synthetic_companion = is_js_exported and !is_global_scope,
+                                .alloc_companion_ident = pc.alloc_ident,
+                                .slice_companion_ident = pc.slice_ident,
+                                .slice_alloc_companion_ident = pc.slice_alloc_ident,
+                                .narrow_companion_ident = pc.narrow_ident,
+                                .narrow_alloc_companion_ident = pc.narrow_alloc_ident,
+                                .default_companion_ident = pc.default_ident,
+                                .default_alloc_companion_ident = pc.default_alloc_ident,
+                                .infer_companion_ident = pc.infer_ident,
+                                .infer_alloc_companion_ident = pc.infer_alloc_ident,
+                                .jsdoc = psig.jsdoc orelse top_jsdoc,
+                                .kind = .{ .function_decl = psig },
+                            });
+                        } else if (prom_sigs_list.items.len > 1) {
+                            var prom_cands = try self.alloc.alloc(OverloadCandidateIr, prom_sigs_list.items.len);
+                            for (0..prom_sigs_list.items.len) |pi| {
+                                const psig = &prom_sigs_list.items[pi];
+                                try self.refreshSigParamsAgainstScope(psig, scope);
+                                const pc = prom_comps[pi];
+                                prom_cands[pi] = .{
+                                    .target_ident = prom_sem_names[pi].zig_ident,
+                                    .alloc_target_ident = pc.alloc_ident,
+                                    .slice_target_ident = pc.slice_ident,
+                                    .infer_target_ident = pc.infer_ident,
+                                    .infer_alloc_target_ident = pc.infer_alloc_ident,
+                                    .signature = psig.*,
+                                };
+                                try out_list.append(self.alloc, .{
+                                    .source_decl_id = decl_id,
+                                    .zig_ident = prom_sem_names[pi].zig_ident,
+                                    .logical_name = prom_sem_names[pi].logical_name,
+                                    .wire_name = bound.wire_name,
+                                    .is_exported = is_exported,
+                                    .is_js_exported = false,
+                                    .is_default_export = is_default_export and pi == 0,
+                                    .is_global_scope = is_global_scope,
+                                    .is_synthetic_companion = is_js_exported and !is_global_scope,
+                                    .alloc_companion_ident = pc.alloc_ident,
+                                    .slice_companion_ident = pc.slice_ident,
+                                    .slice_alloc_companion_ident = pc.slice_alloc_ident,
+                                    .narrow_companion_ident = pc.narrow_ident,
+                                    .narrow_alloc_companion_ident = pc.narrow_alloc_ident,
+                                    .default_companion_ident = pc.default_ident,
+                                    .default_alloc_companion_ident = pc.default_alloc_ident,
+                                    .infer_companion_ident = pc.infer_ident,
+                                    .infer_alloc_companion_ident = pc.infer_alloc_ident,
+                                    .jsdoc = psig.jsdoc orelse top_jsdoc,
+                                    .kind = .{ .function_decl = psig.* },
+                                });
+                            }
+                            try out_list.append(self.alloc, .{
+                                .source_decl_id = decl_id,
+                                .zig_ident = prom_primary_zig.?,
+                                .logical_name = prom_primary_logical.?,
+                                .wire_name = bound.wire_name,
+                                .is_exported = is_exported,
+                                .is_js_exported = false,
+                                .is_default_export = false,
+                                .is_global_scope = is_global_scope,
+                                .is_synthetic_companion = is_js_exported and !is_global_scope,
+                                .alloc_companion_ident = prom_disp_alloc_ident,
+                                .jsdoc = top_jsdoc orelse prom_sigs_list.items[0].jsdoc,
+                                .kind = .{
+                                    .overload_dispatch = .{
+                                        .zig_ident = prom_primary_zig.?,
+                                        .logical_name = prom_primary_logical.?,
+                                        .alloc_companion_ident = prom_disp_alloc_ident,
+                                        .alloc_param_ident = disp_alloc_param,
+                                        .is_static = true,
+                                        .is_constructor = false,
+                                        .mode = overloads.planDispatchMode(prom_sigs_list.items),
+                                        .candidates = prom_cands,
+                                        .jsdoc = top_jsdoc orelse prom_sigs_list.items[0].jsdoc,
+                                    },
+                                },
+                            });
+                        }
                     }
                 },
                 .variable_decl => |ty_id| {
@@ -8763,7 +9807,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             &inter_index_sigs,
                         ) and (inter_props.items.len > 0 or inter_methods.items.len > 0 or
                             inter_calls.items.len > 0 or inter_ctors.items.len > 0 or
-                            inter_index_sigs.items.len > 0))
+                            inter_index_sigs.items.len > 0 or self.hasProtocolInGraphTypes(inter_parts, 0)))
                         {
                             const sourced_bases = try self.wrapUnsourcedBases(inter_parts);
                             const struct_ir = try self.lowerStructDecl(
@@ -9857,8 +10901,8 @@ fn LowerCtx(comptime GraphType: type) type {
                 .reference => |ref| {
                     const rname = self.str(ref.target_name);
                     if (self.isBuiltinMappedReference(rname, ref.type_args.len, ref.target_decl)) return false;
+                    if (self.classifyBuiltinProtocolReference(rname, ref.target_decl) != null) return true;
                     if (std.mem.eql(u8, rname, "Array") or std.mem.eql(u8, rname, "ReadonlyArray") or
-                        std.mem.eql(u8, rname, "Iterable") or std.mem.eql(u8, rname, "IterableIterator") or
                         std.mem.eql(u8, rname, "Promise") or std.mem.eql(u8, rname, "PromiseLike") or
                         std.mem.eql(u8, rname, "Map") or std.mem.eql(u8, rname, "ReadonlyMap") or
                         std.mem.eql(u8, rname, "Set") or std.mem.eql(u8, rname, "ReadonlySet") or
@@ -10513,10 +11557,48 @@ fn LowerCtx(comptime GraphType: type) type {
             if (kept.len == 1) {
                 const orig_idx = kept[0];
                 const slot = slots[orig_idx];
-                var sig_ir = raw_sigs[orig_idx];
+                const raw_one = raw_sigs[orig_idx];
+                const split_opt = try self.prepareAwaitedAndPromiseSig(raw_one);
+                var sig_ir = if (split_opt) |sp| sp.awaited else raw_one;
                 const comps = try self.bindSigCompanions(target_scope, primary_logical, &sig_ir);
+
+                var prom_decl_opt: ?DeclIr = null;
+                if (split_opt) |sp| {
+                    var prom_sig = sp.promise_companion;
+                    const raw_prom = try std.fmt.allocPrint(self.scratch, "{s}Promise", .{primary_logical});
+                    defer self.scratch.free(raw_prom);
+                    const pb = try target_scope.bind(raw_prom, .camel);
+                    const prom_zig = try self.alloc.dupe(u8, pb.zig_ident);
+                    const prom_logical = try self.alloc.dupe(u8, pb.logical_name);
+                    pb.deinit(self.scratch);
+                    const prom_comps = try self.bindSigCompanions(target_scope, prom_logical, &prom_sig);
+                    try self.refreshSigParamsAgainstScope(&prom_sig, target_scope);
+                    prom_decl_opt = .{
+                        .source_decl_id = slot.source_decl_id,
+                        .zig_ident = prom_zig,
+                        .logical_name = prom_logical,
+                        .wire_name = try self.alloc.dupe(u8, owner_wire),
+                        .is_exported = true,
+                        .is_js_exported = false,
+                        .is_default_export = slot.is_default_export,
+                        .is_global_scope = slot.is_global_scope,
+                        .is_synthetic_companion = true,
+                        .alloc_companion_ident = prom_comps.alloc_ident,
+                        .slice_companion_ident = prom_comps.slice_ident,
+                        .slice_alloc_companion_ident = prom_comps.slice_alloc_ident,
+                        .narrow_companion_ident = prom_comps.narrow_ident,
+                        .narrow_alloc_companion_ident = prom_comps.narrow_alloc_ident,
+                        .default_companion_ident = prom_comps.default_ident,
+                        .default_alloc_companion_ident = prom_comps.default_alloc_ident,
+                        .infer_companion_ident = prom_comps.infer_ident,
+                        .infer_alloc_companion_ident = prom_comps.infer_alloc_ident,
+                        .jsdoc = prom_sig.jsdoc orelse slot.decl_jsdoc,
+                        .kind = .{ .function_decl = prom_sig },
+                    };
+                }
+
                 try self.refreshSigParamsAgainstScope(&sig_ir, target_scope);
-                var out = try self.alloc.alloc(DeclIr, 1);
+                var out = try self.alloc.alloc(DeclIr, if (prom_decl_opt != null) 2 else 1);
                 out[0] = .{
                     .source_decl_id = slot.source_decl_id,
                     .zig_ident = primary_zig,
@@ -10538,12 +11620,26 @@ fn LowerCtx(comptime GraphType: type) type {
                     .jsdoc = sig_ir.jsdoc orelse slot.decl_jsdoc,
                     .kind = .{ .function_decl = sig_ir },
                 };
+                if (prom_decl_opt) |pd| out[1] = pd;
                 return out;
             }
 
             var kept_sigs = try self.scratch.alloc(SignatureIr, kept.len);
             defer self.scratch.free(kept_sigs);
-            for (kept, 0..) |orig_idx, ki| kept_sigs[ki] = raw_sigs[orig_idx];
+            var prom_sigs_list: std.ArrayList(SignatureIr) = .empty;
+            defer prom_sigs_list.deinit(self.scratch);
+            var prom_slot_indices: std.ArrayList(usize) = .empty;
+            defer prom_slot_indices.deinit(self.scratch);
+
+            for (kept, 0..) |orig_idx, ki| {
+                if (try self.prepareAwaitedAndPromiseSig(raw_sigs[orig_idx])) |sp| {
+                    kept_sigs[ki] = sp.awaited;
+                    try prom_sigs_list.append(self.scratch, sp.promise_companion);
+                    try prom_slot_indices.append(self.scratch, orig_idx);
+                } else {
+                    kept_sigs[ki] = raw_sigs[orig_idx];
+                }
+            }
 
             const sem_names = try overloads.assignSemanticOverloadNames(
                 self.alloc,
@@ -10568,6 +11664,49 @@ fn LowerCtx(comptime GraphType: type) type {
                 disp_alloc_ident = try self.alloc.dupe(u8, dab.zig_ident);
                 dab.deinit(self.scratch);
             }
+
+            var prom_primary_zig: ?[]const u8 = null;
+            var prom_primary_logical: ?[]const u8 = null;
+            var prom_sem_names: []overloads.BoundOverloadIdent = &.{};
+            var prom_comps: []BoundSigCompanions = &.{};
+            defer if (prom_comps.len > 0) self.scratch.free(prom_comps);
+            var prom_disp_alloc_ident: ?[]const u8 = null;
+
+            if (prom_sigs_list.items.len > 0) {
+                const raw_prom = try std.fmt.allocPrint(self.scratch, "{s}Promise", .{primary_logical});
+                defer self.scratch.free(raw_prom);
+                const pb = try target_scope.bind(raw_prom, .camel);
+                prom_primary_zig = try self.alloc.dupe(u8, pb.zig_ident);
+                prom_primary_logical = try self.alloc.dupe(u8, pb.logical_name);
+                pb.deinit(self.scratch);
+
+                if (prom_sigs_list.items.len == 1) {
+                    prom_comps = try self.scratch.alloc(BoundSigCompanions, 1);
+                    prom_comps[0] = try self.bindSigCompanions(target_scope, prom_primary_logical.?, &prom_sigs_list.items[0]);
+                } else {
+                    prom_sem_names = try overloads.assignSemanticOverloadNames(
+                        self.alloc,
+                        self.scratch,
+                        target_scope,
+                        prom_primary_logical.?,
+                        prom_sigs_list.items,
+                    );
+                    prom_comps = try self.scratch.alloc(BoundSigCompanions, prom_sigs_list.items.len);
+                    var prom_any_alloc = false;
+                    for (0..prom_sigs_list.items.len) |pi| {
+                        prom_comps[pi] = try self.bindSigCompanions(target_scope, prom_sem_names[pi].logical_name, &prom_sigs_list.items[pi]);
+                        if (prom_comps[pi].alloc_ident != null) prom_any_alloc = true;
+                    }
+                    if (prom_any_alloc) {
+                        const raw_pda = try std.fmt.allocPrint(self.scratch, "{s}Alloc", .{prom_primary_logical.?});
+                        defer self.scratch.free(raw_pda);
+                        const pdab = try target_scope.bind(raw_pda, .camel);
+                        prom_disp_alloc_ident = try self.alloc.dupe(u8, pdab.zig_ident);
+                        pdab.deinit(self.scratch);
+                    }
+                }
+            }
+
             const disp_alloc_param = try lower_objects.chooseNonShadowingParamIdent(
                 target_scope,
                 self.scratch,
@@ -10575,7 +11714,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 "allocator",
             );
 
-            var out = try self.alloc.alloc(DeclIr, kept.len + 1);
+            var out_list: std.ArrayList(DeclIr) = .empty;
             var cands = try self.alloc.alloc(OverloadCandidateIr, kept.len);
             const wire_duped = try self.alloc.dupe(u8, owner_wire);
             for (0..kept.len) |ki| {
@@ -10589,7 +11728,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     .infer_alloc_target_ident = kept_comps[ki].infer_alloc_ident,
                     .signature = kept_sigs[ki],
                 };
-                out[ki] = .{
+                try out_list.append(self.alloc, .{
                     .source_decl_id = slot.source_decl_id,
                     .zig_ident = sem_names[ki].zig_ident,
                     .logical_name = sem_names[ki].logical_name,
@@ -10609,10 +11748,10 @@ fn LowerCtx(comptime GraphType: type) type {
                     .infer_alloc_companion_ident = kept_comps[ki].infer_alloc_ident,
                     .jsdoc = kept_sigs[ki].jsdoc orelse slot.decl_jsdoc,
                     .kind = .{ .function_decl = kept_sigs[ki] },
-                };
+                });
             }
             const first_slot = slots[kept[0]];
-            out[kept.len] = .{
+            try out_list.append(self.alloc, .{
                 .source_decl_id = first_slot.source_decl_id,
                 .zig_ident = primary_zig,
                 .logical_name = primary_logical,
@@ -10636,8 +11775,102 @@ fn LowerCtx(comptime GraphType: type) type {
                         .jsdoc = first_slot.decl_jsdoc orelse kept_sigs[0].jsdoc,
                     },
                 },
-            };
-            return out;
+            });
+
+            if (prom_sigs_list.items.len == 1) {
+                const pslot = slots[prom_slot_indices.items[0]];
+                var psig = prom_sigs_list.items[0];
+                try self.refreshSigParamsAgainstScope(&psig, target_scope);
+                const pc = prom_comps[0];
+                try out_list.append(self.alloc, .{
+                    .source_decl_id = pslot.source_decl_id,
+                    .zig_ident = prom_primary_zig.?,
+                    .logical_name = prom_primary_logical.?,
+                    .wire_name = wire_duped,
+                    .is_exported = true,
+                    .is_js_exported = false,
+                    .is_default_export = pslot.is_default_export,
+                    .is_global_scope = pslot.is_global_scope,
+                    .is_synthetic_companion = true,
+                    .alloc_companion_ident = pc.alloc_ident,
+                    .slice_companion_ident = pc.slice_ident,
+                    .slice_alloc_companion_ident = pc.slice_alloc_ident,
+                    .narrow_companion_ident = pc.narrow_ident,
+                    .narrow_alloc_companion_ident = pc.narrow_alloc_ident,
+                    .default_companion_ident = pc.default_ident,
+                    .default_alloc_companion_ident = pc.default_alloc_ident,
+                    .infer_companion_ident = pc.infer_ident,
+                    .infer_alloc_companion_ident = pc.infer_alloc_ident,
+                    .jsdoc = psig.jsdoc orelse pslot.decl_jsdoc,
+                    .kind = .{ .function_decl = psig },
+                });
+            } else if (prom_sigs_list.items.len > 1) {
+                var prom_cands = try self.alloc.alloc(OverloadCandidateIr, prom_sigs_list.items.len);
+                for (0..prom_sigs_list.items.len) |pi| {
+                    const pslot = slots[prom_slot_indices.items[pi]];
+                    const psig = &prom_sigs_list.items[pi];
+                    try self.refreshSigParamsAgainstScope(psig, target_scope);
+                    const pc = prom_comps[pi];
+                    prom_cands[pi] = .{
+                        .target_ident = prom_sem_names[pi].zig_ident,
+                        .alloc_target_ident = pc.alloc_ident,
+                        .slice_target_ident = pc.slice_ident,
+                        .infer_target_ident = pc.infer_ident,
+                        .infer_alloc_target_ident = pc.infer_alloc_ident,
+                        .signature = psig.*,
+                    };
+                    try out_list.append(self.alloc, .{
+                        .source_decl_id = pslot.source_decl_id,
+                        .zig_ident = prom_sem_names[pi].zig_ident,
+                        .logical_name = prom_sem_names[pi].logical_name,
+                        .wire_name = wire_duped,
+                        .is_exported = true,
+                        .is_js_exported = false,
+                        .is_default_export = pslot.is_default_export and pi == 0,
+                        .is_global_scope = pslot.is_global_scope,
+                        .is_synthetic_companion = true,
+                        .alloc_companion_ident = pc.alloc_ident,
+                        .slice_companion_ident = pc.slice_ident,
+                        .slice_alloc_companion_ident = pc.slice_alloc_ident,
+                        .narrow_companion_ident = pc.narrow_ident,
+                        .narrow_alloc_companion_ident = pc.narrow_alloc_ident,
+                        .default_companion_ident = pc.default_ident,
+                        .default_alloc_companion_ident = pc.default_alloc_ident,
+                        .infer_companion_ident = pc.infer_ident,
+                        .infer_alloc_companion_ident = pc.infer_alloc_ident,
+                        .jsdoc = psig.jsdoc orelse pslot.decl_jsdoc,
+                        .kind = .{ .function_decl = psig.* },
+                    });
+                }
+                const first_pslot = slots[prom_slot_indices.items[0]];
+                try out_list.append(self.alloc, .{
+                    .source_decl_id = first_pslot.source_decl_id,
+                    .zig_ident = prom_primary_zig.?,
+                    .logical_name = prom_primary_logical.?,
+                    .wire_name = wire_duped,
+                    .is_exported = true,
+                    .is_js_exported = false,
+                    .is_default_export = false,
+                    .is_global_scope = first_pslot.is_global_scope,
+                    .is_synthetic_companion = true,
+                    .alloc_companion_ident = prom_disp_alloc_ident,
+                    .jsdoc = first_pslot.decl_jsdoc orelse prom_sigs_list.items[0].jsdoc,
+                    .kind = .{
+                        .overload_dispatch = .{
+                            .zig_ident = prom_primary_zig.?,
+                            .logical_name = prom_primary_logical.?,
+                            .alloc_companion_ident = prom_disp_alloc_ident,
+                            .alloc_param_ident = disp_alloc_param,
+                            .is_static = true,
+                            .is_constructor = false,
+                            .mode = overloads.planDispatchMode(prom_sigs_list.items),
+                            .candidates = prom_cands,
+                            .jsdoc = first_pslot.decl_jsdoc orelse prom_sigs_list.items[0].jsdoc,
+                        },
+                    },
+                });
+            }
+            return try out_list.toOwnedSlice(self.alloc);
         }
 
         fn expandIndexSigKeyGraphTypes(
@@ -10946,6 +12179,24 @@ fn LowerCtx(comptime GraphType: type) type {
                     }
                 },
                 .reference => |ref| {
+                    if (repr == .handle_wrapper) {
+                        if (self.classifyBuiltinProtocolReference(self.str(ref.target_name), ref.target_decl)) |pk| {
+                            const proto_base_opt: ?TypeIr = switch (pk) {
+                                .disposable => .js_disposable,
+                                .async_disposable => .js_async_disposable,
+                                else => null,
+                            };
+                            if (proto_base_opt) |pb_tag| {
+                                needs_runtime.* = true;
+                                const pb_ty = try self.makeType(pb_tag);
+                                for (out.items) |existing| {
+                                    if (typeIrEql(existing, pb_ty, 0)) return;
+                                }
+                                try out.append(self.alloc, pb_ty);
+                            }
+                            return;
+                        }
+                    }
                     const raw_td = ref.target_decl orelse return;
                     const td = self.canonicalMergedStructOwnerId(raw_td);
                     if (td == owner_decl_id or td >= self.graph.decls.len) return;
@@ -11741,8 +12992,19 @@ fn LowerCtx(comptime GraphType: type) type {
                 });
             }
 
+            const struct_protocols = try self.extractStructProtocols(
+                raw_props,
+                raw_methods,
+                sourced_bases,
+                tp_res.active,
+                self_ident,
+                imports_used,
+                needs_runtime,
+                &env_cache,
+            );
+
             // 4c. Empty dictionary `init()` factory when this is a pure dictionary interface (`{}` is valid).
-            const empty_init_ident = if (lower_heritage.shouldSynthesizeIndexedEmptyInit(
+            const empty_init_ident = if (!struct_protocols.hasAny() and lower_heritage.shouldSynthesizeIndexedEmptyInit(
                 is_class,
                 is_callable_handle,
                 ctor_count,
@@ -11754,7 +13016,7 @@ fn LowerCtx(comptime GraphType: type) type {
             else
                 null;
 
-            // 5. Backing `ref` field (`ref` or `__zigar_ref` when `.ref()` exists) + lifecycle & cast helpers!
+            // 5. Backing `ref` field (`ref` or `__zigar_ref` when `.ref()` exists) + lifecycle, cast & protocol helpers!
             const ref_field_ident = try lower_objects.bindBackingRefFieldIdent(&struct_scope, self.scratch, self.alloc);
             const deinit_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "deinit");
             const to_js_ref_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "toJsRef");
@@ -11762,6 +13024,34 @@ fn LowerCtx(comptime GraphType: type) type {
             const clone_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "clone");
             const as_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "as");
             const try_as_ident = try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "tryAs");
+            const iterator_ident = if (struct_protocols.iterator_elem_ty != null)
+                try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "iterator")
+            else
+                null;
+            const async_iterator_ident = if (struct_protocols.async_iterator_elem_ty != null)
+                try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "asyncIterator")
+            else
+                null;
+            const dispose_ident = if (struct_protocols.has_sync_dispose)
+                try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "dispose")
+            else
+                null;
+            const try_dispose_ident = if (struct_protocols.has_sync_dispose)
+                try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "tryDispose")
+            else
+                null;
+            const release_handle_only_ident = if (struct_protocols.has_sync_dispose)
+                try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "releaseHandleOnly")
+            else
+                null;
+            const async_dispose_ident = if (struct_protocols.has_async_dispose)
+                try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "asyncDispose")
+            else
+                null;
+            const try_async_dispose_ident = if (struct_protocols.has_async_dispose)
+                try lower_objects.tryBindOptionalHelperIdent(&struct_scope, self.scratch, self.alloc, "tryAsyncDispose")
+            else
+                null;
 
             // 7. Nested declarations (`merged_ns_consumed` & `merged_generic_ns_peer`) + merged static `call`
             // functions (`interface $` + `function $`) so ALL explicit struct-level declarations are registered in
@@ -11949,7 +13239,9 @@ fn LowerCtx(comptime GraphType: type) type {
                 if (kept_m.len == 1) {
                     const orig_idx = kept_m[0];
                     const ent = grp.entries.items[orig_idx];
-                    const m_sig = raw_msigs[orig_idx];
+                    const raw_one = raw_msigs[orig_idx];
+                    const split_opt = try self.prepareAwaitedAndPromiseSig(raw_one);
+                    const m_sig = if (split_opt) |sp| sp.awaited else raw_one;
                     const comps = try self.bindSigCompanions(&struct_scope, grp.primary_logical_name, &m_sig);
                     try methods_list.append(self.alloc, .{
                         .zig_ident = grp.primary_zig_ident,
@@ -11969,10 +13261,52 @@ fn LowerCtx(comptime GraphType: type) type {
                         .signature = m_sig,
                         .jsdoc = m_sig.jsdoc orelse ent.prop_jsdoc,
                     });
+                    if (split_opt) |sp| {
+                        const prom_sig = sp.promise_companion;
+                        const raw_prom = try std.fmt.allocPrint(self.scratch, "{s}Promise", .{grp.primary_logical_name});
+                        defer self.scratch.free(raw_prom);
+                        const pb = try struct_scope.bind(raw_prom, .camel);
+                        const prom_zig = try self.alloc.dupe(u8, pb.zig_ident);
+                        const prom_logical = try self.alloc.dupe(u8, pb.logical_name);
+                        pb.deinit(self.scratch);
+                        const prom_comps = try self.bindSigCompanions(&struct_scope, prom_logical, &prom_sig);
+                        try methods_list.append(self.alloc, .{
+                            .zig_ident = prom_zig,
+                            .logical_name = prom_logical,
+                            .wire_name = grp.wire_name,
+                            .alloc_companion_ident = prom_comps.alloc_ident,
+                            .slice_companion_ident = prom_comps.slice_ident,
+                            .slice_alloc_companion_ident = prom_comps.slice_alloc_ident,
+                            .narrow_companion_ident = prom_comps.narrow_ident,
+                            .narrow_alloc_companion_ident = prom_comps.narrow_alloc_ident,
+                            .default_companion_ident = prom_comps.default_ident,
+                            .default_alloc_companion_ident = prom_comps.default_alloc_ident,
+                            .infer_companion_ident = prom_comps.infer_ident,
+                            .infer_alloc_companion_ident = prom_comps.infer_alloc_ident,
+                            .is_static = grp.is_static,
+                            .is_synthetic_companion = true,
+                            .call_kind = grp.call_kind,
+                            .signature = prom_sig,
+                            .jsdoc = prom_sig.jsdoc orelse ent.prop_jsdoc,
+                        });
+                    }
                 } else {
                     var kept_msigs = try self.scratch.alloc(SignatureIr, kept_m.len);
                     defer self.scratch.free(kept_msigs);
-                    for (kept_m, 0..) |orig_idx, ki| kept_msigs[ki] = raw_msigs[orig_idx];
+                    var prom_msigs_list: std.ArrayList(SignatureIr) = .empty;
+                    defer prom_msigs_list.deinit(self.scratch);
+                    var prom_ent_indices: std.ArrayList(usize) = .empty;
+                    defer prom_ent_indices.deinit(self.scratch);
+
+                    for (kept_m, 0..) |orig_idx, ki| {
+                        if (try self.prepareAwaitedAndPromiseSig(raw_msigs[orig_idx])) |sp| {
+                            kept_msigs[ki] = sp.awaited;
+                            try prom_msigs_list.append(self.scratch, sp.promise_companion);
+                            try prom_ent_indices.append(self.scratch, orig_idx);
+                        } else {
+                            kept_msigs[ki] = raw_msigs[orig_idx];
+                        }
+                    }
 
                     const sem_names = try overloads.assignSemanticOverloadNames(
                         self.alloc,
@@ -12038,6 +13372,106 @@ fn LowerCtx(comptime GraphType: type) type {
                         .cand_start = cand_start,
                         .cand_len = kept_m.len,
                     });
+
+                    if (prom_msigs_list.items.len > 0) {
+                        const raw_prom = try std.fmt.allocPrint(self.scratch, "{s}Promise", .{grp.primary_logical_name});
+                        defer self.scratch.free(raw_prom);
+                        const pb = try struct_scope.bind(raw_prom, .camel);
+                        const prom_primary_zig = try self.alloc.dupe(u8, pb.zig_ident);
+                        const prom_primary_logical = try self.alloc.dupe(u8, pb.logical_name);
+                        pb.deinit(self.scratch);
+
+                        if (prom_msigs_list.items.len == 1) {
+                            const pent = grp.entries.items[prom_ent_indices.items[0]];
+                            const psig = prom_msigs_list.items[0];
+                            const pc = try self.bindSigCompanions(&struct_scope, prom_primary_logical, &psig);
+                            try methods_list.append(self.alloc, .{
+                                .zig_ident = prom_primary_zig,
+                                .logical_name = prom_primary_logical,
+                                .wire_name = grp.wire_name,
+                                .alloc_companion_ident = pc.alloc_ident,
+                                .slice_companion_ident = pc.slice_ident,
+                                .slice_alloc_companion_ident = pc.slice_alloc_ident,
+                                .narrow_companion_ident = pc.narrow_ident,
+                                .narrow_alloc_companion_ident = pc.narrow_alloc_ident,
+                                .default_companion_ident = pc.default_ident,
+                                .default_alloc_companion_ident = pc.default_alloc_ident,
+                                .infer_companion_ident = pc.infer_ident,
+                                .infer_alloc_companion_ident = pc.infer_alloc_ident,
+                                .is_static = grp.is_static,
+                                .is_synthetic_companion = true,
+                                .call_kind = grp.call_kind,
+                                .signature = psig,
+                                .jsdoc = psig.jsdoc orelse pent.prop_jsdoc,
+                            });
+                        } else {
+                            const prom_sem_names = try overloads.assignSemanticOverloadNames(
+                                self.alloc,
+                                self.scratch,
+                                &struct_scope,
+                                prom_primary_logical,
+                                prom_msigs_list.items,
+                            );
+                            var prom_comps = try self.scratch.alloc(BoundSigCompanions, prom_msigs_list.items.len);
+                            defer self.scratch.free(prom_comps);
+                            var prom_any_alloc = false;
+                            for (0..prom_msigs_list.items.len) |pi| {
+                                prom_comps[pi] = try self.bindSigCompanions(&struct_scope, prom_sem_names[pi].logical_name, &prom_msigs_list.items[pi]);
+                                if (prom_comps[pi].alloc_ident != null) prom_any_alloc = true;
+                            }
+                            var prom_disp_alloc_ident: ?[]const u8 = null;
+                            if (prom_any_alloc) {
+                                const raw_pda = try std.fmt.allocPrint(self.scratch, "{s}Alloc", .{prom_primary_logical});
+                                defer self.scratch.free(raw_pda);
+                                const pdab = try struct_scope.bind(raw_pda, .camel);
+                                prom_disp_alloc_ident = try self.alloc.dupe(u8, pdab.zig_ident);
+                                pdab.deinit(self.scratch);
+                            }
+
+                            const prom_cand_start = methods_list.items.len;
+                            const prom_cands = try self.alloc.alloc(OverloadCandidateIr, prom_msigs_list.items.len);
+                            for (0..prom_msigs_list.items.len) |pi| {
+                                const pent = grp.entries.items[prom_ent_indices.items[pi]];
+                                const psig = prom_msigs_list.items[pi];
+                                try methods_list.append(self.alloc, .{
+                                    .zig_ident = prom_sem_names[pi].zig_ident,
+                                    .logical_name = prom_sem_names[pi].logical_name,
+                                    .wire_name = grp.wire_name,
+                                    .alloc_companion_ident = prom_comps[pi].alloc_ident,
+                                    .slice_companion_ident = prom_comps[pi].slice_ident,
+                                    .slice_alloc_companion_ident = prom_comps[pi].slice_alloc_ident,
+                                    .narrow_companion_ident = prom_comps[pi].narrow_ident,
+                                    .narrow_alloc_companion_ident = prom_comps[pi].narrow_alloc_ident,
+                                    .default_companion_ident = prom_comps[pi].default_ident,
+                                    .default_alloc_companion_ident = prom_comps[pi].default_alloc_ident,
+                                    .infer_companion_ident = prom_comps[pi].infer_ident,
+                                    .infer_alloc_companion_ident = prom_comps[pi].infer_alloc_ident,
+                                    .is_static = grp.is_static,
+                                    .is_synthetic_companion = true,
+                                    .call_kind = grp.call_kind,
+                                    .signature = psig,
+                                    .jsdoc = psig.jsdoc orelse pent.prop_jsdoc,
+                                });
+                            }
+                            const first_pent = grp.entries.items[prom_ent_indices.items[0]];
+                            const prom_disp_idx = method_dispatches_list.items.len;
+                            try method_dispatches_list.append(self.alloc, .{
+                                .zig_ident = prom_primary_zig,
+                                .logical_name = prom_primary_logical,
+                                .alloc_companion_ident = prom_disp_alloc_ident,
+                                .is_static = grp.is_static,
+                                .is_constructor = false,
+                                .mode = overloads.planDispatchMode(prom_msigs_list.items),
+                                .candidates = prom_cands,
+                                .jsdoc = prom_msigs_list.items[0].jsdoc orelse first_pent.prop_jsdoc,
+                            });
+                            try pending_dispatches.append(self.scratch, .{
+                                .disp_idx = prom_disp_idx,
+                                .cand_start = prom_cand_start,
+                                .cand_len = prom_msigs_list.items.len,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -12207,6 +13641,17 @@ fn LowerCtx(comptime GraphType: type) type {
                 .try_as_ident = try_as_ident,
                 .clone_ident = clone_ident,
                 .empty_init_ident = empty_init_ident,
+                .iterator_ident = iterator_ident,
+                .iterator_elem_ty = struct_protocols.iterator_elem_ty,
+                .async_iterator_ident = async_iterator_ident,
+                .async_iterator_elem_ty = struct_protocols.async_iterator_elem_ty,
+                .has_sync_dispose = struct_protocols.has_sync_dispose,
+                .dispose_ident = dispose_ident,
+                .try_dispose_ident = try_dispose_ident,
+                .release_handle_only_ident = release_handle_only_ident,
+                .has_async_dispose = struct_protocols.has_async_dispose,
+                .async_dispose_ident = async_dispose_ident,
+                .try_async_dispose_ident = try_async_dispose_ident,
                 .required_methods = try required_methods.toOwnedSlice(self.alloc),
                 .required_props = try required_props.toOwnedSlice(self.alloc),
                 .bases = direct_bases,
@@ -13438,64 +14883,165 @@ fn LowerCtx(comptime GraphType: type) type {
             modules: []ModuleIr,
             mod_scopes: []naming.ScopeNamer,
         ) error{OutOfMemory}!void {
+            const CompFieldTag = enum {
+                alloc,
+                slice,
+                slice_alloc,
+                narrow,
+                narrow_alloc,
+                default,
+                default_alloc,
+                with,
+                infer,
+                infer_alloc,
+            };
+            const CompUpdate = struct {
+                decl_idx: usize,
+                tag: CompFieldTag,
+                ident: []const u8,
+            };
+
             var pass: usize = 0;
             while (pass < 4) : (pass += 1) {
                 var added_any = false;
                 for (modules, 0..) |*m, m_idx| {
                     var extras: std.ArrayList(DeclIr) = .empty;
                     defer extras.deinit(self.scratch);
-                    const comp_updates = try self.scratch.alloc(?[]const u8, m.decls.len);
-                    defer self.scratch.free(comp_updates);
-                    @memset(comp_updates, null);
+                    var comp_updates: std.ArrayList(CompUpdate) = .empty;
+                    defer comp_updates.deinit(self.scratch);
 
                     for (m.decls, 0..) |d, di| {
-                        if (d.kind != .re_export_decl or d.alloc_companion_ident != null) continue;
+                        if (d.kind != .re_export_decl) continue;
                         const re = d.kind.re_export_decl;
                         if (re.target_module_index >= modules.len or re.target_zig_path.len == 0) continue;
                         const target_mod = modules[re.target_module_index];
                         const target_di = findNestedDeclByZigPath(target_mod.decls, re.target_zig_path) orelse continue;
-                        const target_alloc_ident = target_di.alloc_companion_ident orelse continue;
 
-                        const desired_alloc = try std.fmt.allocPrint(self.scratch, "{s}Alloc", .{d.logical_name});
-                        defer self.scratch.free(desired_alloc);
-                        if (mod_scopes[m_idx].isTaken(desired_alloc)) continue;
+                        const field_specs = [_]struct {
+                            tag: CompFieldTag,
+                            suffix: []const u8,
+                            cur: ?[]const u8,
+                            target: ?[]const u8,
+                        }{
+                            .{ .tag = .alloc, .suffix = "Alloc", .cur = d.alloc_companion_ident, .target = target_di.alloc_companion_ident },
+                            .{ .tag = .slice, .suffix = "Slice", .cur = d.slice_companion_ident, .target = target_di.slice_companion_ident },
+                            .{ .tag = .slice_alloc, .suffix = "SliceAlloc", .cur = d.slice_alloc_companion_ident, .target = target_di.slice_alloc_companion_ident },
+                            .{ .tag = .narrow, .suffix = "Narrow", .cur = d.narrow_companion_ident, .target = target_di.narrow_companion_ident },
+                            .{ .tag = .narrow_alloc, .suffix = "NarrowAlloc", .cur = d.narrow_alloc_companion_ident, .target = target_di.narrow_alloc_companion_ident },
+                            .{ .tag = .default, .suffix = "Default", .cur = d.default_companion_ident, .target = target_di.default_companion_ident },
+                            .{ .tag = .default_alloc, .suffix = "DefaultAlloc", .cur = d.default_alloc_companion_ident, .target = target_di.default_alloc_companion_ident },
+                            .{ .tag = .with, .suffix = "With", .cur = d.with_companion_ident, .target = target_di.with_companion_ident },
+                            .{ .tag = .infer, .suffix = "Infer", .cur = d.infer_companion_ident, .target = target_di.infer_companion_ident },
+                            .{ .tag = .infer_alloc, .suffix = "InferAlloc", .cur = d.infer_alloc_companion_ident, .target = target_di.infer_alloc_companion_ident },
+                        };
 
-                        const alloc_sb = try mod_scopes[m_idx].bind(desired_alloc, .preserve);
-                        defer alloc_sb.deinit(self.scratch);
+                        for (field_specs) |fs| {
+                            if (fs.cur != null) continue;
+                            const target_comp_ident = fs.target orelse continue;
+                            const desired = try std.fmt.allocPrint(self.scratch, "{s}{s}", .{ d.logical_name, fs.suffix });
+                            defer self.scratch.free(desired);
+                            if (mod_scopes[m_idx].isTaken(desired)) continue;
 
-                        const new_zig_ident = try self.alloc.dupe(u8, alloc_sb.zig_ident);
-                        const new_logical = try self.alloc.dupe(u8, alloc_sb.logical_name);
-                        const alloc_path = try self.alloc.alloc([]const u8, re.target_zig_path.len);
-                        for (re.target_zig_path[0 .. re.target_zig_path.len - 1], 0..) |seg, si| {
-                            alloc_path[si] = seg;
-                        }
-                        alloc_path[re.target_zig_path.len - 1] = target_alloc_ident;
+                            const sb = try mod_scopes[m_idx].bind(desired, .preserve);
+                            defer sb.deinit(self.scratch);
 
-                        comp_updates[di] = new_zig_ident;
-                        try extras.append(self.scratch, .{
-                            .source_decl_id = d.source_decl_id,
-                            .zig_ident = new_zig_ident,
-                            .logical_name = new_logical,
-                            .wire_name = d.wire_name,
-                            .is_exported = true,
-                            .is_js_exported = false,
-                            .is_default_export = false,
-                            .jsdoc = null,
-                            .kind = .{
-                                .re_export_decl = .{
-                                    .target_module_index = re.target_module_index,
-                                    .target_zig_path = alloc_path,
+                            const new_zig_ident = try self.alloc.dupe(u8, sb.zig_ident);
+                            const new_logical = try self.alloc.dupe(u8, sb.logical_name);
+                            const comp_path = try self.alloc.alloc([]const u8, re.target_zig_path.len);
+                            for (re.target_zig_path[0 .. re.target_zig_path.len - 1], 0..) |seg, si| {
+                                comp_path[si] = seg;
+                            }
+                            comp_path[re.target_zig_path.len - 1] = target_comp_ident;
+
+                            try comp_updates.append(self.scratch, .{
+                                .decl_idx = di,
+                                .tag = fs.tag,
+                                .ident = new_zig_ident,
+                            });
+                            try extras.append(self.scratch, .{
+                                .source_decl_id = d.source_decl_id,
+                                .zig_ident = new_zig_ident,
+                                .logical_name = new_logical,
+                                .wire_name = d.wire_name,
+                                .is_exported = true,
+                                .is_js_exported = false,
+                                .is_default_export = false,
+                                .jsdoc = null,
+                                .kind = .{
+                                    .re_export_decl = .{
+                                        .target_module_index = re.target_module_index,
+                                        .target_zig_path = comp_path,
+                                    },
                                 },
-                            },
-                        });
-                        added_any = true;
+                            });
+                            added_any = true;
+                        }
+
+                        // Also synthesize re-exports for sibling synthetic companion DeclIrs
+                        // (such as `*Promise` and overloaded `*Promise<Suffix>` companions).
+                        if (!d.is_synthetic_companion) {
+                            if (findSiblingDeclsByZigPath(target_mod.decls, re.target_zig_path)) |siblings| {
+                                for (siblings) |sib| {
+                                    if (!sib.is_synthetic_companion) continue;
+                                    if (sib.source_decl_id != target_di.source_decl_id) continue;
+                                    if (sib.logical_name.len <= target_di.logical_name.len) continue;
+                                    if (!std.mem.startsWith(u8, sib.logical_name, target_di.logical_name)) continue;
+
+                                    const suffix = sib.logical_name[target_di.logical_name.len..];
+                                    const desired_sib = try std.fmt.allocPrint(self.scratch, "{s}{s}", .{ d.logical_name, suffix });
+                                    defer self.scratch.free(desired_sib);
+                                    if (mod_scopes[m_idx].isTaken(desired_sib)) continue;
+
+                                    const sib_sb = try mod_scopes[m_idx].bind(desired_sib, .preserve);
+                                    defer sib_sb.deinit(self.scratch);
+
+                                    const new_zig_ident = try self.alloc.dupe(u8, sib_sb.zig_ident);
+                                    const new_logical = try self.alloc.dupe(u8, sib_sb.logical_name);
+                                    const sib_path = try self.alloc.alloc([]const u8, re.target_zig_path.len);
+                                    for (re.target_zig_path[0 .. re.target_zig_path.len - 1], 0..) |seg, si| {
+                                        sib_path[si] = seg;
+                                    }
+                                    sib_path[re.target_zig_path.len - 1] = sib.zig_ident;
+
+                                    try extras.append(self.scratch, .{
+                                        .source_decl_id = sib.source_decl_id,
+                                        .zig_ident = new_zig_ident,
+                                        .logical_name = new_logical,
+                                        .wire_name = sib.wire_name,
+                                        .is_exported = true,
+                                        .is_js_exported = false,
+                                        .is_synthetic_companion = true,
+                                        .is_default_export = false,
+                                        .jsdoc = null,
+                                        .kind = .{
+                                            .re_export_decl = .{
+                                                .target_module_index = re.target_module_index,
+                                                .target_zig_path = sib_path,
+                                            },
+                                        },
+                                    });
+                                    added_any = true;
+                                }
+                            }
+                        }
                     }
 
                     if (extras.items.len > 0) {
                         const merged = try self.alloc.alloc(DeclIr, m.decls.len + extras.items.len);
                         @memcpy(merged[0..m.decls.len], m.decls);
-                        for (comp_updates, 0..) |cu_opt, di| {
-                            if (cu_opt) |cu| merged[di].alloc_companion_ident = cu;
+                        for (comp_updates.items) |cu| {
+                            switch (cu.tag) {
+                                .alloc => merged[cu.decl_idx].alloc_companion_ident = cu.ident,
+                                .slice => merged[cu.decl_idx].slice_companion_ident = cu.ident,
+                                .slice_alloc => merged[cu.decl_idx].slice_alloc_companion_ident = cu.ident,
+                                .narrow => merged[cu.decl_idx].narrow_companion_ident = cu.ident,
+                                .narrow_alloc => merged[cu.decl_idx].narrow_alloc_companion_ident = cu.ident,
+                                .default => merged[cu.decl_idx].default_companion_ident = cu.ident,
+                                .default_alloc => merged[cu.decl_idx].default_alloc_companion_ident = cu.ident,
+                                .with => merged[cu.decl_idx].with_companion_ident = cu.ident,
+                                .infer => merged[cu.decl_idx].infer_companion_ident = cu.ident,
+                                .infer_alloc => merged[cu.decl_idx].infer_alloc_companion_ident = cu.ident,
+                            }
                         }
                         @memcpy(merged[m.decls.len..], extras.items);
                         m.decls = merged;
@@ -13505,6 +15051,25 @@ fn LowerCtx(comptime GraphType: type) type {
             }
         }
     };
+}
+
+fn findSiblingDeclsByZigPath(decls: []const DeclIr, path: []const []const u8) ?[]const DeclIr {
+    if (path.len == 0) return null;
+    if (path.len == 1) return decls;
+    const head = path[0];
+    for (decls) |d| {
+        if (std.mem.eql(u8, d.zig_ident, head) or std.mem.eql(u8, d.logical_name, head)) {
+            return switch (d.kind) {
+                .namespace_decl => |ns| findSiblingDeclsByZigPath(ns.children, path[1..]) orelse
+                    findSiblingDeclsByZigPath(ns.merged_call_fns, path[1..]),
+                .struct_decl => |st| findSiblingDeclsByZigPath(st.nested_decls, path[1..]) orelse
+                    findSiblingDeclsByZigPath(st.merged_call_fns, path[1..]),
+                .enum_decl => |en| findSiblingDeclsByZigPath(en.nested_decls, path[1..]),
+                else => null,
+            };
+        }
+    }
+    return null;
 }
 
 fn findNestedDeclByZigPath(decls: []const DeclIr, path: []const []const u8) ?DeclIr {
@@ -13726,7 +15291,7 @@ fn dfsValueCycleTypeByPath(
 ) error{OutOfMemory}!void {
     switch (ty.*) {
         // Indirection boundaries (pointer/slice/fn/runtime handle) cannot cause a value-size dependency loop!
-        .slice, .pointer_const, .fn_ptr, .promise, .js_map => return,
+        .slice, .pointer_const, .fn_ptr, .promise, .js_iterator, .js_async_iterator, .js_map => return,
         .js_record => |r| {
             if (r.key.* != .string_type) {
                 try dfsValueCycleTypeByPath(state_alloc, ir_alloc, @constCast(r.value), decl_map, state);
@@ -13855,7 +15420,7 @@ fn typeUsesParamByValue(
 ) bool {
     if (depth >= 16) return true;
     return switch (ty.*) {
-        .slice, .pointer_const, .fn_ptr, .promise, .js_map => false,
+        .slice, .pointer_const, .fn_ptr, .promise, .js_iterator, .js_async_iterator, .js_map => false,
         .js_record => |r| r.key.* != .string_type and
             (typeUsesParamByValue(state_alloc, r.key, tp_ident, decl_map, depth + 1) or
                 typeUsesParamByValue(state_alloc, r.value, tp_ident, decl_map, depth + 1)),

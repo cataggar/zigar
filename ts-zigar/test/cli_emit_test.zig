@@ -4638,6 +4638,532 @@ test "Issue #51 M3.3b Sema: comptime generics, Default/With/Infer companions, No
     }
 }
 
+test "Issue #52 M3.3c Sema: Promise<T> auto-await + *Promise, positional Iterable<T>, AsyncIterable/Iterator, and Symbol.dispose / asyncDispose" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    const cwd = std.Io.Dir.cwd();
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue52-protocols", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const src_dir = try std.fmt.allocPrint(alloc, "{s}/src", .{sandbox});
+    defer alloc.free(src_dir);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+    const out_custom_disp = try std.fmt.allocPrint(alloc, "{s}/out-custom-disp", .{sandbox});
+    defer alloc.free(out_custom_disp);
+
+    try cwd.createDirPath(io, src_dir);
+    {
+        var sd = try cwd.openDir(io, src_dir, .{});
+        defer sd.close(io);
+        try sd.writeFile(io, .{
+            .sub_path = "m3_protocols.d.ts",
+            .data =
+            \\export type AsyncRes<T> = Promise<T>;
+            \\export type NumSeq = Iterable<number>;
+            \\
+            \\export declare function fetchNumber(id: number): Promise<number>;
+            \\export declare function fetchLabel(id: number): Promise<string>;
+            \\export declare function pingAsync(): Promise<void>;
+            \\export declare function nestedPromise(): Promise<Promise<PromiseLike<number>>>;
+            \\export declare function aliasedAsync(seed: number): AsyncRes<number>;
+            \\export declare function syncOrAsyncVal(flag: boolean): number | Promise<number>;
+            \\
+            \\export declare function loadRecord(key: string): Promise<string>;
+            \\export declare function loadRecord(id: number): Promise<number>;
+            \\
+            \\export declare function resolveEcho<T>(val: T): Promise<T>;
+            \\
+            \\export interface CallableAsyncFetcher {
+            \\  (url: string): Promise<string>;
+            \\  readonly baseUrl: string;
+            \\}
+            \\
+            \\export declare function mergedFetch(path: string): Promise<number>;
+            \\export declare namespace mergedFetch {
+            \\  export const timeoutMs: number;
+            \\}
+            \\
+            \\export declare function _(key: string): Promise<number>;
+            \\export declare namespace _ {
+            \\  export const ver: number;
+            \\}
+            \\
+            \\export interface ExplicitPromiseCollision {
+            \\  doWork(): Promise<number>;
+            \\  doWorkPromise(): string;
+            \\}
+            \\
+            \\export declare function sumNumbers(items: Iterable<number>): number;
+            \\export declare function rangeIter(count: number): Iterable<number>;
+            \\export declare function produceAliasedSeq(): NumSeq;
+            \\export declare function consumeAliasedSeq(seq: NumSeq): number;
+            \\export declare function fetchItemsAsync(): Promise<Iterable<string>>;
+            \\export declare function makeGenerator(seed: number): Generator<string, void, unknown>;
+            \\export declare function streamEvents(topic: string): AsyncIterable<string>;
+            \\export declare function makeAsyncGen(limit: number): AsyncGenerator<number, void, unknown>;
+            \\
+            \\export declare function firstOf<T>(items: Iterable<T>): T | undefined;
+            \\export declare function drainAsync<T>(stream: AsyncIterable<T>): Promise<T[]>;
+            \\export declare function useDisposable<T extends Disposable>(res: T): number;
+            \\export declare function useAsyncDisposable<T extends AsyncDisposable>(res: T): Promise<number>;
+            \\export declare function sumConstrained<T extends Iterable<number>>(seq: T): number;
+            \\
+            \\export declare class AsyncService {
+            \\  static connect(endpoint: string): Promise<AsyncService>;
+            \\  query(sql: string): Promise<string>;
+            \\  send(msg: string): Promise<number>;
+            \\  send(bytes: Uint8Array): Promise<number>;
+            \\}
+            \\
+            \\export declare class TokenStream implements Iterable<string>, Disposable {
+            \\  constructor(source: string);
+            \\  [Symbol.iterator](): IterableIterator<string>;
+            \\  [Symbol.dispose](): void;
+            \\  readonly closed: boolean;
+            \\}
+            \\
+            \\export declare class AsyncResourcePool implements AsyncDisposable, AsyncIterable<number | string> {
+            \\  constructor(capacity: number);
+            \\  [Symbol.asyncIterator](): AsyncIterableIterator<number | string>;
+            \\  [Symbol.asyncDispose](): PromiseLike<void>;
+            \\}
+            \\
+            \\export interface LegacyNodeHandle {
+            \\  readonly fd: number;
+            \\  [Symbol.for("nodejs.dispose")](): void;
+            \\}
+            \\export interface LegacyAsyncNodeHandle {
+            \\  readonly fd: number;
+            \\  [Symbol.for("nodejs.asyncDispose")](): Promise<void>;
+            \\}
+            \\
+            \\export declare class ExplicitDisposeMethod implements Disposable {
+            \\  dispose(reason: string): boolean;
+            \\  [Symbol.dispose](): void;
+            \\}
+            ,
+        });
+        // User-defined plain interface named `Disposable` (`target_decl != null`) must stay a plain value struct!
+        try sd.writeFile(io, .{
+            .sub_path = "custom_disposable.d.ts",
+            .data =
+            \\export interface Disposable {
+            \\  clean: boolean;
+            \\  tag: string;
+            \\}
+            \\export declare function inspectCustom(d: Disposable): boolean;
+            ,
+        });
+    }
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const dts_path = try std.fmt.allocPrint(alloc, "{s}/m3_protocols.d.ts", .{src_dir});
+    defer alloc.free(dts_path);
+    {
+        const cli_args = [_][]const u8{ "-t", dts_path, "-d", out_dir };
+        var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+        defer parsed.deinit(alloc);
+        var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+        defer res.deinit(alloc);
+        if (res == .err) {
+            std.debug.print("Issue #52 pipeline error: {s}\n", .{res.err});
+        }
+        try std.testing.expect(res == .ok);
+    }
+
+    const custom_dts_path = try std.fmt.allocPrint(alloc, "{s}/custom_disposable.d.ts", .{src_dir});
+    defer alloc.free(custom_dts_path);
+    {
+        const cli_args = [_][]const u8{ "-t", custom_dts_path, "-d", out_custom_disp };
+        var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+        defer parsed.deinit(alloc);
+        var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+        defer res.deinit(alloc);
+        if (res == .err) {
+            std.debug.print("Issue #52 custom_disposable error: {s}\n", .{res.err});
+        }
+        try std.testing.expect(res == .ok);
+    }
+
+    const consumer_zig = try std.fmt.allocPrint(alloc, "{s}/consumer_issue52.zig", .{sandbox});
+    defer alloc.free(consumer_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "consumer_issue52.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r = @import("out/root.zig");
+            \\const m = r.m3_protocols;
+            \\const js = r.zigar_js;
+            \\const rc = @import("out-custom-disp/root.zig");
+            \\
+            \\test "Issue #52 M3.3c Promise<T> auto-await + *Promise, Iterable/AsyncIterable, and Symbol.dispose/asyncDispose" {
+            \\    // 1. Auto-awaited Promise<T> functions + *Promise raw handle companions
+            \\    const fn_num: *const fn (f64) js.CallError!f64 = &m.fetchNumber;
+            \\    const fn_num_p: *const fn (f64) js.CallError!js.Promise(f64) = &m.fetchNumberPromise;
+            \\    const fn_lbl: *const fn (f64) js.CallError![]const u8 = &m.fetchLabel;
+            \\    const fn_lbl_a: *const fn (std.mem.Allocator, f64) js.CallError![]const u8 = &m.fetchLabelAlloc;
+            \\    const fn_lbl_p: *const fn (f64) js.CallError!js.Promise([]const u8) = &m.fetchLabelPromise;
+            \\    try std.testing.expect(!@hasDecl(m, "fetchLabelPromiseAlloc"));
+            \\    const fn_ping: *const fn () js.CallError!void = &m.pingAsync;
+            \\    const fn_ping_p: *const fn () js.CallError!js.Promise(void) = &m.pingAsyncPromise;
+            \\    const fn_nested: *const fn () js.CallError!f64 = &m.nestedPromise;
+            \\    const fn_nested_p: *const fn () js.CallError!js.Promise(f64) = &m.nestedPromisePromise;
+            \\    const fn_aliased: *const fn (f64) js.CallError!f64 = &m.aliasedAsync;
+            \\    const fn_aliased_p: *const fn (f64) js.CallError!js.Promise(f64) = &m.aliasedAsyncPromise;
+            \\    _ = fn_num;
+            \\    _ = fn_num_p;
+            \\    _ = fn_lbl;
+            \\    _ = fn_lbl_a;
+            \\    _ = fn_lbl_p;
+            \\    _ = fn_ping;
+            \\    _ = fn_ping_p;
+            \\    _ = fn_nested;
+            \\    _ = fn_nested_p;
+            \\    _ = fn_aliased;
+            \\    _ = fn_aliased_p;
+            \\
+            \\    // `number | Promise<number>` stays a tagged union and does NOT generate `*Promise`
+            \\    try std.testing.expect(!@hasDecl(m, "syncOrAsyncValPromise"));
+            \\    try std.testing.expectError(error.HostUnavailable, m.syncOrAsyncVal(true));
+            \\
+            \\    // Overloaded async functions emit both auto-awaited and `*Promise` companions
+            \\    const lr_s: *const fn (std.mem.Allocator, []const u8) js.CallError![]const u8 = &m.loadRecordStringAlloc;
+            \\    const lr_n: *const fn (f64) js.CallError!f64 = &m.loadRecordNumber;
+            \\    const lr_sp: *const fn ([]const u8) js.CallError!js.Promise([]const u8) = &m.loadRecordPromiseString;
+            \\    const lr_np: *const fn (f64) js.CallError!js.Promise(f64) = &m.loadRecordPromiseNumber;
+            \\    _ = lr_s;
+            \\    _ = lr_n;
+            \\    _ = lr_sp;
+            \\    _ = lr_np;
+            \\    try std.testing.expectError(error.HostUnavailable, m.loadRecordAlloc(std.testing.allocator, "k"));
+            \\    try std.testing.expectError(error.HostUnavailable, m.loadRecord(@as(f64, 7)));
+            \\    try std.testing.expectError(error.HostUnavailable, m.loadRecordPromise("k"));
+            \\    try std.testing.expectError(error.HostUnavailable, m.loadRecordPromise(@as(f64, 7)));
+            \\
+            \\    // Generic async function + `*Infer` + `*Promise` + `*PromiseInfer`
+            \\    try std.testing.expectError(error.HostUnavailable, m.resolveEcho(f64, 42));
+            \\    try std.testing.expectError(error.HostUnavailable, m.resolveEchoInfer(@as(f64, 42)));
+            \\    try std.testing.expectError(error.HostUnavailable, m.resolveEchoAlloc([]const u8, std.testing.allocator, "hi"));
+            \\    try std.testing.expect(@TypeOf(m.resolveEchoPromise(f64, 42)) == js.CallError!js.Promise(f64));
+            \\    try std.testing.expect(@TypeOf(m.resolveEchoPromiseInfer(@as([]const u8, "hi"))) == js.CallError!js.Promise([]const u8));
+            \\
+            \\    // Callable handle + merged function+namespace + explicit `*Promise` collision preservation
+            \\    const caf_call: *const fn (m.CallableAsyncFetcher, std.mem.Allocator, []const u8) js.CallError![]const u8 = &m.CallableAsyncFetcher.callAlloc;
+            \\    const caf_prom: *const fn (m.CallableAsyncFetcher, []const u8) js.CallError!js.Promise([]const u8) = &m.CallableAsyncFetcher.callPromise;
+            \\    const mf_call: *const fn ([]const u8) js.CallError!f64 = &m.mergedFetch;
+            \\    const mf_prom: *const fn ([]const u8) js.CallError!js.Promise(f64) = &m.mergedFetchPromise;
+            \\    const us_call: *const fn ([]const u8) js.CallError!f64 = &m.@"_".call;
+            \\    const us_prom: *const fn ([]const u8) js.CallError!js.Promise(f64) = &m.@"_".callPromise;
+            \\    const epc_work: *const fn (m.ExplicitPromiseCollision) js.CallError!f64 = &m.ExplicitPromiseCollision.doWork;
+            \\    const epc_prom: *const fn (m.ExplicitPromiseCollision, std.mem.Allocator) js.CallError![]const u8 = &m.ExplicitPromiseCollision.doWorkPromiseAlloc;
+            \\    _ = caf_call;
+            \\    _ = caf_prom;
+            \\    _ = mf_call;
+            \\    _ = mf_prom;
+            \\    _ = us_call;
+            \\    _ = us_prom;
+            \\    _ = epc_work;
+            \\    _ = epc_prom;
+            \\    try std.testing.expectError(error.HostUnavailable, m.MergedFetch.timeout_ms.get());
+            \\    try std.testing.expectError(error.HostUnavailable, m.@"_".ver.get());
+            \\    try std.testing.expectError(error.HostUnavailable, r.mergedFetch("/v1"));
+            \\    try std.testing.expectError(error.HostUnavailable, r.mergedFetchPromise("/v1"));
+            \\
+            \\    // Class static & instance async methods + overloaded async methods
+            \\    const as_conn: *const fn ([]const u8) js.CallError!m.AsyncService = &m.AsyncService.connect;
+            \\    const as_conn_p: *const fn ([]const u8) js.CallError!js.Promise(m.AsyncService) = &m.AsyncService.connectPromise;
+            \\    const as_q: *const fn (m.AsyncService, std.mem.Allocator, []const u8) js.CallError![]const u8 = &m.AsyncService.queryAlloc;
+            \\    const as_qp: *const fn (m.AsyncService, []const u8) js.CallError!js.Promise([]const u8) = &m.AsyncService.queryPromise;
+            \\    const as_s1: *const fn (m.AsyncService, []const u8) js.CallError!f64 = &m.AsyncService.sendString;
+            \\    const as_s2: *const fn (m.AsyncService, js.Uint8Array) js.CallError!f64 = &m.AsyncService.sendUint8Array;
+            \\    const as_s1p: *const fn (m.AsyncService, []const u8) js.CallError!js.Promise(f64) = &m.AsyncService.sendPromiseString;
+            \\    const as_s2p: *const fn (m.AsyncService, js.Uint8Array) js.CallError!js.Promise(f64) = &m.AsyncService.sendPromiseUint8Array;
+            \\    try std.testing.expect(@hasDecl(m.AsyncService, "send"));
+            \\    try std.testing.expect(@hasDecl(m.AsyncService, "sendPromise"));
+            \\    _ = as_conn;
+            \\    _ = as_conn_p;
+            \\    _ = as_q;
+            \\    _ = as_qp;
+            \\    _ = as_s1;
+            \\    _ = as_s2;
+            \\    _ = as_s1p;
+            \\    _ = as_s2p;
+            \\
+            \\    // 2. Positional Iterable<T> (`[]const T` in input vs `js.Iterator(T)` in return) & AsyncIterable/Generator
+            \\    const sum_fn: *const fn ([]const f64) js.CallError!f64 = &m.sumNumbers;
+            \\    const range_fn: *const fn (f64) js.CallError!js.Iterator(f64) = &m.rangeIter;
+            \\    const prod_seq: *const fn () js.CallError!js.Iterator(f64) = &m.produceAliasedSeq;
+            \\    const cons_seq: *const fn (m.NumSeq) js.CallError!f64 = &m.consumeAliasedSeq;
+            \\    const fia: *const fn () js.CallError!js.Iterator([]const u8) = &m.fetchItemsAsync;
+            \\    const fia_p: *const fn () js.CallError!js.Promise(js.Iterator([]const u8)) = &m.fetchItemsAsyncPromise;
+            \\    const gen_fn: *const fn (f64) js.CallError!js.Iterator([]const u8) = &m.makeGenerator;
+            \\    const str_ev: *const fn ([]const u8) js.CallError!js.AsyncIterator([]const u8) = &m.streamEvents;
+            \\    const agen_fn: *const fn (f64) js.CallError!js.AsyncIterator(f64) = &m.makeAsyncGen;
+            \\    try std.testing.expect(m.NumSeq == []const f64);
+            \\    _ = sum_fn;
+            \\    _ = range_fn;
+            \\    _ = prod_seq;
+            \\    _ = cons_seq;
+            \\    _ = fia;
+            \\    _ = fia_p;
+            \\    _ = gen_fn;
+            \\    _ = str_ev;
+            \\    _ = agen_fn;
+            \\
+            \\    // Generic `*Infer` deduction from slice and `js.AsyncIterator(T)`!
+            \\    const nums = [_]f64{ 1, 2, 3 };
+            \\    try std.testing.expectError(error.HostUnavailable, m.firstOfInfer(nums[0..]));
+            \\    try std.testing.expect(@TypeOf(m.drainAsyncInferAlloc(std.testing.allocator, @as(js.AsyncIterator(f64), .{ .handle = 0 }))) == js.CallError![]const f64);
+            \\
+            \\    // 3. Protocol heritage & `[Symbol.iterator]` / `[Symbol.asyncIterator]` / `[Symbol.dispose]` / `[Symbol.asyncDispose]`
+            \\    try std.testing.expect(m.TokenStream.zigar_js.has_dispose);
+            \\    try std.testing.expect(m.TokenStream.zigar_js.iterator_elem == []const u8);
+            \\    const ts_iter: *const fn (m.TokenStream) js.CallError!js.Iterator([]const u8) = &m.TokenStream.iterator;
+            \\    const ts_disp: *const fn (m.TokenStream) void = &m.TokenStream.dispose;
+            \\    const ts_try_disp: *const fn (m.TokenStream) js.CallError!void = &m.TokenStream.tryDispose;
+            \\    _ = ts_iter;
+            \\    _ = ts_disp;
+            \\    _ = ts_try_disp;
+            \\
+            \\    try std.testing.expect(m.AsyncResourcePool.zigar_js.has_async_dispose);
+            \\    const ElemU = m.AsyncResourcePool.zigar_js.async_iterator_elem;
+            \\    try std.testing.expect(@typeInfo(ElemU) == .@"union");
+            \\    const arp_iter: *const fn (m.AsyncResourcePool) js.CallError!js.AsyncIterator(ElemU) = &m.AsyncResourcePool.asyncIterator;
+            \\    const arp_disp: *const fn (m.AsyncResourcePool) void = &m.AsyncResourcePool.asyncDispose;
+            \\    const arp_try_disp: *const fn (m.AsyncResourcePool) js.CallError!void = &m.AsyncResourcePool.tryAsyncDispose;
+            \\    _ = arp_iter;
+            \\    _ = arp_disp;
+            \\    _ = arp_try_disp;
+            \\
+            \\    // Legacy `Symbol.for("nodejs.dispose")` / `Symbol.for("nodejs.asyncDispose")`
+            \\    try std.testing.expect(m.LegacyNodeHandle.zigar_js.has_dispose);
+            \\    try std.testing.expect(@hasDecl(m.LegacyNodeHandle, "tryDispose"));
+            \\    try std.testing.expect(m.LegacyAsyncNodeHandle.zigar_js.has_async_dispose);
+            \\    try std.testing.expect(@hasDecl(m.LegacyAsyncNodeHandle, "tryAsyncDispose"));
+            \\
+            \\    // Explicit `dispose(reason: string): boolean` method is preserved alongside `[Symbol.dispose]`!
+            \\    try std.testing.expect(m.ExplicitDisposeMethod.zigar_js.has_dispose);
+            \\    const edm_disp: *const fn (m.ExplicitDisposeMethod, []const u8) js.CallError!bool = &m.ExplicitDisposeMethod.dispose;
+            \\    const edm_try_disp: *const fn (m.ExplicitDisposeMethod) js.CallError!void = &m.ExplicitDisposeMethod.tryDispose;
+            \\    _ = edm_disp;
+            \\    _ = edm_try_disp;
+            \\
+            \\    // Comptime `T extends Disposable` / `T extends AsyncDisposable` / `T extends Iterable<number>`
+            \\    try std.testing.expect(@hasDecl(m.TokenStream, "releaseHandleOnly"));
+            \\    try std.testing.expect(comptime js.satisfiesTypeConstraint(m.TokenStream, js.Disposable, 0));
+            \\    try std.testing.expect(comptime !js.satisfiesTypeConstraint(m.TokenStream, js.AsyncDisposable, 0));
+            \\    try std.testing.expect(comptime js.satisfiesTypeConstraint(m.TokenStream, js.Iterator([]const u8), 0));
+            \\    try std.testing.expect(comptime js.satisfiesTypeConstraint(m.LegacyNodeHandle, js.Disposable, 0));
+            \\    try std.testing.expect(comptime js.satisfiesTypeConstraint(m.AsyncResourcePool, js.AsyncDisposable, 0));
+            \\    try std.testing.expect(comptime js.satisfiesTypeConstraint(m.AsyncResourcePool, js.AsyncIterator(ElemU), 0));
+            \\    try std.testing.expect(comptime js.satisfiesTypeConstraint(m.LegacyAsyncNodeHandle, js.AsyncDisposable, 0));
+            \\    try std.testing.expect(comptime !js.satisfiesTypeConstraint(m.AsyncService, js.Disposable, 0));
+            \\    try std.testing.expect(comptime !js.satisfiesTypeConstraint(js.Ref(js.Object), js.Disposable, 0));
+            \\    const StringDisposeOnly = struct {
+            \\        pub fn dispose(_: @This()) void {}
+            \\    };
+            \\    try std.testing.expect(comptime !js.satisfiesTypeConstraint(StringDisposeOnly, js.Disposable, 0));
+            \\    const use_d: *const fn (m.TokenStream) js.CallError!f64 = &struct {
+            \\        fn call(ts: m.TokenStream) js.CallError!f64 {
+            \\            return m.useDisposable(m.TokenStream, ts);
+            \\        }
+            \\    }.call;
+            \\    const use_ad: *const fn (m.AsyncResourcePool) js.CallError!f64 = &struct {
+            \\        fn call(arp: m.AsyncResourcePool) js.CallError!f64 {
+            \\            return m.useAsyncDisposable(m.AsyncResourcePool, arp);
+            \\        }
+            \\    }.call;
+            \\    const sum_c: *const fn ([]const f64) js.CallError!f64 = &struct {
+            \\        fn call(s: []const f64) js.CallError!f64 {
+            \\            return m.sumConstrained([]const f64, s);
+            \\        }
+            \\    }.call;
+            \\    _ = use_d;
+            \\    _ = use_ad;
+            \\    _ = sum_c;
+            \\
+            \\    // 4. User-defined `export interface Disposable` stays a plain value struct!
+            \\    try std.testing.expect(!@hasField(@TypeOf(rc.custom_disposable.Disposable.zigar_js), "is_handle"));
+            \\    const cd: rc.custom_disposable.Disposable = .{ .clean = true, .tag = "plain" };
+            \\    try std.testing.expect(cd.clean);
+            \\    try std.testing.expectEqualStrings("plain", cd.tag);
+            \\}
+            ,
+        });
+    }
+
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", consumer_zig });
+
+    const neg_cases = [_]struct {
+        filename: []const u8,
+        expected_err: []const u8,
+        source: []const u8,
+    }{
+        .{
+            .filename = "neg_not_disposable.zig",
+            .expected_err = "does not satisfy TypeScript constraint",
+            .source =
+            \\const r = @import("out/root.zig");
+            \\test "reject non-disposable handle in T extends Disposable" {
+            \\    _ = r.m3_protocols.useDisposable(r.m3_protocols.AsyncService, .{ .ref = .{ .handle = 0 } });
+            \\}
+            ,
+        },
+        .{
+            .filename = "neg_bad_iterable_constraint.zig",
+            .expected_err = "does not satisfy TypeScript constraint",
+            .source =
+            \\const r = @import("out/root.zig");
+            \\test "reject wrong element slice in T extends Iterable<number>" {
+            \\    const strs = [_][]const u8{"nope"};
+            \\    _ = r.m3_protocols.sumConstrained([]const []const u8, strs[0..]);
+            \\}
+            ,
+        },
+    };
+
+    for (neg_cases) |nc| {
+        {
+            var sb = try cwd.openDir(io, sandbox, .{});
+            defer sb.close(io);
+            try sb.writeFile(io, .{ .sub_path = nc.filename, .data = nc.source });
+        }
+        const neg_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ sandbox, nc.filename });
+        defer alloc.free(neg_path);
+        const res = try std.process.run(alloc, io, .{
+            .argv = &.{ test_options.zig_exe, "test", neg_path },
+        });
+        defer alloc.free(res.stdout);
+        defer alloc.free(res.stderr);
+        const failed = switch (res.term) {
+            .exited => |code| code != 0,
+            else => true,
+        };
+        try std.testing.expect(failed);
+        try std.testing.expect(std.mem.indexOf(u8, res.stderr, nc.expected_err) != null);
+    }
+}
+
+test "Issue #52 @types/node@26 protocol sweep: fs/promises, timers/promises, stream, events pass AstGen and Sema" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const types_node_dir = "/d/zigar-worktrees/.cache/ts-zigar/types-node26/node_modules/@types/node";
+    _ = cwd.statFile(io, "/d/zigar-worktrees/.cache/ts-zigar/types-node26/node_modules/@types/node/package.json", .{}) catch {
+        return error.SkipZigTest;
+    };
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue52-node26-protocols", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const cli_args = [_][]const u8{
+        "-t", types_node_dir,
+        "-m", "fs/promises",
+        "-m", "timers/promises",
+        "-m", "stream",
+        "-m", "events",
+        "-d", out_dir,
+    };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Issue #52 @types/node@26 protocol sweep error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+
+    const probe_zig = try std.fmt.allocPrint(alloc, "{s}/node26_protocol_probe.zig", .{sandbox});
+    defer alloc.free(probe_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "node26_protocol_probe.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r = @import("out/root.zig");
+            \\const js = r.zigar_js;
+            \\
+            \\fn touchRecursive(comptime T: type, comptime depth: usize) void {
+            \\    if (depth == 0) return;
+            \\    inline for (comptime std.meta.declarations(T)) |decl_name| {
+            \\        const val = @field(T, decl_name);
+            \\        _ = &@field(T, decl_name);
+            \\        if (@TypeOf(val) == type) {
+            \\            _ = @sizeOf(val);
+            \\            switch (@typeInfo(val)) {
+            \\                .@"struct", .@"union", .@"enum" => touchRecursive(val, depth - 1),
+            \\                else => {},
+            \\            }
+            \\        }
+            \\    }
+            \\}
+            \\
+            \\test "deep 3-level Sema + protocol verification across @types/node@26 fs/promises, timers/promises, stream, events" {
+            \\    @setEvalBranchQuota(10_000_000);
+            \\    touchRecursive(r.node_fs_promises, 3);
+            \\    touchRecursive(r.node_timers_promises, 3);
+            \\    touchRecursive(r.node_stream, 3);
+            \\    touchRecursive(r.node_events, 3);
+            \\
+            \\    // `node:fs/promises`: auto-awaited `open` + `openPromise`, and `FileHandle` implements `[Symbol.asyncDispose]`!
+            \\    try std.testing.expect(@hasDecl(r.node_fs_promises, "open"));
+            \\    try std.testing.expect(@hasDecl(r.node_fs_promises, "openPromise"));
+            \\    try std.testing.expect(r.node_fs_promises.FileHandle.zigar_js.has_async_dispose);
+            \\    try std.testing.expect(@hasDecl(r.node_fs_promises.FileHandle, "asyncDispose"));
+            \\    try std.testing.expect(@hasDecl(r.node_fs_promises.FileHandle, "tryAsyncDispose"));
+            \\
+            \\    // `node:timers/promises`: `setTimeout` + `setTimeoutPromise`, and `setInterval` returning `js.AsyncIterator(T)`!
+            \\    try std.testing.expect(@hasDecl(r.node_timers_promises, "setTimeout"));
+            \\    try std.testing.expect(@hasDecl(r.node_timers_promises, "setTimeoutPromise"));
+            \\    try std.testing.expect(@TypeOf(r.node_timers_promises.setIntervalDefault(10, null, null)) == js.CallError!js.AsyncIterator(void));
+            \\
+            \\    // `node:stream`: `Readable` implements `[Symbol.asyncIterator]` AND `[Symbol.asyncDispose]`!
+            \\    try std.testing.expect(r.node_stream.Readable.zigar_js.has_async_dispose);
+            \\    try std.testing.expect(@hasDecl(r.node_stream.Readable, "asyncIterator"));
+            \\    try std.testing.expect(@hasDecl(r.node_stream.Readable, "tryAsyncDispose"));
+            \\
+            \\    // `node:events`: `on(...)` returns `js.AsyncIterator([]const js.Any)`!
+            \\    try std.testing.expect(@hasDecl(r.node_events, "on"));
+            \\}
+            ,
+        });
+    }
+
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", probe_zig });
+}
+
+
 
 
 
