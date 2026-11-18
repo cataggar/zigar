@@ -97,3 +97,22 @@ export declare function describeEndpointTuple(
   owner: UserDisplayName,
 ): ReturnType<typeof requireText>;
 
+// 6. Handle + plain-struct intersections (`Sync & { readonly gen: Gen }`, `GenericStore<K, V> & Extra`)
+export type SyncScorer = (input: number) => number;
+export type GenScorer = (input: number) => string;
+export interface StoreOverlay {
+  revision: number;
+  ownerTag: string;
+}
+export declare function makeSyncScorer(scale: number): SyncScorer;
+export declare function makeGenScorer(prefix: string): GenScorer;
+export declare function cacheGeneratorMethod<
+  Sync extends (...args: any[]) => any,
+  Gen extends (...args: any[]) => any,
+>(owner: object, name: string, sync: Sync, gen: Gen): Sync & { readonly gen: Gen };
+export declare function attachStoreOverlay<K, V, Extra>(
+  store: GenericStore<K, V>,
+  extra: Extra,
+): GenericStore<K, V> & Extra;
+
+

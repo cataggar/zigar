@@ -40,12 +40,9 @@ function resolveCacheDir() {
   if (fromEnv) {
     return path.resolve(fromEnv);
   }
-  if (fs.existsSync("/d/zigar-worktrees")) {
-    return "/d/zigar-worktrees/.cache/ts-zigar";
-  }
-  const tmpDir = process.env.TMPDIR?.trim();
-  if (tmpDir && !tmpDir.startsWith("/tmp") && !tmpDir.startsWith("/var/tmp")) {
-    return path.resolve(tmpDir, "ts-zigar-cache");
+  const siblingWorktreeCache = path.resolve(repoRoot, "..", ".cache", "ts-zigar");
+  if (fs.existsSync(siblingWorktreeCache)) {
+    return siblingWorktreeCache;
   }
   return path.join(repoRoot, ".cache", "ts-zigar");
 }
@@ -186,31 +183,37 @@ function parseCliArgs(argv) {
   return { outputPath, forceRebuild };
 }
 
-function latestMtimeMs(targetPath) {
+function hashInputsDeterministically(hash, targetPath, baseDir) {
   const st = fs.statSync(targetPath);
-  if (!st.isDirectory()) return st.mtimeMs;
-  let maxMtime = st.mtimeMs;
-  for (const entry of fs.readdirSync(targetPath, { withFileTypes: true })) {
-    const childMtime = latestMtimeMs(path.join(targetPath, entry.name));
-    if (childMtime > maxMtime) maxMtime = childMtime;
+  if (!st.isDirectory()) {
+    const rel = path.relative(baseDir, targetPath).split(path.sep).join("/");
+    hash.update(`file:${rel}\0`);
+    hash.update(fs.readFileSync(targetPath));
+    hash.update("\0");
+    return;
   }
-  return maxMtime;
+  const entries = fs.readdirSync(targetPath, { withFileTypes: true }).sort((a, b) =>
+    a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+  );
+  for (const entry of entries) {
+    hashInputsDeterministically(hash, path.join(targetPath, entry.name), baseDir);
+  }
+}
+
+function computeComponentStamp() {
+  const hash = crypto.createHash("sha256");
+  hash.update(`upstream:${TYPESCRIPT_PINNED_COMMIT}\0`);
+  hashInputsDeterministically(hash, __filename, tsZigarDir);
+  hashInputsDeterministically(hash, witDir, tsZigarDir);
+  hashInputsDeterministically(hash, adapterDir, tsZigarDir);
+  return `${TYPESCRIPT_PINNED_COMMIT}:${hash.digest("hex")}`;
 }
 
 function isComponentUpToDate(outputPath) {
   if (!fs.existsSync(outputPath)) return false;
   const stampPath = `${outputPath}.stamp`;
   if (!fs.existsSync(stampPath)) return false;
-  if (fs.readFileSync(stampPath, "utf8").trim() !== TYPESCRIPT_PINNED_COMMIT) {
-    return false;
-  }
-  const outMtime = fs.statSync(outputPath).mtimeMs;
-  const inputsMaxMtime = Math.max(
-    latestMtimeMs(__filename),
-    latestMtimeMs(witDir),
-    latestMtimeMs(adapterDir),
-  );
-  return outMtime >= inputsMaxMtime;
+  return fs.readFileSync(stampPath, "utf8").trim() === computeComponentStamp();
 }
 
 export function buildComponent({ outputPath = defaultOutputWasm, forceRebuild = false } = {}) {
@@ -284,7 +287,7 @@ export function buildComponent({ outputPath = defaultOutputWasm, forceRebuild = 
     { cwd: cmdDir, env },
   );
 
-  fs.writeFileSync(`${outputPath}.stamp`, `${TYPESCRIPT_PINNED_COMMIT}\n`, "utf8");
+  fs.writeFileSync(`${outputPath}.stamp`, `${computeComponentStamp()}\n`, "utf8");
   const stat = fs.statSync(outputPath);
   console.log(`[ts-zigar] Built ${outputPath} (${(stat.size / (1024 * 1024)).toFixed(2)} MiB)`);
   return outputPath;

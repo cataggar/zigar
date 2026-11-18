@@ -36,11 +36,7 @@ const COMPONENT_WASM_PATH = process.env.TS_ZIGAR_COMPONENT_WASM
   ? resolve(process.env.TS_ZIGAR_COMPONENT_WASM)
   : join(REPO_ROOT, 'ts-zigar/component/dist/typescript-compiler.component.wasm');
 
-const WAZIG_CANDIDATES = [
-  '/d/zigar-worktrees/.tools/bin/wazig',
-  '/d/zig/wazig/bin/wazig',
-];
-const WAZIG_BIN = WAZIG_CANDIDATES.find((p) => existsSync(p)) || 'wazig';
+const WAZIG_BIN = process.env.WAZIG_EXE?.trim() || 'wazig';
 
 const prevEnv = {
   ZIG_LOCAL_CACHE_DIR: process.env.ZIG_LOCAL_CACHE_DIR,

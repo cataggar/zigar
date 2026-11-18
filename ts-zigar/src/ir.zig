@@ -13,6 +13,11 @@ const lower_generics = @import("lower_generics.zig");
 const lower_protocols = @import("lower_protocols.zig");
 const type_ops = @import("type_ops.zig");
 
+pub const SpecifierOverride = struct {
+    vfs_path: []const u8,
+    wire_specifier: []const u8,
+};
+
 /// Lowering configuration for `lowerGraph`.
 pub const LowerOptions = struct {
     /// Optional VFS base directory stripped from file-module paths when deriving relative module names.
@@ -21,6 +26,8 @@ pub const LowerOptions = struct {
     /// empty, only primary modules are re-exported by `root.zig`, and unreferenced non-primary
     /// modules are pruned via reachability closure.
     primary_vfs_paths: []const []const u8 = &.{},
+    /// Optional public package `"exports"` wire specifier overrides (`vfs_path -> "pkg/subpath"`).
+    vfs_specifier_overrides: []const SpecifierOverride = &.{},
     /// Optional `-m / --module` filters. Empty means emit primary modules and their dependencies.
     modules: []const []const u8 = &.{},
     /// Optional `-s / --substitute <from=to>` rules.
@@ -320,6 +327,7 @@ pub const TypeIr = union(enum) {
         object_ty: *const TypeIr,
         index_spec: IndexAccessSpecIr,
     },
+    intersect_op: []const *const TypeIr,
     tuple: []const TupleElemIr,
     fn_ptr: FnPtrIr,
     anon_struct: []const FieldIr,
@@ -406,6 +414,7 @@ pub const NamespaceDeclIr = struct {
 pub const StructDeclIr = struct {
     repr: classify_decls.ObjectDeclKind = .value_struct,
     is_class: bool,
+    has_runtime_ctor_target: bool = true,
     is_abstract: bool,
     is_callable_handle: bool = false,
     has_private_constructor: bool = false,
@@ -486,9 +495,11 @@ pub const DeclKindIr = union(enum) {
     re_export_decl: struct {
         target_module_index: u32,
         target_zig_path: []const []const u8,
+        is_type_only: bool = false,
     },
     namespace_re_export: struct {
         target_module_index: u32,
+        is_type_only: bool = false,
     },
 };
 
@@ -497,6 +508,8 @@ pub const DeclIr = struct {
     zig_ident: []const u8,
     logical_name: []const u8,
     wire_name: []const u8,
+    wire_module_override: ?[]const u8 = null,
+    wire_path_prefix: []const []const u8 = &.{},
     is_exported: bool,
     is_js_exported: bool = true,
     is_default_export: bool,
@@ -532,6 +545,7 @@ pub const ModuleIr = struct {
     export_equals_ident: ?[]const u8 = null,
     export_equals_wire_name: ?[]const u8 = null,
     is_primary: bool,
+    is_encapsulated_internal: bool = false,
     needs_root_runtime: bool,
     imports: []const ModuleImportIr,
     decls: []const DeclIr,
@@ -680,6 +694,7 @@ fn LowerCtx(comptime GraphType: type) type {
             default_export_decl_id: ?u32 = null,
             export_equals_decl_id: ?u32 = null,
             is_primary: bool = false,
+            is_public_export_mod: bool = true,
             included: bool = false,
         };
 
@@ -788,6 +803,10 @@ fn LowerCtx(comptime GraphType: type) type {
         cur_mod_idx: u32 = 0,
         cur_mod_hoisted_locs: std.AutoHashMapUnmanaged(u32, DeclLocation) = .empty,
         cur_mod_closed_types: std.AutoHashMapUnmanaged(u32, *TypeIr) = .empty,
+        cur_mod_enum_member_types: std.AutoHashMapUnmanaged(u64, DeclLocation) = .empty,
+        cur_mod_unit_literal_types: std.StringHashMapUnmanaged(DeclLocation) = .empty,
+        star_summary_cands: std.AutoHashMapUnmanaged(u32, ModuleStarSummary) = .empty,
+        star_summary_smods: std.AutoHashMapUnmanaged(u32, ModuleStarSummary) = .empty,
         cur_mod_decls_out: ?*std.ArrayList(DeclIr) = null,
         cur_mod_root_scope: ?*naming.ScopeNamer = null,
         cur_mod_anon_counter: u32 = 0,
@@ -822,6 +841,10 @@ fn LowerCtx(comptime GraphType: type) type {
             self.decl_to_cand.deinit(self.scratch);
             self.cur_mod_hoisted_locs.deinit(self.scratch);
             self.cur_mod_closed_types.deinit(self.scratch);
+            self.cur_mod_enum_member_types.deinit(self.scratch);
+            self.cur_mod_unit_literal_types.deinit(self.scratch);
+            self.star_summary_cands.deinit(self.scratch);
+            self.star_summary_smods.deinit(self.scratch);
         }
 
         fn str(self: *const Self, id: u32) []const u8 {
@@ -1576,6 +1599,15 @@ fn LowerCtx(comptime GraphType: type) type {
             if (depth > 12 or ty_id >= self.graph.types.len) return;
             const tn = self.graph.types[ty_id];
             switch (tn.kind) {
+                .array, .readonly_array => |elem_id| {
+                    needs_runtime.* = true;
+                    if (out.iterator_elem_ty == null) {
+                        const active_tps = try self.resolveHeritageActiveTps(env, owner_active_tps, self_ident_opt, imports_used, needs_runtime, env_cache, 0);
+                        var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                        defer visited.deinit(self.scratch);
+                        out.iterator_elem_ty = try self.lowerType(elem_id, false, active_tps, self_ident_opt, &visited, imports_used, needs_runtime);
+                    }
+                },
                 .intersection => |parts| {
                     if (self.detectOpenPrimitiveIntersection(parts) != null or
                         self.detectBrandedPrimitiveIntersection(parts, 0) != null) return;
@@ -1597,7 +1629,15 @@ fn LowerCtx(comptime GraphType: type) type {
                 },
                 .reference => |ref| {
                     const rname = self.str(ref.target_name);
-                    if (self.classifyBuiltinProtocolReference(rname, ref.target_decl)) |pk| {
+                    const stripped_rname = lower_types.stripGlobalQualifier(rname);
+                    const array_or_set_iterable = self.isBuiltinProtocolTarget(ref.target_decl) and
+                        (std.mem.eql(u8, stripped_rname, "Array") or
+                            std.mem.eql(u8, stripped_rname, "ReadonlyArray") or
+                            std.mem.eql(u8, stripped_rname, "Set") or
+                            std.mem.eql(u8, stripped_rname, "ReadonlySet"));
+                    if (self.classifyBuiltinProtocolReference(rname, ref.target_decl) orelse
+                        (if (array_or_set_iterable) @as(?lower_protocols.BuiltinProtocolKind, .iterable) else null)) |pk|
+                    {
                         needs_runtime.* = true;
                         const active_tps = try self.resolveHeritageActiveTps(env, owner_active_tps, self_ident_opt, imports_used, needs_runtime, env_cache, 0);
                         switch (pk) {
@@ -1882,24 +1922,27 @@ fn LowerCtx(comptime GraphType: type) type {
                     if (!self.decl_to_cand.contains(did)) {
                         try self.decl_to_cand.put(self.scratch, did, c_idx);
                     }
-                    if (d.kind.re_export_decl.target_module) |tmid| {
-                        try appendUniqueU32(
-                            &self.candidates.items[c_idx].star_re_export_source_mods,
-                            self.scratch,
-                            tmid,
-                        );
-                    }
-                    const mspec = self.str(d.kind.re_export_decl.module_specifier);
-                    if (mspec.len > 0) {
-                        var seen_spec = false;
-                        for (self.candidates.items[c_idx].star_re_export_specs.items) |s| {
-                            if (std.mem.eql(u8, s, mspec)) {
-                                seen_spec = true;
-                                break;
+                    if (!d.kind.re_export_decl.is_type_only) {
+                        if (d.kind.re_export_decl.target_module) |tmid| {
+                            try appendUniqueU32(
+                                &self.candidates.items[c_idx].star_re_export_source_mods,
+                                self.scratch,
+                                tmid,
+                            );
+                        } else {
+                            const mspec = self.str(d.kind.re_export_decl.module_specifier);
+                            if (mspec.len > 0) {
+                                var seen_spec = false;
+                                for (self.candidates.items[c_idx].star_re_export_specs.items) |s| {
+                                    if (std.mem.eql(u8, s, mspec)) {
+                                        seen_spec = true;
+                                        break;
+                                    }
+                                }
+                                if (!seen_spec) {
+                                    try self.candidates.items[c_idx].star_re_export_specs.append(self.scratch, mspec);
+                                }
                             }
-                        }
-                        if (!seen_spec) {
-                            try self.candidates.items[c_idx].star_re_export_specs.append(self.scratch, mspec);
                         }
                     }
                     return;
@@ -2359,6 +2402,36 @@ fn LowerCtx(comptime GraphType: type) type {
                     owner_mod.global_augmentations.len == 0)
                 {
                     try self.markJsExportedDecl(d.id);
+                }
+            }
+
+            // 2c. Apply `package.json` `"exports"` wire specifier overrides (`"typescript/sync"`,
+            // `"typescript/ast/is"`, etc.) ONLY to modules explicitly listed in `"exports"` (plus
+            // ambient modules). Internal modules reached via `export *`, `export * as ns`, or
+            // named re-exports remain `is_public_export_mod = false` (`is_encapsulated_internal = true`),
+            // and only declarations genuinely forwarded under ES module semantics are claimed in
+            // `resolveRuntimeWireTargetsAndPruneUnreachable`.
+            if (self.options.vfs_specifier_overrides.len > 0) {
+                var override_by_vfs: std.StringHashMapUnmanaged([]const u8) = .empty;
+                defer override_by_vfs.deinit(self.scratch);
+                for (self.options.vfs_specifier_overrides) |ov| {
+                    try override_by_vfs.put(self.scratch, ov.vfs_path, ov.wire_specifier);
+                }
+
+                for (self.candidates.items) |*cand| {
+                    // Ambient module blocks (`declare module "node:fs"`) have no `source_mod_ids`
+                    // and represent explicit public specifiers directly.
+                    cand.is_public_export_mod = (cand.source_mod_ids.items.len == 0);
+                    for (cand.source_mod_ids.items) |smid| {
+                        const midx = self.findGraphModuleIndexById(smid) orelse continue;
+                        const m_fp = self.str(self.graph.modules[midx].file_path);
+                        if (override_by_vfs.get(m_fp)) |pub_spec| {
+                            cand.wire_specifier = try self.alloc.dupe(u8, pub_spec);
+                            cand.substituted_specifier = try applySubstitutions(self.alloc, cand.wire_specifier, self.options.substitutions);
+                            cand.is_public_export_mod = true;
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -3909,6 +3982,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 .js_map,
                 .js_record,
                 .mapped_values_op,
+                .intersect_op,
                 => true,
                 .optional => |opt| isSafeToShareTypeIrPtr(opt.child),
                 else => false,
@@ -4087,6 +4161,12 @@ fn LowerCtx(comptime GraphType: type) type {
                         .ty => |kt| typeIrMentionsSelfOrTypeParamsFrom(kt, tps, from_idx, depth + 1),
                         else => false,
                     }),
+                .intersect_op => |arms| blk: {
+                    for (arms) |arm| {
+                        if (typeIrMentionsSelfOrTypeParamsFrom(arm, tps, from_idx, depth + 1)) break :blk true;
+                    }
+                    break :blk false;
+                },
                 .tuple => |elems| blk: {
                     for (elems) |el| {
                         if (typeIrMentionsSelfOrTypeParamsFrom(el.ty, tps, from_idx, depth + 1)) break :blk true;
@@ -4205,9 +4285,8 @@ fn LowerCtx(comptime GraphType: type) type {
                         ir_list[idx].default_type = try self.makeType(.js_any);
                     } else {
                         visited.clearRetainingCapacity();
-                        ir_list[idx].default_type = try self.lowerType(
+                        ir_list[idx].default_type = try self.lowerGenericTypeArg(
                             dt,
-                            false,
                             combined_active,
                             self_ident_opt,
                             &visited,
@@ -4857,7 +4936,7 @@ fn LowerCtx(comptime GraphType: type) type {
 
                             for (0..final_len) |ai| {
                                 if (ai < ref.type_args.len) {
-                                    lowered_args[ai] = try self.lowerType(ref.type_args[ai], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                                    lowered_args[ai] = try self.lowerGenericTypeArg(ref.type_args[ai], active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                                 } else if (ai < loc.type_param_defaults.len and loc.type_param_defaults[ai] != null) {
                                     // Evaluate omitted trailing defaults in a clean target-declaration scope
                                     // (`0..ai`) so caller type parameters NEVER leak into callee defaults!
@@ -4872,7 +4951,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                     }
                                     var def_visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
                                     defer def_visited.deinit(self.scratch);
-                                    lowered_args[ai] = try self.lowerType(loc.type_param_defaults[ai].?, false, def_tps, null, &def_visited, imports_used, needs_runtime);
+                                    lowered_args[ai] = try self.lowerGenericTypeArg(loc.type_param_defaults[ai].?, def_tps, null, &def_visited, imports_used, needs_runtime);
                                 } else {
                                     needs_runtime.* = true;
                                     lowered_args[ai] = try self.makeType(.js_value);
@@ -6279,6 +6358,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 .unary_type_op,
                 .key_filter_op,
                 .index_access_op,
+                .intersect_op,
                 => true,
                 .js_record => |r| r.key.* != .string_type and (r.key.* == .type_param_ref or try self.typeMayAllocateOnDecode(r.value)),
                 .mapped_values_op => |mv| mv.target.* == .type_param_ref or mv.target.* == .slice or try self.typeMayAllocateOnDecode(mv.value),
@@ -7205,11 +7285,13 @@ fn LowerCtx(comptime GraphType: type) type {
                     if (ref.target_decl) |td| {
                         if (td >= self.graph.decls.len) return false;
                         const d = self.graph.decls[td];
-                        // For generic references (`Box<T>`), only inspect when 0 type args or resolved_type is concrete.
+                        // For generic references (`Box<T>`), only inspect when 0 type args or resolved_type is concrete (closed).
                         if (d.type_params.len > 0 and ref.type_args.len > 0) {
                             if (d.kind == .type_alias_decl) {
                                 if (tn.resolved_type) |rt| {
-                                    if (rt != ty_id) return self.collectObjectArmProps(rt, allow_class_decl, out, depth + 1);
+                                    if (rt != ty_id and (try self.isClosedTypeSubgraph(ty_id))) {
+                                        return self.collectObjectArmProps(rt, allow_class_decl, out, depth + 1);
+                                    }
                                 }
                             }
                             return false;
@@ -7322,6 +7404,58 @@ fn LowerCtx(comptime GraphType: type) type {
             return try list.toOwnedSlice(self.alloc);
         }
 
+        fn typeArmHasOpenDynamicKeys(
+            self: *const Self,
+            arm_id: u32,
+            active_tps: []const ActiveTypeParam,
+            depth: usize,
+        ) bool {
+            if (active_tps.len == 0 or arm_id >= self.graph.types.len or depth >= 12) return false;
+            if (!self.typeTreeMentionsActiveTypeParam(arm_id, active_tps, &.{}, 0)) return false;
+            const tn = self.graph.types[arm_id];
+            return switch (tn.kind) {
+                .type_param,
+                .mapped,
+                .indexed_access,
+                .conditional,
+                .keyof_type,
+                => true,
+                .intersection => |parts| blk: {
+                    for (parts) |pid| {
+                        if (self.typeArmHasOpenDynamicKeys(pid, active_tps, depth + 1)) break :blk true;
+                    }
+                    break :blk false;
+                },
+                .reference => |ref| blk: {
+                    const rname = self.str(ref.target_name);
+                    if (type_ops.classifyBuiltinUtility(rname, ref.type_args.len) != null) break :blk true;
+                    if (self.isBuiltinMappedReference(rname, ref.type_args.len, ref.target_decl)) break :blk true;
+                    if (ref.target_decl) |td| {
+                        if (td < self.graph.decls.len) {
+                            const bd = self.graph.decls[td];
+                            if (bd.kind == .type_alias_decl and bd.type_params.len > 0) {
+                                // Check whether the target generic alias's body has open dynamic keys
+                                // with respect to its own type parameters.
+                                var stack_buf: [8]ActiveTypeParam = undefined;
+                                const n_tps = @min(bd.type_params.len, stack_buf.len);
+                                for (0..n_tps) |ti| {
+                                    const tp_id = bd.type_params[ti];
+                                    const tp_name = if (tp_id < self.graph.type_params.len)
+                                        self.str(self.graph.type_params[tp_id].name)
+                                    else
+                                        "";
+                                    stack_buf[ti] = .{ .ts_name = tp_name };
+                                }
+                                break :blk self.typeArmHasOpenDynamicKeys(bd.kind.type_alias_decl, stack_buf[0..n_tps], depth + 1);
+                            }
+                        }
+                    }
+                    break :blk false;
+                },
+                else => false,
+            };
+        }
+
         fn lowerIntersectionInline(
             self: *Self,
             ty_id: u32,
@@ -7353,6 +7487,33 @@ fn LowerCtx(comptime GraphType: type) type {
                         break :blk self.makeType(.js_symbol);
                     },
                 };
+            }
+
+            const inter_cls = try self.classifyObjectType(ty_id);
+            if (!no_free_vars and parts.len >= 2 and parts.len <= 16 and self.inline_anon_depth < 3) {
+                var has_open_dynamic_arm = false;
+                for (parts) |pid| {
+                    if (self.typeArmHasOpenDynamicKeys(pid, active_tps, 0)) {
+                        has_open_dynamic_arm = true;
+                        break;
+                    }
+                }
+                if (has_open_dynamic_arm) {
+                    var lowered_arms = try self.alloc.alloc(*const TypeIr, parts.len);
+                    self.inline_anon_depth += 1;
+                    defer self.inline_anon_depth -= 1;
+                    var degraded_handle_arm = false;
+                    for (parts, 0..) |pid, ai| {
+                        lowered_arms[ai] = try self.lowerType(pid, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                        if (inter_cls.kind == .handle_wrapper and lowered_arms[ai].* == .js_object) {
+                            degraded_handle_arm = true;
+                        }
+                    }
+                    if (!degraded_handle_arm) {
+                        needs_runtime.* = true;
+                        return self.makeType(.{ .intersect_op = lowered_arms });
+                    }
+                }
             }
 
             var merged_props: std.ArrayList(RawObjectPropItem) = .empty;
@@ -7424,7 +7585,6 @@ fn LowerCtx(comptime GraphType: type) type {
                 return self.makeType(.{ .anon_struct = fields });
             }
 
-            const inter_cls = try self.classifyObjectType(ty_id);
             if (inter_cls.kind == .handle_wrapper) {
                 var inter_props: std.ArrayList(SourcedProp) = .empty;
                 defer inter_props.deinit(self.scratch);
@@ -7506,6 +7666,22 @@ fn LowerCtx(comptime GraphType: type) type {
                         });
                         return self.makeHoistedDeclRef(hloc);
                     }
+                    if (parts.len >= 2 and parts.len <= 16 and self.inline_anon_depth < 3) {
+                        var lowered_arms = try self.alloc.alloc(*const TypeIr, parts.len);
+                        self.inline_anon_depth += 1;
+                        defer self.inline_anon_depth -= 1;
+                        var degraded_handle_arm = false;
+                        for (parts, 0..) |pid, ai| {
+                            lowered_arms[ai] = try self.lowerType(pid, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                            if (lowered_arms[ai].* == .js_object) {
+                                degraded_handle_arm = true;
+                            }
+                        }
+                        if (!degraded_handle_arm) {
+                            needs_runtime.* = true;
+                            return self.makeType(.{ .intersect_op = lowered_arms });
+                        }
+                    }
                     needs_runtime.* = true;
                     return self.makeType(if (inter_cls.is_callable_handle) .js_function else .js_object);
                 }
@@ -7567,10 +7743,19 @@ fn LowerCtx(comptime GraphType: type) type {
             };
         }
 
-        fn buildEnumMembersFromClosedLiterals(
+        const ClosedLiteralItem = struct {
+            val: lower_unions.ClosedLiteralValue,
+            member_name: ?[]const u8 = null,
+        };
+
+        fn buildEnumMembersFromClosedLiteralItems(
             self: *Self,
-            vals: []const lower_unions.ClosedLiteralValue,
+            items: []const ClosedLiteralItem,
         ) error{OutOfMemory}!InlineEnumIr {
+            var vals = try self.scratch.alloc(lower_unions.ClosedLiteralValue, items.len);
+            defer self.scratch.free(vals);
+            for (items, 0..) |it, idx| vals[idx] = it.val;
+
             const analysis = try lower_unions.analyzeClosedEnumValues(self.scratch, vals);
             defer analysis.deinit(self.scratch);
 
@@ -7578,14 +7763,22 @@ fn LowerCtx(comptime GraphType: type) type {
             defer tag_scope.deinit();
             try tag_scope.reserve("zigar_js");
 
-            var members = try self.alloc.alloc(EnumMemberIr, vals.len);
-            for (vals, 0..) |v, idx| {
-                const hint = try lower_unions.formatLiteralTagHint(self.scratch, v);
-                defer self.scratch.free(hint);
+            var members = try self.alloc.alloc(EnumMemberIr, items.len);
+            for (items, 0..) |item, idx| {
+                const v = item.val;
+                const fmt_hint = if (item.member_name == null)
+                    try lower_unions.formatLiteralTagHint(self.scratch, v)
+                else
+                    null;
+                defer if (fmt_hint) |fh| self.scratch.free(fh);
+                const hint = item.member_name orelse fmt_hint.?;
                 const bound = try tag_scope.bind(hint, .snake);
                 const wire_str: []const u8 = switch (v) {
                     .str => |s| try self.alloc.dupe(u8, s),
-                    else => try self.alloc.dupe(u8, bound.logical_name),
+                    else => if (item.member_name) |mname|
+                        try self.alloc.dupe(u8, mname)
+                    else
+                        try self.alloc.dupe(u8, bound.logical_name),
                 };
                 members[idx] = .{
                     .zig_ident = try self.alloc.dupe(u8, bound.zig_ident),
@@ -7602,6 +7795,16 @@ fn LowerCtx(comptime GraphType: type) type {
             return .{ .backing = analysis.backing, .members = members };
         }
 
+        fn buildEnumMembersFromClosedLiterals(
+            self: *Self,
+            vals: []const lower_unions.ClosedLiteralValue,
+        ) error{OutOfMemory}!InlineEnumIr {
+            var items = try self.scratch.alloc(ClosedLiteralItem, vals.len);
+            defer self.scratch.free(items);
+            for (vals, 0..) |v, idx| items[idx] = .{ .val = v };
+            return self.buildEnumMembersFromClosedLiteralItems(items);
+        }
+
         fn appendUniqueClosedLiteral(
             self: *Self,
             list: *std.ArrayList(lower_unions.ClosedLiteralValue),
@@ -7613,20 +7816,134 @@ fn LowerCtx(comptime GraphType: type) type {
             try list.append(self.scratch, val);
         }
 
+        fn appendUniqueClosedLiteralItem(
+            self: *Self,
+            list: *std.ArrayList(ClosedLiteralItem),
+            item: ClosedLiteralItem,
+        ) error{OutOfMemory}!void {
+            for (list.items) |*existing| {
+                if (lower_unions.closedLiteralEql(existing.val, item.val)) {
+                    if (existing.member_name == null and item.member_name != null) {
+                        existing.member_name = item.member_name;
+                    }
+                    return;
+                }
+            }
+            try list.append(self.scratch, item);
+        }
+
+        fn enumMemberClosedLiteralItem(
+            self: *Self,
+            em: anytype,
+        ) error{OutOfMemory}!?ClosedLiteralItem {
+            const clv: lower_unions.ClosedLiteralValue = switch (em.value) {
+                .str => |s| .{ .str = s },
+                .num => |n| .{ .num = n },
+                .boolean => |b| .{ .boolean = b },
+                .bigint_val => |bi| .{ .bigint_val = try lower_types.normalizeBigIntLiteral(self.alloc, bi) },
+                .unknown => return null,
+            };
+            var mname_opt: ?[]const u8 = null;
+            if (em.enum_decl_id < self.graph.decls.len) {
+                const ed = self.graph.decls[em.enum_decl_id];
+                if (ed.kind == .enum_decl and em.member_idx < ed.kind.enum_decl.members.len) {
+                    const raw_mname = self.str(ed.kind.enum_decl.members[em.member_idx].name);
+                    if (raw_mname.len > 0) mname_opt = raw_mname;
+                }
+            }
+            return .{ .val = clv, .member_name = mname_opt };
+        }
+
+        fn lowerGenericTypeArg(
+            self: *Self,
+            arg_ty_id: u32,
+            active_tps: []const ActiveTypeParam,
+            self_ident_opt: ?[]const u8,
+            visited: *std.AutoHashMapUnmanaged(u32, void),
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+        ) error{OutOfMemory}!*TypeIr {
+            if (self.cur_mod_decls_out != null and self.cur_mod_root_scope != null) {
+                if (try self.resolveEnumMemberReference(arg_ty_id)) |em| {
+                    if (try self.enumMemberClosedLiteralItem(em)) |item| {
+                        const cache_key: u64 = (@as(u64, em.enum_decl_id) << 32) | @as(u64, @intCast(em.member_idx));
+                        if (self.cur_mod_enum_member_types.get(cache_key)) |cached_loc| {
+                            return self.makeHoistedDeclRef(cached_loc);
+                        }
+                        const enum_ir = try self.buildEnumMembersFromClosedLiteralItems(&.{item});
+                        const h = try self.allocFreshAnonHelperName("__zigar_EnumMember", active_tps);
+                        const hloc = DeclLocation{
+                            .module_index = self.cur_mod_idx,
+                            .zig_path = h.path,
+                            .type_param_defaults = &.{},
+                        };
+                        try self.cur_mod_enum_member_types.put(self.scratch, cache_key, hloc);
+                        try self.cur_mod_decls_out.?.append(self.alloc, .{
+                            .source_decl_id = null,
+                            .zig_ident = h.zig_ident,
+                            .logical_name = h.logical,
+                            .wire_name = h.logical,
+                            .is_exported = false,
+                            .is_js_exported = false,
+                            .is_default_export = false,
+                            .jsdoc = null,
+                            .kind = .{ .literal_enum_decl = enum_ir },
+                        });
+                        return self.makeHoistedDeclRef(hloc);
+                    }
+                }
+                if (arg_ty_id < self.graph.types.len and self.graph.types[arg_ty_id].kind == .literal) {
+                    if (try self.extractClosedLiteralFromType(arg_ty_id, 0)) |clv| {
+                        if (clv == .str or clv == .num) {
+                            const cache_key = switch (clv) {
+                                .str => |s| try std.fmt.allocPrint(self.scratch, "s:{s}", .{s}),
+                                .num => |n| try std.fmt.allocPrint(self.scratch, "n:{x}", .{@as(u64, @bitCast(if (n == 0.0) @as(f64, 0.0) else n))}),
+                                else => unreachable,
+                            };
+                            if (self.cur_mod_unit_literal_types.get(cache_key)) |cached_loc| {
+                                return self.makeHoistedDeclRef(cached_loc);
+                            }
+                            const enum_ir = try self.buildEnumMembersFromClosedLiteralItems(&.{.{ .val = clv }});
+                            const h = try self.allocFreshAnonHelperName("__zigar_UnitLit", active_tps);
+                            const hloc = DeclLocation{
+                                .module_index = self.cur_mod_idx,
+                                .zig_path = h.path,
+                                .type_param_defaults = &.{},
+                            };
+                            try self.cur_mod_unit_literal_types.put(self.scratch, cache_key, hloc);
+                            try self.cur_mod_decls_out.?.append(self.alloc, .{
+                                .source_decl_id = null,
+                                .zig_ident = h.zig_ident,
+                                .logical_name = h.logical,
+                                .wire_name = h.logical,
+                                .is_exported = false,
+                                .is_js_exported = false,
+                                .is_default_export = false,
+                                .jsdoc = null,
+                                .kind = .{ .literal_enum_decl = enum_ir },
+                            });
+                            return self.makeHoistedDeclRef(hloc);
+                        }
+                    }
+                }
+            }
+            return self.lowerType(arg_ty_id, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+        }
+
         fn tryCollectClosedLiteralsFromArm(
             self: *Self,
             arm_id: u32,
-            out: *std.ArrayList(lower_unions.ClosedLiteralValue),
+            out: *std.ArrayList(ClosedLiteralItem),
             expand_alias_refs: bool,
             depth: usize,
         ) error{OutOfMemory}!bool {
-            if (arm_id >= self.graph.types.len or depth > 6) return false;
+            if (arm_id >= self.graph.types.len or depth > 12) return false;
             const tn = self.graph.types[arm_id];
             switch (tn.kind) {
                 .literal => {
                     if (try self.extractClosedLiteralFromType(arm_id, 0)) |clv| {
-                        try self.appendUniqueClosedLiteral(out, clv);
-                        return out.items.len <= 128;
+                        try self.appendUniqueClosedLiteralItem(out, .{ .val = clv });
+                        return out.items.len <= 512;
                     }
                     return false;
                 },
@@ -7635,8 +7952,8 @@ fn LowerCtx(comptime GraphType: type) type {
                     defer strs.deinit(self.alloc);
                     if (!try self.tryExpandFiniteStringSet(arm_id, &strs, 0)) return false;
                     for (strs.items) |s| {
-                        try self.appendUniqueClosedLiteral(out, .{ .str = s });
-                        if (out.items.len > 128) return false;
+                        try self.appendUniqueClosedLiteralItem(out, .{ .val = .{ .str = s } });
+                        if (out.items.len > 512) return false;
                     }
                     return true;
                 },
@@ -7655,15 +7972,9 @@ fn LowerCtx(comptime GraphType: type) type {
                 },
                 .reference => |ref| {
                     if (try self.resolveEnumMemberReference(arm_id)) |em| {
-                        const clv: lower_unions.ClosedLiteralValue = switch (em.value) {
-                            .str => |s| .{ .str = s },
-                            .num => |n| .{ .num = n },
-                            .boolean => |b| .{ .boolean = b },
-                            .bigint_val => |bi| .{ .bigint_val = try lower_types.normalizeBigIntLiteral(self.alloc, bi) },
-                            .unknown => return false,
-                        };
-                        try self.appendUniqueClosedLiteral(out, clv);
-                        return out.items.len <= 128;
+                        const item = (try self.enumMemberClosedLiteralItem(em)) orelse return false;
+                        try self.appendUniqueClosedLiteralItem(out, item);
+                        return out.items.len <= 512;
                     }
                     if (expand_alias_refs) {
                         if (ref.target_decl) |td| {
@@ -7687,10 +7998,10 @@ fn LowerCtx(comptime GraphType: type) type {
             }
         }
 
-        fn isExactBooleanPair(vals: []const lower_unions.ClosedLiteralValue) bool {
-            if (vals.len != 2) return false;
-            if (vals[0] != .boolean or vals[1] != .boolean) return false;
-            return vals[0].boolean != vals[1].boolean;
+        fn isExactBooleanPairItems(items: []const ClosedLiteralItem) bool {
+            if (items.len != 2) return false;
+            if (items[0].val != .boolean or items[1].val != .boolean) return false;
+            return items[0].val.boolean != items[1].val.boolean;
         }
 
         fn tryBuildClosedLiteralEnum(
@@ -7698,14 +8009,14 @@ fn LowerCtx(comptime GraphType: type) type {
             non_null_arms: []const u32,
         ) error{OutOfMemory}!?InlineEnumIr {
             if (non_null_arms.len == 0) return null;
-            var vals: std.ArrayList(lower_unions.ClosedLiteralValue) = .empty;
-            defer vals.deinit(self.scratch);
+            var items: std.ArrayList(ClosedLiteralItem) = .empty;
+            defer items.deinit(self.scratch);
             for (non_null_arms) |aid| {
-                if (!try self.tryCollectClosedLiteralsFromArm(aid, &vals, false, 0)) return null;
+                if (!try self.tryCollectClosedLiteralsFromArm(aid, &items, true, 0)) return null;
             }
-            if (vals.items.len < 2) return null;
-            if (isExactBooleanPair(vals.items)) return null;
-            return try self.buildEnumMembersFromClosedLiterals(vals.items);
+            if (items.items.len < 2) return null;
+            if (isExactBooleanPairItems(items.items)) return null;
+            return try self.buildEnumMembersFromClosedLiteralItems(items.items);
         }
 
         fn tryBuildOpenLiteralUnion(
@@ -7714,7 +8025,7 @@ fn LowerCtx(comptime GraphType: type) type {
         ) error{OutOfMemory}!?OpenLiteralUnionIr {
             if (non_null_arms.len < 2) return null;
             var open_prim_opt: ?lower_unions.OpenPrimitiveKind = null;
-            var vals: std.ArrayList(lower_unions.ClosedLiteralValue) = .empty;
+            var vals: std.ArrayList(ClosedLiteralItem) = .empty;
             defer vals.deinit(self.scratch);
 
             for (non_null_arms) |aid| {
@@ -7733,7 +8044,8 @@ fn LowerCtx(comptime GraphType: type) type {
             const open_prim = open_prim_opt orelse return null;
             if (vals.items.len == 0 or vals.items.len > 128) return null;
 
-            for (vals.items) |v| {
+            for (vals.items) |item| {
+                const v = item.val;
                 const matches_prim = switch (open_prim) {
                     .str => v == .str,
                     .num => v == .num,
@@ -7751,13 +8063,21 @@ fn LowerCtx(comptime GraphType: type) type {
             try tag_scope.reserve("zigar_js");
 
             var known_members = try self.alloc.alloc(EnumMemberIr, vals.items.len);
-            for (vals.items, 0..) |v, idx| {
-                const hint = try lower_unions.formatLiteralTagHint(self.scratch, v);
-                defer self.scratch.free(hint);
+            for (vals.items, 0..) |item, idx| {
+                const v = item.val;
+                const fmt_hint = if (item.member_name == null)
+                    try lower_unions.formatLiteralTagHint(self.scratch, v)
+                else
+                    null;
+                defer if (fmt_hint) |fh| self.scratch.free(fh);
+                const hint = item.member_name orelse fmt_hint.?;
                 const bound = try tag_scope.bind(hint, .snake);
                 const wire_str: []const u8 = switch (v) {
                     .str => |s| try self.alloc.dupe(u8, s),
-                    else => try self.alloc.dupe(u8, bound.logical_name),
+                    else => if (item.member_name) |mname|
+                        try self.alloc.dupe(u8, mname)
+                    else
+                        try self.alloc.dupe(u8, bound.logical_name),
                 };
                 known_members[idx] = .{
                     .zig_ident = try self.alloc.dupe(u8, bound.zig_ident),
@@ -7877,6 +8197,14 @@ fn LowerCtx(comptime GraphType: type) type {
                 .unary_type_op => |ua| ua.op == b.unary_type_op.op and typeIrEql(ua.operand, b.unary_type_op.operand, depth + 1),
                 .key_filter_op => |ka| ka.kind == b.key_filter_op.kind and typeIrEql(ka.target, b.key_filter_op.target, depth + 1) and keyFilterSpecEql(ka.keys, b.key_filter_op.keys, depth + 1),
                 .index_access_op => |ia| typeIrEql(ia.object_ty, b.index_access_op.object_ty, depth + 1) and indexAccessSpecEql(ia.index_spec, b.index_access_op.index_spec, depth + 1),
+                .intersect_op => |aa| blk: {
+                    const ab = b.intersect_op;
+                    if (aa.len != ab.len) break :blk false;
+                    for (aa, ab) |ea, eb| {
+                        if (!typeIrEql(ea, eb, depth + 1)) break :blk false;
+                    }
+                    break :blk true;
+                },
                 .decl_ref => |da| blk: {
                     const db = b.decl_ref;
                     if (da.module_index != db.module_index or da.target_decl_id != db.target_decl_id or da.indirect != db.indirect) break :blk false;
@@ -7985,17 +8313,17 @@ fn LowerCtx(comptime GraphType: type) type {
                     if (try self.resolveEnumMemberReference(rp.ty)) |em| {
                         enum_hint_opt = em.tag_logical_name;
                     }
-                    var lits: std.ArrayList(lower_unions.ClosedLiteralValue) = .empty;
+                    var lits: std.ArrayList(ClosedLiteralItem) = .empty;
+                    defer lits.deinit(self.scratch);
                     if (try self.tryCollectClosedLiteralsFromArm(rp.ty, &lits, true, 0) and lits.items.len > 0) {
-                        const lit_slice = try lits.toOwnedSlice(self.scratch);
+                        const lit_slice = try self.scratch.alloc(lower_unions.ClosedLiteralValue, lits.items.len);
+                        for (lits.items, 0..) |it, li| lit_slice[li] = it.val;
                         try val_SubSlices.append(self.scratch, lit_slice);
                         try infos.append(self.scratch, .{
                             .wire_name = rp.wire,
                             .values = lit_slice,
                             .enum_member_hint = enum_hint_opt,
                         });
-                    } else {
-                        lits.deinit(self.scratch);
                     }
                 }
                 if (infos.items.len == 0) {
@@ -8052,10 +8380,11 @@ fn LowerCtx(comptime GraphType: type) type {
             var first_bool_lit_arm: ?u32 = null;
 
             for (non_null_arms) |aid| {
-                var arm_lits: std.ArrayList(lower_unions.ClosedLiteralValue) = .empty;
+                var arm_lits: std.ArrayList(ClosedLiteralItem) = .empty;
                 defer arm_lits.deinit(self.scratch);
                 if (try self.tryCollectClosedLiteralsFromArm(aid, &arm_lits, false, 0) and arm_lits.items.len > 0) {
-                    for (arm_lits.items) |clv| {
+                    for (arm_lits.items) |item| {
+                        const clv = item.val;
                         if (clv == .boolean and first_bool_lit_arm == null) {
                             first_bool_lit_arm = aid;
                         }
@@ -8613,7 +8942,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 .js_object => return "object",
                 .js_function => return "func",
                 .js_map => return "map",
-                .js_record, .mapped_values_op => return "record",
+                .js_record, .mapped_values_op, .intersect_op => return "record",
                 .promise => return "promise",
                 .js_iterator => return "iterator",
                 .js_async_iterator => return "async_iterator",
@@ -8786,7 +9115,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                 .is_js_exported = false,
                                 .is_default_export = is_default_export,
                                 .is_global_scope = is_global_scope,
-                                .is_synthetic_companion = is_js_exported and !is_global_scope,
+                                .is_synthetic_companion = !is_global_scope,
                                 .alloc_companion_ident = prom_comps.alloc_ident,
                                 .slice_companion_ident = prom_comps.slice_ident,
                                 .slice_alloc_companion_ident = prom_comps.slice_alloc_ident,
@@ -8987,7 +9316,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                 .is_js_exported = false,
                                 .is_default_export = is_default_export,
                                 .is_global_scope = is_global_scope,
-                                .is_synthetic_companion = is_js_exported and !is_global_scope,
+                                .is_synthetic_companion = !is_global_scope,
                                 .alloc_companion_ident = pc.alloc_ident,
                                 .slice_companion_ident = pc.slice_ident,
                                 .slice_alloc_companion_ident = pc.slice_alloc_ident,
@@ -9023,7 +9352,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                     .is_js_exported = false,
                                     .is_default_export = is_default_export and pi == 0,
                                     .is_global_scope = is_global_scope,
-                                    .is_synthetic_companion = is_js_exported and !is_global_scope,
+                                    .is_synthetic_companion = !is_global_scope,
                                     .alloc_companion_ident = pc.alloc_ident,
                                     .slice_companion_ident = pc.slice_ident,
                                     .slice_alloc_companion_ident = pc.slice_alloc_ident,
@@ -9046,7 +9375,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                 .is_js_exported = false,
                                 .is_default_export = false,
                                 .is_global_scope = is_global_scope,
-                                .is_synthetic_companion = is_js_exported and !is_global_scope,
+                                .is_synthetic_companion = !is_global_scope,
                                 .alloc_companion_ident = prom_disp_alloc_ident,
                                 .jsdoc = top_jsdoc orelse prom_sigs_list.items[0].jsdoc,
                                 .kind = .{
@@ -9704,6 +10033,27 @@ fn LowerCtx(comptime GraphType: type) type {
                                     }
                                 }
                             },
+                            .reference => {
+                                // Single enum-member alias (`export type ExponentiationOperator = SyntaxKind.AsteriskAsteriskToken`)!
+                                if (try self.resolveEnumMemberReference(ty_id)) |em| {
+                                    if (try self.enumMemberClosedLiteralItem(em)) |item| {
+                                        const enum_ir = try self.buildEnumMembersFromClosedLiteralItems(&.{item});
+                                        try out_list.append(self.alloc, .{
+                                            .source_decl_id = decl_id,
+                                            .zig_ident = bound.zig_ident,
+                                            .logical_name = bound.logical_name,
+                                            .wire_name = bound.wire_name,
+                                            .is_exported = is_exported,
+                                            .is_js_exported = is_js_exported,
+                                            .is_default_export = is_default_export,
+                                            .is_global_scope = is_global_scope,
+                                            .jsdoc = top_jsdoc,
+                                            .kind = .{ .literal_enum_decl = enum_ir },
+                                        });
+                                        return;
+                                    }
+                                }
+                            },
                             else => {
                                 // Closed `keyof`, `T[K]`, `Exclude`, `Extract`, `Uppercase`, or conditional resolving to closed literals!
                                 if (tn_alias.resolved_type) |rt| {
@@ -9787,6 +10137,15 @@ fn LowerCtx(comptime GraphType: type) type {
                     if (ty_id < self.graph.types.len and self.graph.types[ty_id].kind == .intersection) {
                         const inter_parts = self.graph.types[ty_id].kind.intersection;
                         const inter_cls = try self.classifyDecl(decl_id);
+                        var has_open_dynamic_arm = false;
+                        if (inter_cls.kind != .handle_wrapper and tp_res.active.len > 0) {
+                            for (inter_parts) |pid| {
+                                if (self.typeArmHasOpenDynamicKeys(pid, tp_res.active, 0)) {
+                                    has_open_dynamic_arm = true;
+                                    break;
+                                }
+                            }
+                        }
                         var inter_props: std.ArrayList(SourcedProp) = .empty;
                         defer inter_props.deinit(self.scratch);
                         var inter_methods: std.ArrayList(SourcedMethod) = .empty;
@@ -9798,7 +10157,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         var inter_index_sigs: std.ArrayList(SourcedIndexSig) = .empty;
                         defer inter_index_sigs.deinit(self.scratch);
 
-                        if (try self.collectObjectIntersectionMembers(
+                        if (!has_open_dynamic_arm and try self.collectObjectIntersectionMembers(
                             ty_id,
                             &inter_props,
                             &inter_methods,
@@ -10066,7 +10425,12 @@ fn LowerCtx(comptime GraphType: type) type {
                                     .is_exported = true,
                                     .is_default_export = is_default_export,
                                     .jsdoc = top_jsdoc,
-                                    .kind = .{ .namespace_re_export = .{ .target_module_index = t_mod_idx } },
+                                    .kind = .{
+                                        .namespace_re_export = .{
+                                            .target_module_index = t_mod_idx,
+                                            .is_type_only = re.is_type_only,
+                                        },
+                                    },
                                 });
                             }
                         }
@@ -10093,6 +10457,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                     .re_export_decl = .{
                                         .target_module_index = loc.module_index,
                                         .target_zig_path = loc.zig_path,
+                                        .is_type_only = re.is_type_only,
                                     },
                                 },
                             });
@@ -10123,6 +10488,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                         .re_export_decl = .{
                                             .target_module_index = loc.module_index,
                                             .target_zig_path = loc.zig_path,
+                                            .is_type_only = ie.is_type_only,
                                         },
                                     },
                                 });
@@ -10572,9 +10938,8 @@ fn LowerCtx(comptime GraphType: type) type {
                     var v: std.AutoHashMapUnmanaged(u32, void) = .empty;
                     defer v.deinit(self.scratch);
                     const eval_tps = if (b.arg_in_self_env) list[0..built_len] else parent_active;
-                    break :blk try self.lowerType(
+                    break :blk try self.lowerGenericTypeArg(
                         aty_id,
-                        false,
                         eval_tps,
                         self_ident_opt,
                         &v,
@@ -13882,97 +14247,355 @@ fn LowerCtx(comptime GraphType: type) type {
             }
         }
 
-        fn collectStarReExportsFromSourceMod(
-            self: *Self,
-            source_mod_id: u32,
-            self_final_mod_idx: u32,
-            visited_source_mods: *std.AutoHashMapUnmanaged(u32, void),
-            visited_cands: *std.AutoHashMapUnmanaged(u32, void),
-            out: *std.ArrayList(StarExportItem),
-        ) error{OutOfMemory}!void {
-            if (visited_source_mods.contains(source_mod_id)) return;
-            try visited_source_mods.put(self.scratch, source_mod_id, {});
+        const StarCanonLoc = struct {
+            module_index: u32,
+            canonical_decl_id: u32,
+            zig_path: []const []const u8,
 
-            if (self.findGraphModuleIndexById(source_mod_id)) |sm_idx| {
-                const sm = self.graph.modules[sm_idx];
-                if (self.resolveFinalModFromSourceMod(source_mod_id)) |t_final| {
-                    if (t_final != self_final_mod_idx) {
-                        for (sm.exports) |did| {
-                            try out.append(self.scratch, .{ .decl_id = did });
-                        }
+            fn samePath(pa: []const []const u8, pb: []const []const u8) bool {
+                if (pa.len != pb.len) return false;
+                for (pa, pb) |sa, sb_seg| {
+                    if (!std.mem.eql(u8, sa, sb_seg)) return false;
+                }
+                return true;
+            }
+
+            fn areMergedPeers(decls: anytype, da: u32, db: u32) bool {
+                if (da == db) return true;
+                if (da < decls.len) {
+                    for (decls[da].merged_with) |m| {
+                        if (m == db) return true;
                     }
                 }
-                for (sm.star_re_exports) |next_sm| {
-                    try self.collectStarReExportsFromSourceMod(
-                        next_sm,
-                        self_final_mod_idx,
-                        visited_source_mods,
-                        visited_cands,
-                        out,
-                    );
+                if (db < decls.len) {
+                    for (decls[db].merged_with) |m| {
+                        if (m == da) return true;
+                    }
                 }
+                return false;
             }
 
-            if (self.source_mod_to_cand.get(source_mod_id)) |sc_idx| {
-                try self.collectStarReExportsFromCand(
-                    sc_idx,
-                    self_final_mod_idx,
-                    visited_source_mods,
-                    visited_cands,
-                    out,
-                );
+            fn resolveCanonDeclId(decls: anytype, start_did: u32) u32 {
+                var cur = start_did;
+                var hops: usize = 0;
+                while (hops < 16 and cur < decls.len) : (hops += 1) {
+                    switch (decls[cur].kind) {
+                        .re_export_decl => |re| cur = re.target_decl orelse break,
+                        .import_equals_decl => |ie| cur = ie.target_decl orelse break,
+                        else => break,
+                    }
+                }
+                return cur;
             }
+
+            fn sameSymbol(decls: anytype, a: @This(), b: @This()) bool {
+                if (a.module_index != b.module_index) return false;
+                return samePath(a.zig_path, b.zig_path) or
+                    areMergedPeers(decls, a.canonical_decl_id, b.canonical_decl_id);
+            }
+        };
+
+        const ResolvedStarItem = struct {
+            item: StarExportItem,
+            export_wire: []const u8,
+            canon: StarCanonLoc,
+        };
+
+        const ModuleStarSummary = struct {
+            exported_items: []const ResolvedStarItem = &.{},
+            nested_star_items: []const ResolvedStarItem = &.{},
+            poisoned_wires: []const []const u8 = &.{},
+        };
+
+        fn starItemExportWire(self: *const Self, item: StarExportItem) []const u8 {
+            if (item.wire_name_override) |ov| return ov;
+            if (item.decl_id >= self.graph.decls.len) return "";
+            const sd = self.graph.decls[item.decl_id];
+            return if (sd.export_name) |esid| self.str(esid) else self.str(sd.name);
         }
 
-        fn collectStarReExportsFromCand(
+        fn buildModuleStarSummary(
             self: *Self,
-            cand_idx: u32,
-            self_final_mod_idx: u32,
-            visited_source_mods: *std.AutoHashMapUnmanaged(u32, void),
-            visited_cands: *std.AutoHashMapUnmanaged(u32, void),
-            out: *std.ArrayList(StarExportItem),
-        ) error{OutOfMemory}!void {
-            if (cand_idx >= self.candidates.items.len) return;
-            if (visited_cands.contains(cand_idx)) return;
-            try visited_cands.put(self.scratch, cand_idx, {});
+            direct_items: []const StarExportItem,
+            has_final_mod: bool,
+            child_summaries: []const ModuleStarSummary,
+        ) error{OutOfMemory}!ModuleStarSummary {
+            var direct_wires: std.StringHashMapUnmanaged(void) = .empty;
+            defer direct_wires.deinit(self.scratch);
+            var resolved_direct: std.ArrayList(ResolvedStarItem) = .empty;
 
-            const cand = &self.candidates.items[cand_idx];
-            if (self.candToFinalIndex(cand_idx)) |t_final| {
-                if (t_final != self_final_mod_idx) {
-                    for (cand.exported_decl_ids.items) |did| {
-                        try out.append(self.scratch, .{ .decl_id = did });
-                    }
-                    for (cand.foreign_exports.items) |fe| {
-                        if (!fe.is_default_export) {
-                            try out.append(self.scratch, .{
-                                .decl_id = fe.decl_id,
-                                .wire_name_override = fe.wire_name_override,
+            for (direct_items) |di| {
+                if (di.decl_id >= self.graph.decls.len) continue;
+                const d = self.graph.decls[di.decl_id];
+                if (d.modifiers.default_export) continue;
+                const ew = self.starItemExportWire(di);
+                if (ew.len == 0 or std.mem.eql(u8, ew, "default")) continue;
+                try direct_wires.put(self.scratch, ew, {});
+                if (has_final_mod and !self.merged_ns_consumed.contains(di.decl_id)) {
+                    if (try self.resolveEffectiveReExportTarget(di.decl_id, 0)) |loc| {
+                        if (loc.zig_path.len > 0) {
+                            try resolved_direct.append(self.scratch, .{
+                                .item = di,
+                                .export_wire = ew,
+                                .canon = .{
+                                    .module_index = loc.module_index,
+                                    .canonical_decl_id = StarCanonLoc.resolveCanonDeclId(self.graph.decls, di.decl_id),
+                                    .zig_path = loc.zig_path,
+                                },
                             });
                         }
                     }
                 }
             }
 
-            for (cand.star_re_export_source_mods.items) |smid| {
-                try self.collectStarReExportsFromSourceMod(
-                    smid,
-                    self_final_mod_idx,
-                    visited_source_mods,
-                    visited_cands,
-                    out,
+            // ECMA-262 `ResolveExport` step 10.d: both propagated `AMBIGUOUS` wires from child
+            // `export *` branches and multi-branch symbol collisions poison the wire at this
+            // module unless shadowed by `direct_wires`.
+            var branch_canon: std.StringHashMapUnmanaged(StarCanonLoc) = .empty;
+            defer branch_canon.deinit(self.scratch);
+            var branch_ambig: std.StringHashMapUnmanaged(void) = .empty;
+            defer branch_ambig.deinit(self.scratch);
+            var poisoned_list: std.ArrayList([]const u8) = .empty;
+
+            for (child_summaries) |cs| {
+                for (cs.poisoned_wires) |pw| {
+                    if (direct_wires.contains(pw)) continue;
+                    const gop = try branch_ambig.getOrPut(self.scratch, pw);
+                    if (!gop.found_existing) {
+                        try poisoned_list.append(self.scratch, pw);
+                    }
+                }
+                for (cs.exported_items) |ri| {
+                    if (direct_wires.contains(ri.export_wire)) continue;
+                    if (branch_canon.get(ri.export_wire)) |prev_canon| {
+                        if (!StarCanonLoc.sameSymbol(self.graph.decls, prev_canon, ri.canon)) {
+                            const gop = try branch_ambig.getOrPut(self.scratch, ri.export_wire);
+                            if (!gop.found_existing) {
+                                try poisoned_list.append(self.scratch, ri.export_wire);
+                            }
+                        }
+                    } else {
+                        try branch_canon.put(self.scratch, ri.export_wire, ri.canon);
+                    }
+                }
+            }
+
+            var nested_list: std.ArrayList(ResolvedStarItem) = .empty;
+            var seen_branch_decls: std.AutoHashMapUnmanaged(u32, void) = .empty;
+            defer seen_branch_decls.deinit(self.scratch);
+            const OverrideKey = struct { decl_id: u32, wire: []const u8 };
+            var seen_override_items: std.ArrayList(OverrideKey) = .empty;
+            defer seen_override_items.deinit(self.scratch);
+
+            for (child_summaries) |cs| {
+                for (cs.exported_items) |ri| {
+                    if (direct_wires.contains(ri.export_wire) or branch_ambig.contains(ri.export_wire)) continue;
+                    if (ri.item.wire_name_override == null) {
+                        const gop = try seen_branch_decls.getOrPut(self.scratch, ri.item.decl_id);
+                        if (gop.found_existing) continue;
+                    } else {
+                        var dup_ov = false;
+                        for (seen_override_items.items) |ok| {
+                            if (ok.decl_id == ri.item.decl_id and std.mem.eql(u8, ok.wire, ri.export_wire)) {
+                                dup_ov = true;
+                                break;
+                            }
+                        }
+                        if (dup_ov) continue;
+                        try seen_override_items.append(self.scratch, .{ .decl_id = ri.item.decl_id, .wire = ri.export_wire });
+                    }
+                    try nested_list.append(self.scratch, ri);
+                }
+            }
+
+            const nested_slice = try nested_list.toOwnedSlice(self.scratch);
+            var exported_list: std.ArrayList(ResolvedStarItem) = .empty;
+            try exported_list.ensureTotalCapacity(self.scratch, resolved_direct.items.len + nested_slice.len);
+            exported_list.appendSliceAssumeCapacity(resolved_direct.items);
+            exported_list.appendSliceAssumeCapacity(nested_slice);
+            resolved_direct.deinit(self.scratch);
+
+            return .{
+                .exported_items = try exported_list.toOwnedSlice(self.scratch),
+                .nested_star_items = nested_slice,
+                .poisoned_wires = try poisoned_list.toOwnedSlice(self.scratch),
+            };
+        }
+
+        fn getSourceModStarSummary(
+            self: *Self,
+            source_mod_id: u32,
+            visiting_source_mods: *std.AutoHashMapUnmanaged(u32, void),
+            visiting_cands: *std.AutoHashMapUnmanaged(u32, void),
+            hit_cycle: *bool,
+        ) error{OutOfMemory}!ModuleStarSummary {
+            if (self.source_mod_to_cand.get(source_mod_id)) |sc_idx| {
+                return self.getCandStarSummary(
+                    sc_idx,
+                    visiting_source_mods,
+                    visiting_cands,
+                    hit_cycle,
                 );
+            }
+            if (self.star_summary_smods.get(source_mod_id)) |cached| return cached;
+            if (visiting_source_mods.contains(source_mod_id)) {
+                hit_cycle.* = true;
+                return .{};
+            }
+
+            const is_root_call = (visiting_source_mods.count() == 0 and visiting_cands.count() == 0);
+            try visiting_source_mods.put(self.scratch, source_mod_id, {});
+            defer _ = visiting_source_mods.remove(source_mod_id);
+
+            const sm_idx = self.findGraphModuleIndexById(source_mod_id) orelse return .{};
+            const sm = self.graph.modules[sm_idx];
+
+            var direct_items: std.ArrayList(StarExportItem) = .empty;
+            defer direct_items.deinit(self.scratch);
+            for (sm.exports) |did| {
+                if (sm.default_export != null and sm.default_export.? == did) continue;
+                try direct_items.append(self.scratch, .{ .decl_id = did });
+            }
+
+            var seen_child_cands: std.AutoHashMapUnmanaged(u32, void) = .empty;
+            defer seen_child_cands.deinit(self.scratch);
+            var seen_child_smods: std.AutoHashMapUnmanaged(u32, void) = .empty;
+            defer seen_child_smods.deinit(self.scratch);
+            var child_summaries: std.ArrayList(ModuleStarSummary) = .empty;
+            defer child_summaries.deinit(self.scratch);
+
+            var sub_hit_cycle = false;
+            for (sm.star_re_exports) |next_sm| {
+                if (self.source_mod_to_cand.get(next_sm)) |dep_cand| {
+                    if ((try seen_child_cands.getOrPut(self.scratch, dep_cand)).found_existing) continue;
+                    try child_summaries.append(self.scratch, try self.getCandStarSummary(
+                        dep_cand,
+                        visiting_source_mods,
+                        visiting_cands,
+                        &sub_hit_cycle,
+                    ));
+                } else {
+                    if ((try seen_child_smods.getOrPut(self.scratch, next_sm)).found_existing) continue;
+                    try child_summaries.append(self.scratch, try self.getSourceModStarSummary(
+                        next_sm,
+                        visiting_source_mods,
+                        visiting_cands,
+                        &sub_hit_cycle,
+                    ));
+                }
+            }
+
+            if (sub_hit_cycle) hit_cycle.* = true;
+            const has_final_mod = (self.resolveFinalModFromSourceMod(source_mod_id) != null);
+            const summary = try self.buildModuleStarSummary(
+                direct_items.items,
+                has_final_mod,
+                child_summaries.items,
+            );
+            if (!sub_hit_cycle or is_root_call) {
+                try self.star_summary_smods.put(self.scratch, source_mod_id, summary);
+            }
+            return summary;
+        }
+
+        fn getCandStarSummary(
+            self: *Self,
+            cand_idx: u32,
+            visiting_source_mods: *std.AutoHashMapUnmanaged(u32, void),
+            visiting_cands: *std.AutoHashMapUnmanaged(u32, void),
+            hit_cycle: *bool,
+        ) error{OutOfMemory}!ModuleStarSummary {
+            if (cand_idx >= self.candidates.items.len) return .{};
+            if (self.star_summary_cands.get(cand_idx)) |cached| return cached;
+            if (visiting_cands.contains(cand_idx)) {
+                hit_cycle.* = true;
+                return .{};
+            }
+            const cand = &self.candidates.items[cand_idx];
+            for (cand.source_mod_ids.items) |self_smid| {
+                if (visiting_source_mods.contains(self_smid)) {
+                    hit_cycle.* = true;
+                    return .{};
+                }
+            }
+
+            const is_root_call = (visiting_source_mods.count() == 0 and visiting_cands.count() == 0);
+            try visiting_cands.put(self.scratch, cand_idx, {});
+            defer _ = visiting_cands.remove(cand_idx);
+            for (cand.source_mod_ids.items) |self_smid| {
+                try visiting_source_mods.put(self.scratch, self_smid, {});
+            }
+            defer {
+                for (cand.source_mod_ids.items) |self_smid| {
+                    _ = visiting_source_mods.remove(self_smid);
+                }
+            }
+
+            var direct_items: std.ArrayList(StarExportItem) = .empty;
+            defer direct_items.deinit(self.scratch);
+            for (cand.exported_decl_ids.items) |did| {
+                if (cand.default_export_decl_id != null and cand.default_export_decl_id.? == did) continue;
+                try direct_items.append(self.scratch, .{ .decl_id = did });
+            }
+            for (cand.foreign_exports.items) |fe| {
+                if (!fe.is_default_export) {
+                    try direct_items.append(self.scratch, .{
+                        .decl_id = fe.decl_id,
+                        .wire_name_override = fe.wire_name_override,
+                    });
+                }
+            }
+
+            var seen_child_cands: std.AutoHashMapUnmanaged(u32, void) = .empty;
+            defer seen_child_cands.deinit(self.scratch);
+            var seen_child_smods: std.AutoHashMapUnmanaged(u32, void) = .empty;
+            defer seen_child_smods.deinit(self.scratch);
+            var child_summaries: std.ArrayList(ModuleStarSummary) = .empty;
+            defer child_summaries.deinit(self.scratch);
+
+            var sub_hit_cycle = false;
+            for (cand.star_re_export_source_mods.items) |smid| {
+                if (self.source_mod_to_cand.get(smid)) |dep_cand| {
+                    if ((try seen_child_cands.getOrPut(self.scratch, dep_cand)).found_existing) continue;
+                    try child_summaries.append(self.scratch, try self.getCandStarSummary(
+                        dep_cand,
+                        visiting_source_mods,
+                        visiting_cands,
+                        &sub_hit_cycle,
+                    ));
+                } else {
+                    if ((try seen_child_smods.getOrPut(self.scratch, smid)).found_existing) continue;
+                    try child_summaries.append(self.scratch, try self.getSourceModStarSummary(
+                        smid,
+                        visiting_source_mods,
+                        visiting_cands,
+                        &sub_hit_cycle,
+                    ));
+                }
             }
             for (cand.star_re_export_specs.items) |mspec| {
                 if (try self.resolveSpecToCandidateIdx(mspec)) |dep_cand| {
-                    try self.collectStarReExportsFromCand(
+                    if ((try seen_child_cands.getOrPut(self.scratch, dep_cand)).found_existing) continue;
+                    try child_summaries.append(self.scratch, try self.getCandStarSummary(
                         dep_cand,
-                        self_final_mod_idx,
-                        visited_source_mods,
-                        visited_cands,
-                        out,
-                    );
+                        visiting_source_mods,
+                        visiting_cands,
+                        &sub_hit_cycle,
+                    ));
                 }
             }
+
+            if (sub_hit_cycle) hit_cycle.* = true;
+            const has_final_mod = (self.candToFinalIndex(cand_idx) != null);
+            const summary = try self.buildModuleStarSummary(
+                direct_items.items,
+                has_final_mod,
+                child_summaries.items,
+            );
+            if (!sub_hit_cycle or is_root_call) {
+                try self.star_summary_cands.put(self.scratch, cand_idx, summary);
+            }
+            return summary;
         }
 
         /// Breaks any by-value struct/union/tuple/alias cycles across the entire `PackageIr` by setting
@@ -14532,11 +15155,13 @@ fn LowerCtx(comptime GraphType: type) type {
                 var seen_non_default_decls: std.AutoHashMapUnmanaged(u32, void) = .empty;
                 defer seen_non_default_decls.deinit(self.scratch);
 
-                var seen_export_wires: std.StringHashMapUnmanaged(void) = .empty;
-                defer seen_export_wires.deinit(self.scratch);
+                var explicit_own_wires: std.StringHashMapUnmanaged(void) = .empty;
+                defer explicit_own_wires.deinit(self.scratch);
+                var reexported_wire_canon: std.StringHashMapUnmanaged(StarCanonLoc) = .empty;
+                defer reexported_wire_canon.deinit(self.scratch);
                 for (cand.exported_decl_ids.items) |edid| {
                     if (edid >= self.graph.decls.len) continue;
-                    // Do not pre-seed `same_mod_export_equals_children` in `seen_export_wires` before
+                    // Do not pre-seed `same_mod_export_equals_children` in `explicit_own_wires` before
                     // binding them below as top-level `planned_re_exports`!
                     var is_same_mod_eq_child = false;
                     for (cand.same_mod_export_equals_children.items) |eq_cid| {
@@ -14549,7 +15174,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     const ed = self.graph.decls[edid];
                     if (ed.modifiers.default_export) continue;
                     const ew = if (ed.export_name) |esid| self.str(esid) else self.str(ed.name);
-                    if (ew.len > 0) try seen_export_wires.put(self.scratch, ew, {});
+                    if (ew.len > 0) try explicit_own_wires.put(self.scratch, ew, {});
                 }
 
                 // Expose exported members of a same-module `export = <namespace>` at module top-level (`H4`)!
@@ -14559,7 +15184,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     const loc = (try self.resolveEffectiveReExportTarget(eq_cid, 0)) orelse continue;
                     if (loc.zig_path.len == 0) continue;
                     const export_wire = if (sd.export_name) |esid| self.str(esid) else self.str(sd.name);
-                    if (seen_non_default_decls.contains(eq_cid) or seen_export_wires.contains(export_wire)) continue;
+                    if (seen_non_default_decls.contains(eq_cid) or explicit_own_wires.contains(export_wire)) continue;
                     const style = self.declNameStyle(sd);
                     const desired_styled = switch (style) {
                         .preserve => try self.scratch.dupe(u8, export_wire),
@@ -14571,7 +15196,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     const base_check = if (desired_styled.len == 0) "_empty" else desired_styled;
                     if (ms.isTaken(base_check)) continue;
                     try seen_non_default_decls.put(self.scratch, eq_cid, {});
-                    if (export_wire.len > 0) try seen_export_wires.put(self.scratch, export_wire, {});
+                    if (export_wire.len > 0) try explicit_own_wires.put(self.scratch, export_wire, {});
 
                     const sb = try ms.bind(export_wire, style);
                     try planned_re_exports[final_i].append(self.scratch, .{
@@ -14586,6 +15211,11 @@ fn LowerCtx(comptime GraphType: type) type {
                     sb.deinit(self.scratch);
                 }
 
+                // Process `cand.foreign_exports` BEFORE `star_items`: the Go extractor already filters
+                // ambiguous `export *` bindings per module while keeping explicit re-exports
+                // (`import { X } from './a'; export { X }`) and non-ambiguous intermediate overrides
+                // (`mid` overriding `b`'s `X`). Recording bound wires in `reexported_wire_canon`
+                // ensures explicit/resolved bindings take precedence over `star_items`.
                 for (cand.foreign_exports.items) |fe| {
                     if (self.merged_ns_consumed.contains(fe.decl_id)) continue;
                     if (fe.decl_id >= self.graph.decls.len) continue;
@@ -14603,7 +15233,15 @@ fn LowerCtx(comptime GraphType: type) type {
                         self.declNameStyle(sd);
 
                     if (!fe.is_default_export) {
-                        if (seen_non_default_decls.contains(fe.decl_id) or seen_export_wires.contains(export_wire)) continue;
+                        if (seen_non_default_decls.contains(fe.decl_id) or explicit_own_wires.contains(export_wire)) continue;
+                        const cur_canon: StarCanonLoc = .{
+                            .module_index = loc.module_index,
+                            .canonical_decl_id = StarCanonLoc.resolveCanonDeclId(self.graph.decls, fe.decl_id),
+                            .zig_path = loc.zig_path,
+                        };
+                        if (reexported_wire_canon.get(export_wire)) |prev_canon| {
+                            if (!StarCanonLoc.sameSymbol(self.graph.decls, prev_canon, cur_canon)) continue;
+                        }
                         const desired_styled = switch (style) {
                             .preserve => try self.scratch.dupe(u8, export_wire),
                             .camel => try naming.toCamelCase(self.scratch, export_wire),
@@ -14614,7 +15252,9 @@ fn LowerCtx(comptime GraphType: type) type {
                         const base_check = if (desired_styled.len == 0) "_empty" else desired_styled;
                         if (ms.isTaken(base_check)) continue;
                         try seen_non_default_decls.put(self.scratch, fe.decl_id, {});
-                        if (export_wire.len > 0) try seen_export_wires.put(self.scratch, export_wire, {});
+                        if (export_wire.len > 0 and !reexported_wire_canon.contains(export_wire)) {
+                            try reexported_wire_canon.put(self.scratch, export_wire, cur_canon);
+                        }
                     }
 
                     const sb = try ms.bind(export_wire, style);
@@ -14630,51 +15270,29 @@ fn LowerCtx(comptime GraphType: type) type {
                     sb.deinit(self.scratch);
                 }
 
-                var visited_star_smods: std.AutoHashMapUnmanaged(u32, void) = .empty;
-                defer visited_star_smods.deinit(self.scratch);
-                for (cand.source_mod_ids.items) |self_smid| {
-                    try visited_star_smods.put(self.scratch, self_smid, {});
-                }
+                var visiting_star_smods: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                defer visiting_star_smods.deinit(self.scratch);
+                var visiting_star_cands: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                defer visiting_star_cands.deinit(self.scratch);
+                var root_hit_cycle = false;
+                const star_summary = try self.getCandStarSummary(
+                    cand_idx,
+                    &visiting_star_smods,
+                    &visiting_star_cands,
+                    &root_hit_cycle,
+                );
 
-                var visited_star_cands: std.AutoHashMapUnmanaged(u32, void) = .empty;
-                defer visited_star_cands.deinit(self.scratch);
-                try visited_star_cands.put(self.scratch, cand_idx, {});
-
-                var star_items: std.ArrayList(StarExportItem) = .empty;
-                defer star_items.deinit(self.scratch);
-                for (cand.star_re_export_source_mods.items) |smid| {
-                    try self.collectStarReExportsFromSourceMod(
-                        smid,
-                        final_mod_idx,
-                        &visited_star_smods,
-                        &visited_star_cands,
-                        &star_items,
-                    );
-                }
-                for (cand.star_re_export_specs.items) |mspec| {
-                    if (try self.resolveSpecToCandidateIdx(mspec)) |dep_cand| {
-                        try self.collectStarReExportsFromCand(
-                            dep_cand,
-                            final_mod_idx,
-                            &visited_star_smods,
-                            &visited_star_cands,
-                            &star_items,
-                        );
-                    }
-                }
-
-                for (star_items.items) |item| {
-                    if (self.merged_ns_consumed.contains(item.decl_id)) continue;
-                    if (item.decl_id >= self.graph.decls.len) continue;
+                for (star_summary.nested_star_items) |ri| {
+                    const item = ri.item;
+                    if (ri.canon.module_index == final_mod_idx) continue;
                     const sd = self.graph.decls[item.decl_id];
-                    if (sd.modifiers.default_export) continue;
-                    const loc = (try self.resolveEffectiveReExportTarget(item.decl_id, 0)) orelse continue;
-                    if (loc.zig_path.len == 0 or loc.module_index == final_mod_idx) continue;
-
-                    const export_wire = item.wire_name_override orelse
-                        (if (sd.export_name) |esid| self.str(esid) else self.str(sd.name));
-                    if (seen_export_wires.contains(export_wire)) continue;
+                    const export_wire = ri.export_wire;
+                    if (explicit_own_wires.contains(export_wire)) continue;
                     if (item.wire_name_override == null and seen_non_default_decls.contains(item.decl_id)) continue;
+                    const cur_canon = ri.canon;
+                    if (reexported_wire_canon.get(export_wire)) |prev_canon| {
+                        if (!StarCanonLoc.sameSymbol(self.graph.decls, prev_canon, cur_canon)) continue;
+                    }
 
                     const style: naming.NameStyle = if (item.wire_name_override != null)
                         .preserve
@@ -14696,8 +15314,8 @@ fn LowerCtx(comptime GraphType: type) type {
                     if (item.wire_name_override == null) {
                         try seen_non_default_decls.put(self.scratch, item.decl_id, {});
                     }
-                    if (export_wire.len > 0) {
-                        try seen_export_wires.put(self.scratch, export_wire, {});
+                    if (export_wire.len > 0 and !reexported_wire_canon.contains(export_wire)) {
+                        try reexported_wire_canon.put(self.scratch, export_wire, cur_canon);
                     }
 
                     const sb = try ms.bind(export_wire, style);
@@ -14707,8 +15325,8 @@ fn LowerCtx(comptime GraphType: type) type {
                         .logical_name = try self.alloc.dupe(u8, sb.logical_name),
                         .wire_name = try self.alloc.dupe(u8, sb.wire_name),
                         .is_default_export = false,
-                        .target_module_index = loc.module_index,
-                        .target_zig_path = loc.zig_path,
+                        .target_module_index = ri.canon.module_index,
+                        .target_zig_path = ri.canon.zig_path,
                     });
                     sb.deinit(self.scratch);
                 }
@@ -14755,6 +15373,8 @@ fn LowerCtx(comptime GraphType: type) type {
                 self.cur_mod_idx = final_mod_idx;
                 self.cur_mod_hoisted_locs.clearRetainingCapacity();
                 self.cur_mod_closed_types.clearRetainingCapacity();
+                self.cur_mod_enum_member_types.clearRetainingCapacity();
+                self.cur_mod_unit_literal_types.clearRetainingCapacity();
                 self.cur_mod_decls_out = &decl_irs;
                 self.cur_mod_root_scope = ms;
                 self.cur_mod_anon_counter = 0;
@@ -14784,6 +15404,11 @@ fn LowerCtx(comptime GraphType: type) type {
                         try imports_used.put(self.scratch, pre.target_module_index, {});
                     }
                     const is_pure_eq_ns = self.pure_export_equals_ns.contains(pre.source_decl_id);
+                    const is_type_only_re = pre.source_decl_id < self.graph.decls.len and
+                        ((self.graph.decls[pre.source_decl_id].kind == .re_export_decl and
+                            self.graph.decls[pre.source_decl_id].kind.re_export_decl.is_type_only) or
+                            (self.graph.decls[pre.source_decl_id].kind == .import_equals_decl and
+                                self.graph.decls[pre.source_decl_id].kind.import_equals_decl.is_type_only));
                     try decl_irs.append(self.alloc, .{
                         .source_decl_id = pre.source_decl_id,
                         .zig_ident = pre.zig_ident,
@@ -14797,6 +15422,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             .re_export_decl = .{
                                 .target_module_index = pre.target_module_index,
                                 .target_zig_path = pre.target_zig_path,
+                                .is_type_only = is_type_only_re,
                             },
                         },
                     });
@@ -14867,15 +15493,713 @@ fn LowerCtx(comptime GraphType: type) type {
                     .export_equals_ident = export_equals_ident,
                     .export_equals_wire_name = export_equals_wire_name,
                     .is_primary = cand.is_primary,
+                    .is_encapsulated_internal = (self.options.vfs_specifier_overrides.len > 0 and !cand.is_public_export_mod),
                     .needs_root_runtime = needs_runtime,
                     .imports = mod_imports,
                     .decls = try decl_irs.toOwnedSlice(self.alloc),
                 };
             }
 
+            try self.resolveRuntimeWireTargetsAndPruneUnreachable(modules, mod_scopes);
             try self.synthesizeReExportAllocCompanions(modules, mod_scopes);
             try self.breakValueTypeCycles(modules);
             return modules;
+        }
+
+        fn resolveRuntimeWireTargetsAndPruneUnreachable(
+            self: *Self,
+            modules: []ModuleIr,
+            mod_scopes: []naming.ScopeNamer,
+        ) error{OutOfMemory}!void {
+            const ModDeclKey = struct {
+                mod_idx: u32,
+                sid: u32,
+            };
+            const ClaimInfo = struct {
+                wire_module: []const u8,
+                wire_path_prefix: []const []const u8,
+                wire_name: []const u8,
+                is_default: bool,
+            };
+            const CloneEntry = struct {
+                wire_module: []const u8,
+                wire_name: []const u8,
+                is_default: bool,
+                primary_zig_ident: []const u8,
+            };
+
+            var natively_reachable: std.AutoHashMapUnmanaged(ModDeclKey, void) = .empty;
+            defer natively_reachable.deinit(self.scratch);
+            var claimed_targets: std.AutoHashMapUnmanaged(ModDeclKey, ClaimInfo) = .empty;
+            defer claimed_targets.deinit(self.scratch);
+            var cloned_aliases: std.AutoHashMapUnmanaged(ModDeclKey, std.ArrayList(CloneEntry)) = .empty;
+            defer {
+                var cit = cloned_aliases.valueIterator();
+                while (cit.next()) |lst| lst.deinit(self.scratch);
+                cloned_aliases.deinit(self.scratch);
+            }
+
+            // 1. Mark declarations that are directly reachable from a public runtime module
+            // (or global scope).
+            for (modules, 0..) |m, mi| {
+                const m_idx: u32 = @intCast(mi);
+                for (m.decls) |d| {
+                    if (d.kind == .re_export_decl or d.kind == .namespace_re_export) continue;
+                    const sid = d.source_decl_id orelse continue;
+                    if (d.is_global_scope) {
+                        try natively_reachable.put(self.scratch, .{ .mod_idx = m_idx, .sid = sid }, {});
+                        continue;
+                    }
+                    if (m.is_encapsulated_internal) continue;
+                    const is_eq = m.export_equals_ident != null and std.mem.eql(u8, d.logical_name, m.export_equals_ident.?);
+                    if (d.is_js_exported or is_eq or self.pure_export_equals_ns.contains(sid)) {
+                        try natively_reachable.put(self.scratch, .{ .mod_idx = m_idx, .sid = sid }, {});
+                        if (is_eq and sid < self.graph.decls.len) {
+                            for (self.graph.decls[sid].merged_with) |peer_sid| {
+                                try natively_reachable.put(self.scratch, .{ .mod_idx = m_idx, .sid = peer_sid }, {});
+                            }
+                        }
+                    }
+                }
+            }
+
+            var mod_mut_decls = try self.scratch.alloc([]DeclIr, modules.len);
+            defer self.scratch.free(mod_mut_decls);
+            for (modules, 0..) |*m, mi| {
+                const md = try self.alloc.dupe(DeclIr, m.decls);
+                mod_mut_decls[mi] = md;
+                m.decls = md;
+            }
+
+            const claimDeclAndMergedPeers = struct {
+                fn run(
+                    s: *Self,
+                    claimed: *std.AutoHashMapUnmanaged(ModDeclKey, ClaimInfo),
+                    natively: *const std.AutoHashMapUnmanaged(ModDeclKey, void),
+                    mut_decls: []DeclIr,
+                    t_idx: u32,
+                    sid: u32,
+                    wire_mod: []const u8,
+                    wire_pfx: []const []const u8,
+                    wire_name_val: []const u8,
+                    wire_name_opt: ?[]const u8,
+                    is_def: bool,
+                ) error{OutOfMemory}!void {
+                    try claimed.put(s.scratch, .{ .mod_idx = t_idx, .sid = sid }, .{
+                        .wire_module = wire_mod,
+                        .wire_path_prefix = wire_pfx,
+                        .wire_name = wire_name_val,
+                        .is_default = is_def,
+                    });
+                    for (mut_decls) |*item| {
+                        if (item.source_decl_id != sid) continue;
+                        if (item.kind == .re_export_decl or item.kind == .namespace_re_export) continue;
+                        item.wire_module_override = wire_mod;
+                        item.wire_path_prefix = wire_pfx;
+                        if (wire_name_opt) |wn| {
+                            item.wire_name = wn;
+                        }
+                        if (is_def and !item.is_synthetic_companion) {
+                            item.is_default_export = true;
+                        }
+                    }
+                    if (sid < s.graph.decls.len) {
+                        for (s.graph.decls[sid].merged_with) |peer_sid| {
+                            const pkey: ModDeclKey = .{ .mod_idx = t_idx, .sid = peer_sid };
+                            if (natively.contains(pkey) or claimed.contains(pkey)) continue;
+                            try claimed.put(s.scratch, pkey, .{
+                                .wire_module = wire_mod,
+                                .wire_path_prefix = wire_pfx,
+                                .wire_name = wire_name_val,
+                                .is_default = is_def,
+                            });
+                            for (mut_decls) |*item| {
+                                if (item.source_decl_id != peer_sid) continue;
+                                if (item.kind == .re_export_decl or item.kind == .namespace_re_export) continue;
+                                item.wire_module_override = wire_mod;
+                                item.wire_path_prefix = wire_pfx;
+                                if (wire_name_opt) |wn| {
+                                    item.wire_name = wn;
+                                }
+                            }
+                        }
+                    }
+                }
+            }.run;
+
+            // 2a. Public `export * as ns from "./internal"` (`namespace_re_export`) claims
+            // exported declarations on encapsulated internal target modules recursively across
+            // direct exports, ES-filtered `.re_export_decl`s (`export * from './deep'`), and
+            // nested `namespace_re_export`s under `.ns_path = &.{ ns, ... }`.
+            const NsClaimWork = struct {
+                target_mod_idx: u32,
+                pfx: []const []const u8,
+                depth: usize,
+            };
+            for (modules) |pub_mod| {
+                if (pub_mod.is_encapsulated_internal) continue;
+                for (pub_mod.decls) |d| {
+                    if (!d.is_exported or !d.is_js_exported) continue;
+                    if (d.kind != .namespace_re_export) continue;
+                    const nre = d.kind.namespace_re_export;
+                    if (nre.is_type_only or nre.target_module_index >= modules.len) continue;
+                    const root_pfx = try self.alloc.dupe([]const u8, &.{d.wire_name});
+
+                    var ns_queue: std.ArrayList(NsClaimWork) = .empty;
+                    defer ns_queue.deinit(self.scratch);
+                    var visited_ns_mods: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                    defer visited_ns_mods.deinit(self.scratch);
+                    try ns_queue.append(self.scratch, .{
+                        .target_mod_idx = nre.target_module_index,
+                        .pfx = root_pfx,
+                        .depth = 0,
+                    });
+
+                    var nq_i: usize = 0;
+                    while (nq_i < ns_queue.items.len) : (nq_i += 1) {
+                        const work = ns_queue.items[nq_i];
+                        if (work.depth > 16 or work.target_mod_idx >= modules.len) continue;
+                        if (visited_ns_mods.contains(work.target_mod_idx)) continue;
+                        try visited_ns_mods.put(self.scratch, work.target_mod_idx, {});
+
+                        const t_idx = work.target_mod_idx;
+                        for (modules[t_idx].decls) |td| {
+                            if (!td.is_exported or !td.is_js_exported) continue;
+                            switch (td.kind) {
+                                .namespace_re_export => |sub_nre| {
+                                    if (sub_nre.is_type_only or sub_nre.target_module_index >= modules.len) continue;
+                                    var next_pfx = try self.alloc.alloc([]const u8, work.pfx.len + 1);
+                                    @memcpy(next_pfx[0..work.pfx.len], work.pfx);
+                                    next_pfx[work.pfx.len] = td.wire_name;
+                                    try ns_queue.append(self.scratch, .{
+                                        .target_mod_idx = sub_nre.target_module_index,
+                                        .pfx = next_pfx,
+                                        .depth = work.depth + 1,
+                                    });
+                                },
+                                .re_export_decl => |sub_re0| {
+                                    if (sub_re0.is_type_only or td.is_default_export) continue;
+                                    var cur_m = sub_re0.target_module_index;
+                                    var cur_p = sub_re0.target_zig_path;
+                                    var chain_to = false;
+                                    var hops: usize = 0;
+                                    while (hops < 16) : (hops += 1) {
+                                        if (cur_m >= modules.len or cur_p.len != 1) break;
+                                        const found = findNestedDeclByZigPath(modules[cur_m].decls, cur_p) orelse break;
+                                        if (found.kind != .re_export_decl) break;
+                                        if (found.kind.re_export_decl.is_type_only) {
+                                            chain_to = true;
+                                            break;
+                                        }
+                                        cur_m = found.kind.re_export_decl.target_module_index;
+                                        cur_p = found.kind.re_export_decl.target_zig_path;
+                                    }
+                                    if (chain_to or cur_m >= modules.len or cur_p.len != 1) continue;
+                                    const orig_td = findNestedDeclByZigPath(modules[cur_m].decls, cur_p) orelse continue;
+                                    if (orig_td.kind == .re_export_decl or orig_td.kind == .namespace_re_export) continue;
+                                    const orig_sid = orig_td.source_decl_id orelse continue;
+                                    const okey: ModDeclKey = .{ .mod_idx = cur_m, .sid = orig_sid };
+                                    if (natively_reachable.contains(okey) or claimed_targets.contains(okey)) continue;
+                                    try claimDeclAndMergedPeers(
+                                        self,
+                                        &claimed_targets,
+                                        &natively_reachable,
+                                        mod_mut_decls[cur_m],
+                                        cur_m,
+                                        orig_sid,
+                                        pub_mod.wire_specifier,
+                                        work.pfx,
+                                        td.wire_name,
+                                        td.wire_name,
+                                        false,
+                                    );
+                                },
+                                else => {
+                                    if (td.is_default_export) continue;
+                                    if (!modules[t_idx].is_encapsulated_internal) continue;
+                                    const tsid = td.source_decl_id orelse continue;
+                                    const key: ModDeclKey = .{ .mod_idx = t_idx, .sid = tsid };
+                                    if (natively_reachable.contains(key) or claimed_targets.contains(key)) continue;
+                                    try claimDeclAndMergedPeers(
+                                        self,
+                                        &claimed_targets,
+                                        &natively_reachable,
+                                        mod_mut_decls[t_idx],
+                                        t_idx,
+                                        tsid,
+                                        pub_mod.wire_specifier,
+                                        work.pfx,
+                                        td.wire_name,
+                                        null,
+                                        false,
+                                    );
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2b. Public `.re_export_decl` (`export { foo as bar } from "./internal"` or same-file
+            // `declare function fnA(); export { fnA as alias1, fnA as alias2 }`) claims or clones
+            // otherwise-unreachable canonical declarations with the public module's wire specifier
+            // and exported wire name.
+            var next_synth_sid: u32 = @intCast(self.graph.decls.len + 1_000_000);
+            for (modules, 0..) |*pub_mod, pub_mi| {
+                if (pub_mod.is_encapsulated_internal) continue;
+                const pub_mod_idx: u32 = @intCast(pub_mi);
+                const orig_pub_len = mod_mut_decls[pub_mi].len;
+                var di: usize = 0;
+                while (di < orig_pub_len) : (di += 1) {
+                    const d_val = mod_mut_decls[pub_mi][di];
+                    if (!d_val.is_exported or !d_val.is_js_exported or d_val.kind != .re_export_decl) continue;
+                    const re0 = d_val.kind.re_export_decl;
+                    if (re0.is_type_only) continue;
+
+                    // Follow `.re_export_decl` chains to canonical `(orig_mod_idx, orig_zig_path)`.
+                    var cur_mod_idx = re0.target_module_index;
+                    var cur_path = re0.target_zig_path;
+                    var chain_type_only = false;
+                    var hops: usize = 0;
+                    while (hops < 16) : (hops += 1) {
+                        if (cur_mod_idx >= modules.len or cur_path.len != 1) break;
+                        const found = findNestedDeclByZigPath(modules[cur_mod_idx].decls, cur_path) orelse break;
+                        if (found.kind != .re_export_decl) break;
+                        if (found.kind.re_export_decl.is_type_only) {
+                            chain_type_only = true;
+                            break;
+                        }
+                        cur_mod_idx = found.kind.re_export_decl.target_module_index;
+                        cur_path = found.kind.re_export_decl.target_zig_path;
+                    }
+                    if (chain_type_only or cur_mod_idx >= modules.len or cur_path.len == 0) continue;
+                    if (cur_path.len > 1) {
+                        if (findNestedDeclByZigPath(modules[cur_mod_idx].decls, cur_path[0..1])) |root_d| {
+                            if (root_d.source_decl_id) |rsid| {
+                                const rkey: ModDeclKey = .{ .mod_idx = cur_mod_idx, .sid = rsid };
+                                if (!natively_reachable.contains(rkey) and !claimed_targets.contains(rkey)) {
+                                    try claimDeclAndMergedPeers(
+                                        self,
+                                        &claimed_targets,
+                                        &natively_reachable,
+                                        mod_mut_decls[cur_mod_idx],
+                                        cur_mod_idx,
+                                        rsid,
+                                        pub_mod.wire_specifier,
+                                        &.{},
+                                        root_d.wire_name,
+                                        null,
+                                        false,
+                                    );
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    const orig_d_val = findNestedDeclByZigPath(modules[cur_mod_idx].decls, cur_path) orelse continue;
+                    if (orig_d_val.kind == .re_export_decl or orig_d_val.kind == .namespace_re_export) continue;
+                    const orig_sid = orig_d_val.source_decl_id orelse continue;
+                    const key: ModDeclKey = .{ .mod_idx = cur_mod_idx, .sid = orig_sid };
+                    if (natively_reachable.contains(key)) continue;
+
+                    if (claimed_targets.get(key)) |prev_claim| {
+                        const same_target = std.mem.eql(u8, prev_claim.wire_module, pub_mod.wire_specifier) and
+                            prev_claim.wire_path_prefix.len == 0 and
+                            std.mem.eql(u8, prev_claim.wire_name, d_val.wire_name) and
+                            prev_claim.is_default == d_val.is_default_export;
+                        if (same_target) continue;
+
+                        // Check if we already synthesized a clone for `(pub_mod.wire_specifier, d_val.wire_name, d_val.is_default_export)`.
+                        if (cloned_aliases.get(key)) |existing_list| {
+                            var reused = false;
+                            for (existing_list.items) |ce| {
+                                if (std.mem.eql(u8, ce.wire_module, pub_mod.wire_specifier) and
+                                    std.mem.eql(u8, ce.wire_name, d_val.wire_name) and
+                                    ce.is_default == d_val.is_default_export)
+                                {
+                                    mod_mut_decls[pub_mi][di].kind = .{
+                                        .re_export_decl = .{
+                                            .target_module_index = cur_mod_idx,
+                                            .target_zig_path = try self.alloc.dupe([]const u8, &.{ce.primary_zig_ident}),
+                                            .is_type_only = false,
+                                        },
+                                    };
+                                    reused = true;
+                                    break;
+                                }
+                            }
+                            if (reused) continue;
+                        }
+
+                        if (orig_d_val.kind == .function_decl or
+                            orig_d_val.kind == .overload_dispatch or
+                            orig_d_val.kind == .global_var)
+                        {
+                            const clone_sid = next_synth_sid;
+                            next_synth_sid += 1;
+                            const target_scope = &mod_scopes[cur_mod_idx];
+                            const old_primary_logical = orig_d_val.logical_name;
+                            const old_primary_zig = orig_d_val.zig_ident;
+                            const export_cloned = (cur_mod_idx != pub_mod_idx);
+
+                            var orig_group: std.ArrayList(DeclIr) = .empty;
+                            defer orig_group.deinit(self.scratch);
+                            for (modules[cur_mod_idx].decls) |item| {
+                                if (item.source_decl_id == orig_sid and
+                                    item.kind != .re_export_decl and
+                                    item.kind != .namespace_re_export)
+                                {
+                                    try orig_group.append(self.scratch, item);
+                                }
+                            }
+
+                            var ident_remap: std.StringHashMapUnmanaged([]const u8) = .empty;
+                            defer ident_remap.deinit(self.scratch);
+                            var cloned_items: std.ArrayList(DeclIr) = .empty;
+                            defer cloned_items.deinit(self.scratch);
+                            var new_primary_zig: ?[]const u8 = null;
+
+                            // First pass: clone non-dispatch items so arm `zig_ident`s + companions exist in `ident_remap`.
+                            const CloneCompMap = struct {
+                                zig_ident: []const u8,
+                                comps: BoundSigCompanions,
+                            };
+                            var comp_remap: std.StringHashMapUnmanaged(CloneCompMap) = .empty;
+                            defer comp_remap.deinit(self.scratch);
+
+                            for (orig_group.items) |item| {
+                                if (item.kind == .overload_dispatch) continue;
+                                const suffix = if (std.mem.startsWith(u8, item.logical_name, old_primary_logical))
+                                    item.logical_name[old_primary_logical.len..]
+                                else
+                                    "";
+                                const raw_name = try std.fmt.allocPrint(self.scratch, "{s}{s}", .{ d_val.logical_name, suffix });
+                                defer self.scratch.free(raw_name);
+                                const b = try target_scope.bind(raw_name, .preserve);
+                                const czig = try self.alloc.dupe(u8, b.zig_ident);
+                                const clog = try self.alloc.dupe(u8, b.logical_name);
+                                b.deinit(self.scratch);
+
+                                var cloned = item;
+                                cloned.source_decl_id = clone_sid;
+                                cloned.zig_ident = czig;
+                                cloned.logical_name = clog;
+                                cloned.wire_name = d_val.wire_name;
+                                cloned.wire_module_override = pub_mod.wire_specifier;
+                                cloned.wire_path_prefix = &.{};
+                                cloned.is_exported = export_cloned;
+                                cloned.is_default_export = d_val.is_default_export and !item.is_synthetic_companion;
+
+                                if (cloned.kind == .function_decl) {
+                                    const comps = try self.bindSigCompanions(target_scope, clog, &cloned.kind.function_decl);
+                                    cloned.alloc_companion_ident = comps.alloc_ident;
+                                    cloned.slice_companion_ident = comps.slice_ident;
+                                    cloned.slice_alloc_companion_ident = comps.slice_alloc_ident;
+                                    cloned.narrow_companion_ident = comps.narrow_ident;
+                                    cloned.narrow_alloc_companion_ident = comps.narrow_alloc_ident;
+                                    cloned.default_companion_ident = comps.default_ident;
+                                    cloned.default_alloc_companion_ident = comps.default_alloc_ident;
+                                    cloned.infer_companion_ident = comps.infer_ident;
+                                    cloned.infer_alloc_companion_ident = comps.infer_alloc_ident;
+                                    try comp_remap.put(self.scratch, item.zig_ident, .{ .zig_ident = czig, .comps = comps });
+                                }
+                                try ident_remap.put(self.scratch, item.zig_ident, czig);
+                                if (std.mem.eql(u8, item.zig_ident, old_primary_zig)) {
+                                    new_primary_zig = czig;
+                                }
+                                try cloned_items.append(self.scratch, cloned);
+                            }
+
+                            // Second pass: clone `overload_dispatch` items with remapped candidate target idents.
+                            for (orig_group.items) |item| {
+                                if (item.kind != .overload_dispatch) continue;
+                                const suffix = if (std.mem.startsWith(u8, item.logical_name, old_primary_logical))
+                                    item.logical_name[old_primary_logical.len..]
+                                else
+                                    "";
+                                const raw_name = try std.fmt.allocPrint(self.scratch, "{s}{s}", .{ d_val.logical_name, suffix });
+                                defer self.scratch.free(raw_name);
+                                const b = try target_scope.bind(raw_name, .preserve);
+                                const czig = try self.alloc.dupe(u8, b.zig_ident);
+                                const clog = try self.alloc.dupe(u8, b.logical_name);
+                                b.deinit(self.scratch);
+
+                                var disp_alloc: ?[]const u8 = null;
+                                if (item.alloc_companion_ident != null) {
+                                    const raw_da = try std.fmt.allocPrint(self.scratch, "{s}Alloc", .{clog});
+                                    defer self.scratch.free(raw_da);
+                                    const dab = try target_scope.bind(raw_da, .preserve);
+                                    disp_alloc = try self.alloc.dupe(u8, dab.zig_ident);
+                                    dab.deinit(self.scratch);
+                                }
+
+                                const old_od = item.kind.overload_dispatch;
+                                var new_cands = try self.alloc.alloc(OverloadCandidateIr, old_od.candidates.len);
+                                for (old_od.candidates, 0..) |oc, ci| {
+                                    new_cands[ci] = oc;
+                                    if (comp_remap.get(oc.target_ident)) |cm| {
+                                        new_cands[ci].target_ident = cm.zig_ident;
+                                        new_cands[ci].alloc_target_ident = cm.comps.alloc_ident;
+                                        new_cands[ci].slice_target_ident = cm.comps.slice_ident;
+                                        new_cands[ci].infer_target_ident = cm.comps.infer_ident;
+                                        new_cands[ci].infer_alloc_target_ident = cm.comps.infer_alloc_ident;
+                                    }
+                                }
+
+                                var cloned = item;
+                                cloned.source_decl_id = clone_sid;
+                                cloned.zig_ident = czig;
+                                cloned.logical_name = clog;
+                                cloned.wire_name = d_val.wire_name;
+                                cloned.wire_module_override = pub_mod.wire_specifier;
+                                cloned.wire_path_prefix = &.{};
+                                cloned.is_exported = export_cloned;
+                                cloned.alloc_companion_ident = disp_alloc;
+                                var new_od = old_od;
+                                new_od.zig_ident = czig;
+                                new_od.logical_name = clog;
+                                new_od.alloc_companion_ident = disp_alloc;
+                                new_od.candidates = new_cands;
+                                cloned.kind = .{ .overload_dispatch = new_od };
+
+                                if (std.mem.eql(u8, item.zig_ident, old_primary_zig)) {
+                                    new_primary_zig = czig;
+                                }
+                                try cloned_items.append(self.scratch, cloned);
+                            }
+
+                            if (new_primary_zig) |npz| {
+                                const old_slice = mod_mut_decls[cur_mod_idx];
+                                var merged_decls = try self.alloc.alloc(DeclIr, old_slice.len + cloned_items.items.len);
+                                @memcpy(merged_decls[0..old_slice.len], old_slice);
+                                @memcpy(merged_decls[old_slice.len..], cloned_items.items);
+                                mod_mut_decls[cur_mod_idx] = merged_decls;
+                                modules[cur_mod_idx].decls = merged_decls;
+
+                                try claimed_targets.put(self.scratch, .{ .mod_idx = cur_mod_idx, .sid = clone_sid }, .{
+                                    .wire_module = pub_mod.wire_specifier,
+                                    .wire_path_prefix = &.{},
+                                    .wire_name = d_val.wire_name,
+                                    .is_default = d_val.is_default_export,
+                                });
+
+                                const gop = try cloned_aliases.getOrPut(self.scratch, key);
+                                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                                try gop.value_ptr.append(self.scratch, .{
+                                    .wire_module = pub_mod.wire_specifier,
+                                    .wire_name = d_val.wire_name,
+                                    .is_default = d_val.is_default_export,
+                                    .primary_zig_ident = npz,
+                                });
+
+                                mod_mut_decls[pub_mi][di].kind = .{
+                                    .re_export_decl = .{
+                                        .target_module_index = cur_mod_idx,
+                                        .target_zig_path = try self.alloc.dupe([]const u8, &.{npz}),
+                                        .is_type_only = false,
+                                    },
+                                };
+                                if (cur_mod_idx != pub_mod_idx) {
+                                    try self.ensureModuleImport(pub_mod, pub_mod_idx, cur_mod_idx, modules[cur_mod_idx].rel_zig_path);
+                                }
+                            }
+                        }
+                    } else {
+                        try claimDeclAndMergedPeers(
+                            self,
+                            &claimed_targets,
+                            &natively_reachable,
+                            mod_mut_decls[cur_mod_idx],
+                            cur_mod_idx,
+                            orig_sid,
+                            pub_mod.wire_specifier,
+                            &.{},
+                            d_val.wire_name,
+                            d_val.wire_name,
+                            d_val.is_default_export,
+                        );
+                    }
+                }
+            }
+
+            // 3. Prune runtime-unreachable module-level call targets (`function_decl`,
+            // `overload_dispatch`, `global_var`, class `constructors`/`static_props`/static `methods`/
+            // `ctor_target`, and runtime-computed `enum_decl` members) while keeping all types and
+            // instance handle methods/properties intact.
+            for (modules, 0..) |*m, mi| {
+                const m_idx: u32 = @intCast(mi);
+                var kept_top: std.ArrayList(DeclIr) = .empty;
+                defer kept_top.deinit(self.scratch);
+
+                for (m.decls) |d| {
+                    const is_reach = if (d.kind == .re_export_decl or d.kind == .namespace_re_export)
+                        true
+                    else if (d.is_global_scope)
+                        true
+                    else if (d.source_decl_id) |sid| blk: {
+                        const key: ModDeclKey = .{ .mod_idx = m_idx, .sid = sid };
+                        break :blk natively_reachable.contains(key) or claimed_targets.contains(key);
+                    } else !m.is_encapsulated_internal;
+
+                    if (try self.pruneDeclRuntimeTargets(d, is_reach)) |kept_d| {
+                        try kept_top.append(self.scratch, kept_d);
+                    }
+                }
+                m.decls = try self.alloc.dupe(DeclIr, kept_top.items);
+
+                if (m.export_equals_ident) |eq_id| {
+                    var still_has_eq = false;
+                    for (m.decls) |kd| {
+                        if (std.mem.eql(u8, kd.logical_name, eq_id)) {
+                            still_has_eq = true;
+                            break;
+                        }
+                    }
+                    if (!still_has_eq) {
+                        m.export_equals_ident = null;
+                        m.export_equals_wire_name = null;
+                    }
+                }
+            }
+
+            // 4. Drop any `.re_export_decl` whose target was pruned in step 3 (fixpoint).
+            var clean_pass: usize = 0;
+            while (clean_pass < 8) : (clean_pass += 1) {
+                var removed_any = false;
+                for (modules) |*m| {
+                    var next_decls: std.ArrayList(DeclIr) = .empty;
+                    defer next_decls.deinit(self.scratch);
+                    for (m.decls) |d| {
+                        if (d.kind == .re_export_decl) {
+                            const re = d.kind.re_export_decl;
+                            if (re.target_module_index >= modules.len or
+                                !zigPathTargetExists(modules[re.target_module_index].decls, re.target_zig_path))
+                            {
+                                removed_any = true;
+                                continue;
+                            }
+                        }
+                        try next_decls.append(self.scratch, d);
+                    }
+                    if (next_decls.items.len != m.decls.len) {
+                        m.decls = try self.alloc.dupe(DeclIr, next_decls.items);
+                    }
+                }
+                if (!removed_any) break;
+            }
+        }
+
+        fn ensureModuleImport(
+            self: *Self,
+            mod: *ModuleIr,
+            self_mod_idx: u32,
+            target_mod_idx: u32,
+            target_rel_zig_path: []const u8,
+        ) error{OutOfMemory}!void {
+            if (self_mod_idx == target_mod_idx) return;
+            for (mod.imports) |imp| {
+                if (imp.target_module_index == target_mod_idx) return;
+            }
+            const alias_raw = try std.fmt.allocPrint(self.alloc, "__mod_{d}", .{target_mod_idx});
+            const rel_imp = try naming.relativeImportPath(
+                self.alloc,
+                mod.rel_zig_path,
+                target_rel_zig_path,
+            );
+            var next_imps = try self.alloc.alloc(ModuleImportIr, mod.imports.len + 1);
+            @memcpy(next_imps[0..mod.imports.len], mod.imports);
+            next_imps[mod.imports.len] = .{
+                .target_module_index = target_mod_idx,
+                .local_alias = alias_raw,
+                .rel_import_path = rel_imp,
+            };
+            mod.imports = next_imps;
+        }
+
+        fn pruneDeclRuntimeTargets(
+            self: *Self,
+            d_in: DeclIr,
+            is_reach: bool,
+        ) error{OutOfMemory}!?DeclIr {
+            var d = d_in;
+            switch (d.kind) {
+                .function_decl, .overload_dispatch, .global_var => {
+                    if (!is_reach) return null;
+                    return d;
+                },
+                .struct_decl => |*st| {
+                    if (!is_reach) {
+                        st.has_runtime_ctor_target = false;
+                        st.constructors = &.{};
+                        st.ctor_dispatch = null;
+                        st.static_props = &.{};
+                        st.merged_call_fns = &.{};
+                        if (st.methods.len > 0) {
+                            var inst_methods: std.ArrayList(MethodIr) = .empty;
+                            defer inst_methods.deinit(self.scratch);
+                            for (st.methods) |mth| {
+                                if (!mth.is_static) try inst_methods.append(self.scratch, mth);
+                            }
+                            st.methods = try self.alloc.dupe(MethodIr, inst_methods.items);
+                        }
+                        if (st.method_dispatches.len > 0) {
+                            var inst_disps: std.ArrayList(OverloadDispatchIr) = .empty;
+                            defer inst_disps.deinit(self.scratch);
+                            for (st.method_dispatches) |md| {
+                                if (!md.is_static) try inst_disps.append(self.scratch, md);
+                            }
+                            st.method_dispatches = try self.alloc.dupe(OverloadDispatchIr, inst_disps.items);
+                        }
+                    }
+                    if (st.nested_decls.len > 0) {
+                        var kept_nested: std.ArrayList(DeclIr) = .empty;
+                        defer kept_nested.deinit(self.scratch);
+                        for (st.nested_decls) |nd| {
+                            const nd_reach = is_reach and nd.is_exported;
+                            if (try self.pruneDeclRuntimeTargets(nd, nd_reach)) |knd| {
+                                try kept_nested.append(self.scratch, knd);
+                            }
+                        }
+                        st.nested_decls = try self.alloc.dupe(DeclIr, kept_nested.items);
+                    }
+                    return d;
+                },
+                .namespace_decl => |*ns| {
+                    if (!is_reach) {
+                        ns.merged_call_fns = &.{};
+                    }
+                    if (ns.children.len > 0) {
+                        var kept_children: std.ArrayList(DeclIr) = .empty;
+                        defer kept_children.deinit(self.scratch);
+                        for (ns.children) |ch| {
+                            const ch_reach = is_reach and ch.is_exported;
+                            if (try self.pruneDeclRuntimeTargets(ch, ch_reach)) |kch| {
+                                try kept_children.append(self.scratch, kch);
+                            }
+                        }
+                        ns.children = try self.alloc.dupe(DeclIr, kept_children.items);
+                    }
+                    return d;
+                },
+                .enum_decl => |*ed| {
+                    if (!is_reach and ed.has_unknown_values) {
+                        ed.members = &.{};
+                    }
+                    if (ed.nested_decls.len > 0) {
+                        var kept_nested: std.ArrayList(DeclIr) = .empty;
+                        defer kept_nested.deinit(self.scratch);
+                        for (ed.nested_decls) |nd| {
+                            const nd_reach = is_reach and nd.is_exported;
+                            if (try self.pruneDeclRuntimeTargets(nd, nd_reach)) |knd| {
+                                try kept_nested.append(self.scratch, knd);
+                            }
+                        }
+                        ed.nested_decls = try self.alloc.dupe(DeclIr, kept_nested.items);
+                    }
+                    return d;
+                },
+                else => return d,
+            }
         }
 
         fn synthesizeReExportAllocCompanions(
@@ -15070,6 +16394,49 @@ fn findSiblingDeclsByZigPath(decls: []const DeclIr, path: []const []const u8) ?[
         }
     }
     return null;
+}
+
+fn zigPathTargetExists(decls: []const DeclIr, path: []const []const u8) bool {
+    if (path.len == 0) return false;
+    if (findNestedDeclByZigPath(decls, path) != null) return true;
+    const head = path[0];
+    for (decls) |d| {
+        if (std.mem.eql(u8, d.zig_ident, head) or std.mem.eql(u8, d.logical_name, head)) {
+            if (path.len == 1) return true;
+            const sub = path[1..];
+            switch (d.kind) {
+                .namespace_decl => |ns| return zigPathTargetExists(ns.children, sub) or
+                    zigPathTargetExists(ns.merged_call_fns, sub),
+                .struct_decl => |st| {
+                    if (sub.len == 1) {
+                        const leaf = sub[0];
+                        for (st.methods) |m| {
+                            if (m.is_static and (std.mem.eql(u8, m.zig_ident, leaf) or std.mem.eql(u8, m.logical_name, leaf))) return true;
+                        }
+                        for (st.method_dispatches) |md| {
+                            if (md.is_static and (std.mem.eql(u8, md.zig_ident, leaf) or std.mem.eql(u8, md.logical_name, leaf))) return true;
+                        }
+                        for (st.static_props) |sp| {
+                            if (std.mem.eql(u8, sp.zig_ident, leaf) or std.mem.eql(u8, sp.logical_name, leaf)) return true;
+                        }
+                    }
+                    return zigPathTargetExists(st.nested_decls, sub) or
+                        zigPathTargetExists(st.merged_call_fns, sub);
+                },
+                .enum_decl => |en| {
+                    if (sub.len == 1) {
+                        const leaf = sub[0];
+                        for (en.members) |m| {
+                            if (std.mem.eql(u8, m.zig_ident, leaf) or std.mem.eql(u8, m.logical_name, leaf)) return true;
+                        }
+                    }
+                    return zigPathTargetExists(en.nested_decls, sub);
+                },
+                else => return false,
+            }
+        }
+    }
+    return false;
 }
 
 fn findNestedDeclByZigPath(decls: []const DeclIr, path: []const []const u8) ?DeclIr {
@@ -15311,6 +16678,11 @@ fn dfsValueCycleTypeByPath(
         .index_access_op => |iao| {
             try dfsValueCycleTypeByPath(state_alloc, ir_alloc, @constCast(iao.object_ty), decl_map, state);
         },
+        .intersect_op => |arms| {
+            for (arms) |arm| {
+                try dfsValueCycleTypeByPath(state_alloc, ir_alloc, @constCast(arm), decl_map, state);
+            }
+        },
         .self_type => |sid| {
             const inner = try ir_alloc.create(TypeIr);
             inner.* = .{ .self_type = sid };
@@ -15428,6 +16800,12 @@ fn typeUsesParamByValue(
         .unary_type_op => |uo| uo.op != .keyof and typeUsesParamByValue(state_alloc, uo.operand, tp_ident, decl_map, depth + 1),
         .key_filter_op => |kfo| typeUsesParamByValue(state_alloc, kfo.target, tp_ident, decl_map, depth + 1),
         .index_access_op => |iao| typeUsesParamByValue(state_alloc, iao.object_ty, tp_ident, decl_map, depth + 1),
+        .intersect_op => |arms| blk: {
+            for (arms) |arm| {
+                if (typeUsesParamByValue(state_alloc, arm, tp_ident, decl_map, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
         .type_param_ref => |id| std.mem.eql(u8, id, tp_ident),
         .optional => |opt| typeUsesParamByValue(state_alloc, opt.child, tp_ident, decl_map, depth + 1),
         .tuple => |elems| blk: {

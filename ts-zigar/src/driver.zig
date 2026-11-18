@@ -19,12 +19,18 @@ pub const LoadedSources = struct {
     files: []VirtualFile,
     root_vfs_paths: [][]const u8,
     base_dir: []const u8,
+    specifier_overrides: []ir.SpecifierOverride = &.{},
 
     pub fn deinit(self: *LoadedSources, allocator: std.mem.Allocator) void {
         for (self.files) |f| f.deinit(allocator);
         allocator.free(self.files);
         for (self.root_vfs_paths) |p| allocator.free(p);
         allocator.free(self.root_vfs_paths);
+        for (self.specifier_overrides) |ov| {
+            allocator.free(ov.vfs_path);
+            allocator.free(ov.wire_specifier);
+        }
+        allocator.free(self.specifier_overrides);
         allocator.free(self.base_dir);
         self.* = undefined;
     }
@@ -147,6 +153,7 @@ const SourceCollector = struct {
     probed_pkgs: std.StringHashMapUnmanaged(void) = .empty,
     files: std.ArrayList(VirtualFile) = .empty,
     root_vfs_paths: std.ArrayList([]const u8) = .empty,
+    specifier_overrides: std.ArrayList(ir.SpecifierOverride) = .empty,
     entry_base_dirs: std.ArrayList([]u8) = .empty,
     scan_queue: std.ArrayList(PendingScan) = .empty,
 
@@ -170,6 +177,11 @@ const SourceCollector = struct {
         self.files.deinit(self.allocator);
         for (self.root_vfs_paths.items) |p| self.allocator.free(p);
         self.root_vfs_paths.deinit(self.allocator);
+        for (self.specifier_overrides.items) |ov| {
+            self.allocator.free(ov.vfs_path);
+            self.allocator.free(ov.wire_specifier);
+        }
+        self.specifier_overrides.deinit(self.allocator);
     }
 
     fn addRootVfsPath(self: *SourceCollector, vfs_path: []const u8) !void {
@@ -179,6 +191,21 @@ const SourceCollector = struct {
         const owned = try self.allocator.dupe(u8, vfs_path);
         errdefer self.allocator.free(owned);
         try self.root_vfs_paths.append(self.allocator, owned);
+    }
+
+    fn addSpecifierOverride(self: *SourceCollector, vfs_path: []const u8, wire_specifier: []const u8) !void {
+        if (vfs_path.len == 0 or wire_specifier.len == 0) return;
+        for (self.specifier_overrides.items) |existing| {
+            if (std.mem.eql(u8, existing.vfs_path, vfs_path)) return;
+        }
+        const vp_owned = try self.allocator.dupe(u8, vfs_path);
+        errdefer self.allocator.free(vp_owned);
+        const ws_owned = try self.allocator.dupe(u8, wire_specifier);
+        errdefer self.allocator.free(ws_owned);
+        try self.specifier_overrides.append(self.allocator, .{
+            .vfs_path = vp_owned,
+            .wire_specifier = ws_owned,
+        });
     }
 
     fn tryMountDiskFile(self: *SourceCollector, disk_path: []const u8, enqueue_scan: bool) !?[]const u8 {
@@ -329,36 +356,146 @@ const SourceCollector = struct {
         return null;
     }
 
-    fn resolvePackageJsonEntry(self: *SourceCollector, pkg_dir_disk: []const u8) !?[]const u8 {
+    fn resolvePackageJsonEntry(
+        self: *SourceCollector,
+        pkg_dir_disk: []const u8,
+        add_as_primary_root: bool,
+    ) !bool {
         const pkg_json_disk = try joinDiskPath(self.allocator, pkg_dir_disk, "package.json");
         defer self.allocator.free(pkg_json_disk);
 
-        const pkg_vfs = (try self.tryMountDiskFile(pkg_json_disk, false)) orelse return null;
-        const pkg_idx = self.vfs_seen.get(pkg_vfs) orelse return null;
+        const pkg_vfs = (try self.tryMountDiskFile(pkg_json_disk, false)) orelse return false;
+        const pkg_idx = self.vfs_seen.get(pkg_vfs) orelse return false;
         const raw_json = self.files.items[pkg_idx].contents;
 
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, raw_json, .{}) catch return null;
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, raw_json, .{}) catch return false;
         defer parsed.deinit();
 
-        if (parsed.value != .object) return null;
+        if (parsed.value != .object) return false;
         const obj = parsed.value.object;
+        const pkg_name: ?[]const u8 = if (obj.get("name")) |nv|
+            (if (nv == .string and nv.string.len > 0) nv.string else null)
+        else
+            null;
+
+        var found_any = false;
 
         if (obj.get("types")) |tv| {
             if (tv == .string and tv.string.len > 0) {
-                if (try self.probeAndMountTypeTarget(pkg_dir_disk, tv.string)) |vp| return vp;
+                if (try self.probeAndMountTypeTarget(pkg_dir_disk, tv.string)) |vp| {
+                    if (add_as_primary_root) try self.addRootVfsPath(vp);
+                    found_any = true;
+                }
             }
         }
-        if (obj.get("typings")) |tv| {
-            if (tv == .string and tv.string.len > 0) {
-                if (try self.probeAndMountTypeTarget(pkg_dir_disk, tv.string)) |vp| return vp;
+        if (!found_any) {
+            if (obj.get("typings")) |tv| {
+                if (tv == .string and tv.string.len > 0) {
+                    if (try self.probeAndMountTypeTarget(pkg_dir_disk, tv.string)) |vp| {
+                        if (add_as_primary_root) try self.addRootVfsPath(vp);
+                        found_any = true;
+                    }
+                }
             }
         }
+
         if (obj.get("exports")) |ev| {
-            if (extractTypesCondition(ev)) |exp_types| {
-                if (try self.probeAndMountTypeTarget(pkg_dir_disk, exp_types)) |vp| return vp;
+            var has_subpath_keys = false;
+            if (ev == .object) {
+                var kit = ev.object.iterator();
+                while (kit.next()) |kv| {
+                    const k = kv.key_ptr.*;
+                    if (std.mem.eql(u8, k, ".") or std.mem.startsWith(u8, k, "./")) {
+                        has_subpath_keys = true;
+                        break;
+                    }
+                }
+            }
+
+            if (has_subpath_keys) {
+                const pkg_vfs_dir = try toVfsPath(self.allocator, pkg_dir_disk);
+                defer self.allocator.free(pkg_vfs_dir);
+                const pkg_vfs_prefix = if (std.mem.eql(u8, pkg_vfs_dir, "/"))
+                    try self.allocator.dupe(u8, "/")
+                else
+                    try std.fmt.allocPrint(self.allocator, "{s}/", .{pkg_vfs_dir});
+                defer self.allocator.free(pkg_vfs_prefix);
+
+                var eit = ev.object.iterator();
+                while (eit.next()) |kv| {
+                    const sub_key = kv.key_ptr.*;
+                    if (!std.mem.eql(u8, sub_key, ".") and !std.mem.startsWith(u8, sub_key, "./")) continue;
+                    const rel_target = extractExportTarget(kv.value_ptr.*) orelse continue;
+
+                    const key_star = std.mem.indexOfScalar(u8, sub_key, '*');
+                    if (key_star != null and std.mem.indexOfScalarPos(u8, sub_key, key_star.? + 1, '*') != null) continue;
+                    const target_star = std.mem.indexOfScalar(u8, rel_target, '*');
+                    if (key_star != null and target_star != null) {
+                        const rel_clean = if (std.mem.startsWith(u8, rel_target, "./")) rel_target[2..] else rel_target;
+                        const clean_star = std.mem.indexOfScalar(u8, rel_clean, '*') orelse continue;
+                        const t_prefix = rel_clean[0..clean_star];
+                        const t_suffix_raw = rel_clean[clean_star + 1 ..];
+                        const t_suffix = stripJsOrDtsExtension(t_suffix_raw);
+
+                        for (self.files.items) |vf| {
+                            if (!isTypeScriptDeclarationFileOnly(vf.vfs_path)) continue;
+                            if (!std.mem.startsWith(u8, vf.vfs_path, pkg_vfs_prefix)) continue;
+                            const rel_vfs = vf.vfs_path[pkg_vfs_prefix.len..];
+                            const rel_stem = stripJsOrDtsExtension(rel_vfs);
+                            if (!std.mem.startsWith(u8, rel_stem, t_prefix)) continue;
+                            if (!std.mem.endsWith(u8, rel_stem, t_suffix)) continue;
+                            if (rel_stem.len < t_prefix.len + t_suffix.len) continue;
+                            const mid = rel_stem[t_prefix.len .. rel_stem.len - t_suffix.len];
+                            if (mid.len == 0) continue;
+
+                            const k_pre = sub_key[0..key_star.?];
+                            const k_suf = sub_key[key_star.? + 1 ..];
+                            const sub_expanded = try std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{ k_pre, mid, k_suf });
+                            defer self.allocator.free(sub_expanded);
+                            if (isSubpathExcludedByExports(ev.object, sub_expanded, sub_key)) continue;
+
+                            if (add_as_primary_root) try self.addRootVfsPath(vf.vfs_path);
+                            if (pkg_name) |pn| {
+                                const sub_tail = if (std.mem.startsWith(u8, sub_expanded, "./")) sub_expanded[2..] else sub_expanded;
+                                const wire_spec = if (sub_tail.len == 0)
+                                    try self.allocator.dupe(u8, pn)
+                                else
+                                    try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ pn, sub_tail });
+                                defer self.allocator.free(wire_spec);
+                                try self.addSpecifierOverride(vf.vfs_path, wire_spec);
+                            }
+                            found_any = true;
+                        }
+                    } else if (key_star == null and target_star == null) {
+                        if (try self.probeAndMountTypeTarget(pkg_dir_disk, rel_target)) |vp_borrowed| {
+                            const vp = try self.allocator.dupe(u8, vp_borrowed);
+                            defer self.allocator.free(vp);
+                            if (add_as_primary_root) try self.addRootVfsPath(vp);
+                            if (pkg_name) |pn| {
+                                const wire_spec = if (std.mem.eql(u8, sub_key, "."))
+                                    try self.allocator.dupe(u8, pn)
+                                else
+                                    try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ pn, sub_key[2..] });
+                                defer self.allocator.free(wire_spec);
+                                try self.addSpecifierOverride(vp, wire_spec);
+                            }
+                            found_any = true;
+                        }
+                    }
+                }
+            } else if (extractExportTarget(ev)) |exp_types| {
+                if (try self.probeAndMountTypeTarget(pkg_dir_disk, exp_types)) |vp_borrowed| {
+                    const vp = try self.allocator.dupe(u8, vp_borrowed);
+                    defer self.allocator.free(vp);
+                    if (add_as_primary_root) try self.addRootVfsPath(vp);
+                    if (pkg_name) |pn| {
+                        try self.addSpecifierOverride(vp, pn);
+                    }
+                    found_any = true;
+                }
             }
         }
-        return null;
+        return found_any;
     }
 
     fn loadPackageDirectory(self: *SourceCollector, dir_disk_path: []const u8, add_as_primary_root: bool) !bool {
@@ -373,8 +510,7 @@ const SourceCollector = struct {
         const count_before = self.files.items.len;
         try self.mountDirectoryTree(dir_disk_path, 0);
 
-        if (try self.resolvePackageJsonEntry(dir_disk_path)) |entry_vp| {
-            if (add_as_primary_root) try self.addRootVfsPath(entry_vp);
+        if (try self.resolvePackageJsonEntry(dir_disk_path, add_as_primary_root)) {
             return true;
         }
 
@@ -540,25 +676,76 @@ const SourceCollector = struct {
     }
 };
 
-fn extractTypesCondition(val: std.json.Value) ?[]const u8 {
+fn isTypeScriptDeclarationFileOnly(name: []const u8) bool {
+    const exts = [_][]const u8{ ".d.ts", ".d.mts", ".d.cts" };
+    for (exts) |ext| {
+        if (std.mem.endsWith(u8, name, ext)) return true;
+    }
+    return false;
+}
+
+fn stripJsOrDtsExtension(p: []const u8) []const u8 {
+    const exts = [_][]const u8{ ".d.ts", ".d.mts", ".d.cts", ".mjs", ".cjs", ".js", ".ts", ".mts", ".cts" };
+    for (exts) |ext| {
+        if (std.mem.endsWith(u8, p, ext)) return p[0 .. p.len - ext.len];
+    }
+    return p;
+}
+
+fn isSubpathExcludedByExports(exports_obj: std.json.ObjectMap, sub_expanded: []const u8, cur_pattern: []const u8) bool {
+    // Exact key override (`"./internal/foo": null` or more specific exact mapping handled separately).
+    if (exports_obj.get(sub_expanded)) |exact_val| {
+        if (exact_val == .null) return true;
+        if (!std.mem.eql(u8, sub_expanded, cur_pattern)) return true;
+    }
+    const cur_star = std.mem.indexOfScalar(u8, cur_pattern, '*') orelse return false;
+    const cur_pre_len = cur_star;
+    const cur_suf_len = cur_pattern.len - cur_star - 1;
+
+    var it = exports_obj.iterator();
+    while (it.next()) |kv| {
+        const k = kv.key_ptr.*;
+        if (std.mem.eql(u8, k, cur_pattern)) continue;
+        const k_star = std.mem.indexOfScalar(u8, k, '*') orelse continue;
+        if (std.mem.indexOfScalarPos(u8, k, k_star + 1, '*') != null) continue;
+        const k_pre = k[0..k_star];
+        const k_suf = k[k_star + 1 ..];
+        if (sub_expanded.len <= k_pre.len + k_suf.len) continue;
+        if (!std.mem.startsWith(u8, sub_expanded, k_pre)) continue;
+        if (!std.mem.endsWith(u8, sub_expanded, k_suf)) continue;
+        const more_specific = (k_pre.len > cur_pre_len) or (k_pre.len == cur_pre_len and k_suf.len > cur_suf_len);
+        if (more_specific) return true;
+    }
+    return false;
+}
+
+fn extractExportTarget(val: std.json.Value) ?[]const u8 {
     switch (val) {
-        .string => |s| {
-            if (isTypeScriptDeclarationOrSource(s)) return s;
+        .string => |s| return if (s.len > 0) s else null,
+        .object => |obj| {
+            // Prefer explicit TypeScript declaration condition when present, then evaluate
+            // runtime conditions in exact JSON object key order per Node `PACKAGE_TARGET_RESOLVE`.
+            if (obj.get("types")) |tv| {
+                if (extractExportTarget(tv)) |res| return res;
+            }
+            var it = obj.iterator();
+            while (it.next()) |kv| {
+                const k = kv.key_ptr.*;
+                if (std.mem.eql(u8, k, "types") or
+                    std.mem.eql(u8, k, "node") or
+                    std.mem.eql(u8, k, "import") or
+                    std.mem.eql(u8, k, "default") or
+                    std.mem.eql(u8, k, "require") or
+                    std.mem.eql(u8, k, "."))
+                {
+                    if (extractExportTarget(kv.value_ptr.*)) |res| return res;
+                }
+            }
             return null;
         },
-        .object => |obj| {
-            if (obj.get(".")) |dot| {
-                if (extractTypesCondition(dot)) |res| return res;
-            }
-            if (obj.get("types")) |tv| {
-                if (tv == .string and tv.string.len > 0) return tv.string;
-                if (extractTypesCondition(tv)) |res| return res;
-            }
-            if (obj.get("import")) |iv| {
-                if (extractTypesCondition(iv)) |res| return res;
-            }
-            if (obj.get("default")) |dv| {
-                if (extractTypesCondition(dv)) |res| return res;
+        .array => |arr| {
+            for (arr.items) |item| {
+                if (extractExportTarget(item)) |res| return res;
             }
             return null;
         },
@@ -693,12 +880,18 @@ pub fn loadTypesFromDisk(
         allocator.free(files_slice);
     }
     const roots_slice = try collector.root_vfs_paths.toOwnedSlice(allocator);
+    errdefer {
+        for (roots_slice) |p| allocator.free(p);
+        allocator.free(roots_slice);
+    }
+    const overrides_slice = try collector.specifier_overrides.toOwnedSlice(allocator);
 
     return .{
         .ok = .{
             .files = files_slice,
             .root_vfs_paths = roots_slice,
             .base_dir = base_dir,
+            .specifier_overrides = overrides_slice,
         },
     };
 }
@@ -924,6 +1117,7 @@ pub fn runPipelineWithHost(
     var pkg_ir = ir.lowerGraph(allocator, graph_val, .{
         .base_dir = loaded.base_dir,
         .primary_vfs_paths = loaded.root_vfs_paths,
+        .vfs_specifier_overrides = loaded.specifier_overrides,
         .modules = opts.modules,
         .substitutions = opts.substitutions,
     }) catch |err| switch (err) {

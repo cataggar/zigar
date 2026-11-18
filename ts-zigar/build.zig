@@ -3,6 +3,11 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const require_ts71 = b.option(
+        bool,
+        "require-ts71",
+        "Build TypeScript 7.1 component + staged package and fail if M3.4a torture test prerequisites are missing",
+    ) orelse false;
     const is_aarch64_host = target.result.cpu.arch == .aarch64 and (@import("builtin").zig_backend == .stage2_aarch64);
     const strip: ?bool = if (is_aarch64_host) true else null;
     const use_llvm: ?bool = if (is_aarch64_host) false else null;
@@ -317,6 +322,70 @@ pub fn build(b: *std.Build) void {
     run_cli_emit_tests.has_side_effects = true;
     run_cli_emit_tests.step.dependOn(b.getInstallStep());
 
+    const build_ts_pkg_cmd = b.addSystemCommand(&.{
+        "node",
+        "component/build-typescript-pkg.mjs",
+    });
+    build_ts_pkg_cmd.setCwd(b.path(""));
+    const ts_pkg_step = b.step("typescript-pkg", "Stage TypeScript 7.1 npm package + native tsc API server");
+    ts_pkg_step.dependOn(&build_ts_pkg_cmd.step);
+
+    const ts_dts_opts = b.addOptions();
+    ts_dts_opts.addOption([]const u8, "zig_exe", b.graph.zig_exe);
+    ts_dts_opts.addOption(bool, "require_ts71", require_ts71);
+
+    const ts_dts_test_mod = b.createModule(.{
+        .root_source_file = b.path("test/typescript_dts_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+    });
+    ts_dts_test_mod.addImport("ts_zigar", ts_zigar_mod);
+    ts_dts_test_mod.addOptions("test_options", ts_dts_opts);
+
+    const ts_dts_tests = b.addTest(.{
+        .root_module = ts_dts_test_mod,
+        .use_llvm = use_llvm,
+    });
+    const run_ts_dts_tests = b.addRunArtifact(ts_dts_tests);
+    run_ts_dts_tests.setCwd(b.path(""));
+    run_ts_dts_tests.has_side_effects = true;
+    run_ts_dts_tests.step.dependOn(b.getInstallStep());
+    if (require_ts71) {
+        run_opt_comp_tests.step.dependOn(&build_component_cmd.step);
+        run_opt_host_tests.step.dependOn(&build_component_cmd.step);
+        run_cli_emit_tests.step.dependOn(&build_component_cmd.step);
+        run_ts_dts_tests.step.dependOn(&build_component_cmd.step);
+        run_ts_dts_tests.step.dependOn(&build_ts_pkg_cmd.step);
+    }
+
+    const req_ts_dts_opts = b.addOptions();
+    req_ts_dts_opts.addOption([]const u8, "zig_exe", b.graph.zig_exe);
+    req_ts_dts_opts.addOption(bool, "require_ts71", true);
+
+    const req_ts_dts_test_mod = b.createModule(.{
+        .root_source_file = b.path("test/typescript_dts_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+    });
+    req_ts_dts_test_mod.addImport("ts_zigar", ts_zigar_mod);
+    req_ts_dts_test_mod.addOptions("test_options", req_ts_dts_opts);
+
+    const req_ts_dts_tests = b.addTest(.{
+        .root_module = req_ts_dts_test_mod,
+        .use_llvm = use_llvm,
+    });
+    const run_req_ts_dts_tests = b.addRunArtifact(req_ts_dts_tests);
+    run_req_ts_dts_tests.setCwd(b.path(""));
+    run_req_ts_dts_tests.has_side_effects = true;
+    run_req_ts_dts_tests.step.dependOn(b.getInstallStep());
+    run_req_ts_dts_tests.step.dependOn(&build_component_cmd.step);
+    run_req_ts_dts_tests.step.dependOn(&build_ts_pkg_cmd.step);
+
+    const test_ts71_step = b.step("test-ts71", "Build TypeScript 7.1 component + staged package and run M3.4a torture test");
+    test_ts71_step.dependOn(&run_req_ts_dts_tests.step);
+
     const test_step = b.step("test", "Verify typescript.wit codegen, CLI, IR, Zig 0.17 emitter, and component host");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_root_unit_tests.step);
@@ -324,4 +393,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_opt_comp_tests.step);
     test_step.dependOn(&run_opt_host_tests.step);
     test_step.dependOn(&run_cli_emit_tests.step);
+    test_step.dependOn(&run_ts_dts_tests.step);
 }

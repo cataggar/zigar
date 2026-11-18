@@ -452,9 +452,19 @@ pub fn Classifier(comptime Graph: type) type {
             if (hc.target_type < self.graph.types.len) {
                 const tn = self.graph.types[hc.target_type];
                 switch (tn.kind) {
+                    .array, .readonly_array => return .{ .kind = .handle_wrapper },
                     .object_literal, .intersection => return try self.classifyObjectType(hc.target_type, 0),
                     .reference => |ref| {
-                        if (ref.target_decl == null and lower_protocols.classifyBuiltinProtocolRef(self.str(ref.target_name)) != null) {
+                        const rname = self.str(ref.target_name);
+                        if (ref.target_decl == null and
+                            (lower_protocols.classifyBuiltinProtocolRef(rname) != null or
+                                std.mem.eql(u8, rname, "Array") or
+                                std.mem.eql(u8, rname, "ReadonlyArray") or
+                                std.mem.eql(u8, rname, "Set") or
+                                std.mem.eql(u8, rname, "ReadonlySet") or
+                                std.mem.eql(u8, rname, "Map") or
+                                std.mem.eql(u8, rname, "ReadonlyMap")))
+                        {
                             return .{ .kind = .handle_wrapper };
                         }
                         if (tn.resolved_type != null and (ref.target_decl == null or

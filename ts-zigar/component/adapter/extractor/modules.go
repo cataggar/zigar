@@ -244,8 +244,8 @@ func (b *graphBuilder) extractModule(modID uint32) {
 			}
 
 			if ed.ExportClause == nil {
-				// `export * from "./mod"`
-				if isSome(targetModOpt) {
+				// `export * from "./mod"` (exclude `export type * from "./mod"` from runtime StarReExports)
+				if !ed.IsTypeOnly && isSome(targetModOpt) {
 					b.modules[modID].StarReExports = appendUniqueU32(b.modules[modID].StarReExports, targetModOpt.Some())
 				}
 			} else if ed.ExportClause.Kind == ast.KindNamespaceExport {
@@ -356,10 +356,23 @@ func (b *graphBuilder) extractModule(modID uint32) {
 						continue
 					}
 					// If follow-re-exports is false and this export comes solely from `export * from "..."`, skip duplicating it in Exports.
-					if !b.cfg.FollowReExports && !b.isSymbolDeclaredInFile(expSym, sf) {
+					isOwnOrExplicit := b.isSymbolDeclaredInFile(expSym, sf) || b.hasExplicitExportClauseInFile(sf, expSym.Name())
+					if !b.cfg.FollowReExports && !isOwnOrExplicit {
 						continue
 					}
-					for _, id := range b.extractExportedSymbolWithSet(sf, modID, expSym, true, exportByName) {
+					if !isOwnOrExplicit && b.isAmbiguousStarExportInFile(sf, expSym.Name(), map[*ast.SourceFile]bool{}) {
+						continue
+					}
+					ids := b.extractExportedSymbolWithSet(sf, modID, expSym, true, exportByName)
+					if !isOwnOrExplicit && !b.isSymbolRuntimeExportedFromFile(sf, expSym.Name(), map[*ast.SourceFile]bool{}) {
+						if len(ids) > 0 {
+							targetMod := b.decls[ids[0]].Module
+							reID := b.makeReExportDecl(sf, modID, nil, expSym.Name(), expSym.Name(), "", witTypes.Some(targetMod), witTypes.Some(ids[0]), true)
+							appendExport(reID)
+						}
+						continue
+					}
+					for _, id := range ids {
 						appendExport(id)
 					}
 				}
@@ -563,7 +576,20 @@ func (b *graphBuilder) extractAmbientModuleDecls(
 			if reExported[expSym.Name()] {
 				continue
 			}
-			for _, id := range b.extractExportedSymbolWithSet(sf, modID, expSym, true, exportByName) {
+			isOwnAmb := b.isSymbolDeclaredInAmbientBlocks(expSym, blocks)
+			if !isOwnAmb && b.isAmbiguousStarExportInAmbientBlocks(sf, blocks, expSym.Name()) {
+				continue
+			}
+			ids := b.extractExportedSymbolWithSet(sf, modID, expSym, true, exportByName)
+			if !isOwnAmb && !b.isSymbolRuntimeExportedFromAmbientBlocks(sf, blocks, expSym.Name()) {
+				if len(ids) > 0 {
+					targetMod := b.decls[ids[0]].Module
+					reID := b.makeReExportDecl(sf, modID, nil, expSym.Name(), expSym.Name(), "", witTypes.Some(targetMod), witTypes.Some(ids[0]), true)
+					addDecl(reID)
+				}
+				continue
+			}
+			for _, id := range ids {
 				addDecl(id)
 			}
 		}
@@ -624,6 +650,503 @@ func (b *graphBuilder) isSymbolDeclaredInFile(sym *ast.Symbol, sf *ast.SourceFil
 		}
 	}
 	return false
+}
+
+func (b *graphBuilder) isSymbolDeclaredInAmbientBlocks(sym *ast.Symbol, blocks []*ast.Node) bool {
+	if sym == nil {
+		return false
+	}
+	for _, d := range sym.Declarations() {
+		if d == nil {
+			continue
+		}
+		for _, blk := range blocks {
+			if blk != nil && ast.FindAncestor(d, func(n *ast.Node) bool { return n == blk }) != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (b *graphBuilder) isSymbolRuntimeExportedFromAmbientBlocks(sf *ast.SourceFile, blocks []*ast.Node, expName string) bool {
+	for _, blk := range blocks {
+		if blk == nil || blk.Body() == nil || blk.Body().Kind != ast.KindModuleBlock {
+			continue
+		}
+		mb := blk.Body().AsModuleBlock()
+		if mb == nil || mb.Statements == nil {
+			continue
+		}
+		for _, stmt := range mb.Statements.Nodes {
+			if stmt == nil || stmt.Kind != ast.KindExportDeclaration {
+				continue
+			}
+			ed := stmt.AsExportDeclaration()
+			if ed == nil || ed.ModuleSpecifier == nil || ed.ExportClause != nil || ed.IsTypeOnly {
+				continue
+			}
+			targetSF := b.resolveModuleSpecifierNode(sf, ed.ModuleSpecifier)
+			if targetSF == nil {
+				return true
+			}
+			if b.isSymbolRuntimeExportedFromFile(targetSF, expName, map[*ast.SourceFile]bool{}) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (b *graphBuilder) getFileExportSymbolMap(sf *ast.SourceFile) map[string]*ast.Symbol {
+	if sf == nil {
+		return nil
+	}
+	if cached, ok := b.fileExportsByName[sf]; ok {
+		return cached
+	}
+	modSym := b.tc.GetSymbolOfNode(sf.AsNode())
+	if modSym == nil {
+		modSym = sf.AsNode().Symbol()
+	}
+	var m map[string]*ast.Symbol
+	if modSym != nil {
+		m = buildExportSymbolMap(b.tc.GetExportsOfModule(modSym))
+	} else {
+		m = map[string]*ast.Symbol{}
+	}
+	b.fileExportsByName[sf] = m
+	return m
+}
+
+func (b *graphBuilder) isLocalExportSpecifierRuntime(
+	sf *ast.SourceFile,
+	elem *ast.Node,
+	matchedSym *ast.Symbol,
+	visited map[*ast.SourceFile]bool,
+	hitCycle *bool,
+) bool {
+	if isAliasNodeTypeOnly(elem) {
+		return false
+	}
+	if matchedSym != nil && b.tc.GetTypeOnlyAliasDeclaration(matchedSym) != nil {
+		return false
+	}
+
+	var cur *ast.Symbol
+	if elem != nil {
+		cur = b.tc.GetExportSpecifierLocalTargetSymbol(elem)
+	}
+	if cur == nil && matchedSym != nil {
+		cur = b.tc.GetImmediateAliasedSymbol(matchedSym)
+	}
+
+	for hops := 0; hops < 16 && cur != nil; hops++ {
+		if b.tc.GetTypeOnlyAliasDeclaration(cur) != nil {
+			return false
+		}
+		for _, d := range cur.Declarations() {
+			if d == nil || (sf != nil && ast.GetSourceFileOfNode(d) != sf) {
+				continue
+			}
+			if isAliasNodeTypeOnly(d) {
+				return false
+			}
+			switch d.Kind {
+			case ast.KindImportSpecifier:
+				is := d.AsImportSpecifier()
+				if is == nil || is.Name() == nil {
+					continue
+				}
+				origName := is.Name().Text()
+				if is.PropertyName != nil {
+					origName = is.PropertyName.Text()
+				}
+				impDecl := ast.FindAncestor(d, func(n *ast.Node) bool { return n.Kind == ast.KindImportDeclaration })
+				if impDecl == nil || impDecl.AsImportDeclaration() == nil || impDecl.AsImportDeclaration().ModuleSpecifier == nil {
+					return true
+				}
+				targetSF := b.resolveModuleSpecifierNode(sf, impDecl.AsImportDeclaration().ModuleSpecifier)
+				if targetSF == nil || origName == "default" {
+					return true
+				}
+				return b.isSymbolRuntimeExportedFromFileInner(targetSF, origName, visited, hitCycle)
+			case ast.KindImportClause, ast.KindNamespaceImport:
+				return true
+			case ast.KindImportEqualsDeclaration:
+				ie := d.AsImportEqualsDeclaration()
+				return ie == nil || !ie.IsTypeOnly
+			}
+		}
+		if cur.Flags()&ast.SymbolFlagsAlias == 0 {
+			break
+		}
+		next := b.tc.GetImmediateAliasedSymbol(cur)
+		if next == nil || next == cur {
+			break
+		}
+		cur = next
+	}
+	return true
+}
+
+func (b *graphBuilder) isSymbolRuntimeExportedFromFile(sf *ast.SourceFile, expName string, visited map[*ast.SourceFile]bool) bool {
+	var hitCycle bool
+	return b.isSymbolRuntimeExportedFromFileInner(sf, expName, visited, &hitCycle)
+}
+
+func (b *graphBuilder) isSymbolRuntimeExportedFromFileInner(
+	sf *ast.SourceFile,
+	expName string,
+	visited map[*ast.SourceFile]bool,
+	hitCycle *bool,
+) bool {
+	if sf == nil || expName == "" || expName == "default" {
+		return false
+	}
+	key := sfExportKey{sf: sf, name: expName}
+	if cached, ok := b.runtimeExportMemo[key]; ok {
+		return cached
+	}
+	if visited[sf] {
+		*hitCycle = true
+		return false
+	}
+	visited[sf] = true
+	defer delete(visited, sf)
+
+	matchedSym := b.getFileExportSymbolMap(sf)[expName]
+	if matchedSym == nil {
+		b.runtimeExportMemo[key] = false
+		return false
+	}
+
+	compute := func() bool {
+		if sf.Statements != nil {
+			for _, stmt := range sf.Statements.Nodes {
+				if stmt == nil {
+					continue
+				}
+				switch stmt.Kind {
+				case ast.KindExportDeclaration:
+					ed := stmt.AsExportDeclaration()
+					if ed == nil || ed.ExportClause == nil {
+						continue
+					}
+					if ed.ExportClause.Kind == ast.KindNamespaceExport {
+						if ed.ExportClause.Name() != nil && ed.ExportClause.Name().Text() == expName {
+							return !ed.IsTypeOnly
+						}
+					} else if ed.ExportClause.Kind == ast.KindNamedExports {
+						ne := ed.ExportClause.AsNamedExports()
+						if ne == nil || ne.Elements == nil {
+							continue
+						}
+						for _, elem := range ne.Elements.Nodes {
+							if elem == nil || elem.Kind != ast.KindExportSpecifier {
+								continue
+							}
+							es := elem.AsExportSpecifier()
+							if es == nil || es.Name() == nil || es.Name().Text() != expName {
+								continue
+							}
+							if ed.IsTypeOnly || es.IsTypeOnly {
+								return false
+							}
+							if ed.ModuleSpecifier != nil {
+								targetSF := b.resolveModuleSpecifierNode(sf, ed.ModuleSpecifier)
+								if targetSF == nil {
+									return true
+								}
+								origName := expName
+								if es.PropertyName != nil {
+									origName = es.PropertyName.Text()
+								}
+								if origName == "default" {
+									return true
+								}
+								return b.isSymbolRuntimeExportedFromFileInner(targetSF, origName, visited, hitCycle)
+							}
+							return b.isLocalExportSpecifierRuntime(sf, elem, matchedSym, visited, hitCycle)
+						}
+					}
+				case ast.KindImportEqualsDeclaration:
+					if ast.GetCombinedModifierFlags(stmt)&ast.ModifierFlagsExport != 0 && stmt.Name() != nil && stmt.Name().Text() == expName {
+						ie := stmt.AsImportEqualsDeclaration()
+						return ie == nil || !ie.IsTypeOnly
+					}
+				}
+			}
+		}
+
+		if b.isSymbolDeclaredInFile(matchedSym, sf) {
+			allTypeOnly := len(matchedSym.Declarations()) > 0
+			for _, d := range matchedSym.Declarations() {
+				if d != nil && b.nodeEffectiveOwnerSourceFile(d) == sf && !isAliasNodeTypeOnly(d) {
+					allTypeOnly = false
+					break
+				}
+			}
+			return !allTypeOnly
+		}
+
+		if sf.Statements != nil {
+			for _, stmt := range sf.Statements.Nodes {
+				if stmt == nil || stmt.Kind != ast.KindExportDeclaration {
+					continue
+				}
+				ed := stmt.AsExportDeclaration()
+				if ed == nil || ed.ExportClause != nil || ed.ModuleSpecifier == nil || ed.IsTypeOnly {
+					continue
+				}
+				targetSF := b.resolveModuleSpecifierNode(sf, ed.ModuleSpecifier)
+				if targetSF == nil {
+					return true
+				}
+				if b.isSymbolRuntimeExportedFromFileInner(targetSF, expName, visited, hitCycle) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	res := compute()
+	if !*hitCycle || len(visited) == 1 {
+		b.runtimeExportMemo[key] = res
+	}
+	return res
+}
+
+func (b *graphBuilder) hasExplicitExportClauseInFile(sf *ast.SourceFile, expName string) bool {
+	if sf == nil || sf.Statements == nil {
+		return false
+	}
+	if set, ok := b.fileExplicitExportSet[sf]; ok {
+		return set[expName]
+	}
+	set := map[string]bool{}
+	for _, stmt := range sf.Statements.Nodes {
+		if stmt == nil {
+			continue
+		}
+		switch stmt.Kind {
+		case ast.KindExportDeclaration:
+			ed := stmt.AsExportDeclaration()
+			if ed == nil || ed.ExportClause == nil {
+				continue
+			}
+			if ed.ExportClause.Kind == ast.KindNamespaceExport {
+				if ed.ExportClause.Name() != nil {
+					set[ed.ExportClause.Name().Text()] = true
+				}
+			} else if ed.ExportClause.Kind == ast.KindNamedExports {
+				ne := ed.ExportClause.AsNamedExports()
+				if ne == nil || ne.Elements == nil {
+					continue
+				}
+				for _, elem := range ne.Elements.Nodes {
+					if elem != nil && elem.Kind == ast.KindExportSpecifier {
+						es := elem.AsExportSpecifier()
+						if es != nil && es.Name() != nil {
+							set[es.Name().Text()] = true
+						}
+					}
+				}
+			}
+		case ast.KindImportEqualsDeclaration:
+			if ast.GetCombinedModifierFlags(stmt)&ast.ModifierFlagsExport != 0 && stmt.Name() != nil {
+				set[stmt.Name().Text()] = true
+			}
+		}
+	}
+	b.fileExplicitExportSet[sf] = set
+	return set[expName]
+}
+
+func (b *graphBuilder) resolveStarTargetSymbol(sf *ast.SourceFile, expName string, visited map[*ast.SourceFile]bool) (*ast.Symbol, bool) {
+	var hitCycle bool
+	return b.resolveStarTargetSymbolInner(sf, expName, visited, &hitCycle)
+}
+
+func (b *graphBuilder) resolveStarTargetSymbolInner(
+	sf *ast.SourceFile,
+	expName string,
+	visited map[*ast.SourceFile]bool,
+	hitCycle *bool,
+) (*ast.Symbol, bool) {
+	if sf == nil || expName == "" || expName == "default" {
+		return nil, false
+	}
+	key := sfExportKey{sf: sf, name: expName}
+	if cached, ok := b.starTargetMemo[key]; ok {
+		return cached.sym, cached.ambiguous
+	}
+	if visited[sf] {
+		*hitCycle = true
+		return nil, false
+	}
+	matchedSym := b.getFileExportSymbolMap(sf)[expName]
+	if matchedSym == nil {
+		b.starTargetMemo[key] = starTargetMemoEntry{}
+		return nil, false
+	}
+	if b.isSymbolDeclaredInFile(matchedSym, sf) || b.hasExplicitExportClauseInFile(sf, expName) {
+		canon := b.canonicalSymbol(matchedSym)
+		b.starTargetMemo[key] = starTargetMemoEntry{sym: canon, ambiguous: false}
+		return canon, false
+	}
+	if b.isAmbiguousStarExportInFileInner(sf, expName, visited, hitCycle) {
+		if !*hitCycle || len(visited) == 0 {
+			b.starTargetMemo[key] = starTargetMemoEntry{sym: nil, ambiguous: true}
+		}
+		return nil, true
+	}
+	canon := b.canonicalSymbol(matchedSym)
+	if !*hitCycle || len(visited) == 0 {
+		b.starTargetMemo[key] = starTargetMemoEntry{sym: canon, ambiguous: false}
+	}
+	return canon, false
+}
+
+func (b *graphBuilder) isAmbiguousStarExportInFile(sf *ast.SourceFile, expName string, visited map[*ast.SourceFile]bool) bool {
+	var hitCycle bool
+	return b.isAmbiguousStarExportInFileInner(sf, expName, visited, &hitCycle)
+}
+
+func (b *graphBuilder) isAmbiguousStarExportInFileInner(
+	sf *ast.SourceFile,
+	expName string,
+	visited map[*ast.SourceFile]bool,
+	hitCycle *bool,
+) bool {
+	if sf == nil || sf.Statements == nil || expName == "" || expName == "default" {
+		return false
+	}
+	key := sfExportKey{sf: sf, name: expName}
+	if cached, ok := b.ambigStarMemo[key]; ok {
+		return cached
+	}
+	if visited[sf] {
+		*hitCycle = true
+		return false
+	}
+	visited[sf] = true
+	defer delete(visited, sf)
+
+	var firstRuntimeCanon *ast.Symbol
+	var firstAnyCanon *ast.Symbol
+	anyAmbiguous := false
+
+	for _, stmt := range sf.Statements.Nodes {
+		if stmt == nil || stmt.Kind != ast.KindExportDeclaration {
+			continue
+		}
+		ed := stmt.AsExportDeclaration()
+		if ed == nil || ed.ExportClause != nil || ed.ModuleSpecifier == nil {
+			continue
+		}
+		targetSF := b.resolveModuleSpecifierNode(sf, ed.ModuleSpecifier)
+		if targetSF == nil {
+			continue
+		}
+		canon, ambig := b.resolveStarTargetSymbolInner(targetSF, expName, visited, hitCycle)
+		if ambig {
+			if !ed.IsTypeOnly {
+				if !*hitCycle || len(visited) == 1 {
+					b.ambigStarMemo[key] = true
+				}
+				return true
+			}
+			anyAmbiguous = true
+			continue
+		}
+		if canon == nil {
+			continue
+		}
+		if firstAnyCanon == nil {
+			firstAnyCanon = canon
+		} else if firstAnyCanon != canon {
+			anyAmbiguous = true
+		}
+		if !ed.IsTypeOnly && b.isSymbolRuntimeExportedFromFile(targetSF, expName, map[*ast.SourceFile]bool{}) {
+			if firstRuntimeCanon == nil {
+				firstRuntimeCanon = canon
+			} else if firstRuntimeCanon != canon {
+				if !*hitCycle || len(visited) == 1 {
+					b.ambigStarMemo[key] = true
+				}
+				return true
+			}
+		}
+	}
+	res := anyAmbiguous
+	if firstRuntimeCanon != nil {
+		res = false
+	}
+	if !*hitCycle || len(visited) == 1 {
+		b.ambigStarMemo[key] = res
+	}
+	return res
+}
+
+func (b *graphBuilder) isAmbiguousStarExportInAmbientBlocks(sf *ast.SourceFile, blocks []*ast.Node, expName string) bool {
+	if expName == "" || expName == "default" {
+		return false
+	}
+	var firstRuntimeCanon *ast.Symbol
+	var firstAnyCanon *ast.Symbol
+	anyAmbiguous := false
+
+	for _, blk := range blocks {
+		if blk == nil || blk.Body() == nil || blk.Body().Kind != ast.KindModuleBlock {
+			continue
+		}
+		mb := blk.Body().AsModuleBlock()
+		if mb == nil || mb.Statements == nil {
+			continue
+		}
+		for _, stmt := range mb.Statements.Nodes {
+			if stmt == nil || stmt.Kind != ast.KindExportDeclaration {
+				continue
+			}
+			ed := stmt.AsExportDeclaration()
+			if ed == nil || ed.ExportClause != nil || ed.ModuleSpecifier == nil {
+				continue
+			}
+			targetSF := b.resolveModuleSpecifierNode(sf, ed.ModuleSpecifier)
+			if targetSF == nil {
+				continue
+			}
+			canon, ambig := b.resolveStarTargetSymbol(targetSF, expName, map[*ast.SourceFile]bool{})
+			if ambig {
+				if !ed.IsTypeOnly {
+					return true
+				}
+				anyAmbiguous = true
+				continue
+			}
+			if canon == nil {
+				continue
+			}
+			if firstAnyCanon == nil {
+				firstAnyCanon = canon
+			} else if firstAnyCanon != canon {
+				anyAmbiguous = true
+			}
+			if !ed.IsTypeOnly && b.isSymbolRuntimeExportedFromFile(targetSF, expName, map[*ast.SourceFile]bool{}) {
+				if firstRuntimeCanon == nil {
+					firstRuntimeCanon = canon
+				} else if firstRuntimeCanon != canon {
+					return true
+				}
+			}
+		}
+	}
+	if firstRuntimeCanon != nil {
+		return false
+	}
+	return anyAmbiguous
 }
 
 func appendUniqueU32(slice []uint32, val uint32) []uint32 {

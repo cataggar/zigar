@@ -166,6 +166,16 @@ type nsAliasKey struct {
 	targetDecl uint32
 }
 
+type sfExportKey struct {
+	sf   *ast.SourceFile
+	name string
+}
+
+type starTargetMemoEntry struct {
+	sym       *ast.Symbol
+	ambiguous bool
+}
+
 type graphBuilder struct {
 	prog   *export_zigar_typescript_compiler.Program
 	tsProg *compiler.Program
@@ -209,6 +219,12 @@ type graphBuilder struct {
 
 	sigByNode       map[*ast.Node]uint32
 	sigByCheckerSig map[*checker.Signature]uint32
+
+	fileExportsByName      map[*ast.SourceFile]map[string]*ast.Symbol
+	fileExplicitExportSet  map[*ast.SourceFile]map[string]bool
+	runtimeExportMemo      map[sfExportKey]bool
+	starTargetMemo         map[sfExportKey]starTargetMemoEntry
+	ambigStarMemo          map[sfExportKey]bool
 }
 
 func newGraphBuilder(
@@ -259,8 +275,13 @@ func newGraphBuilder(
 		tpByNode:            map[*ast.Node]uint32{},
 		tpBySym:             map[*ast.Symbol]uint32{},
 		tpByCheckerType:     map[*checker.Type]uint32{},
-		sigByNode:           map[*ast.Node]uint32{},
-		sigByCheckerSig:     map[*checker.Signature]uint32{},
+		sigByNode:              map[*ast.Node]uint32{},
+		sigByCheckerSig:        map[*checker.Signature]uint32{},
+		fileExportsByName:      map[*ast.SourceFile]map[string]*ast.Symbol{},
+		fileExplicitExportSet:  map[*ast.SourceFile]map[string]bool{},
+		runtimeExportMemo:      map[sfExportKey]bool{},
+		starTargetMemo:         map[sfExportKey]starTargetMemoEntry{},
+		ambigStarMemo:          map[sfExportKey]bool{},
 	}
 }
 
