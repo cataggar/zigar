@@ -95,22 +95,37 @@ pub fn exerciseSyncProtocols(out_alloc: std.mem.Allocator) ![]u8 {
         }
         if (count != 4 or collected != 26) return std.fmt.allocPrint(out_alloc, "fail:rangeIter:{d}:{d}", .{ count, collected });
 
-        const gen_it = try m.tokenGen("tok");
-        defer gen_it.deinit();
-        const t0 = (try gen_it.nextAlloc(tracked_alloc)) orelse return out_alloc.dupe(u8, "fail:gen_t0_null");
-        defer tracked_alloc.free(t0);
-        const t1 = (try gen_it.nextAlloc(tracked_alloc)) orelse return out_alloc.dupe(u8, "fail:gen_t1_null");
-        defer tracked_alloc.free(t1);
-        if (!std.mem.eql(u8, t0, "tok:0") or !std.mem.eql(u8, t1, "tok:1")) {
-            return std.fmt.allocPrint(out_alloc, "fail:gen_items:{s},{s}", .{ t0, t1 });
+        {
+            const gen_it = try m.tokenGen("tok");
+            defer gen_it.closeAndDeinit();
+            const t0 = (try gen_it.nextAlloc(tracked_alloc)) orelse return out_alloc.dupe(u8, "fail:gen_t0_null");
+            defer tracked_alloc.free(t0);
+            const t1 = (try gen_it.nextAlloc(tracked_alloc)) orelse return out_alloc.dupe(u8, "fail:gen_t1_null");
+            defer tracked_alloc.free(t1);
+            if (!std.mem.eql(u8, t0, "tok:0") or !std.mem.eql(u8, t1, "tok:1")) {
+                return std.fmt.allocPrint(out_alloc, "fail:gen_items:{s},{s}", .{ t0, t1 });
+            }
         }
-        try gen_it.close();
         if ((try m.getGenClosedCount()) != 1) return out_alloc.dupe(u8, "fail:gen_close_count");
 
-        // TokenCursor: `[Symbol.iterator]` + automatic `[Symbol.dispose]` on `defer cur.deinit()`
+        // H2: `deinit()` and `js.freeDecoded` MUST release handle slots WITHOUT invoking `[Symbol.dispose]`!
+        {
+            const peek_cur = try m.TokenCursor.init(&.{"peek-only"}, false);
+            peek_cur.deinit();
+
+            const arr_cur = try tracked_alloc.alloc(m.TokenCursor, 1);
+            arr_cur[0] = try m.TokenCursor.init(&.{"freed-decoded"}, false);
+            js.freeDecoded([]const m.TokenCursor, tracked_alloc, arr_cur);
+
+            const pre_log = try m.getDisposeLogAlloc(tracked_alloc);
+            defer js.freeDecoded([]const []const u8, tracked_alloc, pre_log);
+            if (pre_log.len != 0) return std.fmt.allocPrint(out_alloc, "fail:deinit_disposed:{d}", .{pre_log.len});
+        }
+
+        // TokenCursor: `[Symbol.iterator]` + explicit `[Symbol.dispose]` on `defer cur.dispose()`
         {
             const cur = try m.TokenCursor.init(&.{ "alpha", "beta", "gamma" }, false);
-            defer cur.deinit();
+            defer cur.dispose();
 
             const wd = try m.withDisposableInferAlloc(tracked_alloc, cur, "live");
             defer tracked_alloc.free(wd);
@@ -133,7 +148,7 @@ pub fn exerciseSyncProtocols(out_alloc: std.mem.Allocator) ![]u8 {
         // Legacy `Symbol.for("nodejs.dispose")`
         {
             const leg = try m.LegacySyncHandle.init("fd42");
-            defer leg.deinit();
+            defer leg.dispose();
         }
 
         const log = try m.getDisposeLogAlloc(tracked_alloc);
@@ -166,7 +181,7 @@ pub fn exerciseSyncProtocols(out_alloc: std.mem.Allocator) ![]u8 {
 
         {
             const cres = try cjs.CjsResource.init("sock7");
-            defer cres.deinit();
+            defer cres.dispose();
         }
         const last_cjs = try cjs.lastCjsDisposedAlloc(tracked_alloc);
         defer tracked_alloc.free(last_cjs);
@@ -319,14 +334,13 @@ const worker_ns = struct {
                 return std.fmt.allocPrint(out_alloc, "fail:streamChunks:{s}", .{buf.items});
             }
 
-            // AsyncGenerator early `.close()` triggers `finally`
+            // AsyncGenerator early `defer inf.closeAndDeinit()` triggers `finally` and releases handle
             {
                 const inf = try m.infiniteAsyncCounter(100);
-                defer inf.deinit();
+                defer inf.closeAndDeinit();
                 const c0 = (try inf.next()) orelse return out_alloc.dupe(u8, "fail:inf0");
                 const c1 = (try inf.next()) orelse return out_alloc.dupe(u8, "fail:inf1");
                 if (c0 != 100 or c1 != 101) return out_alloc.dupe(u8, "fail:inf_vals");
-                try inf.close();
             }
             if ((try m.getAsyncGenClosedCount()) != 1) return out_alloc.dupe(u8, "fail:async_gen_close");
 

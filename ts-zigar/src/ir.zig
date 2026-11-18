@@ -526,7 +526,37 @@ pub const DeclIr = struct {
     infer_companion_ident: ?[]const u8 = null,
     infer_alloc_companion_ident: ?[]const u8 = null,
     jsdoc: ?JsDocIr,
+    fallback_notes: []const []const u8 = &.{},
     kind: DeclKindIr,
+};
+
+pub const FallbackKind = enum {
+    unresolved_type_ref,
+    generic_function_type,
+    unsupported_mapped_type,
+    erased_conditional_type,
+    expansive_generic_cycle,
+    object_literal_budget,
+    unsupported_type_node,
+
+    pub fn tagName(self: FallbackKind) []const u8 {
+        return switch (self) {
+            .unresolved_type_ref => "unresolved_type_ref",
+            .generic_function_type => "generic_function_type",
+            .unsupported_mapped_type => "unsupported_mapped_type",
+            .erased_conditional_type => "erased_conditional_type",
+            .expansive_generic_cycle => "expansive_generic_cycle",
+            .object_literal_budget => "object_literal_budget",
+            .unsupported_type_node => "unsupported_type_node",
+        };
+    }
+};
+
+pub const FallbackEntry = struct {
+    module_specifier: []const u8,
+    decl_name: []const u8,
+    kind: FallbackKind,
+    detail: []const u8,
 };
 
 pub const ModuleImportIr = struct {
@@ -554,6 +584,7 @@ pub const ModuleIr = struct {
 pub const PackageIr = struct {
     arena: std.heap.ArenaAllocator,
     modules: []const ModuleIr,
+    fallbacks: []const FallbackEntry = &.{},
 
     pub fn deinit(self: *PackageIr) void {
         self.arena.deinit();
@@ -667,6 +698,7 @@ pub fn lowerGraph(
     return .{
         .arena = arena,
         .modules = modules,
+        .fallbacks = try ctx.fallbacks.toOwnedSlice(alloc),
     };
 }
 
@@ -812,8 +844,14 @@ fn LowerCtx(comptime GraphType: type) type {
         cur_mod_anon_counter: u32 = 0,
         inline_anon_depth: u32 = 0,
         in_handle_struct: bool = false,
+        cur_mod_specifier: []const u8 = "",
+        cur_decl_logical_name: []const u8 = "<module>",
+        cur_decl_fallback_notes: ?*std.ArrayList([]const u8) = null,
+        fallbacks: std.ArrayList(FallbackEntry) = .empty,
+        fallbacks_seen: std.StringHashMapUnmanaged(void) = .empty,
 
         fn deinitScratch(self: *Self) void {
+            self.fallbacks_seen.deinit(self.scratch);
             for (self.candidates.items) |*c| {
                 c.source_mod_ids.deinit(self.scratch);
                 c.decl_ids.deinit(self.scratch);
@@ -850,6 +888,59 @@ fn LowerCtx(comptime GraphType: type) type {
         fn str(self: *const Self, id: u32) []const u8 {
             if (id < self.graph.strings.len) return self.graph.strings[id];
             return "";
+        }
+
+        fn sanitizeSingleLineNote(alloc: std.mem.Allocator, raw: []const u8) error{OutOfMemory}![]const u8 {
+            var needs_clean = false;
+            for (raw) |c| {
+                if (c == '\n' or c == '\r') {
+                    needs_clean = true;
+                    break;
+                }
+            }
+            if (!needs_clean) return try alloc.dupe(u8, raw);
+            const buf = try alloc.dupe(u8, raw);
+            for (buf) |*c| {
+                if (c.* == '\n' or c.* == '\r') c.* = ' ';
+            }
+            return buf;
+        }
+
+        fn recordFallbackAt(
+            self: *Self,
+            mod_spec: []const u8,
+            decl_name: []const u8,
+            notes_out: ?*std.ArrayList([]const u8),
+            kind: FallbackKind,
+            detail_raw: []const u8,
+        ) error{OutOfMemory}!void {
+            const clean_detail = try sanitizeSingleLineNote(self.alloc, detail_raw);
+            const note = try std.fmt.allocPrint(self.alloc, "{s}: {s}", .{ kind.tagName(), clean_detail });
+            const dedup_key = try std.fmt.allocPrint(self.scratch, "{s}\x00{s}\x00{s}", .{ mod_spec, decl_name, note });
+            const gop = try self.fallbacks_seen.getOrPut(self.scratch, dedup_key);
+            if (gop.found_existing) {
+                self.scratch.free(dedup_key);
+                return;
+            }
+            try self.fallbacks.append(self.alloc, .{
+                .module_specifier = try self.alloc.dupe(u8, mod_spec),
+                .decl_name = try self.alloc.dupe(u8, decl_name),
+                .kind = kind,
+                .detail = clean_detail,
+            });
+            if (notes_out) |lst| {
+                try lst.append(self.scratch, note);
+            }
+        }
+
+        fn recordFallback(self: *Self, kind: FallbackKind, detail_raw: []const u8) error{OutOfMemory}!void {
+            try self.recordFallbackAt(
+                self.cur_mod_specifier,
+                self.cur_decl_logical_name,
+                self.cur_decl_fallback_notes,
+                kind,
+                detail_raw,
+            );
         }
 
         fn classifyDecl(self: *Self, decl_id: u32) error{OutOfMemory}!classify_decls.DeclClassification {
@@ -5022,11 +5113,11 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                         return res;
                     }
-                    if (std.mem.eql(u8, lower_types.stripGlobalQualifier(ref_name), "ArrayBufferLike") and tn.resolved_type == null) {
+                    if (std.mem.eql(u8, stripped_stdlib_name, "ArrayBufferLike") and tn.resolved_type == null) {
                         needs_runtime.* = true;
                         return self.makeType(.{ .binary_view = .array_buffer });
                     }
-                    if (std.mem.eql(u8, ref_name, "Map") or std.mem.eql(u8, ref_name, "ReadonlyMap")) {
+                    if (std.mem.eql(u8, stripped_stdlib_name, "Map") or std.mem.eql(u8, stripped_stdlib_name, "ReadonlyMap")) {
                         needs_runtime.* = true;
                         const k = if (ref.type_args.len > 0)
                             try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
@@ -5052,7 +5143,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     const mentions_open_tp = self.typeTreeMentionsActiveTypeParam(ty_id, active_tps, &.{}, 0);
 
                     if (is_stdlib_utility_target) {
-                        if (type_ops.classifyBuiltinUtility(ref_name, ref.type_args.len)) |util_kind| {
+                        if (type_ops.classifyBuiltinUtility(stripped_stdlib_name, ref.type_args.len)) |util_kind| {
                             switch (util_kind) {
                                 .no_infer => {
                                     if (ref.type_args.len >= 1) {
@@ -5121,20 +5212,21 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                     }
 
-                    if (std.mem.eql(u8, ref_name, "Record") and ref.type_args.len == 2) {
+                    if (std.mem.eql(u8, stripped_stdlib_name, "Record") and ref.type_args.len == 2) {
                         needs_runtime.* = true;
                         const k = try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                         const v = try self.lowerType(ref.type_args[1], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                         return self.makeType(.{ .js_record = .{ .key = k, .value = v } });
                     }
 
+                    try self.recordFallback(.unresolved_type_ref, ref_name);
                     needs_runtime.* = true;
                     return self.makeType(.js_object);
                 },
                 .function_type, .constructor_type => |sig_id| {
                     if (sig_id < self.graph.signatures.len) {
                         const sig = self.graph.signatures[sig_id];
-                        // Generic function types cannot be bare Zig function pointers; represent as JsValue.
+                        // Generic function types cannot be bare Zig function pointers; represent as JsFunction.
                         if (sig.type_params.len == 0) {
                             const fp = try self.lowerGraphSigToFnPtrIr(sig_id, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                             const fp_ir = try self.makeType(.{ .fn_ptr = fp });
@@ -5162,8 +5254,15 @@ fn LowerCtx(comptime GraphType: type) type {
                             return fp_ir;
                         }
                     }
+                    try self.recordFallback(
+                        .generic_function_type,
+                        if (tn.kind == .constructor_type)
+                            "generic constructor signature -> zigar_js.JsFunction"
+                        else
+                            "generic function signature -> zigar_js.JsFunction",
+                    );
                     needs_runtime.* = true;
-                    return self.makeType(.js_value);
+                    return self.makeType(.js_function);
                 },
                 .object_literal => |obj| {
                     if (obj.properties.len == 0 and obj.call_signatures.len == 1 and
@@ -5196,6 +5295,9 @@ fn LowerCtx(comptime GraphType: type) type {
                             }
                             return fp_ir;
                         }
+                        try self.recordFallback(.generic_function_type, "generic call-signature object -> zigar_js.JsFunction");
+                        needs_runtime.* = true;
+                        return self.makeType(.js_function);
                     }
                     const obj_cls = self.classifyObjectLiteral(obj);
                     const has_non_index_members = obj.properties.len > 0 or
@@ -5324,6 +5426,7 @@ fn LowerCtx(comptime GraphType: type) type {
 
                         // Enforce inline nesting & member budget for un-hoistable open generic object literals (`H3`).
                         if (self.inline_anon_depth >= 3 or obj.properties.len > 48) {
+                            try self.recordFallback(.object_literal_budget, "open anonymous object exceeded inline budget -> zigar_js.Object");
                             needs_runtime.* = true;
                             return self.makeType(.js_object);
                         }
@@ -5453,6 +5556,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         },
                         .dynamic_object => {},
                     }
+                    try self.recordFallback(.unsupported_mapped_type, "open mapped type -> zigar_js.Object");
                     return self.makeType(.js_object);
                 },
                 .conditional => |cond| {
@@ -5474,7 +5578,10 @@ fn LowerCtx(comptime GraphType: type) type {
                             const operand = try self.lowerType(check_id, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                             return self.makeType(.{ .unary_type_op = .{ .op = .awaited, .operand = operand } });
                         },
-                        .dynamic_any => return self.makeType(.js_any),
+                        .dynamic_any => {
+                            try self.recordFallback(.erased_conditional_type, "open conditional type -> zigar_js.Any");
+                            return self.makeType(.js_any);
+                        },
                     }
                 },
                 .typeof_query => |tq| {
@@ -5535,6 +5642,7 @@ fn LowerCtx(comptime GraphType: type) type {
                             }
                         }
                     }
+                    try self.recordFallback(.unsupported_type_node, @tagName(tn.kind));
                     needs_runtime.* = true;
                     return self.makeType(.js_value);
                 },
@@ -5616,8 +5724,9 @@ fn LowerCtx(comptime GraphType: type) type {
                             );
                         }
                     }
+                    const stripped_arr_name = lower_types.stripGlobalQualifier(ref_name);
                     if ((ref.target_decl == null or self.isBundledLibDecl(ref.target_decl.?)) and
-                        (std.mem.eql(u8, ref_name, "Array") or std.mem.eql(u8, ref_name, "ReadonlyArray")))
+                        (std.mem.eql(u8, stripped_arr_name, "Array") or std.mem.eql(u8, stripped_arr_name, "ReadonlyArray")))
                     {
                         break :blk true;
                     }
@@ -9042,6 +9151,18 @@ fn LowerCtx(comptime GraphType: type) type {
                 (is_top_level and is_js_exported and std.mem.eql(u8, bound.wire_name, "default"));
             const is_global_scope = self.global_aug_decls.contains(decl_id) or companion_global;
 
+            const saved_decl_name = self.cur_decl_logical_name;
+            const saved_decl_notes = self.cur_decl_fallback_notes;
+            self.cur_decl_logical_name = bound.logical_name;
+            var local_fallback_notes: std.ArrayList([]const u8) = .empty;
+            defer local_fallback_notes.deinit(self.scratch);
+            self.cur_decl_fallback_notes = &local_fallback_notes;
+            defer {
+                self.cur_decl_logical_name = saved_decl_name;
+                self.cur_decl_fallback_notes = saved_decl_notes;
+            }
+            const out_start_idx = out_list.items.len;
+
             switch (d.kind) {
                 .function_decl => |sigs| {
                     needs_runtime.* = true;
@@ -10514,6 +10635,18 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                     }
                 },
+            }
+
+            if (local_fallback_notes.items.len > 0 and out_list.items.len > out_start_idx) {
+                var target_idx = out_start_idx;
+                for (out_list.items[out_start_idx..], out_start_idx..) |cand_item, idx| {
+                    if (!cand_item.is_synthetic_companion) {
+                        target_idx = idx;
+                        break;
+                    }
+                }
+                const owned_notes = try self.alloc.dupe([]const u8, local_fallback_notes.items);
+                out_list.items[target_idx].fallback_notes = owned_notes;
             }
         }
 
@@ -14598,6 +14731,532 @@ fn LowerCtx(comptime GraphType: type) type {
             return summary;
         }
 
+        /// Detects expansive / non-regular generic recursion (`Box<Box<T>>`, `Foo<Bar<Foo<T>>>`,
+        /// `Nest<T[]>`) and unguarded non-container recursive type aliases (`type Loop<T> = Loop<T>[]`)
+        /// that would cause unbounded Zig comptime monomorphization, rewriting the cycle-closing
+        /// `TypeIr` edge in-place to `.js_object` and recording an explicit `.expansive_generic_cycle`
+        /// fallback entry and doc-comment note.
+        fn breakExpansiveGenericCycles(self: *Self, modules: []ModuleIr) !void {
+            var decl_ptr_map: std.StringHashMapUnmanaged(*DeclIr) = .empty;
+            defer {
+                var it = decl_ptr_map.keyIterator();
+                while (it.next()) |k| self.scratch.free(k.*);
+                decl_ptr_map.deinit(self.scratch);
+            }
+
+            for (modules) |*m| {
+                try indexDeclPointersByPath(self.scratch, m.index, &.{}, @constCast(m.decls), &decl_ptr_map);
+            }
+
+            for (modules) |*m| {
+                try self.scanModuleDeclsForExpansiveCycles(modules, m.index, &.{}, @constCast(m.decls), &decl_ptr_map);
+            }
+        }
+
+        const GenSymVal = union(enum) {
+            closed,
+            bare_param: struct {
+                depth: u6,
+                idx: u16,
+            },
+            compound: u64,
+
+            fn mask(self: GenSymVal) u64 {
+                return switch (self) {
+                    .closed => 0,
+                    .bare_param => |bp| (@as(u64, 1) << bp.depth),
+                    .compound => |m| m,
+                };
+            }
+        };
+
+        const GenParamBinding = struct {
+            ident: []const u8,
+            val: GenSymVal,
+        };
+
+        const GenActiveFrame = struct {
+            key: []const u8,
+            decl: *DeclIr,
+            mod_idx: u32,
+            saw_nominal_container: bool,
+        };
+
+        fn evalGenSymType(
+            self: *const Self,
+            ty: *const TypeIr,
+            bindings: []const GenParamBinding,
+            decl_map: *const std.StringHashMapUnmanaged(*DeclIr),
+            depth: usize,
+        ) error{OutOfMemory}!GenSymVal {
+            if (depth >= 24) return .closed;
+            switch (ty.*) {
+                .type_param_ref => |ident| {
+                    for (bindings) |b| {
+                        if (std.mem.eql(u8, b.ident, ident)) return b.val;
+                    }
+                    return .closed;
+                },
+                .decl_ref => |dref| {
+                    if (dref.type_args.len > 0) {
+                        const target_key = try formatDeclCycleKey(self.scratch, dref.module_index, dref.decl_zig_path, null);
+                        defer self.scratch.free(target_key);
+                        if (decl_map.get(target_key)) |t_decl| {
+                            if (t_decl.kind == .type_alias and t_decl.kind.type_alias.target.* == .type_param_ref) {
+                                const ref_tp = t_decl.kind.type_alias.target.type_param_ref;
+                                for (t_decl.kind.type_alias.type_params, 0..) |tp, p_idx| {
+                                    if (std.mem.eql(u8, tp.zig_ident, ref_tp) and p_idx < dref.type_args.len) {
+                                        return self.evalGenSymType(dref.type_args[p_idx], bindings, decl_map, depth + 1);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    var m: u64 = 0;
+                    for (dref.type_args) |arg| {
+                        m |= (try self.evalGenSymType(arg, bindings, decl_map, depth + 1)).mask();
+                    }
+                    return if (m == 0) .closed else .{ .compound = m };
+                },
+                .slice, .pointer_const, .promise, .js_iterator, .js_async_iterator => |inner| {
+                    const m = (try self.evalGenSymType(inner, bindings, decl_map, depth + 1)).mask();
+                    return if (m == 0) .closed else .{ .compound = m };
+                },
+                .optional => |opt| {
+                    const m = (try self.evalGenSymType(opt.child, bindings, decl_map, depth + 1)).mask();
+                    return if (m == 0) .closed else .{ .compound = m };
+                },
+                .js_map => |mp| {
+                    const m = (try self.evalGenSymType(mp.key, bindings, decl_map, depth + 1)).mask() |
+                        (try self.evalGenSymType(mp.value, bindings, decl_map, depth + 1)).mask();
+                    return if (m == 0) .closed else .{ .compound = m };
+                },
+                .js_record => |rec| {
+                    const m = (try self.evalGenSymType(rec.key, bindings, decl_map, depth + 1)).mask() |
+                        (try self.evalGenSymType(rec.value, bindings, decl_map, depth + 1)).mask();
+                    return if (m == 0) .closed else .{ .compound = m };
+                },
+                .mapped_values_op => |mv| {
+                    const m = (try self.evalGenSymType(mv.target, bindings, decl_map, depth + 1)).mask() |
+                        (try self.evalGenSymType(mv.value, bindings, decl_map, depth + 1)).mask();
+                    return if (m == 0) .closed else .{ .compound = m };
+                },
+                .unary_type_op => |uo| {
+                    const m = (try self.evalGenSymType(uo.operand, bindings, decl_map, depth + 1)).mask();
+                    return if (m == 0) .closed else .{ .compound = m };
+                },
+                .key_filter_op => |kfo| {
+                    var m = (try self.evalGenSymType(kfo.target, bindings, decl_map, depth + 1)).mask();
+                    if (kfo.keys == .ty) {
+                        m |= (try self.evalGenSymType(kfo.keys.ty, bindings, decl_map, depth + 1)).mask();
+                    }
+                    return if (m == 0) .closed else .{ .compound = m };
+                },
+                .index_access_op => |iao| {
+                    var m = (try self.evalGenSymType(iao.object_ty, bindings, decl_map, depth + 1)).mask();
+                    if (iao.index_spec == .ty) {
+                        m |= (try self.evalGenSymType(iao.index_spec.ty, bindings, decl_map, depth + 1)).mask();
+                    }
+                    return if (m == 0) .closed else .{ .compound = m };
+                },
+                .intersect_op => |arms| {
+                    var m: u64 = 0;
+                    for (arms) |arm| {
+                        m |= (try self.evalGenSymType(arm, bindings, decl_map, depth + 1)).mask();
+                    }
+                    return if (m == 0) .closed else .{ .compound = m };
+                },
+                .tuple => |elems| {
+                    var m: u64 = 0;
+                    for (elems) |el| {
+                        m |= (try self.evalGenSymType(el.ty, bindings, decl_map, depth + 1)).mask();
+                    }
+                    return if (m == 0) .closed else .{ .compound = m };
+                },
+                .anon_struct => |fields| {
+                    var m: u64 = 0;
+                    for (fields) |f| {
+                        m |= (try self.evalGenSymType(f.ty, bindings, decl_map, depth + 1)).mask();
+                    }
+                    return if (m == 0) .closed else .{ .compound = m };
+                },
+                .tagged_union => |tu| {
+                    var m: u64 = 0;
+                    for (tu.variants) |v| {
+                        m |= (try self.evalGenSymType(v.payload, bindings, decl_map, depth + 1)).mask();
+                    }
+                    return if (m == 0) .closed else .{ .compound = m };
+                },
+                .fn_ptr => |fp| {
+                    var m: u64 = 0;
+                    if (fp.this_param) |thp| {
+                        m |= (try self.evalGenSymType(thp, bindings, decl_map, depth + 1)).mask();
+                    }
+                    for (fp.params) |pt| {
+                        m |= (try self.evalGenSymType(pt, bindings, decl_map, depth + 1)).mask();
+                    }
+                    m |= (try self.evalGenSymType(fp.return_type, bindings, decl_map, depth + 1)).mask();
+                    return if (m == 0) .closed else .{ .compound = m };
+                },
+                else => return .closed,
+            }
+        }
+
+        fn appendFallbackNoteToDecl(
+            self: *Self,
+            modules: []ModuleIr,
+            owner_mod_idx: u32,
+            owner_decl: *DeclIr,
+            kind: FallbackKind,
+            detail: []const u8,
+        ) error{OutOfMemory}!void {
+            const mod_spec = if (owner_mod_idx < modules.len) modules[owner_mod_idx].specifier else "";
+            var extra_notes: std.ArrayList([]const u8) = .empty;
+            defer extra_notes.deinit(self.scratch);
+            for (owner_decl.fallback_notes) |existing| {
+                try extra_notes.append(self.scratch, existing);
+            }
+            const before_len = extra_notes.items.len;
+            try self.recordFallbackAt(mod_spec, owner_decl.logical_name, &extra_notes, kind, detail);
+            if (extra_notes.items.len > before_len) {
+                owner_decl.fallback_notes = try self.alloc.dupe([]const u8, extra_notes.items);
+            }
+            if (owner_mod_idx < modules.len) {
+                modules[owner_mod_idx].needs_root_runtime = true;
+            }
+        }
+
+        fn scanModuleDeclsForExpansiveCycles(
+            self: *Self,
+            modules: []ModuleIr,
+            mod_idx: u32,
+            prefix: []const []const u8,
+            decls: []DeclIr,
+            decl_map: *const std.StringHashMapUnmanaged(*DeclIr),
+        ) error{OutOfMemory}!void {
+            if (prefix.len >= 32) return;
+            for (decls) |*d| {
+                const tps_opt: ?[]const TypeParamIr = switch (d.kind) {
+                    .struct_decl => |st| if (st.repr == .value_struct and st.type_params.len > 0) st.type_params else null,
+                    .union_decl => |un| if (un.type_params.len > 0) un.type_params else null,
+                    .type_alias => |ta| ta.type_params,
+                    else => null,
+                };
+                if (tps_opt) |tps| {
+                    var frames: std.ArrayList(GenActiveFrame) = .empty;
+                    defer frames.deinit(self.scratch);
+                    const root_bindings = try self.scratch.alloc(GenParamBinding, tps.len);
+                    defer self.scratch.free(root_bindings);
+                    for (tps, 0..) |tp, idx| {
+                        root_bindings[idx] = .{
+                            .ident = tp.zig_ident,
+                            .val = .{ .bare_param = .{ .depth = 0, .idx = @intCast(idx) } },
+                        };
+                    }
+                    var visits: usize = 0;
+                    try self.dfsExpansiveGenericDecl(
+                        modules,
+                        mod_idx,
+                        prefix,
+                        d,
+                        root_bindings,
+                        decl_map,
+                        &frames,
+                        &visits,
+                    );
+                }
+
+                switch (d.kind) {
+                    .namespace_decl => |*ns| {
+                        const sub = try self.scratch.alloc([]const u8, prefix.len + 1);
+                        defer self.scratch.free(sub);
+                        @memcpy(sub[0..prefix.len], prefix);
+                        sub[prefix.len] = d.zig_ident;
+                        try self.scanModuleDeclsForExpansiveCycles(modules, mod_idx, sub, @constCast(ns.children), decl_map);
+                    },
+                    .struct_decl => |*st| {
+                        if (st.nested_decls.len > 0) {
+                            const sub = try self.scratch.alloc([]const u8, prefix.len + 1);
+                            defer self.scratch.free(sub);
+                            @memcpy(sub[0..prefix.len], prefix);
+                            sub[prefix.len] = d.zig_ident;
+                            try self.scanModuleDeclsForExpansiveCycles(modules, mod_idx, sub, @constCast(st.nested_decls), decl_map);
+                        }
+                    },
+                    .enum_decl => |*en| {
+                        if (en.nested_decls.len > 0) {
+                            const sub = try self.scratch.alloc([]const u8, prefix.len + 1);
+                            defer self.scratch.free(sub);
+                            @memcpy(sub[0..prefix.len], prefix);
+                            sub[prefix.len] = d.zig_ident;
+                            try self.scanModuleDeclsForExpansiveCycles(modules, mod_idx, sub, @constCast(en.nested_decls), decl_map);
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        fn dfsExpansiveGenericDecl(
+            self: *Self,
+            modules: []ModuleIr,
+            mod_idx: u32,
+            prefix: []const []const u8,
+            d: *DeclIr,
+            bindings: []const GenParamBinding,
+            decl_map: *const std.StringHashMapUnmanaged(*DeclIr),
+            frames: *std.ArrayList(GenActiveFrame),
+            visits: *usize,
+        ) error{OutOfMemory}!void {
+            if (frames.items.len >= 24 or visits.* >= 1024) return;
+            visits.* += 1;
+
+            const self_key = try formatDeclCycleKey(self.scratch, mod_idx, prefix, d.zig_ident);
+            defer self.scratch.free(self_key);
+
+            const is_nominal_decl = (d.kind == .struct_decl and d.kind.struct_decl.repr == .value_struct) or
+                (d.kind == .union_decl);
+            if (is_nominal_decl) {
+                for (frames.items) |*fr| fr.saw_nominal_container = true;
+            }
+
+            try frames.append(self.scratch, .{
+                .key = self_key,
+                .decl = d,
+                .mod_idx = mod_idx,
+                .saw_nominal_container = is_nominal_decl,
+            });
+            defer _ = frames.pop();
+
+            switch (d.kind) {
+                .struct_decl => |*st| {
+                    if (st.repr == .value_struct) {
+                        for (st.fields) |f| {
+                            try self.dfsExpansiveGenericType(modules, mod_idx, d, @constCast(f.ty), bindings, decl_map, frames, visits);
+                        }
+                    }
+                },
+                .union_decl => |*un| {
+                    for (un.variants) |v| {
+                        try self.dfsExpansiveGenericType(modules, mod_idx, d, @constCast(v.payload), bindings, decl_map, frames, visits);
+                    }
+                },
+                .type_alias => |*ta| {
+                    try self.dfsExpansiveGenericType(modules, mod_idx, d, @constCast(ta.target), bindings, decl_map, frames, visits);
+                },
+                else => {},
+            }
+        }
+
+        fn dfsExpansiveGenericType(
+            self: *Self,
+            modules: []ModuleIr,
+            owner_mod_idx: u32,
+            owner_decl: *DeclIr,
+            ty: *TypeIr,
+            bindings: []const GenParamBinding,
+            decl_map: *const std.StringHashMapUnmanaged(*DeclIr),
+            frames: *std.ArrayList(GenActiveFrame),
+            visits: *usize,
+        ) error{OutOfMemory}!void {
+            if (visits.* >= 1024) return;
+
+            const enters_container = switch (ty.*) {
+                .tuple, .anon_struct, .tagged_union => true,
+                else => false,
+            };
+            var saved_container_flags: [24]bool = undefined;
+            const n_frames = frames.items.len;
+            if (enters_container) {
+                for (frames.items[0..n_frames], 0..) |*fr, idx| {
+                    saved_container_flags[idx] = fr.saw_nominal_container;
+                    fr.saw_nominal_container = true;
+                }
+            }
+            defer if (enters_container) {
+                for (frames.items[0..n_frames], 0..) |*fr, idx| {
+                    fr.saw_nominal_container = saved_container_flags[idx];
+                }
+            };
+
+            switch (ty.*) {
+                .slice, .pointer_const, .promise, .js_iterator, .js_async_iterator => |inner| {
+                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(inner), bindings, decl_map, frames, visits);
+                },
+                .optional => |opt| {
+                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(opt.child), bindings, decl_map, frames, visits);
+                },
+                .js_map => |mp| {
+                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(mp.key), bindings, decl_map, frames, visits);
+                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(mp.value), bindings, decl_map, frames, visits);
+                },
+                .js_record => |rec| {
+                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(rec.key), bindings, decl_map, frames, visits);
+                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(rec.value), bindings, decl_map, frames, visits);
+                },
+                .mapped_values_op => |mv| {
+                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(mv.target), bindings, decl_map, frames, visits);
+                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(mv.value), bindings, decl_map, frames, visits);
+                },
+                .unary_type_op => |uo| {
+                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(uo.operand), bindings, decl_map, frames, visits);
+                },
+                .key_filter_op => |kfo| {
+                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(kfo.target), bindings, decl_map, frames, visits);
+                    if (kfo.keys == .ty) {
+                        try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(kfo.keys.ty), bindings, decl_map, frames, visits);
+                    }
+                },
+                .index_access_op => |iao| {
+                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(iao.object_ty), bindings, decl_map, frames, visits);
+                    if (iao.index_spec == .ty) {
+                        try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(iao.index_spec.ty), bindings, decl_map, frames, visits);
+                    }
+                },
+                .intersect_op => |arms| {
+                    for (arms) |arm| {
+                        try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(arm), bindings, decl_map, frames, visits);
+                    }
+                },
+                .tuple => |elems| {
+                    for (elems) |el| {
+                        try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(el.ty), bindings, decl_map, frames, visits);
+                    }
+                },
+                .anon_struct => |fields| {
+                    for (fields) |f| {
+                        try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(f.ty), bindings, decl_map, frames, visits);
+                    }
+                },
+                .tagged_union => |tu| {
+                    for (tu.variants) |v| {
+                        try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(v.payload), bindings, decl_map, frames, visits);
+                    }
+                },
+                .fn_ptr => |fp| {
+                    if (fp.this_param) |thp| {
+                        try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(thp), bindings, decl_map, frames, visits);
+                    }
+                    for (fp.params) |pt| {
+                        try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(pt), bindings, decl_map, frames, visits);
+                    }
+                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(fp.return_type), bindings, decl_map, frames, visits);
+                },
+                .decl_ref => |dref| {
+                    for (dref.type_args) |arg_ty| {
+                        try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(arg_ty), bindings, decl_map, frames, visits);
+                    }
+
+                    // Resolve re-export hops if any.
+                    var cur_mod = dref.module_index;
+                    var cur_path = dref.decl_zig_path;
+                    var target_decl_opt: ?*DeclIr = null;
+                    var hops: usize = 0;
+                    while (hops < 8) : (hops += 1) {
+                        const k = try formatDeclCycleKey(self.scratch, cur_mod, cur_path, null);
+                        defer self.scratch.free(k);
+                        const found = decl_map.get(k) orelse break;
+                        if (found.kind == .re_export_decl) {
+                            cur_mod = found.kind.re_export_decl.target_module_index;
+                            cur_path = found.kind.re_export_decl.target_zig_path;
+                            continue;
+                        }
+                        target_decl_opt = found;
+                        break;
+                    }
+                    const target_decl = target_decl_opt orelse return;
+                    const target_tps: []const TypeParamIr = switch (target_decl.kind) {
+                        .struct_decl => |st| if (st.repr == .value_struct) st.type_params else return,
+                        .union_decl => |un| un.type_params,
+                        .type_alias => |ta| ta.type_params,
+                        else => return,
+                    };
+
+                    const target_key = try formatDeclCycleKey(self.scratch, cur_mod, cur_path, null);
+                    defer self.scratch.free(target_key);
+
+                    var arg_syms = try self.scratch.alloc(GenSymVal, dref.type_args.len);
+                    defer self.scratch.free(arg_syms);
+                    var combined_mask: u64 = 0;
+                    for (dref.type_args, 0..) |arg_ty, i| {
+                        arg_syms[i] = try self.evalGenSymType(arg_ty, bindings, decl_map, 0);
+                        combined_mask |= arg_syms[i].mask();
+                    }
+
+                    for (frames.items, 0..) |fr, d_idx| {
+                        if (!std.mem.eql(u8, fr.key, target_key)) continue;
+                        const bit = @as(u64, 1) << @intCast(d_idx);
+                        var is_expansive = false;
+                        for (arg_syms) |sym| {
+                            if (sym == .compound and (sym.compound & bit) != 0) {
+                                is_expansive = true;
+                                break;
+                            }
+                        }
+                        const is_unguarded_alias = (fr.decl.kind == .type_alias and !fr.saw_nominal_container);
+                        if (is_expansive or is_unguarded_alias) {
+                            const reason = try std.fmt.allocPrint(
+                                self.scratch,
+                                "non-regular recursive instantiation of '{s}' -> zigar_js.Object",
+                                .{fr.decl.logical_name},
+                            );
+                            defer self.scratch.free(reason);
+                            ty.* = .js_object;
+                            try self.appendFallbackNoteToDecl(
+                                modules,
+                                owner_mod_idx,
+                                owner_decl,
+                                .expansive_generic_cycle,
+                                reason,
+                            );
+                        }
+                        return;
+                    }
+
+                    // Prune non-generic / closed calls unless we still have an active unguarded type_alias frame!
+                    var any_unguarded_alias_frame = false;
+                    for (frames.items) |fr| {
+                        if (fr.decl.kind == .type_alias and !fr.saw_nominal_container) {
+                            any_unguarded_alias_frame = true;
+                            break;
+                        }
+                    }
+                    if (combined_mask == 0 and !any_unguarded_alias_frame) return;
+                    if (frames.items.len >= 24) return;
+
+                    const next_depth: u6 = @intCast(frames.items.len);
+                    const next_bindings = try self.scratch.alloc(GenParamBinding, target_tps.len);
+                    defer self.scratch.free(next_bindings);
+                    for (target_tps, 0..) |tp, idx| {
+                        const passed = if (idx < arg_syms.len) arg_syms[idx] else .closed;
+                        // Also tag with `next_depth` if we need to detect cycles rooted at `target_decl`,
+                        // though `scanModuleDeclsForExpansiveCycles` also visits `target_decl` as its own root!
+                        _ = next_depth;
+                        next_bindings[idx] = .{
+                            .ident = tp.zig_ident,
+                            .val = passed,
+                        };
+                    }
+
+                    const parent_prefix = if (cur_path.len > 1)
+                        cur_path[0 .. cur_path.len - 1]
+                    else
+                        &[_][]const u8{};
+                    try self.dfsExpansiveGenericDecl(
+                        modules,
+                        cur_mod,
+                        parent_prefix,
+                        target_decl,
+                        next_bindings,
+                        decl_map,
+                        frames,
+                        visits,
+                    );
+                },
+                else => {},
+            }
+        }
+
         /// Breaks any by-value struct/union/tuple/alias cycles across the entire `PackageIr` by setting
         /// `decl_ref.indirect = true` (`*const Target` / `?*const Target`) on back-edges!
         fn breakValueTypeCycles(self: *Self, modules: []ModuleIr) !void {
@@ -15371,6 +16030,7 @@ fn LowerCtx(comptime GraphType: type) type {
 
                 var decl_irs: std.ArrayList(DeclIr) = .empty;
                 self.cur_mod_idx = final_mod_idx;
+                self.cur_mod_specifier = cand.substituted_specifier;
                 self.cur_mod_hoisted_locs.clearRetainingCapacity();
                 self.cur_mod_closed_types.clearRetainingCapacity();
                 self.cur_mod_enum_member_types.clearRetainingCapacity();
@@ -15502,6 +16162,7 @@ fn LowerCtx(comptime GraphType: type) type {
 
             try self.resolveRuntimeWireTargetsAndPruneUnreachable(modules, mod_scopes);
             try self.synthesizeReExportAllocCompanions(modules, mod_scopes);
+            try self.breakExpansiveGenericCycles(modules);
             try self.breakValueTypeCycles(modules);
             return modules;
         }

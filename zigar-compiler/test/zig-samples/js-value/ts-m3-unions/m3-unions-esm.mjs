@@ -221,3 +221,25 @@ export function inspectSyncOrAsync(val) {
 export function badPromiseLikeReturn() {
   return { then: 'not-a-function' };
 }
+
+export function produceCyclicJson() {
+  const a = [];
+  a.push(a);
+  return a;
+}
+
+export function produceDeepAcyclicJson(depth) {
+  let cur = 99;
+  for (let i = 0; i < depth; i++) {
+    cur = [ cur ];
+  }
+  return cur;
+}
+
+export function produceThrowingGetterPayload() {
+  return {
+    get host() {
+      throw new URIError('getter-exploded');
+    },
+  };
+}

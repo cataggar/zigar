@@ -1,6 +1,8 @@
 package export_zigar_typescript_extractor
 
 import (
+	"math"
+	"math/big"
 	"strconv"
 	"strings"
 
@@ -634,15 +636,49 @@ func (b *graphBuilder) hasExtractableDecl(sym *ast.Symbol) bool {
 	return false
 }
 
+func parseTsNumericLiteral(raw string) (float64, bool) {
+	clean := strings.ReplaceAll(strings.TrimSpace(raw), "_", "")
+	if clean == "" {
+		return 0, false
+	}
+	if len(clean) > 2 && clean[0] == '0' {
+		var base int
+		switch clean[1] {
+		case 'x', 'X':
+			base = 16
+		case 'b', 'B':
+			base = 2
+		case 'o', 'O':
+			base = 8
+		}
+		if base != 0 {
+			bi, ok := new(big.Int).SetString(clean[2:], base)
+			if !ok {
+				return 0, false
+			}
+			val, _ := new(big.Rat).SetInt(bi).Float64()
+			return val, true
+		}
+	}
+	val, err := strconv.ParseFloat(clean, 64)
+	if err != nil || math.IsNaN(val) {
+		return 0, false
+	}
+	return val, true
+}
+
 func (b *graphBuilder) extractLiteralExprTypeKind(lit *ast.Node) zigar_typescript_types.TypeKind {
 	switch lit.Kind {
 	case ast.KindStringLiteral, ast.KindNoSubstitutionTemplateLiteral:
 		return zigar_typescript_types.MakeTypeKindLiteral(zigar_typescript_types.MakeLiteralValueStr(b.intern(lit.Text())))
 	case ast.KindNumericLiteral:
-		val, _ := strconv.ParseFloat(lit.Text(), 64)
+		val, ok := parseTsNumericLiteral(lit.Text())
+		if !ok {
+			return zigar_typescript_types.MakeTypeKindUnknownType()
+		}
 		return zigar_typescript_types.MakeTypeKindLiteral(zigar_typescript_types.MakeLiteralValueNum(val))
 	case ast.KindBigIntLiteral:
-		clean := strings.TrimSuffix(lit.Text(), "n")
+		clean := strings.TrimSuffix(strings.ReplaceAll(lit.Text(), "_", ""), "n")
 		return zigar_typescript_types.MakeTypeKindLiteral(zigar_typescript_types.MakeLiteralValueBigintLiteral(b.intern(clean)))
 	case ast.KindTrueKeyword:
 		return zigar_typescript_types.MakeTypeKindLiteral(zigar_typescript_types.MakeLiteralValueBoolean(true))
@@ -652,7 +688,7 @@ func (b *graphBuilder) extractLiteralExprTypeKind(lit *ast.Node) zigar_typescrip
 		return zigar_typescript_types.MakeTypeKindNullType()
 	case ast.KindPrefixUnaryExpression:
 		pue := lit.AsPrefixUnaryExpression()
-		if pue != nil && pue.Operand != nil {
+		if pue != nil && pue.Operand != nil && (pue.Operator == ast.KindMinusToken || pue.Operator == ast.KindPlusToken) {
 			sign := 1.0
 			prefix := ""
 			if pue.Operator == ast.KindMinusToken {
@@ -660,16 +696,19 @@ func (b *graphBuilder) extractLiteralExprTypeKind(lit *ast.Node) zigar_typescrip
 				prefix = "-"
 			}
 			if pue.Operand.Kind == ast.KindNumericLiteral {
-				val, _ := strconv.ParseFloat(pue.Operand.Text(), 64)
+				val, ok := parseTsNumericLiteral(pue.Operand.Text())
+				if !ok {
+					return zigar_typescript_types.MakeTypeKindUnknownType()
+				}
 				return zigar_typescript_types.MakeTypeKindLiteral(zigar_typescript_types.MakeLiteralValueNum(sign * val))
 			}
 			if pue.Operand.Kind == ast.KindBigIntLiteral {
-				clean := prefix + strings.TrimSuffix(pue.Operand.Text(), "n")
+				clean := prefix + strings.TrimSuffix(strings.ReplaceAll(pue.Operand.Text(), "_", ""), "n")
 				return zigar_typescript_types.MakeTypeKindLiteral(zigar_typescript_types.MakeLiteralValueBigintLiteral(b.intern(clean)))
 			}
 		}
 	}
-	return zigar_typescript_types.MakeTypeKindAnyType()
+	return zigar_typescript_types.MakeTypeKindUnknownType()
 }
 
 func (b *graphBuilder) unwrapVariadicTupleElemAST(node *ast.Node) *ast.Node {

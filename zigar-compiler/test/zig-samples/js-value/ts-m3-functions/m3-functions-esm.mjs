@@ -105,6 +105,24 @@ export class MiniEmitter {
   clearAll() {
     this.#listeners.clear();
   }
+
+  off(event, listener) {
+    const list = this.#listeners.get(event);
+    if (list) {
+      const idx = list.indexOf(listener);
+      if (idx !== -1) list.splice(idx, 1);
+    }
+    return this;
+  }
+}
+
+export function sumTupleOrTriple(a, b, c) {
+  if (Array.isArray(a)) return a[0] + a[1];
+  return a + b + c;
+}
+
+export function pickArity(a, b) {
+  return b === undefined ? a * 10 : `opt2:${a},${b}`;
 }
 
 export function consoleFormat(prefix, ...args) {

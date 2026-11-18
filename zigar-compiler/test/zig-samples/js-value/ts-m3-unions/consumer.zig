@@ -396,6 +396,48 @@ pub fn exerciseHeteroRecursiveAndGenericUnions(out_alloc: std.mem.Allocator) ![]
         } else |err| {
             if (err != error.TypeError) return out_alloc.dupe(u8, "fail:bad_promise_comp_wrong_err");
         }
+
+        // M1: Cyclic JS array/object graph (`const a = []; a.push(a)`) fails cleanly with `error.Overflow` and 0 leaks,
+        // while a 100-level deep acyclic nested `JsonValue` array (`[[[...99...]]]`) decodes cleanly with 0 leaks!
+        if (m.produceCyclicJsonAlloc(tracked_alloc)) |cyc| {
+            js.freeDecoded(m.JsonValue, tracked_alloc, cyc);
+            return out_alloc.dupe(u8, "fail:cyclic_json_accepted");
+        } else |err| {
+            if (err != error.Overflow) return std.fmt.allocPrint(out_alloc, "fail:cyclic_json_err:{s}", .{@errorName(err)});
+        }
+
+        const deep_json = try m.produceDeepAcyclicJsonAlloc(tracked_alloc, 100);
+        defer js.freeDecoded(m.JsonValue, tracked_alloc, deep_json);
+        var cur_jv = deep_json;
+        var unwrapped_levels: usize = 0;
+        while (cur_jv) |inner| {
+            if (std.meta.activeTag(inner) == .array) {
+                if (inner.array.len != 1) return out_alloc.dupe(u8, "fail:deep_json_len");
+                cur_jv = inner.array[0];
+                unwrapped_levels += 1;
+            } else if (std.meta.activeTag(inner) == .num) {
+                if (inner.num != 99) return out_alloc.dupe(u8, "fail:deep_json_leaf");
+                break;
+            } else {
+                return out_alloc.dupe(u8, "fail:deep_json_tag");
+            }
+        }
+        if (unwrapped_levels != 100) return out_alloc.dupe(u8, "fail:deep_json_depth");
+
+        // M5: Throwing JS property getter inside union candidate decode immediately propagates `error.JsException` with `lastError` intact
+        if (m.produceThrowingGetterPayloadAlloc(tracked_alloc)) |bad_gt| {
+            js.freeDecoded(m.HeteroPayload, tracked_alloc, bad_gt);
+            return out_alloc.dupe(u8, "fail:throwing_getter_accepted");
+        } else |err| {
+            if (err != error.JsException) return std.fmt.allocPrint(out_alloc, "fail:throwing_getter_err:{s}", .{@errorName(err)});
+            var exc = (try js.tryTakeLastError()) orelse return out_alloc.dupe(u8, "fail:throwing_getter_no_exc");
+            defer exc.deinit();
+            const msg = (try exc.message(tracked_alloc)) orelse return out_alloc.dupe(u8, "fail:throwing_getter_no_msg");
+            defer tracked_alloc.free(msg);
+            if (std.mem.indexOf(u8, msg, "getter-exploded") == null) {
+                return std.fmt.allocPrint(out_alloc, "fail:throwing_getter_msg:{s}", .{msg});
+            }
+        }
     }
 
     try checkInvariants(handles_before, allocs_before);

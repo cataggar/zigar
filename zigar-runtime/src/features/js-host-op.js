@@ -148,6 +148,7 @@ export default mixin({
     this.jsEsmNamespaces = new WeakSet();
     this.moduleBaseURL = null;
     this.zigCallbackTemplateCache = new Map();
+    this.zigStatelessCallbackCache = new Map();
     this.zigCallbackMap = new Map();
     this.syncCallDepth = 0;
     this.hasPendingHostError = false;
@@ -1619,6 +1620,7 @@ export default mixin({
       sync: !(flags & 1),
       once: Boolean(flags & 2),
       passThis: Boolean(flags & 4),
+      stateless: Boolean(flags & 16),
     };
     this.zigCallbackTemplateCache.set(descriptorAddr, template);
     return template;
@@ -1664,6 +1666,53 @@ export default mixin({
     try {
       const id = Number(callbackId) >>> 0;
       const template = this.getZigCallbackTemplate(descriptorAddr);
+      if (template.stateless && !template.once) {
+        const cacheKey = `${descriptorAddr}:${id}`;
+        let statelessWrapper = this.zigStatelessCallbackCache.get(cacheKey);
+        if (!statelessWrapper) {
+          const caller = this.createOutboundCaller(template.thunkHolder, template.ArgStruct);
+          caller.zigarSync = template.sync;
+          const slotAddr = template.is64 ? BigInt(id) : id;
+          const slotDV = new DataView(new ArrayBuffer(0));
+          slotDV[ZIG] = { address: slotAddr, len: 0 };
+          caller[MEMORY] = slotDV;
+          const thisEnv = this;
+          const unwrapString = template.unwrapString;
+          const passThis = template.passThis;
+          const unwrapResult = (res) => {
+            if (unwrapString && res && typeof(res) === 'object' && MEMORY in res) {
+              if (typeof(res.string) === 'string') {
+                return res.string;
+              }
+              const mem = res[MEMORY];
+              if (mem) {
+                return decodeText(new Uint8Array(mem.buffer, mem.byteOffset, mem.byteLength));
+              }
+            }
+            return res;
+          };
+          statelessWrapper = function(...args) {
+            const savedOuterPending = thisEnv.savePendingHostError();
+            try {
+              const res = passThis ? caller(this, ...args) : caller(...args);
+              const pending = thisEnv.consumePendingHostError();
+              if (pending) {
+                throw pending.error;
+              }
+              if (isPromise(res)) {
+                return res.then((resolved) => unwrapResult(resolved));
+              }
+              return unwrapResult(res);
+            } finally {
+              if (savedOuterPending) {
+                thisEnv.restorePendingHostError(savedOuterPending);
+              }
+            }
+          };
+          this.zigStatelessCallbackCache.set(cacheKey, statelessWrapper);
+        }
+        return this.allocJsValue(statelessWrapper);
+      }
       const caller = this.createOutboundCaller(template.thunkHolder, template.ArgStruct);
       caller.zigarSync = template.sync;
       const slotAddr = template.is64 ? BigInt(id) : id;

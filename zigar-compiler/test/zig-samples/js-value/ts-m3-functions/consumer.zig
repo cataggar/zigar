@@ -86,6 +86,17 @@ pub fn exerciseSmartOverloadsAndCjs(out_alloc: std.mem.Allocator) ![]const u8 {
         const p_bin = try m.parseHexOrRadix("1010", 2);
         if (p_hex != 255 or p_bin != 10) return error.Unexpected;
 
+        // M3: Single-tuple-arg overload wrapping (`pair: [number, number]` vs `(a, b, c)`) & exact-arity bonus
+        const st_pair = try m.sumTupleOrTriple(.{ @as(f64, 10), @as(f64, 32) });
+        const st_triple = try m.sumTupleOrTriple(.{ @as(f64, 10), @as(f64, 20), @as(f64, 12) });
+        if (st_pair != 42 or st_triple != 42) return error.Unexpected;
+
+        const pa1 = try m.pickArity(@as(f64, 7));
+        if (pa1 != 70) return error.Unexpected;
+        const pa2 = try m.pickArityAlloc(tracked_alloc, .{ @as(f64, 7), @as(f64, 9) });
+        defer js.freeDecoded([]const u8, tracked_alloc, pa2);
+        if (!std.mem.eql(u8, pa2, "opt2:7,9")) return error.Unexpected;
+
         // Buf.from via unified comptime dispatch AND semantic names
         const b1 = try m.Buf.from("Zig");
         defer b1.deinit();
@@ -178,7 +189,26 @@ pub fn exerciseSmartOverloadsAndCjs(out_alloc: std.mem.Allocator) ![]const u8 {
     return std.fmt.allocPrint(out_alloc, "reads={s}", .{read_summary[0..read_len]});
 }
 
-// 2. MiniEmitter constructor overloads + literal `on` overloads + persistent reusable `js.Closure` lifecycle
+var stateless_emitter_hits = std.atomic.Value(usize).init(0);
+var stateless_deferred_ok = std.atomic.Value(bool).init(false);
+
+fn statelessEmitterOnData(chunk: []const u8) void {
+    if (std.mem.eql(u8, chunk, "a")) {
+        _ = stateless_emitter_hits.fetchAdd(1, .acq_rel);
+    } else if (std.mem.eql(u8, chunk, "b")) {
+        _ = stateless_emitter_hits.fetchAdd(100, .acq_rel);
+    }
+}
+
+fn statelessDeferredTickCb(payload: []const u8) void {
+    stateless_deferred_ok.store(std.mem.eql(u8, payload, "tick:stateless-fn"), .release);
+}
+
+fn bareTriple(x: f64) f64 {
+    return x * 3;
+}
+
+// 2. MiniEmitter constructor overloads + literal `on`/`off` overloads + stateless bare `fn` identity + `js.persistentClosure`
 pub fn exerciseEmitterLiteralOverloadsAndReusableClosures(out_alloc: std.mem.Allocator) ![]const u8 {
     const handles_before = js.activeHandleCount();
     const cbs_before = js.activeCallbackCount();
@@ -186,6 +216,7 @@ pub fn exerciseEmitterLiteralOverloadsAndReusableClosures(out_alloc: std.mem.All
 
     var events_buf: [64]u8 = undefined;
     var events_len: usize = 0;
+    stateless_emitter_hits.store(0, .release);
 
     {
         const e0 = try m.MiniEmitter.init(.{});
@@ -234,9 +265,9 @@ pub fn exerciseEmitterLiteralOverloadsAndReusableClosures(out_alloc: std.mem.All
         var trace: BusTrace = .{ .buf = &events_buf, .len = &events_len };
         var open_cb = try js.Closure(*BusTrace, fn () void).tryInit(&trace, BusTrace.onOpen);
         defer open_cb.deinit();
-        var data_cb = try js.Closure(*BusTrace, fn ([]const u8) void).tryInit(&trace, BusTrace.onData);
+        var data_cb = try js.persistentClosure(&trace, BusTrace.onData);
         defer data_cb.deinit();
-        var close_cb = try js.Closure(*BusTrace, fn () void).tryInit(&trace, BusTrace.onClose);
+        var close_cb = try js.persistentClosure(&trace, &BusTrace.onClose);
         defer close_cb.deinit();
 
         if (js.activeCallbackCount() != cbs_before + 3) return error.Unexpected;
@@ -248,9 +279,21 @@ pub fn exerciseEmitterLiteralOverloadsAndReusableClosures(out_alloc: std.mem.All
         const r_close = try bus.on(.{ "close", &close_cb });
         r_close.deinit();
 
+        // H1: Stateless bare `fn` passed to `bus.on` survives after return, uses 0 dynamic slots,
+        // and preserves JS Function identity for `bus.off`!
+        const r_stateless_on = try bus.on(.{ .data, statelessEmitterOnData });
+        r_stateless_on.deinit();
+        if (js.activeCallbackCount() != cbs_before + 3) return error.Unexpected;
+
         try bus.emitOpen();
         try bus.emitData("a");
+        if (stateless_emitter_hits.load(.acquire) != 1) return error.Unexpected;
+
+        const r_stateless_off = try bus.off(.{ .data, statelessEmitterOnData });
+        r_stateless_off.deinit();
+
         try bus.emitData("b");
+        if (stateless_emitter_hits.load(.acquire) != 1) return error.Unexpected;
         try bus.emitClose();
         try bus.clearAll();
     }
@@ -398,6 +441,18 @@ pub fn exerciseCallbacksAndHigherOrderCallables(out_alloc: std.mem.Allocator) ![
         defer adder.deinit();
         hof_this_sum = try adder.call(.{ .count = 100 }, .{7});
         if (hof_this_sum != 121) return error.Unexpected;
+
+        // H1: Deferred stateless bare `fn` (survives after `deferTick` returns, 0 dynamic callback slots) + `Callable.fromFn`
+        stateless_deferred_ok.store(false, .release);
+        const st_trigger = try m.deferTick("stateless-fn", statelessDeferredTickCb);
+        defer st_trigger.deinit();
+        if (js.activeCallbackCount() != cbs_before) return error.Unexpected;
+        try st_trigger.call(.{});
+        if (!stateless_deferred_ok.load(.acquire)) return error.Unexpected;
+
+        const fn_callable = try js.Callable(fn (f64) f64).fromFn(bareTriple);
+        defer fn_callable.deinit();
+        if ((try fn_callable.call(.{14})) != 42) return error.Unexpected;
     }
 
     try checkInvariants(handles_before, cbs_before, allocs_before);

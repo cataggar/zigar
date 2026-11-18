@@ -2109,6 +2109,9 @@ const ModuleEmitCtx = struct {
             target_expr_opt = try self.emitSharedNominalTypeExpr(target_ty, sig);
         }
 
+        if (narrow_alloc_ident_opt) |narrow_alloc_id| {
+            try self.emitDefaultAllocDocComment(narrow_alloc_id);
+        }
         try self.out.print(self.allocator, "{s}fn {s}(", .{ pub_kw, narrow_ident });
         try self.emitSigHeaderParams(sig, recv_opt, null, this_type_expr_opt, param_type_exprs, false);
         try self.out.appendSlice(self.allocator, ") __zigar_js.CallError!");
@@ -2301,6 +2304,10 @@ const ModuleEmitCtx = struct {
         try self.out.appendSlice(self.allocator, "};\n");
 
         if (od.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
+        try self.emitOverloadSummaryDocComments(od);
+        if (od.alloc_companion_ident) |alloc_disp_id| {
+            try self.emitDefaultAllocDocComment(alloc_disp_id);
+        }
 
         if (recv_opt) |rv| {
             try self.out.print(
@@ -2328,6 +2335,36 @@ const ModuleEmitCtx = struct {
                     .{ pub_kw, alloc_disp_id, od.alloc_param_ident, spec_ident, spec_ident, od.alloc_param_ident },
                 );
             }
+        }
+    }
+
+    fn emitDefaultAllocDocComment(self: *ModuleEmitCtx, alloc_fn_ident: []const u8) error{OutOfMemory}!void {
+        try self.out.print(
+            self.allocator,
+            "/// Allocates decoded return values via `zigar_js.defaultAllocator()`; use `{s}` for an explicit allocator and free with `zigar_js.freeDecoded`.\n",
+            .{alloc_fn_ident},
+        );
+    }
+
+    fn emitOverloadSummaryDocComments(self: *ModuleEmitCtx, od: ir.OverloadDispatchIr) error{OutOfMemory}!void {
+        if (od.candidates.len == 0) return;
+        try self.out.appendSlice(self.allocator, "/// Overloads:\n");
+        for (od.candidates) |cand| {
+            const csig = cand.signature;
+            try self.out.print(self.allocator, "/// - `{s}(", .{cand.target_ident});
+            var printed_any = false;
+            if (csig.this_param) |thp| {
+                try self.out.print(self.allocator, "{s}", .{thp.zig_ident});
+                printed_any = true;
+            }
+            for (csig.params) |p| {
+                if (printed_any) try self.out.appendSlice(self.allocator, ", ");
+                if (p.is_rest) try self.out.appendSlice(self.allocator, "...");
+                try self.out.appendSlice(self.allocator, p.logical_name);
+                if (p.is_optional) try self.out.append(self.allocator, '?');
+                printed_any = true;
+            }
+            try self.out.appendSlice(self.allocator, ")`\n");
         }
     }
 
@@ -3114,7 +3151,13 @@ const ModuleEmitCtx = struct {
         if (d.jsdoc) |jd| {
             try appendJsDocComments(&self.out, self.allocator, jd);
         }
+        for (d.fallback_notes) |note| {
+            try self.out.print(self.allocator, "/// ts-zigar: fallback({s})\n", .{note});
+        }
         try self.emitTypeParamsDocComments(sig.type_params);
+        if (d.alloc_companion_ident) |alloc_fn_ident| {
+            try self.emitDefaultAllocDocComment(alloc_fn_ident);
+        }
 
         try self.out.print(self.allocator, "{s}fn {s}(", .{ pub_kw, d.zig_ident });
         try self.emitSigHeaderParams(sig, null, null, this_type_expr_opt, param_type_exprs, false);
@@ -3149,6 +3192,9 @@ const ModuleEmitCtx = struct {
         }
 
         if (d.slice_companion_ident) |slice_fn_ident| {
+            if (d.slice_alloc_companion_ident) |slice_alloc_ident| {
+                try self.emitDefaultAllocDocComment(slice_alloc_ident);
+            }
             try self.out.print(self.allocator, "{s}fn {s}(", .{ pub_kw, slice_fn_ident });
             try self.emitSigHeaderParams(sig, null, null, this_type_expr_opt, param_type_exprs, true);
             try self.out.appendSlice(self.allocator, ") __zigar_js.CallError!");
@@ -3584,6 +3630,9 @@ const ModuleEmitCtx = struct {
 
         if (m.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
         try self.emitTypeParamsDocComments(sig.type_params);
+        if (m.alloc_companion_ident) |alloc_fn_ident| {
+            try self.emitDefaultAllocDocComment(alloc_fn_ident);
+        }
 
         try self.out.print(self.allocator, "pub fn {s}(", .{m.zig_ident});
         try self.emitSigHeaderParams(sig, recv_opt, null, this_type_expr_opt, param_type_exprs, false);
@@ -3638,6 +3687,9 @@ const ModuleEmitCtx = struct {
         }
 
         if (m.slice_companion_ident) |slice_fn_ident| {
+            if (m.slice_alloc_companion_ident) |slice_alloc_ident| {
+                try self.emitDefaultAllocDocComment(slice_alloc_ident);
+            }
             try self.out.print(self.allocator, "pub fn {s}(", .{slice_fn_ident});
             try self.emitSigHeaderParams(sig, recv_opt, null, this_type_expr_opt, param_type_exprs, true);
             try self.out.appendSlice(self.allocator, ") __zigar_js.CallError!");
@@ -3753,6 +3805,9 @@ const ModuleEmitCtx = struct {
         if (ip.getter_ident) |getter_id| {
             const get_ty = ip.getter_ty.?;
             if (ip.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
+            if (ip.getter_alloc_ident) |alloc_id| {
+                try self.emitDefaultAllocDocComment(alloc_id);
+            }
 
             try self.out.print(
                 self.allocator,
@@ -3891,6 +3946,9 @@ const ModuleEmitCtx = struct {
             shared_get_expr_opt = try self.emitSharedNominalTypeExpr(ia.getter_ty, synth_sig);
         }
 
+        if (ia.getter_alloc_ident) |alloc_id| {
+            try self.emitDefaultAllocDocComment(alloc_id);
+        }
         try self.out.print(
             self.allocator,
             "pub fn {s}({s}: {s}, {s}: ",
@@ -4229,19 +4287,11 @@ const ModuleEmitCtx = struct {
 
         if (st.repr == .handle_wrapper) {
             if (st.deinit_ident) |di| {
-                if (st.has_sync_dispose) {
-                    try self.out.print(
-                        self.allocator,
-                        "pub fn {s}({s}: {s}) void {{\n__zigar_js.dispose({s});\n}}\n",
-                        .{ di, st.self_param_ident, st.self_ident, st.self_param_ident },
-                    );
-                } else {
-                    try self.out.print(
-                        self.allocator,
-                        "pub fn {s}({s}: {s}) void {{\n{s}.{s}.deinit();\n}}\n",
-                        .{ di, st.self_param_ident, st.self_ident, st.self_param_ident, st.ref_field_ident },
-                    );
-                }
+                try self.out.print(
+                    self.allocator,
+                    "pub fn {s}({s}: {s}) void {{\n{s}.{s}.deinit();\n}}\n",
+                    .{ di, st.self_param_ident, st.self_ident, st.self_param_ident, st.ref_field_ident },
+                );
             }
             if (st.release_handle_only_ident) |rho| {
                 try self.out.print(
@@ -4997,6 +5047,9 @@ const ModuleEmitCtx = struct {
             if (d.jsdoc) |jd| {
                 try appendJsDocComments(&self.out, self.allocator, jd);
             }
+            for (d.fallback_notes) |note| {
+                try self.out.print(self.allocator, "/// ts-zigar: fallback({s})\n", .{note});
+            }
         }
         const pub_kw = if (d.is_exported) "pub " else "";
 
@@ -5626,6 +5679,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    ReferenceError,
         \\    NotCallable,
         \\    NotConstructable,
+        \\    Overflow,
         \\    IntegerOverflow,
         \\};
         \\
@@ -6220,6 +6274,11 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\
         \\        pub const close = returnEarly;
         \\
+        \\        pub fn closeAndDeinit(self: Self) void {
+        \\            defer self.deinit();
+        \\            self.returnEarly() catch {};
+        \\        }
+        \\
         \\        pub fn toRef(self: Self) Any {
         \\            return .{ .handle = self.handle };
         \\        }
@@ -6263,6 +6322,11 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\        }
         \\
         \\        pub const close = returnEarly;
+        \\
+        \\        pub fn closeAndDeinit(self: Self) void {
+        \\            defer self.deinit();
+        \\            self.returnEarly() catch {};
+        \\        }
         \\
         \\        pub fn toRef(self: Self) Any {
         \\            return .{ .handle = self.handle };
@@ -6530,8 +6594,17 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\            else => {},
         \\        },
         \\        .@"struct" => |st| {
-        \\            if (comptime ((@hasDecl(T, "is_js_value") and T.is_js_value) or isGeneratedHandleStruct(T))) {
-        \\                value.deinit();
+        \\            if (comptime isGeneratedHandleStruct(T)) {
+        \\                const ref_fname = comptime if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "ref_field")) T.zigar_js.ref_field else "ref";
+        \\                @field(value, ref_fname).deinit();
+        \\                return;
+        \\            }
+        \\            if (comptime (@hasDecl(T, "is_js_value") and T.is_js_value)) {
+        \\                if (comptime @hasDecl(T, "releaseHandleOnly")) {
+        \\                    value.releaseHandleOnly();
+        \\                } else {
+        \\                    value.deinit();
+        \\                }
         \\                return;
         \\            }
         \\            inline for (st.field_names, 0..) |fname, fi| {
@@ -7576,6 +7649,18 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\        pub fn onceFnPtr(_: anytype) Self {
         \\            @panic("ts-zigar host unavailable");
         \\        }
+        \\        pub fn tryStatelessFn(comptime _: anytype) CallError!Function {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\        pub fn statelessFn(comptime _: anytype) Function {
+        \\            @panic("ts-zigar host unavailable");
+        \\        }
+        \\        pub fn tryStatelessFnPtr(_: anytype) CallError!Function {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\        pub fn statelessFnPtr(_: anytype) Function {
+        \\            @panic("ts-zigar host unavailable");
+        \\        }
         \\        pub fn ref(self: Self) Function {
         \\            return self.func;
         \\        }
@@ -7596,6 +7681,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\}
         \\
         \\pub fn StubClosure(comptime Ctx: type, comptime FnOrSig: anytype) type {
+        \\    const is_sig_type = (@TypeOf(FnOrSig) == type);
         \\    return struct {
         \\        const Self = @This();
         \\        pub const is_zig_callback = true;
@@ -7605,18 +7691,54 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\        id: u32 = 0,
         \\        func: Function = Function.@"undefined",
         \\
-        \\        pub fn tryInit(_: Ctx) CallError!Self {
-        \\            return error.HostUnavailable;
-        \\        }
-        \\        pub fn init(_: Ctx) Self {
-        \\            @panic("ts-zigar host unavailable");
-        \\        }
-        \\        pub fn tryOnce(_: Ctx) CallError!Self {
-        \\            return error.HostUnavailable;
-        \\        }
-        \\        pub fn once(_: Ctx) Self {
-        \\            @panic("ts-zigar host unavailable");
-        \\        }
+        \\        pub const tryInit = if (is_sig_type)
+        \\            struct {
+        \\                pub fn call(_: Ctx, comptime _: anytype) CallError!Self {
+        \\                    return error.HostUnavailable;
+        \\                }
+        \\            }.call
+        \\        else
+        \\            struct {
+        \\                pub fn call(_: Ctx) CallError!Self {
+        \\                    return error.HostUnavailable;
+        \\                }
+        \\            }.call;
+        \\        pub const init = if (is_sig_type)
+        \\            struct {
+        \\                pub fn call(_: Ctx, comptime _: anytype) Self {
+        \\                    @panic("ts-zigar host unavailable");
+        \\                }
+        \\            }.call
+        \\        else
+        \\            struct {
+        \\                pub fn call(_: Ctx) Self {
+        \\                    @panic("ts-zigar host unavailable");
+        \\                }
+        \\            }.call;
+        \\        pub const tryOnce = if (is_sig_type)
+        \\            struct {
+        \\                pub fn call(_: Ctx, comptime _: anytype) CallError!Self {
+        \\                    return error.HostUnavailable;
+        \\                }
+        \\            }.call
+        \\        else
+        \\            struct {
+        \\                pub fn call(_: Ctx) CallError!Self {
+        \\                    return error.HostUnavailable;
+        \\                }
+        \\            }.call;
+        \\        pub const once = if (is_sig_type)
+        \\            struct {
+        \\                pub fn call(_: Ctx, comptime _: anytype) Self {
+        \\                    @panic("ts-zigar host unavailable");
+        \\                }
+        \\            }.call
+        \\        else
+        \\            struct {
+        \\                pub fn call(_: Ctx) Self {
+        \\                    @panic("ts-zigar host unavailable");
+        \\                }
+        \\            }.call;
         \\        pub fn ref(self: Self) Function {
         \\            return self.func;
         \\        }
@@ -7716,12 +7838,36 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    };
         \\}
         \\
-        \\pub fn closure(ctx_ptr: anytype, comptime handler: anytype) InlineClosure(@TypeOf(ctx_ptr), handler, false) {
+        \\/// Wraps a `*Ctx` + handler as a synchronous call-scoped closure (automatically revoked when the JS call returns).
+        \\/// For asynchronous one-shot callbacks use `onceClosure`; for persistent multi-shot callbacks use `persistentClosure`.
+        \\pub fn syncClosure(ctx_ptr: anytype, comptime handler: anytype) InlineClosure(@TypeOf(ctx_ptr), handler, false) {
         \\    return .{ .ctx = ctx_ptr };
         \\}
         \\
+        \\/// Alias of `syncClosure` (synchronous call-scoped; revoked on return).
+        \\pub const closure = syncClosure;
+        \\
+        \\/// Wraps a `*Ctx` + handler as a one-shot callback (automatically revoked upon its first invocation).
         \\pub fn onceClosure(ctx_ptr: anytype, comptime handler: anytype) InlineClosure(@TypeOf(ctx_ptr), handler, true) {
         \\    return .{ .ctx = ctx_ptr };
+        \\}
+        \\
+        \\fn UnwrapClosureHandler(comptime handler: anytype) UnwrapCallbackFnType(@TypeOf(handler)) {
+        \\    return switch (@typeInfo(@TypeOf(handler))) {
+        \\        .pointer => handler.*,
+        \\        .@"fn" => handler,
+        \\        else => @compileError("Expected handler function in persistentClosure(), received " ++ @typeName(@TypeOf(handler))),
+        \\    };
+        \\}
+        \\
+        \\/// Allocates a persistent multi-shot stateful closure whose lifetime is owned by the caller (`defer cb.deinit()`).
+        \\pub fn persistentClosure(ctx_ptr: anytype, comptime handler: anytype) CallError!Closure(@TypeOf(ctx_ptr), UnwrapClosureHandler(handler)) {
+        \\    return Closure(@TypeOf(ctx_ptr), UnwrapClosureHandler(handler)).tryInit(ctx_ptr);
+        \\}
+        \\
+        \\/// Allocates a persistent multi-shot stateful closure receiving JS `this` (`defer cb.deinit()`).
+        \\pub fn persistentClosureWithThis(ctx_ptr: anytype, comptime handler: anytype) CallError!ClosureWithThis(@TypeOf(ctx_ptr), UnwrapClosureHandler(handler)) {
+        \\    return ClosureWithThis(@TypeOf(ctx_ptr), UnwrapClosureHandler(handler)).tryInit(ctx_ptr);
         \\}
         \\
         \\pub fn ScopedCallback(comptime expects_this: bool, comptime ArgT: type) type {
@@ -7731,17 +7877,17 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\        once_fn,
         \\        inline_closure_sync,
         \\        inline_closure_once,
-        \\        sync_bare_fn,
-        \\        sync_fn_ptr,
+        \\        stateless_bare_fn,
+        \\        stateless_fn_ptr,
         \\        passthrough,
         \\    };
         \\    const mode: Mode = blk: {
         \\        if (ArgT == @TypeOf(null)) break :blk .null_lit;
         \\        switch (@typeInfo(ArgT)) {
         \\            .optional => break :blk .optional_arg,
-        \\            .@"fn" => break :blk .sync_bare_fn,
+        \\            .@"fn" => break :blk .stateless_bare_fn,
         \\            .pointer => |pt| {
-        \\                if (pt.size == .one and @typeInfo(pt.child) == .@"fn") break :blk .sync_fn_ptr;
+        \\                if (pt.size == .one and @typeInfo(pt.child) == .@"fn") break :blk .stateless_fn_ptr;
         \\                break :blk .passthrough;
         \\            },
         \\            .@"struct" => {
@@ -7761,11 +7907,11 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\            raw_js.CallbackWithOptions(NormalizeCallbackFnSig(ArgT.FnType), .{ .pass_this = expects_this, .ref_codec = true })
         \\        else
         \\            StubCallback(NormalizeCallbackFnSig(ArgT.FnType)),
-        \\        .sync_bare_fn => if (has_host)
+        \\        .stateless_bare_fn => if (has_host)
         \\            raw_js.CallbackWithOptions(NormalizeCallbackFnSig(ArgT), .{ .pass_this = expects_this, .ref_codec = true })
         \\        else
         \\            StubCallback(NormalizeCallbackFnSig(ArgT)),
-        \\        .sync_fn_ptr => if (has_host)
+        \\        .stateless_fn_ptr => if (has_host)
         \\            raw_js.CallbackWithOptions(NormalizeCallbackFnSig(@typeInfo(ArgT).pointer.child), .{ .pass_this = expects_this, .ref_codec = true })
         \\        else
         \\            StubCallback(NormalizeCallbackFnSig(@typeInfo(ArgT).pointer.child)),
@@ -7780,15 +7926,15 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\        const Self = @This();
         \\        state: switch (mode) {
         \\            .optional_arg => RegType,
-        \\            .sync_bare_fn, .sync_fn_ptr, .inline_closure_sync => ?RegType,
+        \\            .inline_closure_sync => ?RegType,
         \\            else => void,
         \\        } = switch (mode) {
         \\            .optional_arg => .{},
-        \\            .sync_bare_fn, .sync_fn_ptr, .inline_closure_sync => null,
+        \\            .inline_closure_sync => null,
         \\            else => {},
         \\        },
         \\
-        \\        pub fn push(self: *Self, args: Args, value: ArgT, comptime spec: anytype) CallError!void {
+        \\        pub fn push(self: *Self, args: Args, value: anytype, comptime spec: anytype) CallError!void {
         \\            if (!has_host) return error.HostUnavailable;
         \\            switch (mode) {
         \\                .null_lit => try pushArg(args, value, spec),
@@ -7813,13 +7959,15 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                    self.state = try RegType.tryInit(value.ctx);
         \\                    _ = try args.push(Any{ .handle = self.state.?.func.handle });
         \\                },
-        \\                .sync_bare_fn => {
-        \\                    self.state = try RegType.tryInitFnPtr(&value);
-        \\                    _ = try args.push(Any{ .handle = self.state.?.func.handle });
+        \\                .stateless_bare_fn => {
+        \\                    const fn_ref = try RegType.tryStatelessFnPtr(&value);
+        \\                    defer fn_ref.deinit();
+        \\                    _ = try args.push(Any{ .handle = fn_ref.handle });
         \\                },
-        \\                .sync_fn_ptr => {
-        \\                    self.state = try RegType.tryInitFnPtr(value);
-        \\                    _ = try args.push(Any{ .handle = self.state.?.func.handle });
+        \\                .stateless_fn_ptr => {
+        \\                    const fn_ref = try RegType.tryStatelessFnPtr(value);
+        \\                    defer fn_ref.deinit();
+        \\                    _ = try args.push(Any{ .handle = fn_ref.handle });
         \\                },
         \\                .passthrough => try pushArg(args, value, spec),
         \\            }
@@ -7828,7 +7976,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\        pub fn deinit(self: *Self) void {
         \\            switch (mode) {
         \\                .optional_arg => self.state.deinit(),
-        \\                .sync_bare_fn, .sync_fn_ptr, .inline_closure_sync => {
+        \\                .inline_closure_sync => {
         \\                    if (self.state) |*r| {
         \\                        r.deinit();
         \\                        self.state = null;
@@ -7960,6 +8108,19 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\            return .{ .ref = .{ .handle = cloned.handle } };
         \\        }
         \\
+        \\        pub fn fromFn(cb: anytype) CallError!Self {
+        \\            if (!has_host) return error.HostUnavailable;
+        \\            const FnT = UnwrapCallbackFnType(@TypeOf(cb));
+        \\            const RegT = CallbackHost(NormalizeCallbackFnSig(FnT));
+        \\            const ptr: *const FnT = switch (@typeInfo(@TypeOf(cb))) {
+        \\                .@"fn" => &cb,
+        \\                .pointer => cb,
+        \\                else => unreachable,
+        \\            };
+        \\            const fn_ref = try RegT.tryStatelessFnPtr(ptr);
+        \\            return .{ .ref = fn_ref };
+        \\        }
+        \\
         \\        pub fn call(self: Self, call_args: anytype) CallError!CallableReturnPayload(FnSig) {
         \\            if (!has_host) return error.HostUnavailable;
         \\            const RetPayload = CallableReturnPayload(FnSig);
@@ -8039,6 +8200,19 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\            errdefer reg.deinit();
         \\            const cloned = try reg.func.tryClone();
         \\            return .{ .ref = .{ .handle = cloned.handle } };
+        \\        }
+        \\
+        \\        pub fn fromFn(cb: anytype) CallError!Self {
+        \\            if (!has_host) return error.HostUnavailable;
+        \\            const FnT = UnwrapCallbackFnType(@TypeOf(cb));
+        \\            const RegT = CallbackWithThisHost(NormalizeCallbackFnSig(FnT));
+        \\            const ptr: *const FnT = switch (@typeInfo(@TypeOf(cb))) {
+        \\                .@"fn" => &cb,
+        \\                .pointer => cb,
+        \\                else => unreachable,
+        \\            };
+        \\            const fn_ref = try RegT.tryStatelessFnPtr(ptr);
+        \\            return .{ .ref = fn_ref };
         \\        }
         \\
         \\        pub fn fromOnceClosure(ctx_ptr: anytype, comptime handler: anytype) CallError!Self {
@@ -8445,6 +8619,22 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                return .none;
         \\            }
         \\            if (isJsValueStruct(ParamT)) return .none;
+        \\            if ((pst.is_tuple or @hasDecl(ParamT, "zigar_js_tuple")) and @typeInfo(ArgT) == .@"struct" and @typeInfo(ArgT).@"struct".is_tuple) {
+        \\                const ast = @typeInfo(ArgT).@"struct";
+        \\                const has_var = @hasDecl(ParamT, "zigar_js_tuple") and ParamT.zigar_js_tuple.variadic_index != null;
+        \\                if (!has_var) {
+        \\                    if (ast.field_types.len > pst.field_types.len) return .none;
+        \\                    inline for (0..ast.field_types.len) |afi| {
+        \\                        if (argMatchTier(pst.field_types[afi], ast.field_types[afi], ast.field_attrs[afi]) == .none) return .none;
+        \\                    }
+        \\                    inline for (ast.field_types.len..pst.field_types.len) |pfi| {
+        \\                        if (pst.field_attrs[pfi].default_value_ptr == null and @typeInfo(pst.field_types[pfi]) != .optional) {
+        \\                            return .none;
+        \\                        }
+        \\                    }
+        \\                    return .coerced;
+        \\                }
+        \\            }
         \\            if (!pst.is_tuple and @typeInfo(ArgT) == .@"struct") {
         \\                const ast = @typeInfo(ArgT).@"struct";
         \\                if (!ast.is_tuple and !isGeneratedHandleStruct(ArgT) and !isJsValueStruct(ArgT)) {
@@ -8503,6 +8693,24 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\        .@"struct" => |pst| {
         \\            if (comptime isGeneratedHandleStruct(ParamT)) {
         \\                return upcastValue(ArgT, arg, ParamT);
+        \\            }
+        \\            if ((pst.is_tuple or @hasDecl(ParamT, "zigar_js_tuple")) and @typeInfo(ArgT) == .@"struct" and @typeInfo(ArgT).@"struct".is_tuple) {
+        \\                const ast = @typeInfo(ArgT).@"struct";
+        \\                var out: ParamT = undefined;
+        \\                inline for (0..pst.field_types.len) |pfi| {
+        \\                    const FieldT = pst.field_types[pfi];
+        \\                    const pf_name = pst.field_names[pfi];
+        \\                    if (pfi < ast.field_types.len) {
+        \\                        @field(out, pf_name) = coerceArgToParam(FieldT, arg[pfi]);
+        \\                    } else if (pst.field_attrs[pfi].defaultValue(FieldT)) |def_val| {
+        \\                        @field(out, pf_name) = def_val;
+        \\                    } else if (@typeInfo(FieldT) == .optional) {
+        \\                        @field(out, pf_name) = null;
+        \\                    } else {
+        \\                        unreachable;
+        \\                    }
+        \\                }
+        \\                return out;
         \\            }
         \\            if (!pst.is_tuple and @typeInfo(ArgT) == .@"struct") {
         \\                var out: ParamT = undefined;
@@ -8758,19 +8966,26 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                score += 5;
         \\            }
         \\        }
-        \\    } else if (cand.has_rest) {
-        \\        if (score > 0) score -= 1;
+        \\    }
+        \\    score *= 10;
+        \\    if (!cand.has_rest) {
+        \\        if (val_argc == fixed_len) {
+        \\            score += 8;
+        \\        } else {
+        \\            const omitted: usize = fixed_len - check_fixed;
+        \\            score += @as(usize, 7) - @as(usize, @min(@as(usize, 6), omitted));
+        \\        }
         \\    }
         \\
         \\    return score;
         \\}
         \\
-        \\fn selectCandidateIndex(
+        \\fn trySelectCandidateIndex(
         \\    comptime Owner: type,
         \\    comptime has_self: bool,
         \\    comptime specs: anytype,
         \\    comptime TupT: type,
-        \\) usize {
+        \\) ?usize {
         \\    @setEvalBranchQuota(200_000);
         \\    comptime var best_idx: ?usize = null;
         \\    comptime var best_score: usize = 0;
@@ -8782,7 +8997,17 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\            }
         \\        }
         \\    }
-        \\    return best_idx orelse @compileError("No overload of " ++ @typeName(Owner) ++ " matches argument types " ++ @typeName(TupT));
+        \\    return best_idx;
+        \\}
+        \\
+        \\fn selectCandidateIndex(
+        \\    comptime Owner: type,
+        \\    comptime has_self: bool,
+        \\    comptime specs: anytype,
+        \\    comptime TupT: type,
+        \\) usize {
+        \\    return trySelectCandidateIndex(Owner, has_self, specs, TupT) orelse
+        \\        @compileError("No overload of " ++ @typeName(Owner) ++ " matches argument types " ++ @typeName(TupT));
         \\}
         \\
         \\inline fn packRestStep(prefix: anytype, tup: anytype, comptime idx: usize) PackRestStepType(@TypeOf(prefix), @TypeOf(tup), idx) {
@@ -9035,8 +9260,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    };
         \\}
         \\
-        \\fn wrapSingleArgTupleType(comptime ArgsT: type) type {
-        \\    if (isTupleType(ArgsT)) return ArgsT;
+        \\fn forceSingleArgTupleType(comptime ArgsT: type) type {
         \\    if (ArgsT == type) return @TypeOf(.{u8});
         \\    if (!isComptimeOnlyArgType(ArgsT) or @typeInfo(ArgsT) == .enum_literal) {
         \\        return @Tuple(&[_]type{ArgsT});
@@ -9044,28 +9268,43 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    return @TypeOf(.{dummyForType(ArgsT)});
         \\}
         \\
+        \\fn shouldWrapOverloadArgsAsSingle(comptime Owner: type, comptime has_self: bool, comptime specs: anytype, comptime ArgsT: type) bool {
+        \\    if (!isTupleType(ArgsT)) return true;
+        \\    if (@typeInfo(ArgsT).@"struct".field_types.len == 0) return false;
+        \\    if (trySelectCandidateIndex(Owner, has_self, specs, ArgsT) != null) return false;
+        \\    const WrappedT = forceSingleArgTupleType(ArgsT);
+        \\    return trySelectCandidateIndex(Owner, has_self, specs, WrappedT) != null;
+        \\}
+        \\
+        \\fn resolveOverloadTupleType(comptime Owner: type, comptime has_self: bool, comptime specs: anytype, comptime ArgsT: type) type {
+        \\    if (shouldWrapOverloadArgsAsSingle(Owner, has_self, specs, ArgsT)) {
+        \\        return forceSingleArgTupleType(ArgsT);
+        \\    }
+        \\    return ArgsT;
+        \\}
+        \\
         \\pub fn OverloadReturn(comptime Owner: type, comptime specs: anytype, comptime ArgsT: type, comptime has_alloc: bool) type {
-        \\    const TupT = wrapSingleArgTupleType(ArgsT);
+        \\    const TupT = resolveOverloadTupleType(Owner, false, specs, ArgsT);
         \\    const ci = selectCandidateIndex(Owner, false, specs, TupT);
         \\    return CandidateCallReturnType(Owner, false, void, specs[ci], TupT, has_alloc);
         \\}
         \\
         \\pub fn OverloadMethodReturn(comptime Owner: type, comptime SelfT: type, comptime specs: anytype, comptime ArgsT: type, comptime has_alloc: bool) type {
-        \\    const TupT = wrapSingleArgTupleType(ArgsT);
+        \\    const TupT = resolveOverloadTupleType(Owner, true, specs, ArgsT);
         \\    const ci = selectCandidateIndex(Owner, true, specs, TupT);
         \\    return CandidateCallReturnType(Owner, true, SelfT, specs[ci], TupT, has_alloc);
         \\}
         \\
         \\pub inline fn dispatchOverload(comptime Owner: type, comptime specs: anytype, args: anytype, alloc_opt: anytype) OverloadReturn(Owner, specs, @TypeOf(args), @TypeOf(alloc_opt) != @TypeOf(null)) {
         \\    const has_alloc = comptime (@TypeOf(alloc_opt) != @TypeOf(null));
-        \\    const is_tup = comptime isTupleType(@TypeOf(args));
-        \\    const TupT = wrapSingleArgTupleType(@TypeOf(args));
+        \\    const wrap_single = comptime shouldWrapOverloadArgsAsSingle(Owner, false, specs, @TypeOf(args));
+        \\    const TupT = resolveOverloadTupleType(Owner, false, specs, @TypeOf(args));
         \\    const ci = comptime selectCandidateIndex(Owner, false, specs, TupT);
         \\    const cand = specs[ci];
         \\    const pass_alloc = comptime candidatePassAlloc(cand, TupT, has_alloc);
         \\    const TargetFn = @field(Owner, candidateTargetFnName(cand, TupT, pass_alloc));
         \\    const alloc_val: std.mem.Allocator = if (has_alloc) alloc_opt else undefined;
-        \\    if (is_tup) {
+        \\    if (!wrap_single) {
         \\        return invokeStep(Owner, TargetFn, false, void, pass_alloc, alloc_val, cand, TupT, args, 0, .{});
         \\    }
         \\    return invokeStep(Owner, TargetFn, false, void, pass_alloc, alloc_val, cand, TupT, .{args}, 0, .{});
@@ -9073,14 +9312,14 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\
         \\pub inline fn dispatchOverloadMethod(comptime Owner: type, self_val: anytype, comptime specs: anytype, args: anytype, alloc_opt: anytype) OverloadMethodReturn(Owner, @TypeOf(self_val), specs, @TypeOf(args), @TypeOf(alloc_opt) != @TypeOf(null)) {
         \\    const has_alloc = comptime (@TypeOf(alloc_opt) != @TypeOf(null));
-        \\    const is_tup = comptime isTupleType(@TypeOf(args));
-        \\    const TupT = wrapSingleArgTupleType(@TypeOf(args));
+        \\    const wrap_single = comptime shouldWrapOverloadArgsAsSingle(Owner, true, specs, @TypeOf(args));
+        \\    const TupT = resolveOverloadTupleType(Owner, true, specs, @TypeOf(args));
         \\    const ci = comptime selectCandidateIndex(Owner, true, specs, TupT);
         \\    const cand = specs[ci];
         \\    const pass_alloc = comptime candidatePassAlloc(cand, TupT, has_alloc);
         \\    const TargetFn = @field(Owner, candidateTargetFnName(cand, TupT, pass_alloc));
         \\    const alloc_val: std.mem.Allocator = if (has_alloc) alloc_opt else undefined;
-        \\    if (is_tup) {
+        \\    if (!wrap_single) {
         \\        return invokeStep(Owner, TargetFn, true, @TypeOf(self_val), pass_alloc, alloc_val, cand, TupT, args, 0, .{self_val});
         \\    }
         \\    return invokeStep(Owner, TargetFn, true, @TypeOf(self_val), pass_alloc, alloc_val, cand, TupT, .{args}, 0, .{self_val});
