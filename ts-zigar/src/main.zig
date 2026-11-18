@@ -72,7 +72,12 @@ fn runMain(init: std.process.Init) !u8 {
             defer res.deinit(allocator);
 
             switch (res) {
-                .ok => return 0,
+                .ok => |ok_val| {
+                    if (ok_val.fallback_report) |rep| {
+                        writeStderr(io, rep);
+                    }
+                    return 0;
+                },
                 .err => |msg| {
                     writeStderr(io, "ts-zigar: ");
                     writeStderr(io, msg);

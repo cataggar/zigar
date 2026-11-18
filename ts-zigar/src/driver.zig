@@ -40,12 +40,16 @@ pub const DriverOutcome = union(enum) {
     ok: struct {
         module_count: usize,
         file_count: usize,
+        fallback_count: usize = 0,
+        fallback_report: ?[]u8 = null,
     },
     err: []u8,
 
     pub fn deinit(self: *DriverOutcome, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .ok => {},
+            .ok => |ok_val| {
+                if (ok_val.fallback_report) |rep| allocator.free(rep);
+            },
             .err => |msg| allocator.free(msg),
         }
     }
@@ -940,6 +944,25 @@ fn formatDiagnostics(
     return try msg.toOwnedSlice(allocator);
 }
 
+fn formatFallbackReport(
+    allocator: std.mem.Allocator,
+    heading: []const u8,
+    fallbacks: []const ir.FallbackEntry,
+) ![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(allocator);
+    try msg.print(allocator, "{s} ({d} fallback(s)):\n", .{ heading, fallbacks.len });
+    for (fallbacks) |fb| {
+        try msg.print(allocator, "  [{s}] {s}::{s} - {s}\n", .{
+            fb.kind.tagName(),
+            fb.module_specifier,
+            fb.decl_name,
+            fb.detail,
+        });
+    }
+    return try msg.toOwnedSlice(allocator);
+}
+
 /// Runs the complete `ts-zigar` extraction -> IR lowering -> AST-validated Zig 0.17 emission
 /// pipeline against an initialized `TypeScriptHost`.
 pub fn runPipelineWithHost(
@@ -1144,6 +1167,10 @@ pub fn runPipelineWithHost(
         .ast_error => |diag| return .{ .err = try allocator.dupe(u8, diag) },
     };
 
+    if (opts.strict_fallbacks and pkg_ir.fallbacks.len > 0) {
+        return .{ .err = try formatFallbackReport(allocator, "Strict fallback mode failed", pkg_ir.fallbacks) };
+    }
+
     emit.writeBundleToDisk(io, opts.out_dir, &bundle) catch |err| {
         return .{
             .err = try std.fmt.allocPrint(
@@ -1154,10 +1181,17 @@ pub fn runPipelineWithHost(
         };
     };
 
+    const fallback_report = if (opts.report_fallbacks and pkg_ir.fallbacks.len > 0)
+        try formatFallbackReport(allocator, "ts-zigar: type fallback report", pkg_ir.fallbacks)
+    else
+        null;
+
     return .{
         .ok = .{
             .module_count = pkg_ir.modules.len,
             .file_count = bundle.files.len,
+            .fallback_count = pkg_ir.fallbacks.len,
+            .fallback_report = fallback_report,
         },
     };
 }

@@ -138,3 +138,6 @@ export declare function unwrapEnvelope(env: GenericEnvelope<number | undefined>)
 export declare function produceSyncOrAsync(mode: number): SyncOrAsync;
 export declare function inspectSyncOrAsync(val: SyncOrAsync): string;
 export declare function badPromiseLikeReturn(): PromiseLike<number>;
+export declare function produceCyclicJson(): JsonValue;
+export declare function produceDeepAcyclicJson(depth: number): JsonValue;
+export declare function produceThrowingGetterPayload(): HeteroPayload;

@@ -30,12 +30,20 @@ export declare class MiniEmitter {
   on(event: "error", listener: (err: string) => void): this;
   on(event: "open", listener: () => void): this;
   on(event: "close", listener: () => void): this;
+  off(event: "data", listener: (chunk: string) => void): this;
+  off(event: "open", listener: () => void): this;
   emitData(chunk: string): void;
   emitError(err: string): void;
   emitOpen(): void;
   emitClose(): void;
   clearAll(): void;
 }
+
+export declare function sumTupleOrTriple(pair: [number, number]): number;
+export declare function sumTupleOrTriple(a: number, b: number, c: number): number;
+
+export declare function pickArity(a: number, b?: number): string;
+export declare function pickArity(a: number): number;
 
 // 3. Variadic rest parameters (`...args: any[]` and typed `...nums: number[]`)
 export declare function consoleFormat(prefix: string, ...args: any[]): string;

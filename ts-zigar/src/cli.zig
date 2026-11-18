@@ -16,6 +16,8 @@ pub const help_text =
     \\  -m, --module <name>         Emit only matching module(s) and their dependencies (repeatable)
     \\  -s, --substitute <from=to>  Substitute module/namespace path prefix (repeatable, e.g. node:fs=fs)
     \\      --component <path>      Override path to typescript-compiler.component.wasm
+    \\      --report-fallbacks      Print structured summary of lossy type fallbacks to stderr
+    \\      --strict-fallbacks      Exit with error if any lossy type fallback is emitted
     \\  -h, --help                  Print this help message and exit
     \\  -v, --version               Print version information and exit
     \\
@@ -37,6 +39,8 @@ pub const CliOptions = struct {
     modules: [][]const u8,
     substitutions: []Substitution,
     component_path: ?[]const u8,
+    report_fallbacks: bool = false,
+    strict_fallbacks: bool = false,
 
     pub fn deinit(self: *CliOptions, allocator: std.mem.Allocator) void {
         for (self.types_paths) |p| allocator.free(p);
@@ -126,6 +130,9 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) std.mem
 
     var component_path: ?[]u8 = null;
     defer if (component_path) |c| allocator.free(c);
+
+    var report_fallbacks = false;
+    var strict_fallbacks = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -251,6 +258,15 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) std.mem
             continue;
         }
 
+        if (std.mem.eql(u8, arg, "--report-fallbacks")) {
+            report_fallbacks = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--strict-fallbacks")) {
+            strict_fallbacks = true;
+            continue;
+        }
+
         return .{ .err = try std.fmt.allocPrint(allocator, "Unknown option or unexpected argument: '{s}'. Run with --help for usage.", .{arg}) };
     }
 
@@ -290,6 +306,8 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) std.mem
             .modules = owned_modules,
             .substitutions = owned_subs,
             .component_path = owned_comp,
+            .report_fallbacks = report_fallbacks,
+            .strict_fallbacks = strict_fallbacks,
         },
     };
 }

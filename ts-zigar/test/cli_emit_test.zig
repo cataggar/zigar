@@ -5561,6 +5561,243 @@ test "Issue #53 (M3.4a): ECMA-262 export * shadowing/default/ambiguity/diamond/e
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", probe_zig });
 }
 
+test "Issue #54 M3.4b Audit: expansive generic cycles, fallback reporting, hex/underscore literals, globalThis builtins, and overload tuple/arity scoring" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue54-audit", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+    try cwd.createDirPath(io, sandbox);
+
+    const dts_path = try std.fmt.allocPrint(alloc, "{s}/m3-audit.d.mts", .{sandbox});
+    defer alloc.free(dts_path);
+    const clean_dts_path = try std.fmt.allocPrint(alloc, "{s}/m3-clean.d.mts", .{sandbox});
+    defer alloc.free(clean_dts_path);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+    const out_clean_dir = try std.fmt.allocPrint(alloc, "{s}/out-clean", .{sandbox});
+    defer alloc.free(out_clean_dir);
+    const probe_zig = try std.fmt.allocPrint(alloc, "{s}/probe_issue54.zig", .{sandbox});
+    defer alloc.free(probe_zig);
+
+    try cwd.writeFile(io, .{
+        .sub_path = dts_path,
+        .data =
+        \\// 1. M2: Expansive generic cycles (direct self-nesting, mutual generic cycle, unguarded recursive alias, regular control)
+        \\export type Box<T> = { value: T };
+        \\export interface InfChain<T> {
+        \\  head: T;
+        \\  next?: InfChain<Box<T>>;
+        \\}
+        \\export type MutualA<T> = { b?: MutualB<Box<T>> };
+        \\export type MutualB<U> = { item?: MutualA<U> };
+        \\export type RegularSelf<T> = { val: T; next?: RegularSelf<T> };
+        \\export type UnguardedLoop<T> = UnguardedLoop<T>[];
+        \\export declare function makeInfChain(seed: string): InfChain<string>;
+        \\export declare function makeMutual(seed: number): MutualA<number>;
+        \\export declare function makeRegular(seed: number): RegularSelf<number>;
+        \\export declare function makeLoop(seed: boolean): UnguardedLoop<boolean>;
+        \\
+        \\// 2. H3: Generic function / constructor / call-signature fallbacks -> JsFunction
+        \\export type GenericIdentityFn = <T>(x: T) => T;
+        \\export type GenericCtorFn = new <T>(x: T) => Box<T>;
+        \\export interface GenericCallableBox {
+        \\  <T>(x: T): T;
+        \\  readonly tag: string;
+        \\}
+        \\export declare const idFn: GenericIdentityFn;
+        \\
+        \\// 3. H3: Hex, binary, octal, underscore-separated, signed numeric literals, and non-literal const widening
+        \\export type HexMask = 0xff_ff | 1_000_000 | 0b1010_0101 | 0o77 | -0x10;
+        \\export declare const SHIFTED_CONST = 1 << 2;
+        \\export declare function checkMask(m: HexMask): HexMask;
+        \\
+        \\// 4. L3: `globalThis.`-qualified built-in utility & collection types
+        \\export interface RawConfig {
+        \\  host: string;
+        \\  port: number;
+        \\}
+        \\export type PartialCfg = globalThis.Partial<RawConfig>;
+        \\export type StrNumMap = globalThis.Map<string, number>;
+        \\export type RoStrNumMap = globalThis.ReadonlyMap<string, number>;
+        \\export type DictNum = globalThis.Record<string, number>;
+        \\export type RoTags = globalThis.ReadonlyArray<string>;
+        \\export declare function inspectGlobals(
+        \\  cfg: PartialCfg,
+        \\  m: StrNumMap,
+        \\  rm: RoStrNumMap,
+        \\  d: DictNum,
+        \\  tags: RoTags,
+        \\): string;
+        \\
+        \\// 5. M3 + L1 + L2: Tuple-arg overload dispatch, exact-arity bonus, and overload/allocator doc-comments
+        \\export declare function tupleOrScalars(pair: [string, number]): string;
+        \\export declare function tupleOrScalars(a: string, b: number, c: boolean): string;
+        \\export declare function arityTieBreak(x: string, y?: number): number;
+        \\export declare function arityTieBreak(x: string): string;
+        \\
+        ,
+    });
+
+    try cwd.writeFile(io, .{
+        .sub_path = clean_dts_path,
+        .data =
+        \\export interface CleanPoint {
+        \\  x: number;
+        \\  y: number;
+        \\}
+        \\export declare function addPoints(a: CleanPoint, b: CleanPoint): CleanPoint;
+        \\
+        ,
+    });
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    // A) `--strict-fallbacks` MUST reject `m3-audit.d.mts` with structured diagnostics!
+    {
+        const strict_args = [_][]const u8{
+            "-t", dts_path,
+            "-m", "m3-audit",
+            "-d", out_dir,
+            "--strict-fallbacks",
+        };
+        var parsed_strict = try ts_zigar.cli.parseArgs(alloc, &strict_args);
+        defer parsed_strict.deinit(alloc);
+        try std.testing.expect(parsed_strict == .run);
+
+        var strict_res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed_strict.run);
+        defer strict_res.deinit(alloc);
+        try std.testing.expect(strict_res == .err);
+        try std.testing.expect(std.mem.indexOf(u8, strict_res.err, "Strict fallback mode failed") != null);
+        try std.testing.expect(std.mem.indexOf(u8, strict_res.err, "[expansive_generic_cycle]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, strict_res.err, "[generic_function_type]") != null);
+    }
+
+    // B) `--strict-fallbacks` MUST succeed cleanly on fallback-free `m3-clean.d.mts`!
+    {
+        const clean_args = [_][]const u8{
+            "-t", clean_dts_path,
+            "-m", "m3-clean",
+            "-d", out_clean_dir,
+            "--strict-fallbacks",
+        };
+        var parsed_clean = try ts_zigar.cli.parseArgs(alloc, &clean_args);
+        defer parsed_clean.deinit(alloc);
+        try std.testing.expect(parsed_clean == .run);
+
+        var clean_res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed_clean.run);
+        defer clean_res.deinit(alloc);
+        try std.testing.expect(clean_res == .ok);
+        try std.testing.expectEqual(@as(usize, 0), clean_res.ok.fallback_count);
+    }
+
+    // C) `--report-fallbacks` emits modules AND structured fallback report + inline doc-comments!
+    {
+        const report_args = [_][]const u8{
+            "-t", dts_path,
+            "-m", "m3-audit",
+            "-d", out_dir,
+            "--report-fallbacks",
+        };
+        var parsed_rep = try ts_zigar.cli.parseArgs(alloc, &report_args);
+        defer parsed_rep.deinit(alloc);
+        try std.testing.expect(parsed_rep == .run);
+
+        var rep_res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed_rep.run);
+        defer rep_res.deinit(alloc);
+        if (rep_res == .err) {
+            std.debug.print("Issue #54 pipeline error: {s}\n", .{rep_res.err});
+        }
+        try std.testing.expect(rep_res == .ok);
+        try std.testing.expect(rep_res.ok.fallback_count >= 5);
+        const report_txt = rep_res.ok.fallback_report orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, report_txt, "[expansive_generic_cycle]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, report_txt, "[generic_function_type]") != null);
+    }
+
+    const gen_mod_zig = try std.fmt.allocPrint(alloc, "{s}/m3_audit.zig", .{out_dir});
+    defer alloc.free(gen_mod_zig);
+    const gen_src = try cwd.readFileAlloc(io, gen_mod_zig, alloc, .limited(4 * 1024 * 1024));
+    defer alloc.free(gen_src);
+
+    // Verify inline doc-comments (H3 fallback notes, L1 overload list, L2 allocator contract) & JsFunction!
+    try std.testing.expect(std.mem.indexOf(u8, gen_src, "/// ts-zigar: fallback(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen_src, "pub const GenericIdentityFn = __zigar_js.JsFunction;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen_src, "pub const GenericCtorFn = __zigar_js.JsFunction;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen_src, "/// Overloads:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen_src, "/// Allocates decoded return values via `zigar_js.defaultAllocator()`") != null);
+
+    try cwd.writeFile(io, .{
+        .sub_path = probe_zig,
+        .data =
+        \\const std = @import("std");
+        \\const r = @import("out/root.zig");
+        \\const m = r.m3_audit;
+        \\const js = r.zigar_js;
+        \\
+        \\test "Issue #54 generated Zig compile & comptime type checks" {
+        \\    // 1. Hex/underscore/binary/octal/negative numeric literal tags (H3)
+        \\    const h_hex: m.HexMask = .n_65535;
+        \\    const h_sep: m.HexMask = .n_1000000;
+        \\    const h_bin: m.HexMask = .n_165;
+        \\    const h_oct: m.HexMask = .n_63;
+        \\    const h_neg: m.HexMask = .neg_16;
+        \\    try std.testing.expectError(error.HostUnavailable, m.checkMask(h_hex));
+        \\    _ = h_sep;
+        \\    _ = h_bin;
+        \\    _ = h_oct;
+        \\    _ = h_neg;
+        \\
+        \\    // Non-literal `1 << 2` const widens cleanly to `f64` global wrapper rather than bogus `0` literal!
+        \\    try std.testing.expect(@TypeOf(m.SHIFTED_CONST).ValueType == f64);
+        \\    try std.testing.expectError(error.HostUnavailable, m.SHIFTED_CONST.get());
+        \\
+        \\    // 2. `globalThis.` builtins lower identically to unqualified builtins (L3)
+        \\    const cfg: m.PartialCfg = .{ .host = "localhost" };
+        \\    try std.testing.expect(cfg.port == null);
+        \\    try std.testing.expect(m.StrNumMap == js.Map([]const u8, f64));
+        \\    try std.testing.expect(m.RoStrNumMap == js.Map([]const u8, f64));
+        \\    try std.testing.expect(m.DictNum == js.Record([]const u8, f64));
+        \\    try std.testing.expect(m.RoTags == []const []const u8);
+        \\
+        \\    // 3. Single-tuple-arg overload dispatch & exact-arity overload tie-breaking (M3)
+        \\    try std.testing.expectError(error.HostUnavailable, m.tupleOrScalars(.{ "port", @as(f64, 8080) }));
+        \\    try std.testing.expectError(error.HostUnavailable, m.tupleOrScalars(.{ "port", @as(f64, 8080), true }));
+        \\
+        \\    // Exact 1-arg `arityTieBreak(x: string): string` MUST beat `arityTieBreak(x: string, y?: number): number`!
+        \\    const exact_ret = m.arityTieBreak("only-one");
+        \\    try std.testing.expect(@TypeOf(exact_ret) == js.CallError![]const u8);
+        \\    try std.testing.expectError(error.HostUnavailable, exact_ret);
+        \\
+        \\    const opt_ret = m.arityTieBreak(.{ "two", @as(f64, 2) });
+        \\    try std.testing.expect(@TypeOf(opt_ret) == js.CallError!f64);
+        \\    try std.testing.expectError(error.HostUnavailable, opt_ret);
+        \\
+        \\    // 4. Expansive & regular generic cycles instantiate cleanly in Zig (M2)
+        \\    try std.testing.expectError(error.HostUnavailable, m.makeInfChainAlloc(std.testing.allocator, "seed"));
+        \\    try std.testing.expectError(error.HostUnavailable, m.makeMutualAlloc(std.testing.allocator, 1));
+        \\    try std.testing.expectError(error.HostUnavailable, m.makeRegularAlloc(std.testing.allocator, 1));
+        \\    try std.testing.expectError(error.HostUnavailable, m.makeLoopAlloc(std.testing.allocator, true));
+        \\}
+        ,
+    });
+
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "ast-check", root_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", probe_zig });
+}
+
+
 
 
 

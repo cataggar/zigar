@@ -33,6 +33,7 @@ pub const CallError = Error || error{
     RangeError,
     ReferenceError,
     SyntaxError,
+    Overflow,
     OutOfMemory,
     Unexpected,
 };
@@ -492,7 +493,8 @@ pub const CallbackFlags = packed struct(u32) {
     once: bool = false,
     pass_this: bool = false,
     ref_codec: bool = false,
-    _: u28 = 0,
+    stateless: bool = false,
+    _: u27 = 0,
 };
 
 pub const LastErrorOp = enum(u32) {
@@ -1749,6 +1751,32 @@ fn IntersectHandleWrapper(
             if (HostJsOpt != null) {
                 self.ref.deinit();
             }
+        }
+
+        pub fn dispose(self: Self) void {
+            if (HostJsOpt) |HJ| {
+                HJ.dispose(self);
+            }
+        }
+
+        pub fn tryDispose(self: Self) CallError!void {
+            if (HostJsOpt) |HJ| {
+                return HJ.tryDispose(self);
+            }
+            return error.HostUnavailable;
+        }
+
+        pub fn asyncDispose(self: Self) void {
+            if (HostJsOpt) |HJ| {
+                HJ.asyncDispose(self);
+            }
+        }
+
+        pub fn tryAsyncDispose(self: Self) CallError!void {
+            if (HostJsOpt) |HJ| {
+                return HJ.tryAsyncDispose(self);
+            }
+            return error.HostUnavailable;
         }
 
         pub fn clone(self: Self) CallError!Self {
@@ -5161,6 +5189,63 @@ pub fn Js(comptime host: type) type {
             }
         };
 
+        /// Intern table for runtime stateless `*const fn` addresses so persistent/async
+        /// stateless function pointers can pass a compact 32-bit `id` across host-op ABI
+        /// without consuming `CallbackRegistry` slots or user-tracked heap allocations.
+        const StatelessFnPtrRegistry = struct {
+            const inline_cap: u32 = 256;
+            var inline_addrs: [inline_cap]usize = @splat(0);
+            var inline_count: u32 = 0;
+            var overflow_addrs: []usize = &.{};
+            var overflow_len: u32 = 0;
+
+            fn backingAllocator() std.mem.Allocator {
+                return if (builtin.target.cpu.arch.isWasm()) std.heap.wasm_allocator else std.heap.page_allocator;
+            }
+
+            fn intern(addr: usize) error{OutOfMemory}!u32 {
+                var i: u32 = 0;
+                while (i < inline_count) : (i += 1) {
+                    if (inline_addrs[i] == addr) return i + 1;
+                }
+                var j: u32 = 0;
+                while (j < overflow_len) : (j += 1) {
+                    if (overflow_addrs[j] == addr) return inline_cap + j + 1;
+                }
+                if (inline_count < inline_cap) {
+                    const id = inline_count + 1;
+                    inline_addrs[inline_count] = addr;
+                    inline_count += 1;
+                    return id;
+                }
+                if (overflow_len >= overflow_addrs.len) {
+                    const alloc = backingAllocator();
+                    const new_cap: usize = if (overflow_addrs.len == 0) 256 else overflow_addrs.len * 2;
+                    if (new_cap + inline_cap >= std.math.maxInt(u32)) return error.OutOfMemory;
+                    const new_buf = try alloc.alloc(usize, new_cap);
+                    if (overflow_len > 0) {
+                        @memcpy(new_buf[0..overflow_len], overflow_addrs[0..overflow_len]);
+                        alloc.free(overflow_addrs);
+                    }
+                    overflow_addrs = new_buf;
+                }
+                const id = inline_cap + overflow_len + 1;
+                overflow_addrs[overflow_len] = addr;
+                overflow_len += 1;
+                return id;
+            }
+
+            fn lookup(id: u32) ?usize {
+                if (id == 0) return null;
+                const idx = id - 1;
+                if (idx < inline_count) return inline_addrs[idx];
+                if (idx < inline_cap) return null;
+                const ov_idx = idx - inline_cap;
+                if (ov_idx < overflow_len) return overflow_addrs[ov_idx];
+                return null;
+            }
+        };
+
         fn cancelCallbackThunk(raw_id_ptr: *const anyopaque, _: *anyopaque) anyerror!void {
             const callback_id: u32 = @truncate(@intFromPtr(raw_id_ptr));
             const fn_handle = if (CallbackRegistry.resolve(callback_id)) |r| r.entry.fn_handle else module.reserved_undefined_handle;
@@ -5815,6 +5900,112 @@ pub fn Js(comptime host: type) type {
                     };
                 }
 
+                /// Create an un-revoked stateless JS function handle for a comptime Zig function.
+                /// Safe for sync, async, and multi-shot event listeners (`EventEmitter.on`/`off`)
+                /// without allocating a `CallbackRegistry` slot; caller releases only the temporary `Ref`.
+                pub fn tryStatelessFn(comptime plain_fn: anytype) module.CallError!Ref(module.Function) {
+                    const PlainFnT = @TypeOf(plain_fn);
+                    const p_info = @typeInfo(PlainFnT).@"fn";
+                    if (p_info.param_types.len != fn_info.param_types.len) {
+                        @compileError("Stateless callback parameter count mismatch");
+                    }
+                    if (!isJsThread()) return error.OffJsThread;
+                    if (!@hasDecl(host, "createZigCallback")) return error.HostUnavailable;
+                    const StatelessHolder = struct {
+                        var desc: module.CallbackDescriptor = .{
+                            .signature = signature.get(Args),
+                            .flags = @bitCast(module.CallbackFlags{
+                                .async_call = cb_flags.async_call,
+                                .once = false,
+                                .pass_this = cb_flags.pass_this,
+                                .ref_codec = cb_flags.ref_codec,
+                                .stateless = true,
+                            }),
+                        };
+                        fn trampoline(_: *const anyopaque, raw_arg: *anyopaque) anyerror!void {
+                            const frame: *Args = @ptrCast(@alignCast(raw_arg));
+                            return invokeWithFrame(PlainFnT, plain_fn, .{}, frame);
+                        }
+                        fn ensure() *const module.CallbackDescriptor {
+                            _ = reg;
+                            if (desc.trampoline_thunk == 0) {
+                                desc.trampoline_thunk = @intFromPtr(&trampoline);
+                                if (!builtin.target.cpu.arch.isWasm() and @hasDecl(host, "getTypeFactoryThunk")) {
+                                    desc.register_thunk = @intFromPtr(host.getTypeFactoryThunk(Args));
+                                }
+                            }
+                            return &desc;
+                        }
+                    };
+                    const handle = try host.createZigCallback(StatelessHolder.ensure(), 1);
+                    return .{ .handle = handle };
+                }
+
+                pub fn statelessFn(comptime plain_fn: anytype) Ref(module.Function) {
+                    return tryStatelessFn(plain_fn) catch |err| switch (err) {
+                        error.OffJsThread => @panic("JsValue operations require the JS thread"),
+                        error.HostUnavailable => @panic("JsValue host imports unavailable"),
+                        else => @panic("Failed to initialize stateless Zig JS callback"),
+                    };
+                }
+
+                /// Create an un-revoked stateless JS function handle for a runtime `*const fn` pointer.
+                /// Safe for sync, async, and multi-shot event listeners (`EventEmitter.on`/`off`)
+                /// without consuming `CallbackRegistry` slots; caller releases only the temporary `Ref`.
+                pub fn tryStatelessFnPtr(fn_ptr: anytype) module.CallError!Ref(module.Function) {
+                    const PtrT = @TypeOf(fn_ptr);
+                    const PlainFnT = switch (@typeInfo(PtrT)) {
+                        .pointer => |pt| if (pt.size == .one and @typeInfo(pt.child) == .@"fn") pt.child else @compileError("Expected `*const fn (...) ...`, received " ++ @typeName(PtrT)),
+                        else => @compileError("Expected `*const fn (...) ...`, received " ++ @typeName(PtrT)),
+                    };
+                    const p_info = @typeInfo(PlainFnT).@"fn";
+                    if (p_info.param_types.len != fn_info.param_types.len) {
+                        @compileError("Stateless callback pointer parameter count mismatch");
+                    }
+                    if (!isJsThread()) return error.OffJsThread;
+                    if (!@hasDecl(host, "createZigCallback")) return error.HostUnavailable;
+                    const fn_id = try StatelessFnPtrRegistry.intern(@intFromPtr(fn_ptr));
+                    const PtrStatelessHolder = struct {
+                        var desc: module.CallbackDescriptor = .{
+                            .signature = signature.get(Args),
+                            .flags = @bitCast(module.CallbackFlags{
+                                .async_call = cb_flags.async_call,
+                                .once = false,
+                                .pass_this = cb_flags.pass_this,
+                                .ref_codec = cb_flags.ref_codec,
+                                .stateless = true,
+                            }),
+                        };
+                        fn trampoline(raw_id_ptr: *const anyopaque, raw_arg: *anyopaque) anyerror!void {
+                            const id: u32 = @truncate(@intFromPtr(raw_id_ptr));
+                            const addr = StatelessFnPtrRegistry.lookup(id) orelse return error.InvalidCallback;
+                            const typed_fn: *const PlainFnT = @ptrFromInt(addr);
+                            const frame: *Args = @ptrCast(@alignCast(raw_arg));
+                            return invokeWithFrame(PlainFnT, typed_fn, .{}, frame);
+                        }
+                        fn ensure() *const module.CallbackDescriptor {
+                            _ = reg;
+                            if (desc.trampoline_thunk == 0) {
+                                desc.trampoline_thunk = @intFromPtr(&trampoline);
+                                if (!builtin.target.cpu.arch.isWasm() and @hasDecl(host, "getTypeFactoryThunk")) {
+                                    desc.register_thunk = @intFromPtr(host.getTypeFactoryThunk(Args));
+                                }
+                            }
+                            return &desc;
+                        }
+                    };
+                    const handle = try host.createZigCallback(PtrStatelessHolder.ensure(), fn_id);
+                    return .{ .handle = handle };
+                }
+
+                pub fn statelessFnPtr(fn_ptr: anytype) Ref(module.Function) {
+                    return tryStatelessFnPtr(fn_ptr) catch |err| switch (err) {
+                        error.OffJsThread => @panic("JsValue operations require the JS thread"),
+                        error.HostUnavailable => @panic("JsValue host imports unavailable"),
+                        else => @panic("Failed to initialize stateless Zig JS callback pointer"),
+                    };
+                }
+
                 pub inline fn ref(self: Self) Ref(module.Function) {
                     return self.func;
                 }
@@ -6280,6 +6471,32 @@ pub fn Js(comptime host: type) type {
                     }
                 }
             };
+        }
+
+        pub fn PersistentClosureType(comptime CtxPtrT: type, comptime handler: anytype) type {
+            const h_fn = switch (@typeInfo(@TypeOf(handler))) {
+                .pointer => handler.*,
+                .@"fn" => handler,
+                else => @compileError("Expected handler function in persistentClosure(), received " ++ @typeName(@TypeOf(handler))),
+            };
+            return ClosureWithOptions(CtxPtrT, h_fn, .{ .ref_codec = true });
+        }
+
+        pub fn PersistentClosureWithThisType(comptime CtxPtrT: type, comptime handler: anytype) type {
+            const h_fn = switch (@typeInfo(@TypeOf(handler))) {
+                .pointer => handler.*,
+                .@"fn" => handler,
+                else => @compileError("Expected handler function in persistentClosureWithThis(), received " ++ @typeName(@TypeOf(handler))),
+            };
+            return ClosureWithThis(CtxPtrT, h_fn);
+        }
+
+        pub fn persistentClosure(ctx_ptr: anytype, comptime handler: anytype) module.CallError!PersistentClosureType(@TypeOf(ctx_ptr), handler) {
+            return PersistentClosureType(@TypeOf(ctx_ptr), handler).tryInit(ctx_ptr);
+        }
+
+        pub fn persistentClosureWithThis(ctx_ptr: anytype, comptime handler: anytype) module.CallError!PersistentClosureWithThisType(@TypeOf(ctx_ptr), handler) {
+            return PersistentClosureWithThisType(@TypeOf(ctx_ptr), handler).tryInit(ctx_ptr);
         }
 
         pub fn Ref(comptime T: type) type {
@@ -7542,11 +7759,11 @@ pub fn Js(comptime host: type) type {
             }
 
             pub fn deinit(self: Self) void {
-                self.ref().dispose();
+                self.ref().deinit();
             }
 
             pub fn tryDeinit(self: Self) module.Error!void {
-                return self.ref().tryDispose();
+                return self.ref().tryDeinit();
             }
 
             pub fn releaseHandleOnly(self: Self) void {
@@ -7766,6 +7983,11 @@ pub fn Js(comptime host: type) type {
                 }
 
                 pub const close = returnEarly;
+
+                pub fn closeAndDeinit(self: Self) void {
+                    self.returnEarly() catch {};
+                    self.deinit();
+                }
             };
         }
 
@@ -7869,6 +8091,11 @@ pub fn Js(comptime host: type) type {
                 }
 
                 pub const close = returnEarly;
+
+                pub fn closeAndDeinit(self: Self) void {
+                    self.returnEarly() catch {};
+                    self.deinit();
+                }
             };
         }
 
@@ -9435,11 +9662,192 @@ pub fn Js(comptime host: type) type {
             return false;
         }
 
+        const max_tracked_decode_types: usize = 128;
+
+        const TypeReachState = struct {
+            visited: [max_tracked_decode_types]type = undefined,
+            len: usize = 0,
+            found: bool = false,
+        };
+
+        fn typeStateMarkOrSeen(comptime state_in: TypeReachState, comptime Cur: type) struct { seen: bool, state: TypeReachState } {
+            for (state_in.visited[0..state_in.len]) |seen_t| {
+                if (seen_t == Cur) return .{ .seen = true, .state = state_in };
+            }
+            var next = state_in;
+            if (next.len >= max_tracked_decode_types) {
+                next.found = true;
+                return .{ .seen = true, .state = next };
+            }
+            next.visited[next.len] = Cur;
+            next.len += 1;
+            return .{ .seen = false, .state = next };
+        }
+
+        fn typeCanReachDecodeTarget(
+            comptime Cur: type,
+            comptime Target: type,
+            comptime state_in: TypeReachState,
+            comptime has_stepped: bool,
+        ) TypeReachState {
+            if (state_in.found or Cur == void) return state_in;
+            if (isNullableType(Cur)) {
+                return typeCanReachDecodeTarget(Cur.Value, Target, state_in, has_stepped);
+            }
+            if (util.getInternalType(Cur) == .js_value) return state_in;
+
+            return switch (@typeInfo(Cur)) {
+                .bool, .int, .float, .comptime_int, .comptime_float, .@"enum", .@"fn", .void, .noreturn, .null, .undefined => state_in,
+                .optional => |opt| typeCanReachDecodeTarget(opt.child, Target, state_in, has_stepped),
+                .pointer => |pt| switch (pt.size) {
+                    .slice => blk: {
+                        if (pt.child == u8) break :blk state_in;
+                        if (has_stepped and Cur == Target) {
+                            var hit = state_in;
+                            hit.found = true;
+                            break :blk hit;
+                        }
+                        const marked = typeStateMarkOrSeen(state_in, Cur);
+                        if (marked.seen) break :blk marked.state;
+                        break :blk typeCanReachDecodeTarget(pt.child, Target, marked.state, true);
+                    },
+                    .one => if (@typeInfo(pt.child) == .@"fn") state_in else typeCanReachDecodeTarget(pt.child, Target, state_in, has_stepped),
+                    else => state_in,
+                },
+                .array => |ar| blk: {
+                    if (has_stepped and Cur == Target) {
+                        var hit = state_in;
+                        hit.found = true;
+                        break :blk hit;
+                    }
+                    const marked = typeStateMarkOrSeen(state_in, Cur);
+                    if (marked.seen) break :blk marked.state;
+                    break :blk typeCanReachDecodeTarget(ar.child, Target, marked.state, true);
+                },
+                .@"struct" => |st| blk: {
+                    if (@hasDecl(Cur, "zigar_js")) {
+                        const Meta = @TypeOf(Cur.zigar_js);
+                        if (@hasField(Meta, "is_handle") and Cur.zigar_js.is_handle) break :blk state_in;
+                        if (@hasField(Meta, "is_template_literal") and Cur.zigar_js.is_template_literal) break :blk state_in;
+                        if (@hasField(Meta, "is_enum") and Cur.zigar_js.is_enum) break :blk state_in;
+                    }
+                    if (has_stepped and Cur == Target) {
+                        var hit = state_in;
+                        hit.found = true;
+                        break :blk hit;
+                    }
+                    const marked = typeStateMarkOrSeen(state_in, Cur);
+                    if (marked.seen) break :blk marked.state;
+                    var cur_state = marked.state;
+                    for (st.field_names, st.field_types) |fname, ftype| {
+                        if (module.isHiddenMetaField(fname)) continue;
+                        cur_state = typeCanReachDecodeTarget(ftype, Target, cur_state, true);
+                        if (cur_state.found) break :blk cur_state;
+                    }
+                    break :blk cur_state;
+                },
+                .@"union" => |un| blk: {
+                    if (@hasDecl(Cur, "zigar_js")) {
+                        const Meta = @TypeOf(Cur.zigar_js);
+                        if (@hasField(Meta, "is_open_literal") and Cur.zigar_js.is_open_literal) break :blk state_in;
+                    }
+                    if (has_stepped and Cur == Target) {
+                        var hit = state_in;
+                        hit.found = true;
+                        break :blk hit;
+                    }
+                    const marked = typeStateMarkOrSeen(state_in, Cur);
+                    if (marked.seen) break :blk marked.state;
+                    var cur_state = marked.state;
+                    for (un.field_types) |ftype| {
+                        cur_state = typeCanReachDecodeTarget(ftype, Target, cur_state, true);
+                        if (cur_state.found) break :blk cur_state;
+                    }
+                    break :blk cur_state;
+                },
+                else => state_in,
+            };
+        }
+
+        fn TypeSelfRecursionMemo(comptime T: type) type {
+            return struct {
+                const value: bool = blk: {
+                    @setEvalBranchQuota(1_000_000);
+                    break :blk typeCanReachDecodeTarget(T, T, .{}, false).found;
+                };
+            };
+        }
+
+        fn typeCanSelfRecurse(comptime T: type) bool {
+            return TypeSelfRecursionMemo(T).value;
+        }
+
+        fn isContainerDecodeType(comptime T: type) bool {
+            if (T == void) return false;
+            if (isNullableType(T)) return false;
+            if (util.getInternalType(T) == .js_value) return false;
+            return switch (@typeInfo(T)) {
+                .pointer => |pt| pt.size == .slice and pt.child != u8,
+                .array => true,
+                .@"struct" => |st| blk: {
+                    if (st.field_names.len == 0) break :blk false;
+                    if (isTupleStructType(T)) break :blk true;
+                    if (@hasDecl(T, "zigar_js")) {
+                        const Meta = @TypeOf(T.zigar_js);
+                        if (@hasField(Meta, "is_template_literal") and T.zigar_js.is_template_literal) break :blk false;
+                        if (@hasField(Meta, "is_enum") and T.zigar_js.is_enum) break :blk false;
+                        if (@hasField(Meta, "is_handle") and T.zigar_js.is_handle) break :blk false;
+                    }
+                    break :blk true;
+                },
+                else => false,
+            };
+        }
+
+        const DecodeAncestor = struct {
+            anchor_handle: ?u32 = null,
+            steps_since_teleport: usize = 0,
+            teleport_limit: usize = 1,
+        };
+
+        const max_decode_depth: usize = 512;
+
+        fn advanceDecodeCycle(
+            comptime ContainerT: type,
+            raw: Ref(module.Any),
+            ancestor: DecodeAncestor,
+        ) module.CallError!DecodeAncestor {
+            if (comptime !typeCanSelfRecurse(ContainerT)) return ancestor;
+            const anchor_h = ancestor.anchor_handle orelse return .{
+                .anchor_handle = raw.handle,
+                .steps_since_teleport = 0,
+                .teleport_limit = 1,
+            };
+            if (anchor_h == raw.handle) return error.Overflow;
+            const anc_ref: Ref(module.Any) = .{ .handle = anchor_h };
+            if (try anc_ref.tryEql(raw)) return error.Overflow;
+            const next_steps = ancestor.steps_since_teleport + 1;
+            if (next_steps >= ancestor.teleport_limit) {
+                return .{
+                    .anchor_handle = raw.handle,
+                    .steps_since_teleport = 0,
+                    .teleport_limit = ancestor.teleport_limit *| 2,
+                };
+            }
+            return .{
+                .anchor_handle = anchor_h,
+                .steps_since_teleport = next_steps,
+                .teleport_limit = ancestor.teleport_limit,
+            };
+        }
+
         fn decodeDiscriminatedUnion(
             comptime T: type,
             allocator: std.mem.Allocator,
             raw: Ref(module.Any),
             jt: module.JsType,
+            depth: usize,
+            ancestor: DecodeAncestor,
         ) module.CallError!T {
             if (raw.isNullOrUndefined()) return error.TypeError;
             if (jt != .object and jt != .function) return error.TypeError;
@@ -9467,7 +9875,7 @@ pub fn Js(comptime host: type) type {
                                     if (comptime @hasField(@TypeOf(dv), "str_value")) {
                                         if (std.mem.eql(u8, s, dv.str_value)) {
                                             const PayloadT = @FieldType(T, vm.tag);
-                                            return @unionInit(T, vm.tag, try fromJsRefAlloc(PayloadT, allocator, raw));
+                                            return @unionInit(T, vm.tag, try fromJsRefAllocInner(PayloadT, allocator, raw, depth, ancestor));
                                         }
                                     }
                                 }
@@ -9482,7 +9890,7 @@ pub fn Js(comptime host: type) type {
                                     if (comptime @hasField(@TypeOf(dv), "str_value")) {
                                         if (std.mem.eql(u8, s, dv.str_value)) {
                                             const PayloadT = @FieldType(T, vm.tag);
-                                            return @unionInit(T, vm.tag, try fromJsRefAlloc(PayloadT, allocator, raw));
+                                            return @unionInit(T, vm.tag, try fromJsRefAllocInner(PayloadT, allocator, raw, depth, ancestor));
                                         }
                                     }
                                 }
@@ -9500,7 +9908,7 @@ pub fn Js(comptime host: type) type {
                                 if (comptime @hasField(@TypeOf(dv), "num_value")) {
                                     if (n == dv.num_value) {
                                         const PayloadT = @FieldType(T, vm.tag);
-                                        return @unionInit(T, vm.tag, try fromJsRefAlloc(PayloadT, allocator, raw));
+                                        return @unionInit(T, vm.tag, try fromJsRefAllocInner(PayloadT, allocator, raw, depth, ancestor));
                                     }
                                 }
                             }
@@ -9517,7 +9925,7 @@ pub fn Js(comptime host: type) type {
                                 if (comptime @hasField(@TypeOf(dv), "bool_value")) {
                                     if (b == dv.bool_value) {
                                         const PayloadT = @FieldType(T, vm.tag);
-                                        return @unionInit(T, vm.tag, try fromJsRefAlloc(PayloadT, allocator, raw));
+                                        return @unionInit(T, vm.tag, try fromJsRefAllocInner(PayloadT, allocator, raw, depth, ancestor));
                                     }
                                 }
                             }
@@ -9533,7 +9941,7 @@ pub fn Js(comptime host: type) type {
                                 if (comptime @hasField(@TypeOf(dv), "bigint_value")) {
                                     if (try bigintRefMatchesLiteral(disc_ref, allocator, dv.bigint_value)) {
                                         const PayloadT = @FieldType(T, vm.tag);
-                                        return @unionInit(T, vm.tag, try fromJsRefAlloc(PayloadT, allocator, raw));
+                                        return @unionInit(T, vm.tag, try fromJsRefAllocInner(PayloadT, allocator, raw, depth, ancestor));
                                     }
                                 }
                             }
@@ -10187,15 +10595,26 @@ pub fn Js(comptime host: type) type {
             value: anytype,
         ) module.CallError!T {
             const raw: Ref(module.Any) = .{ .handle = extractHandle(value) };
+            return fromJsRefAllocInner(T, allocator, raw, 0, .{});
+        }
+
+        fn fromJsRefAllocInner(
+            comptime T: type,
+            allocator: std.mem.Allocator,
+            raw: Ref(module.Any),
+            depth: usize,
+            ancestor: DecodeAncestor,
+        ) module.CallError!T {
             if (T == void) return {};
+            if (depth > max_decode_depth) return error.Overflow;
             if (comptime isNullableType(T)) {
                 if (raw.isUndefined()) return .@"undefined";
                 if (raw.isNull()) return .@"null";
-                return .{ .value = try fromJsRefAlloc(T.Value, allocator, raw) };
+                return .{ .value = try fromJsRefAllocInner(T.Value, allocator, raw, depth, ancestor) };
             }
             if (@typeInfo(T) == .optional) {
                 if (raw.isNullOrUndefined()) return null;
-                return try fromJsRefAlloc(@typeInfo(T).optional.child, allocator, raw);
+                return try fromJsRefAllocInner(@typeInfo(T).optional.child, allocator, raw, depth, ancestor);
             }
             if (comptime util.getInternalType(T) == .js_value) {
                 if (T == String) {
@@ -10396,6 +10815,7 @@ pub fn Js(comptime host: type) type {
                             return try str.toSliceAlloc(allocator);
                         }
                         if (!(try Array(Ref(module.Any)).isArray(raw))) return error.TypeError;
+                        const next_anc = try advanceDecodeCycle(T, raw, ancestor);
                         const arr = Array(Ref(module.Any)).fromRef(raw);
                         const count = try arr.len();
                         const buf = try allocator.alloc(pt.child, count);
@@ -10409,7 +10829,7 @@ pub fn Js(comptime host: type) type {
                         while (initialized < count) : (initialized += 1) {
                             const elem_ref = try arr.get(initialized);
                             defer elem_ref.deinit();
-                            buf[initialized] = try fromJsRefAlloc(pt.child, allocator, elem_ref);
+                            buf[initialized] = try fromJsRefAllocInner(pt.child, allocator, elem_ref, depth + 1, next_anc);
                         }
                         return buf;
                     },
@@ -10419,7 +10839,8 @@ pub fn Js(comptime host: type) type {
                         }
                         const ptr = try allocator.create(pt.child);
                         errdefer allocator.destroy(ptr);
-                        ptr.* = try fromJsRefAlloc(pt.child, allocator, raw);
+                        const child_depth = if (comptime isContainerDecodeType(pt.child)) depth else depth + 1;
+                        ptr.* = try fromJsRefAllocInner(pt.child, allocator, raw, child_depth, ancestor);
                         return ptr;
                     },
                     else => @compileError("Unsupported pointer type for JS decode: " ++ @typeName(T)),
@@ -10429,6 +10850,7 @@ pub fn Js(comptime host: type) type {
                         if (!(try Array(Ref(module.Any)).isArray(raw))) return error.TypeError;
                         if (st.field_names.len == 0) return .{};
 
+                        const next_anc = try advanceDecodeCycle(T, raw, ancestor);
                         const arr = Array(Ref(module.Any)).fromRef(raw);
                         const arr_len = try arr.len();
                         const meta = T.zigar_js_tuple;
@@ -10458,7 +10880,7 @@ pub fn Js(comptime host: type) type {
                                 if (fi < arr_len) {
                                     const elem_ref = try arr.get(fi);
                                     defer elem_ref.deinit();
-                                    @field(out, fname) = try fromJsRefAlloc(ftype, allocator, elem_ref);
+                                    @field(out, fname) = try fromJsRefAllocInner(ftype, allocator, elem_ref, depth + 1, next_anc);
                                     field_init[fi] = true;
                                 } else if (comptime (@typeInfo(ftype) == .optional)) {
                                     @field(out, fname) = null;
@@ -10491,7 +10913,7 @@ pub fn Js(comptime host: type) type {
                                     if (fi < leading_present) {
                                         const elem_ref = try arr.get(fi);
                                         defer elem_ref.deinit();
-                                        @field(out, fname) = try fromJsRefAlloc(ftype, allocator, elem_ref);
+                                        @field(out, fname) = try fromJsRefAllocInner(ftype, allocator, elem_ref, depth + 1, next_anc);
                                         field_init[fi] = true;
                                     } else if (comptime (@typeInfo(ftype) == .optional)) {
                                         @field(out, fname) = null;
@@ -10510,7 +10932,7 @@ pub fn Js(comptime host: type) type {
                                     while (ri < rest_len) : (ri += 1) {
                                         const elem_ref = try arr.get(rest_start + ri);
                                         defer elem_ref.deinit();
-                                        rest_buf[ri] = try fromJsRefAlloc(RestElem, allocator, elem_ref);
+                                        rest_buf[ri] = try fromJsRefAllocInner(RestElem, allocator, elem_ref, depth + 1, next_anc);
                                     }
                                     @field(out, fname) = rest_buf;
                                     field_init[fi] = true;
@@ -10518,7 +10940,7 @@ pub fn Js(comptime host: type) type {
                                     const trail_offset = comptime (fi - (v_idx + 1));
                                     const elem_ref = try arr.get(avail_before_trailing + trail_offset);
                                     defer elem_ref.deinit();
-                                    @field(out, fname) = try fromJsRefAlloc(ftype, allocator, elem_ref);
+                                    @field(out, fname) = try fromJsRefAllocInner(ftype, allocator, elem_ref, depth + 1, next_anc);
                                     field_init[fi] = true;
                                 }
                             }
@@ -10537,7 +10959,7 @@ pub fn Js(comptime host: type) type {
                     }
 
                     if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_enum") and T.zigar_js.is_enum and @hasField(T, "__zigar_value")) {
-                        return .{ .__zigar_value = try fromJsRefAlloc(@FieldType(T, "__zigar_value"), allocator, raw) };
+                        return .{ .__zigar_value = try fromJsRefAllocInner(@FieldType(T, "__zigar_value"), allocator, raw, depth, ancestor) };
                     }
 
                     if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_handle") and T.zigar_js.is_handle)) {
@@ -10563,7 +10985,7 @@ pub fn Js(comptime host: type) type {
                                 }
                             }
                         } else |err| switch (err) {
-                            error.OffJsThread, error.OutOfMemory => return err,
+                            error.OffJsThread, error.OutOfMemory, error.HostUnavailable, error.JsException => return err,
                             else => clearLastError(),
                         }
                     } else if (comptime (!is_cls and !structHasWireField(T, "length"))) {
@@ -10574,6 +10996,7 @@ pub fn Js(comptime host: type) type {
 
                     if (st.field_names.len == 0) return .{};
 
+                    const next_anc = try advanceDecodeCycle(T, raw, ancestor);
                     const obj = raw.cast(module.Object);
                     var out: T = undefined;
                     var field_init: [st.field_names.len]bool = @splat(false);
@@ -10596,7 +11019,7 @@ pub fn Js(comptime host: type) type {
                         if (comptime (structFieldHasConstraint(T, fname) and structFieldDisallowsNull(T, fname))) {
                             if (prop_ref.isNull()) return error.TypeError;
                         }
-                        @field(out, fname) = try fromJsRefAlloc(ftype, allocator, prop_ref);
+                        @field(out, fname) = try fromJsRefAllocInner(ftype, allocator, prop_ref, depth + 1, next_anc);
                         field_init[fi] = true;
                         if (!(try validateStructFieldConstraint(T, fname, @field(out, fname)))) {
                             return error.TypeError;
@@ -10735,7 +11158,7 @@ pub fn Js(comptime host: type) type {
                         inline for (T.zigar_js.variants) |vm| {
                             if (comptime (@hasField(@TypeOf(vm), "is_custom") and vm.is_custom)) {
                                 const PayloadT = @FieldType(T, vm.tag);
-                                return @unionInit(T, vm.tag, try fromJsRefAlloc(PayloadT, allocator, raw));
+                                return @unionInit(T, vm.tag, try fromJsRefAllocInner(PayloadT, allocator, raw, depth, ancestor));
                             }
                         }
                         return error.TypeError;
@@ -10746,24 +11169,24 @@ pub fn Js(comptime host: type) type {
                     }
 
                     if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "discriminant"))) {
-                        return decodeDiscriminatedUnion(T, allocator, raw, jt);
+                        return decodeDiscriminatedUnion(T, allocator, raw, jt, depth, ancestor);
                     }
 
                     const decode_order = comptime computeUnionDecodeOrder(T);
                     inline for (decode_order) |fi| {
                         const fname = un.field_names[fi];
-                        if (fromJsRefAlloc(un.field_types[fi], allocator, raw)) |decoded| {
+                        if (fromJsRefAllocInner(un.field_types[fi], allocator, raw, depth, ancestor)) |decoded| {
                             return @unionInit(T, fname, decoded);
                         } else |err| switch (err) {
-                            error.OutOfMemory, error.OffJsThread, error.HostUnavailable => return err,
-                            error.TypeError => {},
-                            else => clearLastError(),
+                            error.TypeError, error.RangeError => {},
+                            else => return err,
                         }
                     }
                     return error.TypeError;
                 },
                 .array => |ar| {
                     if (!(try Array(Ref(module.Any)).isArray(raw))) return error.TypeError;
+                    const next_anc = try advanceDecodeCycle(T, raw, ancestor);
                     const arr = Array(Ref(module.Any)).fromRef(raw);
                     const count = try arr.len();
                     if (count != ar.len) return error.TypeError;
@@ -10777,7 +11200,7 @@ pub fn Js(comptime host: type) type {
                     while (initialized < ar.len) : (initialized += 1) {
                         const elem_ref = try arr.get(initialized);
                         defer elem_ref.deinit();
-                        out[initialized] = try fromJsRefAlloc(ar.child, allocator, elem_ref);
+                        out[initialized] = try fromJsRefAllocInner(ar.child, allocator, elem_ref, depth + 1, next_anc);
                     }
                     return out;
                 },
@@ -14764,6 +15187,459 @@ test "Js.String, Nullable(T), needsDecodeAllocator, and tuple/slice marshaling h
     }
     try expectEqual(@as(u32, 0), js.activeHandleCount());
 }
+
+test "Js(#54): stateless callbacks, release-only Disposable.deinit, cyclic graph guard, and union JsException propagation" {
+    const Audit54MockHost = struct {
+        var next_slot: u32 = first_dynamic_slot;
+        var active_handles: u32 = 0;
+        var active_stateful_callbacks: u32 = 0;
+        var dispose_calls: u32 = 0;
+        var async_dispose_calls: u32 = 0;
+        var iter_return_calls: u32 = 0;
+        var equal_calls: u32 = 0;
+        var stored_trampoline: usize = 0;
+        var last_cb_flags: u32 = 0;
+        var last_cb_id: u32 = 0;
+        var captured_err: u32 = no_captured_error_handle;
+
+        // Object identity tags in low 16 bits:
+        // 0x10 = 1-cycle Node (`next` -> 0x10)
+        // 0x11 / 0x12 = 2-cycle Nodes (`0x11.next = 0x12`, `0x12.next = 0x11`)
+        // 0x20 = DAG Root (`left` = 0x21, `right` = 0x21)
+        // 0x21 = DAG Leaf (`next = null`, `left = null`, `right = null`)
+        // 0x30 = Throwing getter object (`boom` throws `error.JsException`)
+        // 0x40 = Disposable/Intersect/Iterator object
+        // 0x50 = 50-element JS Array of non-recursive `Point` objects (`0x2000..0x2031`)
+        // 0x1000..0x1077 = 120-node acyclic `LinkedNode` chain (`0x1077.next = null`)
+        // 0x3000..0x3031 = numeric values `0..49`
+        fn allocObj(id_tag: u16) u32 {
+            active_handles += 1;
+            const slot = next_slot;
+            next_slot += 1;
+            return (slot << 16) | @as(u32, id_tag);
+        }
+
+        fn tagOf(h: u32) u16 {
+            return @truncate(h & 0xFFFF);
+        }
+
+        pub fn releaseJsValue(h: u32) void {
+            if (h >= first_dynamic_slot) {
+                std.debug.assert(active_handles > 0);
+                active_handles -= 1;
+            }
+        }
+
+        pub fn cloneJsValue(h: u32) u32 {
+            if (h <= reserved_global_this_handle) return h;
+            return allocObj(tagOf(h));
+        }
+
+        pub fn equalJsValue(a: u32, b: u32) bool {
+            equal_calls += 1;
+            if (a == b) return true;
+            if (a <= reserved_global_this_handle or b <= reserved_global_this_handle) return false;
+            return tagOf(a) == tagOf(b);
+        }
+
+        pub fn getJsValueCount() u32 {
+            return active_handles;
+        }
+
+        pub fn typeofJsValue(h: u32) JsType {
+            if (h == reserved_undefined_handle) return .undefined;
+            if (h == reserved_null_handle) return .object;
+            const tag = tagOf(h);
+            if (tag == 0x99) return .function;
+            if (tag >= 0x3000 and tag < 0x3100) return .number;
+            return .object;
+        }
+
+        pub fn tryControlLastJsError(action: u32) Error!u32 {
+            switch (action) {
+                0 => return captured_err,
+                1 => {
+                    const out = captured_err;
+                    captured_err = no_captured_error_handle;
+                    return out;
+                },
+                else => {
+                    if (captured_err >= first_dynamic_slot) releaseJsValue(captured_err);
+                    captured_err = no_captured_error_handle;
+                    return no_captured_error_handle;
+                },
+            }
+        }
+
+        pub fn createZigCallback(desc_ptr: *const anyopaque, id: u32) Error!u32 {
+            const desc: *const CallbackDescriptor = @ptrCast(@alignCast(desc_ptr));
+            stored_trampoline = desc.trampoline_thunk;
+            last_cb_flags = desc.flags;
+            last_cb_id = id;
+            const is_stateless = (desc.flags & @as(u32, @bitCast(CallbackFlags{ .stateless = true }))) != 0;
+            if (!is_stateless) active_stateful_callbacks += 1;
+            return allocObj(0x99);
+        }
+
+        pub fn releaseZigCallback(_: u32) void {
+            std.debug.assert(active_stateful_callbacks > 0);
+            std.debug.assert(active_handles > 0);
+            active_stateful_callbacks -= 1;
+            active_handles -= 1;
+        }
+
+        pub fn tryDisposeJsValue(handle: u32) Error!void {
+            defer releaseJsValue(handle);
+            dispose_calls += 1;
+        }
+
+        pub fn disposeJsValue(handle: u32) void {
+            tryDisposeJsValue(handle) catch {};
+        }
+
+        pub fn tryAsyncDisposeJsValue(handle: u32) Error!void {
+            defer releaseJsValue(handle);
+            async_dispose_calls += 1;
+        }
+
+        pub fn asyncDisposeJsValue(handle: u32) void {
+            tryAsyncDisposeJsValue(handle) catch {};
+        }
+
+        pub fn awaitJsPromise(
+            _: u32,
+            mode_raw: u32,
+            _: *const anyopaque,
+            arg_ptr: *anyopaque,
+            _: usize,
+            _: usize,
+        ) E {
+            const mode: AwaitMode = @enumFromInt(mode_raw);
+            if (mode == .async_iterator_return) {
+                iter_return_calls += 1;
+                const Frame = arg_struct.ArgStruct(fn () Error!void);
+                const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                frame.retval = {};
+                return .SUCCESS;
+            }
+            return .FAULT;
+        }
+
+        pub fn invokeJsHostOp(desc_ptr: *const anyopaque, arg_ptr: *anyopaque, _: usize) E {
+            const J = Js(@This());
+            const desc: *const HostOpDescriptor = @ptrCast(@alignCast(desc_ptr));
+            const key = if (desc.key_ptr) |p| p[0..desc.key_len] else "";
+            const op: HostOp = @enumFromInt(desc.op);
+            switch (op) {
+                .binary_info => {
+                    const sub: BinaryInfoKind = @enumFromInt(desc.flags);
+                    switch (sub) {
+                        .is_array => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!bool);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            frame.retval = (tagOf(frame.@"0".handle) == 0x50);
+                            return .SUCCESS;
+                        },
+                        else => return .FAULT,
+                    }
+                },
+                .collection_op => {
+                    const sub: CollectionSubOp = @enumFromInt(desc.flags);
+                    switch (sub) {
+                        .array_len => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!usize);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            frame.retval = if (tagOf(frame.@"0".handle) == 0x50) 50 else 0;
+                            return .SUCCESS;
+                        },
+                        .array_get => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), usize) Error!J.Ref(Any));
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            frame.retval = .{ .handle = allocObj(@intCast(0x2000 + frame.@"1")) };
+                            return .SUCCESS;
+                        },
+                        .value_identity => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) CallError!f64);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const tag = tagOf(frame.@"0".handle);
+                            frame.retval = @floatFromInt(tag - 0x3000);
+                            return .SUCCESS;
+                        },
+                        else => return .FAULT,
+                    }
+                },
+                .get_prop => {
+                    const Frame = arg_struct.ArgStruct(fn (J.Ref(Object)) Error!J.Ref(Any));
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    const tag = tagOf(frame.@"0".handle);
+                    if (tag == 0x10) {
+                        if (std.mem.eql(u8, key, "next")) {
+                            // Distinct handle slot pointing to SAME underlying JS object (0x10)!
+                            frame.retval = .{ .handle = allocObj(0x10) };
+                            return .SUCCESS;
+                        }
+                    } else if (tag == 0x11) {
+                        if (std.mem.eql(u8, key, "next")) {
+                            frame.retval = .{ .handle = allocObj(0x12) };
+                            return .SUCCESS;
+                        }
+                    } else if (tag == 0x12) {
+                        if (std.mem.eql(u8, key, "next")) {
+                            frame.retval = .{ .handle = allocObj(0x11) };
+                            return .SUCCESS;
+                        }
+                    } else if (tag >= 0x1000 and tag <= 0x1077) {
+                        if (std.mem.eql(u8, key, "next")) {
+                            frame.retval = if (tag < 0x1077)
+                                .{ .handle = allocObj(tag + 1) }
+                            else
+                                J.Ref(Any).@"null";
+                            return .SUCCESS;
+                        }
+                    } else if (tag >= 0x2000 and tag < 0x2050) {
+                        if (std.mem.eql(u8, key, "x")) {
+                            frame.retval = .{ .handle = allocObj(0x3000 + (tag - 0x2000)) };
+                            return .SUCCESS;
+                        }
+                    } else if (tag == 0x20) {
+                        if (std.mem.eql(u8, key, "left") or std.mem.eql(u8, key, "right")) {
+                            frame.retval = .{ .handle = allocObj(0x21) };
+                            return .SUCCESS;
+                        }
+                    } else if (tag == 0x21) {
+                        if (std.mem.eql(u8, key, "next") or std.mem.eql(u8, key, "left") or std.mem.eql(u8, key, "right")) {
+                            frame.retval = J.Ref(Any).@"null";
+                            return .SUCCESS;
+                        }
+                    } else if (tag == 0x30) {
+                        captured_err = allocObj(0xEE);
+                        frame.retval = error.JsException;
+                        return .SUCCESS;
+                    }
+                    frame.retval = J.Ref(Any).@"undefined";
+                    return .SUCCESS;
+                },
+                .iterator_return => {
+                    const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!void);
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    iter_return_calls += 1;
+                    frame.retval = {};
+                    return .SUCCESS;
+                },
+                else => return .FAULT,
+            }
+        }
+    };
+
+    const js = Js(Audit54MockHost);
+    const TrampolineThunk = *const fn (*const anyopaque, *anyopaque) anyerror!void;
+
+    // 1. H1: Stateless bare functions & runtime `*const fn` pointers remain callable after `fn_ref.deinit()`
+    // with ZERO active CallbackRegistry slots and ZERO active Zig handles!
+    {
+        const Handlers = struct {
+            fn triple(x: i32) i32 {
+                return x * 3;
+            }
+            fn quad(x: i32) i32 {
+                return x * 4;
+            }
+        };
+        const CbReg = js.CallbackWithOptions(fn (i32) i32, .{ .ref_codec = false });
+        const CbArgs = arg_struct.ArgStruct(fn (i32) i32);
+
+        const fn_ref_comptime = try CbReg.tryStatelessFn(Handlers.triple);
+        try expectEqual(@as(u32, @bitCast(CallbackFlags{ .stateless = true })), Audit54MockHost.last_cb_flags);
+        try expectEqual(@as(u32, 0), js.activeCallbackCount());
+        try expectEqual(@as(u32, 0), Audit54MockHost.active_stateful_callbacks);
+        const comptime_thunk: TrampolineThunk = @ptrFromInt(Audit54MockHost.stored_trampoline);
+        const comptime_id = Audit54MockHost.last_cb_id;
+        // Release temporary Zig handle immediately (simulating ScopedCallback.push -> defer fn_ref.deinit())!
+        fn_ref_comptime.deinit();
+        try expectEqual(@as(u32, 0), js.activeHandleCount());
+        // Simulate async JS callback firing AFTER `fn_ref.deinit()`!
+        var frame1: CbArgs = .{ .retval = 0, .@"0" = 14 };
+        try comptime_thunk(@ptrFromInt(comptime_id), @ptrCast(&frame1));
+        try expectEqual(@as(i32, 42), frame1.retval);
+
+        // Runtime `*const fn` pointer:
+        var rt_ptr: *const fn (i32) i32 = &Handlers.quad;
+        _ = &rt_ptr;
+        const fn_ref_rt = try CbReg.tryStatelessFnPtr(rt_ptr);
+        const rt_thunk: TrampolineThunk = @ptrFromInt(Audit54MockHost.stored_trampoline);
+        const rt_id = Audit54MockHost.last_cb_id;
+        fn_ref_rt.deinit();
+        try expectEqual(@as(u32, 0), js.activeCallbackCount());
+        try expectEqual(@as(u32, 0), js.activeHandleCount());
+        var frame2: CbArgs = .{ .retval = 0, .@"0" = 11 };
+        try rt_thunk(@ptrFromInt(rt_id), @ptrCast(&frame2));
+        try expectEqual(@as(i32, 44), frame2.retval);
+
+        // Passing the exact same runtime `*const fn` pointer yields the exact same deterministic stateless ID!
+        const fn_ref_rt2 = try CbReg.tryStatelessFnPtr(rt_ptr);
+        try expectEqual(rt_id, Audit54MockHost.last_cb_id);
+        fn_ref_rt2.deinit();
+
+        // `persistentClosure` explicit helper (`ref_codec = true` matches ts-zigar callback wire ABI):
+        const Acc = struct {
+            sum: u32 = 0,
+            fn onVal(self: *@This(), v: js.Ref(js.Any)) void {
+                self.sum += Audit54MockHost.tagOf(v.handle);
+            }
+        };
+        var acc: Acc = .{};
+        var pcl = try js.persistentClosure(&acc, Acc.onVal);
+        try expectEqual(@as(u32, 1), js.activeCallbackCount());
+        const pcl_thunk: TrampolineThunk = @ptrFromInt(Audit54MockHost.stored_trampoline);
+        const RefArgs = arg_struct.ArgStruct(fn (js.Ref(js.Any)) js.CallError!void);
+        const arg_h = Audit54MockHost.allocObj(0x09);
+        var frame3: RefArgs = .{ .retval = {}, .@"0" = .{ .handle = arg_h } };
+        try pcl_thunk(@ptrFromInt(pcl.id), @ptrCast(&frame3));
+        try expectEqual(@as(u32, 9), acc.sum);
+        pcl.deinit();
+        try expectEqual(@as(u32, 0), js.activeCallbackCount());
+    }
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    // 2. H2 & M4: `Disposable.deinit()` is release-only; `Disposable.dispose()`, `Intersect.dispose()`,
+    // and `Iterator.closeAndDeinit()` explicitly invoke protocol cleanup AND release the handle!
+    {
+        const d_non_disposing: js.Disposable = .{ .handle = Audit54MockHost.allocObj(0x40) };
+        d_non_disposing.deinit();
+        try expectEqual(@as(u32, 0), Audit54MockHost.dispose_calls);
+        try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+        const d_disposing: js.Disposable = .{ .handle = Audit54MockHost.allocObj(0x40) };
+        d_disposing.dispose();
+        try expectEqual(@as(u32, 1), Audit54MockHost.dispose_calls);
+        try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+        const PartA = struct {
+            ref: js.Ref(js.Object),
+            pub const zigar_js = .{ .is_handle = true };
+        };
+        const Inter = js.Intersect(.{ PartA, js.Disposable });
+        const inter_val: Inter = .{ .ref = .{ .handle = Audit54MockHost.allocObj(0x40) } };
+        inter_val.dispose();
+        try expectEqual(@as(u32, 2), Audit54MockHost.dispose_calls);
+        try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+        const inter_async: Inter = .{ .ref = .{ .handle = Audit54MockHost.allocObj(0x40) } };
+        inter_async.asyncDispose();
+        try expectEqual(@as(u32, 1), Audit54MockHost.async_dispose_calls);
+        try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+        const it: js.Iterator(i32) = .{ .handle = Audit54MockHost.allocObj(0x40) };
+        it.closeAndDeinit();
+        try expectEqual(@as(u32, 1), Audit54MockHost.iter_return_calls);
+        try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+        const ait: js.AsyncIterator(i32) = .{ .handle = Audit54MockHost.allocObj(0x40) };
+        ait.closeAndDeinit();
+        try expectEqual(@as(u32, 2), Audit54MockHost.iter_return_calls);
+        try expectEqual(@as(u32, 0), js.activeHandleCount());
+    }
+
+    // 3. M1: 1-cycles & 2-cycles fail with `error.Overflow` and zero leaks; recursive binary-tree DAG sharing
+    // (`{ left: shared, right: shared }`) and 120-node acyclic `LinkedNode` lists decode in linear O(N) `equalJsValue`
+    // calls; and non-recursive `[]const Point` slices incur ZERO `equalJsValue` host round-trips!
+    {
+        const Node = struct {
+            next: ?*const @This() = null,
+        };
+        const Tree = struct {
+            left: ?*const @This() = null,
+            right: ?*const @This() = null,
+        };
+        const Point = struct {
+            x: i32,
+        };
+
+        const cyc_raw: js.Ref(js.Any) = .{ .handle = Audit54MockHost.allocObj(0x10) };
+        defer cyc_raw.deinit();
+        try std.testing.expectError(error.Overflow, js.fromJsRefAlloc(Node, std.testing.allocator, cyc_raw));
+
+        const cyc2_raw: js.Ref(js.Any) = .{ .handle = Audit54MockHost.allocObj(0x11) };
+        defer cyc2_raw.deinit();
+        try std.testing.expectError(error.Overflow, js.fromJsRefAlloc(Node, std.testing.allocator, cyc2_raw));
+
+        const dag_raw: js.Ref(js.Any) = .{ .handle = Audit54MockHost.allocObj(0x20) };
+        defer dag_raw.deinit();
+        const dag = try js.fromJsRefAlloc(Tree, std.testing.allocator, dag_raw);
+        defer js.freeDecoded(Tree, std.testing.allocator, dag);
+        try expect(dag.left != null and dag.left.?.left == null);
+        try expect(dag.right != null and dag.right.?.right == null);
+
+        // 120-node acyclic linked list (`0x1000..0x1077`): previously failed at 22 nodes with depth=64
+        // and cost 7,140 quadratic `equalJsValue` calls; now succeeds with exactly 119 linear `equalJsValue` calls!
+        Audit54MockHost.equal_calls = 0;
+        const deep_raw: js.Ref(js.Any) = .{ .handle = Audit54MockHost.allocObj(0x1000) };
+        defer deep_raw.deinit();
+        const deep_list = try js.fromJsRefAlloc(Node, std.testing.allocator, deep_raw);
+        defer js.freeDecoded(Node, std.testing.allocator, deep_list);
+        var count: usize = 1;
+        var cur = deep_list.next;
+        while (cur) |n| : (cur = n.next) count += 1;
+        try expectEqual(@as(usize, 120), count);
+        try expectEqual(@as(u32, 119), Audit54MockHost.equal_calls);
+
+        // Non-recursive 50-element `[]const Point` slice: ZERO `equalJsValue` host calls!
+        Audit54MockHost.equal_calls = 0;
+        const pts_raw: js.Ref(js.Any) = .{ .handle = Audit54MockHost.allocObj(0x50) };
+        defer pts_raw.deinit();
+        const pts = try js.fromJsRefAlloc([]const Point, std.testing.allocator, pts_raw);
+        defer js.freeDecoded([]const Point, std.testing.allocator, pts);
+        try expectEqual(@as(usize, 50), pts.len);
+        try expectEqual(@as(i32, 0), pts[0].x);
+        try expectEqual(@as(i32, 49), pts[49].x);
+        try expectEqual(@as(u32, 0), Audit54MockHost.equal_calls);
+
+        // Dense 10-struct mutually recursive clique (`C0..C9`, 100 cross-edges) inside non-self-recursive `[]const C0`:
+        // verifies O(V+E) shared-visited comptime reachability (would exceed >10^7 branches under per-path DFS)!
+        const Clique = struct {
+            const C0 = struct { f0: ?*const C0 = null, f1: ?*const C1 = null, f2: ?*const C2 = null, f3: ?*const C3 = null, f4: ?*const C4 = null, f5: ?*const C5 = null, f6: ?*const C6 = null, f7: ?*const C7 = null, f8: ?*const C8 = null, f9: ?*const C9 = null };
+            const C1 = struct { f0: ?*const C0 = null, f1: ?*const C1 = null, f2: ?*const C2 = null, f3: ?*const C3 = null, f4: ?*const C4 = null, f5: ?*const C5 = null, f6: ?*const C6 = null, f7: ?*const C7 = null, f8: ?*const C8 = null, f9: ?*const C9 = null };
+            const C2 = struct { f0: ?*const C0 = null, f1: ?*const C1 = null, f2: ?*const C2 = null, f3: ?*const C3 = null, f4: ?*const C4 = null, f5: ?*const C5 = null, f6: ?*const C6 = null, f7: ?*const C7 = null, f8: ?*const C8 = null, f9: ?*const C9 = null };
+            const C3 = struct { f0: ?*const C0 = null, f1: ?*const C1 = null, f2: ?*const C2 = null, f3: ?*const C3 = null, f4: ?*const C4 = null, f5: ?*const C5 = null, f6: ?*const C6 = null, f7: ?*const C7 = null, f8: ?*const C8 = null, f9: ?*const C9 = null };
+            const C4 = struct { f0: ?*const C0 = null, f1: ?*const C1 = null, f2: ?*const C2 = null, f3: ?*const C3 = null, f4: ?*const C4 = null, f5: ?*const C5 = null, f6: ?*const C6 = null, f7: ?*const C7 = null, f8: ?*const C8 = null, f9: ?*const C9 = null };
+            const C5 = struct { f0: ?*const C0 = null, f1: ?*const C1 = null, f2: ?*const C2 = null, f3: ?*const C3 = null, f4: ?*const C4 = null, f5: ?*const C5 = null, f6: ?*const C6 = null, f7: ?*const C7 = null, f8: ?*const C8 = null, f9: ?*const C9 = null };
+            const C6 = struct { f0: ?*const C0 = null, f1: ?*const C1 = null, f2: ?*const C2 = null, f3: ?*const C3 = null, f4: ?*const C4 = null, f5: ?*const C5 = null, f6: ?*const C6 = null, f7: ?*const C7 = null, f8: ?*const C8 = null, f9: ?*const C9 = null };
+            const C7 = struct { f0: ?*const C0 = null, f1: ?*const C1 = null, f2: ?*const C2 = null, f3: ?*const C3 = null, f4: ?*const C4 = null, f5: ?*const C5 = null, f6: ?*const C6 = null, f7: ?*const C7 = null, f8: ?*const C8 = null, f9: ?*const C9 = null };
+            const C8 = struct { f0: ?*const C0 = null, f1: ?*const C1 = null, f2: ?*const C2 = null, f3: ?*const C3 = null, f4: ?*const C4 = null, f5: ?*const C5 = null, f6: ?*const C6 = null, f7: ?*const C7 = null, f8: ?*const C8 = null, f9: ?*const C9 = null };
+            const C9 = struct { f0: ?*const C0 = null, f1: ?*const C1 = null, f2: ?*const C2 = null, f3: ?*const C3 = null, f4: ?*const C4 = null, f5: ?*const C5 = null, f6: ?*const C6 = null, f7: ?*const C7 = null, f8: ?*const C8 = null, f9: ?*const C9 = null };
+        };
+        Audit54MockHost.equal_calls = 0;
+        const clique_raw: js.Ref(js.Any) = .{ .handle = Audit54MockHost.allocObj(0x50) };
+        defer clique_raw.deinit();
+        const clique_items = try js.fromJsRefAlloc([]const Clique.C0, std.testing.allocator, clique_raw);
+        defer js.freeDecoded([]const Clique.C0, std.testing.allocator, clique_items);
+        try expectEqual(@as(usize, 50), clique_items.len);
+        try expect(clique_items[0].f9 == null);
+        // `[]const Clique.C0` is NOT self-recursive even though `C0..C9` are mutually recursive, so 0 `equalJsValue` calls!
+        try expectEqual(@as(u32, 0), Audit54MockHost.equal_calls);
+    }
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+
+    // 4. M5: `error.JsException` thrown by a property getter during union arm decode propagates immediately
+    // with `lastError` preserved rather than being swallowed as `error.TypeError`!
+    {
+        const ArmObj = struct {
+            boom: i32,
+        };
+        const U = union(enum) {
+            obj: ArmObj,
+            num: f64,
+        };
+        const throw_raw: js.Ref(js.Any) = .{ .handle = Audit54MockHost.allocObj(0x30) };
+        defer throw_raw.deinit();
+        try std.testing.expectError(error.JsException, js.fromJsRefAlloc(U, std.testing.allocator, throw_raw));
+        const err_opt = js.takeLastError();
+        try expect(err_opt != null);
+        err_opt.?.deinit();
+    }
+    try expectEqual(@as(u32, 0), js.activeHandleCount());
+}
+
 
 
 
