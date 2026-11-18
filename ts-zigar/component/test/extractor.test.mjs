@@ -76,10 +76,11 @@ const ALL_EXPECTED_TYPE_KINDS = [
 
 function ensureTypesNode26Dir() {
   const fromEnv = process.env.TS_ZIGAR_CACHE_DIR?.trim();
+  const siblingWorktreeCache = path.resolve(repoRoot, "..", ".cache", "ts-zigar");
   const cacheBase = fromEnv
     ? path.resolve(fromEnv)
-    : fs.existsSync("/d/zigar-worktrees")
-      ? "/d/zigar-worktrees/.cache/ts-zigar"
+    : fs.existsSync(siblingWorktreeCache)
+      ? siblingWorktreeCache
       : path.join(repoRoot, ".cache", "ts-zigar");
   const prefixDir = path.join(cacheBase, "types-node26");
   const pkgDir = path.join(prefixDir, "node_modules", "@types", "node");

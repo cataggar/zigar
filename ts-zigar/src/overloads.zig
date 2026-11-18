@@ -97,6 +97,14 @@ pub fn typeIrEqlWithTypeParams(
             if (!typeIrEqlWithTypeParams(ia.object_ty, ib.object_ty, tp_names_a, tp_names_b, depth + 1)) break :blk false;
             break :blk indexAccessSpecEqlWithTypeParams(ia.index_spec, ib.index_spec, tp_names_a, tp_names_b, depth + 1);
         },
+        .intersect_op => |ia| blk: {
+            const ib = b.intersect_op;
+            if (ia.len != ib.len) break :blk false;
+            for (ia, ib) |pa, pb| {
+                if (!typeIrEqlWithTypeParams(pa, pb, tp_names_a, tp_names_b, depth + 1)) break :blk false;
+            }
+            break :blk true;
+        },
         .tuple => |ta| blk: {
             const tb = b.tuple;
             if (ta.len != tb.len) break :blk false;
@@ -544,6 +552,12 @@ fn appendTypeSlug(
         .index_access_op => |ia| {
             try appendTypeSlug(buf, alloc, scratch, ia.object_ty, null, false, false, depth + 1);
             try buf.appendSlice(alloc, "Prop");
+        },
+        .intersect_op => |arms| {
+            for (arms[0..@min(arms.len, 2)], 0..) |arm, idx| {
+                if (idx > 0) try buf.appendSlice(alloc, "And");
+                try appendTypeSlug(buf, alloc, scratch, arm, null, false, false, depth + 1);
+            }
         },
         .tuple => |elems| {
             if (detailed) {
@@ -1082,6 +1096,7 @@ test "overloads: subsumption deduplication and deterministic semantic naming wit
                 int_lit: usize,
             },
         },
+        intersect_op: []const *const SelfT,
         tuple: []const struct {
             ty: *const SelfT,
             is_optional: bool = false,

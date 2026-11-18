@@ -144,6 +144,12 @@ describe('ts-zigar M3.3b Live Runtime Roundtrip: Generics, Constraints, Defaults
         );
         expect(mod.acceptUserFlags({ id: true, display_name: true, host_name: false })).to.equal(true);
       });
+
+      it('roundtrips handle + plain-struct intersections (Sync & { readonly gen: Gen } and GenericStore & StoreOverlay)', function () {
+        expect(mod.exerciseHandleStructIntersections().string).to.equal(
+          'sync=42|gen=gen:14|base=100|rev=7->8|tag=ts71',
+        );
+      });
     });
   }
 });

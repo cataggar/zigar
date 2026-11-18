@@ -427,3 +427,78 @@ pub fn exerciseUtilityTypesAndOpenMappedConditional(out_alloc: std.mem.Allocator
 pub fn acceptUserFlags(flags: m.Flags(m.UserProfile)) bool {
     return flags.id and flags.display_name and !flags.host_name and flags.port == null;
 }
+
+// 5. Handle + plain-struct intersections (`Sync & { readonly gen: Gen }`, `GenericStore<K, V> & StoreOverlay`)
+pub fn exerciseHandleStructIntersections(out_alloc: std.mem.Allocator) ![]const u8 {
+    const handles_before = js.activeHandleCount();
+    const cbs_before = js.activeCallbackCount();
+    const allocs_before = live_allocs.load(.acquire);
+
+    var out_text: []const u8 = &.{};
+    {
+        const store = try m.GenericStoreDefault().init("overlay");
+        defer store.deinit();
+        try store.set("base", 100);
+
+        const sync_fn = try m.makeSyncScorer(3);
+        defer sync_fn.deinit();
+        const gen_fn = try m.makeGenScorer("gen");
+        defer gen_fn.deinit();
+
+        const cached = try m.cacheGeneratorMethod(
+            m.SyncScorer,
+            m.GenScorer,
+            .{ .handle = store.ref.handle },
+            "score",
+            sync_fn,
+            gen_fn,
+        );
+        defer cached.deinit();
+        comptime {
+            if (!@TypeOf(cached).is_zigar_intersect_handle) {
+                @compileError("expected IntersectHandleWrapper for Sync & { readonly gen: Gen }");
+            }
+        }
+
+        const sync_res = try cached.as(m.SyncScorer).call(14);
+        const gen_prop = try cached.get("gen");
+        defer gen_prop.deinit();
+        const gen_res = try gen_prop.callAlloc(tracked_alloc, 14);
+        defer js.freeDecoded([]const u8, tracked_alloc, gen_res);
+
+        const StoreT = m.GenericStore([]const u8, f64);
+        const overlaid = try m.attachStoreOverlay(
+            []const u8,
+            f64,
+            m.StoreOverlay,
+            store,
+            .{ .revision = 7, .owner_tag = "ts71" },
+        );
+        defer overlaid.deinit();
+
+        const base_val = (try overlaid.as(StoreT).get("base")) orelse return error.Unexpected;
+        const rev_before = try overlaid.get("revision");
+        const tag_val = try overlaid.getAlloc(tracked_alloc, "owner_tag");
+        defer js.freeDecoded([]const u8, tracked_alloc, tag_val);
+
+        try overlaid.set("revision", 8);
+        const projected = try overlaid.projectAlloc(m.StoreOverlay, tracked_alloc);
+        defer js.freeDecoded(m.StoreOverlay, tracked_alloc, projected);
+
+        out_text = try std.fmt.allocPrint(
+            out_alloc,
+            "sync={d}|gen={s}|base={d}|rev={d}->{d}|tag={s}",
+            .{
+                @as(i64, @intFromFloat(sync_res)),
+                gen_res,
+                @as(i64, @intFromFloat(base_val)),
+                @as(i64, @intFromFloat(rev_before)),
+                @as(i64, @intFromFloat(projected.revision)),
+                tag_val,
+            },
+        );
+    }
+
+    try checkInvariants(handles_before, cbs_before, allocs_before);
+    return out_text;
+}

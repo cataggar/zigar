@@ -274,6 +274,115 @@ jobs:
           cd bun-zigar
           bun node_modules/mocha/bin/mocha.js --timeout 300000 -- test/js-value-handles.test.js test/es-module-imports.test.js test/js-standard-wrappers.test.js
 
+  ts-zigar:
+    name: ts-zigar (TypeScript 7.1 + Node 26 + WASM & Native E2E)
+    runs-on: ubuntu-latest
+    env:
+      COMPONENTIZE_GO_VERSION: v0.5.3
+      TS_ZIGAR_REQUIRE_TS71: '1'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 26
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
+      - name: Setup Go 1.27
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+
+      - name: Cache TypeScript 7.1 upstream checkout & staged npm package
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/ts-zigar
+            ts-zigar/component/dist
+          key: ts-zigar-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ts-zigar/component/build-component.mjs', 'ts-zigar/component/build-typescript-pkg.mjs', 'ts-zigar/wit/typescript.wit', 'ts-zigar/component/adapter/**/*.go') }}
+          restore-keys: |
+            ts-zigar-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install ghr, componentize-go, wasmtime, wazig, and zig
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! command -v zstd >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y zstd
+          fi
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://github.com/cataggar/ghr/releases/download/${GHR_VERSION}/ghr-${GHR_VERSION#v}-linux-x64.tar.gz" \
+            | tar -xzf - --strip-components=2 -C "$HOME/.local/bin" "ghr-${GHR_VERSION#v}-linux-x64/bin/ghr"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          ghr install --skip-attestation "bytecodealliance/componentize-go@${COMPONENTIZE_GO_VERSION}"
+          ghr install --skip-attestation "bytecodealliance/wasmtime@${WASMTIME_VERSION}"
+          ghr install --skip-attestation "cataggar/zig@${WAZIG_VERSION}"
+          ghr install --skip-attestation "cataggar/zig@${ZIG_VERSION}"
+          componentize-go --version
+          wazig version
+          zig version
+
+      - name: Install workspace npm dependencies
+        run: |
+          set -euo pipefail
+          (cd zigar-runtime && npm ci)
+          (cd zigar-compiler && npm ci)
+          (cd node-zigar-addon && npm ci)
+          (
+            cd node-zigar
+            npm ci
+            rm -rf node_modules/zigar-compiler node_modules/node-zigar-addon
+            ln -s ../../zigar-compiler node_modules/zigar-compiler
+            ln -s ../../node-zigar-addon node_modules/node-zigar-addon
+          )
+          if [ ! -f .cache/ts-zigar/types-node26/node_modules/@types/node/package.json ]; then
+            mkdir -p .cache/ts-zigar/types-node26
+            (cd .cache/ts-zigar/types-node26 && npm init -y >/dev/null && npm install --no-audit --no-fund @types/node@26)
+          fi
+
+      - name: Run ts-zigar component, @types/node, and TypeScript 7.1 torture tests
+        run: |
+          set -euo pipefail
+          cd ts-zigar
+          zig build test-component
+          zig build test -Drequire-ts71=true --summary all
+
+      - name: Run ts-zigar WASM32 & WASM64 roundtrip tests (zigar-compiler)
+        env:
+          USE_WAZIG: '1'
+          DEV: '1'
+          TARGET: 'wasm'
+          BITS: '32'
+          MIXIN: 'track'
+        run: |
+          set -euo pipefail
+          cd zigar-compiler
+          npx mocha --timeout 600000 \
+            test/component-host.test.js \
+            test/ts-zigar-cli.test.js \
+            test/ts-zigar-m2-types.test.js \
+            test/ts-zigar-m2-values.test.js \
+            test/ts-zigar-m3-classes.test.js \
+            test/ts-zigar-m3-generics.test.js \
+            test/ts-zigar-m3-protocols.test.js \
+            test/ts-zigar-m3-ts71.test.js
+
+      - name: Run ts-zigar Native ESM & CJS roundtrip tests (node-zigar)
+        env:
+          USE_WAZIG: '0'
+        run: |
+          set -euo pipefail
+          cd node-zigar
+          npx mocha --no-warnings --timeout 600000 \
+            test/ts-zigar-m2-values.test.js \
+            test/ts-zigar-m3-classes.test.js \
+            test/ts-zigar-m3-generics.test.js \
+            test/ts-zigar-m3-protocols.test.js \
+            test/ts-zigar-m3-ts71.test.js
+
   benchmarks:
     name: Wazig vs Zig Benchmarks
     runs-on: ubuntu-latest

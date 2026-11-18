@@ -176,5 +176,24 @@ export function flagsOf(obj) {
   return Object.fromEntries(Object.keys(obj).map((k) => [k, true]));
 }
 
+export function makeSyncScorer(scale) {
+  return (input) => Number(input) * Number(scale);
+}
+
+export function makeGenScorer(prefix) {
+  return (input) => `${prefix}:${input}`;
+}
+
+export function cacheGeneratorMethod(owner, name, sync, gen) {
+  const wrapped = (...args) => sync.apply(owner, args);
+  Object.defineProperty(wrapped, 'name', { value: String(name), configurable: true });
+  wrapped.gen = gen;
+  return wrapped;
+}
+
+export function attachStoreOverlay(store, extra) {
+  return Object.assign(store, extra);
+}
+
 
 

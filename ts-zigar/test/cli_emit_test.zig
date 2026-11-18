@@ -37,6 +37,29 @@ fn fileExists(path: []const u8) bool {
     return true;
 }
 
+fn resolveTypesNode26Dir(alloc: std.mem.Allocator) !?[]const u8 {
+    if (std.testing.environ.getPosix("TS_ZIGAR_CACHE_DIR")) |cache_dir| {
+        if (cache_dir.len > 0) {
+            const env_pkg = try std.fs.path.join(alloc, &.{ cache_dir, "types-node26", "node_modules", "@types", "node" });
+            const env_json = try std.fs.path.join(alloc, &.{ env_pkg, "package.json" });
+            defer alloc.free(env_json);
+            if (fileExists(env_json)) return env_pkg;
+            alloc.free(env_pkg);
+        }
+    }
+    const candidates = [_][]const u8{
+        "../.cache/ts-zigar/types-node26/node_modules/@types/node",
+        ".cache/ts-zigar/types-node26/node_modules/@types/node",
+        "../../.cache/ts-zigar/types-node26/node_modules/@types/node",
+    };
+    for (candidates) |cand| {
+        const pkg_json = try std.fs.path.join(alloc, &.{ cand, "package.json" });
+        defer alloc.free(pkg_json);
+        if (fileExists(pkg_json)) return try alloc.dupe(u8, cand);
+    }
+    return null;
+}
+
 fn runZigCheck(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
     var child = try std.process.spawn(io, .{
         .argv = argv,
@@ -3005,10 +3028,8 @@ test "Issue #47 @types/node@26 sweep: buffer, fs, events, http, stream pass AstG
     const io = std.testing.io;
     const cwd = std.Io.Dir.cwd();
 
-    const types_node_dir = "/d/zigar-worktrees/.cache/ts-zigar/types-node26/node_modules/@types/node";
-    _ = cwd.statFile(io, "/d/zigar-worktrees/.cache/ts-zigar/types-node26/node_modules/@types/node/package.json", .{}) catch {
-        return error.SkipZigTest;
-    };
+    const types_node_dir = (try resolveTypesNode26Dir(alloc)) orelse return error.SkipZigTest;
+    defer alloc.free(types_node_dir);
 
     const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue47-node26-sweep", .{resolveTmpRoot()});
     defer alloc.free(sandbox);
@@ -5066,10 +5087,8 @@ test "Issue #52 @types/node@26 protocol sweep: fs/promises, timers/promises, str
     const io = std.testing.io;
     const cwd = std.Io.Dir.cwd();
 
-    const types_node_dir = "/d/zigar-worktrees/.cache/ts-zigar/types-node26/node_modules/@types/node";
-    _ = cwd.statFile(io, "/d/zigar-worktrees/.cache/ts-zigar/types-node26/node_modules/@types/node/package.json", .{}) catch {
-        return error.SkipZigTest;
-    };
+    const types_node_dir = (try resolveTypesNode26Dir(alloc)) orelse return error.SkipZigTest;
+    defer alloc.free(types_node_dir);
 
     const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue52-node26-protocols", .{resolveTmpRoot()});
     defer alloc.free(sandbox);
@@ -5160,6 +5179,385 @@ test "Issue #52 @types/node@26 protocol sweep: fs/promises, timers/promises, str
         });
     }
 
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", probe_zig });
+}
+
+test "Issue #53 (M3.4a): ECMA-262 export * shadowing/default/ambiguity/diamond/export type *, nested export * as ns, multi-segment wildcard exports, and condition key order" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue53-export-star", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const pkg_dir = try std.fmt.allocPrint(alloc, "{s}/rpkg", .{sandbox});
+    defer alloc.free(pkg_dir);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+
+    const dist_sub_ab = try std.fmt.allocPrint(alloc, "{s}/dist/sub/alpha", .{pkg_dir});
+    defer alloc.free(dist_sub_ab);
+    const dist_sub_priv = try std.fmt.allocPrint(alloc, "{s}/dist/sub/private", .{pkg_dir});
+    defer alloc.free(dist_sub_priv);
+    const dist_sub_spec = try std.fmt.allocPrint(alloc, "{s}/dist/sub/special", .{pkg_dir});
+    defer alloc.free(dist_sub_spec);
+    const dist_spec = try std.fmt.allocPrint(alloc, "{s}/dist/special", .{pkg_dir});
+    defer alloc.free(dist_spec);
+    try cwd.createDirPath(io, dist_sub_ab);
+    try cwd.createDirPath(io, dist_sub_priv);
+    try cwd.createDirPath(io, dist_sub_spec);
+    try cwd.createDirPath(io, dist_spec);
+
+    {
+        var pd = try cwd.openDir(io, pkg_dir, .{});
+        defer pd.close(io);
+
+        try pd.writeFile(io, .{
+            .sub_path = "package.json",
+            .data =
+            \\{
+            \\  "name": "rpkg",
+            \\  "version": "1.0.0",
+            \\  "exports": {
+            \\    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+            \\    "./override": { "types": "./dist/override.d.ts" },
+            \\    "./cond": { "default": "./dist/def_entry.d.ts", "import": "./dist/imp_entry.d.ts" },
+            \\    "./sub/*": { "types": "./dist/sub/*.d.ts" },
+            \\    "./sub/special/*": { "types": "./dist/special/*.d.ts" },
+            \\    "./sub/private/*": null
+            \\  }
+            \\}
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/a.d.ts",
+            .data =
+            \\export declare function foo(): string;
+            \\export default function defFn(): void;
+            \\export declare function dup(): number;
+            \\export declare function explicitPick(): string;
+            \\export declare function ok(): boolean;
+            \\export interface Boxed { tag: string; }
+            \\export declare function isBoxed(v: unknown): v is Boxed;
+            \\export declare namespace isBoxed {
+            \\    function helper(): number;
+            \\}
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/b.d.ts",
+            .data =
+            \\export declare function dup(): string;
+            \\export declare function explicitPick(): number;
+            \\export declare function okB(): number;
+            \\export * from "./diamond.js";
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/mid_leaf.d.ts",
+            .data =
+            \\export declare function midShadow(): number;
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/typeonly_imp.d.ts",
+            .data =
+            \\export declare class ImportedTypeClass {
+            \\    constructor();
+            \\    pong(): number;
+            \\}
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/mid.d.ts",
+            .data =
+            \\import type { ImportedTypeClass } from "./typeonly_imp.js";
+            \\export { ImportedTypeClass };
+            \\export declare function midShadow(): string;
+            \\export * from "./mid_leaf.js";
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/diamond.d.ts",
+            .data =
+            \\export declare function sharedDiamond(): string;
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/typeonly.d.ts",
+            .data =
+            \\export declare class Ghost {
+            \\    constructor();
+            \\    ping(): string;
+            \\}
+            \\export declare function ghostFn(): void;
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/ns_deep.d.ts",
+            .data =
+            \\export declare function deepRun(): number;
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/ns_inner.d.ts",
+            .data =
+            \\export * from "./ns_deep.js";
+            \\export declare function directRun(): string;
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/p_a.d.ts",
+            .data =
+            \\export declare function nestedDup(): string;
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/p_b.d.ts",
+            .data =
+            \\export declare function nestedDup(): number;
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/p.d.ts",
+            .data =
+            \\export * from "./p_a.js";
+            \\export * from "./p_b.js";
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/d.d.ts",
+            .data =
+            \\export declare function nestedDup(): boolean;
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/override.d.ts",
+            .data =
+            \\import { nestedDup } from "./d.js";
+            \\export { nestedDup };
+            \\export * from "./p.js";
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/index.d.ts",
+            .data =
+            \\import { explicitPick } from "./a.js";
+            \\export { explicitPick };
+            \\export * from "./a.js";
+            \\export * from "./b.js";
+            \\export * from "./p.js";
+            \\export * from "./d.js";
+            \\export * from "./mid.js";
+            \\export * from "./diamond.js";
+            \\export type * from "./typeonly.js";
+            \\export * as nestedNs from "./ns_inner.js";
+            \\export declare function foo(n: number): number;
+            \\export declare function acceptGhost(g: Ghost): string;
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/def_entry.d.ts",
+            .data =
+            \\export declare function fromDefaultCond(): boolean;
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/imp_entry.d.ts",
+            .data =
+            \\export declare function fromImportCond(): boolean;
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/sub/alpha/beta.d.ts",
+            .data =
+            \\export declare function multiSegSubpath(): number;
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/sub/special/foo.d.ts",
+            .data =
+            \\export declare function wrongSpecial(): void;
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/special/foo.d.ts",
+            .data =
+            \\export declare function rightSpecial(): boolean;
+            ,
+        });
+
+        try pd.writeFile(io, .{
+            .sub_path = "dist/sub/private/secret.d.ts",
+            .data =
+            \\export declare function blockedByNullExport(): void;
+            ,
+        });
+    }
+
+    const cli_args = [_][]const u8{ "-t", pkg_dir, "-d", out_dir };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Issue #53 export-star pipeline error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+
+    {
+        var out_h = try cwd.openDir(io, out_dir, .{});
+        defer out_h.close(io);
+        // Excluded `"./sub/private/*": null`, more-specific wildcard decoy `dist/sub/special/foo.zig`,
+        // and shadowed `"import"` condition must NOT be emitted!
+        try std.testing.expectError(error.FileNotFound, out_h.statFile(io, "dist/sub/private/secret.zig", .{}));
+        try std.testing.expectError(error.FileNotFound, out_h.statFile(io, "dist/sub/special/foo.zig", .{}));
+        try std.testing.expectError(error.FileNotFound, out_h.statFile(io, "dist/imp_entry.zig", .{}));
+
+        // NB4: Encapsulated internal module `dist/a.zig` must NOT advertise bogus `.wire_specifier = "dist/a"`,
+        // and `dist/typeonly.zig` (with zero runtime-claimed decls) must omit `.wire_specifier`!
+        const a_src = try out_h.readFileAlloc(io, "dist/a.zig", alloc, .limited(64 * 1024));
+        defer alloc.free(a_src);
+        try std.testing.expect(std.mem.indexOf(u8, a_src, ".wire_specifier = \"dist/a\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, a_src, ".wire_specifier = \"rpkg\"") != null);
+
+        const to_src = try out_h.readFileAlloc(io, "dist/typeonly.zig", alloc, .limited(64 * 1024));
+        defer alloc.free(to_src);
+        try std.testing.expect(std.mem.indexOf(u8, to_src, ".wire_specifier =") == null);
+    }
+
+    const probe_zig = try std.fmt.allocPrint(alloc, "{s}/probe_issue53.zig", .{sandbox});
+    defer alloc.free(probe_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "probe_issue53.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r = @import("out/root.zig");
+            \\const mod_idx = @import("out/dist/index.zig");
+            \\const mod_a = @import("out/dist/a.zig");
+            \\const mod_b = @import("out/dist/b.zig");
+            \\const mod_d = @import("out/dist/d.zig");
+            \\const mod_to = @import("out/dist/typeonly.zig");
+            \\const mod_to_imp = @import("out/dist/typeonly_imp.zig");
+            \\const mod_deep = @import("out/dist/ns_deep.zig");
+            \\
+            \\test "ECMA-262 export *, export type *, nested export * as ns, multi-segment *, and condition key order" {
+            \\    // 1. Barrel's own `foo(n: f64) !f64` wins; shadowed `mod_a.foo()` is pruned!
+            \\    try std.testing.expect(@hasDecl(mod_idx, "foo"));
+            \\    try std.testing.expect(!@hasDecl(mod_a, "foo"));
+            \\    const foo_ptr: *const fn (f64) r.zigar_js.CallError!f64 = &mod_idx.foo;
+            \\    _ = foo_ptr;
+            \\
+            \\    // 2. `export *` never forwards `default` (`defFn` / `Default`)!
+            \\    try std.testing.expect(!@hasDecl(mod_idx, "Default"));
+            \\    try std.testing.expect(!@hasDecl(mod_idx, "defFn"));
+            \\    try std.testing.expect(!@hasDecl(mod_a, "Default"));
+            \\    try std.testing.expect(!@hasDecl(mod_a, "defFn"));
+            \\
+            \\    // 3. Ambiguous multi-star `dup` (`a.dup` vs `b.dup`) is excluded everywhere,
+            \\    //    while unambiguous `ok`, `okB`, diamond `sharedDiamond`, and merged
+            \\    //    `function + namespace` (`isBoxed` + `isBoxedNarrow` + `IsBoxed.helper`) are forwarded!
+            \\    try std.testing.expect(!@hasDecl(mod_idx, "dup"));
+            \\    try std.testing.expect(!@hasDecl(mod_a, "dup"));
+            \\    try std.testing.expect(!@hasDecl(mod_b, "dup"));
+            \\    try std.testing.expect(@hasDecl(mod_idx, "ok"));
+            \\    try std.testing.expect(@hasDecl(mod_idx, "okB"));
+            \\    try std.testing.expect(@hasDecl(mod_idx, "sharedDiamond"));
+            \\    try std.testing.expect(@hasDecl(mod_idx, "isBoxed"));
+            \\    try std.testing.expect(@hasDecl(mod_idx, "isBoxedNarrow"));
+            \\    try std.testing.expect(@hasDecl(mod_idx, "IsBoxed"));
+            \\    try std.testing.expect(@hasDecl(mod_idx.IsBoxed, "helper"));
+            \\
+            \\    // 4. `export type *` and `import type { ImportedTypeClass }; export { ImportedTypeClass }` via `export *`
+            \\    //    expose class types + instance methods, but NEVER runtime `.init` constructors or functions!
+            \\    try std.testing.expect(@hasDecl(mod_idx, "Ghost"));
+            \\    try std.testing.expect(mod_idx.Ghost == mod_to.Ghost);
+            \\    try std.testing.expect(@hasDecl(mod_to.Ghost, "ping"));
+            \\    try std.testing.expect(!@hasDecl(mod_to.Ghost, "init"));
+            \\    try std.testing.expect(!@hasDecl(mod_idx, "ghostFn"));
+            \\    try std.testing.expect(!@hasDecl(mod_to, "ghostFn"));
+            \\    try std.testing.expect(@hasDecl(mod_idx, "ImportedTypeClass"));
+            \\    try std.testing.expect(mod_idx.ImportedTypeClass == mod_to_imp.ImportedTypeClass);
+            \\    try std.testing.expect(@hasDecl(mod_to_imp.ImportedTypeClass, "pong"));
+            \\    try std.testing.expect(!@hasDecl(mod_to_imp.ImportedTypeClass, "init"));
+            \\
+            \\    // 4b. B1-R: Intermediate override (`mid.midShadow(): string` hiding `mid_leaf.midShadow(): number`)
+            \\    //     and barrel explicit re-export (`import { explicitPick } from "./a"; export { explicitPick }`)
+            \\    //     both win cleanly over `export *`!
+            \\    try std.testing.expect(@hasDecl(mod_idx, "midShadow"));
+            \\    const mid_ptr: *const fn () r.zigar_js.CallError![]const u8 = &mod_idx.midShadow;
+            \\    _ = mid_ptr;
+            \\    try std.testing.expect(@hasDecl(mod_idx, "explicitPick"));
+            \\    const exp_ptr: *const fn () r.zigar_js.CallError![]const u8 = &mod_idx.explicitPick;
+            \\    _ = exp_ptr;
+            \\    try std.testing.expect(!@hasDecl(mod_b, "explicitPick"));
+            \\
+            \\    // 4c. B1-R2: Nested `export *` ambiguity at `p` (`a.nestedDup` vs `b.nestedDup`) propagates
+            \\    //     upward to `index` (`export * from "./p"; export * from "./d"`), suppressing `d.nestedDup`
+            \\    //     even while `mod_d.nestedDup` is alive via `rpkg/override`'s explicit `export { nestedDup }`!
+            \\    try std.testing.expect(@hasDecl(mod_d, "nestedDup"));
+            \\    try std.testing.expect(!@hasDecl(mod_idx, "nestedDup"));
+            \\    try std.testing.expect(@hasDecl(r.rpkg_override, "nestedDup"));
+            \\    const ov_ptr: *const fn () r.zigar_js.CallError!bool = &r.rpkg_override.nestedDup;
+            \\    _ = ov_ptr;
+            \\
+            \\    // 5. NB1: `export * as nestedNs` claims both direct `directRun` and nested `export *` `deepRun`!
+            \\    try std.testing.expect(@hasDecl(mod_idx.nestedNs, "directRun"));
+            \\    try std.testing.expect(@hasDecl(mod_idx.nestedNs, "deepRun"));
+            \\    try std.testing.expect(&mod_idx.nestedNs.deepRun == &mod_deep.deepRun);
+            \\
+            \\    // 6. NB2 + NB3: Multi-segment wildcard `"./sub/*"` (`rpkg_sub_alpha_beta`), more-specific wildcard
+            \\    //    `"./sub/special/*"` (`rpkg_sub_special_foo`), and JSON key-order `"default"` before `"import"` (`rpkg_cond`)!
+            \\    try std.testing.expect(@hasDecl(r, "rpkg_sub_alpha_beta"));
+            \\    try std.testing.expect(@hasDecl(r.rpkg_sub_alpha_beta, "multiSegSubpath"));
+            \\    try std.testing.expectEqualStrings("rpkg/sub/alpha/beta", r.rpkg_sub_alpha_beta.zigar_js.wire_specifier);
+            \\    try std.testing.expect(@hasDecl(r, "rpkg_sub_special_foo"));
+            \\    try std.testing.expect(@hasDecl(r.rpkg_sub_special_foo, "rightSpecial"));
+            \\    try std.testing.expect(!@hasDecl(r.rpkg_sub_special_foo, "wrongSpecial"));
+            \\    try std.testing.expectEqualStrings("rpkg/sub/special/foo", r.rpkg_sub_special_foo.zigar_js.wire_specifier);
+            \\    try std.testing.expect(@hasDecl(r, "rpkg_cond"));
+            \\    try std.testing.expect(@hasDecl(r.rpkg_cond, "fromDefaultCond"));
+            \\    try std.testing.expect(!@hasDecl(r.rpkg_cond, "fromImportCond"));
+            \\}
+            ,
+        });
+    }
+
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", probe_zig });
 }
 
