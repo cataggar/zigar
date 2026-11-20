@@ -20,9 +20,10 @@ pub const LoadedSources = struct {
     root_vfs_paths: [][]const u8,
     base_dir: []const u8,
     specifier_overrides: []ir.SpecifierOverride = &.{},
+    types_only_vfs_prefixes: [][]const u8 = &.{},
 
     pub fn deinit(self: *LoadedSources, allocator: std.mem.Allocator) void {
-        for (self.files) |f| f.deinit(allocator);
+        for (self.files) |f| deinitVirtualFile(f, allocator);
         allocator.free(self.files);
         for (self.root_vfs_paths) |p| allocator.free(p);
         allocator.free(self.root_vfs_paths);
@@ -31,8 +32,14 @@ pub const LoadedSources = struct {
             allocator.free(ov.wire_specifier);
         }
         allocator.free(self.specifier_overrides);
+        for (self.types_only_vfs_prefixes) |pfx| allocator.free(pfx);
+        allocator.free(self.types_only_vfs_prefixes);
         allocator.free(self.base_dir);
         self.* = undefined;
+    }
+
+    fn deinitVirtualFile(f: VirtualFile, allocator: std.mem.Allocator) void {
+        f.deinit(allocator);
     }
 };
 
@@ -158,6 +165,7 @@ const SourceCollector = struct {
     files: std.ArrayList(VirtualFile) = .empty,
     root_vfs_paths: std.ArrayList([]const u8) = .empty,
     specifier_overrides: std.ArrayList(ir.SpecifierOverride) = .empty,
+    types_only_vfs_prefixes: std.ArrayList([]const u8) = .empty,
     entry_base_dirs: std.ArrayList([]u8) = .empty,
     scan_queue: std.ArrayList(PendingScan) = .empty,
 
@@ -186,6 +194,8 @@ const SourceCollector = struct {
             self.allocator.free(ov.wire_specifier);
         }
         self.specifier_overrides.deinit(self.allocator);
+        for (self.types_only_vfs_prefixes.items) |pfx| self.allocator.free(pfx);
+        self.types_only_vfs_prefixes.deinit(self.allocator);
     }
 
     fn addRootVfsPath(self: *SourceCollector, vfs_path: []const u8) !void {
@@ -195,6 +205,16 @@ const SourceCollector = struct {
         const owned = try self.allocator.dupe(u8, vfs_path);
         errdefer self.allocator.free(owned);
         try self.root_vfs_paths.append(self.allocator, owned);
+    }
+
+    fn addTypesOnlyVfsPrefix(self: *SourceCollector, vfs_prefix: []const u8) !void {
+        if (vfs_prefix.len == 0) return;
+        for (self.types_only_vfs_prefixes.items) |existing| {
+            if (std.mem.eql(u8, existing, vfs_prefix)) return;
+        }
+        const owned = try self.allocator.dupe(u8, vfs_prefix);
+        errdefer self.allocator.free(owned);
+        try self.types_only_vfs_prefixes.append(self.allocator, owned);
     }
 
     fn addSpecifierOverride(self: *SourceCollector, vfs_path: []const u8, wire_specifier: []const u8) !void {
@@ -306,13 +326,35 @@ const SourceCollector = struct {
         std.mem.sort([]u8, subdir_names.items, {}, StrLess.lt);
         std.mem.sort([]u8, file_names.items, {}, StrLess.lt);
 
+        var pkg_json_vfs_opt: ?[]const u8 = null;
         for (file_names.items) |fname| {
             const full = try joinDiskPath(self.allocator, dir_disk_path, fname);
             defer self.allocator.free(full);
-            _ = try self.tryMountDiskFile(full, true);
+            const vp = try self.tryMountDiskFile(full, true);
+            if (depth == 0 and std.mem.eql(u8, fname, "package.json")) {
+                pkg_json_vfs_opt = vp;
+            }
+        }
+
+        var excluded_top_dirs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (excluded_top_dirs.items) |s| self.allocator.free(s);
+            excluded_top_dirs.deinit(self.allocator);
+        }
+        if (depth == 0) {
+            if (pkg_json_vfs_opt) |pkg_vp| {
+                if (self.vfs_seen.get(pkg_vp)) |pkg_idx| {
+                    try collectExcludedTypesVersionsDirs(
+                        self.allocator,
+                        self.files.items[pkg_idx].contents,
+                        &excluded_top_dirs,
+                    );
+                }
+            }
         }
 
         for (subdir_names.items) |sname| {
+            if (depth == 0 and containsSlice(excluded_top_dirs.items, sname)) continue;
             const sub_full = try joinDiskPath(self.allocator, dir_disk_path, sname);
             defer self.allocator.free(sub_full);
             try self.mountDirectoryTree(sub_full, depth + 1);
@@ -381,6 +423,21 @@ const SourceCollector = struct {
             (if (nv == .string and nv.string.len > 0) nv.string else null)
         else
             null;
+
+        if (!add_as_primary_root) {
+            if (pkg_name) |pn| {
+                if (isTypesOnlyNpmPackage(pn, obj, pkg_dir_disk, self.io)) {
+                    const pkg_vfs_dir = try toVfsPath(self.allocator, pkg_dir_disk);
+                    defer self.allocator.free(pkg_vfs_dir);
+                    const pkg_vfs_prefix = if (std.mem.eql(u8, pkg_vfs_dir, "/"))
+                        try self.allocator.dupe(u8, "/")
+                    else
+                        try std.fmt.allocPrint(self.allocator, "{s}/", .{pkg_vfs_dir});
+                    defer self.allocator.free(pkg_vfs_prefix);
+                    try self.addTypesOnlyVfsPrefix(pkg_vfs_prefix);
+                }
+            }
+        }
 
         var found_any = false;
 
@@ -680,6 +737,74 @@ const SourceCollector = struct {
     }
 };
 
+fn isTypesOnlyNpmPackage(
+    pkg_name: []const u8,
+    obj: std.json.ObjectMap,
+    pkg_dir_disk: []const u8,
+    io: std.Io,
+) bool {
+    if (std.mem.startsWith(u8, pkg_name, "@types/")) return false;
+    const has_types = blk: {
+        if (obj.get("types")) |tv| {
+            if (tv == .string and tv.string.len > 0) break :blk true;
+        }
+        if (obj.get("typings")) |tv| {
+            if (tv == .string and tv.string.len > 0) break :blk true;
+        }
+        break :blk false;
+    };
+    if (!has_types) return false;
+    if (obj.get("main") != null or
+        obj.get("module") != null or
+        obj.get("exports") != null or
+        obj.get("browser") != null or
+        obj.get("bin") != null)
+    {
+        return false;
+    }
+    if (obj.get("files")) |fv| {
+        if (fv == .array and fv.array.items.len > 0) {
+            var all_dts = true;
+            for (fv.array.items) |item| {
+                if (item != .string or !isTypeScriptDeclarationFileOnly(item.string)) {
+                    all_dts = false;
+                    break;
+                }
+            }
+            if (all_dts) return true;
+        }
+    }
+    return !dirContainsRuntimeJsFile(pkg_dir_disk, io, 0);
+}
+
+fn dirContainsRuntimeJsFile(dir_disk_path: []const u8, io: std.Io, depth: usize) bool {
+    if (depth > 2) return false;
+    var dir = std.Io.Dir.cwd().openDir(io, dir_disk_path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        switch (entry.kind) {
+            .file, .sym_link => {
+                if (std.mem.endsWith(u8, entry.name, ".js") or
+                    std.mem.endsWith(u8, entry.name, ".mjs") or
+                    std.mem.endsWith(u8, entry.name, ".cjs"))
+                {
+                    return true;
+                }
+            },
+            .directory => {
+                if (std.mem.eql(u8, entry.name, "node_modules")) continue;
+                var sub_buf: [1024]u8 = undefined;
+                const sub = std.fmt.bufPrint(&sub_buf, "{s}/{s}", .{ dir_disk_path, entry.name }) catch continue;
+                if (dirContainsRuntimeJsFile(sub, io, depth + 1)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
 fn isTypeScriptDeclarationFileOnly(name: []const u8) bool {
     const exts = [_][]const u8{ ".d.ts", ".d.mts", ".d.cts" };
     for (exts) |ext| {
@@ -777,6 +902,222 @@ fn extractXmlAttr(line: []const u8, attr_name: []const u8) ?[]const u8 {
         return line[eq + 1 .. eq + 1 + close_rel];
     }
     return null;
+}
+
+fn containsSlice(haystack: []const []u8, needle: []const u8) bool {
+    for (haystack) |item| {
+        if (std.mem.eql(u8, item, needle)) return true;
+    }
+    return false;
+}
+
+fn appendUniqueOwnedDir(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList([]u8),
+    dir_name: []const u8,
+) error{OutOfMemory}!void {
+    if (dir_name.len == 0 or std.mem.eql(u8, dir_name, ".") or std.mem.eql(u8, dir_name, "..")) return;
+    if (containsSlice(list.items, dir_name)) return;
+    try list.append(allocator, try allocator.dupe(u8, dir_name));
+}
+
+fn topDirFromRelTarget(raw_target: []const u8) ?[]const u8 {
+    var s = std.mem.trim(u8, raw_target, " \t\r\n");
+    while (std.mem.startsWith(u8, s, "./")) s = s[2..];
+    while (std.mem.startsWith(u8, s, "/")) s = s[1..];
+    const slash = std.mem.indexOfScalar(u8, s, '/') orelse return null;
+    const head = s[0..slash];
+    if (head.len == 0 or std.mem.indexOfScalar(u8, head, '*') != null) return null;
+    return head;
+}
+
+fn collectTopDirsFromTypesVersionsMap(
+    allocator: std.mem.Allocator,
+    map_val: std.json.Value,
+    out: *std.ArrayList([]u8),
+) error{OutOfMemory}!void {
+    if (map_val != .object) return;
+    var it = map_val.object.iterator();
+    while (it.next()) |kv| {
+        switch (kv.value_ptr.*) {
+            .string => |s| {
+                if (topDirFromRelTarget(s)) |d| try appendUniqueOwnedDir(allocator, out, d);
+            },
+            .array => |arr| {
+                for (arr.items) |elem| {
+                    if (elem == .string) {
+                        if (topDirFromRelTarget(elem.string)) |d| try appendUniqueOwnedDir(allocator, out, d);
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+fn parseSemverPrefix(raw: []const u8) ?struct { major: u32, minor: ?u32, patch: ?u32 } {
+    var s = std.mem.trim(u8, raw, " \t");
+    if (s.len > 0 and (s[0] == 'v' or s[0] == 'V')) s = s[1..];
+    if (std.mem.indexOfAny(u8, s, "-+")) |pre| s = s[0..pre];
+    if (s.len == 0) return null;
+
+    var parts = std.mem.splitScalar(u8, s, '.');
+    const maj_s = parts.next() orelse return null;
+    if (std.mem.eql(u8, maj_s, "*") or std.mem.eql(u8, maj_s, "x") or std.mem.eql(u8, maj_s, "X")) {
+        return .{ .major = 0, .minor = null, .patch = null };
+    }
+    const maj = std.fmt.parseInt(u32, maj_s, 10) catch return null;
+    var min_opt: ?u32 = null;
+    var pat_opt: ?u32 = null;
+    if (parts.next()) |min_s| {
+        if (!std.mem.eql(u8, min_s, "*") and !std.mem.eql(u8, min_s, "x") and !std.mem.eql(u8, min_s, "X")) {
+            min_opt = std.fmt.parseInt(u32, min_s, 10) catch return null;
+            if (parts.next()) |pat_s| {
+                if (!std.mem.eql(u8, pat_s, "*") and !std.mem.eql(u8, pat_s, "x") and !std.mem.eql(u8, pat_s, "X")) {
+                    pat_opt = std.fmt.parseInt(u8, pat_s, 10) catch (std.fmt.parseInt(u32, pat_s, 10) catch return null);
+                }
+            }
+        }
+    }
+    return .{ .major = maj, .minor = min_opt, .patch = pat_opt };
+}
+
+fn cmpSemver3(a0: u32, a1: u32, a2: u32, b0: u32, b1: u32, b2: u32) std.math.Order {
+    if (a0 != b0) return std.math.order(a0, b0);
+    if (a1 != b1) return std.math.order(a1, b1);
+    return std.math.order(a2, b2);
+}
+
+fn singleTypesVersionCompMatches(comp_raw: []const u8, maj: u32, min: u32, pat: u32) bool {
+    const comp = std.mem.trim(u8, comp_raw, " \t");
+    if (comp.len == 0 or std.mem.eql(u8, comp, "*")) return true;
+
+    if (std.mem.startsWith(u8, comp, "<=")) {
+        const v = parseSemverPrefix(comp[2..]) orelse return true;
+        const hi_min = v.minor orelse std.math.maxInt(u32);
+        const hi_pat = if (v.minor == null) std.math.maxInt(u32) else (v.patch orelse std.math.maxInt(u32));
+        return cmpSemver3(maj, min, pat, v.major, hi_min, hi_pat) != .gt;
+    }
+    if (std.mem.startsWith(u8, comp, ">=")) {
+        const v = parseSemverPrefix(comp[2..]) orelse return true;
+        return cmpSemver3(maj, min, pat, v.major, v.minor orelse 0, v.patch orelse 0) != .lt;
+    }
+    if (std.mem.startsWith(u8, comp, "<")) {
+        const v = parseSemverPrefix(comp[1..]) orelse return true;
+        return cmpSemver3(maj, min, pat, v.major, v.minor orelse 0, v.patch orelse 0) == .lt;
+    }
+    if (std.mem.startsWith(u8, comp, ">")) {
+        const v = parseSemverPrefix(comp[1..]) orelse return true;
+        const hi_min = v.minor orelse std.math.maxInt(u32);
+        const hi_pat = if (v.minor == null) std.math.maxInt(u32) else (v.patch orelse std.math.maxInt(u32));
+        return cmpSemver3(maj, min, pat, v.major, hi_min, hi_pat) == .gt;
+    }
+    if (std.mem.startsWith(u8, comp, "^")) {
+        const v = parseSemverPrefix(comp[1..]) orelse return true;
+        if (cmpSemver3(maj, min, pat, v.major, v.minor orelse 0, v.patch orelse 0) == .lt) return false;
+        return maj == v.major;
+    }
+    if (std.mem.startsWith(u8, comp, "~")) {
+        const v = parseSemverPrefix(comp[1..]) orelse return true;
+        if (cmpSemver3(maj, min, pat, v.major, v.minor orelse 0, v.patch orelse 0) == .lt) return false;
+        if (v.minor) |vmin| return maj == v.major and min == vmin;
+        return maj == v.major;
+    }
+    const eq_str = if (std.mem.startsWith(u8, comp, "=")) comp[1..] else comp;
+    const v = parseSemverPrefix(eq_str) orelse return true;
+    if (maj != v.major) return false;
+    if (v.minor) |vmin| {
+        if (min != vmin) return false;
+        if (v.patch) |vpat| return pat == vpat;
+    }
+    return true;
+}
+
+pub fn typesVersionRangeMatches(range_raw: []const u8, maj: u32, min: u32, pat: u32) bool {
+    const trimmed = std.mem.trim(u8, range_raw, " \t\r\n");
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "*")) return true;
+
+    var disj_it = std.mem.splitSequence(u8, trimmed, "||");
+    while (disj_it.next()) |branch_raw| {
+        const branch = std.mem.trim(u8, branch_raw, " \t");
+        if (branch.len == 0) continue;
+        // Conservatively treat hyphen ranges (`4.0 - 5.0`) if encountered cleanly.
+        if (std.mem.indexOf(u8, branch, " - ")) |hyph| {
+            const lo = branch[0..hyph];
+            const hi = branch[hyph + 3 ..];
+            var lo_buf: [64]u8 = undefined;
+            var hi_buf: [64]u8 = undefined;
+            const lo_c = std.fmt.bufPrint(&lo_buf, ">={s}", .{lo}) catch return true;
+            const hi_c = std.fmt.bufPrint(&hi_buf, "<={s}", .{hi}) catch return true;
+            if (singleTypesVersionCompMatches(lo_c, maj, min, pat) and
+                singleTypesVersionCompMatches(hi_c, maj, min, pat))
+            {
+                return true;
+            }
+            continue;
+        }
+        var all_ok = true;
+        var tok_it = std.mem.tokenizeAny(u8, branch, " \t");
+        while (tok_it.next()) |tok| {
+            if (!singleTypesVersionCompMatches(tok, maj, min, pat)) {
+                all_ok = false;
+                break;
+            }
+        }
+        if (all_ok) return true;
+    }
+    return false;
+}
+
+/// Inspects `package.json` `"typesVersions"` and populates `out_excluded` with top-level
+/// fallback subdirectories (such as `@types/node`'s `ts5.6/` and `ts5.7/`) whose version
+/// selectors do not match our embedded TypeScript 7.1 compiler and are not referenced by
+/// `"types"` / `"typings"` or any matching `"typesVersions"` selector.
+fn collectExcludedTypesVersionsDirs(
+    allocator: std.mem.Allocator,
+    raw_json: []const u8,
+    out_excluded: *std.ArrayList([]u8),
+) error{OutOfMemory}!void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const obj = parsed.value.object;
+    const tv_val = obj.get("typesVersions") orelse return;
+    if (tv_val != .object) return;
+
+    var included: std.ArrayList([]u8) = .empty;
+    defer {
+        for (included.items) |s| allocator.free(s);
+        included.deinit(allocator);
+    }
+    for ([_][]const u8{ "types", "typings" }) |field| {
+        if (obj.get(field)) |fv| {
+            if (fv == .string) {
+                if (topDirFromRelTarget(fv.string)) |d| try appendUniqueOwnedDir(allocator, &included, d);
+            }
+        }
+    }
+
+    var cand_excluded: std.ArrayList([]u8) = .empty;
+    defer {
+        for (cand_excluded.items) |s| allocator.free(s);
+        cand_excluded.deinit(allocator);
+    }
+
+    var it = tv_val.object.iterator();
+    while (it.next()) |kv| {
+        if (typesVersionRangeMatches(kv.key_ptr.*, 7, 1, 0)) {
+            try collectTopDirsFromTypesVersionsMap(allocator, kv.value_ptr.*, &included);
+        } else {
+            try collectTopDirsFromTypesVersionsMap(allocator, kv.value_ptr.*, &cand_excluded);
+        }
+    }
+
+    for (cand_excluded.items) |d| {
+        if (!containsSlice(included.items, d)) {
+            try appendUniqueOwnedDir(allocator, out_excluded, d);
+        }
+    }
 }
 
 fn computeCommonBaseDir(allocator: std.mem.Allocator, dirs: []const []u8) ![]u8 {
@@ -889,6 +1230,14 @@ pub fn loadTypesFromDisk(
         allocator.free(roots_slice);
     }
     const overrides_slice = try collector.specifier_overrides.toOwnedSlice(allocator);
+    errdefer {
+        for (overrides_slice) |ov| {
+            allocator.free(ov.vfs_path);
+            allocator.free(ov.wire_specifier);
+        }
+        allocator.free(overrides_slice);
+    }
+    const types_only_slice = try collector.types_only_vfs_prefixes.toOwnedSlice(allocator);
 
     return .{
         .ok = .{
@@ -896,6 +1245,7 @@ pub fn loadTypesFromDisk(
             .root_vfs_paths = roots_slice,
             .base_dir = base_dir,
             .specifier_overrides = overrides_slice,
+            .types_only_vfs_prefixes = types_only_slice,
         },
     };
 }
@@ -1141,6 +1491,7 @@ pub fn runPipelineWithHost(
         .base_dir = loaded.base_dir,
         .primary_vfs_paths = loaded.root_vfs_paths,
         .vfs_specifier_overrides = loaded.specifier_overrides,
+        .types_only_vfs_prefixes = loaded.types_only_vfs_prefixes,
         .modules = opts.modules,
         .substitutions = opts.substitutions,
     }) catch |err| switch (err) {
@@ -1194,4 +1545,36 @@ pub fn runPipelineWithHost(
             .fallback_report = fallback_report,
         },
     };
+}
+
+test "typesVersionRangeMatches and collectExcludedTypesVersionsDirs exclude legacy ts5.6/ts5.7 trees under TS 7.1" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(!typesVersionRangeMatches("<=5.6", 7, 1, 0));
+    try std.testing.expect(!typesVersionRangeMatches("<=5.7", 7, 1, 0));
+    try std.testing.expect(typesVersionRangeMatches("<=5.6", 5, 6, 3));
+    try std.testing.expect(typesVersionRangeMatches(">=5.8", 7, 1, 0));
+    try std.testing.expect(typesVersionRangeMatches("*", 7, 1, 0));
+    try std.testing.expect(!typesVersionRangeMatches("<7.0 >=5.0", 7, 1, 0));
+    try std.testing.expect(typesVersionRangeMatches(">=5.8 <8.0", 7, 1, 0));
+
+    const pkg_json =
+        \\{
+        \\  "name": "@types/node",
+        \\  "version": "26.0.0",
+        \\  "types": "index.d.ts",
+        \\  "typesVersions": {
+        \\    "<=5.6": { "*": ["ts5.6/*"] },
+        \\    "<=5.7": { "*": ["ts5.7/*"] }
+        \\  }
+        \\}
+    ;
+    var excluded: std.ArrayList([]u8) = .empty;
+    defer {
+        for (excluded.items) |d| alloc.free(d);
+        excluded.deinit(alloc);
+    }
+    try collectExcludedTypesVersionsDirs(alloc, pkg_json, &excluded);
+    try std.testing.expectEqual(@as(usize, 2), excluded.items.len);
+    try std.testing.expect(containsSlice(excluded.items, "ts5.6"));
+    try std.testing.expect(containsSlice(excluded.items, "ts5.7"));
 }

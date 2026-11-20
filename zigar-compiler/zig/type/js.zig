@@ -7537,6 +7537,14 @@ pub fn Js(comptime host: type) type {
                     );
                 }
 
+                pub fn subarray(self: Self, start: usize, end: ?usize) module.Error!Self {
+                    if (end) |end_idx| {
+                        return callMethod(fn (usize, usize) module.Error!Self, self, "subarray", .{ start, end_idx });
+                    } else {
+                        return callMethod(fn (usize) module.Error!Self, self, "subarray", .{start});
+                    }
+                }
+
                 pub fn copyTo(self: Self, dest: []Elem) module.Error!usize {
                     _ = try self.len();
                     const dest_bytes: []u8 = std.mem.sliceAsBytes(dest);
@@ -7669,12 +7677,65 @@ pub fn Js(comptime host: type) type {
 
             pub const len = byteLength;
 
+            pub fn byteOffset(self: Self) module.Error!usize {
+                return binarySizeInfoCall(.byte_offset, self.handle);
+            }
+
+            pub fn buffer(self: Self) module.Error!ArrayBuffer {
+                const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!ArrayBuffer);
+                return dispatchHostOpRawFlags(
+                    .collection_op,
+                    @intFromEnum(module.CollectionSubOp.binary_get_buffer),
+                    "",
+                    HostFn,
+                    .{.{ .handle = self.handle }},
+                );
+            }
+
+            pub fn get(self: Self, index: usize) module.Error!u8 {
+                const HostFn = buildFnType(&.{ Ref(module.Any), usize }, module.Error!u8);
+                return dispatchHostOpRawFlags(
+                    .collection_op,
+                    @intFromEnum(module.CollectionSubOp.typed_array_get),
+                    "",
+                    HostFn,
+                    .{ .{ .handle = self.handle }, index },
+                );
+            }
+
+            pub fn set(self: Self, index: usize, value: u8) module.Error!void {
+                const HostFn = buildFnType(&.{ Ref(module.Any), usize, u8 }, module.Error!void);
+                return dispatchHostOpRawFlags(
+                    .collection_op,
+                    @intFromEnum(module.CollectionSubOp.typed_array_set),
+                    "",
+                    HostFn,
+                    .{ .{ .handle = self.handle }, index, value },
+                );
+            }
+
+            pub fn subarray(self: Self, start: usize, end: ?usize) module.Error!Self {
+                if (end) |end_idx| {
+                    return callMethod(fn (usize, usize) module.Error!Self, self, "subarray", .{ start, end_idx });
+                } else {
+                    return callMethod(fn (usize) module.Error!Self, self, "subarray", .{start});
+                }
+            }
+
             pub fn copyTo(self: Self, dest: []u8) module.Error!usize {
                 return binaryReadCall(self.handle, dest, 0);
             }
 
+            pub fn copyToAt(self: Self, dest: []u8, offset: usize) module.Error!usize {
+                return binaryReadCall(self.handle, dest, offset);
+            }
+
             pub fn writeFrom(self: Self, src: []const u8) module.Error!void {
                 return binaryWriteCall(self.handle, src, 0);
+            }
+
+            pub fn writeFromAt(self: Self, src: []const u8, offset: usize) module.Error!void {
+                return binaryWriteCall(self.handle, src, offset);
             }
 
             pub fn toOwnedSlice(self: Self, allocator: std.mem.Allocator) module.AllocError![]u8 {
@@ -9236,6 +9297,30 @@ pub fn Js(comptime host: type) type {
             if (module.hasStructZigarJsMeta(T)) {
                 const meta = module.getStructZigarJsMeta(T);
                 if (@hasField(@TypeOf(meta), "fields")) {
+                    @setEvalBranchQuota(meta.fields.len * 64 + 4096);
+                    inline for (meta.fields) |fm| {
+                        if (std.mem.eql(u8, fm.name, field_name)) {
+                            if (@hasField(@TypeOf(fm), "js_name")) return fm.js_name;
+                            return field_name;
+                        }
+                    }
+                }
+            }
+            return field_name;
+        }
+
+        fn structFieldWireNameAt(comptime T: type, comptime field_idx: usize, comptime field_name: []const u8) []const u8 {
+            if (module.hasStructZigarJsMeta(T)) {
+                const meta = module.getStructZigarJsMeta(T);
+                if (@hasField(@TypeOf(meta), "fields")) {
+                    @setEvalBranchQuota(meta.fields.len * 64 + 4096);
+                    if (field_idx < meta.fields.len) {
+                        const fm0 = meta.fields[field_idx];
+                        if (std.mem.eql(u8, fm0.name, field_name)) {
+                            if (@hasField(@TypeOf(fm0), "js_name")) return fm0.js_name;
+                            return field_name;
+                        }
+                    }
                     inline for (meta.fields) |fm| {
                         if (std.mem.eql(u8, fm.name, field_name)) {
                             if (@hasField(@TypeOf(fm), "js_name")) return fm.js_name;
@@ -9253,6 +9338,13 @@ pub fn Js(comptime host: type) type {
             if (module.hasStructZigarJsMeta(T)) {
                 const meta = module.getStructZigarJsMeta(T);
                 if (@hasField(@TypeOf(meta), "fields")) {
+                    @setEvalBranchQuota(meta.fields.len * 64 + 4096);
+                    if (field_idx < meta.fields.len) {
+                        const fm0 = meta.fields[field_idx];
+                        if (std.mem.eql(u8, fm0.name, field_name)) {
+                            if (@hasField(@TypeOf(fm0), "is_optional")) return fm0.is_optional;
+                        }
+                    }
                     inline for (meta.fields) |fm| {
                         if (std.mem.eql(u8, fm.name, field_name)) {
                             if (@hasField(@TypeOf(fm), "is_optional")) return fm.is_optional;
@@ -9277,9 +9369,10 @@ pub fn Js(comptime host: type) type {
 
         fn structHasWireField(comptime T: type, comptime wire_target: []const u8) bool {
             const st = @typeInfo(T).@"struct";
-            inline for (st.field_names) |fname| {
+            @setEvalBranchQuota(st.field_names.len * 128 + 4096);
+            inline for (st.field_names, 0..) |fname, fi| {
                 if (comptime module.isHiddenMetaField(fname)) continue;
-                if (std.mem.eql(u8, structFieldWireName(T, fname), wire_target)) return true;
+                if (std.mem.eql(u8, structFieldWireNameAt(T, fi, fname), wire_target)) return true;
             }
             return false;
         }
@@ -9288,6 +9381,7 @@ pub fn Js(comptime host: type) type {
             if (!module.hasStructZigarJsMeta(T)) return false;
             const meta = module.getStructZigarJsMeta(T);
             if (!@hasField(@TypeOf(meta), "fields")) return false;
+            @setEvalBranchQuota(meta.fields.len * 64 + 4096);
             inline for (meta.fields) |fm| {
                 if (std.mem.eql(u8, fm.name, field_name)) {
                     const FmT = @TypeOf(fm);
@@ -9306,6 +9400,7 @@ pub fn Js(comptime host: type) type {
             if (!module.hasStructZigarJsMeta(T)) return false;
             const meta = module.getStructZigarJsMeta(T);
             if (!@hasField(@TypeOf(meta), "fields")) return false;
+            @setEvalBranchQuota(meta.fields.len * 64 + 4096);
             inline for (meta.fields) |fm| {
                 if (std.mem.eql(u8, fm.name, field_name)) {
                     if (@hasField(@TypeOf(fm), "nullish")) {
@@ -9388,6 +9483,7 @@ pub fn Js(comptime host: type) type {
                 };
             }
             const meta = module.getStructZigarJsMeta(T);
+            @setEvalBranchQuota(meta.fields.len * 64 + 4096);
             inline for (meta.fields) |fm| {
                 if (comptime std.mem.eql(u8, fm.name, field_name)) {
                     return validateConcreteFieldConstraint(fm, val);
@@ -9738,6 +9834,7 @@ pub fn Js(comptime host: type) type {
                     }
                     const marked = typeStateMarkOrSeen(state_in, Cur);
                     if (marked.seen) break :blk marked.state;
+                    @setEvalBranchQuota(32_768);
                     var cur_state = marked.state;
                     for (st.field_names, st.field_types) |fname, ftype| {
                         if (module.isHiddenMetaField(fname)) continue;
@@ -10016,6 +10113,7 @@ pub fn Js(comptime host: type) type {
                     }
                     var has_constraint = false;
                     var has_required = false;
+                    @setEvalBranchQuota(st.field_names.len * st.field_names.len * 32 + 4096);
                     for (st.field_names, 0..) |fname, fi| {
                         if (structFieldHasConstraint(FieldT, fname)) has_constraint = true;
                         if (!structFieldIsOptional(FieldT, fi)) has_required = true;
@@ -10389,24 +10487,34 @@ pub fn Js(comptime host: type) type {
                         const ftype = st.field_types[fi];
                         const fval = @field(value, fname);
                         if (!(try validateStructFieldConstraint(T, fname, fval))) return error.TypeError;
-                        const wire_key = comptime structFieldWireName(T, fname);
+                        const wire_key = comptime structFieldWireNameAt(T, fi, fname);
                         const is_opt = comptime structFieldIsOptional(T, fi);
                         const field_spec = comptime blk: {
+                            @setEvalBranchQuota(st.field_names.len * 64 + 4096);
                             if (has_fields_override) {
-                                for (spec.fields) |fm| {
-                                    if (std.mem.eql(u8, fm.name, fname)) {
-                                        if (@hasField(@TypeOf(fm), "nullish")) break :blk fm.nullish;
-                                        break;
+                                if (fi < spec.fields.len and std.mem.eql(u8, spec.fields[fi].name, fname)) {
+                                    if (@hasField(@TypeOf(spec.fields[fi]), "nullish")) break :blk spec.fields[fi].nullish;
+                                } else {
+                                    for (spec.fields) |fm| {
+                                        if (std.mem.eql(u8, fm.name, fname)) {
+                                            if (@hasField(@TypeOf(fm), "nullish")) break :blk fm.nullish;
+                                            break;
+                                        }
                                     }
                                 }
                             }
                             if (module.hasStructZigarJsMeta(T)) {
                                 const meta = module.getStructZigarJsMeta(T);
                                 if (@hasField(@TypeOf(meta), "fields")) {
-                                    for (meta.fields) |fm| {
-                                        if (std.mem.eql(u8, fm.name, fname)) {
-                                            if (@hasField(@TypeOf(fm), "nullish")) break :blk fm.nullish;
-                                            break;
+                                    @setEvalBranchQuota(meta.fields.len * 64 + 4096);
+                                    if (fi < meta.fields.len and std.mem.eql(u8, meta.fields[fi].name, fname)) {
+                                        if (@hasField(@TypeOf(meta.fields[fi]), "nullish")) break :blk meta.fields[fi].nullish;
+                                    } else {
+                                        for (meta.fields) |fm| {
+                                            if (std.mem.eql(u8, fm.name, fname)) {
+                                                if (@hasField(@TypeOf(fm), "nullish")) break :blk fm.nullish;
+                                                break;
+                                            }
                                         }
                                     }
                                 }
@@ -11013,7 +11121,7 @@ pub fn Js(comptime host: type) type {
                             continue;
                         }
                         const ftype = st.field_types[fi];
-                        const wire_key = comptime structFieldWireName(T, fname);
+                        const wire_key = comptime structFieldWireNameAt(T, fi, fname);
                         const prop_ref = try getProp(module.CallError!Ref(module.Any), obj, wire_key);
                         defer prop_ref.deinit();
                         if (comptime (structFieldHasConstraint(T, fname) and structFieldDisallowsNull(T, fname))) {
@@ -11345,6 +11453,7 @@ pub fn Js(comptime host: type) type {
             if (module.hasStructZigarJsMeta(T)) {
                 const meta = module.getStructZigarJsMeta(T);
                 if (@hasField(@TypeOf(meta), "fields")) {
+                    @setEvalBranchQuota(meta.fields.len * 64 + 4096);
                     for (meta.fields) |fm| {
                         const fm_zig = if (@hasField(@TypeOf(fm), "zig_name")) fm.zig_name else fm.name;
                         if (std.mem.eql(u8, fm_zig, zig_field_name)) {
@@ -11360,6 +11469,7 @@ pub fn Js(comptime host: type) type {
             if (module.hasStructZigarJsMeta(T)) {
                 const meta = module.getStructZigarJsMeta(T);
                 if (@hasField(@TypeOf(meta), "fields")) {
+                    @setEvalBranchQuota(meta.fields.len * 64 + 4096);
                     for (meta.fields) |fm| {
                         const fm_wire = if (@hasField(@TypeOf(fm), "js_name")) fm.js_name else fm.name;
                         if (std.mem.eql(u8, fm_wire, wire_name)) {
@@ -12852,6 +12962,8 @@ test "Standard wrappers: ABI layout, Promise, binary views, collections, BigInt,
         var await_unavailable: bool = false;
         var storage_bytes: [64]u8 = @splat(0);
         var storage_len: usize = 0;
+        var view_offset: [128]usize = @splat(0);
+        var view_len: [128]usize = @splat(0);
         var bigint_negative: bool = false;
         var bigint_lo: u64 = 0;
         var bigint_hi: u64 = 0;
@@ -12864,12 +12976,20 @@ test "Standard wrappers: ABI layout, Promise, binary views, collections, BigInt,
             active_handles += 1;
             const gen = next_slot;
             next_slot += 1;
+            const slot: usize = @intCast(gen & 127);
+            view_offset[slot] = 0;
+            view_len[slot] = storage_len;
             return (gen << 20) | tag;
         }
 
         pub fn cloneJsValue(handle: u32) u32 {
             if (handle <= reserved_global_this_handle) return handle;
-            return allocSlot(handle & 0xFFFFF);
+            const out = allocSlot(handle & 0xFFFFF);
+            const src_slot: usize = @intCast((handle >> 20) & 127);
+            const dst_slot: usize = @intCast((out >> 20) & 127);
+            view_offset[dst_slot] = view_offset[src_slot];
+            view_len[dst_slot] = view_len[src_slot];
+            return out;
         }
 
         pub fn releaseJsValue(handle: u32) void {
@@ -12987,6 +13107,36 @@ test "Standard wrappers: ABI layout, Promise, binary views, collections, BigInt,
                         frame.retval = .{ .handle = allocSlot(70) };
                         return .SUCCESS;
                     }
+                    if (std.mem.eql(u8, key, "subarray")) {
+                        const Sub2Fn = fn (J.Ref(Any), usize, usize) Error!J.Buffer;
+                        const Sub1Fn = fn (J.Ref(Any), usize) Error!J.Buffer;
+                        if (desc.signature == signature.get(arg_struct.ArgStruct(Sub2Fn))) {
+                            const Frame = arg_struct.ArgStruct(Sub2Fn);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const src_slot: usize = @intCast((frame.@"0".handle >> 20) & 127);
+                            const parent_len = view_len[src_slot];
+                            const s = @min(frame.@"1", parent_len);
+                            const e = @max(s, @min(frame.@"2", parent_len));
+                            const out = allocSlot(frame.@"0".handle & 0xFFFFF);
+                            const dst_slot: usize = @intCast((out >> 20) & 127);
+                            view_offset[dst_slot] = view_offset[src_slot] + s;
+                            view_len[dst_slot] = e - s;
+                            frame.retval = .{ .handle = out };
+                            return .SUCCESS;
+                        } else if (desc.signature == signature.get(arg_struct.ArgStruct(Sub1Fn))) {
+                            const Frame = arg_struct.ArgStruct(Sub1Fn);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const src_slot: usize = @intCast((frame.@"0".handle >> 20) & 127);
+                            const parent_len = view_len[src_slot];
+                            const s = @min(frame.@"1", parent_len);
+                            const out = allocSlot(frame.@"0".handle & 0xFFFFF);
+                            const dst_slot: usize = @intCast((out >> 20) & 127);
+                            view_offset[dst_slot] = view_offset[src_slot] + s;
+                            view_len[dst_slot] = parent_len - s;
+                            frame.retval = .{ .handle = out };
+                            return .SUCCESS;
+                        }
+                    }
                     return .FAULT;
                 },
                 .binary_create => {
@@ -13013,11 +13163,14 @@ test "Standard wrappers: ABI layout, Promise, binary views, collections, BigInt,
                 .binary_read => {
                     const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), usize, usize, usize) Error!usize);
                     const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    const slot: usize = @intCast((frame.@"0".handle >> 20) & 127);
+                    const base_off = view_offset[slot];
+                    const v_len = view_len[slot];
                     const offset = frame.@"3";
-                    const copy_len = @min(frame.@"2", storage_len - offset);
+                    const copy_len = if (offset >= v_len) 0 else @min(frame.@"2", v_len - offset);
                     if (copy_len > 0) {
                         const dst: [*]u8 = @ptrFromInt(frame.@"1");
-                        @memcpy(dst[0..copy_len], storage_bytes[offset .. offset + copy_len]);
+                        @memcpy(dst[0..copy_len], storage_bytes[base_off + offset .. base_off + offset + copy_len]);
                     }
                     frame.retval = copy_len;
                     return .SUCCESS;
@@ -13025,15 +13178,18 @@ test "Standard wrappers: ABI layout, Promise, binary views, collections, BigInt,
                 .binary_write => {
                     const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), usize, usize, usize) Error!void);
                     const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    const slot: usize = @intCast((frame.@"0".handle >> 20) & 127);
+                    const base_off = view_offset[slot];
+                    const v_len = view_len[slot];
                     const copy_len = frame.@"2";
                     const offset = frame.@"3";
-                    if (offset + copy_len > storage_len) {
+                    if (offset + copy_len > v_len) {
                         frame.retval = error.JsException;
                         return .SUCCESS;
                     }
                     if (copy_len > 0) {
                         const src: [*]const u8 = @ptrFromInt(frame.@"1");
-                        @memcpy(storage_bytes[offset .. offset + copy_len], src[0..copy_len]);
+                        @memcpy(storage_bytes[base_off + offset .. base_off + offset + copy_len], src[0..copy_len]);
                     }
                     frame.retval = {};
                     return .SUCCESS;
@@ -13044,19 +13200,22 @@ test "Standard wrappers: ABI layout, Promise, binary views, collections, BigInt,
                         .byte_length => {
                             const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!usize);
                             const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
-                            frame.retval = storage_len;
+                            const slot: usize = @intCast((frame.@"0".handle >> 20) & 127);
+                            frame.retval = view_len[slot];
                         },
                         .byte_offset => {
                             const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!usize);
                             const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
-                            frame.retval = 0;
+                            const slot: usize = @intCast((frame.@"0".handle >> 20) & 127);
+                            frame.retval = view_offset[slot];
                         },
                         .element_length => {
                             const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!usize);
                             const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const slot: usize = @intCast((frame.@"0".handle >> 20) & 127);
                             const tag = frame.@"0".handle & 0xFFFFF;
                             const elem_size: usize = if (tag == 50 + @intFromEnum(BinaryKind.int32_array)) 4 else 1;
-                            frame.retval = storage_len / elem_size;
+                            frame.retval = view_len[slot] / elem_size;
                         },
                         .is_buffer => {
                             const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!bool);
@@ -13215,6 +13374,32 @@ test "Standard wrappers: ABI layout, Promise, binary views, collections, BigInt,
                             const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
                             frame.retval = std.mem.indexOf(u8, frame.@"1", "zig") != null;
                         },
+                        .binary_get_buffer => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!J.ArrayBuffer);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            frame.retval = .{ .handle = allocSlot(50 + @intFromEnum(BinaryKind.array_buffer)) };
+                        },
+                        .typed_array_get => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), usize) Error!u8);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const slot: usize = @intCast((frame.@"0".handle >> 20) & 127);
+                            if (frame.@"1" >= view_len[slot]) {
+                                frame.retval = error.JsException;
+                            } else {
+                                frame.retval = storage_bytes[view_offset[slot] + frame.@"1"];
+                            }
+                        },
+                        .typed_array_set => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), usize, u8) Error!void);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const slot: usize = @intCast((frame.@"0".handle >> 20) & 127);
+                            if (frame.@"1" >= view_len[slot]) {
+                                frame.retval = error.JsException;
+                            } else {
+                                storage_bytes[view_offset[slot] + frame.@"1"] = frame.@"2";
+                                frame.retval = {};
+                            }
+                        },
                         else => return .FAULT,
                     }
                     return .SUCCESS;
@@ -13314,6 +13499,42 @@ test "Standard wrappers: ABI layout, Promise, binary views, collections, BigInt,
         const owned_ints = try i32_ta.toOwnedSlice(std.testing.allocator);
         defer std.testing.allocator.free(owned_ints);
         try std.testing.expectEqualSlices(i32, &src_ints, owned_ints);
+
+        // Zero-copy Buffer.subarray + byteOffset + get/set + copyToAt/writeFromAt + backing ArrayBuffer
+        const full_buf = try js.Buffer.fromSlice("hello world");
+        defer full_buf.deinit();
+        try expectEqual(@as(usize, 11), try full_buf.byteLength());
+        try expectEqual(@as(usize, 0), try full_buf.byteOffset());
+        const backing_ab = try full_buf.buffer();
+        defer backing_ab.deinit();
+        try expectEqual(@as(usize, 11), try backing_ab.byteLength());
+
+        const sub_buf = try full_buf.subarray(6, 11);
+        defer sub_buf.deinit();
+        try expect(try js.Buffer.isBuffer(sub_buf));
+        try expectEqual(@as(usize, 5), try sub_buf.byteLength());
+        try expectEqual(@as(usize, 6), try sub_buf.byteOffset());
+        try expectEqual(@as(u8, 'w'), try sub_buf.get(0));
+        try sub_buf.set(0, 'W');
+        try sub_buf.writeFromAt("ORLD", 1);
+
+        var tail_check: [5]u8 = undefined;
+        try expectEqual(@as(usize, 5), try full_buf.copyToAt(&tail_check, 6));
+        try std.testing.expectEqualStrings("WORLD", &tail_check);
+
+        const mutated = try full_buf.toOwnedSlice(std.testing.allocator);
+        defer std.testing.allocator.free(mutated);
+        try std.testing.expectEqualStrings("hello WORLD", mutated);
+
+        // Open-ended TypedArray.subarray(start, null)
+        const u8_ta = try js.Uint8Array.fromSlice("abcdef");
+        defer u8_ta.deinit();
+        const u8_tail = try u8_ta.subarray(2, null);
+        defer u8_tail.deinit();
+        try expectEqual(@as(usize, 4), try u8_tail.len());
+        try expectEqual(@as(usize, 2), try u8_tail.byteOffset());
+        try u8_tail.set(0, 'C');
+        try expectEqual(@as(u8, 'C'), try u8_ta.get(2));
     }
     try expectEqual(@as(u32, 0), js.activeHandleCount());
 

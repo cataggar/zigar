@@ -163,7 +163,28 @@ pub fn Classifier(comptime Graph: type) type {
                     }
                     return false;
                 },
-                else => return false,
+                .constructor_type => return true,
+                .typeof_query => |tq| {
+                    if (tq.target_decl) |td| {
+                        if (td < self.graph.decls.len) {
+                            switch (self.graph.decls[td].kind) {
+                                .class_decl => return true,
+                                .variable_decl => |vty| return self.typeHasConstructorShape(vty, depth + 1),
+                                else => {},
+                            }
+                        }
+                    }
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) return self.typeHasConstructorShape(rt, depth + 1);
+                    }
+                    return false;
+                },
+                else => {
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) return self.typeHasConstructorShape(rt, depth + 1);
+                    }
+                    return false;
+                },
             }
         }
 
@@ -341,7 +362,72 @@ pub fn Classifier(comptime Graph: type) type {
                         }
                     }
                 },
-                else => {},
+                .constructor_type => |sig_id| {
+                    try appendUniqueU32(out_ctor_sigs, scratch, sig_id);
+                },
+                .typeof_query => |tq| {
+                    if (tq.target_decl) |td| {
+                        if (td < self.graph.decls.len) {
+                            switch (self.graph.decls[td].kind) {
+                                .class_decl => |cls| {
+                                    for (cls.constructors) |sid| {
+                                        try appendUniqueU32(out_ctor_sigs, scratch, sid);
+                                    }
+                                    for (cls.properties) |pid| {
+                                        if (pid >= self.graph.properties.len) continue;
+                                        const p = self.graph.properties[pid];
+                                        if (!p.modifiers.static_mod or p.modifiers.private_mod or p.modifiers.protected_mod) continue;
+                                        if (std.mem.eql(u8, self.str(p.name), "prototype")) continue;
+                                        try appendUniqueU32(out_static_props, scratch, pid);
+                                    }
+                                    for (cls.methods) |m| {
+                                        if (!m.modifiers.static_mod or m.modifiers.private_mod or m.modifiers.protected_mod) continue;
+                                        try out_static_methods.append(scratch, m);
+                                    }
+                                    return;
+                                },
+                                .variable_decl => |vty| {
+                                    try self.collectCtorTypeMembersInner(
+                                        vty,
+                                        out_ctor_sigs,
+                                        out_static_props,
+                                        out_static_methods,
+                                        scratch,
+                                        depth + 1,
+                                    );
+                                    return;
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) {
+                            try self.collectCtorTypeMembersInner(
+                                rt,
+                                out_ctor_sigs,
+                                out_static_props,
+                                out_static_methods,
+                                scratch,
+                                depth + 1,
+                            );
+                        }
+                    }
+                },
+                else => {
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) {
+                            try self.collectCtorTypeMembersInner(
+                                rt,
+                                out_ctor_sigs,
+                                out_static_props,
+                                out_static_methods,
+                                scratch,
+                                depth + 1,
+                            );
+                        }
+                    }
+                },
             }
         }
 
@@ -469,8 +555,7 @@ pub fn Classifier(comptime Graph: type) type {
                         }
                         if (tn.resolved_type != null and (ref.target_decl == null or
                             (ref.target_decl.? < self.graph.decls.len and
-                                self.graph.decls[ref.target_decl.?].kind == .type_alias_decl and
-                                ref.type_args.len > 0)))
+                                self.graph.decls[ref.target_decl.?].kind == .type_alias_decl)))
                         {
                             return try self.classifyObjectType(hc.target_type, 0);
                         }
@@ -491,6 +576,20 @@ pub fn Classifier(comptime Graph: type) type {
                 return try self.classifyObjectType(hc.target_type, 0);
             }
             return .{ .kind = .value_struct };
+        }
+
+        fn isGlobalAugmentationDecl(self: *const Self, did: u32) bool {
+            if (did >= self.graph.decls.len) return false;
+            const mod_id = self.graph.decls[did].module;
+            for (self.graph.modules) |m| {
+                if (m.id == mod_id) {
+                    for (m.global_augmentations) |gdid| {
+                        if (gdid == did) return true;
+                    }
+                    return false;
+                }
+            }
+            return false;
         }
 
         fn classifyDeclUncached(self: *Self, decl_id: u32) error{OutOfMemory}!DeclClassification {
@@ -521,6 +620,7 @@ pub fn Classifier(comptime Graph: type) type {
                 .interface_decl => |iface| {
                     var companion_var: ?u32 = null;
                     var has_merged_class = false;
+                    var has_any_type_params = d.type_params.len > 0;
                     var has_call_sigs = iface.call_signatures.len > 0;
                     var has_construct_sigs = iface.construct_signatures.len > 0;
                     var needs_handle = iface.methods.len > 0 or iface.index_signatures.len > 0;
@@ -534,6 +634,14 @@ pub fn Classifier(comptime Graph: type) type {
                         }
                     }
 
+                    for (d.merged_with) |mid| {
+                        if (mid >= self.graph.decls.len or mid == decl_id) continue;
+                        const md = self.graph.decls[mid];
+                        if ((md.kind == .interface_decl or md.kind == .class_decl) and md.type_params.len > 0) {
+                            has_any_type_params = true;
+                        }
+                    }
+
                     // Note: a merged `function_decl` (`interface Widget` + `declare function Widget(): Widget`)
                     // is a separate value-level factory function and does NOT make `Widget` instances callable.
                     for (d.merged_with) |mid| {
@@ -542,7 +650,9 @@ pub fn Classifier(comptime Graph: type) type {
                         switch (md.kind) {
                             .class_decl => has_merged_class = true,
                             .variable_decl => |vty_id| {
-                                if (md.module == d.module and self.typeHasConstructorShape(vty_id, 0)) {
+                                const same_or_global_scope = (md.module == d.module) or
+                                    (self.isGlobalAugmentationDecl(decl_id) and self.isGlobalAugmentationDecl(mid));
+                                if (!has_any_type_params and same_or_global_scope and self.typeHasConstructorShape(vty_id, 0)) {
                                     companion_var = mid;
                                 }
                             },

@@ -750,6 +750,15 @@ func (b *graphBuilder) extractHeritageExpr(exprNode *ast.Node) zigar_typescript_
 	modSpec := witTypes.None[uint32]()
 
 	sym := b.resolveExpressionSymbol(ewta.Expression)
+	if sym == nil {
+		if ty := b.tc.GetTypeFromTypeNode(exprNode); ty != nil {
+			if ty.Alias() != nil && ty.Alias().Symbol() != nil {
+				sym = ty.Alias().Symbol()
+			} else {
+				sym = ty.Symbol()
+			}
+		}
+	}
 	if sym != nil {
 		ids := b.populateTypeTargetSymbol(sym)
 		if len(ids) > 0 {
@@ -778,7 +787,7 @@ func (b *graphBuilder) extractHeritageExpr(exprNode *ast.Node) zigar_typescript_
 				}
 			}
 		}
-		if b.cfg.ExpandUtilityTypes && (isAliasTarget || (targetDecl.IsNone() && len(typeArgs) > 0)) {
+		if b.cfg.ExpandUtilityTypes && (isAliasTarget || targetDecl.IsNone()) {
 			evaluated := b.tc.GetTypeFromTypeNode(exprNode)
 			if evaluated == nil || evaluated.Flags()&checker.TypeFlagsAny != 0 {
 				evaluated = b.tc.GetTypeAtLocation(exprNode)

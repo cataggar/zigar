@@ -51,6 +51,8 @@ fn resolveTypesNode26Dir(alloc: std.mem.Allocator) !?[]const u8 {
         "../.cache/ts-zigar/types-node26/node_modules/@types/node",
         ".cache/ts-zigar/types-node26/node_modules/@types/node",
         "../../.cache/ts-zigar/types-node26/node_modules/@types/node",
+        "../.cache/types-node26/node_modules/@types/node",
+        ".cache/types-node26/node_modules/@types/node",
     };
     for (candidates) |cand| {
         const pkg_json = try std.fs.path.join(alloc, &.{ cand, "package.json" });
@@ -1385,7 +1387,8 @@ test "Regression Round 3: @types/node reference-path ambient closure, mixed ES+a
             \\    // 1. @types/node package exports fs, fs_promises, http, node_sqlite, globals — NOT empty index or external other!
             \\    try std.testing.expect(!@hasDecl(r_node, "index"));
             \\    try std.testing.expect(!@hasDecl(r_node, "other_ext"));
-            \\    try std.testing.expect(@hasDecl(r_node, "fs"));
+            \\    try std.testing.expect(@hasDecl(r_node, "node_fs"));
+            \\    try std.testing.expectEqualStrings("node:fs", r_node.node_fs.zigar_js.specifier);
             \\    try std.testing.expect(@hasDecl(r_node, "fs_promises"));
             \\    try std.testing.expect(@hasDecl(r_node, "http"));
             \\    try std.testing.expect(@hasDecl(r_node, "node_sqlite"));
@@ -3081,10 +3084,13 @@ test "Issue #47 @types/node@26 sweep: buffer, fs, events, http, stream pass AstG
             \\        const val = @field(T, decl_name);
             \\        _ = &@field(T, decl_name);
             \\        if (@TypeOf(val) == type) {
-            \\            _ = @sizeOf(val);
             \\            switch (@typeInfo(val)) {
-            \\                .@"struct", .@"union", .@"enum" => touchRecursive(val, depth - 1),
-            \\                else => {},
+            \\                .@"opaque", .@"fn" => {},
+            \\                .@"struct", .@"union", .@"enum" => {
+            \\                    _ = @sizeOf(val);
+            \\                    touchRecursive(val, depth - 1);
+            \\                },
+            \\                else => _ = @sizeOf(val),
             \\            }
             \\        }
             \\    }
@@ -5139,10 +5145,13 @@ test "Issue #52 @types/node@26 protocol sweep: fs/promises, timers/promises, str
             \\        const val = @field(T, decl_name);
             \\        _ = &@field(T, decl_name);
             \\        if (@TypeOf(val) == type) {
-            \\            _ = @sizeOf(val);
             \\            switch (@typeInfo(val)) {
-            \\                .@"struct", .@"union", .@"enum" => touchRecursive(val, depth - 1),
-            \\                else => {},
+            \\                .@"opaque", .@"fn" => {},
+            \\                .@"struct", .@"union", .@"enum" => {
+            \\                    _ = @sizeOf(val);
+            \\                    touchRecursive(val, depth - 1);
+            \\                },
+            \\                else => _ = @sizeOf(val),
             \\            }
             \\        }
             \\    }
@@ -5796,6 +5805,236 @@ test "Issue #54 M3.4b Audit: expansive generic cycles, fallback reporting, hex/u
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", probe_zig });
 }
+
+test "Issue #55 @types/node@26 full module graph: node:* canonicalization, 18+ globals, Buffer, and Response body methods pass Zig Sema" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const types_node_dir = (try resolveTypesNode26Dir(alloc)) orelse return error.SkipZigTest;
+    defer alloc.free(types_node_dir);
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue55-node26-full", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const cli_args = [_][]const u8{
+        "-t", types_node_dir,
+        "-d", out_dir,
+    };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Issue #55 full @types/node@26 error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+
+    // Verify legacy ts5.6 / ts5.7 fallback trees were excluded via package.json `typesVersions`
+    const ts56_leak = try std.fmt.allocPrint(alloc, "{s}/ts5_6_globals_typed_arrays.zig", .{out_dir});
+    defer alloc.free(ts56_leak);
+    try std.testing.expect(!fileExists(ts56_leak));
+
+    const probe_zig = try std.fmt.allocPrint(alloc, "{s}/issue55_probe.zig", .{sandbox});
+    defer alloc.free(probe_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "issue55_probe.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r = @import("out/root.zig");
+            \\const g = r.globals;
+            \\const js = r.zigar_js;
+            \\
+            \\test "node:* canonicalization, zero bare duplicate modules, 18+ globals, Buffer, and Response body methods" {
+            \\    @setEvalBranchQuota(10_000_000);
+            \\
+            \\    // Canonical `node_*` modules exist and carry `"node:*"` specifiers; bare duplicates & web_globals helpers are absent!
+            \\    try std.testing.expect(@hasDecl(r, "globals"));
+            \\    try std.testing.expect(@hasDecl(r, "node_fs"));
+            \\    try std.testing.expect(@hasDecl(r, "node_fs_promises"));
+            \\    try std.testing.expect(@hasDecl(r, "node_buffer"));
+            \\    try std.testing.expect(@hasDecl(r, "node_events"));
+            \\    try std.testing.expect(@hasDecl(r, "node_http"));
+            \\    try std.testing.expect(@hasDecl(r, "node_stream"));
+            \\    try std.testing.expect(@hasDecl(r, "node_url"));
+            \\    try std.testing.expect(@hasDecl(r, "node_crypto"));
+            \\    try std.testing.expect(@hasDecl(r, "node_process"));
+            \\    try std.testing.expect(@hasDecl(r, "node_test"));
+            \\    try std.testing.expect(@hasDecl(r, "node_sqlite"));
+            \\    try std.testing.expect(!@hasDecl(r, "fs"));
+            \\    try std.testing.expect(!@hasDecl(r, "buffer"));
+            \\    try std.testing.expect(!@hasDecl(r, "http"));
+            \\    try std.testing.expect(!@hasDecl(r, "web_globals_fetch"));
+            \\
+            \\    var node_mod_count: usize = 0;
+            \\    inline for (comptime std.meta.declarations(r)) |decl_name| {
+            \\        if (comptime std.mem.startsWith(u8, decl_name, "node_")) {
+            \\            const M = @field(r, decl_name);
+            \\            try std.testing.expect(std.mem.startsWith(u8, M.zigar_js.specifier, "node:"));
+            \\            node_mod_count += 1;
+            \\        }
+            \\    }
+            \\    try std.testing.expect(node_mod_count >= 60);
+            \\
+            \\    // All 18+ Node.js 26 globals consolidated onto `r.globals` (`globals.zig`):
+            \\    inline for (.{
+            \\        "console",
+            \\        "process",
+            \\        "Buffer",
+            \\        "buffer",
+            \\        "Url",
+            \\        "UrlSearchParams",
+            \\        "TextEncoder",
+            \\        "TextDecoder",
+            \\        "AbortController",
+            \\        "AbortSignal",
+            \\        "Event",
+            \\        "EventTarget",
+            \\        "fetch",
+            \\        "WebSocket",
+            \\        "Request",
+            \\        "Response",
+            \\        "Headers",
+            \\        "FormData",
+            \\        "crypto",
+            \\        "performance",
+            \\        "setTimeout",
+            \\        "clearTimeout",
+            \\        "queueMicrotask",
+            \\        "structuredClone",
+            \\    }) |global_name| {
+            \\        try std.testing.expect(@hasDecl(g, global_name));
+            \\    }
+            \\
+            \\    // No self-re-export `_2` duplicates on `node_buffer`:
+            \\    try std.testing.expect(@hasDecl(r.node_buffer, "Buffer"));
+            \\    try std.testing.expect(@hasDecl(r.node_buffer, "buffer"));
+            \\    try std.testing.expect(@hasDecl(r.node_buffer, "BufferEncoding"));
+            \\    try std.testing.expect(@hasDecl(r.node_buffer, "atob"));
+            \\    try std.testing.expect(@hasDecl(r.node_buffer, "btoa"));
+            \\    try std.testing.expect(!@hasDecl(r.node_buffer, "atob_2"));
+            \\    try std.testing.expect(!@hasDecl(r.node_buffer, "btoa_2"));
+            \\    try std.testing.expect(!@hasDecl(r.node_buffer, "ImplicitArrayBuffer_2"));
+            \\
+            \\    // `undici-types` `BodyMixin` readonly callable properties promoted to bound methods on `Response`:
+            \\    try std.testing.expect(@hasDecl(g.Response, "text"));
+            \\    try std.testing.expect(@hasDecl(g.Response, "textAlloc"));
+            \\    try std.testing.expect(@hasDecl(g.Response, "textPromise"));
+            \\    try std.testing.expect(@hasDecl(g.Response, "bytes"));
+            \\    try std.testing.expect(@hasDecl(g.Response, "arrayBuffer"));
+            \\    try std.testing.expect(@hasDecl(g.Response, "blob"));
+            \\    try std.testing.expect(@hasDecl(g.Response, "formData"));
+            \\
+            \\    // Pure `.d.ts`-only transitive helper package (`undici-types`) never leaks a non-existent
+            \\    // `"undici-types/*"` JS module specifier onto `Response.headers()` (`Headers.zigar_js.ctor_target`):
+            \\    const HdrsRet = @typeInfo(@TypeOf(g.Response.headers)).@"fn".return_type.?;
+            \\    const HdrsT = @typeInfo(HdrsRet).error_union.payload;
+            \\    try std.testing.expect(!@hasField(@TypeOf(HdrsT.zigar_js.ctor_target), "module"));
+            \\    try std.testing.expectEqualStrings("Headers", HdrsT.zigar_js.ctor_target.name);
+            \\}
+            ,
+        });
+    }
+
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", probe_zig });
+}
+
+test "Issue #55 regression: entry module with own exports + ambient module + declare global preserves globals.zig" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue55-mixed-globals-hub", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const src_dir = try std.fmt.allocPrint(alloc, "{s}/pkg", .{sandbox});
+    defer alloc.free(src_dir);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+    try cwd.createDirPath(io, src_dir);
+
+    const index_dts = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{src_dir});
+    defer alloc.free(index_dts);
+    try cwd.writeFile(io, .{
+        .sub_path = index_dts,
+        .data =
+        \\export declare function f(): number;
+        \\declare module "globfix/extra" {
+        \\    export function g(): number;
+        \\}
+        \\declare global {
+        \\    var myGlobalCounter: number;
+        \\    function myGlobalFn(x: number): string;
+        \\}
+        ,
+    });
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const cli_args = [_][]const u8{ "-t", index_dts, "-d", out_dir };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    try std.testing.expect(res == .ok);
+
+    const globals_zig = try std.fmt.allocPrint(alloc, "{s}/globals.zig", .{out_dir});
+    defer alloc.free(globals_zig);
+    try std.testing.expect(fileExists(globals_zig));
+
+    const probe_zig = try std.fmt.allocPrint(alloc, "{s}/probe.zig", .{out_dir});
+    defer alloc.free(probe_zig);
+    try cwd.writeFile(io, .{
+        .sub_path = probe_zig,
+        .data =
+        \\const std = @import("std");
+        \\const r = @import("root.zig");
+        \\
+        \\test "mixed entry exports + ambient module + declare global" {
+        \\    try std.testing.expect(@hasDecl(r, "index"));
+        \\    try std.testing.expect(@hasDecl(r, "globfix_extra"));
+        \\    try std.testing.expect(@hasDecl(r, "globals"));
+        \\    try std.testing.expect(@hasDecl(r.index, "f"));
+        \\    try std.testing.expect(@hasDecl(r.globfix_extra, "g"));
+        \\    try std.testing.expect(@hasDecl(r.globals, "my_global_counter"));
+        \\    try std.testing.expect(@hasDecl(r.globals, "myGlobalFn"));
+        \\    _ = &r.index.f;
+        \\    _ = &r.globfix_extra.g;
+        \\    _ = &@TypeOf(r.globals.my_global_counter).get;
+        \\    _ = &@TypeOf(r.globals.my_global_counter).set;
+        \\    _ = &r.globals.myGlobalFn;
+        \\}
+        ,
+    });
+
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", probe_zig });
+}
+
 
 
 
