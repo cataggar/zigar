@@ -5897,6 +5897,56 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    pub fn fromRef(v: anytype) Self {
         \\        return .{ .handle = v.handle };
         \\    }
+        \\
+        \\    pub fn byteLength(_: Self) Error!usize {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub const len = byteLength;
+        \\
+        \\    pub fn byteOffset(_: Self) Error!usize {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn buffer(_: Self) Error!Self {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn get(_: Self, _: usize) Error!u8 {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn set(_: Self, _: usize, _: u8) Error!void {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn subarray(_: Self, _: usize, _: ?usize) Error!Self {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn copyTo(_: Self, _: []u8) Error!usize {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn copyToAt(_: Self, _: []u8, _: usize) Error!usize {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn writeFrom(_: Self, _: []const u8) Error!void {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn writeFromAt(_: Self, _: []const u8, _: usize) Error!void {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn toOwnedSlice(_: Self, _: std.mem.Allocator) AllocError![]u8 {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn toStringAlloc(_: Self, _: std.mem.Allocator) AllocError![]u8 {
+        \\        return error.HostUnavailable;
+        \\    }
         \\};
         \\
         \\pub const StubString = extern struct {
@@ -9377,6 +9427,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\}
         \\
         \\fn topStructFieldWireName(comptime T: type, comptime field_name: []const u8) []const u8 {
+        \\    @setEvalBranchQuota(200_000);
         \\    if (hasStructZigarJsMeta(T)) {
         \\        const meta = getStructZigarJsMeta(T);
         \\        if (@hasField(@TypeOf(meta), "fields")) {
@@ -9392,6 +9443,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\}
         \\
         \\fn topStructFieldIsOptional(comptime T: type, comptime field_name: []const u8, comptime has_default: bool) bool {
+        \\    @setEvalBranchQuota(200_000);
         \\    if (hasStructZigarJsMeta(T)) {
         \\        const meta = getStructZigarJsMeta(T);
         \\        if (@hasField(@TypeOf(meta), "fields")) {
@@ -9523,6 +9575,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\}
         \\
         \\fn ComputedTransformedNullishType(comptime T: type, comptime fname: []const u8, comptime mode: TransformMetaMode) type {
+        \\    @setEvalBranchQuota(200_000);
         \\    const OrigFT = @FieldType(T, fname);
         \\    if (hasStructZigarJsMeta(T)) {
         \\        const meta = getStructZigarJsMeta(T);
@@ -9559,6 +9612,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    comptime fname: []const u8,
         \\    comptime mode: TransformMetaMode,
         \\) ComputedTransformedNullishType(T, fname, mode) {
+        \\    @setEvalBranchQuota(200_000);
         \\    const OrigFT = @FieldType(T, fname);
         \\    if (hasStructZigarJsMeta(T)) {
         \\        const meta = getStructZigarJsMeta(T);
@@ -9603,6 +9657,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    ty: type,
         \\    preserve_default: bool,
         \\} {
+        \\    @setEvalBranchQuota(200_000);
         \\    if (hasStructZigarJsMeta(T)) {
         \\        const meta = getStructZigarJsMeta(T);
         \\        if (@hasField(@TypeOf(meta), "fields")) {
@@ -9636,6 +9691,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\}
         \\
         \\fn TransformFieldEntryType(comptime T: type, comptime fname: []const u8, comptime mode: TransformMetaMode) type {
+        \\    @setEvalBranchQuota(200_000);
         \\    if (hasStructZigarJsMeta(T)) {
         \\        const meta = getStructZigarJsMeta(T);
         \\        if (@hasField(@TypeOf(meta), "fields")) {
@@ -9710,6 +9766,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    comptime fname: []const u8,
         \\    comptime mode: TransformMetaMode,
         \\) TransformFieldEntryType(T, fname, mode) {
+        \\    @setEvalBranchQuota(200_000);
         \\    const OutT = TransformFieldEntryType(T, fname, mode);
         \\    const wire = topStructFieldWireName(T, fname);
         \\    if (hasStructZigarJsMeta(T)) {
@@ -11632,6 +11689,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\}
         \\
         \\fn structProvidesMember(comptime T: type, comptime wire_or_zig: []const u8) bool {
+        \\    @setEvalBranchQuota(200_000);
         \\    if (@typeInfo(T) != .@"struct") return false;
         \\    if (@hasField(T, wire_or_zig) or @hasDecl(T, wire_or_zig)) return true;
         \\    if (comptime hasStructZigarJsMeta(T)) {
@@ -11671,6 +11729,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\}
         \\
         \\fn lookupStructFieldType(comptime T: type, comptime zig_name: []const u8, comptime wire_name: []const u8) ?type {
+        \\    @setEvalBranchQuota(200_000);
         \\    if (@typeInfo(T) != .@"struct") return null;
         \\    if (@hasDecl(T, "is_zigar_intersect_handle") and T.is_zigar_intersect_handle) {
         \\        return lookupStructFieldType(T.PlainFields, zig_name, wire_name);
@@ -11694,6 +11753,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\}
         \\
         \\fn enumMemberWireName(comptime EnumT: type, comptime field_name: []const u8) []const u8 {
+        \\    @setEvalBranchQuota(200_000);
         \\    if (comptime (@hasDecl(EnumT, "zigar_js") and @hasField(@TypeOf(EnumT.zigar_js), "members"))) {
         \\        const members = EnumT.zigar_js.members;
         \\        inline for (@typeInfo(@TypeOf(members)).@"struct".field_names) |mf_name| {

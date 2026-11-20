@@ -118,6 +118,29 @@ func boolToTristate(v bool) core.Tristate {
 	return core.TSFalse
 }
 
+func hasExplicitDomOrBrowserTypes(types []string) bool {
+	for _, t := range types {
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "dom", "dom.iterable", "dom.asynciterable", "webworker":
+			return true
+		}
+	}
+	return false
+}
+
+func pureEsLibForTarget(target core.ScriptTarget) string {
+	switch target {
+	case core.ScriptTargetES2020:
+		return "lib.es2020.d.ts"
+	case core.ScriptTargetES2022:
+		return "lib.es2022.d.ts"
+	case core.ScriptTargetES2024:
+		return "lib.es2024.d.ts"
+	default:
+		return "lib.esnext.d.ts"
+	}
+}
+
 func trueOrUnknown(v bool) core.Tristate {
 	if v {
 		return core.TSTrue

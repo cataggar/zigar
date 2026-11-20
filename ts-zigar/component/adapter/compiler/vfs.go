@@ -101,6 +101,33 @@ func (self *Vfs) ListFiles(dir string) []string {
 	return self.mem.listFilesUnder(rootedDir)
 }
 
+// HasNodeWebGlobals reports whether `@types/node`'s `web-globals/fetch.d.ts`
+// (paired with sibling `process.d.ts`) is mounted in user VFS memory.
+// `@types/node` (v20–v26+) guards every web-global (`fetch`, `Response`,
+// `Request`, `Headers`, `FormData`, `WebSocket`, `AbortController`, `Event`,
+// `Crypto`, `Performance`, etc.) with `typeof globalThis extends { onmessage: any } ? {} : ...`
+// so that browser DOM libs take precedence when loaded. In a pure Node package
+// graph (no explicit `"dom"` type requested), loading `lib.esnext.d.ts` instead
+// of `lib.esnext.full.d.ts` avoids `lib.dom.d.ts`'s `var onmessage` turning all
+// Node web-globals into `{}`.
+func (self *Vfs) HasNodeWebGlobals() bool {
+	if self == nil || self.mem == nil {
+		return false
+	}
+	const suffix = "/web-globals/fetch.d.ts"
+	self.mem.mu.RLock()
+	defer self.mem.mu.RUnlock()
+	for k := range self.mem.files {
+		if strings.HasSuffix(k, suffix) {
+			pkgRoot := k[:len(k)-len(suffix)]
+			if _, hasProcess := self.mem.files[pkgRoot+"/process.d.ts"]; hasProcess {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func normalizeFilePath(raw string, baseDir tspath.RootedDirectoryPath) (tspath.RootedFilePath, bool) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" || strings.ContainsAny(trimmed, "?#") {

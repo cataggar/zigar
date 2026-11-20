@@ -28,6 +28,9 @@ pub const LowerOptions = struct {
     primary_vfs_paths: []const []const u8 = &.{},
     /// Optional public package `"exports"` wire specifier overrides (`vfs_path -> "pkg/subpath"`).
     vfs_specifier_overrides: []const SpecifierOverride = &.{},
+    /// Optional VFS directory prefixes belonging to pure declaration-only helper packages
+    /// (such as `undici-types`) that have no runtime JavaScript module.
+    types_only_vfs_prefixes: []const []const u8 = &.{},
     /// Optional `-m / --module` filters. Empty means emit primary modules and their dependencies.
     modules: []const []const u8 = &.{},
     /// Optional `-s / --substitute <from=to>` rules.
@@ -815,6 +818,7 @@ fn LowerCtx(comptime GraphType: type) type {
 
         candidates: std.ArrayList(CandidateModule) = .empty,
         source_mod_to_cand: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+        has_globals_hub: bool = false,
         decl_locations: std.AutoHashMapUnmanaged(u32, DeclLocation) = .empty,
         merged_ns_consumed: std.AutoHashMapUnmanaged(u32, void) = .empty,
         merged_iface_consumed: std.AutoHashMapUnmanaged(u32, void) = .empty,
@@ -1046,6 +1050,15 @@ fn LowerCtx(comptime GraphType: type) type {
 
             for (self.candidates.items, 0..) |*existing, idx| {
                 if (std.mem.eql(u8, existing.rel_zig_path, rel_zig_path)) {
+                    // Canonicalize unprefixed Node built-in specifiers (`"fs"` + `"node:fs"`,
+                    // `"fs/promises"` + `"node:fs/promises"`, etc.) to `"node:*"` whenever
+                    // the canonical `"node:*"` ambient module shares the same `rel_zig_path`.
+                    if (std.mem.startsWith(u8, wire_spec, "node:") and
+                        std.mem.eql(u8, existing.wire_specifier, wire_spec["node:".len..]))
+                    {
+                        existing.wire_specifier = try self.alloc.dupe(u8, wire_spec);
+                        existing.substituted_specifier = sub_spec;
+                    }
                     if (source_mod_id) |smid| {
                         try appendUniqueU32(&existing.source_mod_ids, self.scratch, smid);
                         try self.source_mod_to_cand.put(self.scratch, smid, @intCast(idx));
@@ -2022,7 +2035,10 @@ fn LowerCtx(comptime GraphType: type) type {
                             );
                         } else {
                             const mspec = self.str(d.kind.re_export_decl.module_specifier);
-                            if (mspec.len > 0) {
+                            const cand_wire = self.candidates.items[c_idx].wire_specifier;
+                            const is_self_star = std.mem.eql(u8, mspec, cand_wire) or
+                                (std.mem.startsWith(u8, cand_wire, "node:") and std.mem.eql(u8, stripNodePrefix(mspec), stripNodePrefix(cand_wire)));
+                            if (mspec.len > 0 and !is_self_star) {
                                 var seen_spec = false;
                                 for (self.candidates.items[c_idx].star_re_export_specs.items) |s| {
                                     if (std.mem.eql(u8, s, mspec)) {
@@ -2044,6 +2060,79 @@ fn LowerCtx(comptime GraphType: type) type {
                     }
                     try self.appendDeclRecursiveToCand(did, c_idx);
                     return;
+                }
+                if (!is_default_export and !d.modifiers.default_export and !d.kind.re_export_decl.is_namespace) {
+                    const re = d.kind.re_export_decl;
+                    const re_wire = wire_override orelse eff_name;
+                    if (self.resolveTransitiveReExportTarget(did)) |root_td| {
+                        const root_d = self.graph.decls[root_td];
+                        const root_wire = if (root_d.export_name) |esid| self.str(esid) else self.str(root_d.name);
+
+                        // Forward unmerged runtime value peers of merged symbols (`export { Buffer }`
+                        // in `declare module "node:buffer"` where generic `interface Buffer<T>` and
+                        // `var Buffer: BufferConstructor` live in `globals` as separate declarations!).
+                        if (!re.is_type_only and (root_d.kind == .interface_decl or root_d.kind == .type_alias_decl)) {
+                            const root_has_tps = self.hasMergedTypeParams(root_td);
+                            for (root_d.merged_with) |mid| {
+                                if (mid == root_td or mid >= self.graph.decls.len) continue;
+                                const md = self.graph.decls[mid];
+                                const m_wire = if (md.export_name) |esid| self.str(esid) else self.str(md.name);
+                                if (!merge_decls.sameWireName(root_wire, m_wire)) continue;
+                                const unmerged_value_peer = switch (md.kind) {
+                                    .variable_decl, .namespace_decl => root_has_tps,
+                                    .function_decl => root_has_tps or !(try merge_decls.fnAndNamespaceIdentCollide(self.scratch, root_wire)),
+                                    else => false,
+                                };
+                                if (unmerged_value_peer) {
+                                    if (self.decl_to_cand.get(mid)) |m_cand| {
+                                        if (m_cand != c_idx) {
+                                            try appendUniqueForeignExport(&self.candidates.items[c_idx].foreign_exports, self.scratch, .{
+                                                .decl_id = mid,
+                                                .wire_name_override = wire_override,
+                                                .is_default_export = false,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Skip self-noop re-exports (`declare module "buffer" { export * from "node:buffer"; }`
+                        // merged into the same `buffer.zig` candidate) BEFORE prebinding names so we never
+                        // emit `isUtf8_2`, `isAscii_2`, `atob_2`, etc.!
+                        if (!self.ns_child_ids.contains(root_td) and
+                            self.decl_to_cand.get(root_td) == c_idx and
+                            std.mem.eql(u8, re_wire, root_wire))
+                        {
+                            if (!re.is_type_only) try self.markJsExportedDecl(root_td);
+                            try appendUniqueU32(&self.candidates.items[c_idx].exported_decl_ids, self.scratch, root_td);
+                            return;
+                        }
+
+                        // Also deduplicate multiple `re_export_decl`s (or `export import x = ...` +
+                        // `re_export_decl`) in the same candidate targeting the exact same `root_td`
+                        // under the exact same `re_wire` (e.g. `export import atob = globalThis.atob`
+                        // in `"node:buffer"` + `export * from "node:buffer"` in `"buffer"`).
+                        for (self.candidates.items[c_idx].exported_decl_ids.items) |ex_did| {
+                            if (ex_did >= self.graph.decls.len) continue;
+                            const ex_d = self.graph.decls[ex_did];
+                            const ex_wire = if (ex_d.export_name) |esid| self.str(esid) else self.str(ex_d.name);
+                            if (!std.mem.eql(u8, ex_wire, re_wire)) continue;
+                            if (self.resolveTransitiveReExportTarget(ex_did) == root_td) {
+                                return;
+                            }
+                        }
+                        for (self.candidates.items[c_idx].foreign_exports.items) |fe| {
+                            if (fe.is_default_export or fe.decl_id >= self.graph.decls.len) continue;
+                            const fe_d = self.graph.decls[fe.decl_id];
+                            const fe_wire = fe.wire_name_override orelse
+                                (if (fe_d.export_name) |esid| self.str(esid) else self.str(fe_d.name));
+                            if (!std.mem.eql(u8, fe_wire, re_wire)) continue;
+                            if (self.resolveTransitiveReExportTarget(fe.decl_id) == root_td) {
+                                return;
+                            }
+                        }
+                    }
                 }
                 if (self.decl_to_cand.get(did)) |existing_cand| {
                     if (existing_cand != c_idx) {
@@ -2072,6 +2161,34 @@ fn LowerCtx(comptime GraphType: type) type {
                     }
                     try self.appendDeclRecursiveToCand(did, c_idx);
                     return;
+                }
+                if (d.modifiers.export_decl and !is_default_export and !d.modifiers.default_export) {
+                    const ie_wire = wire_override orelse (if (d.export_name) |esid| self.str(esid) else self.str(d.name));
+                    if (self.resolveTransitiveReExportTarget(did)) |root_td| {
+                        if (root_td != did) {
+                            for (self.candidates.items[c_idx].exported_decl_ids.items, 0..) |ex_did, ex_pos| {
+                                if (ex_did == did or ex_did >= self.graph.decls.len) continue;
+                                const ex_d = self.graph.decls[ex_did];
+                                const ex_wire = if (ex_d.export_name) |esid| self.str(esid) else self.str(ex_d.name);
+                                if (!std.mem.eql(u8, ex_wire, ie_wire)) continue;
+                                if (self.resolveTransitiveReExportTarget(ex_did) == root_td) {
+                                    if (ex_d.kind == .re_export_decl and ex_d.kind.re_export_decl.is_type_only and !d.kind.import_equals_decl.is_type_only) {
+                                        // Upgrade synthetic type-only re-export (`buffer.buffer.d.ts`) to
+                                        // runtime `export import atob = globalThis.atob` (`buffer.d.ts`) in-place!
+                                        self.candidates.items[c_idx].exported_decl_ids.items[ex_pos] = did;
+                                        for (self.candidates.items[c_idx].decl_ids.items) |*slot| {
+                                            if (slot.* == ex_did) slot.* = did;
+                                        }
+                                        _ = self.decl_to_cand.remove(ex_did);
+                                        try self.decl_to_cand.put(self.scratch, did, c_idx);
+                                        try self.markJsExportedDecl(did);
+                                        try self.appendDeclRecursiveToCand(did, c_idx);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                    }
                 }
                 if (self.decl_to_cand.get(did)) |existing_cand| {
                     if (existing_cand != c_idx) {
@@ -2139,6 +2256,26 @@ fn LowerCtx(comptime GraphType: type) type {
                     .wire_name_override = wire_override,
                     .is_default_export = is_default_export,
                 });
+                // When a foreign export points at a generic interface/type-alias half of a
+                // merged value+type symbol (e.g. `export { Buffer }` in `node:buffer` where
+                // `interface Buffer<TArrayBuffer>` cannot merge `var Buffer: BufferConstructor`),
+                // also forward its unmerged runtime value peers from the same owner candidate.
+                if (!is_default_export and
+                    (d.kind == .interface_decl or d.kind == .type_alias_decl) and
+                    self.hasMergedTypeParams(did))
+                {
+                    for (d.merged_with) |mid| {
+                        if (mid >= self.graph.decls.len) continue;
+                        const md = self.graph.decls[mid];
+                        if (md.kind != .variable_decl and md.kind != .function_decl and md.kind != .namespace_decl) continue;
+                        if (self.decl_to_cand.get(mid) != owner_cand) continue;
+                        try appendUniqueForeignExport(&self.candidates.items[c_idx].foreign_exports, self.scratch, .{
+                            .decl_id = mid,
+                            .wire_name_override = wire_override,
+                            .is_default_export = false,
+                        });
+                    }
+                }
             }
         }
 
@@ -2349,6 +2486,50 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
             }
 
+            // 0g. Consolidate `mod.global_augmentations` into `"globals"` (`globals.zig`) BEFORE Step 1a
+            // when a dedicated `"globals"` / `"globals.*"` / `"web-globals/*"` declaration file with
+            // global augmentations exists in the graph (such as `@types/node`), or when nested inside an
+            // ambient module file (`declare module "node:buffer" { global { ... } }`). Claiming global
+            // declarations in `"globals"` first ensures `globals.zig` owns `Buffer`, `var Buffer`,
+            // `NonSharedBuffer`, `AllowSharedBuffer`, `BufferConstructor`, `BufferEncoding`, etc. while
+            // ambient modules (`"node:buffer"`) cleanly re-export them and file-private helpers
+            // (`interface AbortController` / `interface Event` in `web-globals/*.d.ts`) stay isolated!
+            var has_globals_hub = false;
+            for (self.graph.modules) |mod| {
+                if (self.isBundledLibModule(mod) or mod.global_augmentations.len == 0) continue;
+                const fspec = try self.deriveFileLogicalSpecifier(mod);
+                if (std.mem.eql(u8, fspec, "globals") or
+                    std.mem.startsWith(u8, fspec, "globals.") or
+                    std.mem.startsWith(u8, fspec, "web-globals/"))
+                {
+                    has_globals_hub = true;
+                    break;
+                }
+            }
+            self.has_globals_hub = has_globals_hub;
+
+            if (has_globals_hub) {
+                for (self.graph.modules) |mod| {
+                    if (self.isBundledLibModule(mod) or mod.global_augmentations.len == 0) continue;
+                    const fspec = try self.deriveFileLogicalSpecifier(mod);
+                    const g_src_mod: ?u32 = if (std.mem.eql(u8, fspec, "globals")) mod.id else null;
+                    const g_idx = try self.getOrCreateCandidate("globals", g_src_mod);
+                    for (mod.global_augmentations) |did| {
+                        try self.registerCandidateDeclOrForeignExport(g_idx, null, did, null, false);
+                    }
+                }
+            } else {
+                for (self.graph.modules) |mod| {
+                    if (self.isBundledLibModule(mod) or mod.global_augmentations.len == 0 or mod.ambient_modules.len == 0) continue;
+                    const fspec = try self.deriveFileLogicalSpecifier(mod);
+                    const g_src_mod: ?u32 = if (std.mem.eql(u8, fspec, "globals")) mod.id else null;
+                    const g_idx = try self.getOrCreateCandidate("globals", g_src_mod);
+                    for (mod.global_augmentations) |did| {
+                        try self.registerCandidateDeclOrForeignExport(g_idx, null, did, null, false);
+                    }
+                }
+            }
+
             // 1a. Ambient modules (`declare module "node:http" { ... }`): register canonical own
             // declarations first so cross-file ambient re-exports find their owning ambient module.
             for (self.graph.modules) |mod| {
@@ -2384,6 +2565,36 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
             }
 
+            // 1a-helpers. Route unowned same-file helper declarations (`interface Hid` in
+            // `declare module "p2" { interface Hid ... }` or `type ImplicitArrayBuffer` in
+            // `buffer.buffer.d.ts` `declare module "node:buffer"`) BEFORE Step 1b processes
+            // cross-block re-exports (`buffer.d.ts` `export { ImplicitArrayBuffer }`)!
+            for (self.graph.modules) |mod| {
+                if (self.isBundledLibModule(mod)) continue;
+                for (mod.ambient_modules) |amb| {
+                    const amb_cand = (try self.findAmbientCandidateIdx(self.str(amb.module_name))) orelse continue;
+                    var seeds: std.ArrayList(u32) = .empty;
+                    defer seeds.deinit(self.scratch);
+                    for (amb.decls) |did| {
+                        try appendUniqueU32(&seeds, self.scratch, did);
+                        if (did < self.graph.decls.len and self.graph.decls[did].kind == .re_export_decl) {
+                            if (self.resolveTransitiveReExportTarget(did)) |rtd| {
+                                if (rtd < self.graph.decls.len and
+                                    self.graph.decls[rtd].module == mod.id and
+                                    !self.decl_to_cand.contains(rtd))
+                                {
+                                    try self.registerCanonicalDeclInCandidate(amb_cand, rtd);
+                                    try appendUniqueU32(&seeds, self.scratch, rtd);
+                                }
+                            }
+                        }
+                    }
+                    if (amb.default_export) |def_id| try appendUniqueU32(&seeds, self.scratch, def_id);
+                    if (amb.export_equals) |eq_id| try appendUniqueU32(&seeds, self.scratch, eq_id);
+                    try self.claimSameFileAmbientHelpers(amb_cand, mod.id, seeds.items);
+                }
+            }
+
             // 1b. Ambient modules: register re-exports and cross-ambient foreign exports.
             for (self.graph.modules) |mod| {
                 if (self.isBundledLibModule(mod)) continue;
@@ -2403,24 +2614,50 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
             }
 
-            // 2. File-level module exports / star re-exports / export = / global augmentations.
+            // 2. File-level module exports / star re-exports / export = / remaining global augmentations.
             // Reference-only (`/// <reference path="..." />`) and ambient-only (`declare module "..."`)
             // files do NOT create empty file-level candidates here.
             for (self.graph.modules) |mod| {
                 if (self.isBundledLibModule(mod)) continue;
 
+                const fspec = try self.deriveFileLogicalSpecifier(mod);
+                const route_globals_to_hub = mod.global_augmentations.len > 0 and
+                    (has_globals_hub or mod.ambient_modules.len > 0);
+
+                if (route_globals_to_hub and mod.ambient_modules.len > 0) {
+                    // Expose pure type aliases declared inside `declare module "node:<stem>" { global { type ... } }`
+                    // (such as `BufferEncoding` in `buffer.d.ts`) on the matching ambient module as well!
+                    const g_idx_opt = try self.findAmbientCandidateIdx("globals");
+                    for (mod.ambient_modules) |amb| {
+                        const amb_spec = stripNodePrefix(self.str(amb.module_name));
+                        if (!std.mem.eql(u8, amb_spec, fspec)) continue;
+                        if (try self.findAmbientCandidateIdx(self.str(amb.module_name))) |amb_cand| {
+                            if (g_idx_opt == null or amb_cand != g_idx_opt.?) {
+                                for (mod.global_augmentations) |did| {
+                                    if (did >= self.graph.decls.len) continue;
+                                    if (self.graph.decls[did].kind == .type_alias_decl) {
+                                        try appendUniqueForeignExport(&self.candidates.items[amb_cand].foreign_exports, self.scratch, .{
+                                            .decl_id = did,
+                                            .wire_name_override = null,
+                                            .is_default_export = false,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 const has_file_content = mod.exports.len > 0 or
                     mod.star_re_exports.len > 0 or
                     mod.default_export != null or
                     mod.export_equals != null or
-                    mod.global_augmentations.len > 0 or
-                    self.source_mod_to_cand.contains(mod.id);
+                    (!route_globals_to_hub and mod.global_augmentations.len > 0) or
+                    (self.source_mod_to_cand.contains(mod.id) and !std.mem.eql(u8, fspec, "globals"));
 
                 if (has_file_content) {
-                    const c_idx = self.source_mod_to_cand.get(mod.id) orelse blk: {
-                        const wire_spec = try self.deriveFileLogicalSpecifier(mod);
-                        break :blk try self.getOrCreateCandidate(wire_spec, mod.id);
-                    };
+                    const c_idx = self.source_mod_to_cand.get(mod.id) orelse
+                        try self.getOrCreateCandidate(fspec, mod.id);
 
                     for (mod.exports) |did| {
                         try self.registerCandidateDeclOrForeignExport(c_idx, mod.id, did, null, false);
@@ -2432,8 +2669,10 @@ fn LowerCtx(comptime GraphType: type) type {
                     if (mod.export_equals) |eq_id| {
                         try self.registerExportEqualsForCandidate(c_idx, mod.id, eq_id);
                     }
-                    for (mod.global_augmentations) |did| {
-                        try self.registerCandidateDeclOrForeignExport(c_idx, mod.id, did, null, false);
+                    if (!route_globals_to_hub) {
+                        for (mod.global_augmentations) |did| {
+                            try self.registerCandidateDeclOrForeignExport(c_idx, mod.id, did, null, false);
+                        }
                     }
                     for (mod.star_re_exports) |target_smid| {
                         try appendUniqueU32(
@@ -2445,9 +2684,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
             }
 
-            // 2a. Route unowned same-file helper declarations (`interface Hid` in
-            // `declare module "p2" { interface Hid ...; export function g(h: Hid): void; export {}; }`)
-            // by reachability from each ambient module block's declarations BEFORE Step 2b!
+            // 2a. Final sweep for any remaining same-file ambient helpers added during Step 1b.
             for (self.graph.modules) |mod| {
                 if (self.isBundledLibModule(mod)) continue;
                 for (mod.ambient_modules) |amb| {
@@ -2510,9 +2747,10 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
 
                 for (self.candidates.items) |*cand| {
-                    // Ambient module blocks (`declare module "node:fs"`) have no `source_mod_ids`
-                    // and represent explicit public specifiers directly.
-                    cand.is_public_export_mod = (cand.source_mod_ids.items.len == 0);
+                    // Ambient module blocks (`declare module "node:fs"`) and the canonical `"globals"`
+                    // hub represent explicit public surfaces directly.
+                    cand.is_public_export_mod = (cand.source_mod_ids.items.len == 0) or
+                        std.mem.eql(u8, cand.wire_specifier, "globals");
                     for (cand.source_mod_ids.items) |smid| {
                         const midx = self.findGraphModuleIndexById(smid) orelse continue;
                         const m_fp = self.str(self.graph.modules[midx].file_path);
@@ -2522,6 +2760,34 @@ fn LowerCtx(comptime GraphType: type) type {
                             cand.is_public_export_mod = true;
                             break;
                         }
+                    }
+                }
+            }
+
+            if (self.options.types_only_vfs_prefixes.len > 0) {
+                for (self.candidates.items) |*cand| {
+                    if (cand.source_mod_ids.items.len == 0 or std.mem.eql(u8, cand.wire_specifier, "globals")) continue;
+                    var all_types_only = true;
+                    for (cand.source_mod_ids.items) |smid| {
+                        const midx = self.findGraphModuleIndexById(smid) orelse {
+                            all_types_only = false;
+                            break;
+                        };
+                        const m_fp = self.str(self.graph.modules[midx].file_path);
+                        var matched_prefix = false;
+                        for (self.options.types_only_vfs_prefixes) |pfx| {
+                            if (std.mem.startsWith(u8, m_fp, pfx)) {
+                                matched_prefix = true;
+                                break;
+                            }
+                        }
+                        if (!matched_prefix) {
+                            all_types_only = false;
+                            break;
+                        }
+                    }
+                    if (all_types_only) {
+                        cand.is_public_export_mod = false;
                     }
                 }
             }
@@ -3217,11 +3483,40 @@ fn LowerCtx(comptime GraphType: type) type {
                     const midx = self.findGraphModuleIndexById(mid) orelse continue;
                     const m = self.graph.modules[midx];
                     if (m.global_augmentations.len > 0) {
-                        if (self.source_mod_to_cand.get(mid)) |c_idx| {
+                        const route_globals_to_hub = self.has_globals_hub or m.ambient_modules.len > 0;
+                        const g_idx_opt = try self.findAmbientCandidateIdx("globals");
+                        const m_has_own_exports = m.exports.len > 0 or
+                            m.star_re_exports.len > 0 or
+                            m.default_export != null or
+                            m.export_equals != null;
+                        if (route_globals_to_hub) {
+                            if (g_idx_opt) |g_idx| {
+                                self.candidates.items[g_idx].is_primary = true;
+                                if (!self.candidates.items[g_idx].included) {
+                                    self.candidates.items[g_idx].included = true;
+                                    try queue.append(self.scratch, g_idx);
+                                }
+                            }
+                            if (self.source_mod_to_cand.get(mid)) |c_idx| {
+                                if ((g_idx_opt == null or c_idx != g_idx_opt.?) and (m_has_own_exports or primary_mod_ids.contains(mid))) {
+                                    self.candidates.items[c_idx].is_primary = true;
+                                    if (!self.candidates.items[c_idx].included) {
+                                        self.candidates.items[c_idx].included = true;
+                                        try queue.append(self.scratch, c_idx);
+                                    }
+                                }
+                            }
+                        } else if (self.source_mod_to_cand.get(mid)) |c_idx| {
                             self.candidates.items[c_idx].is_primary = true;
                             if (!self.candidates.items[c_idx].included) {
                                 self.candidates.items[c_idx].included = true;
                                 try queue.append(self.scratch, c_idx);
+                            }
+                        } else if (g_idx_opt) |g_idx| {
+                            self.candidates.items[g_idx].is_primary = true;
+                            if (!self.candidates.items[g_idx].included) {
+                                self.candidates.items[g_idx].included = true;
+                                try queue.append(self.scratch, g_idx);
                             }
                         }
                     } else if (!primary_mod_ids.contains(mid)) {
@@ -3380,7 +3675,8 @@ fn LowerCtx(comptime GraphType: type) type {
                 const d = self.graph.decls[did];
                 const d_wire = if (d.export_name) |esid| self.str(esid) else self.str(d.name);
                 if (d.kind == .interface_decl or d.kind == .class_decl) {
-                    if (d.kind == .interface_decl and d.type_params.len == 0) {
+                    const has_merged_tps = self.hasMergedTypeParams(did);
+                    if (d.kind == .interface_decl and !has_merged_tps) {
                         const icls = try self.classifyDecl(did);
                         if (icls.companion_var_decl_id) |var_did| {
                             for (decl_ids) |other| {
@@ -3411,7 +3707,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         if (md.kind == .namespace_decl and merge_decls.sameWireName(d_wire, m_wire)) {
                             for (decl_ids) |other| {
                                 if (other == mid) {
-                                    if (d.type_params.len == 0) {
+                                    if (!has_merged_tps) {
                                         try self.merged_ns_consumed.put(self.scratch, mid, {});
                                     } else {
                                         try self.merged_generic_ns_peer.put(self.scratch, did, mid);
@@ -4131,6 +4427,73 @@ fn LowerCtx(comptime GraphType: type) type {
             names: []const []const u8,
             defaults: []const ?u32,
         };
+
+        fn resolveTransitiveReExportTarget(self: *const Self, start_did: u32) ?u32 {
+            var cur = start_did;
+            var hops: usize = 0;
+            while (hops < 16) : (hops += 1) {
+                if (cur >= self.graph.decls.len) return null;
+                const cd = self.graph.decls[cur];
+                switch (cd.kind) {
+                    .re_export_decl => |re| {
+                        if (re.is_namespace) return null;
+                        cur = re.target_decl orelse return null;
+                    },
+                    .import_equals_decl => |ie| {
+                        cur = ie.target_decl orelse return cur;
+                    },
+                    else => return cur,
+                }
+            }
+            return null;
+        }
+
+        fn hasMergedTypeParams(self: *const Self, did: u32) bool {
+            if (did >= self.graph.decls.len) return false;
+            const d = self.graph.decls[did];
+            if (d.type_params.len > 0) return true;
+            if (d.kind != .interface_decl and d.kind != .class_decl) return false;
+            const wire = if (d.export_name) |esid| self.str(esid) else self.str(d.name);
+            for (d.merged_with) |mid| {
+                if (mid == did or mid >= self.graph.decls.len) continue;
+                const md = self.graph.decls[mid];
+                if (md.kind != .interface_decl and md.kind != .class_decl) continue;
+                const m_wire = if (md.export_name) |esid| self.str(esid) else self.str(md.name);
+                if (!merge_decls.sameWireName(wire, m_wire)) continue;
+                if (md.type_params.len > 0) return true;
+            }
+            return false;
+        }
+
+        fn openConditionalSingleObjectBranch(self: *const Self, cond: anytype) bool {
+            const non_never_id: u32 = blk: {
+                if (cond.false_type < self.graph.types.len and self.graph.types[cond.false_type].kind == .never_type) {
+                    break :blk cond.true_type;
+                }
+                if (cond.true_type < self.graph.types.len and self.graph.types[cond.true_type].kind == .never_type) {
+                    break :blk cond.false_type;
+                }
+                return false;
+            };
+            if (non_never_id >= self.graph.types.len) return false;
+            return switch (self.graph.types[non_never_id].kind) {
+                .object_literal => |obj| obj.call_signatures.len == 0 and obj.construct_signatures.len == 0,
+                .object_type, .mapped => true,
+                .reference => |ref| blk_ref: {
+                    if (ref.target_decl) |td| {
+                        if (td < self.graph.decls.len) {
+                            break :blk_ref switch (self.graph.decls[td].kind) {
+                                .interface_decl => |iface| iface.call_signatures.len == 0 and iface.construct_signatures.len == 0,
+                                .class_decl => true,
+                                else => false,
+                            };
+                        }
+                    }
+                    break :blk_ref false;
+                },
+                else => false,
+            };
+        }
 
         /// Merges type parameters across same-symbol `class_decl` / `interface_decl` merges
         /// (`interface Foo<T>` + `interface Foo<T = string, U = number>`), preserving trailing
@@ -5579,6 +5942,9 @@ fn LowerCtx(comptime GraphType: type) type {
                             return self.makeType(.{ .unary_type_op = .{ .op = .awaited, .operand = operand } });
                         },
                         .dynamic_any => {
+                            if (self.openConditionalSingleObjectBranch(cond)) {
+                                return self.makeType(.js_object);
+                            }
                             try self.recordFallback(.erased_conditional_type, "open conditional type -> zigar_js.Any");
                             return self.makeType(.js_any);
                         },
@@ -10561,7 +10927,8 @@ fn LowerCtx(comptime GraphType: type) type {
                         const is_self_noop = is_top_level and
                             loc.module_index == final_mod_idx and
                             loc.zig_path.len == 1 and
-                            std.mem.eql(u8, loc.zig_path[0], bound.zig_ident);
+                            (std.mem.eql(u8, loc.zig_path[0], bound.zig_ident) or
+                                (re.export_alias == null and std.mem.eql(u8, loc.zig_path[0], bound.wire_name)));
                         if (!is_self_noop and loc.zig_path.len > 0) {
                             if (loc.module_index != final_mod_idx) {
                                 try imports_used.put(self.scratch, loc.module_index, {});
@@ -10592,7 +10959,8 @@ fn LowerCtx(comptime GraphType: type) type {
                             const is_self_noop = is_top_level and
                                 loc.module_index == final_mod_idx and
                                 loc.zig_path.len == 1 and
-                                std.mem.eql(u8, loc.zig_path[0], bound.zig_ident);
+                                (std.mem.eql(u8, loc.zig_path[0], bound.zig_ident) or
+                                    std.mem.eql(u8, loc.zig_path[0], bound.wire_name));
                             if (!is_self_noop and loc.zig_path.len > 0) {
                                 if (loc.module_index != final_mod_idx) {
                                     try imports_used.put(self.scratch, loc.module_index, {});
@@ -12695,7 +13063,27 @@ fn LowerCtx(comptime GraphType: type) type {
                             return;
                         }
                     }
-                    const raw_td = ref.target_decl orelse return;
+                    const raw_td = ref.target_decl orelse {
+                        if (tn.resolved_type) |rt| {
+                            if (rt != ty_id) {
+                                try self.appendDirectBaseFromGraphType(
+                                    owner_decl_id,
+                                    repr,
+                                    rt,
+                                    env,
+                                    owner_active_tps,
+                                    self_ident_opt,
+                                    visited_ty,
+                                    imports_used,
+                                    needs_runtime,
+                                    env_cache,
+                                    out,
+                                    depth + 1,
+                                );
+                            }
+                        }
+                        return;
+                    };
                     const td = self.canonicalMergedStructOwnerId(raw_td);
                     if (td == owner_decl_id or td >= self.graph.decls.len) return;
                     if (self.isBundledLibDecl(td)) return;
@@ -12732,9 +13120,12 @@ fn LowerCtx(comptime GraphType: type) type {
                         return;
                     }
 
-                    // Transparent non-struct `type_alias_decl` (`type Alias<U> = Base<U>`): unwrap!
+                    // Transparent non-struct `type_alias_decl` (`type Alias<U> = Base<U>` or conditional
+                    // web-global `_Headers` / `_Response` / `_WebSocket` aliases): unwrap syntax first,
+                    // then fall back to `tn.resolved_type` when the alias body is a conditional/mapped op.
                     const d = self.graph.decls[td];
                     if (d.kind == .type_alias_decl) {
+                        const prev_len = out.items.len;
                         const child_env = try self.buildHeritageEnv(env, d.type_params, ref.type_args);
                         try self.appendDirectBaseFromGraphType(
                             owner_decl_id,
@@ -12750,9 +13141,48 @@ fn LowerCtx(comptime GraphType: type) type {
                             out,
                             depth + 1,
                         );
+                        if (out.items.len == prev_len) {
+                            if (tn.resolved_type) |rt| {
+                                if (rt != ty_id) {
+                                    try self.appendDirectBaseFromGraphType(
+                                        owner_decl_id,
+                                        repr,
+                                        rt,
+                                        env,
+                                        owner_active_tps,
+                                        self_ident_opt,
+                                        visited_ty,
+                                        imports_used,
+                                        needs_runtime,
+                                        env_cache,
+                                        out,
+                                        depth + 1,
+                                    );
+                                }
+                            }
+                        }
                     }
                 },
-                else => {},
+                else => {
+                    if (tn.resolved_type) |rt| {
+                        if (rt != ty_id) {
+                            try self.appendDirectBaseFromGraphType(
+                                owner_decl_id,
+                                repr,
+                                rt,
+                                env,
+                                owner_active_tps,
+                                self_ident_opt,
+                                visited_ty,
+                                imports_used,
+                                needs_runtime,
+                                env_cache,
+                                out,
+                                depth + 1,
+                            );
+                        }
+                    }
+                },
             }
         }
 
@@ -13259,11 +13689,76 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
             }
 
+            // Promote non-optional `readonly` callable properties on handle classes/interfaces
+            // (e.g. `undici-types` `BodyMixin`'s `readonly text: () => Promise<string>`,
+            // `readonly json: () => Promise<unknown>`, `readonly bytes: () => Promise<Uint8Array>`)
+            // into bound instance methods (`invokeMethod`) so JS prototype methods that require
+            // `this = self` never throw `TypeError: Illegal invocation` and gain auto-awaited
+            // `*Alloc` / `*Promise` forms.
+            var promoted_prop_methods: std.AutoHashMapUnmanaged(u32, void) = .empty;
+            defer promoted_prop_methods.deinit(self.scratch);
+            for (raw_props) |sp| {
+                const pid = sp.pid;
+                if (pid >= self.graph.properties.len) continue;
+                const p = self.graph.properties[pid];
+                if (p.modifiers.private_mod or p.modifiers.protected_mod or
+                    p.modifiers.static_mod or p.modifiers.optional_mod or
+                    p.computed_symbol != null)
+                {
+                    continue;
+                }
+                if (!p.modifiers.readonly_mod or p.has_getter or p.has_setter) continue;
+                if (p.ty >= self.graph.types.len) continue;
+                var fn_sigs: std.ArrayList(u32) = .empty;
+                defer fn_sigs.deinit(self.scratch);
+                switch (self.graph.types[p.ty].kind) {
+                    .function_type => |sid| try fn_sigs.append(self.scratch, sid),
+                    .object_literal => |obj| {
+                        if (obj.properties.len == 0 and obj.construct_signatures.len == 0 and
+                            obj.index_signatures.len == 0 and obj.call_signatures.len > 0)
+                        {
+                            try fn_sigs.appendSlice(self.scratch, obj.call_signatures);
+                        }
+                    },
+                    else => {},
+                }
+                if (fn_sigs.items.len == 0) continue;
+                try promoted_prop_methods.put(self.scratch, pid, {});
+                const p_wire = self.str(p.name);
+                if (!is_class and required_methods.items.len < lower_objects.max_required_handle_checks) {
+                    var seen_rm = false;
+                    for (required_methods.items) |existing_rm| {
+                        if (std.mem.eql(u8, existing_rm, p_wire)) {
+                            seen_rm = true;
+                            break;
+                        }
+                    }
+                    if (!seen_rm) {
+                        try required_methods.append(self.alloc, try self.alloc.dupe(u8, p_wire));
+                    }
+                }
+                const p_jsdoc = try self.lowerJsDoc(p.jsdoc);
+                for (fn_sigs.items) |sid| {
+                    try appendMethodGroupSig(
+                        self,
+                        &struct_scope,
+                        &method_groups,
+                        p_wire,
+                        false,
+                        .method,
+                        sid,
+                        sp.env,
+                        p_jsdoc,
+                    );
+                }
+            }
+
             // 4. Instance property getters / `*Alloc` getters / setters.
             var instance_props: std.ArrayList(InstancePropIr) = .empty;
             for (raw_props) |sp| {
                 const pid = sp.pid;
                 if (pid >= self.graph.properties.len) continue;
+                if (promoted_prop_methods.contains(pid)) continue;
                 const p = self.graph.properties[pid];
                 if (p.modifiers.private_mod or p.modifiers.protected_mod) continue;
                 if (p.modifiers.static_mod) continue;
@@ -15814,7 +16309,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 var seen_non_default_decls: std.AutoHashMapUnmanaged(u32, void) = .empty;
                 defer seen_non_default_decls.deinit(self.scratch);
 
-                var explicit_own_wires: std.StringHashMapUnmanaged(void) = .empty;
+                var explicit_own_wires: std.StringHashMapUnmanaged(u32) = .empty;
                 defer explicit_own_wires.deinit(self.scratch);
                 var reexported_wire_canon: std.StringHashMapUnmanaged(StarCanonLoc) = .empty;
                 defer reexported_wire_canon.deinit(self.scratch);
@@ -15833,7 +16328,9 @@ fn LowerCtx(comptime GraphType: type) type {
                     const ed = self.graph.decls[edid];
                     if (ed.modifiers.default_export) continue;
                     const ew = if (ed.export_name) |esid| self.str(esid) else self.str(ed.name);
-                    if (ew.len > 0) try explicit_own_wires.put(self.scratch, ew, {});
+                    if (ew.len > 0 and !explicit_own_wires.contains(ew)) {
+                        try explicit_own_wires.put(self.scratch, ew, edid);
+                    }
                 }
 
                 // Expose exported members of a same-module `export = <namespace>` at module top-level (`H4`)!
@@ -15855,7 +16352,9 @@ fn LowerCtx(comptime GraphType: type) type {
                     const base_check = if (desired_styled.len == 0) "_empty" else desired_styled;
                     if (ms.isTaken(base_check)) continue;
                     try seen_non_default_decls.put(self.scratch, eq_cid, {});
-                    if (export_wire.len > 0) try explicit_own_wires.put(self.scratch, export_wire, {});
+                    if (export_wire.len > 0 and !explicit_own_wires.contains(export_wire)) {
+                        try explicit_own_wires.put(self.scratch, export_wire, eq_cid);
+                    }
 
                     const sb = try ms.bind(export_wire, style);
                     try planned_re_exports[final_i].append(self.scratch, .{
@@ -15892,12 +16391,16 @@ fn LowerCtx(comptime GraphType: type) type {
                         self.declNameStyle(sd);
 
                     if (!fe.is_default_export) {
-                        if (seen_non_default_decls.contains(fe.decl_id) or explicit_own_wires.contains(export_wire)) continue;
+                        if (seen_non_default_decls.contains(fe.decl_id)) continue;
                         const cur_canon: StarCanonLoc = .{
                             .module_index = loc.module_index,
                             .canonical_decl_id = StarCanonLoc.resolveCanonDeclId(self.graph.decls, fe.decl_id),
                             .zig_path = loc.zig_path,
                         };
+                        if (explicit_own_wires.get(export_wire)) |own_edid| {
+                            const own_canon_id = StarCanonLoc.resolveCanonDeclId(self.graph.decls, own_edid);
+                            if (!StarCanonLoc.areMergedPeers(self.graph.decls, own_canon_id, cur_canon.canonical_decl_id)) continue;
+                        }
                         if (reexported_wire_canon.get(export_wire)) |prev_canon| {
                             if (!StarCanonLoc.sameSymbol(self.graph.decls, prev_canon, cur_canon)) continue;
                         }
@@ -16153,7 +16656,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     .export_equals_ident = export_equals_ident,
                     .export_equals_wire_name = export_equals_wire_name,
                     .is_primary = cand.is_primary,
-                    .is_encapsulated_internal = (self.options.vfs_specifier_overrides.len > 0 and !cand.is_public_export_mod),
+                    .is_encapsulated_internal = !cand.is_public_export_mod,
                     .needs_root_runtime = needs_runtime,
                     .imports = mod_imports,
                     .decls = try decl_irs.toOwnedSlice(self.alloc),
@@ -16679,6 +17182,71 @@ fn LowerCtx(comptime GraphType: type) type {
                             d_val.wire_name,
                             d_val.is_default_export,
                         );
+                    }
+                }
+            }
+
+            // 2c. When a global-scope runtime class (`globals.Headers`, `globals.Response`,
+            // `globals.Request`, `globals.FormData`, `globals.WebSocket`, etc.) extends a same-named
+            // class inside an encapsulated types-only helper module (`undici-types/fetch`, etc.),
+            // promote that base class's runtime constructor target to global scope (`globalThis.<Name>`)
+            // so `instanceof` union discrimination (`HeadersInit`) works natively without importing a
+            // non-existent types-only JS module!
+            for (modules) |pub_mod| {
+                for (pub_mod.decls) |d| {
+                    if (!d.is_global_scope or d.kind != .struct_decl) continue;
+                    const st = d.kind.struct_decl;
+                    if (!st.is_class or !st.has_runtime_ctor_target) continue;
+                    for (st.bases) |base_ty| {
+                        var cur_ty: *const TypeIr = base_ty;
+                        var resolved_mod: ?u32 = null;
+                        var resolved_ident: ?[]const u8 = null;
+                        var hops: usize = 0;
+                        while (hops < 8) : (hops += 1) {
+                            if (cur_ty.* != .decl_ref) break;
+                            var cur_m = cur_ty.decl_ref.module_index;
+                            var cur_p = cur_ty.decl_ref.decl_zig_path;
+                            var re_hops: usize = 0;
+                            while (re_hops < 8) : (re_hops += 1) {
+                                if (cur_m >= modules.len or cur_p.len != 1) break;
+                                const re_cand = findNestedDeclByZigPath(modules[cur_m].decls, cur_p) orelse break;
+                                if (re_cand.kind != .re_export_decl) break;
+                                cur_m = re_cand.kind.re_export_decl.target_module_index;
+                                cur_p = re_cand.kind.re_export_decl.target_zig_path;
+                            }
+                            if (cur_m >= modules.len or cur_p.len != 1) break;
+                            const found = findNestedDeclByZigPath(modules[cur_m].decls, cur_p) orelse break;
+                            if (found.kind == .type_alias and found.kind.type_alias.type_params.len == 0) {
+                                cur_ty = found.kind.type_alias.target;
+                                continue;
+                            }
+                            resolved_mod = cur_m;
+                            resolved_ident = cur_p[0];
+                            break;
+                        }
+                        const b_mod = resolved_mod orelse continue;
+                        const b_ident = resolved_ident orelse continue;
+                        if (b_mod >= modules.len or !modules[b_mod].is_encapsulated_internal) continue;
+                        for (mod_mut_decls[b_mod]) |*bd| {
+                            if (!std.mem.eql(u8, bd.zig_ident, b_ident)) continue;
+                            if (bd.kind != .struct_decl or !bd.kind.struct_decl.is_class) continue;
+                            if (!std.mem.eql(u8, bd.wire_name, d.wire_name)) continue;
+                            const b_sid = bd.source_decl_id orelse continue;
+                            const bkey: ModDeclKey = .{ .mod_idx = b_mod, .sid = b_sid };
+                            if (natively_reachable.contains(bkey) or claimed_targets.contains(bkey)) continue;
+                            bd.is_global_scope = true;
+                            try natively_reachable.put(self.scratch, bkey, {});
+                            if (b_sid < self.graph.decls.len) {
+                                for (self.graph.decls[b_sid].merged_with) |peer_sid| {
+                                    try natively_reachable.put(self.scratch, .{ .mod_idx = b_mod, .sid = peer_sid }, {});
+                                    for (mod_mut_decls[b_mod]) |*pitem| {
+                                        if (pitem.source_decl_id == peer_sid and std.mem.eql(u8, pitem.wire_name, d.wire_name)) {
+                                            pitem.is_global_scope = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

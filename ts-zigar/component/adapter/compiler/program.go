@@ -122,6 +122,10 @@ func CreateProgram(
 		return witTypes.Err[*Program, []zigar_typescript_types.Diagnostic](missingDiags)
 	}
 
+	if fs.useBundledLibs && coreOpts.Lib == nil && !hasExplicitDomOrBrowserTypes(coreOpts.Types) && fs.HasNodeWebGlobals() {
+		coreOpts.Lib = []string{pureEsLibForTarget(coreOpts.Target)}
+	}
+
 	host := compiler.NewCompilerHost(fs.FS(), fs.DefaultLibraryPath(), nil, nil, nil)
 	cmdLine := tsoptions.NewParsedCommandLine(
 		coreOpts,
