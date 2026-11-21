@@ -6155,6 +6155,170 @@ test "Issue #56 @types/node@26 events, stream, stream/consumers, stream/promises
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", probe_zig });
 }
 
+test "Issue #57 @types/node@26 fs, path (plus path/win32 & path/posix), url, querystring, http, http2, https, net, tls, dns, and dgram lower ConstructorOf, InstanceType, Date/RegExp, and aliased sub-namespaces cleanly" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const types_node_dir = (try resolveTypesNode26Dir(alloc)) orelse return error.SkipZigTest;
+    defer alloc.free(types_node_dir);
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue57-fs-net", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const cli_args = [_][]const u8{
+        "-t", types_node_dir,
+        "-m", "globals",
+        "-m", "node:buffer",
+        "-m", "node:events",
+        "-m", "node:stream",
+        "-m", "node:fs",
+        "-m", "node:fs/promises",
+        "-m", "node:path",
+        "-m", "node:path/win32",
+        "-m", "node:path/posix",
+        "-m", "node:url",
+        "-m", "node:querystring",
+        "-m", "node:http",
+        "-m", "node:http2",
+        "-m", "node:https",
+        "-m", "node:net",
+        "-m", "node:tls",
+        "-m", "node:dns",
+        "-m", "node:dns/promises",
+        "-m", "node:dgram",
+        "-d", out_dir,
+    };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Issue #57 @types/node@26 fs/net error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+
+    const path_zig = try std.fmt.allocPrint(alloc, "{s}/path.zig", .{out_dir});
+    defer alloc.free(path_zig);
+    const path_src = try cwd.readFileAlloc(io, path_zig, alloc, .limited(8 * 1024 * 1024));
+    defer alloc.free(path_src);
+    try std.testing.expect(std.mem.indexOf(u8, path_src, ".ns_path = &.{\"posix\"}, .name = \"join\", .from_default = true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, path_src, ".ns_path = &.{\"win32\"}, .name = \"join\", .from_default = true") != null);
+
+    const path_win32_zig = try std.fmt.allocPrint(alloc, "{s}/path/win32.zig", .{out_dir});
+    defer alloc.free(path_win32_zig);
+    const path_win32_src = try cwd.readFileAlloc(io, path_win32_zig, alloc, .limited(4 * 1024 * 1024));
+    defer alloc.free(path_win32_src);
+    try std.testing.expect(std.mem.indexOf(u8, path_win32_src, "resolve_2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, path_win32_src, "join_2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, path_win32_src, "matchesGlob_2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, path_win32_src, ".Path.win32.join") != null);
+    try std.testing.expect(std.mem.indexOf(u8, path_win32_src, ".Path.posix") != null);
+
+    const http_zig = try std.fmt.allocPrint(alloc, "{s}/http.zig", .{out_dir});
+    defer alloc.free(http_zig);
+    const http_src = try cwd.readFileAlloc(io, http_zig, alloc, .limited(16 * 1024 * 1024));
+    defer alloc.free(http_src);
+    try std.testing.expect(std.mem.indexOf(u8, http_src, "__zigar_js.ConstructorOf(IncomingMessage)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, http_src, "__zigar_js.InstanceType(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, http_src, ".default_fn_name = @as(?[]const u8, \"createServerRequestListenerDefault\")") != null);
+
+    const fsp_zig = try std.fmt.allocPrint(alloc, "{s}/fs/promises.zig", .{out_dir});
+    defer alloc.free(fsp_zig);
+    const fsp_src = try cwd.readFileAlloc(io, fsp_zig, alloc, .limited(16 * 1024 * 1024));
+    defer alloc.free(fsp_src);
+    try std.testing.expect(std.mem.indexOf(u8, fsp_src, "pub fn pull") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fsp_src, "\"readableWebStream\", \"readFile\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fsp_src, "\"pull\", \"read\"") == null);
+
+    const http2_zig = try std.fmt.allocPrint(alloc, "{s}/http2.zig", .{out_dir});
+    defer alloc.free(http2_zig);
+    const http2_src = try cwd.readFileAlloc(io, http2_zig, alloc, .limited(16 * 1024 * 1024));
+    defer alloc.free(http2_src);
+    try std.testing.expect(std.mem.indexOf(u8, http2_src, "__zigar_js.invokeSelfMethod(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, http2_src, "\"maxConnections\", \"connections\"") == null);
+
+    const probe_zig = try std.fmt.allocPrint(alloc, "{s}/issue57_probe.zig", .{sandbox});
+    defer alloc.free(probe_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "issue57_probe.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r = @import("out/root.zig");
+            \\const js = r.zigar_js;
+            \\const nfs = r.node_fs;
+            \\const nfsp = r.node_fs_promises;
+            \\const np = r.node_path;
+            \\const npw = r.node_path_win32;
+            \\const npp = r.node_path_posix;
+            \\const nu = r.node_url;
+            \\const nq = r.node_querystring;
+            \\const nhttp = r.node_http;
+            \\const nhttp2 = r.node_http2;
+            \\const nhttps = r.node_https;
+            \\const nnet = r.node_net;
+            \\const ntls = r.node_tls;
+            \\const ndns = r.node_dns;
+            \\const ndnsp = r.node_dns_promises;
+            \\const ndgram = r.node_dgram;
+            \\
+            \\test "Issue #57 @types/node@26 fs, path, url, querystring, http, http2, https, net, tls, dns, dgram Sema" {
+            \\    @setEvalBranchQuota(10_000_000);
+            \\    try std.testing.expect(js.InstanceType(js.ConstructorOf(nhttp.IncomingMessage)) == nhttp.IncomingMessage);
+            \\    try std.testing.expect(@typeInfo(@TypeOf(nfs.Stats.mtime)).@"fn".return_type.? == js.CallError!js.Date);
+            \\    try std.testing.expect(np.ParsedPath == npw.ParsedPath);
+            \\    try std.testing.expect(np.ParsedPath == npp.ParsedPath);
+            \\
+            \\    _ = &nfs.readFileSyncOptionsAlloc;
+            \\    _ = &nfs.writeFileSync;
+            \\    _ = &nfs.statSyncPathLikeOptionsOpt;
+            \\    _ = &nfsp.readFilePathLikeOrFileHandleReadFileOptionsWithStringEncodingOrBufferEncodingAlloc;
+            \\    _ = &nfsp.open;
+            \\    _ = &nfsp.opendir;
+            \\    _ = &np.joinAlloc;
+            \\    _ = &np.win32.joinAlloc;
+            \\    _ = &np.posix.joinAlloc;
+            \\    _ = &npw.joinAlloc;
+            \\    _ = &npp.joinAlloc;
+            \\    _ = &nu.pathToFileUrl;
+            \\    _ = &nu.fileUrlToPathAlloc;
+            \\    _ = &nu.UrlSearchParams.init;
+            \\    _ = &nq.escapeAlloc;
+            \\    _ = &nhttp.createServer;
+            \\    _ = &nhttp.createServerRequestListenerDefault;
+            \\    _ = &nhttp.requestWithOptions;
+            \\    _ = &nhttp2.createServerCallback;
+            \\    _ = &nhttp2.connectCallback;
+            \\    _ = &nhttps.Agent.init;
+            \\    _ = &nnet.createServerCallback;
+            \\    _ = &nnet.createConnectionWithHost;
+            \\    _ = &ntls.getCiphersAlloc;
+            \\    _ = &ndns.lookup;
+            \\    _ = &ndnsp.lookupStringLookupOneOptionsAlloc;
+            \\    _ = &ndgram.createSocketSocketType;
+            \\}
+            ,
+        });
+    }
+
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", probe_zig });
+}
+
 
 
 

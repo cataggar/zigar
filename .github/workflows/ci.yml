@@ -370,7 +370,8 @@ jobs:
             test/ts-zigar-m3-protocols.test.js \
             test/ts-zigar-m3-ts71.test.js \
             test/ts-zigar-m4-node26-core.test.js \
-            test/ts-zigar-m4-node26-events-streams.test.js
+            test/ts-zigar-m4-node26-events-streams.test.js \
+            test/ts-zigar-m4-node26-fs-net.test.js
 
       - name: Run ts-zigar Native ESM & CJS roundtrip tests (node-zigar)
         env:
@@ -385,7 +386,8 @@ jobs:
             test/ts-zigar-m3-protocols.test.js \
             test/ts-zigar-m3-ts71.test.js \
             test/ts-zigar-m4-node26-core.test.js \
-            test/ts-zigar-m4-node26-events-streams.test.js
+            test/ts-zigar-m4-node26-events-streams.test.js \
+            test/ts-zigar-m4-node26-fs-net.test.js
 
   benchmarks:
     name: Wazig vs Zig Benchmarks

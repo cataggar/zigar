@@ -121,12 +121,15 @@ pub const BinaryViewKind = enum(u8) {
     }
 };
 
-/// Nominal / boxed JS wrapper interfaces (`BigInt`, `String`, `Symbol`, `Object`).
+/// Nominal / boxed JS built-in interfaces (`BigInt`, `String`, `Symbol`, `Object`, `Date`, `RegExp`, `Function`, `Error`).
 pub const BoxedIntrinsicKind = enum(u8) {
     bigint,
     string,
     symbol,
     object,
+    date,
+    regexp,
+    function,
 
     pub fn fromTypeName(raw_name: []const u8) ?BoxedIntrinsicKind {
         const stripped = stripGlobalQualifier(raw_name);
@@ -135,6 +138,16 @@ pub const BoxedIntrinsicKind = enum(u8) {
             .{ "String", .string },
             .{ "Symbol", .symbol },
             .{ "Object", .object },
+            .{ "Date", .date },
+            .{ "RegExp", .regexp },
+            .{ "Function", .function },
+            .{ "Error", .object },
+            .{ "TypeError", .object },
+            .{ "RangeError", .object },
+            .{ "SyntaxError", .object },
+            .{ "ReferenceError", .object },
+            .{ "URIError", .object },
+            .{ "EvalError", .object },
         });
         return map.get(stripped);
     }

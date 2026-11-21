@@ -1768,6 +1768,8 @@ const ModuleEmitCtx = struct {
             .js_symbol => try self.out.appendSlice(self.allocator, "__zigar_js.Symbol"),
             .js_bigint => try self.out.appendSlice(self.allocator, "__zigar_js.BigInt"),
             .js_string => try self.out.appendSlice(self.allocator, "__zigar_js.String"),
+            .js_date => try self.out.appendSlice(self.allocator, "__zigar_js.Date"),
+            .js_regexp => try self.out.appendSlice(self.allocator, "__zigar_js.RegExp"),
             .binary_view => |bvk| try self.out.print(self.allocator, "__zigar_js.{s}", .{bvk.zigTypeIdent()}),
             .self_type => |sid| try self.emitIdentSegment(sid),
             .type_param_ref => |tp_ident| {
@@ -2320,6 +2322,18 @@ const ModuleEmitCtx = struct {
             try self.out.appendSlice(self.allocator, "), .infer_alloc_fn_name = @as(?[]const u8, ");
             if (cand.infer_alloc_target_ident) |iafn| {
                 try self.emitStringLit(iafn);
+            } else {
+                try self.out.appendSlice(self.allocator, "null");
+            }
+            try self.out.appendSlice(self.allocator, "), .default_fn_name = @as(?[]const u8, ");
+            if (cand.default_target_ident) |dfn| {
+                try self.emitStringLit(dfn);
+            } else {
+                try self.out.appendSlice(self.allocator, "null");
+            }
+            try self.out.appendSlice(self.allocator, "), .default_alloc_fn_name = @as(?[]const u8, ");
+            if (cand.default_alloc_target_ident) |dafn| {
+                try self.emitStringLit(dafn);
             } else {
                 try self.out.appendSlice(self.allocator, "null");
             }
@@ -3696,7 +3710,11 @@ const ModuleEmitCtx = struct {
                     try self.emitStringLit(m.wire_name);
                     try self.out.appendSlice(self.allocator, ", __zigar_args);\n");
                 } else {
-                    try self.out.appendSlice(self.allocator, "return __zigar_js.invokeMethod(");
+                    const helper_name = if (!m.is_static and ret_type_expr_opt == null and sig.return_type.* == .self_type)
+                        "invokeSelfMethod"
+                    else
+                        "invokeMethod";
+                    try self.out.print(self.allocator, "return __zigar_js.{s}(", .{helper_name});
                     if (ret_type_expr_opt) |rtexpr| try self.out.appendSlice(self.allocator, rtexpr) else try self.emitType(sig.return_type);
                     try self.out.print(self.allocator, ", {s}.{s}, ", .{ recv_ident, st.ref_field_ident });
                     try self.emitStringLit(m.wire_name);
@@ -4321,11 +4339,40 @@ const ModuleEmitCtx = struct {
         for (st.nested_decls) |nd| {
             try appendDeclIdentsToScopeFrame(&frame_list, self.allocator, nd);
         }
+        var emit_instance_const = false;
+        if (st.instance_ty != null) {
+            var has_instance_clash = std.mem.eql(u8, unquoteZigIdent(st.self_ident), "Instance");
+            if (!has_instance_clash) {
+                for (st.static_props) |sp| {
+                    if (std.mem.eql(u8, unquoteZigIdent(sp.zig_ident), "Instance")) {
+                        has_instance_clash = true;
+                        break;
+                    }
+                }
+            }
+            if (!has_instance_clash) {
+                for (frame_list.items) |fid| {
+                    if (std.mem.eql(u8, unquoteZigIdent(fid), "Instance")) {
+                        has_instance_clash = true;
+                        break;
+                    }
+                }
+            }
+            if (!has_instance_clash) {
+                emit_instance_const = true;
+                try frame_list.append(self.allocator, "Instance");
+            }
+        }
         try self.nested_decl_scopes.append(self.allocator, frame_list.items);
         defer _ = self.nested_decl_scopes.pop();
 
         try self.out.appendSlice(self.allocator, "struct {\n");
         try self.out.print(self.allocator, "const {s} = @This();\n", .{st.self_ident});
+        if (emit_instance_const) {
+            try self.out.appendSlice(self.allocator, "pub const Instance = ");
+            try self.emitType(st.instance_ty.?);
+            try self.out.appendSlice(self.allocator, ";\npub const is_js_constructor = true;\n");
+        }
 
         if (st.repr == .handle_wrapper) {
             const backing_ty = if (st.is_callable_handle) "__zigar_js.JsFunction" else "__zigar_js.JsObject";
@@ -6234,10 +6281,156 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    }
         \\};
         \\
+        \\pub const StubDate = extern struct {
+        \\    const Self = @This();
+        \\    pub const is_js_value = true;
+        \\
+        \\    handle: u32 = 0,
+        \\
+        \\    pub const @"undefined": Self = .{ .handle = 0 };
+        \\    pub const @"null": Self = .{ .handle = 1 };
+        \\
+        \\    pub fn isUndefined(self: Self) bool {
+        \\        return self.handle == 0;
+        \\    }
+        \\
+        \\    pub fn isNull(self: Self) bool {
+        \\        return self.handle == 1;
+        \\    }
+        \\
+        \\    pub fn isNullOrUndefined(self: Self) bool {
+        \\        return self.handle <= 1;
+        \\    }
+        \\
+        \\    pub fn clone(self: Self) Self {
+        \\        return self;
+        \\    }
+        \\
+        \\    pub fn tryClone(self: Self) Error!Self {
+        \\        return self;
+        \\    }
+        \\
+        \\    pub fn deinit(_: Self) void {}
+        \\
+        \\    pub fn tryDeinit(_: Self) Error!void {}
+        \\
+        \\    pub fn eql(self: Self, other: anytype) bool {
+        \\        return self.handle == other.handle;
+        \\    }
+        \\
+        \\    pub fn tryEql(_: Self, _: anytype) Error!bool {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn ref(self: Self) Any {
+        \\        return .{ .handle = self.handle };
+        \\    }
+        \\
+        \\    pub fn toRef(self: Self) Any {
+        \\        return .{ .handle = self.handle };
+        \\    }
+        \\
+        \\    pub fn fromRef(v: anytype) Self {
+        \\        return .{ .handle = v.handle };
+        \\    }
+        \\
+        \\    pub fn now() Error!f64 {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn fromTimestampMs(_: f64) Error!Self {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn fromIsoString(_: []const u8) Error!Self {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn timestampMs(_: Self) Error!f64 {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn toIsoStringAlloc(_: Self, _: std.mem.Allocator) AllocError![]u8 {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\};
+        \\
+        \\pub const StubRegExp = extern struct {
+        \\    const Self = @This();
+        \\    pub const is_js_value = true;
+        \\
+        \\    handle: u32 = 0,
+        \\
+        \\    pub const @"undefined": Self = .{ .handle = 0 };
+        \\    pub const @"null": Self = .{ .handle = 1 };
+        \\
+        \\    pub fn isUndefined(self: Self) bool {
+        \\        return self.handle == 0;
+        \\    }
+        \\
+        \\    pub fn isNull(self: Self) bool {
+        \\        return self.handle == 1;
+        \\    }
+        \\
+        \\    pub fn isNullOrUndefined(self: Self) bool {
+        \\        return self.handle <= 1;
+        \\    }
+        \\
+        \\    pub fn clone(self: Self) Self {
+        \\        return self;
+        \\    }
+        \\
+        \\    pub fn tryClone(self: Self) Error!Self {
+        \\        return self;
+        \\    }
+        \\
+        \\    pub fn deinit(_: Self) void {}
+        \\
+        \\    pub fn tryDeinit(_: Self) Error!void {}
+        \\
+        \\    pub fn eql(self: Self, other: anytype) bool {
+        \\        return self.handle == other.handle;
+        \\    }
+        \\
+        \\    pub fn tryEql(_: Self, _: anytype) Error!bool {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn ref(self: Self) Any {
+        \\        return .{ .handle = self.handle };
+        \\    }
+        \\
+        \\    pub fn toRef(self: Self) Any {
+        \\        return .{ .handle = self.handle };
+        \\    }
+        \\
+        \\    pub fn fromRef(v: anytype) Self {
+        \\        return .{ .handle = v.handle };
+        \\    }
+        \\
+        \\    pub fn init(_: []const u8, _: []const u8) Error!Self {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn testMatch(_: Self, _: []const u8) Error!bool {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub const @"test" = testMatch;
+        \\
+        \\    pub fn sourceAlloc(_: Self, _: std.mem.Allocator) AllocError![]u8 {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\
+        \\    pub fn flagsAlloc(_: Self, _: std.mem.Allocator) AllocError![]u8 {
+        \\        return error.HostUnavailable;
+        \\    }
+        \\};
+        \\
         \\pub const String = if (has_host) raw_js.String else StubString;
         \\pub const BigInt = if (has_host) raw_js.BigInt else StubBigInt;
-        \\pub const Date = if (has_host) raw_js.Date else StubHandle;
-        \\pub const RegExp = if (has_host) raw_js.RegExp else StubHandle;
+        \\pub const Date = if (has_host) raw_js.Date else StubDate;
+        \\pub const RegExp = if (has_host) raw_js.RegExp else StubRegExp;
         \\
         \\pub const Buffer = if (has_host) raw_js.Buffer else StubHandle;
         \\pub const Uint8Array = if (has_host) raw_js.Uint8Array else StubHandle;
@@ -6626,6 +6819,10 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\pub const Awaited = if (has_host) raw_js.Awaited else standaloneAwaited;
         \\pub const InferCallbackPromisePayload = if (has_host) raw_js.InferCallbackPromisePayload else standaloneInferCallbackPromisePayload;
         \\pub const KeyOf = if (has_host) raw_js.KeyOf else standaloneKeyOf;
+        \\pub const InstanceType = if (has_host) raw_js.InstanceType else standaloneInstanceType;
+        \\pub const Parameters = if (has_host) raw_js.Parameters else standaloneParameters;
+        \\pub const ReturnType = if (has_host) raw_js.ReturnType else standaloneReturnType;
+        \\pub const ConstructorParameters = if (has_host) raw_js.ConstructorParameters else standaloneConstructorParameters;
         \\pub const MappedValues = if (has_host) raw_js.MappedValues else standaloneMappedValues;
         \\pub const MappedValuesSpec = if (has_host) raw_js.MappedValuesSpec else standaloneMappedValuesSpec;
         \\pub const IndexAccess = if (has_host) raw_js.IndexAccess else standaloneIndexAccess;
@@ -7176,6 +7373,25 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    defer raw.deinit();
         \\    if (T == noreturn) {
         \\        return error.Unexpected;
+        \\    }
+        \\    return try fromJsRef(T, raw);
+        \\}
+        \\
+        \\pub fn invokeSelfMethod(
+        \\    comptime T: type,
+        \\    self_ref: anytype,
+        \\    comptime method_name: []const u8,
+        \\    args: Args,
+        \\) CallError!T {
+        \\    if (!has_host) return error.HostUnavailable;
+        \\    const raw = try invokeRawMethod(self_ref, method_name, args);
+        \\    defer raw.deinit();
+        \\    if (T == noreturn) {
+        \\        return error.Unexpected;
+        \\    }
+        \\    if (raw.isUndefined()) {
+        \\        const self_any: Any = .{ .handle = self_ref.handle };
+        \\        return try fromJsRef(T, self_any);
         \\    }
         \\    return try fromJsRef(T, raw);
         \\}
@@ -8375,6 +8591,76 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    return fni.return_type orelse void;
         \\}
         \\
+        \\pub fn ConstructorOf(comptime InstanceT: type) type {
+        \\    return struct {
+        \\        const Self = @This();
+        \\        pub const Instance = InstanceT;
+        \\        pub const is_js_constructor = true;
+        \\        ref: JsFunction = JsFunction.@"undefined",
+        \\
+        \\        pub fn construct(self: Self, args_tuple: anytype) CallError!InstanceT {
+        \\            const js_args = try initArgs();
+        \\            defer js_args.deinit();
+        \\            if (comptime !isTupleType(@TypeOf(args_tuple))) {
+        \\                @compileError("Expected tuple `.{ ... }` for ConstructorOf.construct");
+        \\            }
+        \\            const tst = @typeInfo(@TypeOf(args_tuple)).@"struct";
+        \\            inline for (0..tst.field_types.len) |i| {
+        \\                try pushArg(js_args, args_tuple[i], .null_or_undefined);
+        \\            }
+        \\            return constructCallable(InstanceT, self.ref, js_args);
+        \\        }
+        \\
+        \\        pub fn prototype(self: Self) CallError!InstanceT {
+        \\            return getInstanceProp(InstanceT, self.ref, "prototype");
+        \\        }
+        \\
+        \\        pub fn deinit(self: Self) void {
+        \\            self.ref.deinit();
+        \\        }
+        \\
+        \\        pub fn clone(self: Self) CallError!Self {
+        \\            return try cloneHandle(Self, self);
+        \\        }
+        \\
+        \\        pub fn as(self: Self, comptime Base: type) Base {
+        \\            return upcastValue(Self, self, Base);
+        \\        }
+        \\
+        \\        pub fn tryAs(self: Self, comptime Sub: type) CallError!?Sub {
+        \\            return downcastHandle(Sub, self.ref);
+        \\        }
+        \\
+        \\        pub fn toRef(self: Self) Any {
+        \\            return .{ .handle = self.ref.handle };
+        \\        }
+        \\
+        \\        pub fn fromRef(raw: anytype) CallError!Self {
+        \\            return try runtimeFromJsRef(Self, raw);
+        \\        }
+        \\
+        \\        pub fn toJsRef(self: Self) Any {
+        \\            return .{ .handle = self.ref.handle };
+        \\        }
+        \\
+        \\        pub fn fromJsRef(raw: anytype) CallError!Self {
+        \\            return try runtimeFromJsRef(Self, raw);
+        \\        }
+        \\
+        \\        pub const zigar_js = .{
+        \\            .js_name = "Function",
+        \\            .is_handle = true,
+        \\            .ref_field = "ref",
+        \\            .is_callable_handle = true,
+        \\            .is_class = false,
+        \\            .fields = .{},
+        \\            .methods = .{},
+        \\        };
+        \\    };
+        \\}
+        \\
+        \\const runtimeFromJsRef = fromJsRef;
+        \\
         \\pub fn Callable(comptime FnSig: type) type {
         \\    return struct {
         \\        const Self = @This();
@@ -9215,9 +9501,12 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    const tst = @typeInfo(TupT).@"struct";
         \\    const tp_n: usize = cand.type_param_count;
         \\    const explicit_tps = candidateUsesExplicitTypeParams(cand, TupT);
+        \\    const has_infer = @hasField(@TypeOf(cand), "infer_fn_name") and cand.infer_fn_name != null;
+        \\    const has_default = @hasField(@TypeOf(cand), "default_fn_name") and cand.default_fn_name != null;
         \\    if (tp_n > 0 and !explicit_tps) {
-        \\        if (!@hasField(@TypeOf(cand), "infer_fn_name") or cand.infer_fn_name == null) return null;
+        \\        if (!has_infer and !has_default) return null;
         \\    }
+        \\    const use_default = tp_n > 0 and !explicit_tps and !has_infer and has_default;
         \\    const eff_tp_n: usize = if (explicit_tps) tp_n else 0;
         \\    if (explicit_tps) {
         \\        inline for (0..tp_n) |ti| {
@@ -9235,9 +9524,9 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    if (val_argc < cand.min_arity) return null;
         \\    if (!cand.has_rest and val_argc > fixed_len) return null;
         \\
-        \\    const BaseFn = @field(Owner, cand.fn_name);
+        \\    const BaseFn = if (use_default) @field(Owner, cand.default_fn_name.?) else @field(Owner, cand.fn_name);
         \\    const base_params = @typeInfo(@TypeOf(BaseFn)).@"fn".param_types;
-        \\    const param_base: usize = @intFromBool(has_self) + tp_n;
+        \\    const param_base: usize = @intFromBool(has_self) + (if (use_default) 0 else tp_n);
         \\
         \\    comptime var score: usize = 1000;
         \\    const deduced_cap = if (tp_n > 0) tp_n else 1;
@@ -9316,7 +9605,8 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\        if (cand.slice_fn_name) |sfn| {
         \\            const SliceFn = @field(Owner, sfn);
         \\            const slice_params = @typeInfo(@TypeOf(SliceFn)).@"fn".param_types;
-        \\            if (slice_params[param_base + fixed_len]) |RestSliceT| {
+        \\            const slice_param_base: usize = @intFromBool(has_self) + tp_n;
+        \\            if (slice_params[slice_param_base + fixed_len]) |RestSliceT| {
         \\                const ElemT = SliceElem(RestSliceT);
         \\                if (ElemT == Any or ElemT == Unknown) {
         \\                    score += (val_argc - fixed_len) * 2;
@@ -9512,17 +9802,23 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\
         \\fn candidatePassAlloc(comptime cand: anytype, comptime TupT: type, comptime caller_has_alloc: bool) bool {
         \\    if (!caller_has_alloc) return false;
-        \\    const use_infer = cand.type_param_count > 0 and !candidateUsesExplicitTypeParams(cand, TupT);
-        \\    if (use_infer) {
-        \\        return @hasField(@TypeOf(cand), "infer_alloc_fn_name") and cand.infer_alloc_fn_name != null;
+        \\    const use_implicit_tp = cand.type_param_count > 0 and !candidateUsesExplicitTypeParams(cand, TupT);
+        \\    if (use_implicit_tp) {
+        \\        if (@hasField(@TypeOf(cand), "infer_fn_name") and cand.infer_fn_name != null) {
+        \\            return @hasField(@TypeOf(cand), "infer_alloc_fn_name") and cand.infer_alloc_fn_name != null;
+        \\        }
+        \\        return @hasField(@TypeOf(cand), "default_alloc_fn_name") and cand.default_alloc_fn_name != null;
         \\    }
         \\    return cand.alloc_fn_name != null;
         \\}
         \\
         \\fn candidateTargetFnName(comptime cand: anytype, comptime TupT: type, comptime pass_alloc: bool) []const u8 {
-        \\    const use_infer = cand.type_param_count > 0 and !candidateUsesExplicitTypeParams(cand, TupT);
-        \\    if (use_infer) {
-        \\        return if (pass_alloc) cand.infer_alloc_fn_name.? else cand.infer_fn_name.?;
+        \\    const use_implicit_tp = cand.type_param_count > 0 and !candidateUsesExplicitTypeParams(cand, TupT);
+        \\    if (use_implicit_tp) {
+        \\        if (@hasField(@TypeOf(cand), "infer_fn_name") and cand.infer_fn_name != null) {
+        \\            return if (pass_alloc) cand.infer_alloc_fn_name.? else cand.infer_fn_name.?;
+        \\        }
+        \\        return if (pass_alloc) cand.default_alloc_fn_name.? else cand.default_fn_name.?;
         \\    }
         \\    return if (pass_alloc) cand.alloc_fn_name.? else cand.fn_name;
         \\}
@@ -11792,7 +12088,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    if (@typeInfo(VT) == .@"struct" and @typeInfo(VT).@"struct".is_tuple) {
         \\        return @typeInfo(VT).@"struct".field_types.len == 0;
         \\    }
-        \\    if (@typeInfo(SeqT) == .@"struct" and @hasDecl(SeqT, "zigar_js_tuple") and VT == SeqT) {
+        \\    if (@typeInfo(SeqT) == .@"struct" and (@typeInfo(SeqT).@"struct".is_tuple or @hasDecl(SeqT, "zigar_js_tuple")) and VT == SeqT) {
         \\        comptime var rc: usize = 0;
         \\        for (@typeInfo(SeqT).@"struct".field_names) |fnm| {
         \\            if (!isHiddenMetaField(fnm)) rc += 1;
@@ -12237,6 +12533,214 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    return standaloneIndexAccessWithFallback(Any, T, keys_spec);
         \\}
         \\
+        \\pub fn standaloneTryConstructorInstanceType(comptime CtorT: type) ?type {
+        \\    if (CtorT == noreturn or @typeInfo(CtorT) != .@"struct") return null;
+        \\    if (@hasDecl(CtorT, "Instance") and @TypeOf(CtorT.Instance) == type) {
+        \\        return CtorT.Instance;
+        \\    }
+        \\    if (@hasDecl(CtorT, "zigar_js") and @hasField(@TypeOf(CtorT.zigar_js), "is_callable_handle") and CtorT.zigar_js.is_callable_handle) {
+        \\        if (@hasDecl(CtorT, "prototype") and @typeInfo(@TypeOf(CtorT.prototype)) == .@"fn") {
+        \\            const pfni = @typeInfo(@TypeOf(CtorT.prototype)).@"fn";
+        \\            if (pfni.param_types.len == 1 and pfni.return_type != null) {
+        \\                const rt = pfni.return_type.?;
+        \\                return if (@typeInfo(rt) == .error_union) @typeInfo(rt).error_union.payload else rt;
+        \\            }
+        \\        }
+        \\        if (@hasDecl(CtorT, "construct") and @typeInfo(@TypeOf(CtorT.construct)) == .@"fn") {
+        \\            const cfni = @typeInfo(@TypeOf(CtorT.construct)).@"fn";
+        \\            if (cfni.return_type != null) {
+        \\                const rt = cfni.return_type.?;
+        \\                return if (@typeInfo(rt) == .error_union) @typeInfo(rt).error_union.payload else rt;
+        \\            }
+        \\        }
+        \\    }
+        \\    return null;
+        \\}
+        \\
+        \\pub fn standaloneInstanceType(comptime CtorT: type) type {
+        \\    if (CtorT == noreturn) return noreturn;
+        \\    if (@typeInfo(CtorT) == .@"union" and @typeInfo(CtorT).@"union".tag_type != null and !isModuleNullableType(CtorT)) {
+        \\        const un = @typeInfo(CtorT).@"union";
+        \\        comptime var distinct: [un.field_types.len]type = undefined;
+        \\        comptime var d_len: usize = 0;
+        \\        for (un.field_types) |ft| {
+        \\            const it = standaloneInstanceType(ft);
+        \\            var seen = false;
+        \\            for (distinct[0..d_len]) |prev| {
+        \\                if (prev == it) {
+        \\                    seen = true;
+        \\                    break;
+        \\                }
+        \\            }
+        \\            if (!seen) {
+        \\                distinct[d_len] = it;
+        \\                d_len += 1;
+        \\            }
+        \\        }
+        \\        return buildSynthesizedUnion(distinct[0..d_len]);
+        \\    }
+        \\    if (standaloneTryConstructorInstanceType(CtorT)) |inst| return inst;
+        \\    return Any;
+        \\}
+        \\
+        \\fn standaloneTupleFromFnParams(comptime fni: std.builtin.Type.Fn, comptime start: usize) type {
+        \\    if (fni.param_types.len <= start) return @Tuple(&.{});
+        \\    const n = fni.param_types.len - start;
+        \\    comptime var ptypes: [n]type = undefined;
+        \\    for (0..n) |i| {
+        \\        ptypes[i] = fni.param_types[start + i] orelse Any;
+        \\    }
+        \\    const fin = ptypes;
+        \\    return @Tuple(&fin);
+        \\}
+        \\
+        \\pub fn standaloneParameters(comptime FnT: type) type {
+        \\    if (FnT == noreturn) return noreturn;
+        \\    if (@typeInfo(FnT) == .@"union" and @typeInfo(FnT).@"union".tag_type != null and !isModuleNullableType(FnT)) {
+        \\        const un = @typeInfo(FnT).@"union";
+        \\        comptime var distinct: [un.field_types.len]type = undefined;
+        \\        comptime var d_len: usize = 0;
+        \\        for (un.field_types) |ft| {
+        \\            const pt = standaloneParameters(ft);
+        \\            var seen = false;
+        \\            for (distinct[0..d_len]) |prev| {
+        \\                if (prev == pt) {
+        \\                    seen = true;
+        \\                    break;
+        \\                }
+        \\            }
+        \\            if (!seen) {
+        \\                distinct[d_len] = pt;
+        \\                d_len += 1;
+        \\            }
+        \\        }
+        \\        return buildSynthesizedUnion(distinct[0..d_len]);
+        \\    }
+        \\    switch (@typeInfo(FnT)) {
+        \\        .@"fn" => |fni| return standaloneTupleFromFnParams(fni, 0),
+        \\        .pointer => |pt| if (pt.size == .one and @typeInfo(pt.child) == .@"fn") return standaloneParameters(pt.child),
+        \\        .@"struct" => {
+        \\            if (@hasDecl(FnT, "is_zigar_variadic_callable") and FnT.is_zigar_variadic_callable and @hasDecl(FnT, "Signature")) {
+        \\                const SigT = if (@TypeOf(FnT.Signature) == type) FnT.Signature else FnT.Signature();
+        \\                const sfni = @typeInfo(SigT).@"fn";
+        \\                return if (sfni.param_types.len == 1 and sfni.param_types[0] != null) sfni.param_types[0].? else []const Any;
+        \\            }
+        \\            if (@hasDecl(FnT, "FnType") and @TypeOf(FnT.FnType) == type and @typeInfo(FnT.FnType) == .@"fn") {
+        \\                return standaloneParameters(FnT.FnType);
+        \\            }
+        \\            if (@hasDecl(FnT, "Signature")) {
+        \\                const SigT = if (@TypeOf(FnT.Signature) == type) FnT.Signature else FnT.Signature();
+        \\                if (@typeInfo(SigT) == .@"fn") return standaloneParameters(SigT);
+        \\            }
+        \\            if (@hasDecl(FnT, "zigar_js") and @hasField(@TypeOf(FnT.zigar_js), "is_callable_handle") and FnT.zigar_js.is_callable_handle and
+        \\                @hasDecl(FnT, "call") and @typeInfo(@TypeOf(FnT.call)) == .@"fn")
+        \\            {
+        \\                const cfni = @typeInfo(@TypeOf(FnT.call)).@"fn";
+        \\                const start: usize = if (cfni.param_types.len > 0 and cfni.param_types[0] == FnT) 1 else 0;
+        \\                if (!(cfni.param_types.len - start == 1 and cfni.param_types[start] == null)) {
+        \\                    return standaloneTupleFromFnParams(cfni, start);
+        \\                }
+        \\            }
+        \\        },
+        \\        else => {},
+        \\    }
+        \\    return []const Any;
+        \\}
+        \\
+        \\pub fn standaloneReturnType(comptime FnT: type) type {
+        \\    if (FnT == noreturn) return noreturn;
+        \\    if (@typeInfo(FnT) == .@"union" and @typeInfo(FnT).@"union".tag_type != null and !isModuleNullableType(FnT)) {
+        \\        const un = @typeInfo(FnT).@"union";
+        \\        comptime var distinct: [un.field_types.len]type = undefined;
+        \\        comptime var d_len: usize = 0;
+        \\        for (un.field_types) |ft| {
+        \\            const rt = standaloneReturnType(ft);
+        \\            var seen = false;
+        \\            for (distinct[0..d_len]) |prev| {
+        \\                if (prev == rt) {
+        \\                    seen = true;
+        \\                    break;
+        \\                }
+        \\            }
+        \\            if (!seen) {
+        \\                distinct[d_len] = rt;
+        \\                d_len += 1;
+        \\            }
+        \\        }
+        \\        return buildSynthesizedUnion(distinct[0..d_len]);
+        \\    }
+        \\    switch (@typeInfo(FnT)) {
+        \\        .@"fn" => |fni| {
+        \\            const rt = fni.return_type orelse return void;
+        \\            return if (@typeInfo(rt) == .error_union) @typeInfo(rt).error_union.payload else rt;
+        \\        },
+        \\        .pointer => |pt| if (pt.size == .one and @typeInfo(pt.child) == .@"fn") return standaloneReturnType(pt.child),
+        \\        .@"struct" => {
+        \\            if (@hasDecl(FnT, "ReturnPayload")) {
+        \\                return if (@TypeOf(FnT.ReturnPayload) == type) FnT.ReturnPayload else FnT.ReturnPayload();
+        \\            }
+        \\            if (@hasDecl(FnT, "FnType") and @TypeOf(FnT.FnType) == type and @typeInfo(FnT.FnType) == .@"fn") {
+        \\                return standaloneReturnType(FnT.FnType);
+        \\            }
+        \\            if (@hasDecl(FnT, "Signature")) {
+        \\                const SigT = if (@TypeOf(FnT.Signature) == type) FnT.Signature else FnT.Signature();
+        \\                if (@typeInfo(SigT) == .@"fn") return standaloneReturnType(SigT);
+        \\            }
+        \\            if (@hasDecl(FnT, "zigar_js") and @hasField(@TypeOf(FnT.zigar_js), "is_callable_handle") and FnT.zigar_js.is_callable_handle and
+        \\                @hasDecl(FnT, "call") and @typeInfo(@TypeOf(FnT.call)) == .@"fn")
+        \\            {
+        \\                const rt = @typeInfo(@TypeOf(FnT.call)).@"fn".return_type orelse return void;
+        \\                return if (@typeInfo(rt) == .error_union) @typeInfo(rt).error_union.payload else rt;
+        \\            }
+        \\        },
+        \\        else => {},
+        \\    }
+        \\    return Any;
+        \\}
+        \\
+        \\pub fn standaloneConstructorParameters(comptime CtorT: type) type {
+        \\    if (CtorT == noreturn) return noreturn;
+        \\    if (@typeInfo(CtorT) == .@"union" and @typeInfo(CtorT).@"union".tag_type != null and !isModuleNullableType(CtorT)) {
+        \\        const un = @typeInfo(CtorT).@"union";
+        \\        comptime var distinct: [un.field_types.len]type = undefined;
+        \\        comptime var d_len: usize = 0;
+        \\        for (un.field_types) |ft| {
+        \\            const cp = standaloneConstructorParameters(ft);
+        \\            var seen = false;
+        \\            for (distinct[0..d_len]) |prev| {
+        \\                if (prev == cp) {
+        \\                    seen = true;
+        \\                    break;
+        \\                }
+        \\            }
+        \\            if (!seen) {
+        \\                distinct[d_len] = cp;
+        \\                d_len += 1;
+        \\            }
+        \\        }
+        \\        return buildSynthesizedUnion(distinct[0..d_len]);
+        \\    }
+        \\    if (@typeInfo(CtorT) == .@"struct") {
+        \\        if (@hasDecl(CtorT, "Instance") and @TypeOf(CtorT.Instance) == type) {
+        \\            const InstT = CtorT.Instance;
+        \\            if (@typeInfo(InstT) == .@"struct" and @hasDecl(InstT, "init") and @typeInfo(@TypeOf(InstT.init)) == .@"fn") {
+        \\                const ifni = @typeInfo(@TypeOf(InstT.init)).@"fn";
+        \\                if (!(ifni.param_types.len == 1 and ifni.param_types[0] == null)) {
+        \\                    return standaloneTupleFromFnParams(ifni, 0);
+        \\                }
+        \\            }
+        \\        }
+        \\        if (@hasDecl(CtorT, "construct") and @typeInfo(@TypeOf(CtorT.construct)) == .@"fn") {
+        \\            const cfni = @typeInfo(@TypeOf(CtorT.construct)).@"fn";
+        \\            const start: usize = if (cfni.param_types.len > 0 and cfni.param_types[0] == CtorT) 1 else 0;
+        \\            if (!(cfni.param_types.len - start == 1 and cfni.param_types[start] == null)) {
+        \\                return standaloneTupleFromFnParams(cfni, start);
+        \\            }
+        \\        }
+        \\    }
+        \\    return []const Any;
+        \\}
+        \\
         \\pub fn standaloneInferJsType(comptime Arg: type) type {
         \\    if (Arg == comptime_int or Arg == comptime_float) return f64;
         \\    if (Arg == @TypeOf(null) or Arg == @TypeOf(undefined)) return Any;
@@ -12662,6 +13166,14 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\        return isJsSymbolConstraintMarker(T);
         \\    }
         \\
+        \\    if (comptime (standaloneTryConstructorInstanceType(Constraint) != null and !(@typeInfo(Constraint) == .@"struct" and @hasDecl(Constraint, "call")))) {
+        \\        const ConstraintInst = comptime standaloneTryConstructorInstanceType(Constraint).?;
+        \\        if (comptime standaloneTryConstructorInstanceType(T)) |ActualInst| {
+        \\            return standaloneSatisfiesTypeConstraint(ActualInst, ConstraintInst, depth + 1);
+        \\        }
+        \\        return isJsFunctionConstraintMarker(T);
+        \\    }
+        \\
         \\    if (comptime (isJsFunctionConstraintMarker(Constraint) or
         \\        (@typeInfo(Constraint) == .@"struct" and @hasDecl(Constraint, "is_zig_callback") and Constraint.is_zig_callback) or
         \\        (@typeInfo(Constraint) == .@"struct" and @hasDecl(Constraint, "zigar_js") and @hasField(@TypeOf(Constraint.zigar_js), "is_callable_handle") and Constraint.zigar_js.is_callable_handle) or
@@ -12925,7 +13437,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                }
         \\                break :blk structProvidesMember(T, "then");
         \\            }
-        \\            if (comptime @hasDecl(Constraint, "zigar_js_tuple")) {
+        \\            if (comptime (@typeInfo(Constraint).@"struct".is_tuple or @hasDecl(Constraint, "zigar_js_tuple"))) {
         \\                if (@typeInfo(T) != .@"struct" and @typeInfo(T) != .array) break :blk false;
         \\                break :blk true;
         \\            }

@@ -63,6 +63,11 @@ pub const UnaryTypeOp = enum {
     awaited,
     keyof,
     infer_callback_promise_payload,
+    instance_type,
+    parameters,
+    return_type,
+    constructor_parameters,
+    constructor_of,
 
     pub fn runtimeHelperName(self: UnaryTypeOp) []const u8 {
         return switch (self) {
@@ -73,6 +78,11 @@ pub const UnaryTypeOp = enum {
             .awaited => "Awaited",
             .keyof => "KeyOf",
             .infer_callback_promise_payload => "InferCallbackPromisePayload",
+            .instance_type => "InstanceType",
+            .parameters => "Parameters",
+            .return_type => "ReturnType",
+            .constructor_parameters => "ConstructorParameters",
+            .constructor_of => "ConstructorOf",
         };
     }
 };
