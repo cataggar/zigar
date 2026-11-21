@@ -2348,6 +2348,7 @@ test "Issue #46 (M3.1a): primitives, optionals/nullish kinds, bigint literals, s
             \\    i32: Int32Array;
             \\    u64: BigUint64Array;
             \\    i64: BigInt64Array;
+            \\    f16: Float16Array;
             \\    f32: Float32Array;
             \\    f64: Float64Array;
             \\    ab: ArrayBuffer;
@@ -2412,6 +2413,7 @@ test "Issue #46 (M3.1a): primitives, optionals/nullish kinds, bigint literals, s
             "__zigar_js.Int32Array",
             "__zigar_js.BigUint64Array",
             "__zigar_js.BigInt64Array",
+            "__zigar_js.Float16Array",
             "__zigar_js.Float32Array",
             "__zigar_js.Float64Array",
             "__zigar_js.ArrayBuffer",
@@ -2552,6 +2554,7 @@ test "Issue #46 (M3.1a): primitives, optionals/nullish kinds, bigint literals, s
             \\        .i32 = .{},
             \\        .u64 = .{},
             \\        .i64 = .{},
+            \\        .f16 = .{},
             \\        .f32 = .{},
             \\        .f64 = .{},
             \\        .ab = .{},
@@ -6317,6 +6320,185 @@ test "Issue #57 @types/node@26 fs, path (plus path/win32 & path/posix), url, que
     }
 
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", probe_zig });
+}
+
+test "Issue #58 (M4.2b): full 63-module @types/node@26 sweep + crypto, sqlite, zlib, async_hooks, os, vm, timers, child_process, wasi, test, diagnostics_channel, sea, module, worker_threads" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const types_node_dir = (try resolveTypesNode26Dir(alloc)) orelse return error.SkipZigTest;
+    defer alloc.free(types_node_dir);
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue58-full-node26", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    // Omit `-m` so `ts-zigar` discovers and emits the entire 63-module `@types/node@26` surface!
+    const cli_args = [_][]const u8{ "-t", types_node_dir, "-d", out_dir };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Issue #58 full @types/node@26 error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+
+    // 1. Verify ES2025/Node 26 `Float16Array` is lowered as a first-class binary view (`__zigar_js.Float16Array`),
+    // never `float16_array: __zigar_js.Object` or `unresolved_type_ref: Float16Array`.
+    const globals_zig = try std.fmt.allocPrint(alloc, "{s}/globals.zig", .{out_dir});
+    defer alloc.free(globals_zig);
+    const globals_src = try cwd.readFileAlloc(io, globals_zig, alloc, .limited(32 * 1024 * 1024));
+    defer alloc.free(globals_src);
+    try std.testing.expect(std.mem.indexOf(u8, globals_src, "float16_array: __zigar_js.Float16Array") != null);
+    try std.testing.expect(std.mem.indexOf(u8, globals_src, "NonSharedFloat16Array = __zigar_js.Float16Array;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, globals_src, "unresolved_type_ref: Float16Array\n") == null);
+
+    const util_types_zig = try std.fmt.allocPrint(alloc, "{s}/util/types.zig", .{out_dir});
+    defer alloc.free(util_types_zig);
+    const util_types_src = try cwd.readFileAlloc(io, util_types_zig, alloc, .limited(8 * 1024 * 1024));
+    defer alloc.free(util_types_src);
+    try std.testing.expect(std.mem.indexOf(u8, util_types_src, "__zigar_js.CallError!?__zigar_js.Float16Array") != null);
+    try std.testing.expect(std.mem.indexOf(u8, util_types_src, "unresolved_type_ref: Float16Array") == null);
+
+    // 2. Verify all 63 modules pass standalone `zig test out/root.zig` AND targeted M4.2b probe.
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+
+    const probe_zig = try std.fmt.allocPrint(alloc, "{s}/issue58_probe.zig", .{sandbox});
+    defer alloc.free(probe_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "issue58_probe.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r = @import("out/root.zig");
+            \\const js = r.zigar_js;
+            \\
+            \\test "Issue #58 M4.2b @types/node@26 module APIs, Test.Mock union constraint, and nested binary union coercion" {
+            \\    @setEvalBranchQuota(10_000_000);
+            \\    const CbUnion = union(enum) {
+            \\        a: js.Callable(fn (f64) f64),
+            \\        b: js.Callable(fn ([]const u8) void),
+            \\    };
+            \\    _ = r.node_test.Mock(CbUnion);
+            \\    _ = r.node_test.MockFunctionContext(CbUnion);
+            \\
+            \\    const gz_buf: js.Buffer = .{ .handle = 42 };
+            \\    const in_gz = r.node_zlib.InputType.from(gz_buf);
+            \\    try std.testing.expect(in_gz == .node_js_array_buffer_view);
+            \\    try std.testing.expect(in_gz.node_js_array_buffer_view == .typed_array);
+            \\    try std.testing.expect(in_gz.node_js_array_buffer_view.typed_array == .uint8_array);
+            \\
+            \\    const f16_arr: js.Float16Array = .{ .handle = 43 };
+            \\    const bs_f16 = r.globals.NodeJs.BufferSource.from(f16_arr);
+            \\    try std.testing.expect(bs_f16 == .non_shared_array_buffer_view);
+            \\    try std.testing.expect(bs_f16.non_shared_array_buffer_view == .typed_array);
+            \\    try std.testing.expect(bs_f16.non_shared_array_buffer_view.typed_array == .float16_array);
+            \\
+            \\    _ = &r.node_crypto.createHash;
+            \\    _ = &r.node_crypto.createHmac;
+            \\    _ = &r.node_crypto.randomUuidAlloc;
+            \\    _ = &r.node_crypto.subtle;
+            \\    _ = &r.node_sqlite.DatabaseSync.init;
+            \\    _ = &r.node_sqlite.DatabaseSync.dispose;
+            \\    _ = &r.node_zlib.crc32;
+            \\    _ = &r.node_zlib.gzipSync;
+            \\    _ = &r.node_zlib.gunzipSync;
+            \\    _ = &r.node_async_hooks.AsyncLocalStorage([]const u8).init;
+            \\    _ = &r.node_os.platformAlloc;
+            \\    _ = &r.node_os.cpusAlloc;
+            \\    _ = &r.node_vm.runInNewContext;
+            \\    _ = &r.node_timers.setTimeout;
+            \\    _ = &r.node_timers_promises.setTimeout;
+            \\    _ = &r.node_child_process.execFileSync;
+            \\    _ = &r.node_wasi.Wasi.init;
+            \\    _ = &r.node_diagnostics_channel.channelDefault;
+            \\    _ = &r.node_sea.isSea;
+            \\    _ = &r.node_module.createRequire;
+            \\    _ = &r.node_worker_threads.Worker.init;
+            \\    _ = &r.node_util_types.asFloat16Array;
+            \\}
+            ,
+        });
+    }
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", probe_zig });
+
+    // 3. Also verify `has_host == true` compilation against `zigar-compiler/zig/package.zig` across all 63 modules!
+    const pkg_rel = "../zigar-compiler/zig/package.zig";
+    if (cwd.statFile(io, pkg_rel, .{})) |_| {
+        const host_probe_zig = try std.fmt.allocPrint(alloc, "{s}/issue58_host_probe.zig", .{sandbox});
+        defer alloc.free(host_probe_zig);
+        const host_obj = try std.fmt.allocPrint(alloc, "-femit-bin={s}/issue58_host_probe.o", .{sandbox});
+        defer alloc.free(host_obj);
+        const mroot_arg = try std.fmt.allocPrint(alloc, "-Mroot={s}", .{host_probe_zig});
+        defer alloc.free(mroot_arg);
+        {
+            var sb = try cwd.openDir(io, sandbox, .{});
+            defer sb.close(io);
+            try sb.writeFile(io, .{
+                .sub_path = "issue58_host_probe.zig",
+                .data =
+                \\const std = @import("std");
+                \\const zigar = @import("zigar");
+                \\const r = @import("out/root.zig");
+                \\
+                \\fn forceModuleSema(comptime T: type) void {
+                \\    @setEvalBranchQuota(20_000_000);
+                \\    inline for (@typeInfo(T).@"struct".decls) |decl| {
+                \\        const V = @TypeOf(@field(T, decl.name));
+                \\        if (V == type) {
+                \\            const Sub = @field(T, decl.name);
+                \\            if (@typeInfo(Sub) == .@"struct") {
+                \\                inline for (@typeInfo(Sub).@"struct".decls) |sdecl| {
+                \\                    _ = &@field(Sub, sdecl.name);
+                \\                }
+                \\            }
+                \\        } else {
+                \\            _ = &@field(T, decl.name);
+                \\        }
+                \\    }
+                \\}
+                \\
+                \\export fn verifyAll63ModulesHostSema() usize {
+                \\    @setEvalBranchQuota(20_000_000);
+                \\    if (!r.zigar_js.has_host) @compileError("expected has_host == true");
+                \\    _ = zigar;
+                \\    inline for (@typeInfo(r).@"struct".decls) |decl| {
+                \\        if (!comptime std.mem.eql(u8, decl.name, "zigar_js")) {
+                \\            forceModuleSema(@field(r, decl.name));
+                \\        }
+                \\    }
+                \\    return @typeInfo(r).@"struct".decls.len;
+                \\}
+                ,
+            });
+        }
+        try runZigCheck(alloc, io, &.{
+            test_options.zig_exe,
+            "build-obj",
+            host_obj,
+            "--dep",
+            "zigar",
+            mroot_arg,
+            "-Mzigar=../zigar-compiler/zig/package.zig",
+        });
+    } else |_| {}
 }
 
 

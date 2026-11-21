@@ -5687,6 +5687,7 @@ fn LowerCtx(comptime GraphType: type) type {
                     // Built-in JS / TypeScript standard library types.
                     const stripped_stdlib_name = lower_types.stripGlobalQualifier(ref_name);
                     if (std.mem.eql(u8, stripped_stdlib_name, "Array") or std.mem.eql(u8, stripped_stdlib_name, "ReadonlyArray") or
+                        std.mem.eql(u8, stripped_stdlib_name, "ArrayLike") or
                         std.mem.eql(u8, stripped_stdlib_name, "Set") or std.mem.eql(u8, stripped_stdlib_name, "ReadonlySet"))
                     {
                         const elem = if (ref.type_args.len > 0)

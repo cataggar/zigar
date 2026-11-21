@@ -41,7 +41,7 @@ pub const NullishKind = enum(u8) {
     }
 };
 
-/// All 15 JavaScript & Node.js binary buffer and typed-array wrapper types backed by `zigar.js`.
+/// All 16 JavaScript & Node.js binary buffer and typed-array wrapper types backed by `zigar.js`.
 pub const BinaryViewKind = enum(u8) {
     buffer,
     uint8_array,
@@ -53,6 +53,7 @@ pub const BinaryViewKind = enum(u8) {
     int32_array,
     big_uint64_array,
     big_int64_array,
+    float16_array,
     float32_array,
     float64_array,
     array_buffer,
@@ -70,6 +71,7 @@ pub const BinaryViewKind = enum(u8) {
         .int32_array,
         .big_uint64_array,
         .big_int64_array,
+        .float16_array,
         .float32_array,
         .float64_array,
         .array_buffer,
@@ -89,6 +91,7 @@ pub const BinaryViewKind = enum(u8) {
             .int32_array => "Int32Array",
             .big_uint64_array => "BigUint64Array",
             .big_int64_array => "BigInt64Array",
+            .float16_array => "Float16Array",
             .float32_array => "Float32Array",
             .float64_array => "Float64Array",
             .array_buffer => "ArrayBuffer",
@@ -111,6 +114,7 @@ pub const BinaryViewKind = enum(u8) {
             .{ "Int32Array", .int32_array },
             .{ "BigUint64Array", .big_uint64_array },
             .{ "BigInt64Array", .big_int64_array },
+            .{ "Float16Array", .float16_array },
             .{ "Float32Array", .float32_array },
             .{ "Float64Array", .float64_array },
             .{ "ArrayBuffer", .array_buffer },
@@ -148,6 +152,12 @@ pub const BoxedIntrinsicKind = enum(u8) {
             .{ "ReferenceError", .object },
             .{ "URIError", .object },
             .{ "EvalError", .object },
+            .{ "AggregateError", .object },
+            .{ "Number", .object },
+            .{ "Boolean", .object },
+            .{ "IArguments", .object },
+            .{ "GeneratorFunction", .function },
+            .{ "AsyncGeneratorFunction", .function },
         });
         return map.get(stripped);
     }
@@ -179,7 +189,9 @@ pub fn isBuiltinBufferOrGlobalsModule(specifier: []const u8, file_path: []const 
         if (std.mem.endsWith(u8, file_path, "/buffer.d.ts") or
             std.mem.endsWith(u8, file_path, "/buffer.buffer.d.ts") or
             std.mem.endsWith(u8, file_path, "/globals.d.ts") or
-            std.mem.endsWith(u8, file_path, "/globals.global.d.ts"))
+            std.mem.endsWith(u8, file_path, "/globals.global.d.ts") or
+            std.mem.endsWith(u8, file_path, "/globals.typedarray.d.ts") or
+            std.mem.indexOf(u8, file_path, "/compatibility/") != null)
         {
             return true;
         }
@@ -209,8 +221,8 @@ pub fn normalizeBigIntLiteral(allocator: std.mem.Allocator, raw_text: []const u8
     return out;
 }
 
-test "BinaryViewKind maps all 15 JS/Node binary buffer and typed-array types" {
-    try std.testing.expectEqual(@as(usize, 15), BinaryViewKind.all.len);
+test "BinaryViewKind maps all 16 JS/Node binary buffer and typed-array types" {
+    try std.testing.expectEqual(@as(usize, 16), BinaryViewKind.all.len);
     for (BinaryViewKind.all) |k| {
         const ident = k.zigTypeIdent();
         try std.testing.expectEqual(@as(?BinaryViewKind, k), BinaryViewKind.fromTypeName(ident));

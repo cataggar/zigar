@@ -201,7 +201,85 @@ fn isStringSliceCoercible(comptime T: type) bool {
     };
 }
 
+fn canCoerceUnion(comptime U: type, comptime ValT: type, comptime depth: usize) bool {
+    @setEvalBranchQuota(200_000);
+    if (depth > 6) return false;
+    if (ValT == U) return true;
+    if (@typeInfo(U) != .@"union") return false;
+    if (@hasDecl(U, "is_zigar_nullable") and U.is_zigar_nullable) return false;
+    const un = @typeInfo(U).@"union";
+    comptime var exact_count: usize = 0;
+    inline for (un.field_types) |FT| {
+        if (FT != void and FT == ValT) exact_count += 1;
+    }
+    if (exact_count == 1) return true;
+    if (exact_count == 0 and @typeInfo(ValT) == .@"struct" and @hasDecl(ValT, "binary_kind") and ValT.binary_kind == .buffer) {
+        comptime var u8_count: usize = 0;
+        inline for (un.field_types) |FT| {
+            if (FT != void and FT != noreturn and @typeInfo(FT) == .@"struct" and @hasDecl(FT, "binary_kind") and FT.binary_kind == .uint8_array) {
+                u8_count += 1;
+            }
+        }
+        if (u8_count == 1) return true;
+    }
+    if (isStringSliceCoercible(ValT)) {
+        comptime var str_count: usize = 0;
+        inline for (un.field_types) |FT| {
+            if (FT == []const u8) str_count += 1;
+        }
+        if (str_count == 1) return true;
+    }
+    const val_info = @typeInfo(ValT);
+    if (val_info == .comptime_int or val_info == .comptime_float) {
+        comptime var num_count: usize = 0;
+        inline for (un.field_types) |FT| {
+            if (FT == f64 or (val_info == .comptime_int and (FT == i64 or FT == i32))) num_count += 1;
+        }
+        if (num_count == 1) return true;
+    }
+    if (val_info == .@"enum") {
+        inline for (un.field_types) |FT| {
+            if (@typeInfo(FT) == .@"enum") {
+                const src_fields = val_info.@"enum".field_names;
+                if (src_fields.len > 0) {
+                    var all_in = true;
+                    for (src_fields) |sf_name| {
+                        if (!@hasField(FT, sf_name)) {
+                            all_in = false;
+                            break;
+                        }
+                    }
+                    if (all_in) return true;
+                }
+            }
+        }
+        if (!@hasDecl(ValT, "toInt") and !@hasDecl(ValT, "toFloat")) {
+            comptime var str_count: usize = 0;
+            inline for (un.field_types) |FT| {
+                if (FT == []const u8) str_count += 1;
+            }
+            if (str_count == 1) return true;
+        }
+    }
+    if (isGeneratedHandleStruct(ValT)) {
+        inline for (un.field_types) |FT| {
+            if (FT != void and FT != noreturn and isGeneratedHandleStruct(FT) and structDerivesFrom(ValT, FT, 0)) return true;
+        }
+    }
+    comptime var nested_count: usize = 0;
+    inline for (un.field_types) |FT| {
+        if (FT != void and FT != noreturn and @typeInfo(FT) == .@"union" and !(@hasDecl(FT, "is_zigar_nullable") and FT.is_zigar_nullable)) {
+            if (canCoerceUnion(FT, ValT, depth + 1)) nested_count += 1;
+        }
+    }
+    return nested_count == 1;
+}
+
 pub fn coerceUnion(comptime U: type, val: anytype) U {
+    return coerceUnionImpl(U, val, 0);
+}
+
+fn coerceUnionImpl(comptime U: type, val: anytype, comptime depth: usize) U {
     @setEvalBranchQuota(200_000);
     const ValT = @TypeOf(val);
     if (ValT == U) return val;
@@ -217,6 +295,20 @@ pub fn coerceUnion(comptime U: type, val: anytype) U {
     }
     if (exact_count == 1) {
         return @unionInit(U, un.field_names[exact_idx.?], val);
+    }
+    if (comptime (exact_count == 0 and @typeInfo(ValT) == .@"struct" and @hasDecl(ValT, "binary_kind") and ValT.binary_kind == .buffer)) {
+        comptime var u8_idx: ?usize = null;
+        comptime var u8_count: usize = 0;
+        inline for (un.field_names, 0..) |_, i| {
+            const FT = un.field_types[i];
+            if (FT != void and FT != noreturn and @typeInfo(FT) == .@"struct" and @hasDecl(FT, "binary_kind") and FT.binary_kind == .uint8_array) {
+                u8_idx = i;
+                u8_count += 1;
+            }
+        }
+        if (u8_count == 1) {
+            return @unionInit(U, un.field_names[u8_idx.?], .{ .handle = val.handle });
+        }
     }
     if (comptime isStringSliceCoercible(ValT)) {
         const slice_val: []const u8 = val;
@@ -407,6 +499,22 @@ pub fn coerceUnion(comptime U: type, val: anytype) U {
             }
         }
     }
+    if (comptime (depth < 6)) {
+        comptime var nested_idx: ?usize = null;
+        comptime var nested_count: usize = 0;
+        inline for (un.field_names, 0..) |_, i| {
+            const FT = un.field_types[i];
+            if (comptime (FT != void and FT != noreturn and @typeInfo(FT) == .@"union" and !(@hasDecl(FT, "is_zigar_nullable") and FT.is_zigar_nullable))) {
+                if (comptime canCoerceUnion(FT, ValT, depth + 1)) {
+                    nested_idx = i;
+                    nested_count += 1;
+                }
+            }
+        }
+        if (nested_count == 1) {
+            return @unionInit(U, un.field_names[nested_idx.?], coerceUnionImpl(un.field_types[nested_idx.?], val, depth + 1));
+        }
+    }
     @compileError("Cannot unambiguously coerce value of type " ++ @typeName(ValT) ++ " into union " ++ @typeName(U));
 }
 
@@ -509,6 +617,7 @@ pub const BinaryKind = enum(u32) {
     big_int64_array = 12,
     float32_array = 13,
     float64_array = 14,
+    float16_array = 15,
 };
 
 pub const BinaryInfoKind = enum(u32) {
@@ -1775,6 +1884,7 @@ fn IntersectHandleWrapper(
             if (isJsFunctionConstraintMarker(B) or isCallbackWrapper(B)) break :blk true;
             if (@typeInfo(B) == .@"struct" and @hasDecl(B, "Target") and B.Target == Function) break :blk true;
             if (isGeneratedHandleStruct(B) and @hasField(@TypeOf(B.zigar_js), "is_callable_handle") and B.zigar_js.is_callable_handle) break :blk true;
+            if (@typeInfo(B) == .@"union" and satisfiesTypeConstraint(B, Function, 0)) break :blk true;
         }
         break :blk false;
     };
@@ -3530,6 +3640,36 @@ pub fn satisfiesTypeConstraint(comptime T: type, comptime Constraint: type, comp
     if (comptime isUnconstrainedJsAnyOrUnknown(T)) return true;
     if (comptime isUnconstrainedJsAnyOrUnknown(Constraint)) return true;
 
+    // If `T` itself is a tagged union, every variant payload must satisfy `Constraint`.
+    // Must run before `Constraint`-specific early returns so unions like `CallableA | CallableB`
+    // satisfy `Function`, `"a" | "b"` unions satisfy `string`, and `SubA | SubB` satisfy `typeof Base`.
+    if (comptime (@typeInfo(T) == .@"union")) {
+        if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_open_literal") and T.zigar_js.is_open_literal)) {
+            // Handled below via string/number candidate checks or union constraint arms.
+        } else if (comptime (@hasDecl(T, "is_zigar_nullable") and T.is_zigar_nullable)) {
+            return satisfiesTypeConstraint(@TypeOf(null), Constraint, depth + 1) and
+                satisfiesTypeConstraint(T.Value, Constraint, depth + 1);
+        } else {
+            const u_types = @typeInfo(T).@"union".field_types;
+            if (comptime (u_types.len > 0)) {
+                const has_t_vars = comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "variants"));
+                inline for (u_types, 0..) |uf_ty, ui| {
+                    if (uf_ty != void) {
+                        if (!satisfiesTypeConstraint(uf_ty, Constraint, depth + 1)) return false;
+                    } else if (has_t_vars and ui < T.zigar_js.variants.len and
+                        @hasField(@TypeOf(T.zigar_js.variants[ui]), "is_unit_literal") and
+                        T.zigar_js.variants[ui].is_unit_literal)
+                    {
+                        if (!unitLiteralSatisfiesConstraint(T.zigar_js.variants[ui], Constraint, depth + 1)) return false;
+                    } else {
+                        if (!satisfiesTypeConstraint(void, Constraint, depth + 1)) return false;
+                    }
+                }
+                return true;
+            }
+        }
+    }
+
     // `T extends object`: reject scalar primitives (`bool`, numbers), allow structs, handles, slices, arrays, functions.
     if (comptime isJsObjectConstraintMarker(Constraint)) {
         return switch (@typeInfo(T)) {
@@ -3586,34 +3726,6 @@ pub fn satisfiesTypeConstraint(comptime T: type, comptime Constraint: type, comp
     // `T extends number`
     if (comptime (@typeInfo(Constraint) == .float or @typeInfo(Constraint) == .int)) {
         return isNumberLikeConstraintCandidate(T);
-    }
-
-    // If `T` itself is a tagged union, every variant payload must satisfy `Constraint`.
-    if (comptime (@typeInfo(T) == .@"union")) {
-        if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_open_literal") and T.zigar_js.is_open_literal)) {
-            // Handled below if Constraint is open literal or union.
-        } else if (comptime (@hasDecl(T, "is_zigar_nullable") and T.is_zigar_nullable)) {
-            return satisfiesTypeConstraint(@TypeOf(null), Constraint, depth + 1) and
-                satisfiesTypeConstraint(T.Value, Constraint, depth + 1);
-        } else {
-            const u_types = @typeInfo(T).@"union".field_types;
-            if (comptime (u_types.len > 0)) {
-                const has_t_vars = comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "variants"));
-                inline for (u_types, 0..) |uf_ty, ui| {
-                    if (uf_ty != void) {
-                        if (!satisfiesTypeConstraint(uf_ty, Constraint, depth + 1)) return false;
-                    } else if (has_t_vars and ui < T.zigar_js.variants.len and
-                        @hasField(@TypeOf(T.zigar_js.variants[ui]), "is_unit_literal") and
-                        T.zigar_js.variants[ui].is_unit_literal)
-                    {
-                        if (!unitLiteralSatisfiesConstraint(T.zigar_js.variants[ui], Constraint, depth + 1)) return false;
-                    } else {
-                        if (!satisfiesTypeConstraint(void, Constraint, depth + 1)) return false;
-                    }
-                }
-                return true;
-            }
-        }
     }
 
     return switch (@typeInfo(Constraint)) {
@@ -3877,6 +3989,12 @@ pub fn satisfiesTypeConstraint(comptime T: type, comptime Constraint: type, comp
                     if (!((@hasDecl(T, "is_js_async_iterator") and T.is_js_async_iterator) or structHasProtocolFlag(T, "has_async_iterator", 0))) break :blk false;
                 }
                 break :blk true;
+            }
+            if (comptime @hasDecl(Constraint, "binary_kind")) {
+                if (comptime (@typeInfo(T) != .@"struct" or !@hasDecl(T, "binary_kind"))) break :blk false;
+                if (comptime (Constraint.binary_kind == .array_buffer and T.binary_kind == .shared_array_buffer)) break :blk true;
+                if (comptime (Constraint.binary_kind == .uint8_array and T.binary_kind == .buffer)) break :blk true;
+                break :blk T.binary_kind == Constraint.binary_kind;
             }
             // Plain value struct constraint (`T extends HasId`):
             if (@typeInfo(T) != .@"struct") break :blk false;
@@ -7263,6 +7381,12 @@ pub fn Js(comptime host: type) type {
                     }
                     break :blk false;
                 },
+                .@"union" => |un| blk: {
+                    for (un.field_types) |ft| {
+                        if (needsAllocatorForRead(ft)) break :blk true;
+                    }
+                    break :blk false;
+                },
                 else => false,
             };
         }
@@ -7287,6 +7411,13 @@ pub fn Js(comptime host: type) type {
                     inline for (st.field_names, 0..) |fname, i| {
                         if (!st.field_attrs[i].@"comptime") {
                             deinitOwnedElement(st.field_types[i], allocator, @field(value, fname));
+                        }
+                    }
+                },
+                .@"union" => |un| {
+                    if (un.tag_type != null) {
+                        switch (value) {
+                            inline else => |pl| deinitOwnedElement(@TypeOf(pl), allocator, pl),
                         }
                     }
                 },
@@ -7851,6 +7982,7 @@ pub fn Js(comptime host: type) type {
                 i32 => .int32_array,
                 u64 => .big_uint64_array,
                 i64 => .big_int64_array,
+                f16 => .float16_array,
                 f32 => .float32_array,
                 f64 => .float64_array,
                 else => @compileError("Unsupported TypedArray element type: " ++ @typeName(Elem)),
@@ -8028,6 +8160,7 @@ pub fn Js(comptime host: type) type {
         pub const Int32Array = TypedArray(i32);
         pub const BigUint64Array = TypedArray(u64);
         pub const BigInt64Array = TypedArray(i64);
+        pub const Float16Array = TypedArray(f16);
         pub const Float32Array = TypedArray(f32);
         pub const Float64Array = TypedArray(f64);
 
@@ -8677,7 +8810,10 @@ pub fn Js(comptime host: type) type {
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.array_with_capacity), "", HostFn, .{capacity});
                 }
 
-                pub fn fromSlice(items: []const T) module.Error!Self {
+                pub const ElemOpError = if (typeNeedsRefDecode(T, 0)) module.CallError else module.Error;
+                pub const ElemAllocError = if (typeNeedsRefDecode(T, 0)) module.CallError else module.AllocError;
+
+                pub fn fromSlice(items: []const T) ElemOpError!Self {
                     const arr = try Self.withCapacity(items.len);
                     errdefer arr.deinit();
                     for (items, 0..) |item, idx| {
@@ -8695,28 +8831,66 @@ pub fn Js(comptime host: type) type {
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.array_len), "", HostFn, .{.{ .handle = self.handle }});
                 }
 
-                pub fn get(self: Self, index: usize) module.Error!T {
+                pub fn get(self: Self, index: usize) ElemOpError!T {
+                    if (comptime typeNeedsRefDecode(T, 0)) {
+                        const HostFn = buildFnType(&.{ Ref(module.Any), usize }, module.Error!Ref(module.Any));
+                        const raw = try dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.array_get), "", HostFn, .{ .{ .handle = self.handle }, index });
+                        defer raw.deinit();
+                        return fromJsRef(T, raw);
+                    }
                     const HostFn = buildFnType(&.{ Ref(module.Any), usize }, module.Error!T);
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.array_get), "", HostFn, .{ .{ .handle = self.handle }, index });
                 }
 
-                pub fn getAlloc(self: Self, allocator: std.mem.Allocator, index: usize) module.AllocError!T {
+                pub fn getAlloc(self: Self, allocator: std.mem.Allocator, index: usize) ElemAllocError!T {
+                    if (comptime typeNeedsRefDecode(T, 0)) {
+                        const HostFn = buildFnType(&.{ Ref(module.Any), usize }, module.Error!Ref(module.Any));
+                        const raw = try dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.array_get), "", HostFn, .{ .{ .handle = self.handle }, index });
+                        defer raw.deinit();
+                        return fromJsRefAlloc(T, allocator, raw);
+                    }
                     const HostFn = buildFnType(&.{ std.mem.Allocator, Ref(module.Any), usize }, module.AllocError!T);
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.array_get), "", HostFn, .{ allocator, .{ .handle = self.handle }, index });
                 }
 
-                pub fn set(self: Self, index: usize, value: T) module.Error!void {
+                pub fn set(self: Self, index: usize, value: T) ElemOpError!void {
+                    if (comptime typeNeedsRefDecode(T, 0)) {
+                        const v_ref = try toJsRef(T, value);
+                        defer v_ref.deinit();
+                        const HostFn = buildFnType(&.{ Ref(module.Any), usize, Ref(module.Any) }, module.Error!void);
+                        return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.array_set), "", HostFn, .{ .{ .handle = self.handle }, index, v_ref });
+                    }
                     const HostFn = buildFnType(&.{ Ref(module.Any), usize, T }, module.Error!void);
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.array_set), "", HostFn, .{ .{ .handle = self.handle }, index, value });
                 }
 
-                pub fn push(self: Self, value: T) module.Error!usize {
+                pub fn push(self: Self, value: T) ElemOpError!usize {
+                    if (comptime typeNeedsRefDecode(T, 0)) {
+                        const v_ref = try toJsRef(T, value);
+                        defer v_ref.deinit();
+                        const HostFn = buildFnType(&.{ Ref(module.Any), Ref(module.Any) }, module.Error!usize);
+                        return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.array_push), "", HostFn, .{ .{ .handle = self.handle }, v_ref });
+                    }
                     const HostFn = buildFnType(&.{ Ref(module.Any), T }, module.Error!usize);
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.array_push), "", HostFn, .{ .{ .handle = self.handle }, value });
                 }
 
-                pub fn pop(self: Self) module.Error!?T {
+                pub fn pop(self: Self) ElemOpError!?T {
                     var empty_flag: u8 = 0;
+                    if (comptime typeNeedsRefDecode(T, 0)) {
+                        const maybe_raw = try dispatchHostOpOptionalFlag(
+                            .collection_op,
+                            @intFromEnum(module.CollectionSubOp.array_pop),
+                            Ref(module.Any),
+                            module.Error,
+                            &.{ Ref(module.Any), usize },
+                            .{ .{ .handle = self.handle }, @intFromPtr(&empty_flag) },
+                            &empty_flag,
+                        );
+                        const raw = maybe_raw orelse return null;
+                        defer raw.deinit();
+                        return try fromJsRef(T, raw);
+                    }
                     return dispatchHostOpOptionalFlag(
                         .collection_op,
                         @intFromEnum(module.CollectionSubOp.array_pop),
@@ -8728,8 +8902,22 @@ pub fn Js(comptime host: type) type {
                     );
                 }
 
-                pub fn popAlloc(self: Self, allocator: std.mem.Allocator) module.AllocError!?T {
+                pub fn popAlloc(self: Self, allocator: std.mem.Allocator) ElemAllocError!?T {
                     var empty_flag: u8 = 0;
+                    if (comptime typeNeedsRefDecode(T, 0)) {
+                        const maybe_raw = try dispatchHostOpOptionalFlag(
+                            .collection_op,
+                            @intFromEnum(module.CollectionSubOp.array_pop),
+                            Ref(module.Any),
+                            module.Error,
+                            &.{ Ref(module.Any), usize },
+                            .{ .{ .handle = self.handle }, @intFromPtr(&empty_flag) },
+                            &empty_flag,
+                        );
+                        const raw = maybe_raw orelse return null;
+                        defer raw.deinit();
+                        return try fromJsRefAlloc(T, allocator, raw);
+                    }
                     return dispatchHostOpOptionalFlag(
                         .collection_op,
                         @intFromEnum(module.CollectionSubOp.array_pop),
@@ -8741,7 +8929,7 @@ pub fn Js(comptime host: type) type {
                     );
                 }
 
-                pub fn toOwnedSlice(self: Self, allocator: std.mem.Allocator) module.AllocError![]T {
+                pub fn toOwnedSlice(self: Self, allocator: std.mem.Allocator) ElemAllocError![]T {
                     const count = try self.len();
                     const buf = try allocator.alloc(T, count);
                     var initialized: usize = 0;
@@ -8838,13 +9026,47 @@ pub fn Js(comptime host: type) type {
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.map_init), "", HostFn, .{});
                 }
 
+                const k_codec = typeNeedsRefDecode(K, 0);
+                const v_codec = typeNeedsRefDecode(V, 0);
+                pub const KeyOpError = if (k_codec) module.CallError else module.Error;
+                pub const MapOpError = if (k_codec or v_codec) module.CallError else module.Error;
+                pub const MapAllocError = if (k_codec or v_codec) module.CallError else module.AllocError;
+
                 pub fn size(self: Self) module.Error!usize {
                     const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!usize);
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.map_size), "", HostFn, .{.{ .handle = self.handle }});
                 }
 
-                pub fn get(self: Self, key: K) module.Error!?V {
+                pub fn get(self: Self, key: K) MapOpError!?V {
                     var missing_flag: u8 = 0;
+                    if (comptime k_codec or v_codec) {
+                        const k_arg = if (comptime k_codec) try toJsRef(K, key) else key;
+                        defer if (comptime k_codec) k_arg.deinit();
+                        const KWire = if (k_codec) Ref(module.Any) else K;
+                        if (comptime v_codec) {
+                            const maybe_raw = try dispatchHostOpOptionalFlag(
+                                .collection_op,
+                                @intFromEnum(module.CollectionSubOp.map_get),
+                                Ref(module.Any),
+                                module.Error,
+                                &.{ Ref(module.Any), KWire, usize },
+                                .{ .{ .handle = self.handle }, k_arg, @intFromPtr(&missing_flag) },
+                                &missing_flag,
+                            );
+                            const raw = maybe_raw orelse return null;
+                            defer raw.deinit();
+                            return try fromJsRef(V, raw);
+                        }
+                        return dispatchHostOpOptionalFlag(
+                            .collection_op,
+                            @intFromEnum(module.CollectionSubOp.map_get),
+                            V,
+                            module.Error,
+                            &.{ Ref(module.Any), KWire, usize },
+                            .{ .{ .handle = self.handle }, k_arg, @intFromPtr(&missing_flag) },
+                            &missing_flag,
+                        );
+                    }
                     return dispatchHostOpOptionalFlag(
                         .collection_op,
                         @intFromEnum(module.CollectionSubOp.map_get),
@@ -8856,8 +9078,36 @@ pub fn Js(comptime host: type) type {
                     );
                 }
 
-                pub fn getAlloc(self: Self, allocator: std.mem.Allocator, key: K) module.AllocError!?V {
+                pub fn getAlloc(self: Self, allocator: std.mem.Allocator, key: K) MapAllocError!?V {
                     var missing_flag: u8 = 0;
+                    if (comptime k_codec or v_codec) {
+                        const k_arg = if (comptime k_codec) try toJsRef(K, key) else key;
+                        defer if (comptime k_codec) k_arg.deinit();
+                        const KWire = if (k_codec) Ref(module.Any) else K;
+                        if (comptime v_codec) {
+                            const maybe_raw = try dispatchHostOpOptionalFlag(
+                                .collection_op,
+                                @intFromEnum(module.CollectionSubOp.map_get),
+                                Ref(module.Any),
+                                module.Error,
+                                &.{ Ref(module.Any), KWire, usize },
+                                .{ .{ .handle = self.handle }, k_arg, @intFromPtr(&missing_flag) },
+                                &missing_flag,
+                            );
+                            const raw = maybe_raw orelse return null;
+                            defer raw.deinit();
+                            return try fromJsRefAlloc(V, allocator, raw);
+                        }
+                        return dispatchHostOpOptionalFlag(
+                            .collection_op,
+                            @intFromEnum(module.CollectionSubOp.map_get),
+                            V,
+                            module.AllocError,
+                            &.{ std.mem.Allocator, Ref(module.Any), KWire, usize },
+                            .{ allocator, .{ .handle = self.handle }, k_arg, @intFromPtr(&missing_flag) },
+                            &missing_flag,
+                        );
+                    }
                     return dispatchHostOpOptionalFlag(
                         .collection_op,
                         @intFromEnum(module.CollectionSubOp.map_get),
@@ -8869,17 +9119,39 @@ pub fn Js(comptime host: type) type {
                     );
                 }
 
-                pub fn set(self: Self, key: K, value: V) module.Error!void {
+                pub fn set(self: Self, key: K, value: V) MapOpError!void {
+                    if (comptime k_codec or v_codec) {
+                        const k_arg = if (comptime k_codec) try toJsRef(K, key) else key;
+                        defer if (comptime k_codec) k_arg.deinit();
+                        const v_arg = if (comptime v_codec) try toJsRef(V, value) else value;
+                        defer if (comptime v_codec) v_arg.deinit();
+                        const KWire = if (k_codec) Ref(module.Any) else K;
+                        const VWire = if (v_codec) Ref(module.Any) else V;
+                        const HostFn = buildFnType(&.{ Ref(module.Any), KWire, VWire }, module.Error!void);
+                        return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.map_set), "", HostFn, .{ .{ .handle = self.handle }, k_arg, v_arg });
+                    }
                     const HostFn = buildFnType(&.{ Ref(module.Any), K, V }, module.Error!void);
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.map_set), "", HostFn, .{ .{ .handle = self.handle }, key, value });
                 }
 
-                pub fn has(self: Self, key: K) module.Error!bool {
+                pub fn has(self: Self, key: K) KeyOpError!bool {
+                    if (comptime k_codec) {
+                        const k_ref = try toJsRef(K, key);
+                        defer k_ref.deinit();
+                        const HostFn = buildFnType(&.{ Ref(module.Any), Ref(module.Any) }, module.Error!bool);
+                        return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.map_has), "", HostFn, .{ .{ .handle = self.handle }, k_ref });
+                    }
                     const HostFn = buildFnType(&.{ Ref(module.Any), K }, module.Error!bool);
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.map_has), "", HostFn, .{ .{ .handle = self.handle }, key });
                 }
 
-                pub fn delete(self: Self, key: K) module.Error!bool {
+                pub fn delete(self: Self, key: K) KeyOpError!bool {
+                    if (comptime k_codec) {
+                        const k_ref = try toJsRef(K, key);
+                        defer k_ref.deinit();
+                        const HostFn = buildFnType(&.{ Ref(module.Any), Ref(module.Any) }, module.Error!bool);
+                        return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.map_delete), "", HostFn, .{ .{ .handle = self.handle }, k_ref });
+                    }
                     const HostFn = buildFnType(&.{ Ref(module.Any), K }, module.Error!bool);
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.map_delete), "", HostFn, .{ .{ .handle = self.handle }, key });
                 }
@@ -8977,22 +9249,42 @@ pub fn Js(comptime host: type) type {
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.set_init), "", HostFn, .{});
                 }
 
+                pub const ElemOpError = if (typeNeedsRefDecode(T, 0)) module.CallError else module.Error;
+
                 pub fn size(self: Self) module.Error!usize {
                     const HostFn = buildFnType(&.{Ref(module.Any)}, module.Error!usize);
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.set_size), "", HostFn, .{.{ .handle = self.handle }});
                 }
 
-                pub fn add(self: Self, value: T) module.Error!void {
+                pub fn add(self: Self, value: T) ElemOpError!void {
+                    if (comptime typeNeedsRefDecode(T, 0)) {
+                        const v_ref = try toJsRef(T, value);
+                        defer v_ref.deinit();
+                        const HostFn = buildFnType(&.{ Ref(module.Any), Ref(module.Any) }, module.Error!void);
+                        return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.set_add), "", HostFn, .{ .{ .handle = self.handle }, v_ref });
+                    }
                     const HostFn = buildFnType(&.{ Ref(module.Any), T }, module.Error!void);
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.set_add), "", HostFn, .{ .{ .handle = self.handle }, value });
                 }
 
-                pub fn has(self: Self, value: T) module.Error!bool {
+                pub fn has(self: Self, value: T) ElemOpError!bool {
+                    if (comptime typeNeedsRefDecode(T, 0)) {
+                        const v_ref = try toJsRef(T, value);
+                        defer v_ref.deinit();
+                        const HostFn = buildFnType(&.{ Ref(module.Any), Ref(module.Any) }, module.Error!bool);
+                        return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.set_has), "", HostFn, .{ .{ .handle = self.handle }, v_ref });
+                    }
                     const HostFn = buildFnType(&.{ Ref(module.Any), T }, module.Error!bool);
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.set_has), "", HostFn, .{ .{ .handle = self.handle }, value });
                 }
 
-                pub fn delete(self: Self, value: T) module.Error!bool {
+                pub fn delete(self: Self, value: T) ElemOpError!bool {
+                    if (comptime typeNeedsRefDecode(T, 0)) {
+                        const v_ref = try toJsRef(T, value);
+                        defer v_ref.deinit();
+                        const HostFn = buildFnType(&.{ Ref(module.Any), Ref(module.Any) }, module.Error!bool);
+                        return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.set_delete), "", HostFn, .{ .{ .handle = self.handle }, v_ref });
+                    }
                     const HostFn = buildFnType(&.{ Ref(module.Any), T }, module.Error!bool);
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.set_delete), "", HostFn, .{ .{ .handle = self.handle }, value });
                 }
@@ -9079,13 +9371,47 @@ pub fn Js(comptime host: type) type {
                     return self.ref().tryEql(other);
                 }
 
+                const k_codec = typeNeedsRefDecode(K, 0);
+                const v_codec = typeNeedsRefDecode(V, 0);
+                pub const KeyOpError = if (k_codec) module.CallError else module.Error;
+                pub const RecOpError = if (k_codec or v_codec) module.CallError else module.Error;
+                pub const RecAllocError = if (k_codec or v_codec) module.CallError else module.AllocError;
+
                 pub fn init() module.Error!Self {
                     const HostFn = buildFnType(&.{}, module.Error!Self);
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.record_init), "", HostFn, .{});
                 }
 
-                pub fn get(self: Self, key: K) module.Error!?V {
+                pub fn get(self: Self, key: K) RecOpError!?V {
                     var missing_flag: u8 = 0;
+                    if (comptime k_codec or v_codec) {
+                        const k_arg = if (comptime k_codec) try toJsRef(K, key) else key;
+                        defer if (comptime k_codec) k_arg.deinit();
+                        const KWire = if (k_codec) Ref(module.Any) else K;
+                        if (comptime v_codec) {
+                            const maybe_raw = try dispatchHostOpOptionalFlag(
+                                .collection_op,
+                                @intFromEnum(module.CollectionSubOp.record_get),
+                                Ref(module.Any),
+                                module.Error,
+                                &.{ Ref(module.Any), KWire, usize },
+                                .{ .{ .handle = self.handle }, k_arg, @intFromPtr(&missing_flag) },
+                                &missing_flag,
+                            );
+                            const raw = maybe_raw orelse return null;
+                            defer raw.deinit();
+                            return try fromJsRef(V, raw);
+                        }
+                        return dispatchHostOpOptionalFlag(
+                            .collection_op,
+                            @intFromEnum(module.CollectionSubOp.record_get),
+                            V,
+                            module.Error,
+                            &.{ Ref(module.Any), KWire, usize },
+                            .{ .{ .handle = self.handle }, k_arg, @intFromPtr(&missing_flag) },
+                            &missing_flag,
+                        );
+                    }
                     return dispatchHostOpOptionalFlag(
                         .collection_op,
                         @intFromEnum(module.CollectionSubOp.record_get),
@@ -9097,8 +9423,36 @@ pub fn Js(comptime host: type) type {
                     );
                 }
 
-                pub fn getAlloc(self: Self, allocator: std.mem.Allocator, key: K) module.AllocError!?V {
+                pub fn getAlloc(self: Self, allocator: std.mem.Allocator, key: K) RecAllocError!?V {
                     var missing_flag: u8 = 0;
+                    if (comptime k_codec or v_codec) {
+                        const k_arg = if (comptime k_codec) try toJsRef(K, key) else key;
+                        defer if (comptime k_codec) k_arg.deinit();
+                        const KWire = if (k_codec) Ref(module.Any) else K;
+                        if (comptime v_codec) {
+                            const maybe_raw = try dispatchHostOpOptionalFlag(
+                                .collection_op,
+                                @intFromEnum(module.CollectionSubOp.record_get),
+                                Ref(module.Any),
+                                module.Error,
+                                &.{ Ref(module.Any), KWire, usize },
+                                .{ .{ .handle = self.handle }, k_arg, @intFromPtr(&missing_flag) },
+                                &missing_flag,
+                            );
+                            const raw = maybe_raw orelse return null;
+                            defer raw.deinit();
+                            return try fromJsRefAlloc(V, allocator, raw);
+                        }
+                        return dispatchHostOpOptionalFlag(
+                            .collection_op,
+                            @intFromEnum(module.CollectionSubOp.record_get),
+                            V,
+                            module.AllocError,
+                            &.{ std.mem.Allocator, Ref(module.Any), KWire, usize },
+                            .{ allocator, .{ .handle = self.handle }, k_arg, @intFromPtr(&missing_flag) },
+                            &missing_flag,
+                        );
+                    }
                     return dispatchHostOpOptionalFlag(
                         .collection_op,
                         @intFromEnum(module.CollectionSubOp.record_get),
@@ -9110,17 +9464,39 @@ pub fn Js(comptime host: type) type {
                     );
                 }
 
-                pub fn set(self: Self, key: K, value: V) module.Error!void {
+                pub fn set(self: Self, key: K, value: V) RecOpError!void {
+                    if (comptime k_codec or v_codec) {
+                        const k_arg = if (comptime k_codec) try toJsRef(K, key) else key;
+                        defer if (comptime k_codec) k_arg.deinit();
+                        const v_arg = if (comptime v_codec) try toJsRef(V, value) else value;
+                        defer if (comptime v_codec) v_arg.deinit();
+                        const KWire = if (k_codec) Ref(module.Any) else K;
+                        const VWire = if (v_codec) Ref(module.Any) else V;
+                        const HostFn = buildFnType(&.{ Ref(module.Any), KWire, VWire }, module.Error!void);
+                        return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.record_set), "", HostFn, .{ .{ .handle = self.handle }, k_arg, v_arg });
+                    }
                     const HostFn = buildFnType(&.{ Ref(module.Any), K, V }, module.Error!void);
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.record_set), "", HostFn, .{ .{ .handle = self.handle }, key, value });
                 }
 
-                pub fn has(self: Self, key: K) module.Error!bool {
+                pub fn has(self: Self, key: K) KeyOpError!bool {
+                    if (comptime k_codec) {
+                        const k_ref = try toJsRef(K, key);
+                        defer k_ref.deinit();
+                        const HostFn = buildFnType(&.{ Ref(module.Any), Ref(module.Any) }, module.Error!bool);
+                        return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.record_has), "", HostFn, .{ .{ .handle = self.handle }, k_ref });
+                    }
                     const HostFn = buildFnType(&.{ Ref(module.Any), K }, module.Error!bool);
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.record_has), "", HostFn, .{ .{ .handle = self.handle }, key });
                 }
 
-                pub fn delete(self: Self, key: K) module.Error!bool {
+                pub fn delete(self: Self, key: K) KeyOpError!bool {
+                    if (comptime k_codec) {
+                        const k_ref = try toJsRef(K, key);
+                        defer k_ref.deinit();
+                        const HostFn = buildFnType(&.{ Ref(module.Any), Ref(module.Any) }, module.Error!bool);
+                        return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.record_delete), "", HostFn, .{ .{ .handle = self.handle }, k_ref });
+                    }
                     const HostFn = buildFnType(&.{ Ref(module.Any), K }, module.Error!bool);
                     return dispatchHostOpRawFlags(.collection_op, @intFromEnum(module.CollectionSubOp.record_delete), "", HostFn, .{ .{ .handle = self.handle }, key });
                 }
@@ -9676,8 +10052,26 @@ pub fn Js(comptime host: type) type {
                     }
                 },
                 .@"struct" => |st| {
-                    inline for (st.field_names, 0..) |fname, fi| {
-                        freeDecoded(st.field_types[fi], allocator, @field(value, fname));
+                    const chunk_size = 16;
+                    comptime var chunk_start: usize = 0;
+                    inline while (chunk_start < st.field_names.len) : (chunk_start += chunk_size) {
+                        const cs = chunk_start;
+                        const ce = @min(cs + chunk_size, st.field_names.len);
+                        const Chunk = struct {
+                            fn run(alloc_arg: std.mem.Allocator, val_ptr: *const T) void {
+                                inline for (cs..ce) |fi| {
+                                    const fname = st.field_names[fi];
+                                    if (comptime !st.field_attrs[fi].@"comptime") {
+                                        freeDecoded(st.field_types[fi], alloc_arg, @field(val_ptr.*, fname));
+                                    }
+                                }
+                            }
+                        };
+                        if (comptime st.field_names.len > chunk_size) {
+                            @call(.never_inline, Chunk.run, .{ allocator, &value });
+                        } else {
+                            Chunk.run(allocator, &value);
+                        }
                     }
                 },
                 else => {},
@@ -9823,30 +10217,53 @@ pub fn Js(comptime host: type) type {
             return false;
         }
 
-        fn structFieldHasConstraint(comptime T: type, comptime field_name: []const u8) bool {
+        fn fieldMetaHasConstraint(comptime FmT: type) bool {
+            return @hasField(FmT, "expected_str") or
+                @hasField(FmT, "expected_num") or
+                @hasField(FmT, "expected_bool") or
+                @hasField(FmT, "expected_bigint_i64") or
+                @hasField(FmT, "expected_bigint_str") or
+                @hasField(FmT, "expected_enum_tag");
+        }
+
+        fn structFieldHasConstraintAt(comptime T: type, comptime field_idx: usize, comptime field_name: []const u8) bool {
             if (!module.hasStructZigarJsMeta(T)) return false;
             const meta = module.getStructZigarJsMeta(T);
             if (!@hasField(@TypeOf(meta), "fields")) return false;
-            @setEvalBranchQuota(meta.fields.len * 64 + 4096);
+            @setEvalBranchQuota(meta.fields.len * meta.fields.len * 32 + 32_768);
+            if (field_idx < meta.fields.len) {
+                const fm0 = meta.fields[field_idx];
+                if (std.mem.eql(u8, fm0.name, field_name)) {
+                    return fieldMetaHasConstraint(@TypeOf(fm0));
+                }
+            }
             inline for (meta.fields) |fm| {
                 if (std.mem.eql(u8, fm.name, field_name)) {
-                    const FmT = @TypeOf(fm);
-                    return @hasField(FmT, "expected_str") or
-                        @hasField(FmT, "expected_num") or
-                        @hasField(FmT, "expected_bool") or
-                        @hasField(FmT, "expected_bigint_i64") or
-                        @hasField(FmT, "expected_bigint_str") or
-                        @hasField(FmT, "expected_enum_tag");
+                    return fieldMetaHasConstraint(@TypeOf(fm));
                 }
             }
             return false;
         }
 
-        fn structFieldDisallowsNull(comptime T: type, comptime field_name: []const u8) bool {
+        fn structFieldHasConstraint(comptime T: type, comptime field_name: []const u8) bool {
+            return structFieldHasConstraintAt(T, std.math.maxInt(usize), field_name);
+        }
+
+        fn structFieldDisallowsNullAt(comptime T: type, comptime field_idx: usize, comptime field_name: []const u8) bool {
             if (!module.hasStructZigarJsMeta(T)) return false;
             const meta = module.getStructZigarJsMeta(T);
             if (!@hasField(@TypeOf(meta), "fields")) return false;
-            @setEvalBranchQuota(meta.fields.len * 64 + 4096);
+            @setEvalBranchQuota(meta.fields.len * meta.fields.len * 32 + 32_768);
+            if (field_idx < meta.fields.len) {
+                const fm0 = meta.fields[field_idx];
+                if (std.mem.eql(u8, fm0.name, field_name)) {
+                    if (@hasField(@TypeOf(fm0), "nullish")) {
+                        const nk = specSelfNullish(fm0.nullish);
+                        return nk == .none or nk == .undefined_only;
+                    }
+                    return false;
+                }
+            }
             inline for (meta.fields) |fm| {
                 if (std.mem.eql(u8, fm.name, field_name)) {
                     if (@hasField(@TypeOf(fm), "nullish")) {
@@ -9913,23 +10330,26 @@ pub fn Js(comptime host: type) type {
             return true;
         }
 
-        fn validateStructFieldConstraint(comptime T: type, comptime field_name: []const u8, val: anytype) module.CallError!bool {
-            if (comptime !structFieldHasConstraint(T, field_name)) return true;
+        fn validateStructFieldConstraintAt(comptime T: type, comptime field_idx: usize, comptime field_name: []const u8, val: anytype) module.CallError!bool {
+            if (comptime !structFieldHasConstraintAt(T, field_idx, field_name)) return true;
             const ValT = @TypeOf(val);
             if (comptime (@typeInfo(ValT) == .optional)) {
                 if (val) |inner| {
-                    return validateStructFieldConstraint(T, field_name, inner);
+                    return validateStructFieldConstraintAt(T, field_idx, field_name, inner);
                 }
                 return true;
             }
             if (comptime isNullableType(ValT)) {
                 return switch (val) {
-                    .value => |inner| validateStructFieldConstraint(T, field_name, inner),
+                    .value => |inner| validateStructFieldConstraintAt(T, field_idx, field_name, inner),
                     else => true,
                 };
             }
             const meta = module.getStructZigarJsMeta(T);
-            @setEvalBranchQuota(meta.fields.len * 64 + 4096);
+            @setEvalBranchQuota(meta.fields.len * meta.fields.len * 32 + 32_768);
+            if (comptime (field_idx < meta.fields.len and std.mem.eql(u8, meta.fields[field_idx].name, field_name))) {
+                return validateConcreteFieldConstraint(meta.fields[field_idx], val);
+            }
             inline for (meta.fields) |fm| {
                 if (comptime std.mem.eql(u8, fm.name, field_name)) {
                     return validateConcreteFieldConstraint(fm, val);
@@ -10561,7 +10981,7 @@ pub fn Js(comptime host: type) type {
                     var has_required = false;
                     @setEvalBranchQuota(st.field_names.len * st.field_names.len * 32 + 4096);
                     for (st.field_names, 0..) |fname, fi| {
-                        if (structFieldHasConstraint(FieldT, fname)) has_constraint = true;
+                        if (structFieldHasConstraintAt(FieldT, fi, fname)) has_constraint = true;
                         if (!structFieldIsOptional(FieldT, fi)) has_required = true;
                     }
                     if (has_constraint) break :blk 78;
@@ -10930,63 +11350,84 @@ pub fn Js(comptime host: type) type {
                             else => clearLastError(),
                         }
                     }
-                    inline for (st.field_names, 0..) |fname, fi| {
-                        if (comptime module.isHiddenMetaField(fname)) continue;
-                        const ftype = st.field_types[fi];
-                        const fval = @field(value, fname);
-                        if (!(try validateStructFieldConstraint(T, fname, fval))) return error.TypeError;
-                        const wire_key = comptime structFieldWireNameAt(T, fi, fname);
-                        const is_opt = comptime structFieldIsOptional(T, fi);
-                        const field_spec = comptime blk: {
-                            @setEvalBranchQuota(st.field_names.len * 64 + 4096);
-                            if (has_fields_override) {
-                                if (fi < spec.fields.len and std.mem.eql(u8, spec.fields[fi].name, fname)) {
-                                    if (@hasField(@TypeOf(spec.fields[fi]), "nullish")) break :blk spec.fields[fi].nullish;
-                                } else {
-                                    for (spec.fields) |fm| {
-                                        if (std.mem.eql(u8, fm.name, fname)) {
-                                            if (@hasField(@TypeOf(fm), "nullish")) break :blk fm.nullish;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            if (module.hasStructZigarJsMeta(T)) {
-                                const meta = module.getStructZigarJsMeta(T);
-                                if (@hasField(@TypeOf(meta), "fields")) {
-                                    @setEvalBranchQuota(meta.fields.len * 64 + 4096);
-                                    if (fi < meta.fields.len and std.mem.eql(u8, meta.fields[fi].name, fname)) {
-                                        if (@hasField(@TypeOf(meta.fields[fi]), "nullish")) break :blk meta.fields[fi].nullish;
-                                    } else {
-                                        for (meta.fields) |fm| {
-                                            if (std.mem.eql(u8, fm.name, fname)) {
-                                                if (@hasField(@TypeOf(fm), "nullish")) break :blk fm.nullish;
-                                                break;
+                    const chunk_size = 16;
+                    comptime var chunk_start: usize = 0;
+                    inline while (chunk_start < st.field_names.len) : (chunk_start += chunk_size) {
+                        const cs = chunk_start;
+                        const ce = @min(cs + chunk_size, st.field_names.len);
+                        const Chunk = struct {
+                            fn encode(
+                                rec_arg: Record([]const u8, Ref(module.Any)),
+                                val_ptr: *const T,
+                                stack_arg: @TypeOf(next_stack),
+                            ) module.CallError!void {
+                                @setEvalBranchQuota(st.field_names.len * 128 + 16_384);
+                                inline for (cs..ce) |fi| {
+                                    const fname = st.field_names[fi];
+                                    if (comptime module.isHiddenMetaField(fname)) continue;
+                                    const ftype = st.field_types[fi];
+                                    const fval = @field(val_ptr.*, fname);
+                                    if (!(try validateStructFieldConstraintAt(T, fi, fname, fval))) return error.TypeError;
+                                    const wire_key = comptime structFieldWireNameAt(T, fi, fname);
+                                    const is_opt = comptime structFieldIsOptional(T, fi);
+                                    const field_spec = comptime blk: {
+                                        @setEvalBranchQuota(st.field_names.len * 64 + 4096);
+                                        if (has_fields_override) {
+                                            if (fi < spec.fields.len and std.mem.eql(u8, spec.fields[fi].name, fname)) {
+                                                if (@hasField(@TypeOf(spec.fields[fi]), "nullish")) break :blk spec.fields[fi].nullish;
+                                            } else {
+                                                for (spec.fields) |fm| {
+                                                    if (std.mem.eql(u8, fm.name, fname)) {
+                                                        if (@hasField(@TypeOf(fm), "nullish")) break :blk fm.nullish;
+                                                        break;
+                                                    }
+                                                }
                                             }
                                         }
+                                        if (module.hasStructZigarJsMeta(T)) {
+                                            const meta = module.getStructZigarJsMeta(T);
+                                            if (@hasField(@TypeOf(meta), "fields")) {
+                                                @setEvalBranchQuota(meta.fields.len * 64 + 4096);
+                                                if (fi < meta.fields.len and std.mem.eql(u8, meta.fields[fi].name, fname)) {
+                                                    if (@hasField(@TypeOf(meta.fields[fi]), "nullish")) break :blk meta.fields[fi].nullish;
+                                                } else {
+                                                    for (meta.fields) |fm| {
+                                                        if (std.mem.eql(u8, fm.name, fname)) {
+                                                            if (@hasField(@TypeOf(fm), "nullish")) break :blk fm.nullish;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        break :blk module.NullishKind.null_or_undefined;
+                                    };
+                                    if (comptime (is_opt and isNullableType(ftype))) {
+                                        if (fval != .@"undefined") {
+                                            const prop_ref = try toJsRefWithSpecImpl(ftype, fval, field_spec, stack_arg);
+                                            defer prop_ref.deinit();
+                                            try rec_arg.set(wire_key, prop_ref);
+                                        }
+                                    } else if (comptime (is_opt and @typeInfo(ftype) == .optional)) {
+                                        if (fval != null) {
+                                            const prop_ref = try toJsRefWithSpecImpl(ftype, fval, field_spec, stack_arg);
+                                            defer prop_ref.deinit();
+                                            try rec_arg.set(wire_key, prop_ref);
+                                        }
+                                    } else if (comptime (is_opt and ftype == void)) {
+                                        // Optional undefined-typed property (`prop?: undefined`): omit on encode.
+                                    } else {
+                                        const prop_ref = try toJsRefWithSpecImpl(ftype, fval, field_spec, stack_arg);
+                                        defer prop_ref.deinit();
+                                        try rec_arg.set(wire_key, prop_ref);
                                     }
                                 }
                             }
-                            break :blk module.NullishKind.null_or_undefined;
                         };
-                        if (comptime (is_opt and isNullableType(ftype))) {
-                            if (fval != .@"undefined") {
-                                const prop_ref = try toJsRefWithSpecImpl(ftype, fval, field_spec, next_stack);
-                                defer prop_ref.deinit();
-                                try rec.set(wire_key, prop_ref);
-                            }
-                        } else if (comptime (is_opt and @typeInfo(ftype) == .optional)) {
-                            if (fval != null) {
-                                const prop_ref = try toJsRefWithSpecImpl(ftype, fval, field_spec, next_stack);
-                                defer prop_ref.deinit();
-                                try rec.set(wire_key, prop_ref);
-                            }
-                        } else if (comptime (is_opt and ftype == void)) {
-                            // Optional undefined-typed property (`prop?: undefined`): omit on encode.
+                        if (comptime st.field_names.len > chunk_size) {
+                            try @call(.never_inline, Chunk.encode, .{ rec, &value, next_stack });
                         } else {
-                            const prop_ref = try toJsRefWithSpecImpl(ftype, fval, field_spec, next_stack);
-                            defer prop_ref.deinit();
-                            try rec.set(wire_key, prop_ref);
+                            try Chunk.encode(rec, &value, next_stack);
                         }
                     }
                     return .{ .handle = rec.handle };
@@ -11559,31 +12000,89 @@ pub fn Js(comptime host: type) type {
                     const obj = raw.cast(module.Object);
                     var out: T = undefined;
                     var field_init: [st.field_names.len]bool = @splat(false);
-                    errdefer {
-                        inline for (st.field_names, 0..) |fname, fi| {
-                            if (field_init[fi]) {
-                                freeDecoded(st.field_types[fi], allocator, @field(out, fname));
+                    const chunk_size = 16;
+                    const CleanupAll = struct {
+                        fn run(
+                            alloc_arg: std.mem.Allocator,
+                            out_ptr: *T,
+                            init_ptr: *const [st.field_names.len]bool,
+                        ) void {
+                            comptime var c_start: usize = 0;
+                            inline while (c_start < st.field_names.len) : (c_start += chunk_size) {
+                                const cs = c_start;
+                                const ce = @min(cs + chunk_size, st.field_names.len);
+                                const FreeChunk = struct {
+                                    fn free(
+                                        a: std.mem.Allocator,
+                                        o: *T,
+                                        f_init: *const [st.field_names.len]bool,
+                                    ) void {
+                                        inline for (cs..ce) |fi| {
+                                            const fname = st.field_names[fi];
+                                            if (f_init[fi]) {
+                                                freeDecoded(st.field_types[fi], a, @field(o.*, fname));
+                                            }
+                                        }
+                                    }
+                                };
+                                if (comptime st.field_names.len > chunk_size) {
+                                    @call(.never_inline, FreeChunk.free, .{ alloc_arg, out_ptr, init_ptr });
+                                } else {
+                                    FreeChunk.free(alloc_arg, out_ptr, init_ptr);
+                                }
                             }
                         }
+                    };
+                    var decode_ok = false;
+                    defer if (!decode_ok) {
+                        if (comptime st.field_names.len > chunk_size) {
+                            @call(.never_inline, CleanupAll.run, .{ allocator, &out, &field_init });
+                        } else {
+                            CleanupAll.run(allocator, &out, &field_init);
+                        }
+                    };
+                    comptime var chunk_start: usize = 0;
+                    inline while (chunk_start < st.field_names.len) : (chunk_start += chunk_size) {
+                        const cs = chunk_start;
+                        const ce = @min(cs + chunk_size, st.field_names.len);
+                        const DecodeChunk = struct {
+                            fn decode(
+                                alloc_arg: std.mem.Allocator,
+                                obj_arg: Ref(module.Object),
+                                out_ptr: *T,
+                                init_ptr: *[st.field_names.len]bool,
+                                depth_arg: usize,
+                                anc_arg: @TypeOf(next_anc),
+                            ) module.CallError!void {
+                                @setEvalBranchQuota(st.field_names.len * 128 + 16_384);
+                                inline for (cs..ce) |fi| {
+                                    const fname = st.field_names[fi];
+                                    if (comptime module.isHiddenMetaField(fname)) {
+                                        @field(out_ptr.*, fname) = .{};
+                                        continue;
+                                    }
+                                    const ftype = st.field_types[fi];
+                                    const wire_key = comptime structFieldWireNameAt(T, fi, fname);
+                                    const prop_ref = try getProp(module.CallError!Ref(module.Any), obj_arg, wire_key);
+                                    defer prop_ref.deinit();
+                                    if (comptime (structFieldHasConstraintAt(T, fi, fname) and structFieldDisallowsNullAt(T, fi, fname))) {
+                                        if (prop_ref.isNull()) return error.TypeError;
+                                    }
+                                    @field(out_ptr.*, fname) = try fromJsRefAllocInner(ftype, alloc_arg, prop_ref, depth_arg + 1, anc_arg);
+                                    init_ptr[fi] = true;
+                                    if (!(try validateStructFieldConstraintAt(T, fi, fname, @field(out_ptr.*, fname)))) {
+                                        return error.TypeError;
+                                    }
+                                }
+                            }
+                        };
+                        if (comptime st.field_names.len > chunk_size) {
+                            try @call(.never_inline, DecodeChunk.decode, .{ allocator, obj, &out, &field_init, depth, next_anc });
+                        } else {
+                            try DecodeChunk.decode(allocator, obj, &out, &field_init, depth, next_anc);
+                        }
                     }
-                    inline for (st.field_names, 0..) |fname, fi| {
-                        if (comptime module.isHiddenMetaField(fname)) {
-                            @field(out, fname) = .{};
-                            continue;
-                        }
-                        const ftype = st.field_types[fi];
-                        const wire_key = comptime structFieldWireNameAt(T, fi, fname);
-                        const prop_ref = try getProp(module.CallError!Ref(module.Any), obj, wire_key);
-                        defer prop_ref.deinit();
-                        if (comptime (structFieldHasConstraint(T, fname) and structFieldDisallowsNull(T, fname))) {
-                            if (prop_ref.isNull()) return error.TypeError;
-                        }
-                        @field(out, fname) = try fromJsRefAllocInner(ftype, allocator, prop_ref, depth + 1, next_anc);
-                        field_init[fi] = true;
-                        if (!(try validateStructFieldConstraint(T, fname, @field(out, fname)))) {
-                            return error.TypeError;
-                        }
-                    }
+                    decode_ok = true;
                     return out;
                 },
                 .@"enum" => |en_info| {
@@ -13598,7 +14097,7 @@ test "Standard wrappers: ABI layout, Promise, binary views, collections, BigInt,
                     const elem_size: usize = switch (kind) {
                         .int32_array, .uint32_array, .float32_array => 4,
                         .big_uint64_array, .big_int64_array, .float64_array => 8,
-                        .uint16_array, .int16_array => 2,
+                        .uint16_array, .int16_array, .float16_array => 2,
                         else => 1,
                     };
                     const byte_len = frame.@"1" * elem_size;
@@ -13874,6 +14373,7 @@ test "Standard wrappers: ABI layout, Promise, binary views, collections, BigInt,
         js.Uint8Array,
         js.Uint8ClampedArray,
         js.Int32Array,
+        js.Float16Array,
         js.Float64Array,
         js.BigUint64Array,
         js.Array(i32),
@@ -16400,6 +16900,277 @@ test "Js(#54): stateless callbacks, release-only Disposable.deinit, cyclic graph
     }
     try expectEqual(@as(u32, 0), js.activeHandleCount());
 }
+
+test "Issue #58: distributive union constraints, callable Intersect, Float16Array, nested union coercion, and 110-field struct branch quota" {
+    const Mock58 = struct {
+        const J = Js(@This());
+        var next_slot: u32 = 16;
+        var f16_bytes: [64]u8 = @splat(0);
+        var f16_byte_len: usize = 0;
+
+        pub fn releaseJsValue(_: u32) void {}
+        pub fn cloneJsValue(h: u32) u32 {
+            if (h < first_dynamic_slot) return h;
+            next_slot += 1;
+            return next_slot;
+        }
+        pub fn equalJsValue(a: u32, b: u32) bool {
+            return a == b;
+        }
+        pub fn getJsValueCount() u32 {
+            return 0;
+        }
+        pub fn typeofJsValue(h: u32) JsType {
+            if (h == reserved_undefined_handle) return .@"undefined";
+            if (h >= 0x4000) return .number;
+            return .object;
+        }
+        pub fn invokeJsHostOp(desc_ptr: *const anyopaque, arg_ptr: *anyopaque, _: usize) E {
+            const desc: *const HostOpDescriptor = @ptrCast(@alignCast(desc_ptr));
+            const op: HostOp = @enumFromInt(desc.op);
+            switch (op) {
+                .binary_create => {
+                    const Frame = arg_struct.ArgStruct(fn (usize, usize, bool) Error!J.Ref(Object));
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    if (desc.flags != @intFromEnum(BinaryKind.float16_array)) return .FAULT;
+                    const byte_len = frame.@"1" * @sizeOf(f16);
+                    f16_byte_len = byte_len;
+                    const src: [*]const u8 = @ptrFromInt(frame.@"0");
+                    @memcpy(f16_bytes[0..byte_len], src[0..byte_len]);
+                    next_slot += 1;
+                    frame.retval = .{ .handle = next_slot };
+                    return .SUCCESS;
+                },
+                .binary_info => {
+                    const info: BinaryInfoKind = @enumFromInt(desc.flags);
+                    switch (info) {
+                        .byte_length => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!usize);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            frame.retval = f16_byte_len;
+                            return .SUCCESS;
+                        },
+                        .element_length => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!usize);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            frame.retval = f16_byte_len / @sizeOf(f16);
+                            return .SUCCESS;
+                        },
+                        .is_array => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any)) Error!bool);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            frame.retval = false;
+                            return .SUCCESS;
+                        },
+                        else => return .FAULT,
+                    }
+                },
+                .binary_read => {
+                    const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), usize, usize, usize) Error!usize);
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    const dst: [*]u8 = @ptrFromInt(frame.@"1");
+                    const copy_len = @min(frame.@"2", f16_byte_len);
+                    @memcpy(dst[0..copy_len], f16_bytes[0..copy_len]);
+                    frame.retval = copy_len;
+                    return .SUCCESS;
+                },
+                .set_prop => {
+                    const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), J.Ref(Any)) CallError!void);
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    frame.retval = {};
+                    return .SUCCESS;
+                },
+                .get_prop => {
+                    const Frame = arg_struct.ArgStruct(fn (J.Ref(Object)) Error!J.Ref(Any));
+                    const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                    const key = if (desc.key_ptr) |kp| kp[0..desc.key_len] else "";
+                    if (std.mem.eql(u8, key, "f000") or std.mem.eql(u8, key, "f109")) {
+                        frame.retval = .{ .handle = 0x4001 };
+                    } else {
+                        frame.retval = J.Ref(Any).@"undefined";
+                    }
+                    return .SUCCESS;
+                },
+                .collection_op => {
+                    const sub: CollectionSubOp = @enumFromInt(desc.flags);
+                    switch (sub) {
+                        .record_init => {
+                            const Frame = arg_struct.ArgStruct(fn () Error!J.Ref(Object));
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            next_slot += 1;
+                            frame.retval = .{ .handle = next_slot };
+                            return .SUCCESS;
+                        },
+                        .record_set => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), []const u8, J.Ref(Any)) Error!void);
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            frame.retval = {};
+                            return .SUCCESS;
+                        },
+                        .record_get => {
+                            const Frame = arg_struct.ArgStruct(fn (J.Ref(Any), []const u8, usize) Error!J.Ref(Any));
+                            const frame: *Frame = @ptrCast(@alignCast(arg_ptr));
+                            const missing_ptr: *u8 = @ptrFromInt(frame.@"2");
+                            if (std.mem.eql(u8, frame.@"1", "score")) {
+                                missing_ptr.* = 0;
+                                frame.retval = .{ .handle = 0x4001 };
+                            } else if (std.mem.eql(u8, frame.@"1", "raw")) {
+                                missing_ptr.* = 0;
+                                frame.retval = J.Ref(Any).@"null";
+                            } else {
+                                missing_ptr.* = 1;
+                                frame.retval = J.Ref(Any).@"undefined";
+                            }
+                            return .SUCCESS;
+                        },
+                        .value_identity => {
+                            const BoxF64 = fn (f64) CallError!J.Ref(Any);
+                            const UnboxF64 = fn (J.Ref(Any)) CallError!f64;
+                            if (desc.signature == signature.get(arg_struct.ArgStruct(BoxF64))) {
+                                const frame: *arg_struct.ArgStruct(BoxF64) = @ptrCast(@alignCast(arg_ptr));
+                                frame.retval = .{ .handle = 0x4001 };
+                                return .SUCCESS;
+                            } else if (desc.signature == signature.get(arg_struct.ArgStruct(UnboxF64))) {
+                                const frame: *arg_struct.ArgStruct(UnboxF64) = @ptrCast(@alignCast(arg_ptr));
+                                frame.retval = 42.5;
+                                return .SUCCESS;
+                            }
+                            return .FAULT;
+                        },
+                        else => return .FAULT,
+                    }
+                },
+                else => return .FAULT,
+            }
+        }
+    };
+
+    const js = Js(Mock58);
+
+    // 1. Union of callables satisfies `js.Function`, and `Intersect` over a callable union propagates `.is_callable_handle`.
+    const CbUnion = union(enum) {
+        cb_a: js.Callback(fn (f64) f64),
+        cb_b: js.Callback(fn ([]const u8) void),
+    };
+    try expect(comptime js.satisfiesTypeConstraint(CbUnion, js.Function, 0));
+    const ExtraProps = struct {
+        ref: js.Ref(js.Object),
+        pub const zigar_js = .{ .is_handle = true };
+    };
+    const MockFn = js.Intersect(.{ CbUnion, ExtraProps });
+    try expect(comptime MockFn.zigar_js.is_callable_handle);
+    try expect(comptime js.satisfiesTypeConstraint(MockFn, js.Function, 0));
+
+    // 2. Binary kind constraints and `Float16Array` (binary_kind = .float16_array = 15).
+    try expectEqual(BinaryKind.float16_array, js.Float16Array.binary_kind);
+    try expectEqual(@as(u8, 15), @intFromEnum(BinaryKind.float16_array));
+    try expect(comptime js.satisfiesTypeConstraint(js.Buffer, js.Uint8Array, 0));
+    try expect(comptime js.satisfiesTypeConstraint(js.SharedArrayBuffer, js.ArrayBuffer, 0));
+    try expect(comptime !js.satisfiesTypeConstraint(js.Uint8Array, js.Float32Array, 0));
+    try expect(comptime !js.satisfiesTypeConstraint(js.Float16Array, js.Float32Array, 0));
+
+    const f16_view = try js.Float16Array.fromSlice(&[_]f16{ 1.5, -2.5, 4.0 });
+    defer f16_view.deinit();
+    const f16_owned = try f16_view.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(f16_owned);
+    try expectEqual(@as(usize, 3), f16_owned.len);
+    try expectEqual(@as(f16, 1.5), f16_owned[0]);
+    try expectEqual(@as(f16, -2.5), f16_owned[1]);
+    try expectEqual(@as(f16, 4.0), f16_owned[2]);
+
+    // 3. Nested tagged-union coercion + `Buffer -> Uint8Array` coercion.
+    const TypedArrayU = union(enum) {
+        uint8_array: js.Uint8Array,
+        float16_array: js.Float16Array,
+        float32_array: js.Float32Array,
+        pub fn from(v: anytype) @This() {
+            return js.coerceUnion(@This(), v);
+        }
+    };
+    const ArrayBufferViewU = union(enum) {
+        typed_array: TypedArrayU,
+        data_view: js.DataView,
+        pub fn from(v: anytype) @This() {
+            return js.coerceUnion(@This(), v);
+        }
+    };
+    const InputTypeU = union(enum) {
+        str: []const u8,
+        array_buffer: js.ArrayBuffer,
+        view: ArrayBufferViewU,
+        pub fn from(v: anytype) @This() {
+            return js.coerceUnion(@This(), v);
+        }
+    };
+    const buf_val: js.Buffer = .{ .handle = 77 };
+    const coerced_buf = InputTypeU.from(buf_val);
+    try expect(coerced_buf == .view);
+    try expect(coerced_buf.view == .typed_array);
+    try expect(coerced_buf.view.typed_array == .uint8_array);
+    try expectEqual(@as(u32, 77), coerced_buf.view.typed_array.uint8_array.handle);
+
+    const coerced_f16 = InputTypeU.from(f16_view);
+    try expect(coerced_f16 == .view);
+    try expect(coerced_f16.view == .typed_array);
+    try expect(coerced_f16.view.typed_array == .float16_array);
+
+    // 4. 110-field plain struct encodes/decodes without caller-side `@setEvalBranchQuota` overflow.
+    const Wide110 = struct {
+        f000: ?f64 = null, f001: ?f64 = null, f002: ?f64 = null, f003: ?f64 = null, f004: ?f64 = null,
+        f005: ?f64 = null, f006: ?f64 = null, f007: ?f64 = null, f008: ?f64 = null, f009: ?f64 = null,
+        f010: ?f64 = null, f011: ?f64 = null, f012: ?f64 = null, f013: ?f64 = null, f014: ?f64 = null,
+        f015: ?f64 = null, f016: ?f64 = null, f017: ?f64 = null, f018: ?f64 = null, f019: ?f64 = null,
+        f020: ?f64 = null, f021: ?f64 = null, f022: ?f64 = null, f023: ?f64 = null, f024: ?f64 = null,
+        f025: ?f64 = null, f026: ?f64 = null, f027: ?f64 = null, f028: ?f64 = null, f029: ?f64 = null,
+        f030: ?f64 = null, f031: ?f64 = null, f032: ?f64 = null, f033: ?f64 = null, f034: ?f64 = null,
+        f035: ?f64 = null, f036: ?f64 = null, f037: ?f64 = null, f038: ?f64 = null, f039: ?f64 = null,
+        f040: ?f64 = null, f041: ?f64 = null, f042: ?f64 = null, f043: ?f64 = null, f044: ?f64 = null,
+        f045: ?f64 = null, f046: ?f64 = null, f047: ?f64 = null, f048: ?f64 = null, f049: ?f64 = null,
+        f050: ?f64 = null, f051: ?f64 = null, f052: ?f64 = null, f053: ?f64 = null, f054: ?f64 = null,
+        f055: ?f64 = null, f056: ?f64 = null, f057: ?f64 = null, f058: ?f64 = null, f059: ?f64 = null,
+        f060: ?f64 = null, f061: ?f64 = null, f062: ?f64 = null, f063: ?f64 = null, f064: ?f64 = null,
+        f065: ?f64 = null, f066: ?f64 = null, f067: ?f64 = null, f068: ?f64 = null, f069: ?f64 = null,
+        f070: ?f64 = null, f071: ?f64 = null, f072: ?f64 = null, f073: ?f64 = null, f074: ?f64 = null,
+        f075: ?f64 = null, f076: ?f64 = null, f077: ?f64 = null, f078: ?f64 = null, f079: ?f64 = null,
+        f080: ?f64 = null, f081: ?f64 = null, f082: ?f64 = null, f083: ?f64 = null, f084: ?f64 = null,
+        f085: ?f64 = null, f086: ?f64 = null, f087: ?f64 = null, f088: ?f64 = null, f089: ?f64 = null,
+        f090: ?f64 = null, f091: ?f64 = null, f092: ?f64 = null, f093: ?f64 = null, f094: ?f64 = null,
+        f095: ?f64 = null, f096: ?f64 = null, f097: ?f64 = null, f098: ?f64 = null, f099: ?f64 = null,
+        f100: ?f64 = null, f101: ?f64 = null, f102: ?f64 = null, f103: ?f64 = null, f104: ?f64 = null,
+        f105: ?f64 = null, f106: ?f64 = null, f107: ?f64 = null, f108: ?f64 = null, f109: ?f64 = null,
+    };
+    const wide_ref = try js.toJsRef(Wide110, Wide110{ .f000 = 42.5, .f109 = 42.5 });
+    defer wide_ref.deinit();
+    const wide_dec = try js.fromJsRefAlloc(Wide110, std.testing.allocator, wide_ref);
+    try expectEqual(@as(?f64, 42.5), wide_dec.f000);
+    try expectEqual(@as(?f64, 42.5), wide_dec.f109);
+    try expectEqual(@as(?f64, null), wide_dec.f050);
+
+    // 5. Composite `Record(K, ?TaggedUnion)` distinguishes missing keys (`null`), present JS `null` (`.{null}`), and decoded union values.
+    const SqlValUnion = union(enum) {
+        num: f64,
+        flag: bool,
+        pub const zigar_js = .{ .is_union = true };
+    };
+    const SqlOutVal = ?SqlValUnion;
+    const row_rec: js.Record([]const u8, SqlOutVal) = .{ .handle = 20 };
+    try row_rec.set("score", .{ .num = 42.5 });
+    try row_rec.set("raw", null);
+
+    const missing_col = try row_rec.getAlloc(std.testing.allocator, "missing");
+    try expect(missing_col == null);
+
+    const null_col = try row_rec.getAlloc(std.testing.allocator, "raw");
+    try expect(null_col != null);
+    try expect(null_col.? == null);
+
+    const score_col = try row_rec.getAlloc(std.testing.allocator, "score");
+    try expect(score_col != null);
+    try expect(score_col.? != null);
+    try expect(score_col.?.? == .num);
+    try expectEqual(@as(f64, 42.5), score_col.?.?.num);
+}
+
 
 
 
