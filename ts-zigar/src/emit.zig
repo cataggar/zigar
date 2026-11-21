@@ -6081,109 +6081,114 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\pub const JsSymbol = Symbol;
         \\pub const JsFunction = Function;
         \\
-        \\pub const StubHandle = extern struct {
-        \\    const Self = @This();
-        \\    pub const is_js_value = true;
+        \\pub fn StubBinaryHandle(comptime kind: anytype) type {
+        \\    return extern struct {
+        \\        const Self = @This();
+        \\        pub const is_js_value = true;
+        \\        pub const binary_kind = kind;
         \\
-        \\    handle: u32 = 0,
+        \\        handle: u32 = 0,
         \\
-        \\    pub const @"undefined": Self = .{ .handle = 0 };
-        \\    pub const @"null": Self = .{ .handle = 1 };
+        \\        pub const @"undefined": Self = .{ .handle = 0 };
+        \\        pub const @"null": Self = .{ .handle = 1 };
         \\
-        \\    pub fn isUndefined(self: Self) bool {
-        \\        return self.handle == 0;
-        \\    }
+        \\        pub fn isUndefined(self: Self) bool {
+        \\            return self.handle == 0;
+        \\        }
         \\
-        \\    pub fn isNull(self: Self) bool {
-        \\        return self.handle == 1;
-        \\    }
+        \\        pub fn isNull(self: Self) bool {
+        \\            return self.handle == 1;
+        \\        }
         \\
-        \\    pub fn isNullOrUndefined(self: Self) bool {
-        \\        return self.handle <= 1;
-        \\    }
+        \\        pub fn isNullOrUndefined(self: Self) bool {
+        \\            return self.handle <= 1;
+        \\        }
         \\
-        \\    pub fn clone(self: Self) Self {
-        \\        return self;
-        \\    }
+        \\        pub fn clone(self: Self) Self {
+        \\            return self;
+        \\        }
         \\
-        \\    pub fn tryClone(self: Self) Error!Self {
-        \\        return self;
-        \\    }
+        \\        pub fn tryClone(self: Self) Error!Self {
+        \\            return self;
+        \\        }
         \\
-        \\    pub fn deinit(_: Self) void {}
+        \\        pub fn deinit(_: Self) void {}
         \\
-        \\    pub fn tryDeinit(_: Self) Error!void {}
+        \\        pub fn tryDeinit(_: Self) Error!void {}
         \\
-        \\    pub fn eql(self: Self, other: anytype) bool {
-        \\        return self.handle == other.handle;
-        \\    }
+        \\        pub fn eql(self: Self, other: anytype) bool {
+        \\            return self.handle == other.handle;
+        \\        }
         \\
-        \\    pub fn tryEql(_: Self, _: anytype) Error!bool {
-        \\        return error.HostUnavailable;
-        \\    }
+        \\        pub fn tryEql(_: Self, _: anytype) Error!bool {
+        \\            return error.HostUnavailable;
+        \\        }
         \\
-        \\    pub fn ref(self: Self) Any {
-        \\        return .{ .handle = self.handle };
-        \\    }
+        \\        pub fn ref(self: Self) Any {
+        \\            return .{ .handle = self.handle };
+        \\        }
         \\
-        \\    pub fn toRef(self: Self) Any {
-        \\        return .{ .handle = self.handle };
-        \\    }
+        \\        pub fn toRef(self: Self) Any {
+        \\            return .{ .handle = self.handle };
+        \\        }
         \\
-        \\    pub fn fromRef(v: anytype) Self {
-        \\        return .{ .handle = v.handle };
-        \\    }
+        \\        pub fn fromRef(v: anytype) Self {
+        \\            return .{ .handle = v.handle };
+        \\        }
         \\
-        \\    pub fn byteLength(_: Self) Error!usize {
-        \\        return error.HostUnavailable;
-        \\    }
+        \\        pub fn byteLength(_: Self) Error!usize {
+        \\            return error.HostUnavailable;
+        \\        }
         \\
-        \\    pub const len = byteLength;
+        \\        pub const len = byteLength;
         \\
-        \\    pub fn byteOffset(_: Self) Error!usize {
-        \\        return error.HostUnavailable;
-        \\    }
+        \\        pub fn byteOffset(_: Self) Error!usize {
+        \\            return error.HostUnavailable;
+        \\        }
         \\
-        \\    pub fn buffer(_: Self) Error!Self {
-        \\        return error.HostUnavailable;
-        \\    }
+        \\        pub fn buffer(_: Self) Error!Self {
+        \\            return error.HostUnavailable;
+        \\        }
         \\
-        \\    pub fn get(_: Self, _: usize) Error!u8 {
-        \\        return error.HostUnavailable;
-        \\    }
+        \\        pub fn get(_: Self, _: usize) Error!u8 {
+        \\            return error.HostUnavailable;
+        \\        }
         \\
-        \\    pub fn set(_: Self, _: usize, _: u8) Error!void {
-        \\        return error.HostUnavailable;
-        \\    }
+        \\        pub fn set(_: Self, _: usize, _: u8) Error!void {
+        \\            return error.HostUnavailable;
+        \\        }
         \\
-        \\    pub fn subarray(_: Self, _: usize, _: ?usize) Error!Self {
-        \\        return error.HostUnavailable;
-        \\    }
+        \\        pub fn subarray(_: Self, _: usize, _: ?usize) Error!Self {
+        \\            return error.HostUnavailable;
+        \\        }
         \\
-        \\    pub fn copyTo(_: Self, _: []u8) Error!usize {
-        \\        return error.HostUnavailable;
-        \\    }
+        \\        pub fn copyTo(_: Self, _: []u8) Error!usize {
+        \\            return error.HostUnavailable;
+        \\        }
         \\
-        \\    pub fn copyToAt(_: Self, _: []u8, _: usize) Error!usize {
-        \\        return error.HostUnavailable;
-        \\    }
+        \\        pub fn copyToAt(_: Self, _: []u8, _: usize) Error!usize {
+        \\            return error.HostUnavailable;
+        \\        }
         \\
-        \\    pub fn writeFrom(_: Self, _: []const u8) Error!void {
-        \\        return error.HostUnavailable;
-        \\    }
+        \\        pub fn writeFrom(_: Self, _: []const u8) Error!void {
+        \\            return error.HostUnavailable;
+        \\        }
         \\
-        \\    pub fn writeFromAt(_: Self, _: []const u8, _: usize) Error!void {
-        \\        return error.HostUnavailable;
-        \\    }
+        \\        pub fn writeFromAt(_: Self, _: []const u8, _: usize) Error!void {
+        \\            return error.HostUnavailable;
+        \\        }
         \\
-        \\    pub fn toOwnedSlice(_: Self, _: std.mem.Allocator) AllocError![]u8 {
-        \\        return error.HostUnavailable;
-        \\    }
+        \\        pub fn toOwnedSlice(_: Self, _: std.mem.Allocator) AllocError![]u8 {
+        \\            return error.HostUnavailable;
+        \\        }
         \\
-        \\    pub fn toStringAlloc(_: Self, _: std.mem.Allocator) AllocError![]u8 {
-        \\        return error.HostUnavailable;
-        \\    }
-        \\};
+        \\        pub fn toStringAlloc(_: Self, _: std.mem.Allocator) AllocError![]u8 {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\    };
+        \\}
+        \\
+        \\pub const StubHandle = StubBinaryHandle(.none);
         \\
         \\pub const StubString = extern struct {
         \\    const Self = @This();
@@ -6432,21 +6437,22 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\pub const Date = if (has_host) raw_js.Date else StubDate;
         \\pub const RegExp = if (has_host) raw_js.RegExp else StubRegExp;
         \\
-        \\pub const Buffer = if (has_host) raw_js.Buffer else StubHandle;
-        \\pub const Uint8Array = if (has_host) raw_js.Uint8Array else StubHandle;
-        \\pub const Uint8ClampedArray = if (has_host) raw_js.Uint8ClampedArray else StubHandle;
-        \\pub const Int8Array = if (has_host) raw_js.Int8Array else StubHandle;
-        \\pub const Uint16Array = if (has_host) raw_js.Uint16Array else StubHandle;
-        \\pub const Int16Array = if (has_host) raw_js.Int16Array else StubHandle;
-        \\pub const Uint32Array = if (has_host) raw_js.Uint32Array else StubHandle;
-        \\pub const Int32Array = if (has_host) raw_js.Int32Array else StubHandle;
-        \\pub const BigUint64Array = if (has_host) raw_js.BigUint64Array else StubHandle;
-        \\pub const BigInt64Array = if (has_host) raw_js.BigInt64Array else StubHandle;
-        \\pub const Float32Array = if (has_host) raw_js.Float32Array else StubHandle;
-        \\pub const Float64Array = if (has_host) raw_js.Float64Array else StubHandle;
-        \\pub const ArrayBuffer = if (has_host) raw_js.ArrayBuffer else StubHandle;
-        \\pub const SharedArrayBuffer = if (has_host) raw_js.SharedArrayBuffer else StubHandle;
-        \\pub const DataView = if (has_host) raw_js.DataView else StubHandle;
+        \\pub const Buffer = if (has_host) raw_js.Buffer else StubBinaryHandle(.buffer);
+        \\pub const Uint8Array = if (has_host) raw_js.Uint8Array else StubBinaryHandle(.uint8_array);
+        \\pub const Uint8ClampedArray = if (has_host) raw_js.Uint8ClampedArray else StubBinaryHandle(.uint8_clamped_array);
+        \\pub const Int8Array = if (has_host) raw_js.Int8Array else StubBinaryHandle(.int8_array);
+        \\pub const Uint16Array = if (has_host) raw_js.Uint16Array else StubBinaryHandle(.uint16_array);
+        \\pub const Int16Array = if (has_host) raw_js.Int16Array else StubBinaryHandle(.int16_array);
+        \\pub const Uint32Array = if (has_host) raw_js.Uint32Array else StubBinaryHandle(.uint32_array);
+        \\pub const Int32Array = if (has_host) raw_js.Int32Array else StubBinaryHandle(.int32_array);
+        \\pub const BigUint64Array = if (has_host) raw_js.BigUint64Array else StubBinaryHandle(.big_uint64_array);
+        \\pub const BigInt64Array = if (has_host) raw_js.BigInt64Array else StubBinaryHandle(.big_int64_array);
+        \\pub const Float16Array = if (has_host) raw_js.Float16Array else StubBinaryHandle(.float16_array);
+        \\pub const Float32Array = if (has_host) raw_js.Float32Array else StubBinaryHandle(.float32_array);
+        \\pub const Float64Array = if (has_host) raw_js.Float64Array else StubBinaryHandle(.float64_array);
+        \\pub const ArrayBuffer = if (has_host) raw_js.ArrayBuffer else StubBinaryHandle(.array_buffer);
+        \\pub const SharedArrayBuffer = if (has_host) raw_js.SharedArrayBuffer else StubBinaryHandle(.shared_array_buffer);
+        \\pub const DataView = if (has_host) raw_js.DataView else StubBinaryHandle(.data_view);
         \\
         \\pub fn StubPromise(comptime T: type) type {
         \\    return extern struct {
@@ -6503,6 +6509,14 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\            return error.HostUnavailable;
         \\        }
         \\
+        \\        pub fn withCapacity(_: usize) CallError!Self {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn fromSlice(_: []const T) CallError!Self {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
         \\        pub fn len(_: Self) CallError!usize {
         \\            return error.HostUnavailable;
         \\        }
@@ -6511,7 +6525,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\            return error.HostUnavailable;
         \\        }
         \\
-        \\        pub fn getAlloc(_: Self, _: std.mem.Allocator, _: usize) AllocError!T {
+        \\        pub fn getAlloc(_: Self, _: std.mem.Allocator, _: usize) CallError!T {
         \\            return error.HostUnavailable;
         \\        }
         \\
@@ -6520,6 +6534,18 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\        }
         \\
         \\        pub fn push(_: Self, _: anytype) CallError!usize {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn pop(_: Self) CallError!?T {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn popAlloc(_: Self, _: std.mem.Allocator) CallError!?T {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn toOwnedSlice(_: Self, _: std.mem.Allocator) CallError![]T {
         \\            return error.HostUnavailable;
         \\        }
         \\
@@ -6541,6 +6567,38 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\
         \\        handle: u32 = 0,
         \\
+        \\        pub fn init() CallError!Self {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn size(_: Self) CallError!usize {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn get(_: Self, _: K) CallError!?V {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn getAlloc(_: Self, _: std.mem.Allocator, _: K) CallError!?V {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn set(_: Self, _: K, _: V) CallError!void {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn has(_: Self, _: K) CallError!bool {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn delete(_: Self, _: K) CallError!bool {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn clear(_: Self) CallError!void {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
         \\        pub fn clone(self: Self) Self {
         \\            return self;
         \\        }
@@ -6558,6 +6616,30 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\        pub const is_js_value = true;
         \\
         \\        handle: u32 = 0,
+        \\
+        \\        pub fn init() CallError!Self {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn size(_: Self) CallError!usize {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn add(_: Self, _: T) CallError!void {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn has(_: Self, _: T) CallError!bool {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn delete(_: Self, _: T) CallError!bool {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn clear(_: Self) CallError!void {
+        \\            return error.HostUnavailable;
+        \\        }
         \\
         \\        pub fn clone(self: Self) Self {
         \\            return self;
@@ -6579,6 +6661,38 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\        pub const is_js_value = true;
         \\
         \\        handle: u32 = 0,
+        \\
+        \\        pub fn init() CallError!Self {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn get(_: Self, _: K) CallError!?V {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn getAlloc(_: Self, _: std.mem.Allocator, _: K) CallError!?V {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn set(_: Self, _: K, _: V) CallError!void {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn has(_: Self, _: K) CallError!bool {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn delete(_: Self, _: K) CallError!bool {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn keys(_: Self) CallError!StubArray([]const u8) {
+        \\            return error.HostUnavailable;
+        \\        }
+        \\
+        \\        pub fn keysAlloc(_: Self, _: std.mem.Allocator) CallError![][]u8 {
+        \\            return error.HostUnavailable;
+        \\        }
         \\
         \\        pub fn clone(self: Self) Self {
         \\            return self;
@@ -7957,8 +8071,87 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    };
         \\}
         \\
+        \\fn standaloneCanCoerceUnion(comptime U: type, comptime ValT: type, comptime depth: usize) bool {
+        \\    @setEvalBranchQuota(200_000);
+        \\    if (depth > 6) return false;
+        \\    if (ValT == U) return true;
+        \\    if (@typeInfo(U) != .@"union") return false;
+        \\    if (@hasDecl(U, "is_zigar_nullable") and U.is_zigar_nullable) return false;
+        \\    const un = @typeInfo(U).@"union";
+        \\    comptime var exact_count: usize = 0;
+        \\    inline for (un.field_types) |FT| {
+        \\        if (FT != void and FT == ValT) exact_count += 1;
+        \\    }
+        \\    if (exact_count == 1) return true;
+        \\    if (exact_count == 0 and @typeInfo(ValT) == .@"struct" and @hasDecl(ValT, "binary_kind") and ValT.binary_kind == .buffer) {
+        \\        comptime var u8_count: usize = 0;
+        \\        inline for (un.field_types) |FT| {
+        \\            if (FT != void and FT != noreturn and @typeInfo(FT) == .@"struct" and @hasDecl(FT, "binary_kind") and FT.binary_kind == .uint8_array) {
+        \\                u8_count += 1;
+        \\            }
+        \\        }
+        \\        if (u8_count == 1) return true;
+        \\    }
+        \\    if (isStringSliceCoercible(ValT)) {
+        \\        comptime var str_count: usize = 0;
+        \\        inline for (un.field_types) |FT| {
+        \\            if (FT == []const u8) str_count += 1;
+        \\        }
+        \\        if (str_count == 1) return true;
+        \\    }
+        \\    const val_info = @typeInfo(ValT);
+        \\    if (val_info == .comptime_int or val_info == .comptime_float) {
+        \\        comptime var num_count: usize = 0;
+        \\        inline for (un.field_types) |FT| {
+        \\            if (FT == f64 or (val_info == .comptime_int and (FT == i64 or FT == i32))) num_count += 1;
+        \\        }
+        \\        if (num_count == 1) return true;
+        \\    }
+        \\    if (val_info == .@"enum") {
+        \\        inline for (un.field_types) |FT| {
+        \\            if (@typeInfo(FT) == .@"enum") {
+        \\                const src_fields = val_info.@"enum".field_names;
+        \\                if (src_fields.len > 0) {
+        \\                    var all_in = true;
+        \\                    for (src_fields) |sf_name| {
+        \\                        if (!@hasField(FT, sf_name)) {
+        \\                            all_in = false;
+        \\                            break;
+        \\                        }
+        \\                    }
+        \\                    if (all_in) return true;
+        \\                }
+        \\            }
+        \\        }
+        \\        if (!@hasDecl(ValT, "toInt") and !@hasDecl(ValT, "toFloat")) {
+        \\            comptime var str_count: usize = 0;
+        \\            inline for (un.field_types) |FT| {
+        \\                if (FT == []const u8) str_count += 1;
+        \\            }
+        \\            if (str_count == 1) return true;
+        \\        }
+        \\    }
+        \\    if (isGeneratedHandleStruct(ValT)) {
+        \\        inline for (un.field_types) |FT| {
+        \\            if (FT != void and FT != noreturn and isGeneratedHandleStruct(FT) and structDerivesFrom(ValT, FT, 0)) return true;
+        \\        }
+        \\    }
+        \\    comptime var nested_count: usize = 0;
+        \\    inline for (un.field_types) |FT| {
+        \\        if (FT != void and FT != noreturn and @typeInfo(FT) == .@"union" and !(@hasDecl(FT, "is_zigar_nullable") and FT.is_zigar_nullable)) {
+        \\            if (standaloneCanCoerceUnion(FT, ValT, depth + 1)) nested_count += 1;
+        \\        }
+        \\    }
+        \\    return nested_count == 1;
+        \\}
+        \\
         \\pub fn coerceUnion(comptime U: type, val: anytype) U {
         \\    if (has_host) return raw_js.coerceUnion(U, val);
+        \\    return standaloneCoerceUnionImpl(U, val, 0);
+        \\}
+        \\
+        \\fn standaloneCoerceUnionImpl(comptime U: type, val: anytype, comptime depth: usize) U {
+        \\    @setEvalBranchQuota(200_000);
         \\    const ValT = @TypeOf(val);
         \\    if (ValT == U) return val;
         \\    const un = @typeInfo(U).@"union";
@@ -7973,6 +8166,20 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    }
         \\    if (exact_count == 1) {
         \\        return @unionInit(U, un.field_names[exact_idx.?], val);
+        \\    }
+        \\    if (comptime (exact_count == 0 and @typeInfo(ValT) == .@"struct" and @hasDecl(ValT, "binary_kind") and ValT.binary_kind == .buffer)) {
+        \\        comptime var u8_idx: ?usize = null;
+        \\        comptime var u8_count: usize = 0;
+        \\        inline for (un.field_names, 0..) |_, i| {
+        \\            const FT = un.field_types[i];
+        \\            if (FT != void and FT != noreturn and @typeInfo(FT) == .@"struct" and @hasDecl(FT, "binary_kind") and FT.binary_kind == .uint8_array) {
+        \\                u8_idx = i;
+        \\                u8_count += 1;
+        \\            }
+        \\        }
+        \\        if (u8_count == 1) {
+        \\            return @unionInit(U, un.field_names[u8_idx.?], .{ .handle = val.handle });
+        \\        }
         \\    }
         \\    if (comptime isStringSliceCoercible(ValT)) {
         \\        const slice_val: []const u8 = val;
@@ -8161,6 +8368,22 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                @field(casted, dst_rf) = .{ .handle = @field(val, src_rf).handle };
         \\                return @unionInit(U, arm_name, casted);
         \\            }
+        \\        }
+        \\    }
+        \\    if (comptime (depth < 6)) {
+        \\        comptime var nested_idx: ?usize = null;
+        \\        comptime var nested_count: usize = 0;
+        \\        inline for (un.field_names, 0..) |_, i| {
+        \\            const FT = un.field_types[i];
+        \\            if (comptime (FT != void and FT != noreturn and @typeInfo(FT) == .@"union" and !(@hasDecl(FT, "is_zigar_nullable") and FT.is_zigar_nullable))) {
+        \\                if (comptime standaloneCanCoerceUnion(FT, ValT, depth + 1)) {
+        \\                    nested_idx = i;
+        \\                    nested_count += 1;
+        \\                }
+        \\            }
+        \\        }
+        \\        if (nested_count == 1) {
+        \\            return @unionInit(U, un.field_names[nested_idx.?], standaloneCoerceUnionImpl(un.field_types[nested_idx.?], val, depth + 1));
         \\        }
         \\    }
         \\    @compileError("Cannot unambiguously coerce value of type " ++ @typeName(ValT) ++ " into union " ++ @typeName(U));
@@ -11126,6 +11349,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\            if (isJsFunctionConstraintMarker(B)) break :blk true;
         \\            if (@typeInfo(B) == .@"struct" and @hasDecl(B, "is_zig_callback") and B.is_zig_callback) break :blk true;
         \\            if (isGeneratedHandleStruct(B) and @hasField(@TypeOf(B.zigar_js), "is_callable_handle") and B.zigar_js.is_callable_handle) break :blk true;
+        \\            if (@typeInfo(B) == .@"union" and standaloneSatisfiesTypeConstraint(B, Function, 0)) break :blk true;
         \\        }
         \\        break :blk false;
         \\    };
@@ -13155,6 +13379,33 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    if (comptime isUnconstrainedJsAnyOrUnknown(T)) return true;
         \\    if (comptime isUnconstrainedJsAnyOrUnknown(Constraint)) return true;
         \\
+        \\    if (comptime (@typeInfo(T) == .@"union")) {
+        \\        if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_open_literal") and T.zigar_js.is_open_literal)) {
+        \\            // Handled below if Constraint is open literal or union.
+        \\        } else if (comptime (@hasDecl(T, "is_zigar_nullable") and T.is_zigar_nullable)) {
+        \\            return standaloneSatisfiesTypeConstraint(@TypeOf(null), Constraint, depth + 1) and
+        \\                standaloneSatisfiesTypeConstraint(T.Value, Constraint, depth + 1);
+        \\        } else {
+        \\            const u_types = @typeInfo(T).@"union".field_types;
+        \\            if (comptime (u_types.len > 0)) {
+        \\                const has_t_vars = comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "variants"));
+        \\                inline for (u_types, 0..) |uf_ty, ui| {
+        \\                    if (uf_ty != void) {
+        \\                        if (!standaloneSatisfiesTypeConstraint(uf_ty, Constraint, depth + 1)) return false;
+        \\                    } else if (has_t_vars and ui < T.zigar_js.variants.len and
+        \\                        @hasField(@TypeOf(T.zigar_js.variants[ui]), "is_unit_literal") and
+        \\                        T.zigar_js.variants[ui].is_unit_literal)
+        \\                    {
+        \\                        if (!standaloneUnitLiteralSatisfiesConstraint(T.zigar_js.variants[ui], Constraint, depth + 1)) return false;
+        \\                    } else {
+        \\                        if (!standaloneSatisfiesTypeConstraint(void, Constraint, depth + 1)) return false;
+        \\                    }
+        \\                }
+        \\                return true;
+        \\            }
+        \\        }
+        \\    }
+        \\
         \\    if (comptime isJsObjectConstraintMarker(Constraint)) {
         \\        return switch (@typeInfo(T)) {
         \\            .bool, .int, .comptime_int, .float, .comptime_float, .void => false,
@@ -13203,33 +13454,6 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\
         \\    if (comptime (@typeInfo(Constraint) == .float or @typeInfo(Constraint) == .int)) {
         \\        return isNumberLikeConstraintCandidate(T);
-        \\    }
-        \\
-        \\    if (comptime (@typeInfo(T) == .@"union")) {
-        \\        if (comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "is_open_literal") and T.zigar_js.is_open_literal)) {
-        \\            // Handled below if Constraint is open literal or union.
-        \\        } else if (comptime (@hasDecl(T, "is_zigar_nullable") and T.is_zigar_nullable)) {
-        \\            return standaloneSatisfiesTypeConstraint(@TypeOf(null), Constraint, depth + 1) and
-        \\                standaloneSatisfiesTypeConstraint(T.Value, Constraint, depth + 1);
-        \\        } else {
-        \\            const u_types = @typeInfo(T).@"union".field_types;
-        \\            if (comptime (u_types.len > 0)) {
-        \\                const has_t_vars = comptime (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "variants"));
-        \\                inline for (u_types, 0..) |uf_ty, ui| {
-        \\                    if (uf_ty != void) {
-        \\                        if (!standaloneSatisfiesTypeConstraint(uf_ty, Constraint, depth + 1)) return false;
-        \\                    } else if (has_t_vars and ui < T.zigar_js.variants.len and
-        \\                        @hasField(@TypeOf(T.zigar_js.variants[ui]), "is_unit_literal") and
-        \\                        T.zigar_js.variants[ui].is_unit_literal)
-        \\                    {
-        \\                        if (!standaloneUnitLiteralSatisfiesConstraint(T.zigar_js.variants[ui], Constraint, depth + 1)) return false;
-        \\                    } else {
-        \\                        if (!standaloneSatisfiesTypeConstraint(void, Constraint, depth + 1)) return false;
-        \\                    }
-        \\                }
-        \\                return true;
-        \\            }
-        \\        }
         \\    }
         \\
         \\    return switch (@typeInfo(Constraint)) {
@@ -13489,6 +13713,12 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                    if (!((@hasDecl(T, "is_js_async_iterator") and T.is_js_async_iterator) or standaloneStructHasProtocolFlag(T, "has_async_iterator", 0))) break :blk false;
         \\                }
         \\                break :blk true;
+        \\            }
+        \\            if (comptime @hasDecl(Constraint, "binary_kind")) {
+        \\                if (comptime (@typeInfo(T) != .@"struct" or !@hasDecl(T, "binary_kind"))) break :blk false;
+        \\                if (comptime (Constraint.binary_kind == .array_buffer and T.binary_kind == .shared_array_buffer)) break :blk true;
+        \\                if (comptime (Constraint.binary_kind == .uint8_array and T.binary_kind == .buffer)) break :blk true;
+        \\                break :blk T.binary_kind == Constraint.binary_kind;
         \\            }
         \\            if (@typeInfo(T) != .@"struct") break :blk false;
         \\            if (isJsObjectConstraintMarker(T)) break :blk true;

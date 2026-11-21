@@ -10423,6 +10423,7 @@ const TYPED_ARRAY_CTORS = [
   BigInt64Array,
   Float32Array,
   Float64Array,
+  globalThis.Float16Array,
 ];
 
 function isSharedArrayBuffer(val) {
