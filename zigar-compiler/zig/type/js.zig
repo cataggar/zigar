@@ -10052,8 +10052,26 @@ pub fn Js(comptime host: type) type {
                     }
                 },
                 .@"struct" => |st| {
-                    inline for (st.field_names, 0..) |fname, fi| {
-                        freeDecoded(st.field_types[fi], allocator, @field(value, fname));
+                    const chunk_size = 16;
+                    comptime var chunk_start: usize = 0;
+                    inline while (chunk_start < st.field_names.len) : (chunk_start += chunk_size) {
+                        const cs = chunk_start;
+                        const ce = @min(cs + chunk_size, st.field_names.len);
+                        const Chunk = struct {
+                            fn run(alloc_arg: std.mem.Allocator, val_ptr: *const T) void {
+                                inline for (cs..ce) |fi| {
+                                    const fname = st.field_names[fi];
+                                    if (comptime !st.field_attrs[fi].@"comptime") {
+                                        freeDecoded(st.field_types[fi], alloc_arg, @field(val_ptr.*, fname));
+                                    }
+                                }
+                            }
+                        };
+                        if (comptime st.field_names.len > chunk_size) {
+                            @call(.never_inline, Chunk.run, .{ allocator, &value });
+                        } else {
+                            Chunk.run(allocator, &value);
+                        }
                     }
                 },
                 else => {},
@@ -11332,64 +11350,84 @@ pub fn Js(comptime host: type) type {
                             else => clearLastError(),
                         }
                     }
-                    @setEvalBranchQuota(st.field_names.len * st.field_names.len * 32 + 65_536);
-                    inline for (st.field_names, 0..) |fname, fi| {
-                        if (comptime module.isHiddenMetaField(fname)) continue;
-                        const ftype = st.field_types[fi];
-                        const fval = @field(value, fname);
-                        if (!(try validateStructFieldConstraintAt(T, fi, fname, fval))) return error.TypeError;
-                        const wire_key = comptime structFieldWireNameAt(T, fi, fname);
-                        const is_opt = comptime structFieldIsOptional(T, fi);
-                        const field_spec = comptime blk: {
-                            @setEvalBranchQuota(st.field_names.len * 64 + 4096);
-                            if (has_fields_override) {
-                                if (fi < spec.fields.len and std.mem.eql(u8, spec.fields[fi].name, fname)) {
-                                    if (@hasField(@TypeOf(spec.fields[fi]), "nullish")) break :blk spec.fields[fi].nullish;
-                                } else {
-                                    for (spec.fields) |fm| {
-                                        if (std.mem.eql(u8, fm.name, fname)) {
-                                            if (@hasField(@TypeOf(fm), "nullish")) break :blk fm.nullish;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            if (module.hasStructZigarJsMeta(T)) {
-                                const meta = module.getStructZigarJsMeta(T);
-                                if (@hasField(@TypeOf(meta), "fields")) {
-                                    @setEvalBranchQuota(meta.fields.len * 64 + 4096);
-                                    if (fi < meta.fields.len and std.mem.eql(u8, meta.fields[fi].name, fname)) {
-                                        if (@hasField(@TypeOf(meta.fields[fi]), "nullish")) break :blk meta.fields[fi].nullish;
-                                    } else {
-                                        for (meta.fields) |fm| {
-                                            if (std.mem.eql(u8, fm.name, fname)) {
-                                                if (@hasField(@TypeOf(fm), "nullish")) break :blk fm.nullish;
-                                                break;
+                    const chunk_size = 16;
+                    comptime var chunk_start: usize = 0;
+                    inline while (chunk_start < st.field_names.len) : (chunk_start += chunk_size) {
+                        const cs = chunk_start;
+                        const ce = @min(cs + chunk_size, st.field_names.len);
+                        const Chunk = struct {
+                            fn encode(
+                                rec_arg: Record([]const u8, Ref(module.Any)),
+                                val_ptr: *const T,
+                                stack_arg: @TypeOf(next_stack),
+                            ) module.CallError!void {
+                                @setEvalBranchQuota(st.field_names.len * 128 + 16_384);
+                                inline for (cs..ce) |fi| {
+                                    const fname = st.field_names[fi];
+                                    if (comptime module.isHiddenMetaField(fname)) continue;
+                                    const ftype = st.field_types[fi];
+                                    const fval = @field(val_ptr.*, fname);
+                                    if (!(try validateStructFieldConstraintAt(T, fi, fname, fval))) return error.TypeError;
+                                    const wire_key = comptime structFieldWireNameAt(T, fi, fname);
+                                    const is_opt = comptime structFieldIsOptional(T, fi);
+                                    const field_spec = comptime blk: {
+                                        @setEvalBranchQuota(st.field_names.len * 64 + 4096);
+                                        if (has_fields_override) {
+                                            if (fi < spec.fields.len and std.mem.eql(u8, spec.fields[fi].name, fname)) {
+                                                if (@hasField(@TypeOf(spec.fields[fi]), "nullish")) break :blk spec.fields[fi].nullish;
+                                            } else {
+                                                for (spec.fields) |fm| {
+                                                    if (std.mem.eql(u8, fm.name, fname)) {
+                                                        if (@hasField(@TypeOf(fm), "nullish")) break :blk fm.nullish;
+                                                        break;
+                                                    }
+                                                }
                                             }
                                         }
+                                        if (module.hasStructZigarJsMeta(T)) {
+                                            const meta = module.getStructZigarJsMeta(T);
+                                            if (@hasField(@TypeOf(meta), "fields")) {
+                                                @setEvalBranchQuota(meta.fields.len * 64 + 4096);
+                                                if (fi < meta.fields.len and std.mem.eql(u8, meta.fields[fi].name, fname)) {
+                                                    if (@hasField(@TypeOf(meta.fields[fi]), "nullish")) break :blk meta.fields[fi].nullish;
+                                                } else {
+                                                    for (meta.fields) |fm| {
+                                                        if (std.mem.eql(u8, fm.name, fname)) {
+                                                            if (@hasField(@TypeOf(fm), "nullish")) break :blk fm.nullish;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        break :blk module.NullishKind.null_or_undefined;
+                                    };
+                                    if (comptime (is_opt and isNullableType(ftype))) {
+                                        if (fval != .@"undefined") {
+                                            const prop_ref = try toJsRefWithSpecImpl(ftype, fval, field_spec, stack_arg);
+                                            defer prop_ref.deinit();
+                                            try rec_arg.set(wire_key, prop_ref);
+                                        }
+                                    } else if (comptime (is_opt and @typeInfo(ftype) == .optional)) {
+                                        if (fval != null) {
+                                            const prop_ref = try toJsRefWithSpecImpl(ftype, fval, field_spec, stack_arg);
+                                            defer prop_ref.deinit();
+                                            try rec_arg.set(wire_key, prop_ref);
+                                        }
+                                    } else if (comptime (is_opt and ftype == void)) {
+                                        // Optional undefined-typed property (`prop?: undefined`): omit on encode.
+                                    } else {
+                                        const prop_ref = try toJsRefWithSpecImpl(ftype, fval, field_spec, stack_arg);
+                                        defer prop_ref.deinit();
+                                        try rec_arg.set(wire_key, prop_ref);
                                     }
                                 }
                             }
-                            break :blk module.NullishKind.null_or_undefined;
                         };
-                        if (comptime (is_opt and isNullableType(ftype))) {
-                            if (fval != .@"undefined") {
-                                const prop_ref = try toJsRefWithSpecImpl(ftype, fval, field_spec, next_stack);
-                                defer prop_ref.deinit();
-                                try rec.set(wire_key, prop_ref);
-                            }
-                        } else if (comptime (is_opt and @typeInfo(ftype) == .optional)) {
-                            if (fval != null) {
-                                const prop_ref = try toJsRefWithSpecImpl(ftype, fval, field_spec, next_stack);
-                                defer prop_ref.deinit();
-                                try rec.set(wire_key, prop_ref);
-                            }
-                        } else if (comptime (is_opt and ftype == void)) {
-                            // Optional undefined-typed property (`prop?: undefined`): omit on encode.
+                        if (comptime st.field_names.len > chunk_size) {
+                            try @call(.never_inline, Chunk.encode, .{ rec, &value, next_stack });
                         } else {
-                            const prop_ref = try toJsRefWithSpecImpl(ftype, fval, field_spec, next_stack);
-                            defer prop_ref.deinit();
-                            try rec.set(wire_key, prop_ref);
+                            try Chunk.encode(rec, &value, next_stack);
                         }
                     }
                     return .{ .handle = rec.handle };
@@ -11962,32 +12000,89 @@ pub fn Js(comptime host: type) type {
                     const obj = raw.cast(module.Object);
                     var out: T = undefined;
                     var field_init: [st.field_names.len]bool = @splat(false);
-                    errdefer {
-                        inline for (st.field_names, 0..) |fname, fi| {
-                            if (field_init[fi]) {
-                                freeDecoded(st.field_types[fi], allocator, @field(out, fname));
+                    const chunk_size = 16;
+                    const CleanupAll = struct {
+                        fn run(
+                            alloc_arg: std.mem.Allocator,
+                            out_ptr: *T,
+                            init_ptr: *const [st.field_names.len]bool,
+                        ) void {
+                            comptime var c_start: usize = 0;
+                            inline while (c_start < st.field_names.len) : (c_start += chunk_size) {
+                                const cs = c_start;
+                                const ce = @min(cs + chunk_size, st.field_names.len);
+                                const FreeChunk = struct {
+                                    fn free(
+                                        a: std.mem.Allocator,
+                                        o: *T,
+                                        f_init: *const [st.field_names.len]bool,
+                                    ) void {
+                                        inline for (cs..ce) |fi| {
+                                            const fname = st.field_names[fi];
+                                            if (f_init[fi]) {
+                                                freeDecoded(st.field_types[fi], a, @field(o.*, fname));
+                                            }
+                                        }
+                                    }
+                                };
+                                if (comptime st.field_names.len > chunk_size) {
+                                    @call(.never_inline, FreeChunk.free, .{ alloc_arg, out_ptr, init_ptr });
+                                } else {
+                                    FreeChunk.free(alloc_arg, out_ptr, init_ptr);
+                                }
                             }
                         }
+                    };
+                    var decode_ok = false;
+                    defer if (!decode_ok) {
+                        if (comptime st.field_names.len > chunk_size) {
+                            @call(.never_inline, CleanupAll.run, .{ allocator, &out, &field_init });
+                        } else {
+                            CleanupAll.run(allocator, &out, &field_init);
+                        }
+                    };
+                    comptime var chunk_start: usize = 0;
+                    inline while (chunk_start < st.field_names.len) : (chunk_start += chunk_size) {
+                        const cs = chunk_start;
+                        const ce = @min(cs + chunk_size, st.field_names.len);
+                        const DecodeChunk = struct {
+                            fn decode(
+                                alloc_arg: std.mem.Allocator,
+                                obj_arg: Ref(module.Object),
+                                out_ptr: *T,
+                                init_ptr: *[st.field_names.len]bool,
+                                depth_arg: usize,
+                                anc_arg: @TypeOf(next_anc),
+                            ) module.CallError!void {
+                                @setEvalBranchQuota(st.field_names.len * 128 + 16_384);
+                                inline for (cs..ce) |fi| {
+                                    const fname = st.field_names[fi];
+                                    if (comptime module.isHiddenMetaField(fname)) {
+                                        @field(out_ptr.*, fname) = .{};
+                                        continue;
+                                    }
+                                    const ftype = st.field_types[fi];
+                                    const wire_key = comptime structFieldWireNameAt(T, fi, fname);
+                                    const prop_ref = try getProp(module.CallError!Ref(module.Any), obj_arg, wire_key);
+                                    defer prop_ref.deinit();
+                                    if (comptime (structFieldHasConstraintAt(T, fi, fname) and structFieldDisallowsNullAt(T, fi, fname))) {
+                                        if (prop_ref.isNull()) return error.TypeError;
+                                    }
+                                    @field(out_ptr.*, fname) = try fromJsRefAllocInner(ftype, alloc_arg, prop_ref, depth_arg + 1, anc_arg);
+                                    init_ptr[fi] = true;
+                                    if (!(try validateStructFieldConstraintAt(T, fi, fname, @field(out_ptr.*, fname)))) {
+                                        return error.TypeError;
+                                    }
+                                }
+                            }
+                        };
+                        if (comptime st.field_names.len > chunk_size) {
+                            try @call(.never_inline, DecodeChunk.decode, .{ allocator, obj, &out, &field_init, depth, next_anc });
+                        } else {
+                            try DecodeChunk.decode(allocator, obj, &out, &field_init, depth, next_anc);
+                        }
                     }
-                    @setEvalBranchQuota(st.field_names.len * st.field_names.len * 32 + 65_536);
-                    inline for (st.field_names, 0..) |fname, fi| {
-                        if (comptime module.isHiddenMetaField(fname)) {
-                            @field(out, fname) = .{};
-                            continue;
-                        }
-                        const ftype = st.field_types[fi];
-                        const wire_key = comptime structFieldWireNameAt(T, fi, fname);
-                        const prop_ref = try getProp(module.CallError!Ref(module.Any), obj, wire_key);
-                        defer prop_ref.deinit();
-                        if (comptime (structFieldHasConstraintAt(T, fi, fname) and structFieldDisallowsNullAt(T, fi, fname))) {
-                            if (prop_ref.isNull()) return error.TypeError;
-                        }
-                        @field(out, fname) = try fromJsRefAllocInner(ftype, allocator, prop_ref, depth + 1, next_anc);
-                        field_init[fi] = true;
-                        if (!(try validateStructFieldConstraintAt(T, fi, fname, @field(out, fname)))) {
-                            return error.TypeError;
-                        }
-                    }
+                    decode_ok = true;
                     return out;
                 },
                 .@"enum" => |en_info| {
