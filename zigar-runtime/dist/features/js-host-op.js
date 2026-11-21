@@ -1,8 +1,119 @@
-import { VisitorFlag, PosixError, StructureType, StructurePurpose, MemberType, PointerFlag, SliceFlag, ArrayFlag } from '../constants.js';
+import { VisitorFlag, PosixError, StructureType, StructurePurpose, MemberType, PointerFlag, SliceFlag, ArrayFlag, ArgStructFlag, MemberFlag } from '../constants.js';
 import { mixin } from '../environment.js';
 import { NotInErrorSet, isErrorJSON } from '../errors.js';
 import { ZIG, MEMORY, VISIT, FALLBACK, THROWING, RETURN, ALLOCATOR, RESTORE, SLOTS, VIVIFICATE, CLASS } from '../symbols.js';
 import { decodeText, isPromise, hasJsValue, encodeText, clearView } from '../utils.js';
+
+function isImplicitOptionMember(member) {
+  if (member.structure?.type !== StructureType.Struct) {
+    return false;
+  }
+  switch (member.structure.purpose) {
+    case StructurePurpose.Allocator:
+    case StructurePurpose.Promise:
+    case StructurePurpose.Generator:
+    case StructurePurpose.AbortSignal:
+      return true;
+    default:
+      return false;
+  }
+}
+
+function isAllOptionalStructMember(member) {
+  if (member.structure?.type !== StructureType.Struct || isImplicitOptionMember(member)) {
+    return false;
+  }
+  const structMembers = member.structure.instance?.members;
+  if (!structMembers) {
+    return false;
+  }
+  for (const field of structMembers) {
+    if (field.flags & MemberFlag.IsRequired) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function computeCallbackParamSpec(argStructStructure, passThis) {
+  const rawArgLength = argStructStructure.length ?? 0;
+  const expectedArgs = passThis ? Math.max(0, rawArgLength - 1) : rawArgLength;
+  const variadic = argStructStructure.type === StructureType.VariadicStruct;
+  const hasOptions = Boolean(argStructStructure.flags & ArgStructFlag.HasOptions);
+  const argMembers = argStructStructure.instance?.members?.slice(1) ?? [];
+  const lastArgOptional = expectedArgs > 0
+    && argMembers.length > 0
+    && isAllOptionalStructMember(argMembers[argMembers.length - 1]);
+  const positionalMembers = argMembers.filter((m) => !isImplicitOptionMember(m));
+  const jsMembers = passThis ? positionalMembers.slice(1) : positionalMembers;
+  // 0 = required (let ArgStruct validate), 1 = fill `undefined` (Void / JsValue), 2 = fill `{}` (all-optional struct)
+  const slotFill = new Uint8Array(expectedArgs);
+  for (let i = 0; i < expectedArgs; i++) {
+    const m = jsMembers[i];
+    if (!m) {
+      break;
+    }
+    if (m.type === MemberType.Void || m.structure?.purpose === StructurePurpose.JsValue) {
+      slotFill[i] = 1;
+    } else if (isAllOptionalStructMember(m)) {
+      slotFill[i] = 2;
+    }
+  }
+  return { expectedArgs, variadic, hasOptions, lastArgOptional, slotFill };
+}
+
+function isZigarCallbackOptions(opt) {
+  if (opt === null || typeof(opt) !== 'object') {
+    return false;
+  }
+  const { allocator, allocator1, signal, callback } = opt;
+  if (allocator === undefined && allocator1 === undefined && signal === undefined && callback === undefined) {
+    return false;
+  }
+  if (signal !== undefined && typeof(signal?.addEventListener) !== 'function') {
+    return false;
+  }
+  if (callback !== undefined && typeof(callback) !== 'function') {
+    return false;
+  }
+  if (allocator !== undefined && (allocator === null || typeof(allocator) !== 'object')) {
+    return false;
+  }
+  if (allocator1 !== undefined && (allocator1 === null || typeof(allocator1) !== 'object')) {
+    return false;
+  }
+  return true;
+}
+
+function normalizeZigCallbackArgs(args, template) {
+  const { expectedArgs, variadic, hasOptions, lastArgOptional, slotFill } = template;
+  const len = args.length;
+  if (len === expectedArgs) {
+    return args;
+  }
+  if (len > expectedArgs) {
+    if (variadic) {
+      return args;
+    }
+    if (hasOptions && isZigarCallbackOptions(args[expectedArgs])) {
+      return len === expectedArgs + 1 ? args : args.slice(0, expectedArgs + 1);
+    }
+    return args.slice(0, expectedArgs);
+  }
+  if (len === expectedArgs - 1 && lastArgOptional) {
+    return args;
+  }
+  for (let i = len; i < expectedArgs; i++) {
+    if (slotFill[i] === 0) {
+      return args;
+    }
+  }
+  const padded = args.slice();
+  for (let i = len; i < expectedArgs; i++) {
+    padded.push(slotFill[i] === 2 ? {} : undefined);
+  }
+  return padded;
+}
 
 const NO_CAPTURED_ERROR_HANDLE = 7;
 
@@ -1585,6 +1696,8 @@ var jsHostOp = mixin({
     const thunkHolder = { [MEMORY]: thunkDV };
     const retvalStructure = unwrapPayloadStructure(argStructStructure.instance.members[0]?.structure);
     const unwrapString = isConstStringStructure(retvalStructure);
+    const passThis = Boolean(flags & 4);
+    const paramSpec = computeCallbackParamSpec(argStructStructure, passThis);
 
     template = {
       ArgStruct,
@@ -1594,8 +1707,9 @@ var jsHostOp = mixin({
       is64,
       sync: !(flags & 1),
       once: Boolean(flags & 2),
-      passThis: Boolean(flags & 4),
+      passThis,
       stateless: Boolean(flags & 16),
+      ...paramSpec,
     };
     this.zigCallbackTemplateCache.set(descriptorAddr, template);
     return template;
@@ -1652,6 +1766,7 @@ var jsHostOp = mixin({
           const thisEnv = this;
           const unwrapString = template.unwrapString;
           const passThis = template.passThis;
+          const expectedArgs = template.expectedArgs;
           const unwrapResult = (res) => {
             if (unwrapString && res && typeof(res) === 'object' && MEMORY in res) {
               if (typeof(res.string) === 'string') {
@@ -1667,7 +1782,8 @@ var jsHostOp = mixin({
           statelessWrapper = function(...args) {
             const savedOuterPending = thisEnv.savePendingHostError();
             try {
-              const res = passThis ? caller(this, ...args) : caller(...args);
+              const callArgs = normalizeZigCallbackArgs(args, template);
+              const res = passThis ? caller(this, ...callArgs) : caller(...callArgs);
               const pending = thisEnv.consumePendingHostError();
               if (pending) {
                 throw pending.error;
@@ -1682,6 +1798,7 @@ var jsHostOp = mixin({
               }
             }
           };
+          Object.defineProperty(statelessWrapper, 'length', { value: expectedArgs, configurable: true });
           this.zigStatelessCallbackCache.set(cacheKey, statelessWrapper);
         }
         return this.allocJsValue(statelessWrapper);
@@ -1698,6 +1815,7 @@ var jsHostOp = mixin({
       const unwrapString = template.unwrapString;
       const isOnce = template.once;
       const passThis = template.passThis;
+      const expectedArgs = template.expectedArgs;
       const unwrapResult = (res) => {
         if (unwrapString && res && typeof(res) === 'object' && MEMORY in res) {
           if (typeof(res.string) === 'string') {
@@ -1726,7 +1844,8 @@ var jsHostOp = mixin({
         const savedOuterPending = thisEnv.savePendingHostError();
         let asyncResult = false;
         try {
-          const res = passThis ? caller(this, ...args) : caller(...args);
+          const callArgs = normalizeZigCallbackArgs(args, template);
+          const res = passThis ? caller(this, ...callArgs) : caller(...callArgs);
           const pending = thisEnv.consumePendingHostError();
           if (pending) {
             throw pending.error;
@@ -1751,6 +1870,7 @@ var jsHostOp = mixin({
           }
         }
       };
+      Object.defineProperty(wrapper, 'length', { value: expectedArgs, configurable: true });
       const handle = this.allocJsValue(wrapper);
       state.handle = handle;
       this.zigCallbackMap.set(id, state);

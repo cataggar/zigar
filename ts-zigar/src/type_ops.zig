@@ -62,6 +62,7 @@ pub const UnaryTypeOp = enum {
     non_nullable,
     awaited,
     keyof,
+    infer_callback_promise_payload,
 
     pub fn runtimeHelperName(self: UnaryTypeOp) []const u8 {
         return switch (self) {
@@ -71,6 +72,7 @@ pub const UnaryTypeOp = enum {
             .non_nullable => "NonNullable",
             .awaited => "Awaited",
             .keyof => "KeyOf",
+            .infer_callback_promise_payload => "InferCallbackPromisePayload",
         };
     }
 };
@@ -182,12 +184,27 @@ pub fn recognizeOpenMappedPattern(
 }
 
 /// Inspects an open `conditional_type_data` node (`Check extends Extends ? True : False`)
-/// for canonical TypeScript type-level idioms (`NonNullable<T>`, `Awaited<T>`).
+/// for canonical TypeScript type-level idioms (`NonNullable<T>`, `Awaited<T>`, `IfEventMap`,
+/// guarded indexed access `K extends keyof Obj ? Obj[K] : Fallback`, and `PipelineResult<S>`).
 pub const OpenConditionalPattern = union(enum) {
     /// `T extends null | undefined ? never : T` or `T extends {} ? T : never`
     non_nullable: u32,
     /// `T extends Promise<infer U> ? U : T` or `T extends PromiseLike<infer U> ? U : T`
     awaited: u32,
+    /// `{} extends Target ? True : False` (e.g. Node `IfEventMap<Events, True, False>`)
+    empty_object_extends: struct {
+        target_ty: u32,
+        true_ty: u32,
+        false_ty: u32,
+    },
+    /// `K extends keyof Obj ? Obj[K] : Fallback` (e.g. Node `Args<T, E>` / `Listener<T, E>`)
+    conditional_index_access: struct {
+        object_ty: u32,
+        key_ty: u32,
+        fallback_ty: u32,
+    },
+    /// `S extends (...args: any[]) => PromiseLike<infer R> ? Promise<R> : Promise<void>` (`PipelineResult<S>`)
+    conditional_promise_return: u32,
     /// Uninstantiated general conditional type.
     dynamic_any,
 };
@@ -236,10 +253,101 @@ pub fn recognizeOpenConditionalPattern(
         }
     }
 
+    // Pattern 4: `{} extends Target ? True : False` (`IfEventMap<Events, True, False>`)
+    if (isEmptyNonNullishObjectConstraint(graph, cond.check_type) and
+        cond.extends_type < graph.types.len)
+    {
+        const ext_k = graph.types[cond.extends_type].kind;
+        if (ext_k == .type_param or (@hasField(@TypeOf(ext_k), "reference") and ext_k == .reference)) {
+            return .{ .empty_object_extends = .{
+                .target_ty = cond.extends_type,
+                .true_ty = cond.true_type,
+                .false_ty = cond.false_type,
+            } };
+        }
+    }
+
+    // Pattern 5: `K extends keyof Obj ? Obj[K] : Fallback`
+    if (cond.extends_type < graph.types.len and cond.true_type < graph.types.len) {
+        const ext_k = graph.types[cond.extends_type].kind;
+        const true_k = graph.types[cond.true_type].kind;
+        if (@hasField(@TypeOf(ext_k), "keyof_type") and ext_k == .keyof_type and
+            @hasField(@TypeOf(true_k), "indexed_access") and true_k == .indexed_access)
+        {
+            const ia = true_k.indexed_access;
+            if (sameTypeNodeOrTypeParam(graph, ia.object_ty, ext_k.keyof_type) and
+                sameTypeNodeOrTypeParam(graph, ia.index_ty, cond.check_type))
+            {
+                return .{ .conditional_index_access = .{
+                    .object_ty = ia.object_ty,
+                    .key_ty = ia.index_ty,
+                    .fallback_ty = cond.false_type,
+                } };
+            }
+        }
+    }
+
+    // Pattern 6: `S extends (...args: any[]) => PromiseLike<infer R> ? Promise<R> : Promise<void>` (`PipelineResult<S>`)
+    if (@hasField(@TypeOf(cond), "infer_params") and cond.infer_params.len == 1 and
+        cond.extends_type < graph.types.len)
+    {
+        const infer_tp_id = cond.infer_params[0];
+        const ext_k = graph.types[cond.extends_type].kind;
+        if (@hasField(@TypeOf(ext_k), "function_type") and ext_k == .function_type and
+            @hasField(@TypeOf(graph), "signatures") and ext_k.function_type < graph.signatures.len)
+        {
+            const ext_sig = graph.signatures[ext_k.function_type];
+            const ext_ret_arg = unwrapPromiseLikeArg(graph, ext_sig.return_type);
+            const true_prom_arg = unwrapExactPromiseArg(graph, cond.true_type);
+            const false_prom_arg = unwrapExactPromiseArg(graph, cond.false_type);
+            if (ext_ret_arg != null and true_prom_arg != null and false_prom_arg != null and
+                typeNodeMatchesTypeParam(graph, ext_ret_arg.?, infer_tp_id) and
+                typeNodeMatchesTypeParam(graph, true_prom_arg.?, infer_tp_id) and
+                false_prom_arg.? < graph.types.len and graph.types[false_prom_arg.?].kind == .void_type)
+            {
+                return .{ .conditional_promise_return = cond.check_type };
+            }
+        }
+    }
+
     return .dynamic_any;
 }
 
-fn typeNodeMatchesTypeParam(graph: anytype, tid: u32, tp_id: u32) bool {
+fn unwrapPromiseLikeArg(graph: anytype, tid: u32) ?u32 {
+    if (tid >= graph.types.len) return null;
+    const k = graph.types[tid].kind;
+    if (@hasField(@TypeOf(k), "reference") and k == .reference and
+        @hasField(@TypeOf(graph), "strings"))
+    {
+        const r = k.reference;
+        if (r.type_args.len == 1 and r.target_name < graph.strings.len) {
+            const tname = graph.strings[r.target_name];
+            if (std.mem.eql(u8, tname, "Promise") or std.mem.eql(u8, tname, "PromiseLike")) {
+                return r.type_args[0];
+            }
+        }
+    }
+    return null;
+}
+
+fn unwrapExactPromiseArg(graph: anytype, tid: u32) ?u32 {
+    if (tid >= graph.types.len) return null;
+    const k = graph.types[tid].kind;
+    if (@hasField(@TypeOf(k), "reference") and k == .reference and
+        @hasField(@TypeOf(graph), "strings"))
+    {
+        const r = k.reference;
+        if (r.type_args.len == 1 and r.target_name < graph.strings.len) {
+            const tname = graph.strings[r.target_name];
+            if (std.mem.eql(u8, tname, "Promise")) {
+                return r.type_args[0];
+            }
+        }
+    }
+    return null;
+}
+
+pub fn typeNodeMatchesTypeParam(graph: anytype, tid: u32, tp_id: u32) bool {
     if (tid >= graph.types.len) return false;
     const k = graph.types[tid].kind;
     if (k == .type_param) return k.type_param == tp_id;
