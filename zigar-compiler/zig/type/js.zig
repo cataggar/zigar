@@ -2854,6 +2854,230 @@ pub fn IndexAccess(comptime T: type, comptime keys_spec: anytype) type {
     return IndexAccessWithFallback(Any, T, keys_spec);
 }
 
+pub fn tryConstructorInstanceType(comptime CtorT: type) ?type {
+    if (CtorT == noreturn or @typeInfo(CtorT) != .@"struct") return null;
+    if (@hasDecl(CtorT, "Instance") and @TypeOf(CtorT.Instance) == type) {
+        return CtorT.Instance;
+    }
+    if (@hasDecl(CtorT, "zigar_js") and @hasField(@TypeOf(CtorT.zigar_js), "is_callable_handle") and CtorT.zigar_js.is_callable_handle) {
+        if (@hasDecl(CtorT, "prototype") and @typeInfo(@TypeOf(CtorT.prototype)) == .@"fn") {
+            const pfni = @typeInfo(@TypeOf(CtorT.prototype)).@"fn";
+            if (pfni.param_types.len == 1 and pfni.return_type != null) {
+                const rt = pfni.return_type.?;
+                return if (@typeInfo(rt) == .error_union) @typeInfo(rt).error_union.payload else rt;
+            }
+        }
+        if (@hasDecl(CtorT, "construct") and @typeInfo(@TypeOf(CtorT.construct)) == .@"fn") {
+            const cfni = @typeInfo(@TypeOf(CtorT.construct)).@"fn";
+            if (cfni.return_type != null) {
+                const rt = cfni.return_type.?;
+                return if (@typeInfo(rt) == .error_union) @typeInfo(rt).error_union.payload else rt;
+            }
+        }
+    }
+    return null;
+}
+
+pub fn InstanceTypeWithFallback(comptime FallbackAny: type, comptime CtorT: type) type {
+    if (CtorT == noreturn) return noreturn;
+    if (@typeInfo(CtorT) == .@"union" and @typeInfo(CtorT).@"union".tag_type != null and !isModuleNullableType(CtorT)) {
+        const un = @typeInfo(CtorT).@"union";
+        comptime var distinct: [un.field_types.len]type = undefined;
+        comptime var d_len: usize = 0;
+        for (un.field_types) |ft| {
+            const it = InstanceTypeWithFallback(FallbackAny, ft);
+            var seen = false;
+            for (distinct[0..d_len]) |prev| {
+                if (prev == it) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                distinct[d_len] = it;
+                d_len += 1;
+            }
+        }
+        return buildSynthesizedUnion(distinct[0..d_len]);
+    }
+    if (tryConstructorInstanceType(CtorT)) |inst| return inst;
+    return FallbackAny;
+}
+
+pub fn InstanceType(comptime CtorT: type) type {
+    return InstanceTypeWithFallback(Any, CtorT);
+}
+
+fn tupleFromFnParamsWithFallback(comptime FallbackAny: type, comptime fni: std.builtin.Type.Fn, comptime start: usize) type {
+    if (fni.param_types.len <= start) return @Tuple(&.{});
+    const n = fni.param_types.len - start;
+    comptime var ptypes: [n]type = undefined;
+    for (0..n) |i| {
+        ptypes[i] = fni.param_types[start + i] orelse FallbackAny;
+    }
+    const fin = ptypes;
+    return @Tuple(&fin);
+}
+
+pub fn ParametersWithFallback(comptime FallbackAny: type, comptime FnT: type) type {
+    if (FnT == noreturn) return noreturn;
+    if (@typeInfo(FnT) == .@"union" and @typeInfo(FnT).@"union".tag_type != null and !isModuleNullableType(FnT)) {
+        const un = @typeInfo(FnT).@"union";
+        comptime var distinct: [un.field_types.len]type = undefined;
+        comptime var d_len: usize = 0;
+        for (un.field_types) |ft| {
+            const pt = ParametersWithFallback(FallbackAny, ft);
+            var seen = false;
+            for (distinct[0..d_len]) |prev| {
+                if (prev == pt) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                distinct[d_len] = pt;
+                d_len += 1;
+            }
+        }
+        return buildSynthesizedUnion(distinct[0..d_len]);
+    }
+    switch (@typeInfo(FnT)) {
+        .@"fn" => |fni| return tupleFromFnParamsWithFallback(FallbackAny, fni, 0),
+        .pointer => |pt| if (pt.size == .one and @typeInfo(pt.child) == .@"fn") return ParametersWithFallback(FallbackAny, pt.child),
+        .@"struct" => {
+            if (@hasDecl(FnT, "is_zigar_variadic_callable") and FnT.is_zigar_variadic_callable and @hasDecl(FnT, "Signature")) {
+                const SigT = if (@TypeOf(FnT.Signature) == type) FnT.Signature else FnT.Signature();
+                const sfni = @typeInfo(SigT).@"fn";
+                return if (sfni.param_types.len == 1 and sfni.param_types[0] != null) sfni.param_types[0].? else []const FallbackAny;
+            }
+            if (@hasDecl(FnT, "FnType") and @TypeOf(FnT.FnType) == type and @typeInfo(FnT.FnType) == .@"fn") {
+                return ParametersWithFallback(FallbackAny, FnT.FnType);
+            }
+            if (@hasDecl(FnT, "Signature")) {
+                const SigT = if (@TypeOf(FnT.Signature) == type) FnT.Signature else FnT.Signature();
+                if (@typeInfo(SigT) == .@"fn") return ParametersWithFallback(FallbackAny, SigT);
+            }
+            if (@hasDecl(FnT, "zigar_js") and @hasField(@TypeOf(FnT.zigar_js), "is_callable_handle") and FnT.zigar_js.is_callable_handle and
+                @hasDecl(FnT, "call") and @typeInfo(@TypeOf(FnT.call)) == .@"fn")
+            {
+                const cfni = @typeInfo(@TypeOf(FnT.call)).@"fn";
+                const start: usize = if (cfni.param_types.len > 0 and cfni.param_types[0] == FnT) 1 else 0;
+                if (!(cfni.param_types.len - start == 1 and cfni.param_types[start] == null)) {
+                    return tupleFromFnParamsWithFallback(FallbackAny, cfni, start);
+                }
+            }
+        },
+        else => {},
+    }
+    return []const FallbackAny;
+}
+
+pub fn Parameters(comptime FnT: type) type {
+    return ParametersWithFallback(Any, FnT);
+}
+
+pub fn ReturnTypeWithFallback(comptime FallbackAny: type, comptime FnT: type) type {
+    if (FnT == noreturn) return noreturn;
+    if (@typeInfo(FnT) == .@"union" and @typeInfo(FnT).@"union".tag_type != null and !isModuleNullableType(FnT)) {
+        const un = @typeInfo(FnT).@"union";
+        comptime var distinct: [un.field_types.len]type = undefined;
+        comptime var d_len: usize = 0;
+        for (un.field_types) |ft| {
+            const rt = ReturnTypeWithFallback(FallbackAny, ft);
+            var seen = false;
+            for (distinct[0..d_len]) |prev| {
+                if (prev == rt) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                distinct[d_len] = rt;
+                d_len += 1;
+            }
+        }
+        return buildSynthesizedUnion(distinct[0..d_len]);
+    }
+    switch (@typeInfo(FnT)) {
+        .@"fn" => |fni| {
+            const rt = fni.return_type orelse return void;
+            return if (@typeInfo(rt) == .error_union) @typeInfo(rt).error_union.payload else rt;
+        },
+        .pointer => |pt| if (pt.size == .one and @typeInfo(pt.child) == .@"fn") return ReturnTypeWithFallback(FallbackAny, pt.child),
+        .@"struct" => {
+            if (@hasDecl(FnT, "ReturnPayload")) {
+                return if (@TypeOf(FnT.ReturnPayload) == type) FnT.ReturnPayload else FnT.ReturnPayload();
+            }
+            if (@hasDecl(FnT, "FnType") and @TypeOf(FnT.FnType) == type and @typeInfo(FnT.FnType) == .@"fn") {
+                return ReturnTypeWithFallback(FallbackAny, FnT.FnType);
+            }
+            if (@hasDecl(FnT, "Signature")) {
+                const SigT = if (@TypeOf(FnT.Signature) == type) FnT.Signature else FnT.Signature();
+                if (@typeInfo(SigT) == .@"fn") return ReturnTypeWithFallback(FallbackAny, SigT);
+            }
+            if (@hasDecl(FnT, "zigar_js") and @hasField(@TypeOf(FnT.zigar_js), "is_callable_handle") and FnT.zigar_js.is_callable_handle and
+                @hasDecl(FnT, "call") and @typeInfo(@TypeOf(FnT.call)) == .@"fn")
+            {
+                const rt = @typeInfo(@TypeOf(FnT.call)).@"fn".return_type orelse return void;
+                return if (@typeInfo(rt) == .error_union) @typeInfo(rt).error_union.payload else rt;
+            }
+        },
+        else => {},
+    }
+    return FallbackAny;
+}
+
+pub fn ReturnType(comptime FnT: type) type {
+    return ReturnTypeWithFallback(Any, FnT);
+}
+
+pub fn ConstructorParametersWithFallback(comptime FallbackAny: type, comptime CtorT: type) type {
+    if (CtorT == noreturn) return noreturn;
+    if (@typeInfo(CtorT) == .@"union" and @typeInfo(CtorT).@"union".tag_type != null and !isModuleNullableType(CtorT)) {
+        const un = @typeInfo(CtorT).@"union";
+        comptime var distinct: [un.field_types.len]type = undefined;
+        comptime var d_len: usize = 0;
+        for (un.field_types) |ft| {
+            const cp = ConstructorParametersWithFallback(FallbackAny, ft);
+            var seen = false;
+            for (distinct[0..d_len]) |prev| {
+                if (prev == cp) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                distinct[d_len] = cp;
+                d_len += 1;
+            }
+        }
+        return buildSynthesizedUnion(distinct[0..d_len]);
+    }
+    if (@typeInfo(CtorT) == .@"struct") {
+        if (@hasDecl(CtorT, "Instance") and @TypeOf(CtorT.Instance) == type) {
+            const InstT = CtorT.Instance;
+            if (@typeInfo(InstT) == .@"struct" and @hasDecl(InstT, "init") and @typeInfo(@TypeOf(InstT.init)) == .@"fn") {
+                const ifni = @typeInfo(@TypeOf(InstT.init)).@"fn";
+                if (!(ifni.param_types.len == 1 and ifni.param_types[0] == null)) {
+                    return tupleFromFnParamsWithFallback(FallbackAny, ifni, 0);
+                }
+            }
+        }
+        if (@hasDecl(CtorT, "construct") and @typeInfo(@TypeOf(CtorT.construct)) == .@"fn") {
+            const cfni = @typeInfo(@TypeOf(CtorT.construct)).@"fn";
+            const start: usize = if (cfni.param_types.len > 0 and cfni.param_types[0] == CtorT) 1 else 0;
+            if (!(cfni.param_types.len - start == 1 and cfni.param_types[start] == null)) {
+                return tupleFromFnParamsWithFallback(FallbackAny, cfni, start);
+            }
+        }
+    }
+    return []const FallbackAny;
+}
+
+pub fn ConstructorParameters(comptime CtorT: type) type {
+    return ConstructorParametersWithFallback(Any, CtorT);
+}
+
 /// Normalizes a caller value argument type `Arg` (`@TypeOf(arg)`) into a runtime-representable
 /// Zig parameter type for generic `<fn>Infer` deduction (`"hi"` -> `[]const u8`, `42` -> `f64`,
 /// `&[_]T{...}` -> `[]const T`).
@@ -3319,6 +3543,15 @@ pub fn satisfiesTypeConstraint(comptime T: type, comptime Constraint: type, comp
         return isJsSymbolConstraintMarker(T);
     }
 
+    // `T extends typeof SomeClass` / constructor constraint: verify instance compatibility!
+    if (comptime (tryConstructorInstanceType(Constraint) != null and !(@typeInfo(Constraint) == .@"struct" and @hasDecl(Constraint, "call")))) {
+        const ConstraintInst = comptime tryConstructorInstanceType(Constraint).?;
+        if (comptime tryConstructorInstanceType(T)) |ActualInst| {
+            return satisfiesTypeConstraint(ActualInst, ConstraintInst, depth + 1);
+        }
+        return isJsFunctionConstraintMarker(T);
+    }
+
     // `T extends Function` / callback signature constraint
     if (comptime (isJsFunctionConstraintMarker(Constraint) or
         isCallbackWrapper(Constraint) or
@@ -3590,8 +3823,8 @@ pub fn satisfiesTypeConstraint(comptime T: type, comptime Constraint: type, comp
                 }
                 break :blk structProvidesMember(T, "then");
             }
-            // Tuple constraint (`zigar_js_tuple`): check fixed array or tuple struct.
-            if (comptime @hasDecl(Constraint, "zigar_js_tuple")) {
+            // Tuple constraint (`zigar_js_tuple` or `@Tuple`): check fixed array or tuple struct.
+            if (comptime (@typeInfo(Constraint).@"struct".is_tuple or @hasDecl(Constraint, "zigar_js_tuple"))) {
                 if (@typeInfo(T) != .@"struct" and @typeInfo(T) != .array) break :blk false;
                 break :blk true;
             }
@@ -3981,6 +4214,18 @@ pub fn Js(comptime host: type) type {
         pub const Awaited = module.Awaited;
         pub const InferCallbackPromisePayload = module.InferCallbackPromisePayload;
         pub const KeyOf = module.KeyOf;
+        pub fn InstanceType(comptime CtorT: type) type {
+            return module.InstanceTypeWithFallback(Ref(module.Any), CtorT);
+        }
+        pub fn Parameters(comptime FnT: type) type {
+            return module.ParametersWithFallback(Ref(module.Any), FnT);
+        }
+        pub fn ReturnType(comptime FnT: type) type {
+            return module.ReturnTypeWithFallback(Ref(module.Any), FnT);
+        }
+        pub fn ConstructorParameters(comptime CtorT: type) type {
+            return module.ConstructorParametersWithFallback(Ref(module.Any), CtorT);
+        }
         pub const IndexAccessWithFallback = module.IndexAccessWithFallback;
         pub fn IndexAccess(comptime T: type, comptime keys_spec: anytype) type {
             return module.IndexAccessWithFallback(Ref(module.Any), T, keys_spec);
@@ -9338,7 +9583,7 @@ pub fn Js(comptime host: type) type {
         }
 
         pub fn isTupleStructType(comptime T: type) bool {
-            return @typeInfo(T) == .@"struct" and util.getInternalType(T) == null and @hasDecl(T, "zigar_js_tuple");
+            return @typeInfo(T) == .@"struct" and util.getInternalType(T) == null and (@typeInfo(T).@"struct".is_tuple or @hasDecl(T, "zigar_js_tuple"));
         }
 
         fn seenContainsType(comptime seen: anytype, comptime T: type) bool {
@@ -9459,31 +9704,35 @@ pub fn Js(comptime host: type) type {
         }
 
         fn tupleFieldIsOptional(comptime T: type, comptime idx: usize) bool {
-            const meta = T.zigar_js_tuple;
-            if (@hasField(@TypeOf(meta), "variadic_index")) {
-                if (meta.variadic_index) |vi| {
-                    if (idx == vi) return false;
+            if (@hasDecl(T, "zigar_js_tuple")) {
+                const meta = T.zigar_js_tuple;
+                if (@hasField(@TypeOf(meta), "variadic_index")) {
+                    if (meta.variadic_index) |vi| {
+                        if (idx == vi) return false;
+                    }
                 }
-            }
-            if (@hasField(@TypeOf(meta), "fields")) {
-                if (idx < meta.fields.len) {
-                    const fm = meta.fields[idx];
-                    if (@hasField(@TypeOf(fm), "is_optional")) return fm.is_optional;
+                if (@hasField(@TypeOf(meta), "fields")) {
+                    if (idx < meta.fields.len) {
+                        const fm = meta.fields[idx];
+                        if (@hasField(@TypeOf(fm), "is_optional")) return fm.is_optional;
+                    }
+                    return false;
                 }
-                return false;
-            }
-            if (@hasField(@TypeOf(meta), "optional_mask") and idx < 64) {
-                return ((meta.optional_mask >> @intCast(idx)) & 1) != 0;
+                if (@hasField(@TypeOf(meta), "optional_mask") and idx < 64) {
+                    return ((meta.optional_mask >> @intCast(idx)) & 1) != 0;
+                }
             }
             const st = @typeInfo(T).@"struct";
             return st.field_attrs[idx].default_value_ptr != null and @typeInfo(st.field_types[idx]) == .optional;
         }
 
         fn tupleFieldNullishKind(comptime T: type, comptime idx: usize) module.NullishKind {
-            const meta = T.zigar_js_tuple;
-            if (@hasField(@TypeOf(meta), "null_only_mask") and idx < 64) {
-                if (((meta.null_only_mask >> @intCast(idx)) & 1) != 0) {
-                    return .null_only;
+            if (@hasDecl(T, "zigar_js_tuple")) {
+                const meta = T.zigar_js_tuple;
+                if (@hasField(@TypeOf(meta), "null_only_mask") and idx < 64) {
+                    if (((meta.null_only_mask >> @intCast(idx)) & 1) != 0) {
+                        return .null_only;
+                    }
                 }
             }
             if (tupleFieldIsOptional(T, idx)) return .undefined_only;
@@ -10533,7 +10782,7 @@ pub fn Js(comptime host: type) type {
                 },
                 .@"struct" => |st| {
                     if (comptime isTupleStructType(T)) {
-                        const meta = T.zigar_js_tuple;
+                        const meta = if (@hasDecl(T, "zigar_js_tuple")) T.zigar_js_tuple else .{};
                         const var_idx_opt: ?usize = if (@hasField(@TypeOf(meta), "variadic_index")) meta.variadic_index else null;
                         const has_tuple_override = comptime (@typeInfo(@TypeOf(spec)) == .@"struct" and @hasField(@TypeOf(spec), "tuple"));
                         const js_arr = try Array(Ref(module.Any)).init();
@@ -11163,7 +11412,7 @@ pub fn Js(comptime host: type) type {
                         const next_anc = try advanceDecodeCycle(T, raw, ancestor);
                         const arr = Array(Ref(module.Any)).fromRef(raw);
                         const arr_len = try arr.len();
-                        const meta = T.zigar_js_tuple;
+                        const meta = if (@hasDecl(T, "zigar_js_tuple")) T.zigar_js_tuple else .{};
                         const var_idx_opt: ?usize = if (@hasField(@TypeOf(meta), "variadic_index")) meta.variadic_index else null;
 
                         var out: T = undefined;
@@ -15608,6 +15857,94 @@ test "Js.String, Nullable(T), needsDecodeAllocator, and tuple/slice marshaling h
         try expect(!js.satisfiesTypeConstraint(SubKindBad, SuperKind, 0));
         try expect(js.satisfiesTypeConstraint(void, ?[]const u8, 0));
         try expect(!js.satisfiesTypeConstraint(i32, ?[]const u8, 0));
+
+        // Issue #57: ConstructorOf, InstanceType/Parameters/ReturnType/ConstructorParameters,
+        // constructor constraints, Date/RegExp wrappers, and @Tuple codecs
+        const BaseServer = struct {
+            __zigar_ref: js.Ref(js.Object),
+            pub fn init(opts: ?bool) js.CallError!@This() {
+                _ = opts;
+                return .{ .__zigar_ref = .{ .handle = MarshalingMockHost.allocVal(.{ .num = 1 }) } };
+            }
+            pub fn listen(self: @This()) void {
+                _ = self;
+            }
+            pub const zigar_js = .{
+                .js_name = "BaseServer",
+                .is_handle = true,
+                .is_class = true,
+                .methods = .{.{ .name = "listen", .js_name = "listen", .is_static = false }},
+            };
+        };
+        const SubServer = struct {
+            __zigar_ref: js.Ref(js.Object),
+            pub fn baseServer(self: @This()) BaseServer {
+                return .{ .__zigar_ref = self.__zigar_ref.clone() };
+            }
+            pub fn init(port: f64, host: ?[]const u8) js.CallError!@This() {
+                _ = port;
+                _ = host;
+                return .{ .__zigar_ref = .{ .handle = MarshalingMockHost.allocVal(.{ .num = 2 }) } };
+            }
+            pub const zigar_js = .{ .js_name = "SubServer", .is_handle = true, .is_class = true, .bases = .{BaseServer} };
+        };
+        const OtherClass = struct {
+            __zigar_ref: js.Ref(js.Object),
+            pub fn init() js.CallError!@This() {
+                return .{ .__zigar_ref = .{ .handle = MarshalingMockHost.allocVal(.{ .num = 3 }) } };
+            }
+            pub const zigar_js = .{ .js_name = "OtherClass", .is_handle = true, .is_class = true };
+        };
+        const PlainDict = struct {
+            port: f64 = 80,
+            pub const zigar_js = .{ .js_name = "PlainDict", .is_class = false, .fields = .{.{ .name = "port", .js_name = "port", .is_optional = false, .nullish = .none }} };
+        };
+        const BaseCtor = struct {
+            __zigar_ref: js.Ref(js.Object),
+            pub const Instance = BaseServer;
+            pub const zigar_js = .{ .js_name = "typeof BaseServer", .is_class = true };
+        };
+        const SubCtor = struct {
+            __zigar_ref: js.Ref(js.Object),
+            pub const Instance = SubServer;
+            pub const zigar_js = .{ .js_name = "typeof SubServer", .is_class = true };
+        };
+        const OtherCtor = struct {
+            __zigar_ref: js.Ref(js.Object),
+            pub const Instance = OtherClass;
+            pub const zigar_js = .{ .js_name = "typeof OtherClass", .is_class = true };
+        };
+        try expect(js.InstanceType(BaseCtor) == BaseServer);
+        try expect(js.InstanceType(SubCtor) == SubServer);
+        try expect(js.ConstructorParameters(SubCtor) == @Tuple(&.{ f64, ?[]const u8 }));
+        try expect(js.Parameters(fn ([]const u8, i32) js.CallError!bool) == @Tuple(&.{ []const u8, i32 }));
+        try expect(js.ReturnType(fn ([]const u8, i32) js.CallError!bool) == bool);
+        try expect(js.satisfiesTypeConstraint(SubCtor, BaseCtor, 0));
+        try expect(js.satisfiesTypeConstraint(SubServer, BaseServer, 0));
+        try expect(!js.satisfiesTypeConstraint(SubServer, BaseCtor, 0));
+        try expect(!js.satisfiesTypeConstraint(OtherCtor, BaseCtor, 0));
+        try expect(!js.satisfiesTypeConstraint(PlainDict, BaseCtor, 0));
+
+        // Date and RegExp nominal handles
+        const date_val = js.Date.fromRef(js.Ref(js.Any){ .handle = MarshalingMockHost.allocVal(.{ .num = 1700000000000 }) });
+        defer date_val.deinit();
+        const re_val = js.RegExp.fromRef(js.Ref(js.Any){ .handle = MarshalingMockHost.allocVal(.{ .num = 42 }) });
+        defer re_val.deinit();
+
+        // @Tuple codec roundtrip + arity validation
+        const Tup = @Tuple(&.{ []const u8, f64, bool });
+        const raw_tup = try js.toJsRef(Tup, .{ "http-ok", 200.0, true });
+        defer raw_tup.deinit();
+        const decoded_tup = try js.fromJsRefAlloc(Tup, std.testing.allocator, raw_tup);
+        defer js.freeDecoded(Tup, std.testing.allocator, decoded_tup);
+        try std.testing.expectEqualStrings("http-ok", decoded_tup[0]);
+        try expectEqual(@as(f64, 200.0), decoded_tup[1]);
+        try expectEqual(true, decoded_tup[2]);
+
+        const ShortTup = @Tuple(&.{ []const u8, f64 });
+        const short_raw = try js.toJsRef(ShortTup, .{ "short", 1.0 });
+        defer short_raw.deinit();
+        try std.testing.expectError(error.TypeError, js.fromJsRefAlloc(Tup, std.testing.allocator, short_raw));
     }
     try expectEqual(@as(u32, 0), js.activeHandleCount());
 }
