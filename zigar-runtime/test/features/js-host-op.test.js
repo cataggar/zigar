@@ -1905,10 +1905,145 @@ describe('Feature: js-host-op', function() {
     }
     const thisCbHandle = env.createZigCallback(harness.addrOf(thisDescOff), 3);
     const thisCbFn = env.getJsValue(thisCbHandle);
+    expect(thisCbFn.length).to.equal(1);
     expect(thisCbFn.call(100, 23)).to.equal(123);
+    // Excess trailing JS arguments (e.g. Array.map index/array or stream.pipeline options) are ignored
+    expect(thisCbFn.call(100, 23, 'ignored-extra', { signal: null })).to.equal(123);
     env.releaseZigCallback(3);
     expect(env.getActiveZigCallbackCount()).to.equal(0);
     expect(env.getJsValueCount()).to.equal(0);
+
+    // 5. Real `ArgStruct` outbound caller: trailing all-optional struct + `HasOptions` AbortSignal preservation
+    {
+      const env2 = new Env();
+      env2.littleEndian = true;
+      const h2 = createMemoryHarness(env2);
+      const s2 = defineHostOpStructures(env2, h2.is64);
+      if (process.env.TARGET === 'wasm') {
+        env2.runThunk = () => true;
+      }
+
+      // 5a. Trailing all-optional struct (`fn(a: i32, opts: struct { bonus: i32 = 7 }) i32`)
+      const optStruct = {
+        type: StructureType.Struct,
+        name: 'CallbackOpts',
+        byteSize: 4,
+        align: 4,
+        flags: StructureFlag.HasValue,
+        signature: 5040n,
+        instance: {
+          members: [
+            { name: 'bonus', type: MemberType.Int, bitSize: 32, bitOffset: 0, byteSize: 4, structure: s2.i32 },
+          ],
+          template: (() => {
+            const dv = new DataView(new ArrayBuffer(4));
+            dv.setInt32(0, 7, true);
+            return { [MEMORY]: dv };
+          })(),
+        },
+        static: {},
+      };
+      env2.beginStructure(optStruct);
+      env2.finishStructure(optStruct);
+      s2.makeArgStruct(504n, s2.i32, [ s2.i32, optStruct ]);
+
+      const optDescOff = 0x590;
+      const optDescDV = h2.viewAt(optDescOff, 16 + 3 * h2.ptrSize);
+      optDescDV.setBigUint64(0, 504n, true);
+      optDescDV.setUint32(8, 0, true);
+      optDescDV.setUint32(12, 0, true);
+      if (h2.is64) {
+        optDescDV.setBigUint64(16, 0x9300n, true);
+      } else {
+        optDescDV.setUint32(16, 0x9300, true);
+      }
+      env2.invokeThunk = (_thunk, _fnHolder, argsHolder) => {
+        argsHolder.retval = argsHolder[0] + argsHolder[1].bonus;
+        return argsHolder.retval;
+      };
+      const optCbHandle = env2.createZigCallback(h2.addrOf(optDescOff), 4);
+      const optCbFn = env2.getJsValue(optCbHandle);
+      expect(optCbFn(10)).to.equal(17);
+      expect(optCbFn(10, { bonus: 20 }, 'extra-ignored')).to.equal(30);
+      expect(() => optCbFn()).to.throw(/Expecting 2 arguments, received 0/);
+      env2.releaseZigCallback(4);
+
+      // 5b. `HasOptions` (`AbortSignal`) callback preserves real `{ signal }` options and ignores non-options objects
+      const int32Ptr = {
+        type: StructureType.Pointer,
+        name: '*const i32',
+        byteSize: h2.ptrSize,
+        align: h2.ptrSize,
+        flags: StructureFlag.HasPointer | StructureFlag.HasSlot | StructureFlag.HasObject | PointerFlag.IsSingle | PointerFlag.IsConst,
+        signature: 5051n,
+        instance: {
+          members: [
+            { type: MemberType.Object, bitSize: 32, bitOffset: 0, byteSize: 4, slot: 0, structure: s2.i32 },
+            { type: MemberType.Uint, bitSize: h2.ptrSize * 8, bitOffset: 0, byteSize: h2.ptrSize, structure: {} },
+          ],
+        },
+        static: {},
+      };
+      env2.beginStructure(int32Ptr);
+      env2.finishStructure(int32Ptr);
+      const sigStruct = {
+        type: StructureType.Struct,
+        purpose: StructurePurpose.AbortSignal,
+        name: 'AbortSignal',
+        byteSize: h2.ptrSize,
+        align: h2.ptrSize,
+        flags: StructureFlag.HasPointer | StructureFlag.HasSlot | StructureFlag.HasObject,
+        signature: 5052n,
+        instance: { members: [ { name: 'ptr', type: MemberType.Object, flags: 1, bitSize: h2.ptrSize * 8, bitOffset: 0, byteSize: h2.ptrSize, slot: 0, structure: int32Ptr } ] },
+        static: {},
+      };
+      env2.beginStructure(sigStruct);
+      env2.finishStructure(sigStruct);
+      const sigArgStruct = {
+        type: StructureType.ArgStruct,
+        name: 'Args_505',
+        length: 1,
+        byteSize: 16 + h2.ptrSize,
+        align: h2.ptrSize,
+        flags: StructureFlag.HasValue | StructureFlag.HasObject | StructureFlag.HasSlot | StructureFlag.HasPointer | (1 << 5), // ArgStructFlag.HasOptions
+        signature: 505n,
+        instance: {
+          members: [
+            { name: 'retval', type: MemberType.Int, bitSize: 32, bitOffset: 0, byteSize: 4, structure: s2.i32 },
+            { name: '0', type: MemberType.Int, bitSize: 32, bitOffset: 32, byteSize: 4, structure: s2.i32 },
+            { name: '1', type: MemberType.Object, bitSize: h2.ptrSize * 8, bitOffset: 64, byteSize: h2.ptrSize, slot: 0, structure: sigStruct },
+          ],
+        },
+        static: {},
+      };
+      env2.beginStructure(sigArgStruct);
+      env2.finishStructure(sigArgStruct);
+
+      const sigDescOff = 0x5c0;
+      const sigDescDV = h2.viewAt(sigDescOff, 16 + 3 * h2.ptrSize);
+      sigDescDV.setBigUint64(0, 505n, true);
+      sigDescDV.setUint32(8, 0, true);
+      sigDescDV.setUint32(12, 0, true);
+      if (h2.is64) {
+        sigDescDV.setBigUint64(16, 0x9400n, true);
+      } else {
+        sigDescDV.setUint32(16, 0x9400, true);
+      }
+      env2.invokeThunk = (_thunk, _fnHolder, argsHolder) => {
+        const aborted = argsHolder[1].ptr['*'];
+        argsHolder.retval = argsHolder[0] + (aborted ? 1000 : 0);
+        return argsHolder.retval;
+      };
+      const sigCbHandle = env2.createZigCallback(h2.addrOf(sigDescOff), 5);
+      const sigCbFn = env2.getJsValue(sigCbHandle);
+      const ac = new AbortController();
+      ac.abort();
+      expect(sigCbFn(5, { signal: ac.signal })).to.equal(1005);
+      expect(sigCbFn(5, { signal: ac.signal }, 'extra-ignored')).to.equal(1005);
+      // Non-options 2nd argument (even with a non-AbortSignal `.signal` property) is safely ignored
+      expect(sigCbFn(5, { signal: 'not-an-abort-signal' })).to.equal(5);
+      env2.releaseZigCallback(5);
+    }
   });
 
   it('should execute O(1) bulk binary operations, BigInt 64/128-bit conversions with overflow detection, and sync/async iterator ops', function() {

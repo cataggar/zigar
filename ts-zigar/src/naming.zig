@@ -258,6 +258,10 @@ pub fn toCamelCase(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
+    if (raw.len >= 2 and raw[0] == '_' and std.ascii.isAlphanumeric(raw[1])) {
+        try out.append(allocator, '_');
+    }
+
     for (words, 0..) |w, idx| {
         if (idx == 0) {
             for (w) |ch| try out.append(allocator, std.ascii.toLower(ch));
@@ -699,6 +703,23 @@ test "casing helpers convert camelCase, PascalCase, and snake_case deterministic
         const s = try toSnakeCase(alloc, "@scope/my-pkg");
         defer alloc.free(s);
         try std.testing.expectEqualStrings("scope_my_pkg", s);
+    }
+    {
+        const priv_read = try toCamelCase(alloc, "_read");
+        defer alloc.free(priv_read);
+        try std.testing.expectEqualStrings("_read", priv_read);
+
+        const priv_state = try toCamelCase(alloc, "_readableState");
+        defer alloc.free(priv_state);
+        try std.testing.expectEqualStrings("_readableState", priv_state);
+
+        const dunder_dir = try toCamelCase(alloc, "__dirname");
+        defer alloc.free(dunder_dir);
+        try std.testing.expectEqualStrings("dirname", dunder_dir);
+
+        const single_us = try toCamelCase(alloc, "_");
+        defer alloc.free(single_us);
+        try std.testing.expectEqualStrings("_", single_us);
     }
 }
 

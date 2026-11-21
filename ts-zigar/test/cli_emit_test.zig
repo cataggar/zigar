@@ -6035,6 +6035,126 @@ test "Issue #55 regression: entry module with own exports + ambient module + dec
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", probe_zig });
 }
 
+test "Issue #56 @types/node@26 events, stream, stream/consumers, stream/promises, and stream/web lower typed EventMap, PipelineResult, and Web Streams cleanly" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const types_node_dir = (try resolveTypesNode26Dir(alloc)) orelse return error.SkipZigTest;
+    defer alloc.free(types_node_dir);
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue56-events-streams", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    const cli_args = [_][]const u8{
+        "-t", types_node_dir,
+        "-m", "globals",
+        "-m", "node:buffer",
+        "-m", "node:events",
+        "-m", "node:stream",
+        "-m", "node:stream/consumers",
+        "-m", "node:stream/promises",
+        "-m", "node:stream/web",
+        "-d", out_dir,
+    };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Issue #56 @types/node@26 events/streams error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+
+    const events_zig = try std.fmt.allocPrint(alloc, "{s}/events.zig", .{out_dir});
+    defer alloc.free(events_zig);
+    const events_src = try cwd.readFileAlloc(io, events_zig, alloc, .limited(8 * 1024 * 1024));
+    defer alloc.free(events_src);
+    try std.testing.expect(std.mem.indexOf(u8, events_src, "pub fn onInfer(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events_src, "pub fn onceInfer(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events_src, "pub fn emitInfer(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events_src, "__zigar_js.RestTupleCallable(__zigar_js.IndexAccessWithFallback(") != null);
+
+    const web_zig = try std.fmt.allocPrint(alloc, "{s}/stream/web.zig", .{out_dir});
+    defer alloc.free(web_zig);
+    const web_src = try cwd.readFileAlloc(io, web_zig, alloc, .limited(8 * 1024 * 1024));
+    defer alloc.free(web_src);
+    try std.testing.expect(std.mem.indexOf(u8, web_src, "readable_type: void = {},") != null);
+    try std.testing.expect(std.mem.indexOf(u8, web_src, "writable_type: void = {},") != null);
+
+    const probe_zig = try std.fmt.allocPrint(alloc, "{s}/issue56_probe.zig", .{sandbox});
+    defer alloc.free(probe_zig);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "issue56_probe.zig",
+            .data =
+            \\const std = @import("std");
+            \\const r = @import("out/root.zig");
+            \\const js = r.zigar_js;
+            \\const ne = r.node_events;
+            \\const ns = r.node_stream;
+            \\const nsc = r.node_stream_consumers;
+            \\const nsp = r.node_stream_promises;
+            \\const nw = r.node_stream_web;
+            \\
+            \\const MyEvents = struct {
+            \\    tick: struct { []const u8, f64 },
+            \\    done: @TypeOf(.{}),
+            \\};
+            \\
+            \\test "typed EventEmitter Args/Listener conditional lowering, stream/consumers, stream/promises, and stream/web Sema" {
+            \\    @setEvalBranchQuota(5_000_000);
+            \\    const TickKey = js.InferEventKeyType(.tick);
+            \\    const DoneKey = js.InferEventKeyType(.done);
+            \\    try std.testing.expect(ne.Args(MyEvents, TickKey) == struct { []const u8, f64 });
+            \\    try std.testing.expect(ne.Listener(MyEvents, TickKey).Signature() == fn ([]const u8, f64) void);
+            \\    try std.testing.expect(ne.Listener(MyEvents, DoneKey).Signature() == fn () void);
+            \\    try std.testing.expect(ne.Args(js.Any, TickKey) == []const js.Any);
+            \\
+            \\    const xform: nw.Transformer([]const u8, []const u8) = .{};
+            \\    try std.testing.expect(xform.readable_type == {});
+            \\    try std.testing.expect(xform.writable_type == {});
+            \\    const sink: nw.UnderlyingSink([]const u8) = .{};
+            \\    try std.testing.expect(sink.type == {});
+            \\
+            \\    _ = &ne.EventEmitter(MyEvents).init;
+            \\    _ = &ne.EventEmitterDefault().init;
+            \\    _ = &ne.addAbortListener;
+            \\    _ = &ns.Readable.from;
+            \\    _ = &ns.Readable.toWeb;
+            \\    _ = &ns.Readable.fromWeb;
+            \\    _ = &ns.PassThrough.init;
+            \\    _ = &nsc.text;
+            \\    _ = &nsc.json;
+            \\    _ = &nsc.buffer;
+            \\    _ = &nsp.finished;
+            \\    _ = &nw.ReadableStream([]const u8).initUnderlyingDefaultSource;
+            \\    _ = &nw.TransformStream([]const u8, []const u8).init;
+            \\    _ = &nw.WritableStream([]const u8).init;
+            \\    _ = &nw.TextEncoderStream.init;
+            \\    _ = &nw.TextDecoderStream.init;
+            \\}
+            ,
+        });
+    }
+
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", probe_zig });
+}
+
 
 
 

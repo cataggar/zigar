@@ -69,6 +69,8 @@ pub const ParamIr = struct {
     ty: *const TypeIr,
     is_optional: bool,
     is_rest: bool,
+    is_open_callback: bool = false,
+    is_open_rest_sequence: bool = false,
     nullish_kind: lower_types.NullishKind = .none,
     callback_sig: ?FnPtrIr = null,
 };
@@ -253,6 +255,8 @@ pub const FnPtrIr = struct {
     this_param: ?*const TypeIr = null,
     params: []const *const TypeIr,
     return_type: *const TypeIr,
+    has_rest: bool = false,
+    rest_sequence_ty: ?*const TypeIr = null,
 };
 
 pub const DeclRefIr = struct {
@@ -329,6 +333,12 @@ pub const TypeIr = union(enum) {
     index_access_op: struct {
         object_ty: *const TypeIr,
         index_spec: IndexAccessSpecIr,
+        fallback_ty: ?*const TypeIr = null,
+    },
+    empty_object_extends_op: struct {
+        target_ty: *const TypeIr,
+        true_ty: *const TypeIr,
+        false_ty: *const TypeIr,
     },
     intersect_op: []const *const TypeIr,
     tuple: []const TupleElemIr,
@@ -823,6 +833,7 @@ fn LowerCtx(comptime GraphType: type) type {
         merged_ns_consumed: std.AutoHashMapUnmanaged(u32, void) = .empty,
         merged_iface_consumed: std.AutoHashMapUnmanaged(u32, void) = .empty,
         merged_ctor_var_consumed: std.AutoHashMapUnmanaged(u32, void) = .empty,
+        merged_generic_ctor_var_peer: std.AutoHashMapUnmanaged(u32, u32) = .empty,
         merged_fn_consumed: std.AutoHashMapUnmanaged(u32, void) = .empty,
         decl_classifications: std.AutoHashMapUnmanaged(u32, classify_decls.DeclClassification) = .empty,
         merged_generic_ns_peer: std.AutoHashMapUnmanaged(u32, u32) = .empty,
@@ -871,6 +882,7 @@ fn LowerCtx(comptime GraphType: type) type {
             self.merged_ns_consumed.deinit(self.scratch);
             self.merged_iface_consumed.deinit(self.scratch);
             self.merged_ctor_var_consumed.deinit(self.scratch);
+            self.merged_generic_ctor_var_peer.deinit(self.scratch);
             self.merged_fn_consumed.deinit(self.scratch);
             self.decl_classifications.deinit(self.scratch);
             self.merged_generic_ns_peer.deinit(self.scratch);
@@ -1577,6 +1589,57 @@ fn LowerCtx(comptime GraphType: type) type {
                                     }
                                 },
                                 else => {},
+                            }
+                            if (bd.kind == .interface_decl or bd.kind == .class_decl) {
+                                switch (bd.kind) {
+                                    .interface_decl => |cif| {
+                                        for (cif.extends_clauses) |hc| {
+                                            const base_el = try self.extractIteratorElemFromReturnType(
+                                                hc.target_type,
+                                                is_async,
+                                                child_env,
+                                                owner_active_tps,
+                                                self_ident_opt,
+                                                imports_used,
+                                                needs_runtime,
+                                                env_cache,
+                                                depth + 1,
+                                            );
+                                            if (base_el.* != .js_value) return base_el;
+                                        }
+                                    },
+                                    .class_decl => |ccls| {
+                                        if (ccls.extends_clause) |hc| {
+                                            const base_el = try self.extractIteratorElemFromReturnType(
+                                                hc.target_type,
+                                                is_async,
+                                                child_env,
+                                                owner_active_tps,
+                                                self_ident_opt,
+                                                imports_used,
+                                                needs_runtime,
+                                                env_cache,
+                                                depth + 1,
+                                            );
+                                            if (base_el.* != .js_value) return base_el;
+                                        }
+                                        for (ccls.implements_clauses) |hc| {
+                                            const base_el = try self.extractIteratorElemFromReturnType(
+                                                hc.target_type,
+                                                is_async,
+                                                child_env,
+                                                owner_active_tps,
+                                                self_ident_opt,
+                                                imports_used,
+                                                needs_runtime,
+                                                env_cache,
+                                                depth + 1,
+                                            );
+                                            if (base_el.* != .js_value) return base_el;
+                                        }
+                                    },
+                                    else => {},
+                                }
                             }
                         }
                     }
@@ -3676,16 +3739,20 @@ fn LowerCtx(comptime GraphType: type) type {
                 const d_wire = if (d.export_name) |esid| self.str(esid) else self.str(d.name);
                 if (d.kind == .interface_decl or d.kind == .class_decl) {
                     const has_merged_tps = self.hasMergedTypeParams(did);
-                    if (d.kind == .interface_decl and !has_merged_tps) {
+                    if (d.kind == .interface_decl) {
                         const icls = try self.classifyDecl(did);
                         if (icls.companion_var_decl_id) |var_did| {
                             for (decl_ids) |other| {
                                 if (other == var_did) {
-                                    try self.merged_ctor_var_consumed.put(self.scratch, var_did, {});
+                                    if (!has_merged_tps) {
+                                        try self.merged_ctor_var_consumed.put(self.scratch, var_did, {});
+                                    } else {
+                                        try self.merged_generic_ctor_var_peer.put(self.scratch, did, var_did);
+                                    }
                                 }
                             }
                         }
-                        if (try merge_decls.fnAndNamespaceIdentCollide(self.scratch, d_wire)) {
+                        if (!has_merged_tps and try merge_decls.fnAndNamespaceIdentCollide(self.scratch, d_wire)) {
                             for (d.merged_with) |mid| {
                                 if (mid >= self.graph.decls.len or mid == did) continue;
                                 const md = self.graph.decls[mid];
@@ -4614,7 +4681,11 @@ fn LowerCtx(comptime GraphType: type) type {
                     (switch (iao.index_spec) {
                         .ty => |kt| typeIrMentionsSelfOrTypeParamsFrom(kt, tps, from_idx, depth + 1),
                         else => false,
-                    }),
+                    }) or
+                    (if (iao.fallback_ty) |ft| typeIrMentionsSelfOrTypeParamsFrom(ft, tps, from_idx, depth + 1) else false),
+                .empty_object_extends_op => |eoe| typeIrMentionsSelfOrTypeParamsFrom(eoe.target_ty, tps, from_idx, depth + 1) or
+                    typeIrMentionsSelfOrTypeParamsFrom(eoe.true_ty, tps, from_idx, depth + 1) or
+                    typeIrMentionsSelfOrTypeParamsFrom(eoe.false_ty, tps, from_idx, depth + 1),
                 .intersect_op => |arms| blk: {
                     for (arms) |arm| {
                         if (typeIrMentionsSelfOrTypeParamsFrom(arm, tps, from_idx, depth + 1)) break :blk true;
@@ -4667,12 +4738,47 @@ fn LowerCtx(comptime GraphType: type) type {
             imports_used: *std.AutoHashMapUnmanaged(u32, void),
             needs_runtime: *bool,
         ) error{OutOfMemory}!LoweredTypeParams {
-            var ir_list = try self.alloc.alloc(TypeParamIr, raw_tp_ids.len);
-            var combined_active = try self.alloc.alloc(ActiveTypeParam, outer_active_tps.len + raw_tp_ids.len);
+            return self.lowerTypeParamsWithSkip(
+                raw_tp_ids,
+                &.{},
+                tp_scope,
+                outer_active_tps,
+                self_ident_opt,
+                imports_used,
+                needs_runtime,
+            );
+        }
+
+        fn lowerTypeParamsWithSkip(
+            self: *Self,
+            raw_tp_ids: []const u32,
+            skip_tp_ids: []const u32,
+            tp_scope: *naming.ScopeNamer,
+            outer_active_tps: []const ActiveTypeParam,
+            self_ident_opt: ?[]const u8,
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+        ) error{OutOfMemory}!LoweredTypeParams {
+            var kept_tp_ids: std.ArrayList(u32) = .empty;
+            defer kept_tp_ids.deinit(self.scratch);
+            for (raw_tp_ids) |tp_id| {
+                var skipped = false;
+                for (skip_tp_ids) |sid| {
+                    if (sid == tp_id) {
+                        skipped = true;
+                        break;
+                    }
+                }
+                if (!skipped) try kept_tp_ids.append(self.scratch, tp_id);
+            }
+            const eff_tp_ids = kept_tp_ids.items;
+
+            var ir_list = try self.alloc.alloc(TypeParamIr, eff_tp_ids.len);
+            var combined_active = try self.alloc.alloc(ActiveTypeParam, outer_active_tps.len + eff_tp_ids.len);
             @memcpy(combined_active[0..outer_active_tps.len], outer_active_tps);
 
             // Bind all type parameter names first so mutual constraints (`<T extends U, U>`) resolve cleanly.
-            for (raw_tp_ids, 0..) |tp_id, idx| {
+            for (eff_tp_ids, 0..) |tp_id, idx| {
                 const has_tp = tp_id < self.graph.type_params.len;
                 const raw_name = if (has_tp)
                     self.str(self.graph.type_params[tp_id].name)
@@ -4709,7 +4815,7 @@ fn LowerCtx(comptime GraphType: type) type {
             var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
             defer visited.deinit(self.scratch);
 
-            for (raw_tp_ids, 0..) |tp_id, idx| {
+            for (eff_tp_ids, 0..) |tp_id, idx| {
                 if (tp_id >= self.graph.type_params.len) continue;
                 const tp = self.graph.type_params[tp_id];
                 if (tp.constraint) |ct| {
@@ -4815,9 +4921,41 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                     }
                 },
+                .decl_ref => |dr| {
+                    for (dr.type_args) |ta| {
+                        if (ta.* == .type_param_ref) {
+                            for (tps, 0..) |tp, idx| {
+                                if (std.mem.eql(u8, tp.zig_ident, ta.type_param_ref) and isPropertyKeyConstrainedTypeParam(tp)) {
+                                    return .{ .literal_key = idx };
+                                }
+                            }
+                        }
+                    }
+                },
                 else => {},
             }
             return .none;
+        }
+
+        fn isPropertyKeyConstrainedTypeParam(tp: TypeParamIr) bool {
+            const ct = tp.constraint orelse return false;
+            return isPropertyKeyLikeTypeIr(ct, 0);
+        }
+
+        fn isPropertyKeyLikeTypeIr(ty: *const TypeIr, depth: usize) bool {
+            if (depth >= 6) return false;
+            return switch (ty.*) {
+                .string_type, .js_string, .js_symbol, .inline_enum, .open_literal_union, .template_pattern => true,
+                .unary_type_op => |uo| uo.op == .keyof,
+                .tagged_union => |tu| blk: {
+                    if (tu.variants.len == 0) break :blk false;
+                    for (tu.variants) |v| {
+                        if (!isPropertyKeyLikeTypeIr(v.payload, depth + 1)) break :blk false;
+                    }
+                    break :blk true;
+                },
+                else => false,
+            };
         }
 
         fn typeTreeMentionsActiveTypeParam(
@@ -5941,6 +6079,40 @@ fn LowerCtx(comptime GraphType: type) type {
                             const operand = try self.lowerType(check_id, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                             return self.makeType(.{ .unary_type_op = .{ .op = .awaited, .operand = operand } });
                         },
+                        .empty_object_extends => |eoe| {
+                            const target_ir = try self.lowerType(eoe.target_ty, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                            const true_ir = try self.lowerType(eoe.true_ty, is_return_pos, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                            const false_ir = try self.lowerType(eoe.false_ty, is_return_pos, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                            return self.makeType(.{
+                                .empty_object_extends_op = .{
+                                    .target_ty = target_ir,
+                                    .true_ty = true_ir,
+                                    .false_ty = false_ir,
+                                },
+                            });
+                        },
+                        .conditional_index_access => |cia| {
+                            const obj_ir = try self.lowerType(cia.object_ty, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                            const key_ir = try self.lowerType(cia.key_ty, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                            const fb_ir = try self.lowerType(cia.fallback_ty, is_return_pos, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                            return self.makeType(.{
+                                .index_access_op = .{
+                                    .object_ty = obj_ir,
+                                    .index_spec = .{ .ty = key_ir },
+                                    .fallback_ty = fb_ir,
+                                },
+                            });
+                        },
+                        .conditional_promise_return => |check_id| {
+                            const operand = try self.lowerType(check_id, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                            const payload = try self.makeType(.{
+                                .unary_type_op = .{
+                                    .op = .infer_callback_promise_payload,
+                                    .operand = operand,
+                                },
+                            });
+                            return self.makeType(.{ .promise = payload });
+                        },
                         .dynamic_any => {
                             if (self.openConditionalSingleObjectBranch(cond)) {
                                 return self.makeType(.js_object);
@@ -6272,10 +6444,19 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
             }
             var p_types = try self.alloc.alloc(*const TypeIr, sig.params.len);
+            var has_rest = false;
+            var rest_seq_ty: ?*const TypeIr = null;
             for (sig.params, 0..) |p, idx| {
                 var pt = try self.lowerType(p.ty, false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                 if (p.rest) {
-                    if (!self.isAlreadySliceTypeIr(pt, 0)) pt = try self.makeType(.{ .slice = pt });
+                    has_rest = true;
+                    if (!self.isAlreadySliceTypeIr(pt, 0)) {
+                        if (sig.params.len == 1 and this_ty == null and self.isOpenRestSequenceTypeIr(pt, 0)) {
+                            rest_seq_ty = pt;
+                        } else {
+                            pt = try self.makeType(.{ .slice = pt });
+                        }
+                    }
                 } else if (p.optional) {
                     pt = try self.wrapOptional(pt);
                 }
@@ -6289,7 +6470,92 @@ fn LowerCtx(comptime GraphType: type) type {
                 .this_param = this_ty,
                 .params = p_types,
                 .return_type = ret,
+                .has_rest = has_rest,
+                .rest_sequence_ty = rest_seq_ty,
             };
+        }
+
+        fn isOpenRestSequenceTypeIr(self: *const Self, ty: *const TypeIr, depth: usize) bool {
+            if (depth >= 8) return false;
+            return switch (ty.*) {
+                .type_param_ref, .index_access_op, .empty_object_extends_op, .tuple => true,
+                .decl_ref => |dr| blk: {
+                    if (dr.type_args.len == 0 or dr.target_decl_id >= self.graph.decls.len) break :blk false;
+                    break :blk self.graph.decls[dr.target_decl_id].kind == .type_alias_decl;
+                },
+                else => false,
+            };
+        }
+
+        fn graphTypeResolvesToCallableAlias(self: *const Self, ty_id: u32, depth: usize) bool {
+            if (depth >= 12 or ty_id >= self.graph.types.len) return false;
+            const tn = self.graph.types[ty_id];
+            return switch (tn.kind) {
+                .function_type => true,
+                .object_literal => |obj| obj.properties.len == 0 and obj.call_signatures.len > 0 and
+                    obj.construct_signatures.len == 0 and obj.index_signatures.len == 0,
+                .union_type => |arms| blk: {
+                    var saw_callable = false;
+                    for (arms) |aid| {
+                        if (aid >= self.graph.types.len) break :blk false;
+                        const ak = self.graph.types[aid].kind;
+                        if (ak == .null_type or ak == .undefined_type or ak == .void_type or ak == .never_type) continue;
+                        if (!self.graphTypeResolvesToCallableAlias(aid, depth + 1)) break :blk false;
+                        saw_callable = true;
+                    }
+                    break :blk saw_callable;
+                },
+                .conditional => |cond| blk: {
+                    const true_never = cond.true_type < self.graph.types.len and self.graph.types[cond.true_type].kind == .never_type;
+                    const false_never = cond.false_type < self.graph.types.len and self.graph.types[cond.false_type].kind == .never_type;
+                    if (true_never and false_never) break :blk false;
+                    if (!true_never and !self.graphTypeResolvesToCallableAlias(cond.true_type, depth + 1)) break :blk false;
+                    if (!false_never and !self.graphTypeResolvesToCallableAlias(cond.false_type, depth + 1)) break :blk false;
+                    break :blk true;
+                },
+                .reference => |ref| blk: {
+                    if (ref.target_decl) |td| {
+                        if (td < self.graph.decls.len and self.graph.decls[td].kind == .type_alias_decl) {
+                            const alias_tid = self.graph.decls[td].kind.type_alias_decl;
+                            if (self.graphTypeResolvesToCallableAlias(alias_tid, depth + 1)) break :blk true;
+                            if (alias_tid < self.graph.types.len and self.graph.types[alias_tid].kind == .conditional) {
+                                const cond = self.graph.types[alias_tid].kind.conditional;
+                                // Also handle `Listener<K, T, F>` where `true_type` is type param `F` supplied via `ref.type_args`:
+                                const td_tps = self.graph.decls[td].type_params;
+                                if (td_tps.len == ref.type_args.len) {
+                                    var true_ok = cond.true_type < self.graph.types.len and self.graph.types[cond.true_type].kind == .never_type;
+                                    if (!true_ok) {
+                                        true_ok = self.graphTypeResolvesToCallableAliasWithArgs(cond.true_type, td_tps, ref.type_args, depth + 1);
+                                    }
+                                    var false_ok = cond.false_type < self.graph.types.len and self.graph.types[cond.false_type].kind == .never_type;
+                                    if (!false_ok) {
+                                        false_ok = self.graphTypeResolvesToCallableAliasWithArgs(cond.false_type, td_tps, ref.type_args, depth + 1);
+                                    }
+                                    if (true_ok and false_ok) break :blk true;
+                                }
+                            }
+                        }
+                    }
+                    break :blk false;
+                },
+                else => false,
+            };
+        }
+
+        fn graphTypeResolvesToCallableAliasWithArgs(
+            self: *const Self,
+            ty_id: u32,
+            tp_ids: []const u32,
+            type_args: []const u32,
+            depth: usize,
+        ) bool {
+            if (depth >= 12 or ty_id >= self.graph.types.len) return false;
+            for (tp_ids, 0..) |tp_id, idx| {
+                if (type_ops.typeNodeMatchesTypeParam(self.graph, ty_id, tp_id)) {
+                    return self.graphTypeResolvesToCallableAlias(type_args[idx], depth + 1);
+                }
+            }
+            return self.graphTypeResolvesToCallableAlias(ty_id, depth + 1);
         }
 
         fn findGraphCallbackSigId(self: *const Self, ty_id: u32, depth: usize) ?u32 {
@@ -6514,7 +6780,46 @@ fn LowerCtx(comptime GraphType: type) type {
             self: *Self,
             raw_sig: SignatureIr,
         ) error{OutOfMemory}!?SplitPromiseSig {
-            if (raw_sig.has_type_predicate or raw_sig.return_type.* != .promise) return null;
+            if (raw_sig.has_type_predicate) return null;
+            if (raw_sig.return_type.* != .promise) {
+                if (raw_sig.return_type.* == .decl_ref) {
+                    const dr = raw_sig.return_type.decl_ref;
+                    if (dr.target_decl_id < self.graph.decls.len) {
+                        const td = self.graph.decls[dr.target_decl_id];
+                        if (td.kind == .type_alias_decl and td.type_params.len == dr.type_args.len) {
+                            const alias_tid = td.kind.type_alias_decl;
+                            if (alias_tid < self.graph.types.len and self.graph.types[alias_tid].kind == .conditional) {
+                                const pat = type_ops.recognizeOpenConditionalPattern(
+                                    self.graph,
+                                    self.graph.types[alias_tid].kind.conditional,
+                                );
+                                if (pat == .conditional_promise_return) {
+                                    const check_tid = pat.conditional_promise_return;
+                                    for (td.type_params, 0..) |tp_id, tp_idx| {
+                                        if (type_ops.typeNodeMatchesTypeParam(self.graph, check_tid, tp_id)) {
+                                            const payload = try self.makeType(.{
+                                                .unary_type_op = .{
+                                                    .op = .infer_callback_promise_payload,
+                                                    .operand = dr.type_args[tp_idx],
+                                                },
+                                            });
+                                            var awaited = raw_sig;
+                                            awaited.return_type = payload;
+                                            awaited.awaits_promise = true;
+
+                                            var prom_comp = raw_sig;
+                                            prom_comp.params = try self.alloc.dupe(ParamIr, raw_sig.params);
+                                            prom_comp.awaits_promise = false;
+                                            return .{ .awaited = awaited, .promise_companion = prom_comp };
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                return null;
+            }
             var payload = raw_sig.return_type.promise;
             while (payload.* == .promise) {
                 payload = payload.promise;
@@ -6608,6 +6913,33 @@ fn LowerCtx(comptime GraphType: type) type {
             imports_used: *std.AutoHashMapUnmanaged(u32, void),
             needs_runtime: *bool,
         ) error{OutOfMemory}!SignatureIr {
+            return self.lowerSignatureWithSkip(
+                sig_id,
+                &.{},
+                enclosing_scope,
+                has_self_receiver,
+                receiver_binds_js_this,
+                allow_single_literal_enum,
+                outer_active_tps,
+                self_ident_opt,
+                imports_used,
+                needs_runtime,
+            );
+        }
+
+        fn lowerSignatureWithSkip(
+            self: *Self,
+            sig_id: u32,
+            skip_tp_ids: []const u32,
+            enclosing_scope: *const naming.ScopeNamer,
+            has_self_receiver: bool,
+            receiver_binds_js_this: bool,
+            allow_single_literal_enum: bool,
+            outer_active_tps: []const ActiveTypeParam,
+            self_ident_opt: ?[]const u8,
+            imports_used: *std.AutoHashMapUnmanaged(u32, void),
+            needs_runtime: *bool,
+        ) error{OutOfMemory}!SignatureIr {
             if (sig_id >= self.graph.signatures.len) {
                 var fallback_self_ident: ?[]const u8 = null;
                 if (has_self_receiver) {
@@ -6645,8 +6977,9 @@ fn LowerCtx(comptime GraphType: type) type {
                 sb.deinit(self.scratch);
             }
 
-            const tp_res = try self.lowerTypeParams(
+            const tp_res = try self.lowerTypeParamsWithSkip(
                 sig.type_params,
+                skip_tp_ids,
                 &fn_scope,
                 outer_active_tps,
                 self_ident_opt,
@@ -6694,8 +7027,16 @@ fn LowerCtx(comptime GraphType: type) type {
                         try self.lowerType(p.ty, false, tp_res.active, self_ident_opt, &visited, imports_used, needs_runtime)
                 else
                     try self.lowerType(p.ty, false, tp_res.active, self_ident_opt, &visited, imports_used, needs_runtime);
+                var is_open_rest_seq = false;
                 if (p.rest) {
-                    if (!self.isAlreadySliceTypeIr(pt, 0)) pt = try self.makeType(.{ .slice = pt });
+                    if (!self.isAlreadySliceTypeIr(pt, 0)) {
+                        if (self.isOpenRestSequenceTypeIr(pt, 0)) {
+                            is_open_rest_seq = true;
+                            needs_runtime.* = true;
+                        } else {
+                            pt = try self.makeType(.{ .slice = pt });
+                        }
+                    }
                 } else if (p.optional) {
                     pt = try self.wrapOptional(pt);
                 }
@@ -6712,6 +7053,9 @@ fn LowerCtx(comptime GraphType: type) type {
                 else
                     null;
 
+                const is_open_cb = !p.rest and cb_sig == null and self.graphTypeResolvesToCallableAlias(p.ty, 0);
+                if (is_open_cb) needs_runtime.* = true;
+
                 params[idx] = .{
                     .zig_ident = zig_ident,
                     .logical_name = logical,
@@ -6719,6 +7063,8 @@ fn LowerCtx(comptime GraphType: type) type {
                     .ty = pt,
                     .is_optional = p.optional,
                     .is_rest = p.rest,
+                    .is_open_callback = is_open_cb,
+                    .is_open_rest_sequence = is_open_rest_seq,
                     .nullish_kind = if (!p.rest and pt.* == .optional) pt.optional.nullish_kind else .none,
                     .callback_sig = cb_sig,
                 };
@@ -6833,6 +7179,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 .unary_type_op,
                 .key_filter_op,
                 .index_access_op,
+                .empty_object_extends_op,
                 .intersect_op,
                 => true,
                 .js_record => |r| r.key.* != .string_type and (r.key.* == .type_param_ref or try self.typeMayAllocateOnDecode(r.value)),
@@ -8671,7 +9018,13 @@ fn LowerCtx(comptime GraphType: type) type {
                 .mapped_values_op => |ma| typeIrEql(ma.target, b.mapped_values_op.target, depth + 1) and typeIrEql(ma.value, b.mapped_values_op.value, depth + 1),
                 .unary_type_op => |ua| ua.op == b.unary_type_op.op and typeIrEql(ua.operand, b.unary_type_op.operand, depth + 1),
                 .key_filter_op => |ka| ka.kind == b.key_filter_op.kind and typeIrEql(ka.target, b.key_filter_op.target, depth + 1) and keyFilterSpecEql(ka.keys, b.key_filter_op.keys, depth + 1),
-                .index_access_op => |ia| typeIrEql(ia.object_ty, b.index_access_op.object_ty, depth + 1) and indexAccessSpecEql(ia.index_spec, b.index_access_op.index_spec, depth + 1),
+                .index_access_op => |ia| typeIrEql(ia.object_ty, b.index_access_op.object_ty, depth + 1) and
+                    indexAccessSpecEql(ia.index_spec, b.index_access_op.index_spec, depth + 1) and
+                    ((ia.fallback_ty != null) == (b.index_access_op.fallback_ty != null)) and
+                    (if (ia.fallback_ty) |fa| typeIrEql(fa, b.index_access_op.fallback_ty.?, depth + 1) else true),
+                .empty_object_extends_op => |ea| typeIrEql(ea.target_ty, b.empty_object_extends_op.target_ty, depth + 1) and
+                    typeIrEql(ea.true_ty, b.empty_object_extends_op.true_ty, depth + 1) and
+                    typeIrEql(ea.false_ty, b.empty_object_extends_op.false_ty, depth + 1),
                 .intersect_op => |aa| blk: {
                     const ab = b.intersect_op;
                     if (aa.len != ab.len) break :blk false;
@@ -9496,7 +9849,9 @@ fn LowerCtx(comptime GraphType: type) type {
                 const vd = self.graph.decls[mid];
                 const v_wire = if (vd.export_name) |esid| self.str(esid) else self.str(vd.name);
                 if (!merge_decls.sameWireName(bound.wire_name, v_wire)) continue;
-                if (self.merged_ctor_var_consumed.contains(mid) or
+                const is_generic_ctor_peer = if (self.merged_generic_ctor_var_peer.get(decl_id)) |pvid| pvid == mid else false;
+                if (is_generic_ctor_peer or
+                    self.merged_ctor_var_consumed.contains(mid) or
                     self.merged_iface_consumed.contains(mid) or
                     self.merged_ns_consumed.contains(mid) or
                     self.merged_fn_consumed.contains(mid))
@@ -10048,13 +10403,15 @@ fn LowerCtx(comptime GraphType: type) type {
                         for (miface.properties) |pid| try self.upsertPropByWireName(&combined_props, .{ .pid = pid });
                     }
 
-                    // Fold companion constructable `var` (`interface URL` + `declare var URL: URLConstructor`) when non-generic!
+                    // Fold companion constructable `var` (`interface URL` + `declare var URL: URLConstructor`
+                    // and generic `interface ReadableStream<R>` + `declare var ReadableStream: { new<R>(...): ReadableStream<R> }`)!
                     var companion_ctors: std.ArrayList(u32) = .empty;
                     defer companion_ctors.deinit(self.scratch);
                     var companion_static_props: std.ArrayList(u32) = .empty;
                     defer companion_static_props.deinit(self.scratch);
                     if (icls.companion_var_decl_id) |var_did| {
-                        if (self.merged_ctor_var_consumed.contains(var_did)) {
+                        const is_generic_ctor_peer = if (self.merged_generic_ctor_var_peer.get(decl_id)) |pvid| pvid == var_did else false;
+                        if (self.merged_ctor_var_consumed.contains(var_did) or is_generic_ctor_peer) {
                             var companion_static_methods: std.ArrayList(MethodNodeType) = .empty;
                             defer companion_static_methods.deinit(self.scratch);
                             var tmp_cls = classify_decls.Classifier(GraphType).init(self.scratch, &self.graph);
@@ -14102,7 +14459,7 @@ fn LowerCtx(comptime GraphType: type) type {
                 var raw_ctor_sigs = try self.scratch.alloc(SignatureIr, public_ctor_sigs.items.len);
                 defer self.scratch.free(raw_ctor_sigs);
                 for (public_ctor_sigs.items, 0..) |ss, idx| {
-                    const ctor_active_tps = try self.resolveHeritageActiveTps(
+                    var ctor_active_tps = try self.resolveHeritageActiveTps(
                         ss.env,
                         tp_res.active,
                         self_ident,
@@ -14111,8 +14468,61 @@ fn LowerCtx(comptime GraphType: type) type {
                         &env_cache,
                         0,
                     );
-                    var c_sig = try self.lowerSignature(ss.sid, &struct_scope, false, true, raw_ctor_sigs.len > 1, ctor_active_tps, self_ident, imports_used, needs_runtime);
-                    c_sig.return_type = try self.makeType(.{ .self_type = self_ident });
+                    var skip_ctor_tps: std.ArrayList(u32) = .empty;
+                    defer skip_ctor_tps.deinit(self.scratch);
+                    var extra_active_tps: std.ArrayList(ActiveTypeParam) = .empty;
+                    defer extra_active_tps.deinit(self.scratch);
+                    var preserve_concrete_owner_ret = false;
+
+                    if (tp_res.active.len > 0 and ss.sid < self.graph.signatures.len) {
+                        const csig = self.graph.signatures[ss.sid];
+                        if (csig.return_type < self.graph.types.len and self.graph.types[csig.return_type].kind == .reference) {
+                            const r = self.graph.types[csig.return_type].kind.reference;
+                            const ret_matches_owner = (r.target_decl != null and r.target_decl.? == owner_decl_id) or
+                                std.mem.eql(u8, lower_types.stripGlobalQualifier(self.str(r.target_name)), owner_wire);
+                            if (ret_matches_owner and r.type_args.len == tp_res.active.len) {
+                                if (csig.type_params.len > 0) {
+                                    try extra_active_tps.appendSlice(self.scratch, ctor_active_tps);
+                                    for (csig.type_params) |ctp_id| {
+                                        for (r.type_args, 0..) |ta_id, ta_idx| {
+                                            if (type_ops.typeNodeMatchesTypeParam(self.graph, ta_id, ctp_id)) {
+                                                try skip_ctor_tps.append(self.scratch, ctp_id);
+                                                if (ctp_id < self.graph.type_params.len) {
+                                                    const ctp_name = self.str(self.graph.type_params[ctp_id].name);
+                                                    try extra_active_tps.append(self.scratch, .{
+                                                        .ts_name = ctp_name,
+                                                        .zig_ident = tp_res.active[ta_idx].zig_ident,
+                                                    });
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (skip_ctor_tps.items.len > 0) {
+                                        ctor_active_tps = extra_active_tps.items;
+                                    }
+                                } else {
+                                    preserve_concrete_owner_ret = true;
+                                }
+                            }
+                        }
+                    }
+
+                    var c_sig = try self.lowerSignatureWithSkip(
+                        ss.sid,
+                        skip_ctor_tps.items,
+                        &struct_scope,
+                        false,
+                        true,
+                        raw_ctor_sigs.len > 1,
+                        ctor_active_tps,
+                        self_ident,
+                        imports_used,
+                        needs_runtime,
+                    );
+                    if (!(preserve_concrete_owner_ret and c_sig.return_type.* == .decl_ref)) {
+                        c_sig.return_type = try self.makeType(.{ .self_type = self_ident });
+                    }
                     raw_ctor_sigs[idx] = c_sig;
                 }
                 const kept_ctors = try overloads.deduplicateSubsumedIndices(self.scratch, self.scratch, raw_ctor_sigs);
@@ -15352,6 +15762,15 @@ fn LowerCtx(comptime GraphType: type) type {
                     if (iao.index_spec == .ty) {
                         m |= (try self.evalGenSymType(iao.index_spec.ty, bindings, decl_map, depth + 1)).mask();
                     }
+                    if (iao.fallback_ty) |ft| {
+                        m |= (try self.evalGenSymType(ft, bindings, decl_map, depth + 1)).mask();
+                    }
+                    return if (m == 0) .closed else .{ .compound = m };
+                },
+                .empty_object_extends_op => |eoe| {
+                    var m = (try self.evalGenSymType(eoe.target_ty, bindings, decl_map, depth + 1)).mask();
+                    m |= (try self.evalGenSymType(eoe.true_ty, bindings, decl_map, depth + 1)).mask();
+                    m |= (try self.evalGenSymType(eoe.false_ty, bindings, decl_map, depth + 1)).mask();
                     return if (m == 0) .closed else .{ .compound = m };
                 },
                 .intersect_op => |arms| {
@@ -15607,6 +16026,14 @@ fn LowerCtx(comptime GraphType: type) type {
                     if (iao.index_spec == .ty) {
                         try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(iao.index_spec.ty), bindings, decl_map, frames, visits);
                     }
+                    if (iao.fallback_ty) |ft| {
+                        try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(ft), bindings, decl_map, frames, visits);
+                    }
+                },
+                .empty_object_extends_op => |eoe| {
+                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(eoe.target_ty), bindings, decl_map, frames, visits);
+                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(eoe.true_ty), bindings, decl_map, frames, visits);
+                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(eoe.false_ty), bindings, decl_map, frames, visits);
                 },
                 .intersect_op => |arms| {
                     for (arms) |arm| {
@@ -17186,17 +17613,26 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
             }
 
-            // 2c. When a global-scope runtime class (`globals.Headers`, `globals.Response`,
-            // `globals.Request`, `globals.FormData`, `globals.WebSocket`, etc.) extends a same-named
-            // class inside an encapsulated types-only helper module (`undici-types/fetch`, etc.),
-            // promote that base class's runtime constructor target to global scope (`globalThis.<Name>`)
-            // so `instanceof` union discrimination (`HeadersInit`) works natively without importing a
-            // non-existent types-only JS module!
-            for (modules) |pub_mod| {
-                for (pub_mod.decls) |d| {
+            // 2c. When a global-scope runtime handle class (`globals.AbortSignal`, `globals.AbortController`,
+            // `globals.Event`, `globals.EventTarget`, `globals.Headers`, `globals.Response`, `globals.Request`,
+            // `globals.FormData`, `globals.WebSocket`, etc.) extends a same-named handle interface/class inside
+            // an encapsulated types-only helper module (`web-globals/*`, `undici-types/*`, etc.), redirect the
+            // helper declaration to a `.re_export_decl` of the canonical `globals` declaration (splicing the
+            // helper's own bases into `globals.<Name>.bases` to prevent self-inheritance cycles) so methods
+            // like `AbortController.signal()` and `Response.headers()` return `globals.AbortSignal` and
+            // `globals.Headers` directly. If the helper cannot be aliased (e.g. has nested namespace decls),
+            // fall back to promoting its runtime constructor target to global scope (`globalThis.<Name>`).
+            for (modules, 0..) |*pub_mod, pub_mi| {
+                const pub_mod_idx: u32 = @intCast(pub_mi);
+                for (mod_mut_decls[pub_mi]) |*d| {
                     if (!d.is_global_scope or d.kind != .struct_decl) continue;
-                    const st = d.kind.struct_decl;
+                    const st = &d.kind.struct_decl;
                     if (!st.is_class or !st.has_runtime_ctor_target) continue;
+
+                    var next_bases: std.ArrayList(*const TypeIr) = .empty;
+                    defer next_bases.deinit(self.scratch);
+                    var spliced_any_base = false;
+
                     for (st.bases) |base_ty| {
                         var cur_ty: *const TypeIr = base_ty;
                         var resolved_mod: ?u32 = null;
@@ -17224,13 +17660,57 @@ fn LowerCtx(comptime GraphType: type) type {
                             resolved_ident = cur_p[0];
                             break;
                         }
-                        const b_mod = resolved_mod orelse continue;
-                        const b_ident = resolved_ident orelse continue;
-                        if (b_mod >= modules.len or !modules[b_mod].is_encapsulated_internal) continue;
+                        const b_mod = resolved_mod orelse {
+                            try next_bases.append(self.scratch, base_ty);
+                            continue;
+                        };
+                        const b_ident = resolved_ident.?;
+                        if (b_mod >= modules.len) {
+                            try next_bases.append(self.scratch, base_ty);
+                            continue;
+                        }
+
+                        var redirected_base = false;
                         for (mod_mut_decls[b_mod]) |*bd| {
                             if (!std.mem.eql(u8, bd.zig_ident, b_ident)) continue;
-                            if (bd.kind != .struct_decl or !bd.kind.struct_decl.is_class) continue;
+                            if (bd.kind != .struct_decl) continue;
                             if (!std.mem.eql(u8, bd.wire_name, d.wire_name)) continue;
+                            if (!modules[b_mod].is_encapsulated_internal and bd.is_js_exported) continue;
+
+                            const bst = bd.kind.struct_decl;
+                            if (b_mod != pub_mod_idx and
+                                st.repr == .handle_wrapper and bst.repr == .handle_wrapper and
+                                st.type_params.len == 0 and bst.type_params.len == 0 and
+                                bst.nested_decls.len == 0)
+                            {
+                                for (bst.bases) |inh_base| {
+                                    if (inh_base.* == .decl_ref and
+                                        inh_base.decl_ref.module_index == pub_mod_idx and
+                                        inh_base.decl_ref.decl_zig_path.len == 1 and
+                                        std.mem.eql(u8, inh_base.decl_ref.decl_zig_path[0], d.zig_ident))
+                                    {
+                                        continue;
+                                    }
+                                    try self.ensureTypeImports(pub_mod, pub_mod_idx, modules, inh_base);
+                                    try next_bases.append(self.scratch, inh_base);
+                                }
+                                const target_path = try self.alloc.alloc([]const u8, 1);
+                                target_path[0] = d.zig_ident;
+                                bd.is_exported = true;
+                                bd.kind = .{
+                                    .re_export_decl = .{
+                                        .target_module_index = pub_mod_idx,
+                                        .target_zig_path = target_path,
+                                        .is_type_only = false,
+                                    },
+                                };
+                                try self.ensureModuleImport(&modules[b_mod], b_mod, pub_mod_idx, pub_mod.rel_zig_path);
+                                redirected_base = true;
+                                spliced_any_base = true;
+                                break;
+                            }
+
+                            if (!modules[b_mod].is_encapsulated_internal or !bst.is_class) continue;
                             const b_sid = bd.source_decl_id orelse continue;
                             const bkey: ModDeclKey = .{ .mod_idx = b_mod, .sid = b_sid };
                             if (natively_reachable.contains(bkey) or claimed_targets.contains(bkey)) continue;
@@ -17247,6 +17727,14 @@ fn LowerCtx(comptime GraphType: type) type {
                                 }
                             }
                         }
+
+                        if (!redirected_base) {
+                            try next_bases.append(self.scratch, base_ty);
+                        }
+                    }
+
+                    if (spliced_any_base) {
+                        st.bases = try self.alloc.dupe(*const TypeIr, next_bases.items);
                     }
                 }
             }
@@ -17343,6 +17831,75 @@ fn LowerCtx(comptime GraphType: type) type {
                 .rel_import_path = rel_imp,
             };
             mod.imports = next_imps;
+        }
+
+        fn ensureTypeImports(
+            self: *Self,
+            mod: *ModuleIr,
+            self_mod_idx: u32,
+            modules: []const ModuleIr,
+            ty: *const TypeIr,
+        ) error{OutOfMemory}!void {
+            switch (ty.*) {
+                .decl_ref => |dr| {
+                    if (dr.module_index < modules.len) {
+                        try self.ensureModuleImport(mod, self_mod_idx, dr.module_index, modules[dr.module_index].rel_zig_path);
+                    }
+                    for (dr.type_args) |ta| {
+                        try self.ensureTypeImports(mod, self_mod_idx, modules, ta);
+                    }
+                },
+                .optional => |opt| try self.ensureTypeImports(mod, self_mod_idx, modules, opt.child),
+                .pointer_const, .slice, .promise, .js_iterator, .js_async_iterator => |ch| {
+                    try self.ensureTypeImports(mod, self_mod_idx, modules, ch);
+                },
+                .js_map => |kv| {
+                    try self.ensureTypeImports(mod, self_mod_idx, modules, kv.key);
+                    try self.ensureTypeImports(mod, self_mod_idx, modules, kv.value);
+                },
+                .js_record => |kv| {
+                    try self.ensureTypeImports(mod, self_mod_idx, modules, kv.key);
+                    try self.ensureTypeImports(mod, self_mod_idx, modules, kv.value);
+                },
+                .mapped_values_op => |mv| {
+                    try self.ensureTypeImports(mod, self_mod_idx, modules, mv.target);
+                    try self.ensureTypeImports(mod, self_mod_idx, modules, mv.value);
+                },
+                .unary_type_op => |uo| try self.ensureTypeImports(mod, self_mod_idx, modules, uo.operand),
+                .key_filter_op => |kf| {
+                    try self.ensureTypeImports(mod, self_mod_idx, modules, kf.target);
+                    if (kf.keys == .ty) try self.ensureTypeImports(mod, self_mod_idx, modules, kf.keys.ty);
+                },
+                .index_access_op => |ia| {
+                    try self.ensureTypeImports(mod, self_mod_idx, modules, ia.object_ty);
+                    if (ia.index_spec == .ty) try self.ensureTypeImports(mod, self_mod_idx, modules, ia.index_spec.ty);
+                    if (ia.fallback_ty) |fb| try self.ensureTypeImports(mod, self_mod_idx, modules, fb);
+                },
+                .empty_object_extends_op => |eoe| {
+                    try self.ensureTypeImports(mod, self_mod_idx, modules, eoe.target_ty);
+                    try self.ensureTypeImports(mod, self_mod_idx, modules, eoe.true_ty);
+                    try self.ensureTypeImports(mod, self_mod_idx, modules, eoe.false_ty);
+                },
+                .intersect_op => |members| {
+                    for (members) |mt| try self.ensureTypeImports(mod, self_mod_idx, modules, mt);
+                },
+                .tuple => |elems| {
+                    for (elems) |el| try self.ensureTypeImports(mod, self_mod_idx, modules, el.ty);
+                },
+                .fn_ptr => |fp| {
+                    if (fp.this_param) |tp| try self.ensureTypeImports(mod, self_mod_idx, modules, tp);
+                    for (fp.params) |pt| try self.ensureTypeImports(mod, self_mod_idx, modules, pt);
+                    try self.ensureTypeImports(mod, self_mod_idx, modules, fp.return_type);
+                    if (fp.rest_sequence_ty) |rt| try self.ensureTypeImports(mod, self_mod_idx, modules, rt);
+                },
+                .anon_struct => |fields| {
+                    for (fields) |fld| try self.ensureTypeImports(mod, self_mod_idx, modules, fld.ty);
+                },
+                .tagged_union => |tu| {
+                    for (tu.variants) |vr| try self.ensureTypeImports(mod, self_mod_idx, modules, vr.payload);
+                },
+                else => {},
+            }
         }
 
         fn pruneDeclRuntimeTargets(
@@ -17906,6 +18463,13 @@ fn dfsValueCycleTypeByPath(
         },
         .index_access_op => |iao| {
             try dfsValueCycleTypeByPath(state_alloc, ir_alloc, @constCast(iao.object_ty), decl_map, state);
+            if (iao.fallback_ty) |ft| {
+                try dfsValueCycleTypeByPath(state_alloc, ir_alloc, @constCast(ft), decl_map, state);
+            }
+        },
+        .empty_object_extends_op => |eoe| {
+            try dfsValueCycleTypeByPath(state_alloc, ir_alloc, @constCast(eoe.true_ty), decl_map, state);
+            try dfsValueCycleTypeByPath(state_alloc, ir_alloc, @constCast(eoe.false_ty), decl_map, state);
         },
         .intersect_op => |arms| {
             for (arms) |arm| {
@@ -18028,7 +18592,10 @@ fn typeUsesParamByValue(
         .mapped_values_op => |mv| typeUsesParamByValue(state_alloc, mv.value, tp_ident, decl_map, depth + 1),
         .unary_type_op => |uo| uo.op != .keyof and typeUsesParamByValue(state_alloc, uo.operand, tp_ident, decl_map, depth + 1),
         .key_filter_op => |kfo| typeUsesParamByValue(state_alloc, kfo.target, tp_ident, decl_map, depth + 1),
-        .index_access_op => |iao| typeUsesParamByValue(state_alloc, iao.object_ty, tp_ident, decl_map, depth + 1),
+        .index_access_op => |iao| typeUsesParamByValue(state_alloc, iao.object_ty, tp_ident, decl_map, depth + 1) or
+            (if (iao.fallback_ty) |ft| typeUsesParamByValue(state_alloc, ft, tp_ident, decl_map, depth + 1) else false),
+        .empty_object_extends_op => |eoe| typeUsesParamByValue(state_alloc, eoe.true_ty, tp_ident, decl_map, depth + 1) or
+            typeUsesParamByValue(state_alloc, eoe.false_ty, tp_ident, decl_map, depth + 1),
         .intersect_op => |arms| blk: {
             for (arms) |arm| {
                 if (typeUsesParamByValue(state_alloc, arm, tp_ident, decl_map, depth + 1)) break :blk true;

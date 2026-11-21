@@ -620,7 +620,6 @@ pub fn Classifier(comptime Graph: type) type {
                 .interface_decl => |iface| {
                     var companion_var: ?u32 = null;
                     var has_merged_class = false;
-                    var has_any_type_params = d.type_params.len > 0;
                     var has_call_sigs = iface.call_signatures.len > 0;
                     var has_construct_sigs = iface.construct_signatures.len > 0;
                     var needs_handle = iface.methods.len > 0 or iface.index_signatures.len > 0;
@@ -634,14 +633,6 @@ pub fn Classifier(comptime Graph: type) type {
                         }
                     }
 
-                    for (d.merged_with) |mid| {
-                        if (mid >= self.graph.decls.len or mid == decl_id) continue;
-                        const md = self.graph.decls[mid];
-                        if ((md.kind == .interface_decl or md.kind == .class_decl) and md.type_params.len > 0) {
-                            has_any_type_params = true;
-                        }
-                    }
-
                     // Note: a merged `function_decl` (`interface Widget` + `declare function Widget(): Widget`)
                     // is a separate value-level factory function and does NOT make `Widget` instances callable.
                     for (d.merged_with) |mid| {
@@ -652,7 +643,7 @@ pub fn Classifier(comptime Graph: type) type {
                             .variable_decl => |vty_id| {
                                 const same_or_global_scope = (md.module == d.module) or
                                     (self.isGlobalAugmentationDecl(decl_id) and self.isGlobalAugmentationDecl(mid));
-                                if (!has_any_type_params and same_or_global_scope and self.typeHasConstructorShape(vty_id, 0)) {
+                                if (same_or_global_scope and self.typeHasConstructorShape(vty_id, 0)) {
                                     companion_var = mid;
                                 }
                             },

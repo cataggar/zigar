@@ -72,6 +72,8 @@ pub const InferMode = enum {
     promise_payload,
     /// Parameter has type `Iterator(T)` or `AsyncIterator(T)`; deduce via `__zigar_js.InferIteratorElem(@TypeOf(arg))`.
     iterator_elem,
+    /// Parameter carries a key-constrained type parameter (e.g. `EventNames(T, E)`); deduce via `__zigar_js.InferEventKeyType(arg)`.
+    literal_key,
     /// Type parameter not present in value params, resolved from its TypeScript default (`= DefaultT`).
     from_default,
 };
@@ -83,6 +85,7 @@ pub const ParamTypeParamShape = union(enum) {
     slice_elem: usize,
     promise_payload: usize,
     iterator_elem: usize,
+    literal_key: usize,
 };
 
 pub const InferBinding = struct {
@@ -132,6 +135,11 @@ pub fn solveTypeParamInference(
             .iterator_elem => |tp_idx| {
                 if (tp_idx < tp_count and chosen[tp_idx] == null) {
                     chosen[tp_idx] = .{ .param_index = pidx, .mode = .iterator_elem };
+                }
+            },
+            .literal_key => |tp_idx| {
+                if (tp_idx < tp_count and chosen[tp_idx] == null) {
+                    chosen[tp_idx] = .{ .param_index = pidx, .mode = .literal_key };
                 }
             },
         }
@@ -189,6 +197,11 @@ pub fn solveTypeParamInferenceWithDefaults(
             .iterator_elem => |tp_idx| {
                 if (tp_idx < tp_count and chosen[tp_idx] == null) {
                     chosen[tp_idx] = .{ .param_index = pidx, .mode = .iterator_elem };
+                }
+            },
+            .literal_key => |tp_idx| {
+                if (tp_idx < tp_count and chosen[tp_idx] == null) {
+                    chosen[tp_idx] = .{ .param_index = pidx, .mode = .literal_key };
                 }
             },
         }

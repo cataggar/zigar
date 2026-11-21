@@ -95,7 +95,17 @@ pub fn typeIrEqlWithTypeParams(
         .index_access_op => |ia| blk: {
             const ib = b.index_access_op;
             if (!typeIrEqlWithTypeParams(ia.object_ty, ib.object_ty, tp_names_a, tp_names_b, depth + 1)) break :blk false;
+            if ((ia.fallback_ty != null) != (ib.fallback_ty != null)) break :blk false;
+            if (ia.fallback_ty) |fa| {
+                if (!typeIrEqlWithTypeParams(fa, ib.fallback_ty.?, tp_names_a, tp_names_b, depth + 1)) break :blk false;
+            }
             break :blk indexAccessSpecEqlWithTypeParams(ia.index_spec, ib.index_spec, tp_names_a, tp_names_b, depth + 1);
+        },
+        .empty_object_extends_op => |ea| blk: {
+            const eb = b.empty_object_extends_op;
+            break :blk typeIrEqlWithTypeParams(ea.target_ty, eb.target_ty, tp_names_a, tp_names_b, depth + 1) and
+                typeIrEqlWithTypeParams(ea.true_ty, eb.true_ty, tp_names_a, tp_names_b, depth + 1) and
+                typeIrEqlWithTypeParams(ea.false_ty, eb.false_ty, tp_names_a, tp_names_b, depth + 1);
         },
         .intersect_op => |ia| blk: {
             const ib = b.intersect_op;
@@ -552,6 +562,9 @@ fn appendTypeSlug(
         .index_access_op => |ia| {
             try appendTypeSlug(buf, alloc, scratch, ia.object_ty, null, false, false, depth + 1);
             try buf.appendSlice(alloc, "Prop");
+        },
+        .empty_object_extends_op => |eoe| {
+            try appendTypeSlug(buf, alloc, scratch, eoe.false_ty, null, false, false, depth + 1);
         },
         .intersect_op => |arms| {
             for (arms[0..@min(arms.len, 2)], 0..) |arm, idx| {
@@ -1095,6 +1108,12 @@ test "overloads: subsumption deduplication and deterministic semantic naming wit
                 str_list: []const []const u8,
                 int_lit: usize,
             },
+            fallback_ty: ?*const SelfT = null,
+        },
+        empty_object_extends_op: struct {
+            target_ty: *const SelfT,
+            true_ty: *const SelfT,
+            false_ty: *const SelfT,
         },
         intersect_op: []const *const SelfT,
         tuple: []const struct {
@@ -1107,6 +1126,8 @@ test "overloads: subsumption deduplication and deterministic semantic naming wit
             this_param: ?*const SelfT = null,
             params: []const *const SelfT,
             return_type: *const SelfT,
+            has_rest: bool = false,
+            rest_sequence_ty: ?*const SelfT = null,
         },
         anon_struct: []const struct {
             wire_name: []const u8,
