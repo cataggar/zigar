@@ -8,6 +8,11 @@ pub fn build(b: *std.Build) void {
         "require-ts71",
         "Build TypeScript 7.1 component + staged package and fail if M3.4a torture test prerequisites are missing",
     ) orelse false;
+    const test_filters = b.option(
+        []const []const u8,
+        "test-filter",
+        "Optional test name filter(s) for zig build test",
+    ) orelse &.{};
     const is_aarch64_host = target.result.cpu.arch == .aarch64 and (@import("builtin").zig_backend == .stage2_aarch64);
     const strip: ?bool = if (is_aarch64_host) true else null;
     const use_llvm: ?bool = if (is_aarch64_host) false else null;
@@ -315,6 +320,7 @@ pub fn build(b: *std.Build) void {
 
     const cli_emit_tests = b.addTest(.{
         .root_module = cli_emit_test_mod,
+        .filters = test_filters,
         .use_llvm = use_llvm,
     });
     const run_cli_emit_tests = b.addRunArtifact(cli_emit_tests);

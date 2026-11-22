@@ -1,0 +1,19 @@
+{
+  "name": "@zigar-examples/monaco-editor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser DOM subset + monaco-editor Zig 0.17 bindings generated via zigar ts",
+  "exports": {
+    ".": "./generated/root.zig"
+  },
+  "scripts": {
+    "generate": "node generate.mjs",
+    "build:wasm": "node build-wasm.mjs",
+    "test:zig": "zig build test --summary all",
+    "test": "node --test test/monaco.test.mjs"
+  },
+  "devDependencies": {
+    "monaco-editor": "^0.57.0"
+  }
+}

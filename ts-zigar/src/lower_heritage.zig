@@ -102,8 +102,31 @@ pub fn bindIndexGetterAllocName(
     return ident;
 }
 
-/// Checks whether a handle-backed indexed struct with no constructors or call signatures
-/// and no required methods/properties can safely expose a synthesized `init()` empty JS `{}` factory.
+/// Checks whether a handle-backed non-class interface with no constructors, call signatures,
+/// class bases, non-public members, or required methods/properties can safely expose a
+/// synthesized `init()` empty JS `{}` factory (either an indexed dictionary or an
+/// optional-methods configuration interface such as `monaco.Environment`).
+pub fn shouldSynthesizeEmptyHandleInit(
+    is_class: bool,
+    has_class_base: bool,
+    has_non_public_members: bool,
+    is_callable_handle: bool,
+    ctor_count: usize,
+    index_sig_count: usize,
+    optional_methods_count: usize,
+    required_methods_count: usize,
+    required_props_count: usize,
+) bool {
+    return !is_class and
+        !has_class_base and
+        !has_non_public_members and
+        !is_callable_handle and
+        ctor_count == 0 and
+        (index_sig_count > 0 or optional_methods_count > 0) and
+        required_methods_count == 0 and
+        required_props_count == 0;
+}
+
 pub fn shouldSynthesizeIndexedEmptyInit(
     is_class: bool,
     is_callable_handle: bool,
@@ -112,12 +135,17 @@ pub fn shouldSynthesizeIndexedEmptyInit(
     required_methods_count: usize,
     required_props_count: usize,
 ) bool {
-    return !is_class and
-        !is_callable_handle and
-        ctor_count == 0 and
-        index_sig_count > 0 and
-        required_methods_count == 0 and
-        required_props_count == 0;
+    return shouldSynthesizeEmptyHandleInit(
+        is_class,
+        false,
+        false,
+        is_callable_handle,
+        ctor_count,
+        index_sig_count,
+        0,
+        required_methods_count,
+        required_props_count,
+    );
 }
 
 test "bindIndexAccessorNames binds primary get/set and falls back cleanly on dual or colliding indexers" {
@@ -174,4 +202,10 @@ test "shouldSynthesizeIndexedEmptyInit only enables empty object factory on pure
     try std.testing.expect(!shouldSynthesizeIndexedEmptyInit(false, false, 0, 0, 0, 0));
     try std.testing.expect(!shouldSynthesizeIndexedEmptyInit(false, false, 0, 1, 1, 0));
     try std.testing.expect(!shouldSynthesizeIndexedEmptyInit(false, false, 0, 1, 0, 1));
+
+    // Optional-method interfaces (`monaco.Environment`) get `init()`, unless extending a class or branded:
+    try std.testing.expect(shouldSynthesizeEmptyHandleInit(false, false, false, false, 0, 0, 2, 0, 0));
+    try std.testing.expect(!shouldSynthesizeEmptyHandleInit(false, true, false, false, 0, 0, 2, 0, 0));
+    try std.testing.expect(!shouldSynthesizeEmptyHandleInit(false, false, true, false, 0, 0, 2, 0, 0));
+    try std.testing.expect(!shouldSynthesizeEmptyHandleInit(false, false, false, false, 0, 0, 2, 1, 0));
 }
