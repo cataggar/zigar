@@ -7,48 +7,15 @@ const m3_esm = gen.m3_esm;
 const m3_cjs = gen.m3_cjs;
 const fixture = gen.globals;
 
-var live_allocs = std.atomic.Value(usize).init(0);
-
-const TrackingAllocator = struct {
-    fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const ptr = zigar.mem.allocator.rawAlloc(len, alignment, ret_addr) orelse return null;
-        _ = live_allocs.fetchAdd(1, .acq_rel);
-        return ptr;
-    }
-
-    fn resize(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        return zigar.mem.allocator.rawResize(buf, alignment, new_len, ret_addr);
-    }
-
-    fn remap(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        return zigar.mem.allocator.rawRemap(buf, alignment, new_len, ret_addr);
-    }
-
-    fn free(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        zigar.mem.allocator.rawFree(buf, alignment, ret_addr);
-        _ = live_allocs.fetchSub(1, .acq_rel);
-    }
-
-    const vtable: std.mem.Allocator.VTable = .{
-        .alloc = alloc,
-        .resize = resize,
-        .remap = remap,
-        .free = free,
-    };
-
-    fn allocator() std.mem.Allocator {
-        return .{ .ptr = undefined, .vtable = &vtable };
-    }
-};
-
-const tracked_alloc = TrackingAllocator.allocator();
+var gpa: zigar.mem.TrackingAllocator = .init(zigar.mem.allocator);
+const tracked_alloc = gpa.allocator();
 
 pub fn activeHandles() u32 {
     return js.activeHandleCount();
 }
 
 pub fn liveZigAllocs() usize {
-    return live_allocs.load(.acquire);
+    return gpa.activeCount();
 }
 
 pub fn hasPendingCapturedError() bool {
@@ -57,7 +24,7 @@ pub fn hasPendingCapturedError() bool {
 
 fn checkInvariants(handles_before: u32, allocs_before: usize) !void {
     if (js.activeHandleCount() != handles_before) return error.Unexpected;
-    if (live_allocs.load(.acquire) != allocs_before) return error.Unexpected;
+    if (gpa.activeCount() != allocs_before) return error.Unexpected;
     if (js.hasLastError()) return error.Unexpected;
 }
 
@@ -65,7 +32,7 @@ fn checkInvariants(handles_before: u32, allocs_before: usize) !void {
 //    []const u8 + *Alloc, String zero-copy handle, Symbol & unique symbol, Object/Any/Unknown
 pub fn exercisePrimitives(out_alloc: std.mem.Allocator) ![]const u8 {
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     if (!js.has_host) return error.HostUnavailable;
     if (m3_esm.SMALL_BIGINT != -99_999_000_111) return error.Unexpected;
@@ -182,7 +149,7 @@ pub fn exercisePrimitives(out_alloc: std.mem.Allocator) ![]const u8 {
 //    inbound null & undefined -> Zig null, and js.Nullable(f64) 3-way distinction
 pub fn exerciseOptionalsAndNullable(out_alloc: std.mem.Allocator) ![]const u8 {
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     var summary: []u8 = undefined;
     {
@@ -259,7 +226,7 @@ pub fn exerciseOptionalsAndNullable(out_alloc: std.mem.Allocator) ![]const u8 {
 //    + Malformed tuple return arity/type error cleanup with zero Zig or handle leaks!
 pub fn exerciseArraysAndTuples(out_alloc: std.mem.Allocator) ![]const u8 {
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     // ReadonlyArray<string> + number[] -> string[]
     {
@@ -363,7 +330,7 @@ pub fn exerciseArraysAndTuples(out_alloc: std.mem.Allocator) ![]const u8 {
 //    ArrayBuffer, SharedArrayBuffer, DataView — including in-place JS mutation visible to Zig!
 pub fn exerciseBinaryViews(out_alloc: std.mem.Allocator) ![]const u8 {
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     var out: []u8 = undefined;
     {
@@ -435,7 +402,7 @@ pub fn exerciseBinaryViews(out_alloc: std.mem.Allocator) ![]const u8 {
 //    export default, export = CJS callable + merged namespace, and declare global!
 pub fn exerciseGlobalsNamespacesExports(out_alloc: std.mem.Allocator) ![]const u8 {
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     var out: []u8 = undefined;
     {
@@ -539,7 +506,7 @@ pub fn exerciseGlobalsNamespacesExports(out_alloc: std.mem.Allocator) ![]const u
 //    - Module/namespace/global `.set(null)` on `gUndef: string | undefined` vs `gNull: string | null`
 pub fn exerciseNullishFidelity(out_alloc: std.mem.Allocator) ![]const u8 {
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     var out: []u8 = undefined;
     {

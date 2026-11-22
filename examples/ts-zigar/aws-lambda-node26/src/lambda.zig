@@ -12,61 +12,15 @@ const lambda = pkg.aws_lambda_index;
 
 const is_wasm = builtin.cpu.arch.isWasm();
 
-var live_allocs = std.atomic.Value(usize).init(0);
-
-const TrackingAllocator = struct {
-    const backing: std.mem.Allocator = if (is_wasm)
-        std.heap.wasm_allocator
-    else
-        std.heap.smp_allocator;
-
-    const vtable: std.mem.Allocator.VTable = .{
-        .alloc = alloc,
-        .resize = resize,
-        .remap = remap,
-        .free = free,
-    };
-
-    fn allocator() std.mem.Allocator {
-        return .{ .ptr = undefined, .vtable = &vtable };
-    }
-
-    fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const ptr = backing.rawAlloc(len, alignment, ret_addr) orelse return null;
-        if (len > 0) _ = live_allocs.fetchAdd(1, .acq_rel);
-        return ptr;
-    }
-
-    fn resize(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        if (!backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
-        if (memory.len == 0 and new_len > 0) {
-            _ = live_allocs.fetchAdd(1, .acq_rel);
-        } else if (memory.len > 0 and new_len == 0) {
-            _ = live_allocs.fetchSub(1, .acq_rel);
-        }
-        return true;
-    }
-
-    fn remap(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        const ptr = backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
-        if (memory.len == 0 and new_len > 0) {
-            _ = live_allocs.fetchAdd(1, .acq_rel);
-        } else if (memory.len > 0 and new_len == 0) {
-            _ = live_allocs.fetchSub(1, .acq_rel);
-        }
-        return ptr;
-    }
-
-    fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        backing.rawFree(memory, alignment, ret_addr);
-        if (memory.len > 0) _ = live_allocs.fetchSub(1, .acq_rel);
-    }
-};
-
-const tracked_alloc = TrackingAllocator.allocator();
+var gpa: zigar.mem.TrackingAllocator = .init(zigar.mem.allocator);
+const tracked_alloc = gpa.allocator();
 
 pub fn activeAllocCount() usize {
-    return live_allocs.load(.acquire);
+    return gpa.activeCount();
+}
+
+pub fn activeAllocBytes() usize {
+    return gpa.activeBytes();
 }
 
 pub fn activeJsHandleCount() usize {

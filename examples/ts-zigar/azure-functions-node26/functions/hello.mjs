@@ -2,6 +2,7 @@ import {
   registerHttpTriggers,
   invokeHttp,
   activeAllocCount,
+  activeAllocBytes,
   activeJsHandleCount,
   activeJsCallbackCount,
 } from '../dist/azure-func.mjs';
@@ -17,4 +18,4 @@ export function register() {
 
 register();
 
-export { activeAllocCount, activeJsHandleCount, activeJsCallbackCount };
+export { activeAllocCount, activeAllocBytes, activeJsHandleCount, activeJsCallbackCount };

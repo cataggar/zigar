@@ -337,7 +337,13 @@ For nested decoded structs or slices containing strings or handles, use `defer j
 | `defer x.asyncDispose()` / `try x.tryAsyncDispose()` | **Yes** | **Yes** (async) | Async resources (`await using`) inside a JSPI or `WorkQueue` context |
 
 - Reserved singleton handles (`undefined`, `null`, `false`, `true`, `globalThis`) are static indices (`0..4`); calling `.deinit()` or `.clone()` on them is a zero-cost no-op.
-- Audit handle and callback hygiene in tests via `js.activeHandleCount()` and `js.activeCallbackCount()`.
+- Audit handle, callback, and Zig heap hygiene in tests and cloud health endpoints via `js.activeHandleCount()`, `js.activeCallbackCount()`, and `zigar.mem.TrackingAllocator`:
+  ```zig
+  var gpa: zigar.mem.TrackingAllocator = .init(zigar.mem.allocator);
+  const alloc = gpa.allocator();
+  // Inspect live Zig heap usage via gpa.activeCount() and gpa.activeBytes()
+  ```
+  `TrackingAllocator` wraps `std.mem.Allocator` on the Zig side (capturing both Zig-internal heap usage and cross-boundary JS->Zig allocations) and stays opt-in per instance so `zigar.mem.allocator`'s 16-shard `ShardedPool` remains contention-free and application leak checks stay isolated from permanent runtime internal allocations.
 
 #### Inspecting JavaScript Exceptions (`error.JsException`)
 

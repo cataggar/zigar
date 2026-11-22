@@ -5,48 +5,15 @@ const gen = @import("generated/root.zig");
 const js = gen.zigar_js;
 const m = gen.m3_unions_esm;
 
-var live_allocs = std.atomic.Value(usize).init(0);
-
-const TrackingAllocator = struct {
-    fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const ptr = zigar.mem.allocator.rawAlloc(len, alignment, ret_addr) orelse return null;
-        _ = live_allocs.fetchAdd(1, .acq_rel);
-        return ptr;
-    }
-
-    fn resize(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        return zigar.mem.allocator.rawResize(buf, alignment, new_len, ret_addr);
-    }
-
-    fn remap(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        return zigar.mem.allocator.rawRemap(buf, alignment, new_len, ret_addr);
-    }
-
-    fn free(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        zigar.mem.allocator.rawFree(buf, alignment, ret_addr);
-        _ = live_allocs.fetchSub(1, .acq_rel);
-    }
-
-    const vtable: std.mem.Allocator.VTable = .{
-        .alloc = alloc,
-        .resize = resize,
-        .remap = remap,
-        .free = free,
-    };
-
-    fn allocator() std.mem.Allocator {
-        return .{ .ptr = undefined, .vtable = &vtable };
-    }
-};
-
-const tracked_alloc = TrackingAllocator.allocator();
+var gpa: zigar.mem.TrackingAllocator = .init(zigar.mem.allocator);
+const tracked_alloc = gpa.allocator();
 
 pub fn activeHandles() u32 {
     return js.activeHandleCount();
 }
 
 pub fn liveZigAllocs() usize {
-    return live_allocs.load(.acquire);
+    return gpa.activeCount();
 }
 
 pub fn hasPendingCapturedError() bool {
@@ -55,14 +22,14 @@ pub fn hasPendingCapturedError() bool {
 
 fn checkInvariants(handles_before: u32, allocs_before: usize) !void {
     if (js.activeHandleCount() != handles_before) return error.Unexpected;
-    if (live_allocs.load(.acquire) != allocs_before) return error.Unexpected;
+    if (gpa.activeCount() != allocs_before) return error.Unexpected;
     if (js.hasLastError()) return error.Unexpected;
 }
 
 // 1. Enums (i32, aliases, const enum, i64, mixed, ambient unknown-value) & closed literal unions
 pub fn exerciseEnumsAndClosedLiterals(out_alloc: std.mem.Allocator) ![]const u8 {
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     {
         if (m.HttpStatus.ok != m.HttpStatus.success_alias) return error.Unexpected;
@@ -123,7 +90,7 @@ pub fn exerciseEnumsAndClosedLiterals(out_alloc: std.mem.Allocator) ![]const u8 
 // 2. Open literal unions & finite/open template literal patterns
 pub fn exerciseOpenLiteralsAndTemplates(out_alloc: std.mem.Allocator) ![]const u8 {
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     {
         // Known unit literal -> custom literal roundtrip
@@ -173,7 +140,7 @@ pub fn exerciseOpenLiteralsAndTemplates(out_alloc: std.mem.Allocator) ![]const u
 // 3. Discriminated unions (single-tag, multi-tag, boolean, enum-member, non-fallthrough & outbound guard)
 pub fn exerciseDiscriminatedUnions(out_alloc: std.mem.Allocator) ![]const u8 {
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     {
         const ev1 = try m.processAuditEventAlloc(tracked_alloc, .{
@@ -232,7 +199,7 @@ pub fn exerciseDiscriminatedUnions(out_alloc: std.mem.Allocator) ![]const u8 {
 // 4. Heterogeneous specificity, CJS `export =` class instanceof, recursive JsonValue, and generic union nullish
 pub fn exerciseHeteroRecursiveAndGenericUnions(out_alloc: std.mem.Allocator) ![]const u8 {
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     {
         // Exercise all 11 heterogeneous arms inbound + outbound

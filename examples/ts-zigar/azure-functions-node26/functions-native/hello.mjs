@@ -78,5 +78,6 @@ process.once('SIGTERM', () => {
 register();
 
 export const activeAllocCount = () => addon.activeAllocCount();
+export const activeAllocBytes = () => addon.activeAllocBytes();
 export const activeJsHandleCount = () => addon.activeJsHandleCount();
 export const activeJsCallbackCount = () => addon.activeJsCallbackCount();

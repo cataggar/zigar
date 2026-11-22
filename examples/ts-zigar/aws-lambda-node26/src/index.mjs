@@ -3,6 +3,7 @@ export {
   shutdown,
   invoke,
   activeAllocCount,
+  activeAllocBytes,
   activeJsHandleCount,
   activeJsCallbackCount,
 } from './lambda.zig';
