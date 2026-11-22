@@ -38,6 +38,8 @@ function initRegistryState(env) {
   env.jsValueFreeNext = new Int32Array(INITIAL_CAPACITY).fill(-1);
   env.jsValueFreeHead = -1;
   env.jsValueFreeTail = -1;
+  env.jsValueRetiredHead = -1;
+  env.jsValueRetiredTail = -1;
   env.jsValueNextSlot = FIRST_DYNAMIC_SLOT;
   env.jsValueActiveCount = 0;
   env.pendingJsHandles = null;
@@ -90,12 +92,23 @@ var jsValueRegistry = mixin({
       this.jsValueFreeNext[slot] = -1;
       const prevGen = this.jsValueGenerations[slot] & GEN_MASK;
       gen = prevGen + 1;
-    } else {
+    } else if (this.jsValueNextSlot < MAX_SLOTS) {
       if (this.jsValueNextSlot >= this.jsValueSlots.length) {
         this.growJsValueRegistry();
       }
       slot = this.jsValueNextSlot++;
       gen = 1;
+    } else if (this.jsValueRetiredHead >= 0) {
+      slot = this.jsValueRetiredHead;
+      const next = this.jsValueFreeNext[slot];
+      this.jsValueRetiredHead = next;
+      if (next < 0) {
+        this.jsValueRetiredTail = -1;
+      }
+      this.jsValueFreeNext[slot] = -1;
+      gen = 1;
+    } else {
+      throw new RangeError('JsValueRegistry exhausted');
     }
     this.jsValueSlots[slot] = value;
     this.jsValueGenerations[slot] = ACTIVE_BIT | gen;
@@ -153,10 +166,19 @@ var jsValueRegistry = mixin({
     this.jsValueSlots[slot] = undefined;
     this.jsValueActiveCount--;
     if (gen >= GEN_MASK) {
-      // Permanently retire slots once their 12-bit generation reaches 0xFFF (4095)
-      // so a (gen, slot) handle pair is never re-issued across the instance lifetime.
+      // Quarantine slots once their 12-bit generation reaches 0xFFF (4095) into the
+      // retired FIFO list: `jsValueGenerations[slot] = 0` invalidates stale handles,
+      // and the slot is only recycled back to generation 1 once all fresh slots up to
+      // MAX_SLOTS have been allocated (~67M alloc/release cycles).
       this.jsValueGenerations[slot] = 0;
       this.jsValueFreeNext[slot] = -1;
+      if (this.jsValueRetiredTail >= 0) {
+        this.jsValueFreeNext[this.jsValueRetiredTail] = slot;
+        this.jsValueRetiredTail = slot;
+      } else {
+        this.jsValueRetiredHead = slot;
+        this.jsValueRetiredTail = slot;
+      }
     } else {
       this.jsValueGenerations[slot] = gen;
       this.jsValueFreeNext[slot] = -1;

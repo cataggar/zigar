@@ -5547,6 +5547,7 @@ pub fn Js(comptime host: type) type {
         const CallbackRegistry = struct {
             const slab_capacity: usize = 64;
             const initial_table_capacity: usize = 16;
+            const quarantine_slot_cap: usize = 16_384;
             const null_index: u32 = std.math.maxInt(u32);
             const max_slot_index: u32 = (1 << 20) - 2;
             const max_generation: u16 = 0x0FFF;
@@ -5582,6 +5583,8 @@ pub fn Js(comptime host: type) type {
             var high_water_in_tail: usize = 0;
             var free_head: u32 = null_index;
             var free_tail: u32 = null_index;
+            var retired_head: u32 = null_index;
+            var retired_tail: u32 = null_index;
             var active_count: u32 = 0;
 
             fn backingAllocator() std.mem.Allocator {
@@ -5604,6 +5607,7 @@ pub fn Js(comptime host: type) type {
             fn allocate(ctx_ptr: *anyopaque, invoker: InvokerFn, deinit_ctx: ?DeinitCtxFn, is_once: bool, sig_hash: u64) !u32 {
                 var slot_index: u32 = undefined;
                 var entry_ptr: *SlotEntry = undefined;
+                const allocated_slots: usize = (slab_count - 1) * slab_capacity + high_water_in_tail;
 
                 if (free_head != null_index) {
                     slot_index = free_head;
@@ -5613,6 +5617,15 @@ pub fn Js(comptime host: type) type {
                         free_tail = null_index;
                     }
                     entry_ptr.next_free = null_index;
+                } else if (retired_head != null_index and (allocated_slots >= quarantine_slot_cap or allocated_slots > max_slot_index)) {
+                    slot_index = retired_head;
+                    entry_ptr = entryAt(slot_index) orelse return error.Unexpected;
+                    retired_head = entry_ptr.next_free;
+                    if (retired_head == null_index) {
+                        retired_tail = null_index;
+                    }
+                    entry_ptr.next_free = null_index;
+                    entry_ptr.generation = 1;
                 } else {
                     if (high_water_in_tail >= slab_capacity) {
                         const next_global_usize: usize = slab_count * slab_capacity;
@@ -5704,6 +5717,16 @@ pub fn Js(comptime host: type) type {
                         free_head = slot_index;
                         free_tail = slot_index;
                     }
+                } else {
+                    if (retired_tail != null_index) {
+                        if (entryAt(retired_tail)) |tail_entry| {
+                            tail_entry.next_free = slot_index;
+                        }
+                        retired_tail = slot_index;
+                    } else {
+                        retired_head = slot_index;
+                        retired_tail = slot_index;
+                    }
                 }
                 if (deinit_ctx) |cleanup| {
                     cleanup(ctx_ptr);
@@ -5728,8 +5751,9 @@ pub fn Js(comptime host: type) type {
 
                 entry.invoker = null;
                 entry.sig_hash = 0;
-                // Permanently retire slots once their 12-bit generation reaches 0x0FFF (4095)
-                // so a (gen, slot) CallbackId can never wrap around and alias a future callback.
+                // Quarantine slots once their 12-bit generation reaches 0x0FFF (4095) into
+                // the retired FIFO queue (`generation = 0` invalidates stale IDs until recycled
+                // after `quarantine_slot_cap` distinct slots have been allocated).
                 entry.generation = if (entry.generation >= max_generation) 0 else (entry.generation + 1);
                 active_count -= 1;
 
@@ -14731,6 +14755,34 @@ test "CallbackRegistry: FIFO reuse, permanent retirement at 0xFFF, multi-slab O(
 
         // Dispatching `i32_cb.id` (`fn (i32) i32`) through `u32_thunk` (`fn (u32) u32`) MUST fail with `error.SignatureMismatch`!
         try std.testing.expectError(error.SignatureMismatch, u32_thunk(@ptrFromInt(i32_cb.id), @ptrCast(&u32_frame)));
+    }
+
+    // 5. Quarantined max-generation slots recycle cleanly at `quarantine_slot_cap` (16,384 slots) without unbounded slab growth
+    {
+        // Slots 1..3 were quarantined in step 2; holding 16,381 live callbacks reaches `allocated_slots == 16,384` (256 slabs).
+        const hold_count = 16_384 - 3;
+        const held = try std.testing.allocator.alloc(js.Closure(void, Fns.addOne), hold_count);
+        defer std.testing.allocator.free(held);
+        for (held) |*slot| {
+            slot.* = js.Closure(void, Fns.addOne).init();
+        }
+        const slabs_at_cap = js.CallbackRegistry.slab_count;
+        try expectEqual(@as(usize, 256), slabs_at_cap);
+
+        // Next allocation with `free_head == null_index` and `allocated_slots == 16,384` recycles quarantined slot 1 at generation 1.
+        var recycled = js.Closure(void, Fns.addOne).init();
+        try expectEqual(@as(u32, 1), recycled.id & 0x000F_FFFF);
+        try expectEqual(@as(u32, 1), recycled.id >> 20);
+        try expectEqual(slabs_at_cap, js.CallbackRegistry.slab_count);
+
+        var frame: I32Args = .{ .retval = 0, .@"0" = 99 };
+        try i32_thunk_capture(@ptrFromInt(recycled.id), @ptrCast(&frame));
+        try expectEqual(@as(i32, 100), frame.retval);
+
+        recycled.deinit();
+        for (held) |*slot| {
+            slot.deinit();
+        }
     }
     try expectEqual(@as(u32, 0), js.activeCallbackCount());
     try expectEqual(@as(u32, 0), js.activeHandleCount());
