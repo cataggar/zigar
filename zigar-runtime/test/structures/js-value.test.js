@@ -13,7 +13,7 @@ import {
 import { defineEnvironment } from '../../src/environment.js';
 import { NotInErrorSet, UndefinedArgument } from '../../src/errors.js';
 import '../../src/mixins.js';
-import { MEMORY, READ_ONLY, RETURN, SLOTS, ZIG } from '../../src/symbols.js';
+import { FINALIZE, MEMORY, PROMISE, READ_ONLY, RETURN, SLOTS, ZIG } from '../../src/symbols.js';
 
 const Env = defineEnvironment();
 
@@ -874,5 +874,340 @@ describe('Structure: js-value', function() {
     expect(pair.first).to.equal(b);
     expect(pair.second).to.equal(c);
     expect(env.getJsValueCount()).to.equal(0);
+  });
+
+  it('should consume Zig JsValue handles inside ErrorUnion and Generator callback arguments', async function() {
+    const env = new Env();
+    const { u32, jsRef } = defineBasicTypes(env);
+    const allocZigDV = createZigBufferSetup(env);
+
+    const errSetStruct = {
+      type: StructureType.ErrorSet,
+      name: 'CbErr',
+      byteSize: 2,
+      align: 2,
+      flags: StructureFlag.HasValue,
+      signature: 60n,
+      instance: { members: [] },
+      static: {},
+    };
+    errSetStruct.instance.members.push({ type: MemberType.Uint, bitSize: 16, bitOffset: 0, byteSize: 2, structure: errSetStruct });
+    env.beginStructure(errSetStruct);
+    errSetStruct.static = {
+      members: [
+        { name: 'Unexpected', type: MemberType.Object, flags: MemberFlag.IsPartOfSet, slot: 0, structure: errSetStruct },
+      ],
+      template: { [SLOTS]: { 0: env.createInstance(errSetStruct, new DataView(new Uint16Array([ 1 ]).buffer)) } },
+    };
+    env.finishStructure(errSetStruct);
+
+    const euRefStruct = {
+      type: StructureType.ErrorUnion,
+      name: 'CbErr!Ref',
+      byteSize: 8,
+      align: 4,
+      flags: StructureFlag.HasValue | StructureFlag.HasObject | StructureFlag.HasSlot,
+      signature: 61n,
+      instance: {
+        members: [
+          { type: MemberType.Object, bitSize: 32, bitOffset: 0, byteSize: 4, slot: 0, structure: jsRef },
+          { type: MemberType.Uint, flags: MemberFlag.IsSelector, bitSize: 16, bitOffset: 32, byteSize: 2, structure: errSetStruct },
+        ],
+      },
+      static: {},
+    };
+    env.beginStructure(euRefStruct);
+    env.finishStructure(euRefStruct);
+
+    const cbArgStruct = {
+      type: StructureType.ArgStruct,
+      name: 'PromiseCbArgs',
+      byteSize: 12,
+      align: 4,
+      length: 2,
+      flags: StructureFlag.HasObject | StructureFlag.HasSlot,
+      signature: 62n,
+      instance: {
+        members: [
+          { name: 'retval', type: MemberType.Void, bitSize: 0, bitOffset: 0, byteSize: 0, structure: u32 },
+          { name: '0', type: MemberType.Uint, bitSize: 32, bitOffset: 0, byteSize: 4, structure: u32 },
+          { name: '1', type: MemberType.Object, bitSize: 64, bitOffset: 32, byteSize: 8, slot: 0, structure: euRefStruct },
+        ],
+      },
+      static: {},
+    };
+    env.beginStructure(cbArgStruct);
+    env.finishStructure(cbArgStruct);
+    const PromiseCbArgs = cbArgStruct.constructor;
+
+    const cbFnStruct = {
+      type: StructureType.Function,
+      name: 'fn (u32, CbErr!Ref) void',
+      byteSize: 0,
+      align: 1,
+      instance: { members: [ { type: MemberType.Object, structure: cbArgStruct } ] },
+      static: {},
+    };
+    const cbPtrStruct = {
+      type: StructureType.Pointer,
+      name: '*const fn (u32, CbErr!Ref) void',
+      byteSize: 4,
+      align: 4,
+      instance: { members: [ { type: MemberType.Object, structure: cbFnStruct } ] },
+      static: {},
+    };
+    const realPromiseStruct = {
+      type: StructureType.Struct,
+      purpose: StructurePurpose.Promise,
+      constructor: function RealPromiseStruct() {},
+      instance: {
+        members: [
+          { name: 'ptr', structure: u32 },
+          { name: 'callback', structure: cbPtrStruct },
+        ],
+      },
+      static: {},
+    };
+
+    const payload = { statusCode: 200, body: 'ok' };
+    const handle = env.allocJsValue(payload);
+    expect(env.getJsValueCount()).to.equal(1);
+
+    if (process.env.TARGET === 'wasm') {
+      env.memory = new WebAssembly.Memory({ initial: 1 });
+    }
+    const argsObj = { [FINALIZE]: () => {} };
+    const promiseRec = env.createPromise(realPromiseStruct, argsObj, undefined);
+    expect(promiseRec.callback[FINALIZE]).to.be.true;
+
+    let resolvedPtr;
+    let resolvedValue;
+    const cb = (ptr, val) => {
+      resolvedPtr = ptr;
+      resolvedValue = val;
+    };
+    cb[FINALIZE] = true;
+    const inboundCaller = env.createInboundCaller(cb, PromiseCbArgs);
+    expect(inboundCaller).to.be.a('function');
+
+    const zigArgDV = allocZigDV(0x4000, 12);
+    zigArgDV.setUint32(0, 77, env.littleEndian);
+    zigArgDV.setUint32(4, handle, env.littleEndian);
+    zigArgDV.setUint16(8, 0, env.littleEndian);
+
+    const fnId = env.getFunctionId(cb);
+    env.jsFunctionCallerMap.get(fnId)(zigArgDV);
+
+    expect(resolvedPtr).to.equal(77);
+    expect(resolvedValue).to.equal(payload);
+    expect(env.getJsValueCount()).to.equal(0);
+
+    // Error branch on ErrorUnion(JsValue): non-zero error selector must pass Error and NOT release
+    // an unrelated live handle whose integer value happens to sit in the uninitialized payload bytes!
+    const innocentObj = { innocent: true };
+    const innocentHandle = env.allocJsValue(innocentObj);
+    expect(env.getJsValueCount()).to.equal(1);
+    zigArgDV.setUint32(0, 78, env.littleEndian);
+    zigArgDV.setUint32(4, innocentHandle, env.littleEndian);
+    zigArgDV.setUint16(8, 1, env.littleEndian); // CbErr.Unexpected
+
+    env.jsFunctionCallerMap.get(fnId)(zigArgDV);
+    expect(resolvedPtr).to.equal(78);
+    expect(resolvedValue).to.be.instanceOf(Error);
+    expect(env.getJsValueCount()).to.equal(1);
+    expect(env.getJsValue(innocentHandle)).to.equal(innocentObj);
+
+    // Reference identity + Zig-owned Ref preservation end-to-end through `createPromise` with real
+    // `Pointer -> Function -> ArgStruct` structure: when `!JsValue` carries a borrowed Zig-backed
+    // Zigar object containing a `Ref` field, `await argsObj[PROMISE]` must return `=== zigBackedInstance`
+    // and must NOT release the Zig-owned `Ref` handle inside `zigBackedInstance`!
+    const zigBoxStruct = {
+      type: StructureType.Struct,
+      name: 'ZigBoxWithRef',
+      byteSize: 8,
+      align: 4,
+      flags: StructureFlag.HasObject | StructureFlag.HasSlot | StructFlag.IsExtern,
+      signature: 63n,
+      instance: {
+        members: [
+          { name: 'inner', type: MemberType.Object, bitSize: 32, bitOffset: 0, byteSize: 4, slot: 0, structure: jsRef },
+          { name: 'val', type: MemberType.Uint, bitSize: 32, bitOffset: 32, byteSize: 4, structure: u32 },
+        ],
+      },
+      static: {},
+    };
+    env.beginStructure(zigBoxStruct);
+    env.finishStructure(zigBoxStruct);
+    const ZigBox = zigBoxStruct.constructor;
+    const zigOwnedInnerObj = { ownedByZig: true };
+    const zigOwnedInnerHandle = env.allocJsValue(zigOwnedInnerObj);
+    const zigBoxDV = allocZigDV(0x4100, 8);
+    zigBoxDV.setUint32(0, zigOwnedInnerHandle, env.littleEndian);
+    zigBoxDV.setUint32(4, 999, env.littleEndian);
+    const zigBackedInstance = ZigBox(zigBoxDV);
+    expect(zigBackedInstance[MEMORY][ZIG]).to.be.ok;
+
+    const realPromiseCallerThunk = (_unusedPtr, val) => promiseRec.callback(promiseRec.ptr, val);
+    realPromiseCallerThunk[FINALIZE] = promiseRec.callback[FINALIZE];
+    env.createInboundCaller(realPromiseCallerThunk, PromiseCbArgs);
+    const realPromiseCaller = env.jsFunctionCallerMap.get(env.getFunctionId(realPromiseCallerThunk));
+
+    const zigBackedHandle = env.allocJsValue(zigBackedInstance);
+    expect(env.getJsValueCount()).to.equal(3); // innocentHandle + zigOwnedInnerHandle + zigBackedHandle
+    zigArgDV.setUint32(0, 79, env.littleEndian);
+    zigArgDV.setUint32(4, zigBackedHandle, env.littleEndian);
+    zigArgDV.setUint16(8, 0, env.littleEndian);
+
+    realPromiseCaller(zigArgDV);
+    const awaitedBox = await argsObj[PROMISE];
+    expect(awaitedBox).to.equal(zigBackedInstance);
+    expect(awaitedBox.inner).to.equal(zigOwnedInnerObj);
+    expect(env.getJsValueCount()).to.equal(2); // zigBackedHandle consumed; innocentHandle + zigOwnedInnerHandle intact!
+    expect(env.getJsValue(zigOwnedInnerHandle)).to.equal(zigOwnedInnerObj);
+    env.releaseJsValue(innocentHandle);
+    expect(env.getJsValueCount()).to.equal(1); // zigOwnedInnerHandle remains live for Generator check below
+
+    // Generator multi-yield + null completion + early consumer stop (`retval === false`)
+    env.finalizeAsyncCall = () => {};
+    const futexAddr = (env.memory64 || process.env.BITS == 64) ? 0x100n : 0x100;
+
+    const optRefStruct = {
+      type: StructureType.Optional,
+      name: '?Ref',
+      byteSize: 8,
+      align: 4,
+      flags: StructureFlag.HasValue | StructureFlag.HasObject | StructureFlag.HasSlot | OptionalFlag.HasSelector,
+      signature: 64n,
+      instance: {
+        members: [
+          { type: MemberType.Object, bitSize: 32, bitOffset: 0, byteSize: 4, slot: 0, structure: jsRef },
+          { type: MemberType.Uint, flags: MemberFlag.IsSelector, bitSize: 8, bitOffset: 32, byteSize: 1, structure: u32 },
+        ],
+      },
+      static: {},
+    };
+    env.beginStructure(optRefStruct);
+    env.finishStructure(optRefStruct);
+
+    const genCbArgStruct = {
+      type: StructureType.ArgStruct,
+      name: 'GenCbArgs',
+      byteSize: 16,
+      align: 4,
+      length: 2,
+      flags: StructureFlag.HasObject | StructureFlag.HasSlot,
+      signature: 65n,
+      instance: {
+        members: [
+          { name: 'retval', type: MemberType.Uint, bitSize: 8, bitOffset: 0, byteSize: 1, structure: u32 },
+          { name: '0', type: MemberType.Uint, bitSize: 32, bitOffset: 32, byteSize: 4, structure: u32 },
+          { name: '1', type: MemberType.Object, bitSize: 64, bitOffset: 64, byteSize: 8, slot: 0, structure: optRefStruct },
+        ],
+      },
+      static: {},
+    };
+    env.beginStructure(genCbArgStruct);
+    env.finishStructure(genCbArgStruct);
+    const GenCbArgs = genCbArgStruct.constructor;
+
+    const genCbFnStruct = {
+      type: StructureType.Function,
+      name: 'fn (u32, ?Ref) bool',
+      byteSize: 0,
+      align: 1,
+      instance: { members: [ { type: MemberType.Object, structure: genCbArgStruct } ] },
+      static: {},
+    };
+    const genCbPtrStruct = {
+      type: StructureType.Pointer,
+      name: '*const fn (u32, ?Ref) bool',
+      byteSize: 4,
+      align: 4,
+      instance: { members: [ { type: MemberType.Object, structure: genCbFnStruct } ] },
+      static: {},
+    };
+    const realGenStruct = {
+      type: StructureType.Struct,
+      purpose: StructurePurpose.Generator,
+      constructor: function RealGeneratorStruct() {},
+      instance: {
+        members: [
+          { name: 'ptr', structure: u32 },
+          { name: 'callback', structure: genCbPtrStruct },
+        ],
+      },
+      static: {},
+    };
+
+    const genArgsObj = { [FINALIZE]: () => {} };
+    const yieldedItems = [];
+    let stopAfterSecond = false;
+    const genRec = env.createGenerator(realGenStruct, genArgsObj, (val) => {
+      yieldedItems.push(val);
+      if (stopAfterSecond && yieldedItems.length >= 2) {
+        return false;
+      }
+      return true;
+    });
+    expect(genRec.callback[FINALIZE]).to.be.true;
+    let activeGenRec = genRec;
+    const genThunk = (_unusedPtr, val) => activeGenRec.callback(activeGenRec.ptr, val);
+    genThunk[FINALIZE] = genRec.callback[FINALIZE];
+    env.createInboundCaller(genThunk, GenCbArgs);
+    const genCaller = env.jsFunctionCallerMap.get(env.getFunctionId(genThunk));
+
+    const genArgDV = allocZigDV(0x4200, 16);
+    const item1 = zigBackedInstance; // verify Generator `?Ref` also preserves `===` + Zig-owned Ref handle!
+    const item2 = { seq: 2 };
+    const hItem1 = env.allocJsValue(item1);
+    genArgDV.setUint32(4, 1, env.littleEndian);
+    genArgDV.setUint32(8, hItem1, env.littleEndian);
+    genArgDV.setUint8(12, 1);
+    genCaller(genArgDV, futexAddr);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(env.getJsValueCount()).to.equal(1); // only zigOwnedInnerHandle remains
+
+    const hItem2 = env.allocJsValue(item2);
+    genArgDV.setUint32(8, hItem2, env.littleEndian);
+    genArgDV.setUint8(12, 1);
+    genCaller(genArgDV, futexAddr);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(env.getJsValueCount()).to.equal(1);
+
+    // Null completion (selector = 0)
+    genArgDV.setUint32(8, 0, env.littleEndian);
+    genArgDV.setUint8(12, 0);
+    genCaller(genArgDV, futexAddr);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(yieldedItems[0]).to.equal(zigBackedInstance);
+    expect(yieldedItems[0].inner).to.equal(zigOwnedInnerObj);
+    expect(yieldedItems[1]).to.eql(item2);
+    expect(yieldedItems[2]).to.be.null;
+    env.releaseJsValue(zigOwnedInnerHandle);
+    expect(env.getJsValueCount()).to.equal(0);
+
+    // Early consumer break (`stopAfterSecond = true` -> callback returns false)
+    yieldedItems.length = 0;
+    stopAfterSecond = true;
+    const genArgsObj2 = { [FINALIZE]: () => {} };
+    const genRec2 = env.createGenerator(realGenStruct, genArgsObj2, (val) => {
+      yieldedItems.push(val);
+      return yieldedItems.length < 2;
+    });
+    activeGenRec = genRec2;
+    const hEarly1 = env.allocJsValue({ early: 1 });
+    genArgDV.setUint32(8, hEarly1, env.littleEndian);
+    genArgDV.setUint8(12, 1);
+    genCaller(genArgDV, futexAddr);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(env.getJsValueCount()).to.equal(0);
+
+    const hEarly2 = env.allocJsValue({ early: 2 });
+    genArgDV.setUint32(8, hEarly2, env.littleEndian);
+    genArgDV.setUint8(12, 1);
+    genCaller(genArgDV, futexAddr);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(env.getJsValueCount()).to.equal(0);
+    expect(yieldedItems).to.eql([ { early: 1 }, { early: 2 } ]);
   });
 });

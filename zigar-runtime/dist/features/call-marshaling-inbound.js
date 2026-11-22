@@ -1,7 +1,8 @@
 import { PosixError, StructureType, StructurePurpose, MemberType, VisitorFlag } from '../constants.js';
 import { mixin } from '../environment.js';
 import { catchPosixError, UnexpectedGenerator } from '../errors.js';
-import { MEMORY, ZIG, ALLOCATOR, VISIT, RETURN, YIELD, THROWING } from '../symbols.js';
+import { MEMORY, FINALIZE, ZIG, ALLOCATOR, VISIT, RETURN, YIELD, THROWING } from '../symbols.js';
+import { unwrapsJsValue } from '../utils.js';
 
 var callMarshalingInbound = mixin({
   init() {
@@ -46,6 +47,9 @@ var callMarshalingInbound = mixin({
           this.updatePointerTargets(context, argStruct, true);
           this.updateShadowTargets(context);
           this.endContext();
+        }
+        if (fn[FINALIZE]) {
+          argStruct[FINALIZE] = true;
         }
         // obtain argument list so that argStruct[RETURN] gets set when there's a promise
         const args = [ ...argStruct ];
@@ -103,13 +107,17 @@ var callMarshalingInbound = mixin({
         let allocatorCount = 0, callbackCount = 0, signalCount = 0;
         let generatorAlloc;
         const args = [];
-        for (const [ srcIndex, { structure, type } ] of members.entries()) {
+        const consumeZigJsValues = Boolean(this[FINALIZE]);
+        for (const [ srcIndex, { structure, type, bitOffset } ] of members.entries()) {
           // error unions will throw on access, in which case we pass the error as the argument
           try {
             let arg = this[srcIndex];
-            if (type === MemberType.Object && structure.purpose !== StructurePurpose.JsValue && arg?.[MEMORY]?.[ZIG]) {
+            if (type === MemberType.Object && !unwrapsJsValue(structure) && arg?.[MEMORY]?.[ZIG]) {
               // create copy in JS memory
               arg = new arg.constructor(arg);
+            }
+            if (consumeZigJsValues && type === MemberType.Object && bitOffset !== undefined && this[MEMORY]?.[ZIG]) {
+              thisEnv.releaseZigJsValues?.(structure, this[MEMORY], bitOffset >> 3);
             }
             let optName, opt;
             if (structure.type === StructureType.Struct) {

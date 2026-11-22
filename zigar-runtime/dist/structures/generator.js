@@ -1,7 +1,8 @@
 import { StructurePurpose } from '../constants.js';
 import { mixin } from '../environment.js';
 import { TypeMismatch } from '../errors.js';
-import { YIELD, THROWING, GENERATOR, MEMORY, TRANSFORM, RESET, FINALIZE, RETURN } from '../symbols.js';
+import { YIELD, THROWING, GENERATOR, MEMORY, ZIG, TRANSFORM, RESET, FINALIZE, RETURN } from '../symbols.js';
+import { unwrapsJsValue, getCallbackPayloadStructure } from '../utils.js';
 
 var generator = mixin({
   init() {
@@ -11,6 +12,7 @@ var generator = mixin({
   },
   createGenerator(structure, args, func) {
     const { constructor, instance: { members } } = structure;
+    const payloadUnwrapsJsValue = unwrapsJsValue(getCallbackPayloadStructure(structure));
     if (func) {
       if (typeof(func) !== 'function') {
         throw new TypeMismatch('function', func);
@@ -35,6 +37,9 @@ var generator = mixin({
         const instance = this.generatorContextMap.get(contextId);
         if (instance) {
           const { func, args } = instance;
+          if (!payloadUnwrapsJsValue && result?.[MEMORY]?.[ZIG]) {
+            result = new result.constructor(result);
+          }
           const isError = result instanceof Error;
           if (!isError && result) {
             const f = args[TRANSFORM];
@@ -54,6 +59,7 @@ var generator = mixin({
         }
         return false
       };
+      callback[FINALIZE] = true;
       this.generatorCallbackMap.set(constructor, callback);
       this.destructors.push(() => this.freeFunction(callback));
     }

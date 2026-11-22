@@ -4,6 +4,45 @@ const expectError = std.testing.expectError;
 
 const util = @import("util.zig");
 
+fn releaseDiscardedJsValues(comptime V: type, value: V) void {
+    switch (@typeInfo(V)) {
+        .error_union => {
+            if (value) |payload| {
+                releaseDiscardedJsValues(@TypeOf(payload), payload);
+            } else |_| {}
+        },
+        .optional => {
+            if (value) |payload| {
+                releaseDiscardedJsValues(@TypeOf(payload), payload);
+            }
+        },
+        .@"struct" => |info| {
+            if (comptime util.getInternalType(V) == .js_value) {
+                if (comptime @hasDecl(V, "deinit")) {
+                    value.deinit();
+                }
+                return;
+            }
+            inline for (info.fields) |field| {
+                releaseDiscardedJsValues(field.type, @field(value, field.name));
+            }
+        },
+        .@"union" => |info| {
+            if (info.tag_type != null) {
+                switch (value) {
+                    inline else => |payload| releaseDiscardedJsValues(@TypeOf(payload), payload),
+                }
+            }
+        },
+        .array => |info| {
+            for (value) |elem| {
+                releaseDiscardedJsValues(info.child, elem);
+            }
+        },
+        else => {},
+    }
+}
+
 pub fn Promise(comptime T: type) type {
     return struct {
         ptr: ?*anyopaque = null,
@@ -55,6 +94,8 @@ pub fn Promise(comptime T: type) type {
                     }
                     if (call) {
                         ctx.promise.resolve(value);
+                    } else {
+                        releaseDiscardedJsValues(T, value);
                     }
                     if (free) {
                         const allocator_copy = ctx.allocator;
@@ -95,6 +136,46 @@ pub fn Promise(comptime T: type) type {
 
 test {
     _ = Promise(anyerror!u32);
+}
+
+test "partition releases discarded JsValue handles" {
+    const MockJsVal = struct {
+        handle: u32,
+        pub const internal_type: util.InternalType = .js_value;
+
+        var deinit_count: usize = 0;
+        var last_deinited: u32 = 0;
+
+        pub fn deinit(self: @This()) void {
+            deinit_count += 1;
+            last_deinited = self.handle;
+        }
+    };
+
+    const ns = struct {
+        var resolved_handle: u32 = 0;
+
+        fn onResolve(_: ?*anyopaque, val: anyerror!MockJsVal) void {
+            if (val) |v| {
+                resolved_handle = v.handle;
+            } else |_| {}
+        }
+    };
+
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    defer _ = gpa.deinit();
+
+    const p = Promise(anyerror!MockJsVal).init(null, ns.onResolve);
+    const mp = try p.partition(gpa.allocator(), 3);
+    mp.resolve(.{ .handle = 101 });
+    mp.resolve(.{ .handle = 102 });
+    try expectEqual(@as(usize, 2), MockJsVal.deinit_count);
+    try expectEqual(@as(u32, 102), MockJsVal.last_deinited);
+    try expectEqual(@as(u32, 0), ns.resolved_handle);
+
+    mp.resolve(.{ .handle = 103 });
+    try expectEqual(@as(usize, 2), MockJsVal.deinit_count);
+    try expectEqual(@as(u32, 103), ns.resolved_handle);
 }
 
 pub fn PromiseOf(comptime arg: anytype) type {

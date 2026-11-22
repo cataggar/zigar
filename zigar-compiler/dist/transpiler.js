@@ -578,6 +578,26 @@ function isCompatibleInstanceOf(object, Type) {
   return (object instanceof Type) || isCompatibleType(object?.constructor, Type);
 }
 
+function unwrapsJsValue(structure) {
+  if (!structure) {
+    return false;
+  }
+  if (structure.purpose === StructurePurpose.JsValue) {
+    return true;
+  }
+  if (structure.type === StructureType.ErrorUnion || structure.type === StructureType.Optional) {
+    return unwrapsJsValue(structure.instance?.members?.[0]?.structure);
+  }
+  return false;
+}
+
+function getCallbackPayloadStructure(structure) {
+  const callbackStructure = structure?.instance?.members?.find(m => m.name === 'callback')?.structure;
+  const fnStructure = callbackStructure?.instance?.members?.[0]?.structure;
+  const argStructure = fnStructure?.instance?.members?.[0]?.structure;
+  return argStructure?.instance?.members?.[2]?.structure;
+}
+
 function hasJsValue(structure, seen = new Set()) {
   if (!structure || seen.has(structure)) {
     return false;
@@ -7341,6 +7361,9 @@ var callMarshalingInbound = mixin({
           this.updateShadowTargets(context);
           this.endContext();
         }
+        if (fn[FINALIZE]) {
+          argStruct[FINALIZE] = true;
+        }
         // obtain argument list so that argStruct[RETURN] gets set when there's a promise
         const args = [ ...argStruct ];
         const hasCallback = argStruct.hasOwnProperty(RETURN);
@@ -7397,13 +7420,17 @@ var callMarshalingInbound = mixin({
         let allocatorCount = 0, callbackCount = 0, signalCount = 0;
         let generatorAlloc;
         const args = [];
-        for (const [ srcIndex, { structure, type } ] of members.entries()) {
+        const consumeZigJsValues = Boolean(this[FINALIZE]);
+        for (const [ srcIndex, { structure, type, bitOffset } ] of members.entries()) {
           // error unions will throw on access, in which case we pass the error as the argument
           try {
             let arg = this[srcIndex];
-            if (type === MemberType.Object && structure.purpose !== StructurePurpose.JsValue && arg?.[MEMORY]?.[ZIG]) {
+            if (type === MemberType.Object && !unwrapsJsValue(structure) && arg?.[MEMORY]?.[ZIG]) {
               // create copy in JS memory
               arg = new arg.constructor(arg);
+            }
+            if (consumeZigJsValues && type === MemberType.Object && bitOffset !== undefined && this[MEMORY]?.[ZIG]) {
+              thisEnv.releaseZigJsValues?.(structure, this[MEMORY], bitOffset >> 3);
             }
             let optName, opt;
             if (structure.type === StructureType.Struct) {
@@ -13993,6 +14020,7 @@ var generator = mixin({
   },
   createGenerator(structure, args, func) {
     const { constructor, instance: { members } } = structure;
+    const payloadUnwrapsJsValue = unwrapsJsValue(getCallbackPayloadStructure(structure));
     if (func) {
       if (typeof(func) !== 'function') {
         throw new TypeMismatch('function', func);
@@ -14017,6 +14045,9 @@ var generator = mixin({
         const instance = this.generatorContextMap.get(contextId);
         if (instance) {
           const { func, args } = instance;
+          if (!payloadUnwrapsJsValue && result?.[MEMORY]?.[ZIG]) {
+            result = new result.constructor(result);
+          }
           const isError = result instanceof Error;
           if (!isError && result) {
             const f = args[TRANSFORM];
@@ -14036,6 +14067,7 @@ var generator = mixin({
         }
         return false
       };
+      callback[FINALIZE] = true;
       this.generatorCallbackMap.set(constructor, callback);
       this.destructors.push(() => this.freeFunction(callback));
     }
@@ -14227,6 +14259,7 @@ var promise = mixin({
   // create promise struct for outbound call
   createPromise(structure, args, func) {
     const { constructor } = structure;
+    const payloadUnwrapsJsValue = unwrapsJsValue(getCallbackPayloadStructure(structure));
     if (func) {
       if (typeof(func) !== 'function') {
         throw new TypeMismatch('function', func);
@@ -14234,11 +14267,6 @@ var promise = mixin({
     } else {
       args[PROMISE] = new Promise((resolve, reject) => {
         func = (result) => {
-          if (result?.[MEMORY]?.[ZIG]) {
-            // the memory in the result object is stack memory, which will go bad after the function
-            // returns; we need to copy the content into JavaScript memory
-            result = new result.constructor(result);
-          }
           if (result instanceof Error) {
             reject(result);
           } else {
@@ -14268,6 +14296,11 @@ var promise = mixin({
         const instance = this.promiseContextMap.get(contextId);
         if (instance) {
           const { func, args } = instance;
+          if (!payloadUnwrapsJsValue && result?.[MEMORY]?.[ZIG]) {
+            // the memory in the result object is stack memory, which will go bad after the function
+            // returns; we need to copy the content into JavaScript memory
+            result = new result.constructor(result);
+          }
           if (func.length === 2) {
             const isError = result instanceof Error;
             func(isError ? result : null, isError ? null : result);
@@ -14278,6 +14311,7 @@ var promise = mixin({
           this.promiseContextMap.delete(contextId);  
         }
       };
+      callback[FINALIZE] = true;
       this.promiseCallbackMap.set(constructor, callback);
       this.destructors.push(() => this.freeFunction(callback));
     }
@@ -17464,6 +17498,9 @@ var all$1 = mixin({
     }
     // static variable/constants are stored in slots
     staticDescriptors[SLOTS] = (props.length > 0) && defineValue(template[SLOTS]);
+    if (type !== StructureType.Pointer && hasJsValue(structure)) {
+      staticDescriptors[JS_VALUE] = defineValue(structure);
+    }
     const handlerName = `finalize${structureNames[type]}`;
     const f = this[handlerName];
     if (f?.call(this, structure, staticDescriptors, descriptors) !== false) {

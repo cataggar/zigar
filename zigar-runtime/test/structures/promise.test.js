@@ -1,7 +1,8 @@
 import { expect } from 'chai';
+import { StructurePurpose, StructureType } from '../../src/constants.js';
 import { defineEnvironment } from '../../src/environment.js';
 import '../../src/mixins.js';
-import { FINALIZE, MEMORY, PROMISE, RETURN, TRANSFORM, ZIG } from '../../src/symbols.js';
+import { FINALIZE, JS_VALUE, MEMORY, PROMISE, RETURN, TRANSFORM, TYPE, ZIG } from '../../src/symbols.js';
 import { copyView, usize } from '../../src/utils.js';
 
 const Env = defineEnvironment();
@@ -61,6 +62,76 @@ describe('Structure: promise', function() {
       const result = await args[PROMISE];
       expect(result[MEMORY]).to.not.equal(resultFixed[MEMORY]);
       expect(result[MEMORY][ZIG]).to.be.undefined;
+    })
+    it('should preserve === identity and Zig-owned handles when resolving !JsValue with a Zig-backed object', async function() {
+      const env = new Env();
+      const args = {};
+      if (process.env.TARGET === 'wasm') {
+        env.memory = new WebAssembly.Memory({ initial: 1 });
+      }
+      const jsValueStructure = {
+        type: StructureType.Struct,
+        purpose: StructurePurpose.JsValue,
+        byteSize: 4,
+        instance: { members: [] },
+      };
+      const errorUnionStructure = {
+        type: StructureType.ErrorUnion,
+        instance: { members: [ { structure: jsValueStructure } ] },
+      };
+      const cbArgStructure = {
+        type: StructureType.ArgStruct,
+        instance: {
+          members: [
+            { name: 'retval', structure: {} },
+            { name: '0', structure: {} },
+            { name: '1', structure: errorUnionStructure },
+          ],
+        },
+      };
+      const cbFnStructure = {
+        type: StructureType.Function,
+        instance: { members: [ { structure: cbArgStructure } ] },
+      };
+      const cbPtrStructure = {
+        type: StructureType.Pointer,
+        instance: { members: [ { structure: cbFnStructure } ] },
+      };
+      const promiseStructure = {
+        constructor: function PromiseStruct() {},
+        instance: {
+          members: [
+            { name: 'ptr', structure: {} },
+            { name: 'callback', structure: cbPtrStructure },
+          ],
+        },
+      };
+      const { ptr, callback } = env.createPromise(promiseStructure, args, undefined);
+      args[FINALIZE] = () => {};
+
+      const zigOwnedHandle = env.allocJsValue({ inner: 'zig-owned' });
+      expect(env.getJsValueCount()).to.equal(1);
+      let copyCount = 0;
+      const BorrowedBox = function(other) {
+        if (other) copyCount++;
+        this[MEMORY] = new DataView(new ArrayBuffer(4));
+      };
+      BorrowedBox[TYPE] = StructureType.Struct;
+      BorrowedBox[JS_VALUE] = jsValueStructure;
+      const zigResult = new BorrowedBox();
+      if (process.env.TARGET === 'wasm') {
+        zigResult[MEMORY] = new DataView(env.memory.buffer, 0x2000, 4);
+      }
+      zigResult[MEMORY].setUint32(0, zigOwnedHandle, env.littleEndian);
+      zigResult[MEMORY][ZIG] = { address: usize(0x2000), len: 4 };
+
+      callback({ '*': { [MEMORY]: ptr } }, zigResult);
+      const resolved = await args[PROMISE];
+      expect(resolved).to.equal(zigResult);
+      expect(copyCount).to.equal(0);
+      expect(env.getJsValueCount()).to.equal(1);
+      env.releaseJsValue(zigOwnedHandle);
+      expect(env.getJsValueCount()).to.equal(0);
     })
     it('should reject a promise when the callback function is given an error', async function() {
       const env = new Env();

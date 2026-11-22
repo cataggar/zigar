@@ -1,0 +1,20 @@
+{
+  "name": "@zigar-examples/aws-lambda-node26",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=26.0.0"
+  },
+  "description": "AWS Lambda nodejs26.x (Amazon Linux 2023) + Elastic Beanstalk async Zig 0.17 handler via zigar ts (@types/aws-lambda + @types/node@26)",
+  "devDependencies": {
+    "@types/aws-lambda": "8.10.164",
+    "@types/node": "26.6.6"
+  },
+  "scripts": {
+    "generate": "node generate.mjs",
+    "build:wasm": "node build-wasm.mjs",
+    "build:native": "node build-native.mjs",
+    "test": "node --test test/lambda.test.mjs"
+  }
+}

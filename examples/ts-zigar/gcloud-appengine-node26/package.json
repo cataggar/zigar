@@ -1,0 +1,19 @@
+{
+  "name": "@zigar-examples/gcloud-appengine-node26",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=26.0.0"
+  },
+  "description": "Google App Engine Standard (nodejs26, Ubuntu 24.04) HTTP service in Zig 0.17 via zigar ts",
+  "scripts": {
+    "generate": "node ../node/generate.mjs",
+    "build:wasm": "node build-wasm.mjs",
+    "predeploy": "npm run build:wasm",
+    "start": "node run-wasm.mjs",
+    "run:wasm": "REBUILD_WASM=1 node run-wasm.mjs",
+    "run:native": "node run-native.mjs",
+    "test": "node --test test/gae.test.mjs"
+  }
+}

@@ -2,8 +2,9 @@ import { StructurePurpose } from '../constants.js';
 import { mixin } from '../environment.js';
 import { TypeMismatch } from '../errors.js';
 import {
-  FINALIZE, GENERATOR, MEMORY, RESET, RETURN, THROWING, TRANSFORM, YIELD
+  FINALIZE, GENERATOR, MEMORY, RESET, RETURN, THROWING, TRANSFORM, YIELD, ZIG
 } from '../symbols.js';
+import { getCallbackPayloadStructure, unwrapsJsValue } from '../utils.js';
 
 export default mixin({
   init() {
@@ -13,6 +14,7 @@ export default mixin({
   },
   createGenerator(structure, args, func) {
     const { constructor, instance: { members } } = structure;
+    const payloadUnwrapsJsValue = unwrapsJsValue(getCallbackPayloadStructure(structure));
     if (func) {
       if (typeof(func) !== 'function') {
         throw new TypeMismatch('function', func);
@@ -37,6 +39,9 @@ export default mixin({
         const instance = this.generatorContextMap.get(contextId);
         if (instance) {
           const { func, args } = instance;
+          if (!payloadUnwrapsJsValue && result?.[MEMORY]?.[ZIG]) {
+            result = new result.constructor(result);
+          }
           const isError = result instanceof Error;
           if (!isError && result) {
             const f = args[TRANSFORM];
@@ -56,6 +61,7 @@ export default mixin({
         }
         return false
       };
+      callback[FINALIZE] = true;
       this.generatorCallbackMap.set(constructor, callback);
       this.destructors.push(() => this.freeFunction(callback));
     }

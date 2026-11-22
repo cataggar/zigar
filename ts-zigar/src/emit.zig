@@ -5326,10 +5326,13 @@ const ModuleEmitCtx = struct {
                 try self.emitLiteralConst(pub_kw, d.zig_ident, cl.ty, cl.value);
             },
             .global_var => |gty| {
+                const is_default_var = !d.is_global_scope and
+                    self.ns_wire_path.items.len == 0 and
+                    (d.is_default_export or self.isExportEqualsRootDecl(d) or std.mem.eql(u8, d.wire_name, "default"));
                 try self.out.print(self.allocator, "{s}const {s}: __zigar_js.GlobalTarget(", .{ pub_kw, d.zig_ident });
                 try self.emitType(gty);
                 try self.out.appendSlice(self.allocator, ", ");
-                try self.emitCallTargetLiteral(d.is_global_scope, d.wire_name, false, null);
+                try self.emitCallTargetLiteral(d.is_global_scope, d.wire_name, is_default_var, null);
                 try self.out.appendSlice(self.allocator, ", ");
                 try self.emitNullishSpec(gty, false);
                 try self.out.appendSlice(self.allocator, ") = .{};\n");
