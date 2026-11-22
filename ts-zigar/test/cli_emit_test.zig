@@ -7353,3 +7353,155 @@ test "Issue #65: export = declare var emits .is_default = true on GlobalTarget (
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
 }
 
+test "Issue #66: bundled package.json main+types without exports rewrites declaration-only submodules to package root while preserving real JS subpaths" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue66-main-types-no-exports", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const bundled_pkg = try std.fmt.allocPrint(alloc, "{s}/node_modules/@acme/bundled-fn", .{sandbox});
+    defer alloc.free(bundled_pkg);
+    const unbundled_pkg = try std.fmt.allocPrint(alloc, "{s}/node_modules/@acme/unbundled", .{sandbox});
+    defer alloc.free(unbundled_pkg);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+
+    try cwd.createDirPath(io, bundled_pkg);
+    try cwd.createDirPath(io, unbundled_pkg);
+
+    {
+        var bp = try cwd.openDir(io, bundled_pkg, .{});
+        defer bp.close(io);
+        try bp.createDirPath(io, "types");
+        try bp.createDirPath(io, "dist");
+        try bp.writeFile(io, .{
+            .sub_path = "package.json",
+            .data =
+            \\{
+            \\  "name": "@acme/bundled-fn",
+            \\  "version": "4.17.1",
+            \\  "main": "./dist/bundled-fn.js",
+            \\  "types": "types/index.d.ts"
+            \\}
+            ,
+        });
+        try bp.writeFile(io, .{ .sub_path = "dist/bundled-fn.js", .data = "module.exports = {};\n" });
+        try bp.writeFile(io, .{
+            .sub_path = "types/http.d.ts",
+            .data =
+            \\export declare class HttpRequest {
+            \\    constructor(url: string);
+            \\    readonly url: string;
+            \\}
+            ,
+        });
+        try bp.writeFile(io, .{
+            .sub_path = "types/app.d.ts",
+            .data =
+            \\import { HttpRequest } from "./http";
+            \\export declare function http(name: string, handler: (req: HttpRequest) => void): void;
+            ,
+        });
+        try bp.writeFile(io, .{
+            .sub_path = "types/index.d.ts",
+            .data =
+            \\export * as app from "./app";
+            \\export * from "./http";
+            ,
+        });
+    }
+
+    {
+        var up = try cwd.openDir(io, unbundled_pkg, .{});
+        defer up.close(io);
+        try up.createDirPath(io, "dist");
+        try up.writeFile(io, .{
+            .sub_path = "package.json",
+            .data =
+            \\{
+            \\  "name": "@acme/unbundled",
+            \\  "version": "1.0.0",
+            \\  "main": "./dist/index.js",
+            \\  "types": "dist/index.d.ts"
+            \\}
+            ,
+        });
+        try up.writeFile(io, .{ .sub_path = "dist/index.js", .data = "export {};\n" });
+        try up.writeFile(io, .{ .sub_path = "dist/sub.js", .data = "export function helper() { return 42; }\n" });
+        try up.writeFile(io, .{
+            .sub_path = "dist/index.d.ts",
+            .data = "export declare function rootFn(): number;\n",
+        });
+        try up.writeFile(io, .{
+            .sub_path = "dist/sub.d.ts",
+            .data = "export declare function helper(): number;\n",
+        });
+    }
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    {
+        var parsed = try ts_zigar.cli.parseArgs(alloc, &.{ "-t", bundled_pkg, "--strict-fallbacks", "-d", out_dir });
+        defer parsed.deinit(alloc);
+        var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+        defer res.deinit(alloc);
+        try std.testing.expect(res == .ok);
+
+        var out_h = try cwd.openDir(io, out_dir, .{});
+        defer out_h.close(io);
+        const root_src = try out_h.readFileAlloc(io, "root.zig", alloc, .limited(64 * 1024));
+        defer alloc.free(root_src);
+        try std.testing.expect(std.mem.indexOf(u8, root_src, "pub const acme_bundled_fn =") != null);
+
+        const app_src = try out_h.readFileAlloc(io, "types/app.zig", alloc, .limited(64 * 1024));
+        defer alloc.free(app_src);
+        try std.testing.expect(std.mem.indexOf(u8, app_src, ".module = \"@acme/bundled-fn\", .ns_path = &.{\"app\"}, .name = \"http\"") != null);
+
+        const http_src = try out_h.readFileAlloc(io, "types/http.zig", alloc, .limited(64 * 1024));
+        defer alloc.free(http_src);
+        try std.testing.expect(std.mem.indexOf(u8, http_src, ".module = \"@acme/bundled-fn\", .name = \"HttpRequest\"") != null);
+
+        const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+        defer alloc.free(root_zig);
+        try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+    }
+
+    const out_unbundled = try std.fmt.allocPrint(alloc, "{s}/out_unbundled", .{sandbox});
+    defer alloc.free(out_unbundled);
+    {
+        var parsed = try ts_zigar.cli.parseArgs(alloc, &.{
+            "-t",
+            unbundled_pkg,
+            "-m",
+            "@acme/unbundled/dist/sub",
+            "--strict-fallbacks",
+            "-d",
+            out_unbundled,
+        });
+        defer parsed.deinit(alloc);
+        var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+        defer res.deinit(alloc);
+        try std.testing.expect(res == .ok);
+
+        var out_u = try cwd.openDir(io, out_unbundled, .{});
+        defer out_u.close(io);
+        const sub_src = try out_u.readFileAlloc(io, "dist/sub.zig", alloc, .limited(64 * 1024));
+        defer alloc.free(sub_src);
+        try std.testing.expect(std.mem.indexOf(u8, sub_src, ".module = \"@acme/unbundled/dist/sub\", .name = \"helper\"") != null);
+
+        const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_unbundled});
+        defer alloc.free(root_zig);
+        try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+    }
+}
+
+

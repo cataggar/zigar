@@ -1,0 +1,23 @@
+{
+  "name": "@zigar-examples/azure-functions-node26",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "functions/*.mjs",
+  "engines": {
+    "node": ">=26.0.0"
+  },
+  "description": "Azure Functions v4 Programming Model (Node.js 26 Active LTS, linuxFxVersion NODE|26) + Azure App Service async Zig 0.17 HTTP triggers via zigar ts (@azure/functions + @types/node@26)",
+  "dependencies": {
+    "@azure/functions": "4.17.1"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6"
+  },
+  "scripts": {
+    "generate": "node generate.mjs",
+    "build:wasm": "node build-wasm.mjs",
+    "build:native": "node build-native.mjs",
+    "test": "node --test test/azure-functions.test.mjs"
+  }
+}
