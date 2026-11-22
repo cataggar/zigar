@@ -1487,11 +1487,18 @@ pub fn runPipelineWithHost(
         },
     };
 
+    const source_views = try allocator.alloc(ir.SourceFileView, loaded.files.len);
+    defer allocator.free(source_views);
+    for (loaded.files, 0..) |f, i| {
+        source_views[i] = .{ .vfs_path = f.vfs_path, .contents = f.contents };
+    }
+
     var pkg_ir = ir.lowerGraph(allocator, graph_val, .{
         .base_dir = loaded.base_dir,
         .primary_vfs_paths = loaded.root_vfs_paths,
         .vfs_specifier_overrides = loaded.specifier_overrides,
         .types_only_vfs_prefixes = loaded.types_only_vfs_prefixes,
+        .source_files = source_views,
         .modules = opts.modules,
         .substitutions = opts.substitutions,
     }) catch |err| switch (err) {
