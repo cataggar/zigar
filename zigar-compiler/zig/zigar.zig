@@ -18,7 +18,19 @@ pub const thread = struct {
 };
 
 pub const mem = struct {
+    /// Default target-optimal Zigar allocator (`ShardedPool` / `wasm_allocator` on WebAssembly,
+    /// `smp_allocator` / `c_allocator` / `page_allocator` on native targets).
     pub const allocator = host.default_allocator;
+
+    /// Opt-in thread-safe wrapper tracking `activeCount()` and `activeBytes()` across all
+    /// Zig-side and cross-boundary allocations without adding atomic contention to `allocator`
+    /// or mixing user leak assertions with long-lived runtime internal slabs.
+    pub const TrackingAllocator = @import("type/tracking-allocator.zig").TrackingAllocator;
+
+    /// Convenience constructor for a `TrackingAllocator` backed by `zigar.mem.allocator`.
+    pub fn initTrackingAllocator() TrackingAllocator {
+        return .init(allocator);
+    }
 };
 
 pub const io = struct {

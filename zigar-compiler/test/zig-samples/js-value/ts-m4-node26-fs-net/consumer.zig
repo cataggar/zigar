@@ -30,41 +30,8 @@ comptime {
 
 const is_wasm = builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64;
 
-var live_allocs = std.atomic.Value(usize).init(0);
-
-const TrackingAllocator = struct {
-    fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const ptr = zigar.mem.allocator.rawAlloc(len, alignment, ret_addr) orelse return null;
-        _ = live_allocs.fetchAdd(1, .acq_rel);
-        return ptr;
-    }
-
-    fn resize(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        return zigar.mem.allocator.rawResize(buf, alignment, new_len, ret_addr);
-    }
-
-    fn remap(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        return zigar.mem.allocator.rawRemap(buf, alignment, new_len, ret_addr);
-    }
-
-    fn free(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        zigar.mem.allocator.rawFree(buf, alignment, ret_addr);
-        _ = live_allocs.fetchSub(1, .acq_rel);
-    }
-
-    const vtable: std.mem.Allocator.VTable = .{
-        .alloc = alloc,
-        .resize = resize,
-        .remap = remap,
-        .free = free,
-    };
-
-    fn allocator() std.mem.Allocator {
-        return .{ .ptr = undefined, .vtable = &vtable };
-    }
-};
-
-const tracked_alloc = TrackingAllocator.allocator();
+var gpa: zigar.mem.TrackingAllocator = .init(zigar.mem.allocator);
+const tracked_alloc = gpa.allocator();
 
 pub fn activeHandles() u32 {
     return js.activeHandleCount();
@@ -75,7 +42,7 @@ pub fn activeCallbacks() u32 {
 }
 
 pub fn liveZigAllocs() usize {
-    return live_allocs.load(.acquire);
+    return gpa.activeCount();
 }
 
 pub fn hasPendingCapturedError() bool {
@@ -85,7 +52,7 @@ pub fn hasPendingCapturedError() bool {
 fn checkInvariants(handles_before: u32, cbs_before: u32, allocs_before: usize) !void {
     if (js.activeHandleCount() != handles_before) return error.Unexpected;
     if (js.activeCallbackCount() != cbs_before) return error.Unexpected;
-    if (live_allocs.load(.acquire) != allocs_before) return error.Unexpected;
+    if (gpa.activeCount() != allocs_before) return error.Unexpected;
     if (js.hasLastError()) return error.Unexpected;
 }
 
@@ -96,7 +63,7 @@ fn checkInvariants(handles_before: u32, cbs_before: u32, allocs_before: usize) !
 pub fn exerciseSyncFsPathUrlTls(out_alloc: std.mem.Allocator, tmp_base: []const u8) ![]u8 {
     const handles_before = js.activeHandleCount();
     const cbs_before = js.activeCallbackCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     // 1. `node:path`, `node:path/win32`, and `node:path/posix`
     {
@@ -227,7 +194,7 @@ pub fn exerciseSyncFsPathUrlTls(out_alloc: std.mem.Allocator, tmp_base: []const 
 pub fn probeSyncFsNetHostUnavailable() !bool {
     const handles_before = js.activeHandleCount();
     const cbs_before = js.activeCallbackCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     var got_unavail = false;
     {
@@ -275,7 +242,7 @@ const worker_ns = struct {
     pub fn exerciseAsyncFsAndNet(out_alloc: std.mem.Allocator, tmp_base: []const u8) ![]u8 {
         const handles_before = js.activeHandleCount();
         const cbs_before = js.activeCallbackCount();
-        const allocs_before = live_allocs.load(.acquire);
+        const allocs_before = gpa.activeCount();
 
         // 1. `node:fs/promises` CRUD + `FileHandle.asyncDispose()` + `Dir.asyncIterator()`
         {

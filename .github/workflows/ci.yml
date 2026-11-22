@@ -84,8 +84,10 @@ jobs:
           cd wit-zigar
           zig build test
 
-      - name: Run zigar.js wasm32-wasi unit tests
-        run: zig test -target wasm32-wasi zigar-compiler/zig/type/js.zig --test-cmd wasmtime --test-cmd-bin
+      - name: Run zigar.js & TrackingAllocator wasm32-wasi unit tests
+        run: |
+          zig test -target wasm32-wasi zigar-compiler/zig/type/js.zig --test-cmd wasmtime --test-cmd-bin
+          zig test -target wasm32-wasi zigar-compiler/zig/type/tracking-allocator.zig --test-cmd wasmtime --test-cmd-bin
 
       - name: Run zigar-compiler tests (USE_WAZIG=1)
         env:
@@ -230,8 +232,10 @@ jobs:
           ghr install --skip-attestation "cataggar/zig@${ZIG_VERSION}"
           zig version
 
-      - name: Run zigar.js.Ref(T) Zig unit tests
-        run: zig test zigar-compiler/zig/type/js.zig
+      - name: Run zigar.js.Ref(T) & TrackingAllocator Zig unit tests
+        run: |
+          zig test zigar-compiler/zig/type/js.zig
+          zig test zigar-compiler/zig/type/tracking-allocator.zig
 
       - name: Install dependencies and link workspace packages
         run: |

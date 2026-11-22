@@ -28,41 +28,8 @@ comptime {
     }
 }
 
-var live_allocs = std.atomic.Value(usize).init(0);
-
-const TrackingAllocator = struct {
-    fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const ptr = zigar.mem.allocator.rawAlloc(len, alignment, ret_addr) orelse return null;
-        _ = live_allocs.fetchAdd(1, .acq_rel);
-        return ptr;
-    }
-
-    fn resize(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        return zigar.mem.allocator.rawResize(buf, alignment, new_len, ret_addr);
-    }
-
-    fn remap(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        return zigar.mem.allocator.rawRemap(buf, alignment, new_len, ret_addr);
-    }
-
-    fn free(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        zigar.mem.allocator.rawFree(buf, alignment, ret_addr);
-        _ = live_allocs.fetchSub(1, .acq_rel);
-    }
-
-    const vtable: std.mem.Allocator.VTable = .{
-        .alloc = alloc,
-        .resize = resize,
-        .remap = remap,
-        .free = free,
-    };
-};
-
-var tracking_state: u8 = 0;
-const tracked_alloc: std.mem.Allocator = .{
-    .ptr = @ptrCast(&tracking_state),
-    .vtable = &TrackingAllocator.vtable,
-};
+var gpa: zigar.mem.TrackingAllocator = .init(zigar.mem.allocator);
+const tracked_alloc = gpa.allocator();
 
 pub fn activeHandles() usize {
     return zigar.js.activeHandleCount();
@@ -73,7 +40,7 @@ pub fn activeCallbacks() usize {
 }
 
 pub fn liveZigAllocs() usize {
-    return live_allocs.load(.monotonic);
+    return gpa.activeCount();
 }
 
 pub fn hasPendingCapturedError() bool {
@@ -87,7 +54,7 @@ pub fn hasPendingCapturedError() bool {
 fn checkInvariants(handles_before: usize, cbs_before: usize, allocs_before: usize) !void {
     if (js.activeHandleCount() != handles_before) return error.Unexpected;
     if (js.activeCallbackCount() != cbs_before) return error.Unexpected;
-    if (live_allocs.load(.acquire) != allocs_before) return error.Unexpected;
+    if (gpa.activeCount() != allocs_before) return error.Unexpected;
 }
 
 /// Exercises unfiltered 121-file `@types/node@26` `-s "node:="` bindings synchronously:
@@ -96,7 +63,7 @@ fn checkInvariants(handles_before: usize, cbs_before: usize, allocs_before: usiz
 pub fn exerciseSyncM4Audit(out_alloc: std.mem.Allocator) ![]u8 {
     const handles_before = js.activeHandleCount();
     const cbs_before = js.activeCallbackCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     // 1. `node.http.max_header_size` & `node.http.web_socket` (`ConstructorOf(WebSocket)`)
     {
@@ -186,7 +153,7 @@ const worker_ns = struct {
     pub fn exerciseAsyncM4LoadAudit(out_alloc: std.mem.Allocator, tmp_base: []const u8) ![]u8 {
         const handles_before = js.activeHandleCount();
         const cbs_before = js.activeCallbackCount();
-        const allocs_before = live_allocs.load(.acquire);
+        const allocs_before = gpa.activeCount();
 
         // 1. 25-request HTTP loopback load test
         {

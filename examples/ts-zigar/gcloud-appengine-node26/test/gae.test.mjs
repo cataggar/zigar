@@ -48,6 +48,7 @@ async function verifyGaeServiceLifecycle(mod) {
   assert.equal(Number(mod.activeHandles()), 0);
   assert.equal(Number(mod.activeCallbacks()), 0);
   assert.equal(Number(mod.liveZigAllocs()), 0);
+  assert.equal(Number(mod.liveZigBytes()), 0);
 
   const rawLogs = [];
   const origLog = globalThis.console.log;
@@ -202,6 +203,7 @@ async function verifyGaeServiceLifecycle(mod) {
   assert.equal(Number(mod.activeHandles()), 0);
   assert.equal(Number(mod.activeCallbacks()), 0);
   assert.equal(Number(mod.liveZigAllocs()), 0);
+  assert.equal(Number(mod.liveZigBytes()), 0);
 }
 
 describe('gcloud-appengine-node26 (WASM + native node-zigar)', () => {
@@ -270,6 +272,7 @@ describe('gcloud-appengine-node26 (WASM + native node-zigar)', () => {
         assert.equal(Number(mod.activeHandles()), 0);
         assert.equal(Number(mod.activeCallbacks()), 0);
         assert.equal(Number(mod.liveZigAllocs()), 0);
+        assert.equal(Number(mod.liveZigBytes()), 0);
       } finally {
         process.off('uncaughtException', onUncaught);
         hungSock?.destroy();
@@ -288,6 +291,7 @@ describe('gcloud-appengine-node26 (WASM + native node-zigar)', () => {
       assert.equal(Number(mod.activeHandles()), 0);
       assert.equal(Number(mod.activeCallbacks()), 0);
       assert.equal(Number(mod.liveZigAllocs()), 0);
+      assert.equal(Number(mod.liveZigBytes()), 0);
     } finally {
       http.Server.prototype.listen = origListen;
     }
@@ -315,6 +319,7 @@ describe('gcloud-appengine-node26 (WASM + native node-zigar)', () => {
       assert.equal(Number(mod.activeHandles()), 0);
       assert.equal(Number(mod.activeCallbacks()), 0);
       assert.equal(Number(mod.liveZigAllocs()), 0);
+      assert.equal(Number(mod.liveZigBytes()), 0);
     } finally {
       globalThis.console.log = origLog;
       restoreEnv();

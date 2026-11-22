@@ -8,41 +8,8 @@ const ts_fs = gen.typescript_fs;
 const ts_ast = gen.typescript_ast;
 const ts_is = gen.typescript_ast_is;
 
-var live_allocs = std.atomic.Value(usize).init(0);
-
-const TrackingAllocator = struct {
-    fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const ptr = zigar.mem.allocator.rawAlloc(len, alignment, ret_addr) orelse return null;
-        _ = live_allocs.fetchAdd(1, .acq_rel);
-        return ptr;
-    }
-
-    fn resize(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        return zigar.mem.allocator.rawResize(buf, alignment, new_len, ret_addr);
-    }
-
-    fn remap(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        return zigar.mem.allocator.rawRemap(buf, alignment, new_len, ret_addr);
-    }
-
-    fn free(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        zigar.mem.allocator.rawFree(buf, alignment, ret_addr);
-        _ = live_allocs.fetchSub(1, .acq_rel);
-    }
-
-    const vtable: std.mem.Allocator.VTable = .{
-        .alloc = alloc,
-        .resize = resize,
-        .remap = remap,
-        .free = free,
-    };
-
-    fn allocator() std.mem.Allocator {
-        return .{ .ptr = undefined, .vtable = &vtable };
-    }
-};
-
-const tracked_alloc = TrackingAllocator.allocator();
+var gpa: zigar.mem.TrackingAllocator = .init(zigar.mem.allocator);
+const tracked_alloc = gpa.allocator();
 
 pub fn activeHandles() u32 {
     return js.activeHandleCount();
@@ -53,7 +20,7 @@ pub fn activeCallbacks() u32 {
 }
 
 pub fn liveZigAllocs() usize {
-    return live_allocs.load(.acquire);
+    return gpa.activeCount();
 }
 
 pub fn hasPendingCapturedError() bool {
@@ -63,7 +30,7 @@ pub fn hasPendingCapturedError() bool {
 fn checkInvariants(handles_before: u32, cbs_before: u32, allocs_before: usize) !void {
     if (js.activeHandleCount() != handles_before) return error.Unexpected;
     if (js.activeCallbackCount() != cbs_before) return error.Unexpected;
-    if (live_allocs.load(.acquire) != allocs_before) return error.Unexpected;
+    if (gpa.activeCount() != allocs_before) return error.Unexpected;
     if (js.hasLastError()) return error.Unexpected;
 }
 
@@ -75,7 +42,7 @@ fn checkInvariants(handles_before: u32, cbs_before: u32, allocs_before: usize) !
 pub fn checkInMemoryTypeScriptProgram(out_alloc: std.mem.Allocator) ![]const u8 {
     const h0 = js.activeHandleCount();
     const c0 = js.activeCallbackCount();
-    const a0 = live_allocs.load(.acquire);
+    const a0 = gpa.activeCount();
 
     var summary: []const u8 = &.{};
     {

@@ -83,6 +83,7 @@ async function verifyLambdaModule(mod, expectedBackend) {
   const baselineHandles = mod.activeJsHandleCount();
   const baselineCallbacks = mod.activeJsCallbackCount();
   const baselineAllocs = mod.activeAllocCount();
+  const baselineBytes = mod.activeAllocBytes();
 
   // 1. GET /healthz
   {
@@ -195,6 +196,7 @@ async function verifyLambdaModule(mod, expectedBackend) {
   assert.equal(mod.activeJsHandleCount(), baselineHandles, 'zero leaked JS handles across invocations');
   assert.equal(mod.activeJsCallbackCount(), baselineCallbacks, 'zero leaked JS callbacks across invocations');
   assert.equal(mod.activeAllocCount(), baselineAllocs, 'zero leaked Zig allocations across invocations');
+  assert.equal(mod.activeAllocBytes(), baselineBytes, 'zero leaked Zig bytes across invocations');
 }
 
 describe('aws-lambda-node26', () => {

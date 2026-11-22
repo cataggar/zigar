@@ -20,43 +20,8 @@ const is_wasm = switch (builtin.cpu.arch) {
     else => false,
 };
 
-var live_allocs = std.atomic.Value(usize).init(0);
-
-const TrackingAllocator = struct {
-    fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const ptr = zigar.mem.allocator.rawAlloc(len, alignment, ret_addr) orelse return null;
-        _ = live_allocs.fetchAdd(1, .acq_rel);
-        return ptr;
-    }
-
-    fn resize(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        return zigar.mem.allocator.rawResize(buf, alignment, new_len, ret_addr);
-    }
-
-    fn remap(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        return zigar.mem.allocator.rawRemap(buf, alignment, new_len, ret_addr);
-    }
-
-    fn free(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        zigar.mem.allocator.rawFree(buf, alignment, new_addr: {
-            break :new_addr ret_addr;
-        });
-        _ = live_allocs.fetchSub(1, .acq_rel);
-    }
-
-    const vtable: std.mem.Allocator.VTable = .{
-        .alloc = alloc,
-        .resize = resize,
-        .remap = remap,
-        .free = free,
-    };
-};
-
-var tracking_state: u8 = 0;
-const tracked_alloc: std.mem.Allocator = .{
-    .ptr = @ptrCast(&tracking_state),
-    .vtable = &TrackingAllocator.vtable,
-};
+var gpa: zigar.mem.TrackingAllocator = .init(zigar.mem.allocator);
+const tracked_alloc = gpa.allocator();
 
 pub fn activeHandles() usize {
     return zigar.js.activeHandleCount();
@@ -67,7 +32,7 @@ pub fn activeCallbacks() usize {
 }
 
 pub fn liveZigAllocs() usize {
-    return live_allocs.load(.monotonic);
+    return gpa.activeCount();
 }
 
 pub fn hasPendingCapturedError() bool {

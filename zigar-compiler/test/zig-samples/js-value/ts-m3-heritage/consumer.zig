@@ -8,48 +8,15 @@ const base_mod = gen.m3_heritage_base;
 const cjs_mod = gen.m3_heritage_cjs;
 const def_mod = gen.m3_heritage_def;
 
-var live_allocs = std.atomic.Value(usize).init(0);
-
-const TrackingAllocator = struct {
-    fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const ptr = zigar.mem.allocator.rawAlloc(len, alignment, ret_addr) orelse return null;
-        _ = live_allocs.fetchAdd(1, .acq_rel);
-        return ptr;
-    }
-
-    fn resize(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        return zigar.mem.allocator.rawResize(buf, alignment, new_len, ret_addr);
-    }
-
-    fn remap(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        return zigar.mem.allocator.rawRemap(buf, alignment, new_len, ret_addr);
-    }
-
-    fn free(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        zigar.mem.allocator.rawFree(buf, alignment, ret_addr);
-        _ = live_allocs.fetchSub(1, .acq_rel);
-    }
-
-    const vtable: std.mem.Allocator.VTable = .{
-        .alloc = alloc,
-        .resize = resize,
-        .remap = remap,
-        .free = free,
-    };
-
-    fn allocator() std.mem.Allocator {
-        return .{ .ptr = undefined, .vtable = &vtable };
-    }
-};
-
-const tracked_alloc = TrackingAllocator.allocator();
+var gpa: zigar.mem.TrackingAllocator = .init(zigar.mem.allocator);
+const tracked_alloc = gpa.allocator();
 
 pub fn activeHandles() u32 {
     return js.activeHandleCount();
 }
 
 pub fn liveZigAllocs() usize {
-    return live_allocs.load(.acquire);
+    return gpa.activeCount();
 }
 
 pub fn hasPendingCapturedError() bool {
@@ -58,14 +25,14 @@ pub fn hasPendingCapturedError() bool {
 
 fn checkInvariants(handles_before: u32, allocs_before: usize) !void {
     if (js.activeHandleCount() != handles_before) return error.Unexpected;
-    if (live_allocs.load(.acquire) != allocs_before) return error.Unexpected;
+    if (gpa.activeCount() != allocs_before) return error.Unexpected;
     if (js.hasLastError()) return error.Unexpected;
 }
 
 // 1. Multi-level class inheritance + multiple `implements` + borrowed `.as` upcasts + `.clone` + `.tryAs` downcasts
 pub fn exerciseClassHeritageUpcastCloneAndDowncast(out_alloc: std.mem.Allocator) ![]const u8 {
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     {
         const dup = try m.Duplex.init(64);
@@ -160,7 +127,7 @@ pub fn exerciseClassHeritageUpcastCloneAndDowncast(out_alloc: std.mem.Allocator)
 // 2. Diamond multiple interface inheritance + value-struct `.as(Base)` projection (with inline nominal enums)
 pub fn exerciseDiamondInterfacesAndValueStructProjection(out_alloc: std.mem.Allocator) ![]const u8 {
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     {
         const dc = try m.makeDiamondChannel("ch-1", "net");
@@ -238,7 +205,7 @@ pub fn exerciseIntersectionsBrandsUnionsAndRecursiveGuards(out_alloc: std.mem.Al
     }
 
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     {
         const brand_res = try m.echoBrandPairAlloc(tracked_alloc, "usr_49", 8443);
@@ -309,7 +276,7 @@ pub fn exerciseIndexSignaturesAndCollisionSafeDicts(out_alloc: std.mem.Allocator
     }
 
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     // Pure dictionary `.init()` -> `{}` + `getAlloc` / `set`
     {
@@ -418,7 +385,7 @@ pub fn exerciseIndexSignaturesAndCollisionSafeDicts(out_alloc: std.mem.Allocator
 //    `enum`+`namespace`, multi-block `namespace`, and external module augmentation (`declare module`)
 pub fn exerciseDeclarationMergingAndAugmentations(out_alloc: std.mem.Allocator) ![]const u8 {
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     // Merged `interface MergedRegistry` x2
     {

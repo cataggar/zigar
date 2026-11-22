@@ -162,6 +162,7 @@ async function verifyAzureFunctionsSuite(mod, expectedBackend) {
   const baselineHandles = mod.activeJsHandleCount();
   const baselineCallbacks = mod.activeJsCallbackCount();
   const baselineAllocs = mod.activeAllocCount();
+  const baselineBytes = mod.activeAllocBytes();
 
   // 1. GET /api/healthz via `healthz` trigger + Application Insights structured user telemetry
   {
@@ -303,6 +304,7 @@ async function verifyAzureFunctionsSuite(mod, expectedBackend) {
   assert.equal(mod.activeJsHandleCount(), baselineHandles, 'zero leaked JS handles across invocations');
   assert.equal(mod.activeJsCallbackCount(), baselineCallbacks, 'zero leaked JS callbacks across invocations');
   assert.equal(mod.activeAllocCount(), baselineAllocs, 'zero leaked Zig allocations across invocations');
+  assert.equal(mod.activeAllocBytes(), baselineBytes, 'zero leaked Zig bytes across invocations');
 }
 
 describe('azure-functions-node26', () => {

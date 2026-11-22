@@ -1,6 +1,7 @@
 import {
   invoke,
   activeAllocCount,
+  activeAllocBytes,
   activeJsHandleCount,
   activeJsCallbackCount,
 } from './dist/lambda.mjs';
@@ -10,4 +11,4 @@ export async function handler(event, context) {
   return res?.$ ?? res;
 }
 
-export { activeAllocCount, activeJsHandleCount, activeJsCallbackCount };
+export { activeAllocCount, activeAllocBytes, activeJsHandleCount, activeJsCallbackCount };

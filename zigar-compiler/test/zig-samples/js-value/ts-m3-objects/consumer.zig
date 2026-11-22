@@ -7,48 +7,15 @@ const m = gen.m3_objects_esm;
 const cjs_mod = gen.m3_objects_cjs;
 const def_mod = gen.m3_objects_def;
 
-var live_allocs = std.atomic.Value(usize).init(0);
-
-const TrackingAllocator = struct {
-    fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const ptr = zigar.mem.allocator.rawAlloc(len, alignment, ret_addr) orelse return null;
-        _ = live_allocs.fetchAdd(1, .acq_rel);
-        return ptr;
-    }
-
-    fn resize(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        return zigar.mem.allocator.rawResize(buf, alignment, new_len, ret_addr);
-    }
-
-    fn remap(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        return zigar.mem.allocator.rawRemap(buf, alignment, new_len, ret_addr);
-    }
-
-    fn free(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        zigar.mem.allocator.rawFree(buf, alignment, ret_addr);
-        _ = live_allocs.fetchSub(1, .acq_rel);
-    }
-
-    const vtable: std.mem.Allocator.VTable = .{
-        .alloc = alloc,
-        .resize = resize,
-        .remap = remap,
-        .free = free,
-    };
-
-    fn allocator() std.mem.Allocator {
-        return .{ .ptr = undefined, .vtable = &vtable };
-    }
-};
-
-const tracked_alloc = TrackingAllocator.allocator();
+var gpa: zigar.mem.TrackingAllocator = .init(zigar.mem.allocator);
+const tracked_alloc = gpa.allocator();
 
 pub fn activeHandles() u32 {
     return js.activeHandleCount();
 }
 
 pub fn liveZigAllocs() usize {
-    return live_allocs.load(.acquire);
+    return gpa.activeCount();
 }
 
 pub fn hasPendingCapturedError() bool {
@@ -57,7 +24,7 @@ pub fn hasPendingCapturedError() bool {
 
 fn checkInvariants(handles_before: u32, allocs_before: usize) !void {
     if (js.activeHandleCount() != handles_before) return error.Unexpected;
-    if (live_allocs.load(.acquire) != allocs_before) return error.Unexpected;
+    if (gpa.activeCount() != allocs_before) return error.Unexpected;
     if (js.hasLastError()) return error.Unexpected;
 }
 
@@ -65,7 +32,7 @@ fn checkInvariants(handles_before: u32, allocs_before: usize) !void {
 //    anonymous inline structs with explicit `null`, and cyclic `LinkedNode` `.toJsRef()` / `.fromJsRefAlloc()`).
 pub fn exercisePlainOptionsAndCyclicStructs(out_alloc: std.mem.Allocator) ![]const u8 {
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     {
         const desc1 = try m.describeRequestOptionsAlloc(
@@ -125,7 +92,7 @@ pub fn exercisePlainOptionsAndCyclicStructs(out_alloc: std.mem.Allocator) ![]con
 //    instance properties, static RW/RO/WO/divergent properties & static methods, and `instanceof` guard.
 pub fn exerciseClassesInheritanceAndAccessors(out_alloc: std.mem.Allocator) ![]const u8 {
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     {
         if (m.BaseTransport.SPEC_VERSION != 2) return error.Unexpected;
@@ -219,7 +186,7 @@ pub fn exerciseClassesInheritanceAndAccessors(out_alloc: std.mem.Allocator) ![]c
 //    and `interface CustomUrl` + `declare var CustomUrl: CustomUrlConstructor` companion folding.
 pub fn exerciseDefaultCjsAndCompanionConstructors(out_alloc: std.mem.Allocator) ![]const u8 {
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     {
         if (!std.mem.eql(u8, cjs_mod.CjsSocket.zigar_js.ref_field, "__zigar_ref")) {
@@ -284,7 +251,7 @@ pub fn exerciseDefaultCjsAndCompanionConstructors(out_alloc: std.mem.Allocator) 
 //    and callable + constructable function-handle interfaces (`call` + `construct`).
 pub fn exerciseStatefulDuckHandlesAndCallableInterfaces(out_alloc: std.mem.Allocator) ![]const u8 {
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     {
         const items = [_][]const u8{ "alpha", "beta" };
@@ -355,7 +322,7 @@ pub fn exerciseStatefulDuckHandlesAndCallableInterfaces(out_alloc: std.mem.Alloc
 //    and generic `extends` instantiation (`StrBox extends Box<string>`, `Svc extends MidEmitter<string>`, `NumberStore extends StoreBase<number>`).
 pub fn exerciseFactoryMergedAndGenericExtends(out_alloc: std.mem.Allocator) ![]const u8 {
     const handles_before = js.activeHandleCount();
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
 
     {
         // Plain object returned by `Widget("nav")` must decode as `JsObject` handle (NOT `JsFunction`!)

@@ -4,41 +4,8 @@ const zigar = @import("zigar");
 const js = zigar.js;
 const Ref = js.Ref;
 
-var live_allocs = std.atomic.Value(usize).init(0);
-
-const TrackingAllocator = struct {
-    fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const ptr = std.heap.c_allocator.rawAlloc(len, alignment, ret_addr) orelse return null;
-        _ = live_allocs.fetchAdd(1, .acq_rel);
-        return ptr;
-    }
-
-    fn resize(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        return std.heap.c_allocator.rawResize(buf, alignment, new_len, ret_addr);
-    }
-
-    fn remap(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        return std.heap.c_allocator.rawRemap(buf, alignment, new_len, ret_addr);
-    }
-
-    fn free(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        std.heap.c_allocator.rawFree(buf, alignment, ret_addr);
-        _ = live_allocs.fetchSub(1, .acq_rel);
-    }
-
-    const vtable: std.mem.Allocator.VTable = .{
-        .alloc = alloc,
-        .resize = resize,
-        .remap = remap,
-        .free = free,
-    };
-
-    fn allocator() std.mem.Allocator {
-        return .{ .ptr = undefined, .vtable = &vtable };
-    }
-};
-
-const tracked_alloc = TrackingAllocator.allocator();
+var gpa: zigar.mem.TrackingAllocator = .init(std.heap.c_allocator);
+const tracked_alloc = gpa.allocator();
 
 pub const Point = struct {
     x: i32,
@@ -130,7 +97,7 @@ pub fn hasPendingCapturedError() bool {
 }
 
 pub fn liveZigAllocs() usize {
-    return live_allocs.load(.acquire);
+    return gpa.activeCount();
 }
 
 // ---------------------------------------------------------------------------
@@ -305,7 +272,7 @@ pub fn collectionsAndIntrinsicsShowcase(allocator: std.mem.Allocator, bad_mixed_
     defer bad_mixed_str_arr.deinit();
 
     // Array + mid-array error cleanup
-    const allocs_before = live_allocs.load(.acquire);
+    const allocs_before = gpa.activeCount();
     if (bad_mixed_str_arr.toOwnedSlice(tracked_alloc)) |unexpected| {
         for (unexpected) |s| tracked_alloc.free(s);
         tracked_alloc.free(unexpected);
@@ -314,7 +281,7 @@ pub fn collectionsAndIntrinsicsShowcase(allocator: std.mem.Allocator, bad_mixed_
         if (err != error.JsException) return err;
         js.clearLastError();
     }
-    if (live_allocs.load(.acquire) != allocs_before) return error.JsException;
+    if (gpa.activeCount() != allocs_before) return error.JsException;
 
     // Map, Set, Record
     const m = try js.Map([]const u8, ?i32).init();

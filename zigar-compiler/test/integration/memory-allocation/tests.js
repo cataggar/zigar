@@ -81,5 +81,36 @@ export function addTests(importModule, options) {
       expect(ptr.valueOf()).to.eql({ number1: 123, number2: 456 });
       default_allocator.free(ptr);
     })
+    it('should track both Zig-internal and cross-boundary allocations via zigar.mem.TrackingAllocator', async function() {
+      const {
+        tracked_allocator,
+        activeCount,
+        activeBytes,
+        formatGreeting,
+        exerciseInternalRealloc,
+      } = await importTest('tracking-allocator');
+      expect(Number(activeCount())).to.equal(0);
+      expect(Number(activeBytes())).to.equal(0);
+
+      const dv = tracked_allocator.dupe('Hello Zigar!');
+      expect(Number(activeCount())).to.equal(1);
+      expect(Number(activeBytes())).to.equal(12);
+      tracked_allocator.free(dv);
+      expect(Number(activeCount())).to.equal(0);
+      expect(Number(activeBytes())).to.equal(0);
+
+      const greeting = formatGreeting('TrackingAllocator', { allocator: tracked_allocator });
+      expect(greeting.string).to.equal('Hello, TrackingAllocator!');
+      expect(Number(activeCount())).to.equal(1);
+      expect(Number(activeBytes())).to.equal(greeting.length);
+      tracked_allocator.free(greeting);
+      expect(Number(activeCount())).to.equal(0);
+      expect(Number(activeBytes())).to.equal(0);
+
+      const peak = exerciseInternalRealloc();
+      expect(Number(peak)).to.equal(256);
+      expect(Number(activeCount())).to.equal(0);
+      expect(Number(activeBytes())).to.equal(0);
+    })
   })
 }
