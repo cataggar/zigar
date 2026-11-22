@@ -300,7 +300,7 @@ jobs:
           path: |
             .cache/ts-zigar
             ts-zigar/component/dist
-          key: ts-zigar-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ts-zigar/component/build-component.mjs', 'ts-zigar/component/build-typescript-pkg.mjs', 'ts-zigar/wit/typescript.wit', 'ts-zigar/component/adapter/**/*.go') }}
+          key: ts-zigar-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ts-zigar/component/build-component.mjs', 'ts-zigar/component/build-typescript-pkg.mjs', 'ts-zigar/wit/typescript.wit', 'ts-zigar/component/adapter/**/*.go', 'examples/ts-zigar/*/package.json') }}
           restore-keys: |
             ts-zigar-${{ runner.os }}-${{ runner.arch }}-
 
@@ -342,6 +342,22 @@ jobs:
             mkdir -p .cache/ts-zigar/types-node26
             (cd .cache/ts-zigar/types-node26 && npm init -y >/dev/null && npm install --no-audit --no-fund @types/node@26)
           fi
+          if [ ! -f .cache/ts-zigar/types-aws-lambda/node_modules/@types/aws-lambda/package.json ]; then
+            mkdir -p .cache/ts-zigar/types-aws-lambda
+            (cd .cache/ts-zigar/types-aws-lambda && npm init -y >/dev/null && npm install --no-audit --no-fund @types/aws-lambda@8.10.164 @types/node@26)
+          fi
+          if [ ! -f .cache/ts-zigar/types-azure-functions/node_modules/@azure/functions/package.json ]; then
+            mkdir -p .cache/ts-zigar/types-azure-functions
+            (cd .cache/ts-zigar/types-azure-functions && npm init -y >/dev/null && npm install --no-audit --no-fund @azure/functions@4.17.1 @types/node@26)
+          fi
+          if [ ! -f .cache/ts-zigar/monaco-editor/node_modules/monaco-editor/package.json ]; then
+            mkdir -p .cache/ts-zigar/monaco-editor
+            (cd .cache/ts-zigar/monaco-editor && npm init -y >/dev/null && npm install --no-audit --no-fund monaco-editor@^0.57.0)
+          fi
+          if [ ! -f .cache/ts-zigar/vite-deps/node_modules/vite/package.json ] || [ ! -f .cache/ts-zigar/vite-deps/node_modules/jsdom/package.json ]; then
+            mkdir -p .cache/ts-zigar/vite-deps
+            (cd .cache/ts-zigar/vite-deps && npm init -y >/dev/null && npm install --no-audit --no-fund vite@^7.3.5 jsdom@^29.0.1)
+          fi
 
       - name: Run ts-zigar component, @types/node, and TypeScript 7.1 torture tests
         run: |
@@ -349,6 +365,7 @@ jobs:
           cd ts-zigar
           zig build test-component
           zig build test -Drequire-ts71=true --summary all
+          zig build
 
       - name: Run ts-zigar WASM32 & WASM64 roundtrip tests (zigar-compiler)
         env:
@@ -408,6 +425,9 @@ jobs:
           (cd examples/ts-zigar/node-server-hello-world && npm test)
           (cd examples/ts-zigar/monaco-editor && npm test)
           (cd examples/ts-zigar/monaco-editor-hello-world && npm test)
+          (cd examples/ts-zigar/gcloud-appengine-node26 && npm test)
+          (cd examples/ts-zigar/aws-lambda-node26 && zig build test && npm test)
+          (cd examples/ts-zigar/azure-functions-node26 && zig build test && npm test)
 
   benchmarks:
     name: Wazig vs Zig Benchmarks

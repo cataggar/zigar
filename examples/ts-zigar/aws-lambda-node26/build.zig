@@ -4,6 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const gen_cmd = b.addSystemCommand(&.{ "node", "generate.mjs", "--quiet" });
+    gen_cmd.setCwd(b.path(""));
+    gen_cmd.has_side_effects = true;
+    const gen_step = b.step("generate", "Generate @types/aws-lambda + @types/node@26 Zig bindings");
+    gen_step.dependOn(&gen_cmd.step);
+
     const aws_lambda_mod = b.addModule("aws_lambda", .{
         .root_source_file = b.path("generated/root.zig"),
         .target = target,
@@ -20,6 +26,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    tests.step.dependOn(&gen_cmd.step);
 
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Compile-check generated @types/aws-lambda + @types/node@26 Zig bindings");
