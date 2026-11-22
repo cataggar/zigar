@@ -18,6 +18,11 @@ pub const SpecifierOverride = struct {
     wire_specifier: []const u8,
 };
 
+pub const SourceFileView = struct {
+    vfs_path: []const u8,
+    contents: []const u8,
+};
+
 /// Lowering configuration for `lowerGraph`.
 pub const LowerOptions = struct {
     /// Optional VFS base directory stripped from file-module paths when deriving relative module names.
@@ -31,6 +36,8 @@ pub const LowerOptions = struct {
     /// Optional VFS directory prefixes belonging to pure declaration-only helper packages
     /// (such as `undici-types`) that have no runtime JavaScript module.
     types_only_vfs_prefixes: []const []const u8 = &.{},
+    /// Optional VFS declaration source files used to detect unresolved local `import` bindings.
+    source_files: []const SourceFileView = &.{},
     /// Optional `-m / --module` filters. Empty means emit primary modules and their dependencies.
     modules: []const []const u8 = &.{},
     /// Optional `-s / --substitute <from=to>` rules.
@@ -626,9 +633,11 @@ pub fn applySubstitutions(
 
     for (substitutions) |rule| {
         if (std.mem.eql(u8, current, rule.from)) {
-            const next = try allocator.dupe(u8, rule.to);
-            allocator.free(current);
-            current = next;
+            if (rule.to.len > 0) {
+                const next = try allocator.dupe(u8, rule.to);
+                allocator.free(current);
+                current = next;
+            }
             continue;
         }
         if (std.mem.startsWith(u8, current, rule.from) and current.len > rule.from.len) {
@@ -860,13 +869,18 @@ fn LowerCtx(comptime GraphType: type) type {
         cur_mod_closed_types: std.AutoHashMapUnmanaged(u32, *TypeIr) = .empty,
         cur_mod_enum_member_types: std.AutoHashMapUnmanaged(u64, DeclLocation) = .empty,
         cur_mod_unit_literal_types: std.StringHashMapUnmanaged(DeclLocation) = .empty,
+        cur_mod_property_key_loc: ?DeclLocation = null,
+        cur_mod_array_buffer_view_loc: ?DeclLocation = null,
         star_summary_cands: std.AutoHashMapUnmanaged(u32, ModuleStarSummary) = .empty,
         star_summary_smods: std.AutoHashMapUnmanaged(u32, ModuleStarSummary) = .empty,
+        vfs_sources: std.StringHashMapUnmanaged([]const u8) = .empty,
         cur_mod_decls_out: ?*std.ArrayList(DeclIr) = null,
         cur_mod_root_scope: ?*naming.ScopeNamer = null,
         cur_mod_anon_counter: u32 = 0,
         inline_anon_depth: u32 = 0,
+        in_synthesized_resolved_depth: u32 = 0,
         in_handle_struct: bool = false,
+        cur_cand_idx: ?u32 = null,
         cur_mod_specifier: []const u8 = "",
         cur_decl_logical_name: []const u8 = "<module>",
         cur_decl_fallback_notes: ?*std.ArrayList([]const u8) = null,
@@ -908,6 +922,7 @@ fn LowerCtx(comptime GraphType: type) type {
             self.cur_mod_unit_literal_types.deinit(self.scratch);
             self.star_summary_cands.deinit(self.scratch);
             self.star_summary_smods.deinit(self.scratch);
+            self.vfs_sources.deinit(self.scratch);
         }
 
         fn str(self: *const Self, id: u32) []const u8 {
@@ -3331,6 +3346,7 @@ fn LowerCtx(comptime GraphType: type) type {
         ) error{OutOfMemory}!void {
             const CandReachVisitor = struct {
                 queue: *std.ArrayList(u32),
+                from_cand: ?u32,
 
                 fn markCand(v: *@This(), ctx: *Self, dep_cand: u32) error{OutOfMemory}!void {
                     if (!ctx.candidates.items[dep_cand].included) {
@@ -3352,13 +3368,16 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
 
                 fn onModuleSpecRef(v: *@This(), ctx: *Self, mspec: []const u8) error{OutOfMemory}!void {
-                    if (try ctx.resolveSpecToCandidateIdx(mspec)) |dep_cand| {
+                    if (try ctx.resolveSpecFromCandToCandidateIdx(v.from_cand, mspec)) |dep_cand| {
                         try v.markCand(ctx, dep_cand);
                     }
                 }
             };
 
-            var visitor = CandReachVisitor{ .queue = queue };
+            var visitor = CandReachVisitor{
+                .queue = queue,
+                .from_cand = self.decl_to_cand.get(decl_id),
+            };
             try self.walkDeclRefs(decl_id, visited_types, &visitor);
         }
 
@@ -3468,6 +3487,47 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
             }
             return null;
+        }
+
+        fn resolveSpecFromCandToCandidateIdx(
+            self: *Self,
+            from_cand_opt: ?u32,
+            mspec: []const u8,
+        ) error{OutOfMemory}!?u32 {
+            const trimmed = std.mem.trim(u8, mspec, " \t\r\n");
+            if (trimmed.len == 0) return null;
+
+            if (std.mem.startsWith(u8, trimmed, "./") or std.mem.startsWith(u8, trimmed, "../")) {
+                if (from_cand_opt) |fc_idx| {
+                    if (fc_idx < self.candidates.items.len) {
+                        const fcand = &self.candidates.items[fc_idx];
+                        for (fcand.source_mod_ids.items) |smid| {
+                            const sm_idx = self.findGraphModuleIndexById(smid) orelse continue;
+                            const from_fp = self.str(self.graph.modules[sm_idx].file_path);
+                            const base_vfs = try resolveRelativeVfsPath(self.scratch, from_fp, trimmed);
+                            defer self.scratch.free(base_vfs);
+
+                            const suffixes = [_][]const u8{ "", ".d.ts", ".ts", "/index.d.ts", "/index.ts" };
+                            for (suffixes) |sfx| {
+                                const probe = if (sfx.len == 0)
+                                    base_vfs
+                                else
+                                    try std.fmt.allocPrint(self.scratch, "{s}{s}", .{ base_vfs, sfx });
+                                defer if (sfx.len > 0) self.scratch.free(probe);
+
+                                for (self.graph.modules) |gm| {
+                                    if (std.mem.eql(u8, self.str(gm.file_path), probe)) {
+                                        if (self.source_mod_to_cand.get(gm.id)) |dep_cand| {
+                                            return dep_cand;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return self.resolveSpecToCandidateIdx(trimmed);
         }
 
         fn resolveSpecToCandidateIdx(self: *Self, mspec: []const u8) error{OutOfMemory}!?u32 {
@@ -4173,6 +4233,173 @@ fn LowerCtx(comptime GraphType: type) type {
             return self.isBundledLibModule(self.graph.modules[mid]);
         }
 
+        fn curCandHasLocalImportBinding(self: *const Self, root_ident: []const u8) bool {
+            if (root_ident.len == 0) return false;
+            const cidx = self.cur_cand_idx orelse return false;
+            if (cidx >= self.candidates.items.len) return false;
+            const cand = &self.candidates.items[cidx];
+
+            for (cand.decl_ids.items) |did| {
+                if (did >= self.graph.decls.len) continue;
+                const d = self.graph.decls[did];
+                if (d.kind == .import_equals_decl and std.mem.eql(u8, self.str(d.name), root_ident)) {
+                    return true;
+                }
+            }
+
+            if (self.vfs_sources.count() == 0) return false;
+            for (cand.source_mod_ids.items) |smid| {
+                const mid = self.findGraphModuleIndexById(smid) orelse continue;
+                const fpath = self.str(self.graph.modules[mid].file_path);
+                if (self.vfs_sources.get(fpath)) |src| {
+                    if (lower_types.sourceHasLocalImportBinding(src, root_ident)) return true;
+                } else if (fpath.len > 0 and fpath[0] == '/') {
+                    if (self.vfs_sources.get(fpath[1..])) |src| {
+                        if (lower_types.sourceHasLocalImportBinding(src, root_ident)) return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        fn isRefShadowedByUnresolvedImport(
+            self: *const Self,
+            ref_name: []const u8,
+            target_decl: ?u32,
+            module_specifier: ?u32,
+        ) bool {
+            if (target_decl != null) return false;
+            if (std.mem.startsWith(u8, ref_name, "globalThis.")) return false;
+            if (module_specifier != null) return true;
+            const stripped = lower_types.stripGlobalQualifier(ref_name);
+            const root_ident = if (std.mem.indexOfScalar(u8, stripped, '.')) |dot|
+                stripped[0..dot]
+            else
+                stripped;
+            return self.curCandHasLocalImportBinding(root_ident);
+        }
+
+        fn lowerBuiltinPropertyKeyType(
+            self: *Self,
+            active_tps: []const ActiveTypeParam,
+            needs_runtime: *bool,
+        ) error{OutOfMemory}!*TypeIr {
+            needs_runtime.* = true;
+            if (self.cur_mod_property_key_loc) |hloc| {
+                return self.makeHoistedDeclRef(hloc);
+            }
+            const variants = try self.alloc.alloc(UnionVariantIr, 3);
+            variants[0] = .{
+                .zig_ident = try self.alloc.dupe(u8, "str"),
+                .logical_name = try self.alloc.dupe(u8, "str"),
+                .wire_tag = try self.alloc.dupe(u8, "str"),
+                .payload = try self.makeType(.string_type),
+            };
+            variants[1] = .{
+                .zig_ident = try self.alloc.dupe(u8, "num"),
+                .logical_name = try self.alloc.dupe(u8, "num"),
+                .wire_tag = try self.alloc.dupe(u8, "num"),
+                .payload = try self.makeType(.f64_type),
+            };
+            variants[2] = .{
+                .zig_ident = try self.alloc.dupe(u8, "symbol"),
+                .logical_name = try self.alloc.dupe(u8, "symbol"),
+                .wire_tag = try self.alloc.dupe(u8, "symbol"),
+                .payload = try self.makeType(.js_symbol),
+            };
+            if (self.cur_mod_decls_out != null and self.cur_mod_root_scope != null) {
+                const h = try self.allocFreshAnonHelperName("__zigar_PropertyKey", active_tps);
+                const hloc = DeclLocation{
+                    .module_index = self.cur_mod_idx,
+                    .zig_path = h.path,
+                    .type_param_defaults = &.{},
+                };
+                self.cur_mod_property_key_loc = hloc;
+                try self.cur_mod_decls_out.?.append(self.alloc, .{
+                    .source_decl_id = null,
+                    .zig_ident = h.zig_ident,
+                    .logical_name = h.logical,
+                    .wire_name = h.logical,
+                    .is_exported = false,
+                    .is_js_exported = false,
+                    .is_default_export = false,
+                    .jsdoc = null,
+                    .kind = .{
+                        .union_decl = .{
+                            .type_params = &.{},
+                            .discriminant_prop = null,
+                            .variants = variants,
+                        },
+                    },
+                });
+                return self.makeHoistedDeclRef(hloc);
+            }
+            return self.makeType(.{ .tagged_union = .{ .discriminant_prop = null, .variants = variants } });
+        }
+
+        fn lowerBuiltinArrayBufferViewType(
+            self: *Self,
+            active_tps: []const ActiveTypeParam,
+            needs_runtime: *bool,
+        ) error{OutOfMemory}!*TypeIr {
+            needs_runtime.* = true;
+            if (self.cur_mod_array_buffer_view_loc) |hloc| {
+                return self.makeHoistedDeclRef(hloc);
+            }
+            const view_specs = [_]struct { ident: []const u8, bvk: lower_types.BinaryViewKind }{
+                .{ .ident = "int8_array", .bvk = .int8_array },
+                .{ .ident = "uint8_array", .bvk = .uint8_array },
+                .{ .ident = "uint8_clamped_array", .bvk = .uint8_clamped_array },
+                .{ .ident = "int16_array", .bvk = .int16_array },
+                .{ .ident = "uint16_array", .bvk = .uint16_array },
+                .{ .ident = "int32_array", .bvk = .int32_array },
+                .{ .ident = "uint32_array", .bvk = .uint32_array },
+                .{ .ident = "float16_array", .bvk = .float16_array },
+                .{ .ident = "float32_array", .bvk = .float32_array },
+                .{ .ident = "float64_array", .bvk = .float64_array },
+                .{ .ident = "big_int64_array", .bvk = .big_int64_array },
+                .{ .ident = "big_uint64_array", .bvk = .big_uint64_array },
+                .{ .ident = "data_view", .bvk = .data_view },
+            };
+            const variants = try self.alloc.alloc(UnionVariantIr, view_specs.len);
+            for (view_specs, 0..) |spec, idx| {
+                variants[idx] = .{
+                    .zig_ident = try self.alloc.dupe(u8, spec.ident),
+                    .logical_name = try self.alloc.dupe(u8, spec.ident),
+                    .wire_tag = try self.alloc.dupe(u8, spec.ident),
+                    .payload = try self.makeType(.{ .binary_view = spec.bvk }),
+                };
+            }
+            if (self.cur_mod_decls_out != null and self.cur_mod_root_scope != null) {
+                const h = try self.allocFreshAnonHelperName("__zigar_ArrayBufferView", active_tps);
+                const hloc = DeclLocation{
+                    .module_index = self.cur_mod_idx,
+                    .zig_path = h.path,
+                    .type_param_defaults = &.{},
+                };
+                self.cur_mod_array_buffer_view_loc = hloc;
+                try self.cur_mod_decls_out.?.append(self.alloc, .{
+                    .source_decl_id = null,
+                    .zig_ident = h.zig_ident,
+                    .logical_name = h.logical,
+                    .wire_name = h.logical,
+                    .is_exported = false,
+                    .is_js_exported = false,
+                    .is_default_export = false,
+                    .jsdoc = null,
+                    .kind = .{
+                        .union_decl = .{
+                            .type_params = &.{},
+                            .discriminant_prop = null,
+                            .variants = variants,
+                        },
+                    },
+                });
+                return self.makeHoistedDeclRef(hloc);
+            }
+            return self.makeType(.{ .tagged_union = .{ .discriminant_prop = null, .variants = variants } });
+        }
+
         fn lookupDeclLocation(self: *const Self, td: u32) ?struct { id: u32, loc: DeclLocation } {
             if (self.decl_locations.get(td)) |loc| {
                 return .{ .id = td, .loc = loc };
@@ -4628,6 +4855,155 @@ fn LowerCtx(comptime GraphType: type) type {
             return false;
         }
 
+        fn isEmptyObjectOrNeverGraphType(self: *const Self, tid: u32) bool {
+            if (tid >= self.graph.types.len) return false;
+            return switch (self.graph.types[tid].kind) {
+                .never_type => true,
+                .object_literal => |obj| obj.properties.len == 0 and
+                    obj.call_signatures.len == 0 and
+                    obj.construct_signatures.len == 0 and
+                    obj.index_signatures.len == 0,
+                else => false,
+            };
+        }
+
+        fn isConstructorLikeTargetDecl(self: *const Self, td: u32) bool {
+            if (td >= self.graph.decls.len) return false;
+            const d = self.graph.decls[td];
+            if (d.kind == .class_decl) return true;
+            if (self.merged_ctor_var_consumed.contains(td)) return true;
+            if (d.kind == .interface_decl) {
+                for (d.merged_with) |mid| {
+                    if (mid < self.graph.decls.len and
+                        (self.graph.decls[mid].kind == .class_decl or self.merged_ctor_var_consumed.contains(mid)))
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        fn unwrapExportTargetDecl(self: *const Self, start_did: u32) u32 {
+            var did = start_did;
+            var hops: usize = 0;
+            while (hops < 16 and did < self.graph.decls.len) : (hops += 1) {
+                switch (self.graph.decls[did].kind) {
+                    .re_export_decl => |re| {
+                        if (re.target_decl) |td| {
+                            did = td;
+                            continue;
+                        }
+                        break;
+                    },
+                    .import_equals_decl => |ie| {
+                        if (ie.target_decl) |td| {
+                            did = td;
+                            continue;
+                        }
+                        break;
+                    },
+                    else => break,
+                }
+            }
+            return did;
+        }
+
+        fn resolveImportTypeTargetDecl(
+            self: *Self,
+            mspec: []const u8,
+            qualifier: []const u32,
+            prefer_value: bool,
+        ) error{OutOfMemory}!?u32 {
+            if (qualifier.len == 0) return null;
+            const cand_idx = (try self.resolveSpecFromCandToCandidateIdx(self.cur_cand_idx, mspec)) orelse return null;
+            const cand = &self.candidates.items[cand_idx];
+            const first_seg = self.str(qualifier[0]);
+
+            var cur_did: ?u32 = null;
+            if (std.mem.eql(u8, first_seg, "default")) {
+                if (cand.default_export_decl_id orelse cand.export_equals_decl_id) |raw_def| {
+                    cur_did = self.unwrapExportTargetDecl(raw_def);
+                }
+            } else {
+                var v_smods: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                defer v_smods.deinit(self.scratch);
+                var v_cands: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                defer v_cands.deinit(self.scratch);
+                var hit_cyc = false;
+                const summary = try self.getCandStarSummary(cand_idx, &v_smods, &v_cands, &hit_cyc);
+
+                var fallback_did: ?u32 = null;
+                for (summary.exported_items) |ri| {
+                    if (!std.mem.eql(u8, ri.export_wire, first_seg)) continue;
+                    const did = self.unwrapExportTargetDecl(ri.item.decl_id);
+                    if (did >= self.graph.decls.len) continue;
+                    const dk = self.graph.decls[did].kind;
+                    const is_val = self.isConstructorLikeTargetDecl(did) or
+                        dk == .variable_decl or dk == .function_decl or dk == .namespace_decl or dk == .enum_decl;
+                    const is_ty = dk == .class_decl or dk == .interface_decl or dk == .type_alias_decl or dk == .enum_decl;
+                    if ((prefer_value and is_val) or (!prefer_value and is_ty)) {
+                        cur_did = did;
+                        break;
+                    }
+                    if (fallback_did == null) fallback_did = did;
+                }
+                if (cur_did == null) cur_did = fallback_did;
+
+                if (cur_did == null) {
+                    for (cand.same_mod_export_equals_children.items) |raw_did| {
+                        const did = self.unwrapExportTargetDecl(raw_did);
+                        if (did >= self.graph.decls.len) continue;
+                        const raw_d = self.graph.decls[raw_did];
+                        const dwire = if (raw_d.export_name) |esid| self.str(esid) else self.str(raw_d.name);
+                        if (std.mem.eql(u8, dwire, first_seg)) {
+                            cur_did = did;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            var step_idx: usize = 1;
+            while (step_idx < qualifier.len) : (step_idx += 1) {
+                const parent_id = cur_did orelse return null;
+                if (parent_id >= self.graph.decls.len) return null;
+                const seg = self.str(qualifier[step_idx]);
+                var next_did: ?u32 = null;
+
+                var ns_peers: [8]u32 = undefined;
+                var ns_count: usize = 0;
+                const pd = self.graph.decls[parent_id];
+                if (pd.kind == .namespace_decl) {
+                    ns_peers[ns_count] = parent_id;
+                    ns_count += 1;
+                }
+                for (pd.merged_with) |mid| {
+                    if (ns_count < ns_peers.len and mid < self.graph.decls.len and self.graph.decls[mid].kind == .namespace_decl) {
+                        ns_peers[ns_count] = mid;
+                        ns_count += 1;
+                    }
+                }
+
+                outer_ns: for (ns_peers[0..ns_count]) |ns_id| {
+                    for (self.graph.decls[ns_id].kind.namespace_decl) |cid| {
+                        if (cid >= self.graph.decls.len) continue;
+                        const cd = self.graph.decls[cid];
+                        const cwire = if (cd.export_name) |esid| self.str(esid) else self.str(cd.name);
+                        if (!std.mem.eql(u8, cwire, seg)) continue;
+                        next_did = switch (cd.kind) {
+                            .re_export_decl => |re| re.target_decl orelse cid,
+                            .import_equals_decl => |ie| ie.target_decl orelse cid,
+                            else => cid,
+                        };
+                        break :outer_ns;
+                    }
+                }
+                cur_did = next_did;
+            }
+            return cur_did;
+        }
+
         fn openConditionalSingleObjectBranch(self: *const Self, cond: anytype) bool {
             const non_never_id: u32 = blk: {
                 if (cond.false_type < self.graph.types.len and self.graph.types[cond.false_type].kind == .never_type) {
@@ -5041,8 +5417,9 @@ fn LowerCtx(comptime GraphType: type) type {
         fn isPropertyKeyLikeTypeIr(ty: *const TypeIr, depth: usize) bool {
             if (depth >= 6) return false;
             return switch (ty.*) {
-                .string_type, .js_string, .js_symbol, .inline_enum, .open_literal_union, .template_pattern => true,
+                .string_type, .js_string, .f64_type, .js_symbol, .inline_enum, .open_literal_union, .template_pattern => true,
                 .unary_type_op => |uo| uo.op == .keyof,
+                .decl_ref => |dr| dr.decl_zig_path.len == 1 and std.mem.startsWith(u8, dr.decl_zig_path[0], "__zigar_PropertyKey"),
                 .tagged_union => |tu| blk: {
                     if (tu.variants.len == 0) break :blk false;
                     for (tu.variants) |v| {
@@ -5158,6 +5535,12 @@ fn LowerCtx(comptime GraphType: type) type {
                 },
                 .typeof_query => |tq| blk: {
                     for (tq.type_args) |ta| {
+                        if (self.typeTreeMentionsActiveTypeParam(ta, active_tps, locally_bound_tp_ids, depth + 1)) break :blk true;
+                    }
+                    break :blk false;
+                },
+                .import_type => |it| blk: {
+                    for (it.type_args) |ta| {
                         if (self.typeTreeMentionsActiveTypeParam(ta, active_tps, locally_bound_tp_ids, depth + 1)) break :blk true;
                     }
                     break :blk false;
@@ -5525,7 +5908,9 @@ fn LowerCtx(comptime GraphType: type) type {
                     }
 
                     // Built-in JS/Node binary buffer & view types and boxed global wrappers (`BigInt`, `String`, `Symbol`, `Object`).
-                    if (self.isBuiltinMappedReference(ref_name, ref.type_args.len, ref.target_decl)) {
+                    if (!self.isRefShadowedByUnresolvedImport(ref_name, ref.target_decl, ref.module_specifier) and
+                        self.isBuiltinMappedReference(ref_name, ref.type_args.len, ref.target_decl))
+                    {
                         needs_runtime.* = true;
                         if (lower_types.BinaryViewKind.fromTypeName(ref_name)) |bvk| {
                             const res = try self.makeType(.{ .binary_view = bvk });
@@ -5554,65 +5939,67 @@ fn LowerCtx(comptime GraphType: type) type {
 
                     // Built-in ES iteration & resource disposal protocols (`Iterable<T>`, `Iterator<T>`,
                     // `AsyncIterable<T>`, `AsyncIterator<T>`, `Disposable`, `AsyncDisposable`, etc.).
-                    if (self.classifyBuiltinProtocolReference(ref_name, ref.target_decl)) |pkind| {
-                        switch (pkind) {
-                            .disposable => {
-                                needs_runtime.* = true;
-                                const res = try self.makeType(.js_disposable);
-                                if (!is_return_pos and ref_cnt > 1 and can_hoist_in_mod and no_free_vars) {
-                                    try self.cur_mod_closed_types.put(self.scratch, ty_id, res);
-                                }
-                                return res;
-                            },
-                            .async_disposable => {
-                                needs_runtime.* = true;
-                                const res = try self.makeType(.js_async_disposable);
-                                if (!is_return_pos and ref_cnt > 1 and can_hoist_in_mod and no_free_vars) {
-                                    try self.cur_mod_closed_types.put(self.scratch, ty_id, res);
-                                }
-                                return res;
-                            },
-                            .iterable => {
-                                const elem = if (ref.type_args.len > 0)
-                                    try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
-                                else blk: {
+                    if (!self.isRefShadowedByUnresolvedImport(ref_name, ref.target_decl, ref.module_specifier)) {
+                        if (self.classifyBuiltinProtocolReference(ref_name, ref.target_decl)) |pkind| {
+                            switch (pkind) {
+                                .disposable => {
                                     needs_runtime.* = true;
-                                    break :blk try self.makeType(.js_value);
-                                };
-                                if (is_return_pos) {
+                                    const res = try self.makeType(.js_disposable);
+                                    if (!is_return_pos and ref_cnt > 1 and can_hoist_in_mod and no_free_vars) {
+                                        try self.cur_mod_closed_types.put(self.scratch, ty_id, res);
+                                    }
+                                    return res;
+                                },
+                                .async_disposable => {
                                     needs_runtime.* = true;
-                                    return self.makeType(.{ .js_iterator = elem });
-                                }
-                                const res = try self.makeType(.{ .slice = elem });
-                                if (ref_cnt > 1 and can_hoist_in_mod and (no_free_vars or try self.isClosedTypeSubgraph(ty_id))) {
-                                    try self.cur_mod_closed_types.put(self.scratch, ty_id, res);
-                                }
-                                return res;
-                            },
-                            .iterator => {
-                                needs_runtime.* = true;
-                                const elem = if (ref.type_args.len > 0)
-                                    try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
-                                else
-                                    try self.makeType(.js_value);
-                                const res = try self.makeType(.{ .js_iterator = elem });
-                                if (!is_return_pos and ref_cnt > 1 and can_hoist_in_mod and (no_free_vars or try self.isClosedTypeSubgraph(ty_id))) {
-                                    try self.cur_mod_closed_types.put(self.scratch, ty_id, res);
-                                }
-                                return res;
-                            },
-                            .async_iterable, .async_iterator => {
-                                needs_runtime.* = true;
-                                const elem = if (ref.type_args.len > 0)
-                                    try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
-                                else
-                                    try self.makeType(.js_value);
-                                const res = try self.makeType(.{ .js_async_iterator = elem });
-                                if (!is_return_pos and ref_cnt > 1 and can_hoist_in_mod and (no_free_vars or try self.isClosedTypeSubgraph(ty_id))) {
-                                    try self.cur_mod_closed_types.put(self.scratch, ty_id, res);
-                                }
-                                return res;
-                            },
+                                    const res = try self.makeType(.js_async_disposable);
+                                    if (!is_return_pos and ref_cnt > 1 and can_hoist_in_mod and no_free_vars) {
+                                        try self.cur_mod_closed_types.put(self.scratch, ty_id, res);
+                                    }
+                                    return res;
+                                },
+                                .iterable => {
+                                    const elem = if (ref.type_args.len > 0)
+                                        try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
+                                    else blk: {
+                                        needs_runtime.* = true;
+                                        break :blk try self.makeType(.js_value);
+                                    };
+                                    if (is_return_pos) {
+                                        needs_runtime.* = true;
+                                        return self.makeType(.{ .js_iterator = elem });
+                                    }
+                                    const res = try self.makeType(.{ .slice = elem });
+                                    if (ref_cnt > 1 and can_hoist_in_mod and (no_free_vars or try self.isClosedTypeSubgraph(ty_id))) {
+                                        try self.cur_mod_closed_types.put(self.scratch, ty_id, res);
+                                    }
+                                    return res;
+                                },
+                                .iterator => {
+                                    needs_runtime.* = true;
+                                    const elem = if (ref.type_args.len > 0)
+                                        try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
+                                    else
+                                        try self.makeType(.js_value);
+                                    const res = try self.makeType(.{ .js_iterator = elem });
+                                    if (!is_return_pos and ref_cnt > 1 and can_hoist_in_mod and (no_free_vars or try self.isClosedTypeSubgraph(ty_id))) {
+                                        try self.cur_mod_closed_types.put(self.scratch, ty_id, res);
+                                    }
+                                    return res;
+                                },
+                                .async_iterable, .async_iterator => {
+                                    needs_runtime.* = true;
+                                    const elem = if (ref.type_args.len > 0)
+                                        try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
+                                    else
+                                        try self.makeType(.js_value);
+                                    const res = try self.makeType(.{ .js_async_iterator = elem });
+                                    if (!is_return_pos and ref_cnt > 1 and can_hoist_in_mod and (no_free_vars or try self.isClosedTypeSubgraph(ty_id))) {
+                                        try self.cur_mod_closed_types.put(self.scratch, ty_id, res);
+                                    }
+                                    return res;
+                                },
+                            }
                         }
                     }
 
@@ -5686,9 +6073,12 @@ fn LowerCtx(comptime GraphType: type) type {
 
                     // Built-in JS / TypeScript standard library types.
                     const stripped_stdlib_name = lower_types.stripGlobalQualifier(ref_name);
-                    if (std.mem.eql(u8, stripped_stdlib_name, "Array") or std.mem.eql(u8, stripped_stdlib_name, "ReadonlyArray") or
-                        std.mem.eql(u8, stripped_stdlib_name, "ArrayLike") or
-                        std.mem.eql(u8, stripped_stdlib_name, "Set") or std.mem.eql(u8, stripped_stdlib_name, "ReadonlySet"))
+                    const is_unshadowed_stdlib = !self.isRefShadowedByUnresolvedImport(ref_name, ref.target_decl, ref.module_specifier) and
+                        self.isBuiltinProtocolTarget(ref.target_decl);
+                    if (is_unshadowed_stdlib and
+                        (std.mem.eql(u8, stripped_stdlib_name, "Array") or std.mem.eql(u8, stripped_stdlib_name, "ReadonlyArray") or
+                            std.mem.eql(u8, stripped_stdlib_name, "ArrayLike") or
+                            std.mem.eql(u8, stripped_stdlib_name, "Set") or std.mem.eql(u8, stripped_stdlib_name, "ReadonlySet")))
                     {
                         const elem = if (ref.type_args.len > 0)
                             try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
@@ -5702,7 +6092,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                         return res;
                     }
-                    if (std.mem.eql(u8, stripped_stdlib_name, "Promise") or std.mem.eql(u8, stripped_stdlib_name, "PromiseLike")) {
+                    if (is_unshadowed_stdlib and (std.mem.eql(u8, stripped_stdlib_name, "Promise") or std.mem.eql(u8, stripped_stdlib_name, "PromiseLike"))) {
                         needs_runtime.* = true;
                         const inner = if (ref.type_args.len > 0)
                             try self.lowerType(ref.type_args[0], is_return_pos, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
@@ -5714,11 +6104,11 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                         return res;
                     }
-                    if (std.mem.eql(u8, stripped_stdlib_name, "ArrayBufferLike") and tn.resolved_type == null) {
+                    if (is_unshadowed_stdlib and std.mem.eql(u8, stripped_stdlib_name, "ArrayBufferLike") and tn.resolved_type == null) {
                         needs_runtime.* = true;
                         return self.makeType(.{ .binary_view = .array_buffer });
                     }
-                    if (std.mem.eql(u8, stripped_stdlib_name, "Map") or std.mem.eql(u8, stripped_stdlib_name, "ReadonlyMap")) {
+                    if (is_unshadowed_stdlib and (std.mem.eql(u8, stripped_stdlib_name, "Map") or std.mem.eql(u8, stripped_stdlib_name, "ReadonlyMap"))) {
                         needs_runtime.* = true;
                         const k = if (ref.type_args.len > 0)
                             try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime)
@@ -5737,10 +6127,11 @@ fn LowerCtx(comptime GraphType: type) type {
 
                     // Built-in TypeScript utility types (`NoInfer`, `Partial`, `Required`, `Readonly`,
                     // `Pick`, `Omit`, `Record`, `NonNullable`, `Awaited`, `Exclude`, `Extract`, etc.).
-                    const is_stdlib_utility_target = if (ref.target_decl) |td|
-                        (self.isBundledLibDecl(td) or (td < self.graph.decls.len and self.graph.decls[td].kind == .type_alias_decl))
-                    else
-                        true;
+                    const is_stdlib_utility_target = !self.isRefShadowedByUnresolvedImport(ref_name, ref.target_decl, ref.module_specifier) and
+                        (if (ref.target_decl) |td|
+                            (self.isBundledLibDecl(td) or (td < self.graph.decls.len and self.graph.decls[td].kind == .type_alias_decl))
+                        else
+                            true);
                     const mentions_open_tp = self.typeTreeMentionsActiveTypeParam(ty_id, active_tps, &.{}, 0);
 
                     if (is_stdlib_utility_target) {
@@ -5761,7 +6152,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                 .return_type,
                                 .constructor_parameters,
                                 => {
-                                    if (ref.type_args.len >= 1 and mentions_open_tp) {
+                                    if (ref.type_args.len >= 1 and (mentions_open_tp or tn.resolved_type == null or tn.resolved_type.? == ty_id)) {
                                         needs_runtime.* = true;
                                         const op_kind: type_ops.UnaryTypeOp = switch (util_kind) {
                                             .partial => .partial,
@@ -5780,7 +6171,7 @@ fn LowerCtx(comptime GraphType: type) type {
                                     }
                                 },
                                 .pick, .omit => {
-                                    if (ref.type_args.len >= 2 and mentions_open_tp) {
+                                    if (ref.type_args.len >= 2 and (mentions_open_tp or tn.resolved_type == null or tn.resolved_type.? == ty_id)) {
                                         needs_runtime.* = true;
                                         const target = try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                                         const keys = try self.lowerKeyFilterSpec(ref.type_args[1], active_tps, self_ident_opt, visited, imports_used, needs_runtime);
@@ -5826,11 +6217,35 @@ fn LowerCtx(comptime GraphType: type) type {
                         }
                     }
 
-                    if (std.mem.eql(u8, stripped_stdlib_name, "Record") and ref.type_args.len == 2) {
+                    if (is_unshadowed_stdlib and std.mem.eql(u8, stripped_stdlib_name, "Record") and ref.type_args.len == 2) {
                         needs_runtime.* = true;
                         const k = try self.lowerType(ref.type_args[0], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                         const v = try self.lowerType(ref.type_args[1], false, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                         return self.makeType(.{ .js_record = .{ .key = k, .value = v } });
+                    }
+
+                    if (is_unshadowed_stdlib and std.mem.eql(u8, stripped_stdlib_name, "TemplateStringsArray") and ref.type_args.len == 0) {
+                        const str_ty = try self.makeType(.string_type);
+                        return self.makeType(.{ .slice = str_ty });
+                    }
+
+                    if (is_unshadowed_stdlib and std.mem.eql(u8, stripped_stdlib_name, "PropertyKey") and ref.type_args.len == 0) {
+                        return self.lowerBuiltinPropertyKeyType(active_tps, needs_runtime);
+                    }
+
+                    if (is_unshadowed_stdlib and std.mem.eql(u8, stripped_stdlib_name, "ArrayBufferView") and ref.type_args.len <= 1) {
+                        return self.lowerBuiltinArrayBufferViewType(active_tps, needs_runtime);
+                    }
+
+                    const is_resolved_bundled_lib = if (ref.target_decl) |td| self.isBundledLibDecl(td) else false;
+                    const is_unshadowed_builtin_global = is_resolved_bundled_lib or
+                        (is_unshadowed_stdlib and
+                            (lower_types.isStandardBuiltinGlobalType(stripped_stdlib_name) or
+                                (self.in_synthesized_resolved_depth > 0 and
+                                    lower_types.isSynthesizedIntlOrTemporalMember(stripped_stdlib_name))));
+                    if (is_unshadowed_builtin_global) {
+                        needs_runtime.* = true;
+                        return self.makeType(.js_object);
                     }
 
                     try self.recordFallback(.unresolved_type_ref, ref_name);
@@ -6177,7 +6592,28 @@ fn LowerCtx(comptime GraphType: type) type {
                     if (!self.typeTreeMentionsActiveTypeParam(ty_id, active_tps, &.{}, 0)) {
                         if (tn.resolved_type) |rt| {
                             if (rt != ty_id) {
+                                self.in_synthesized_resolved_depth += 1;
+                                defer self.in_synthesized_resolved_depth -= 1;
                                 return self.lowerType(rt, is_return_pos, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                            }
+                        }
+                    }
+                    // When the condition (`check_type extends extends_type`) has no open type
+                    // parameters or `infer` bindings (e.g. `typeof globalThis extends { onmessage: any } ? {} : webstreams.ReadableStream<R>`),
+                    // the TypeScript checker has already evaluated which branch wins in `tn.resolved_type`;
+                    // lower the winning AST branch directly so nominal generic references stay intact!
+                    if (cond.infer_params.len == 0 and
+                        !self.typeTreeMentionsActiveTypeParam(cond.check_type, active_tps, &.{}, 0) and
+                        !self.typeTreeMentionsActiveTypeParam(cond.extends_type, active_tps, &.{}, 0))
+                    {
+                        if (tn.resolved_type) |rt| {
+                            if (rt != ty_id and rt < self.graph.types.len) {
+                                if (self.isEmptyObjectOrNeverGraphType(cond.true_type) and !self.isEmptyObjectOrNeverGraphType(rt)) {
+                                    return self.lowerType(cond.false_type, is_return_pos, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                                }
+                                if (self.isEmptyObjectOrNeverGraphType(cond.false_type) and !self.isEmptyObjectOrNeverGraphType(rt)) {
+                                    return self.lowerType(cond.true_type, is_return_pos, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                                }
                             }
                         }
                     }
@@ -6259,6 +6695,8 @@ fn LowerCtx(comptime GraphType: type) type {
                                 if (!mentions_open_tp) {
                                     if (tn.resolved_type) |rt| {
                                         if (rt != ty_id) {
+                                            self.in_synthesized_resolved_depth += 1;
+                                            defer self.in_synthesized_resolved_depth -= 1;
                                             const resolved_ir = try self.lowerType(rt, is_return_pos, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                                             if (resolved_ir.* == .decl_ref) {
                                                 if (self.cur_mod_decls_out) |decls_out| {
@@ -6290,6 +6728,8 @@ fn LowerCtx(comptime GraphType: type) type {
                     if (!mentions_open_tp) {
                         if (tn.resolved_type) |rt| {
                             if (rt != ty_id) {
+                                self.in_synthesized_resolved_depth += 1;
+                                defer self.in_synthesized_resolved_depth -= 1;
                                 return self.lowerType(rt, is_return_pos, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
                             }
                         }
@@ -6321,6 +6761,77 @@ fn LowerCtx(comptime GraphType: type) type {
                     needs_runtime.* = true;
                     return self.makeType(.js_value);
                 },
+                .import_type => |it| {
+                    const mentions_open_tp = self.typeTreeMentionsActiveTypeParam(ty_id, active_tps, &.{}, 0);
+                    if (it.qualifier.len == 0) {
+                        needs_runtime.* = true;
+                        return self.makeType(.js_object);
+                    }
+                    if (try self.resolveImportTypeTargetDecl(self.str(it.module_specifier), it.qualifier, it.is_type_of)) |td| {
+                        if (!it.is_type_of) {
+                            if (self.lookupDeclLocation(td) != null) {
+                                return self.lowerClassInstanceFromTypeof(td, it.type_args, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                            }
+                            if (!mentions_open_tp and td < self.graph.decls.len and self.graph.decls[td].kind == .type_alias_decl) {
+                                if (tn.resolved_type) |rt| {
+                                    if (rt != ty_id) {
+                                        return self.lowerType(rt, is_return_pos, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                                    }
+                                }
+                            }
+                        } else {
+                            if (self.isConstructorLikeTargetDecl(td) and self.lookupDeclLocation(td) != null) {
+                                const inst_ty = try self.lowerClassInstanceFromTypeof(td, it.type_args, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                                needs_runtime.* = true;
+                                return self.makeType(.{
+                                    .unary_type_op = .{
+                                        .op = .constructor_of,
+                                        .operand = inst_ty,
+                                    },
+                                });
+                            }
+                            if (!mentions_open_tp) {
+                                if (tn.resolved_type) |rt| {
+                                    if (rt != ty_id) {
+                                        return self.lowerType(rt, is_return_pos, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                                    }
+                                }
+                            }
+                            if (td < self.graph.decls.len) {
+                                switch (self.graph.decls[td].kind) {
+                                    .variable_decl => |v_ty_id| {
+                                        return self.lowerType(v_ty_id, is_return_pos, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                                    },
+                                    .function_decl => |sigs| {
+                                        if (sigs.len == 1 and sigs[0] < self.graph.signatures.len and
+                                            self.graph.signatures[sigs[0]].type_params.len == 0)
+                                        {
+                                            const fp = try self.lowerGraphSigToFnPtrIr(sigs[0], active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                                            return self.makeType(.{ .fn_ptr = fp });
+                                        }
+                                        needs_runtime.* = true;
+                                        return self.makeType(.js_function);
+                                    },
+                                    .class_decl, .interface_decl, .namespace_decl, .enum_decl => {
+                                        needs_runtime.* = true;
+                                        return self.makeType(.js_object);
+                                    },
+                                    else => {},
+                                }
+                            }
+                        }
+                    }
+                    if (!mentions_open_tp) {
+                        if (tn.resolved_type) |rt| {
+                            if (rt != ty_id) {
+                                return self.lowerType(rt, is_return_pos, active_tps, self_ident_opt, visited, imports_used, needs_runtime);
+                            }
+                        }
+                    }
+                    try self.recordFallback(.unsupported_type_node, @tagName(tn.kind));
+                    needs_runtime.* = true;
+                    return self.makeType(.js_value);
+                },
                 else => {
                     if (!self.typeTreeMentionsActiveTypeParam(ty_id, active_tps, &.{}, 0)) {
                         if (tn.resolved_type) |rt| {
@@ -6345,7 +6856,7 @@ fn LowerCtx(comptime GraphType: type) type {
             visited: *std.AutoHashMapUnmanaged(u32, void),
             imports_used: *std.AutoHashMapUnmanaged(u32, void),
             needs_runtime: *bool,
-        ) error{OutOfMemory}!*const TypeIr {
+        ) error{OutOfMemory}!*TypeIr {
             const found = self.lookupDeclLocation(td) orelse {
                 needs_runtime.* = true;
                 return self.makeType(.js_object);
@@ -7412,7 +7923,8 @@ fn LowerCtx(comptime GraphType: type) type {
                     if (dr.target_decl_id == std.math.maxInt(u32)) {
                         if (dr.decl_zig_path.len == 1 and
                             (std.mem.startsWith(u8, dr.decl_zig_path[0], "__zigar_AnonHandle") or
-                                std.mem.startsWith(u8, dr.decl_zig_path[0], "__zigar_AnonFn")))
+                                std.mem.startsWith(u8, dr.decl_zig_path[0], "__zigar_AnonFn") or
+                                std.mem.startsWith(u8, dr.decl_zig_path[0], "__zigar_ArrayBufferView")))
                         {
                             break :blk false;
                         }
@@ -11295,6 +11807,7 @@ fn LowerCtx(comptime GraphType: type) type {
                         v_oid
                     else if (!mentions_alias_tp and ty_id < self.graph.types.len and self.graph.types[ty_id].resolved_type != null and
                         self.graph.types[ty_id].kind != .reference and
+                        self.graph.types[ty_id].kind != .import_type and
                         self.graph.types[ty_id].resolved_type.? < self.graph.types.len and
                         self.graph.types[self.graph.types[ty_id].resolved_type.?].kind == .object_literal)
                         self.graph.types[ty_id].resolved_type.?
@@ -16931,6 +17444,12 @@ fn LowerCtx(comptime GraphType: type) type {
         }
 
         fn build(self: *Self) LowerError![]ModuleIr {
+            for (self.options.source_files) |sf| {
+                try self.vfs_sources.put(self.scratch, sf.vfs_path, sf.contents);
+                if (sf.vfs_path.len > 0 and sf.vfs_path[0] == '/') {
+                    try self.vfs_sources.put(self.scratch, sf.vfs_path[1..], sf.contents);
+                }
+            }
             try self.normalizeIntersectionGraphTypes();
             try self.computeTypeRefCounts();
             try self.discoverCandidates();
@@ -17224,16 +17743,20 @@ fn LowerCtx(comptime GraphType: type) type {
 
                 var decl_irs: std.ArrayList(DeclIr) = .empty;
                 self.cur_mod_idx = final_mod_idx;
+                self.cur_cand_idx = cand_idx;
                 self.cur_mod_specifier = cand.substituted_specifier;
                 self.cur_mod_hoisted_locs.clearRetainingCapacity();
                 self.cur_mod_closed_types.clearRetainingCapacity();
                 self.cur_mod_enum_member_types.clearRetainingCapacity();
                 self.cur_mod_unit_literal_types.clearRetainingCapacity();
+                self.cur_mod_property_key_loc = null;
+                self.cur_mod_array_buffer_view_loc = null;
                 self.cur_mod_decls_out = &decl_irs;
                 self.cur_mod_root_scope = ms;
                 self.cur_mod_anon_counter = 0;
                 self.inline_anon_depth = 0;
                 defer {
+                    self.cur_cand_idx = null;
                     self.cur_mod_decls_out = null;
                     self.cur_mod_root_scope = null;
                 }

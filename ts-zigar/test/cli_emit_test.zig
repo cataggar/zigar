@@ -63,6 +63,14 @@ fn resolveTypesNode26Dir(alloc: std.mem.Allocator) !?[]const u8 {
 }
 
 fn runZigCheck(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
+    return runZigCheckImpl(allocator, io, argv, false, null);
+}
+
+fn runZigCheckExpectFail(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, expected_err_substr: []const u8) !void {
+    return runZigCheckImpl(allocator, io, argv, true, expected_err_substr);
+}
+
+fn runZigCheckImpl(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, expect_fail: bool, expected_err_substr: ?[]const u8) !void {
     var child = try std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
@@ -86,7 +94,18 @@ fn runZigCheck(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u
     }
 
     const term = try child.wait(io);
-    if (term != .exited or term.exited != 0) {
+    const failed = (term != .exited or term.exited != 0);
+    if (expect_fail) {
+        if (!failed) return error.UnexpectedZigCheckSuccess;
+        if (expected_err_substr) |sub| {
+            if (std.mem.indexOf(u8, err_buf.items, sub) == null) {
+                std.debug.print("Expected stderr to contain '{s}', got:\n{s}\n", .{ sub, err_buf.items });
+                return error.UnexpectedZigCheckErrorOutput;
+            }
+        }
+        return;
+    }
+    if (failed) {
         std.debug.print("Command failed ({s}):\nSTDOUT:\n{s}\nSTDERR:\n{s}\n", .{
             argv[1],
             out_buf.items,
@@ -6346,7 +6365,7 @@ test "Issue #58 (M4.2b): full 63-module @types/node@26 sweep + crypto, sqlite, z
     defer ts_host.deinit();
 
     // Omit `-m` so `ts-zigar` discovers and emits the entire 63-module `@types/node@26` surface!
-    const cli_args = [_][]const u8{ "-t", types_node_dir, "-d", out_dir };
+    const cli_args = [_][]const u8{ "-t", types_node_dir, "-d", out_dir, "--report-fallbacks" };
     var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
     defer parsed.deinit(alloc);
     var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
@@ -6355,6 +6374,40 @@ test "Issue #58 (M4.2b): full 63-module @types/node@26 sweep + crypto, sqlite, z
         std.debug.print("Issue #58 full @types/node@26 error: {s}\n", .{res.err});
     }
     try std.testing.expect(res == .ok);
+    // Issue #59 M4.2c audit invariants across all 121 generated `@types/node@26` modules:
+    try std.testing.expect(res.ok.fallback_count <= 50);
+    if (res.ok.fallback_report) |rep| {
+        try std.testing.expect(std.mem.indexOf(u8, rep, "unresolved_type_ref") == null);
+        try std.testing.expect(std.mem.indexOf(u8, rep, "unsupported_type_node") == null);
+        try std.testing.expect(std.mem.indexOf(u8, rep, "web-globals/streams") == null);
+    }
+
+    const web_streams_zig = try std.fmt.allocPrint(alloc, "{s}/web_globals/streams.zig", .{out_dir});
+    defer alloc.free(web_streams_zig);
+    const web_streams_src = try cwd.readFileAlloc(io, web_streams_zig, alloc, .limited(8 * 1024 * 1024));
+    defer alloc.free(web_streams_src);
+    try std.testing.expect(std.mem.indexOf(u8, web_streams_src, "pub fn ReadableStream(comptime R: type) type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, web_streams_src, "erased_conditional_type") == null);
+
+    const http_zig = try std.fmt.allocPrint(alloc, "{s}/http.zig", .{out_dir});
+    defer alloc.free(http_zig);
+    const http_src = try cwd.readFileAlloc(io, http_zig, alloc, .limited(8 * 1024 * 1024));
+    defer alloc.free(http_src);
+    try std.testing.expect(std.mem.indexOf(u8, http_src, "pub const web_socket: __zigar_js.GlobalTarget(__zigar_js.ConstructorOf(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, http_src, "unsupported_type_node: import_type") == null);
+
+    const sqlite_zig = try std.fmt.allocPrint(alloc, "{s}/sqlite.zig", .{out_dir});
+    defer alloc.free(sqlite_zig);
+    const sqlite_src = try cwd.readFileAlloc(io, sqlite_zig, alloc, .limited(8 * 1024 * 1024));
+    defer alloc.free(sqlite_src);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_src, "string_elements: []const []const u8") != null);
+
+    const fs_zig = try std.fmt.allocPrint(alloc, "{s}/fs.zig", .{out_dir});
+    defer alloc.free(fs_zig);
+    const fs_src = try cwd.readFileAlloc(io, fs_zig, alloc, .limited(8 * 1024 * 1024));
+    defer alloc.free(fs_src);
+    try std.testing.expect(std.mem.indexOf(u8, fs_src, "PathPathLike") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fs_src, "CallbackCb") == null);
 
     // 1. Verify ES2025/Node 26 `Float16Array` is lowered as a first-class binary view (`__zigar_js.Float16Array`),
     // never `float16_array: __zigar_js.Object` or `unresolved_type_ref: Float16Array`.
@@ -6500,6 +6553,401 @@ test "Issue #58 (M4.2b): full 63-module @types/node@26 sweep + crypto, sqlite, z
         });
     } else |_| {}
 }
+
+test "Issue #59 M4.2c Audit: closed-condition generic conditionals, import() / typeof import() types, TemplateStringsArray, stutter-free Tier-3 overloads, -s node:= aliases, and downstream zig test laziness" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue59-m4-audit", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const pkg_dir = try std.fmt.allocPrint(alloc, "{s}/node_modules/@types/node", .{sandbox});
+    defer alloc.free(pkg_dir);
+    const undici_dir = try std.fmt.allocPrint(alloc, "{s}/node_modules/undici-types", .{sandbox});
+    defer alloc.free(undici_dir);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+    try cwd.createDirPath(io, pkg_dir);
+    try cwd.createDirPath(io, undici_dir);
+
+    {
+        var undici = try cwd.openDir(io, undici_dir, .{});
+        defer undici.close(io);
+        try undici.writeFile(io, .{
+            .sub_path = "package.json",
+            .data =
+            \\{ "name": "undici-types", "version": "7.0.0", "types": "index.d.ts" }
+            ,
+        });
+        try undici.writeFile(io, .{
+            .sub_path = "websocket.d.ts",
+            .data =
+            \\export declare class WebSocket {
+            \\    constructor(url: string);
+            \\    readonly url: string;
+            \\    close(code?: number, reason?: string): void;
+            \\}
+            ,
+        });
+        try undici.writeFile(io, .{
+            .sub_path = "default-agent.d.ts",
+            .data =
+            \\export default class DefaultAgent {
+            \\    constructor(origin: string);
+            \\    destroy(): Promise<void>;
+            \\}
+            ,
+        });
+        try undici.writeFile(io, .{
+            .sub_path = "index.d.ts",
+            .data =
+            \\import DefaultAgent from "./default-agent";
+            \\export { WebSocket } from "./websocket";
+            \\export { DefaultAgent };
+            \\export type AgentClass = typeof import("./default-agent").default;
+            ,
+        });
+    }
+
+    {
+        var pkg = try cwd.openDir(io, pkg_dir, .{});
+        defer pkg.close(io);
+        try pkg.writeFile(io, .{
+            .sub_path = "package.json",
+            .data =
+            \\{ "name": "@types/node", "version": "26.0.0", "types": "index.d.ts", "dependencies": { "undici-types": "7.0.0" } }
+            ,
+        });
+        try pkg.writeFile(io, .{
+            .sub_path = "index.d.ts",
+            .data =
+            \\/// <reference path="globals.d.ts" />
+            \\/// <reference path="http.d.ts" />
+            \\/// <reference path="fs.d.ts" />
+            \\/// <reference path="sqlite.d.ts" />
+            \\/// <reference path="unused_heavy.d.ts" />
+            ,
+        });
+        try pkg.writeFile(io, .{
+            .sub_path = "globals.d.ts",
+            .data =
+            \\type EmptySentinel = {};
+            \\export type ReadableStream<R = any> = [EmptySentinel] extends [never] ? never : {
+            \\    readonly locked: boolean;
+            \\    cancel(reason?: string): Promise<void>;
+            \\    getValue(): R;
+            \\};
+            \\export interface BuiltinShowcase {
+            \\    fmt: Intl.DateTimeFormat;
+            \\    instant: Temporal.Instant;
+            \\    stack: DisposableStack;
+            \\    astack: AsyncDisposableStack;
+            \\    reg: FinalizationRegistry<string>;
+            \\    iter: IteratorObject<number, void, unknown>;
+            \\}
+            ,
+        });
+        try pkg.writeFile(io, .{
+            .sub_path = "http.d.ts",
+            .data =
+            \\declare module "http" {
+            \\    export const WebSocket: typeof import("undici-types").WebSocket;
+            \\    export type AgentCtor = import("undici-types").AgentClass;
+            \\    export type FsModuleRef = typeof import("node:fs");
+            \\    export type BodyStream<R = Uint8Array> = import("./globals").ReadableStream<R>;
+            \\    export function createServer(): { close(): void };
+            \\}
+            \\declare module "node:http" {
+            \\    export * from "http";
+            \\}
+            ,
+        });
+        try pkg.writeFile(io, .{
+            .sub_path = "fs.d.ts",
+            .data =
+            \\declare module "fs" {
+            \\    export type PathLike = string | Uint8Array;
+            \\    export interface StatOptions { bigint?: false; }
+            \\    export interface BigIntOptions { bigint: true; }
+            \\    export type StatCallback = (err: Error | null, size: number) => void;
+            \\    export type BigIntCallback = (err: Error | null, size: bigint) => void;
+            \\    export function stat(path: PathLike, callback: StatCallback): void;
+            \\    export function stat(path: PathLike, options: StatOptions | undefined, callback: StatCallback): void;
+            \\    export function stat(path: PathLike, options: BigIntOptions, callback: BigIntCallback): void;
+            \\}
+            \\declare module "node:fs" {
+            \\    export * from "fs";
+            \\}
+            ,
+        });
+        try pkg.writeFile(io, .{
+            .sub_path = "sqlite.d.ts",
+            .data =
+            \\declare module "node:sqlite" {
+            \\    export interface SQLTagStore {
+            \\        get(strings: TemplateStringsArray, ...values: string[]): Record<string, string> | undefined;
+            \\    }
+            \\}
+            ,
+        });
+        try pkg.writeFile(io, .{
+            .sub_path = "unused_heavy.d.ts",
+            .data =
+            \\declare module "node:unused_heavy" {
+            \\    export function neverImported(): number;
+            \\}
+            ,
+        });
+    }
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    // Emit with `-s "node:="` so `root.zig` exposes ergonomic `http`, `fs`, `sqlite` module identifiers
+    // while preserving canonical `"node:http"`, `"node:fs"`, `"node:sqlite"` wire specifiers!
+    const cli_args = [_][]const u8{
+        "-t",
+        pkg_dir,
+        "-s",
+        "node:=",
+        "-d",
+        out_dir,
+        "--report-fallbacks",
+    };
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &cli_args);
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Issue #59 synthetic audit error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+    if (res.ok.fallback_count != 0) {
+        if (res.ok.fallback_report) |rep| std.debug.print("Issue #59 unexpected fallbacks:\n{s}\n", .{rep});
+    }
+    try std.testing.expectEqual(@as(usize, 0), res.ok.fallback_count);
+
+    // 1. Verify closed-condition generic `ReadableStream(comptime R: type)` + built-in globals with 0 fallbacks.
+    const globals_path = try std.fmt.allocPrint(alloc, "{s}/globals.zig", .{out_dir});
+    defer alloc.free(globals_path);
+    const globals_src = try cwd.readFileAlloc(io, globals_path, alloc, .limited(1024 * 1024));
+    defer alloc.free(globals_src);
+    try std.testing.expect(std.mem.indexOf(u8, globals_src, "pub fn ReadableStream(comptime R: type) type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, globals_src, "erased_conditional_type") == null);
+    try std.testing.expect(std.mem.indexOf(u8, globals_src, "unresolved_type_ref") == null);
+
+    // 2. Verify `http.zig` keeps canonical `.wire_specifier = "node:http"` while lowering `typeof import(...)` to `ConstructorOf`.
+    const http_path = try std.fmt.allocPrint(alloc, "{s}/http.zig", .{out_dir});
+    defer alloc.free(http_path);
+    const http_src = try cwd.readFileAlloc(io, http_path, alloc, .limited(1024 * 1024));
+    defer alloc.free(http_src);
+    try std.testing.expect(std.mem.indexOf(u8, http_src, ".wire_specifier = \"node:http\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, http_src, "pub const web_socket: __zigar_js.GlobalTarget(__zigar_js.ConstructorOf(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, http_src, "pub const AgentCtor = ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, http_src, "pub const AgentCtor = __zigar_js.Object") == null);
+
+    const undici_path = try std.fmt.allocPrint(alloc, "{s}/undici_types.zig", .{out_dir});
+    defer alloc.free(undici_path);
+    const undici_src = try cwd.readFileAlloc(io, undici_path, alloc, .limited(1024 * 1024));
+    defer alloc.free(undici_src);
+    try std.testing.expect(std.mem.indexOf(u8, undici_src, "pub const AgentClass = __zigar_js.ConstructorOf(") != null);
+
+    // 3. Verify `sqlite.zig` maps `TemplateStringsArray` to `[]const []const u8`.
+    const sqlite_path = try std.fmt.allocPrint(alloc, "{s}/sqlite.zig", .{out_dir});
+    defer alloc.free(sqlite_path);
+    const sqlite_src = try cwd.readFileAlloc(io, sqlite_path, alloc, .limited(1024 * 1024));
+    defer alloc.free(sqlite_src);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_src, "strings: []const []const u8") != null);
+
+    // 4. Verify `fs.zig` Tier-3 overload names eliminate `PathPathLike` / `OptionsStatOptionsOpt` stuttering.
+    const fs_path = try std.fmt.allocPrint(alloc, "{s}/fs.zig", .{out_dir});
+    defer alloc.free(fs_path);
+    const fs_src = try cwd.readFileAlloc(io, fs_path, alloc, .limited(1024 * 1024));
+    defer alloc.free(fs_src);
+    try std.testing.expect(std.mem.indexOf(u8, fs_src, "PathPathLike") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fs_src, "OptionsStatOptionsOpt") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fs_src, "OptionsBigIntOptions") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fs_src, "pub fn statPathLikeStatOptionsOpt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fs_src, "pub fn statPathLikeBigIntOptions") != null);
+
+    // 5. Standalone `zig test out/root.zig` exercises `refAllDecls` across the entire generated graph.
+    const root_path = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_path);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_path });
+
+    // 6. Prove downstream `zig test` laziness (`@typeName(@This()) == "root"` guard):
+    // Plant `@compileError` inside unreferenced `unused_heavy.zig`:
+    // - Direct `zig test out/root.zig` MUST fail (proving standalone `zig test root.zig` checks every module).
+    // - Downstream `zig test` via BOTH relative `@import("out/root.zig")` AND `--dep node -Mnode=out/root.zig`
+    //   MUST pass without evaluating `unused_heavy.zig`!
+    {
+        var out_handle = try cwd.openDir(io, out_dir, .{});
+        defer out_handle.close(io);
+        try out_handle.writeFile(io, .{
+            .sub_path = "unused_heavy.zig",
+            .data = "comptime { @compileError(\"unused_heavy should not be evaluated by downstream zig test\"); }\n",
+        });
+    }
+    try runZigCheckExpectFail(
+        alloc,
+        io,
+        &.{ test_options.zig_exe, "test", root_path },
+        "unused_heavy should not be evaluated by downstream zig test",
+    );
+
+    const rel_consumer_path = try std.fmt.allocPrint(alloc, "{s}/rel_downstream_consumer_test.zig", .{sandbox});
+    defer alloc.free(rel_consumer_path);
+    const consumer_path = try std.fmt.allocPrint(alloc, "{s}/downstream_consumer_test.zig", .{sandbox});
+    defer alloc.free(consumer_path);
+    const mroot_arg = try std.fmt.allocPrint(alloc, "-Mroot={s}", .{consumer_path});
+    defer alloc.free(mroot_arg);
+    const mnode_arg = try std.fmt.allocPrint(alloc, "-Mnode={s}", .{root_path});
+    defer alloc.free(mnode_arg);
+    {
+        var sb = try cwd.openDir(io, sandbox, .{});
+        defer sb.close(io);
+        try sb.writeFile(io, .{
+            .sub_path = "rel_downstream_consumer_test.zig",
+            .data =
+            \\const std = @import("std");
+            \\const node = @import("out/root.zig");
+            \\
+            \\test "relative @import downstream consumer skips root.zig refAllDecls" {
+            \\    try std.testing.expectEqualStrings("node:http", node.http.zigar_js.wire_specifier);
+            \\    try std.testing.expect(@hasDecl(node.zigar_js.InstanceType(node.http.AgentCtor), "destroy"));
+            \\    _ = &node.http.createServer;
+            \\    _ = &@TypeOf(node.http.web_socket).get;
+            \\    _ = node.http.BodyStream(u8);
+            \\}
+            ,
+        });
+        try sb.writeFile(io, .{
+            .sub_path = "downstream_consumer_test.zig",
+            .data =
+            \\const std = @import("std");
+            \\const node = @import("node");
+            \\
+            \\test "downstream consumer imports only node.http lazily" {
+            \\    try std.testing.expectEqualStrings("node:http", node.http.zigar_js.wire_specifier);
+            \\    try std.testing.expect(@hasDecl(node.zigar_js.InstanceType(node.http.AgentCtor), "destroy"));
+            \\    _ = &node.http.createServer;
+            \\    _ = &@TypeOf(node.http.web_socket).get;
+            \\    _ = node.http.BodyStream(u8);
+            \\}
+            ,
+        });
+    }
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", rel_consumer_path });
+    try runZigCheck(alloc, io, &.{
+        test_options.zig_exe,
+        "test",
+        "--dep",
+        "node",
+        mroot_arg,
+        mnode_arg,
+    });
+
+    // 7. Verify built-in `PropertyKey` & `ArrayBufferView` lower losslessly to exact Zig unions
+    //    (not lossy `Object`), while unresolved local `import` bindings (`Duration`, `Locale`,
+    //    `WeakRef`, `Intl.DateTimeFormat`, `Promise`) are NEVER swallowed under `--strict-fallbacks`.
+    const strict_src_dir = try std.fmt.allocPrint(alloc, "{s}/src_strict", .{sandbox});
+    defer alloc.free(strict_src_dir);
+    try cwd.createDirPath(io, strict_src_dir);
+    {
+        var sd = try cwd.openDir(io, strict_src_dir, .{});
+        defer sd.close(io);
+        try sd.writeFile(io, .{
+            .sub_path = "builtins.d.ts",
+            .data =
+            \\export declare function byKey<K extends PropertyKey>(key: K, raw: PropertyKey, view: ArrayBufferView): PropertyKey;
+            \\export declare function fmtDate(fmt: Intl.DateTimeFormat, dur: Temporal.Duration): globalThis.Intl.Locale;
+            ,
+        });
+        try sd.writeFile(io, .{
+            .sub_path = "unresolved_imports.d.ts",
+            .data =
+            \\import type { Duration, Locale, WeakRef, Promise } from "luxon-not-installed";
+            \\import type * as Intl from "fake-intl-not-installed";
+            \\export declare function broken(
+            \\    d: Duration,
+            \\    loc: Locale,
+            \\    bareInstant: Instant,
+            \\    wr: WeakRef<object>,
+            \\    p: Promise<number>,
+            \\    dtf: Intl.DateTimeFormat,
+            \\    m: TotallyMissingType,
+            \\): void;
+            ,
+        });
+    }
+
+    const strict_ok_out = try std.fmt.allocPrint(alloc, "{s}/out_strict_ok", .{sandbox});
+    defer alloc.free(strict_ok_out);
+    const strict_builtins_entry = try std.fmt.allocPrint(alloc, "{s}/builtins.d.ts", .{strict_src_dir});
+    defer alloc.free(strict_builtins_entry);
+    {
+        var ok_parsed = try ts_zigar.cli.parseArgs(alloc, &.{
+            "-t",
+            strict_builtins_entry,
+            "-d",
+            strict_ok_out,
+            "--strict-fallbacks",
+        });
+        defer ok_parsed.deinit(alloc);
+        var ok_res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &ok_parsed.run);
+        defer ok_res.deinit(alloc);
+        if (ok_res == .err) {
+            std.debug.print("unexpected strict builtins failure:\n{s}\n", .{ok_res.err});
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expectEqual(@as(usize, 0), ok_res.ok.fallback_count);
+    }
+    const builtins_zig_path = try std.fmt.allocPrint(alloc, "{s}/builtins.zig", .{strict_ok_out});
+    defer alloc.free(builtins_zig_path);
+    const builtins_zig_src = try cwd.readFileAlloc(io, builtins_zig_path, alloc, .limited(1024 * 1024));
+    defer alloc.free(builtins_zig_src);
+    try std.testing.expect(std.mem.indexOf(u8, builtins_zig_src, "__zigar_PropertyKey_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, builtins_zig_src, "symbol: __zigar_js.Symbol") != null);
+    try std.testing.expect(std.mem.indexOf(u8, builtins_zig_src, "__zigar_ArrayBufferView_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, builtins_zig_src, "float16_array: __zigar_js.Float16Array") != null);
+    try std.testing.expect(std.mem.indexOf(u8, builtins_zig_src, "data_view: __zigar_js.DataView") != null);
+    const strict_ok_root = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{strict_ok_out});
+    defer alloc.free(strict_ok_root);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", strict_ok_root });
+
+    const strict_fail_out = try std.fmt.allocPrint(alloc, "{s}/out_strict_fail", .{sandbox});
+    defer alloc.free(strict_fail_out);
+    const strict_bad_entry = try std.fmt.allocPrint(alloc, "{s}/unresolved_imports.d.ts", .{strict_src_dir});
+    defer alloc.free(strict_bad_entry);
+    {
+        var fail_parsed = try ts_zigar.cli.parseArgs(alloc, &.{
+            "-t",
+            strict_bad_entry,
+            "-d",
+            strict_fail_out,
+            "--strict-fallbacks",
+        });
+        defer fail_parsed.deinit(alloc);
+        var fail_res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &fail_parsed.run);
+        defer fail_res.deinit(alloc);
+        try std.testing.expect(fail_res == .err);
+        try std.testing.expect(std.mem.indexOf(u8, fail_res.err, "[unresolved_type_ref] unresolved_imports::broken - Duration") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fail_res.err, "[unresolved_type_ref] unresolved_imports::broken - Locale") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fail_res.err, "[unresolved_type_ref] unresolved_imports::broken - Instant") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fail_res.err, "[unresolved_type_ref] unresolved_imports::broken - WeakRef") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fail_res.err, "[unresolved_type_ref] unresolved_imports::broken - Promise") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fail_res.err, "[unresolved_type_ref] unresolved_imports::broken - Intl.DateTimeFormat") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fail_res.err, "[unresolved_type_ref] unresolved_imports::broken - TotallyMissingType") != null);
+    }
+}
+
 
 
 

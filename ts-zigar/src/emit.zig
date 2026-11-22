@@ -5879,12 +5879,14 @@ fn renderRootRaw(
     }
 
     try out.appendSlice(allocator, "\ntest \"ts-zigar generated module graph\" {\n");
-    try out.appendSlice(allocator, "    @setEvalBranchQuota(2_000_000);\n");
-    try out.appendSlice(allocator, "    @import(\"std\").testing.refAllDecls(@This());\n");
+    try out.appendSlice(allocator, "    if (comptime @import(\"std\").mem.eql(u8, @typeName(@This()), \"root\")) {\n");
+    try out.appendSlice(allocator, "        @setEvalBranchQuota(2_000_000);\n");
+    try out.appendSlice(allocator, "        @import(\"std\").testing.refAllDecls(@This());\n");
     for (pkg.modules) |*m| {
         if (!m.is_primary) continue;
-        try out.print(allocator, "    @import(\"std\").testing.refAllDecls({s});\n", .{m.root_export_ident});
+        try out.print(allocator, "        @import(\"std\").testing.refAllDecls({s});\n", .{m.root_export_ident});
     }
+    try out.appendSlice(allocator, "    }\n");
     try out.appendSlice(allocator, "}\n");
 
     return try out.toOwnedSlice(allocator);

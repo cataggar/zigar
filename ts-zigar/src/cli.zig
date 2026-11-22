@@ -14,7 +14,7 @@ pub const help_text =
     \\  -t, --types <path>          Input .d.ts / .ts file or package directory (repeatable, required)
     \\  -d, --out-dir <dir>         Output directory for generated .zig modules (required)
     \\  -m, --module <name>         Emit only matching module(s) and their dependencies (repeatable)
-    \\  -s, --substitute <from=to>  Substitute module/namespace path prefix (repeatable, e.g. node:fs=fs)
+    \\  -s, --substitute <from=to>  Substitute or strip module prefix (repeatable, e.g. node:fs=fs, node:=)
     \\      --component <path>      Override path to typescript-compiler.component.wasm
     \\      --report-fallbacks      Print structured summary of lossy type fallbacks to stderr
     \\      --strict-fallbacks      Exit with error if any lossy type fallback is emitted
@@ -79,7 +79,10 @@ pub fn parseSubstituteRule(allocator: std.mem.Allocator, raw: []const u8) !Subst
     const from_raw = std.mem.trim(u8, raw[0..eq_idx], " \t");
     const to_raw = std.mem.trim(u8, raw[eq_idx + 1 ..], " \t");
     if (from_raw.len == 0) return error.EmptyFrom;
-    if (to_raw.len == 0) return error.EmptyTo;
+    const is_prefix_strip = from_raw[from_raw.len - 1] == ':' or
+        from_raw[from_raw.len - 1] == '/' or
+        from_raw[from_raw.len - 1] == '.';
+    if (to_raw.len == 0 and !is_prefix_strip) return error.EmptyTo;
     if (std.mem.indexOfScalar(u8, to_raw, '=') != null) return error.MultipleEquals;
 
     const from_owned = try allocator.dupe(u8, from_raw);
@@ -407,5 +410,12 @@ test "parseArgs handles --help, --version, missing required flags, unknown flags
         defer out.deinit(alloc);
         try std.testing.expect(out == .err);
         try std.testing.expect(std.mem.indexOf(u8, out.err, "--substitute") != null);
+    }
+    // Prefix-stripping rules ending in ':', '/', or '.' (e.g. `-s node:=`) are valid.
+    for ([_][]const u8{ "node:=", "@scope/=", "ns.=" }) |prefix_strip| {
+        var out = try parseArgs(alloc, &.{ "-t", "a.d.ts", "-d", "out", "-s", prefix_strip });
+        defer out.deinit(alloc);
+        try std.testing.expect(out == .run);
+        try std.testing.expectEqualStrings("", out.run.substitutions[0].to);
     }
 }

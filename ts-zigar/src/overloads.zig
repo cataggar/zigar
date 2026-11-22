@@ -853,10 +853,12 @@ fn buildTier3Suffix(scratch: std.mem.Allocator, sig: anytype) error{OutOfMemory}
     }
     for (sig.params) |p| {
         const p_hint = paramHintName(p);
-        if (p_hint.len > 0 and !std.mem.eql(u8, p_hint, "arg")) {
-            try appendPascalClean(&buf, scratch, scratch, p_hint);
-        }
         if (p.callback_sig) |cbs| {
+            const is_cb_hint = std.ascii.eqlIgnoreCase(p_hint, "callback") or
+                std.ascii.eqlIgnoreCase(p_hint, "cb");
+            if (p_hint.len > 0 and !std.mem.eql(u8, p_hint, "arg") and !is_cb_hint) {
+                try appendPascalClean(&buf, scratch, scratch, p_hint);
+            }
             try buf.appendSlice(scratch, "Cb");
             for (cbs.params) |cpt| {
                 try appendTypeSlug(&buf, scratch, scratch, cpt, null, true, false, 0);
@@ -866,7 +868,28 @@ fn buildTier3Suffix(scratch: std.mem.Allocator, sig: anytype) error{OutOfMemory}
                 try appendTypeSlug(&buf, scratch, scratch, cbs.return_type, null, true, false, 0);
             }
         } else {
-            try appendTypeSlug(&buf, scratch, scratch, p.ty, p_hint, true, false, 0);
+            var p_pascal_buf: std.ArrayList(u8) = .empty;
+            defer p_pascal_buf.deinit(scratch);
+            if (p_hint.len > 0 and !std.mem.eql(u8, p_hint, "arg")) {
+                try appendPascalClean(&p_pascal_buf, scratch, scratch, p_hint);
+            }
+            var t_slug_buf: std.ArrayList(u8) = .empty;
+            defer t_slug_buf.deinit(scratch);
+            try appendTypeSlug(&t_slug_buf, scratch, scratch, p.ty, p_hint, true, false, 0);
+
+            const p_pas = p_pascal_buf.items;
+            const t_slug = t_slug_buf.items;
+            const t_base = if (std.mem.endsWith(u8, t_slug, "Opt") and t_slug.len > 3)
+                t_slug[0 .. t_slug.len - 3]
+            else
+                t_slug;
+            const stutters = p_pas.len > 0 and t_base.len >= p_pas.len and
+                (std.ascii.startsWithIgnoreCase(t_base, p_pas) or
+                std.ascii.endsWithIgnoreCase(t_base, p_pas));
+            if (!stutters and p_pas.len > 0) {
+                try buf.appendSlice(scratch, p_pas);
+            }
+            try buf.appendSlice(scratch, t_slug);
         }
     }
     if (sig.return_type.* != .void_type) {

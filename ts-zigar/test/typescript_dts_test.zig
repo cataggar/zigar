@@ -326,7 +326,7 @@ test "M3.4a torture test: generate and compile Zig 0.17 bindings for TypeScript 
             \\        SyncCb,
             \\        GenCb,
             \\        js.Object.globalThis,
-            \\        js.Object.globalThis,
+            \\        .{ .str = "next" },
             \\        @as(SyncCb, undefined),
             \\        @as(GenCb, undefined),
             \\    ));
