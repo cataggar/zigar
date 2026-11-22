@@ -281,3 +281,20 @@ export class ReadyChannel extends Channel {
 export function openChannel(ready, token) {
   return ready ? new ReadyChannel(token) : new Channel(false);
 }
+
+export function endOrBind(a, b) {
+  if (typeof a === 'number' && typeof b === 'string') {
+    return `bind:${b}:${a}`;
+  }
+  if (typeof a === 'function' || a === undefined) {
+    if (typeof a === 'function') a();
+    return 'end:empty';
+  }
+  if (typeof b === 'function') b();
+  return `end:${typeof a}:${typeof a === 'object' && a !== null ? JSON.stringify(a) : String(a)}`;
+}
+
+export function acceptNestedPayload(payload) {
+  return `nested:${typeof payload.data}:${String(payload.data)}`;
+}
+

@@ -113,7 +113,13 @@ async function runViteCli(subcommand) {
   await ensureMonacoBindings({ quiet: true });
   const localNm = ensureViteDeps();
   const viteBin = join(localNm, 'vite/bin/vite.js');
-  const child = spawn(process.execPath, [ viteBin, subcommand, '--config', join(APP_DIR, 'vite.config.js') ], {
+  const cliArgs = [
+    viteBin,
+    ...(subcommand ? [ subcommand ] : []),
+    '--config',
+    join(APP_DIR, 'vite.config.js'),
+  ];
+  const child = spawn(process.execPath, cliArgs, {
     cwd: APP_DIR,
     env: process.env,
     stdio: 'inherit',
@@ -123,7 +129,7 @@ async function runViteCli(subcommand) {
 
 if (process.argv[1] && resolve(process.argv[1]) === __filename) {
   if (process.argv.includes('--dev')) {
-    await runViteCli('');
+    await runViteCli(null);
   } else if (process.argv.includes('--preview')) {
     if (!existsSync(join(DIST_DIR, 'index.html'))) {
       await buildViteApp();

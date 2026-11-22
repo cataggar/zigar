@@ -376,9 +376,9 @@ pub fn exerciseHeteroRecursiveAndGenericUnions(out_alloc: std.mem.Allocator) ![]
         defer tracked_alloc.free(soa4_desc);
         if (!std.mem.eql(u8, soa4_desc, "thenable:object:false")) return std.fmt.allocPrint(out_alloc, "fail:soa4_desc:{s}", .{soa4_desc});
 
-        // mode 5: native Promise.resolve(99) -> `.promise_like`
-        const soa5 = try m.produceSyncOrAsyncAlloc(tracked_alloc, 5);
-        defer js.freeDecoded(m.SyncOrAsync, tracked_alloc, soa5);
+        // mode 5: native Promise.resolve(99) -> `.promise_like`, exercising generated tagged-union `.deinit()` directly
+        const soa5 = try m.produceSyncOrAsync(5);
+        defer soa5.deinit();
         if (std.meta.activeTag(soa5) != .promise_like) return std.fmt.allocPrint(out_alloc, "fail:soa5:{s}", .{@tagName(std.meta.activeTag(soa5))});
         const soa5_desc = try m.inspectSyncOrAsyncAlloc(tracked_alloc, soa5);
         defer tracked_alloc.free(soa5_desc);

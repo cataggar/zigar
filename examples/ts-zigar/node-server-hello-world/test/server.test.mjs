@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import net from 'node:net';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -94,16 +95,75 @@ describe('node-server-hello-world (WASM + native node-zigar)', () => {
 
     const bundlePath = await buildWasmBundle({ quiet: true });
     const bundleSource = readFileSync(bundlePath, 'utf8');
+    const assetsDir = join(dirname(bundlePath), 'assets');
+    const wasmFiles = readdirSync(assetsDir).filter((f) => f.endsWith('.wasm'));
+    assert.equal(wasmFiles.length, 1, `Expected 1 .wasm asset, got ${JSON.stringify(wasmFiles)}`);
+    const wasmBytes = statSync(join(assetsDir, wasmFiles[0])).size;
+    assert.ok(
+      wasmBytes > 0 && wasmBytes < 256 * 1024,
+      `Expected compact stripped WASM binary (< 256 KiB), got ${wasmBytes} bytes`,
+    );
+    assert.ok(
+      Buffer.byteLength(bundleSource, 'utf8') < 768 * 1024,
+      `Expected compact Rollup JS bundle (< 768 KiB), got ${Buffer.byteLength(bundleSource, 'utf8')} bytes`,
+    );
 
-    assert.match(bundleSource, /from\s+["']node:http["']/);
-    assert.doesNotMatch(
-      bundleSource,
-      /from\s+["']node:(?:https|fs|crypto|sqlite|zlib|child_process)["']/,
-      'Unreferenced node:* modules must be tree-shaken out of the bundle',
+    const nodeImports = [ ...bundleSource.matchAll(/\bfrom\s*["'](node:[^"']+)["']/g) ].map((m) => m[1]);
+    assert.deepEqual(
+      nodeImports,
+      [ 'node:http' ],
+      `Expected sole built-in import 'node:http', got ${JSON.stringify(nodeImports)}`,
     );
 
     const mod = await import(`${pathToFileURL(bundlePath).href}?t=${Date.now()}`);
     await verifyServerLifecycle(mod);
+
+    // Verify async listen error (EADDRINUSE) is captured cleanly without crashing or leaking handles
+    const blocker = net.createServer();
+    await new Promise((res) => blocker.listen(0, '127.0.0.1', res));
+    const busyPort = blocker.address().port;
+    const prevPort = process.env.PORT;
+    process.env.PORT = String(busyPort);
+    try {
+      mod.start();
+      const deadline = Date.now() + 3_000;
+      while (!mod.hadError() && Date.now() < deadline) {
+        await delay(10);
+      }
+      assert.equal(mod.hadError(), true, 'Server error listener must record EADDRINUSE');
+      mod.shutdown();
+      assert.equal(Number(mod.activeHandles()), 0);
+      assert.equal(Number(mod.activeCallbacks()), 0);
+    } finally {
+      if (prevPort === undefined) delete process.env.PORT;
+      else process.env.PORT = prevPort;
+      await new Promise((res) => blocker.close(res));
+    }
+
+    // Verify runtime 'error' emitted AFTER listening still closes the listening socket on shutdown()
+    let capturedServer = null;
+    const origListen = net.Server.prototype.listen;
+    net.Server.prototype.listen = function (...args) {
+      capturedServer = this;
+      return origListen.apply(this, args);
+    };
+    const prevEnvPort = process.env.PORT;
+    process.env.PORT = '0';
+    try {
+      mod.start();
+      await waitForBoundPort(mod);
+      assert.ok(capturedServer && capturedServer.listening, 'Expected live listening http.Server');
+      capturedServer.emit('error', new Error('simulated runtime accept error'));
+      assert.equal(mod.hadError(), true, 'Runtime error event must set hadError()');
+      mod.shutdown();
+      assert.equal(capturedServer.listening, false, 'shutdown() must close server even when hadError() is true');
+      assert.equal(Number(mod.activeHandles()), 0);
+      assert.equal(Number(mod.activeCallbacks()), 0);
+    } finally {
+      net.Server.prototype.listen = origListen;
+      if (prevEnvPort === undefined) delete process.env.PORT;
+      else process.env.PORT = prevEnvPort;
+    }
   });
 
   it('serves HTTP 200 natively via node-zigar and shuts down with zero leaked handles or callbacks', async () => {

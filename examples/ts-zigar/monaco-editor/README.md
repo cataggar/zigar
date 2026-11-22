@@ -34,20 +34,23 @@ npx zigar ts \
 zig build test --summary all
 ```
 
-### 3. Run End-to-End WASM + Native `node-zigar` Tests
+### 3. Run Binding-Level WASM + Native `node-zigar` Tests
 
 ```bash
 npm test
 ```
 
+> Note: `test/monaco.test.mjs` combines real `monaco-editor` `editorBaseApi.js` primitives (`Uri`, `Range`, `Position`, `Selection`, `KeyMod`, `KeyCode`, `MarkerSeverity`) with lightweight headless `editor`/`languages` stubs for fast binding verification. For full Vite + `rollup-plugin-zigar` browser bundling and real `monaco.editor.create` DOM mounting in JSDOM, see [`../monaco-editor-hello-world`](../monaco-editor-hello-world).
+
 ## Example Usage in Zig (`@import("web")`)
 
 ```zig
 const std = @import("std");
+const zigar = @import("zigar");
 const web = @import("web");
 const dom = web.dom;
 const monaco = web.monaco;
-const js = web.zigar_js;
+const js = zigar.js;
 
 const WorkerSetup = struct {
     pub fn getWorkerUrl(_: *const @This(), _: []const u8, label: []const u8) []const u8 {

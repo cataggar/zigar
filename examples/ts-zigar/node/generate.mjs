@@ -5,10 +5,11 @@
  */
 
 import { execFile, execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { register } from 'node:module';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { registerHooks } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -59,6 +60,22 @@ function linkIfMissing(linkPath, targetPath) {
 }
 
 export function ensureWorkspaceLinks() {
+  const { npmCache } = ensureIsolatedCacheEnv('node');
+  if (!existsSync(join(REPO_ROOT, 'zigar-compiler/node_modules/rollup'))) {
+    execFileSync('npm', [ 'install', '--no-audit', '--no-fund', '--no-package-lock', '--ignore-scripts', '--prefer-offline', '--cache', npmCache ], {
+      cwd: join(REPO_ROOT, 'zigar-compiler'),
+      env: process.env,
+      stdio: 'ignore',
+    });
+  }
+  if (!existsSync(join(REPO_ROOT, 'node-zigar-addon/node_modules/node-api-headers'))) {
+    execFileSync('npm', [ 'install', '--no-audit', '--no-fund', '--no-package-lock', '--ignore-scripts', '--prefer-offline', '--cache', npmCache ], {
+      cwd: join(REPO_ROOT, 'node-zigar-addon'),
+      env: process.env,
+      stdio: 'ignore',
+    });
+  }
+
   const examplesNm = join(EXAMPLES_ROOT, 'node_modules');
   mkdirSync(examplesNm, { recursive: true });
 
@@ -126,6 +143,51 @@ function resolveComponentWasm() {
   return null;
 }
 
+function listGeneratorSourcePaths() {
+  const rels = [ 'ts-zigar/build.zig', 'ts-zigar/wit/typescript.wit' ];
+  const srcDir = join(REPO_ROOT, 'ts-zigar/src');
+  if (existsSync(srcDir)) {
+    for (const f of readdirSync(srcDir).filter((name) => name.endsWith('.zig')).sort()) {
+      rels.push(`ts-zigar/src/${f}`);
+    }
+  }
+  const adapterDir = join(REPO_ROOT, 'ts-zigar/component/adapter');
+  if (existsSync(adapterDir)) {
+    for (const f of readdirSync(adapterDir).filter((name) => name.endsWith('.go')).sort()) {
+      rels.push(`ts-zigar/component/adapter/${f}`);
+    }
+  }
+  return rels;
+}
+
+function computeGeneratorFingerprint() {
+  const hash = createHash('sha256');
+  for (const rel of listGeneratorSourcePaths()) {
+    const p = join(REPO_ROOT, rel);
+    if (existsSync(p)) {
+      hash.update(rel);
+      hash.update(readFileSync(p));
+    }
+  }
+  const componentWasm = resolveComponentWasm();
+  if (componentWasm && existsSync(componentWasm)) {
+    const st = statSync(componentWasm);
+    hash.update(`component:${st.size}:${Math.trunc(st.mtimeMs)}`);
+  }
+  return hash.digest('hex').slice(0, 16);
+}
+
+function isNativeBinFresh(nativeBin) {
+  if (!existsSync(nativeBin)) return false;
+  const binMtime = statSync(nativeBin).mtimeMs;
+  for (const rel of listGeneratorSourcePaths()) {
+    if (rel.endsWith('.go')) continue;
+    const p = join(REPO_ROOT, rel);
+    if (existsSync(p) && statSync(p).mtimeMs > binMtime) return false;
+  }
+  return true;
+}
+
 export async function ensureNodeBindings({ force = false, quiet = false } = {}) {
   const { buildDir } = ensureIsolatedCacheEnv('node');
   ensureWorkspaceLinks();
@@ -133,6 +195,7 @@ export async function ensureNodeBindings({ force = false, quiet = false } = {}) 
   const typesNodeDir = resolveOrInstallTypesNode26();
   const pkgJson = JSON.parse(readFileSync(join(typesNodeDir, 'package.json'), 'utf8'));
   const typesNodeVersion = pkgJson.version || 'unknown';
+  const generatorHash = computeGeneratorFingerprint();
   const cliArgs = [ '-t', typesNodeDir, '-s', 'node:=', '-d', GENERATED_DIR ];
 
   if (
@@ -144,7 +207,11 @@ export async function ensureNodeBindings({ force = false, quiet = false } = {}) 
   ) {
     try {
       const saved = JSON.parse(readFileSync(STAMP_PATH, 'utf8'));
-      if (saved.typesNodeVersion === typesNodeVersion && saved.stripSpec === 'node:=') {
+      if (
+        saved.typesNodeVersion === typesNodeVersion
+        && saved.stripSpec === 'node:='
+        && saved.generatorHash === generatorHash
+      ) {
         return { generatedDir: GENERATED_DIR, typesNodeVersion, cached: true };
       }
     } catch {}
@@ -156,7 +223,7 @@ export async function ensureNodeBindings({ force = false, quiet = false } = {}) 
   const nativeBin = join(REPO_ROOT, 'ts-zigar/zig-out/bin/ts-zigar');
   const componentWasm = resolveComponentWasm();
 
-  if (existsSync(nativeBin) && componentWasm) {
+  if (isNativeBinFresh(nativeBin) && componentWasm) {
     await execFileAsync(nativeBin, [ '--component', componentWasm, ...cliArgs ], {
       cwd: REPO_ROOT,
       env: process.env,
@@ -172,7 +239,7 @@ export async function ensureNodeBindings({ force = false, quiet = false } = {}) 
 
   writeFileSync(
     STAMP_PATH,
-    JSON.stringify({ typesNodeVersion, stripSpec: 'node:=' }, null, 2) + '\n',
+    JSON.stringify({ typesNodeVersion, stripSpec: 'node:=', generatorHash }, null, 2) + '\n',
     'utf8',
   );
 
@@ -182,20 +249,42 @@ export async function ensureNodeBindings({ force = false, quiet = false } = {}) 
   return { generatedDir: GENERATED_DIR, typesNodeVersion, cached: false };
 }
 
-let nativeLoaderRegistered = false;
+let nativeHooksRegistered = false;
+const compiledZigSources = new Map();
 
 export async function loadNativeZigModule(zigFileUrl) {
   ensureWorkspaceLinks();
-  try {
-    return await import(zigFileUrl);
-  } catch (err) {
-    if (!nativeLoaderRegistered && err && err.code === 'ERR_UNKNOWN_FILE_EXTENSION') {
-      register('node-zigar', import.meta.url);
-      nativeLoaderRegistered = true;
-      return await import(zigFileUrl);
-    }
-    throw err;
+  const resolvedUrl = new URL(zigFileUrl, import.meta.url).href;
+  if (!compiledZigSources.has(resolvedUrl)) {
+    const nodeZigar = await import(pathToFileURL(join(REPO_ROOT, 'node-zigar/dist/index.js')).href);
+    const loaded = await nodeZigar.load(resolvedUrl, {}, () => {
+      throw new Error(`Unexpected fallback load for ${resolvedUrl}`);
+    });
+    compiledZigSources.set(resolvedUrl, loaded.source);
   }
+  if (!nativeHooksRegistered) {
+    registerHooks({
+      resolve(specifier, context, nextResolve) {
+        if (!/\.(zig|zigar)(\?|$)/.test(specifier)) {
+          return nextResolve(specifier, context);
+        }
+        return {
+          format: 'module',
+          shortCircuit: true,
+          url: new URL(specifier, context.parentURL).href,
+        };
+      },
+      load(url, context, nextLoad) {
+        const src = compiledZigSources.get(url);
+        if (src !== undefined) {
+          return { format: 'module', shortCircuit: true, source: src };
+        }
+        return nextLoad(url, context);
+      },
+    });
+    nativeHooksRegistered = true;
+  }
+  return await import(resolvedUrl);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === __filename) {

@@ -19,9 +19,10 @@ import { buildWasmBundle } from '../build-wasm.mjs';
 const DIST_BUNDLE = path.join(MONACO_PKG_DIR, 'dist', 'showcase.mjs');
 
 // Install a Node.js 26 synchronous module hook that maps `'monaco-editor/editor/editor.api.js'`
-// to Microsoft's real `createMonacoBaseAPI()` (`Uri`, `Range`, `Selection`, `Position`, `KeyMod`,
-// `KeyCode`, `MarkerSeverity`, etc. — which has zero CSS/DOM top-level imports) combined with
-// deterministic `editor` and `languages` host implementations for headless Node testing.
+// to a hybrid headless host: Microsoft's real `createMonacoBaseAPI()` (`Uri`, `Range`, `Selection`,
+// `Position`, `KeyMod`, `KeyCode`, `MarkerSeverity`, etc. — which has zero CSS/DOM imports) plus
+// lightweight headless `editor` and `languages` stubs for fast binding-level tests without JSDOM.
+// (Full JSDOM + real `monaco.editor.create` DOM mounting is exercised in `../monaco-editor-hello-world`.)
 const editorBaseApiUrl = pathToFileURL(
   path.join(
     MONACO_PKG_DIR,
@@ -40,10 +41,7 @@ const VIRTUAL_EDITOR_API_URL = 'virtual-monaco://editor.api.mjs';
 
 registerHooks({
   resolve(specifier, context, nextResolve) {
-    if (
-      specifier === 'monaco-editor/editor/editor.api.js' ||
-      specifier === 'monaco-editor'
-    ) {
+    if (specifier === 'monaco-editor/editor/editor.api.js') {
       return {
         url: VIRTUAL_EDITOR_API_URL,
         shortCircuit: true,
@@ -271,9 +269,14 @@ describe('examples/ts-zigar/monaco-editor (#62 — M5.2a)', () => {
     assert.ok(existsSync(DIST_BUNDLE));
 
     // Verify Rollup emitted a static ES import ONLY for `monaco-editor/editor/editor.api.js`
-    // and did NOT pull in `monaco-editor` barrel language registrations!
+    // and did NOT pull in bare `monaco-editor` or barrel language registrations!
     const bundleSrc = readFileSync(DIST_BUNDLE, 'utf8');
-    assert.match(bundleSrc, /from\s+['"]monaco-editor\/editor\/editor\.api\.js['"]/);
+    const externalImports = [ ...bundleSrc.matchAll(/\bfrom\s*['"]([^'"]+)['"]/g) ].map((m) => m[1]);
+    assert.deepEqual(
+      externalImports,
+      [ 'monaco-editor/editor/editor.api.js' ],
+      `Expected sole external import 'monaco-editor/editor/editor.api.js', got ${JSON.stringify(externalImports)}`,
+    );
     assert.doesNotMatch(bundleSrc, /languages\/register\.all/);
 
     const wasmShowcase = await import(pathToFileURL(DIST_BUNDLE).href);

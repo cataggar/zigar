@@ -616,3 +616,99 @@ pub fn exerciseTypePredicatesAndNarrowing(out_alloc: std.mem.Allocator) ![]const
         send_copy[0..send_len],
     });
 }
+
+// 7. Auto-boxing Zig values into `Any` overload slots + narrow runtime integer (`u16`) -> `f64` coercion
+pub fn exerciseAnyOverloadAutoBoxingAndNarrowIntCoercion(out_alloc: std.mem.Allocator) ![]const u8 {
+    const handles_before = js.activeHandleCount();
+    const cbs_before = js.activeCallbackCount();
+    const allocs_before = live_allocs.load(.acquire);
+
+    var summary: []u8 = &.{};
+    errdefer if (summary.len > 0) out_alloc.free(summary);
+
+    {
+        // Direct string literal into `(chunk: any, cb?: () => void)` without manual `js.toJsRef`
+        const r_lit = try m.endOrBindAlloc(tracked_alloc, "Hello, World!");
+        defer js.freeDecoded([]const u8, tracked_alloc, r_lit);
+
+        // Runtime `[]const u8` + inline closure into `(chunk: any, cb?: () => void)`
+        var cb_hits: usize = 0;
+        const HitCtx = struct {
+            hits: *usize,
+            fn onDone(self: *@This()) void {
+                self.hits.* += 1;
+            }
+        };
+        var hctx: HitCtx = .{ .hits = &cb_hits };
+        const dyn_slice: []const u8 = r_lit[0..9];
+        const r_slice = try m.endOrBindAlloc(tracked_alloc, .{ dyn_slice, js.closure(&hctx, HitCtx.onDone) });
+        defer js.freeDecoded([]const u8, tracked_alloc, r_slice);
+        if (cb_hits != 1) return error.Unexpected;
+
+        // Pre-boxed `js.Any` still matches `.any_ catchall` directly without double-boxing or prematurely deiniting caller's ref
+        const caller_ref = try js.toJsRef(bool, true);
+        defer caller_ref.deinit();
+        const r_ref = try m.endOrBindAlloc(tracked_alloc, .{caller_ref});
+        defer js.freeDecoded([]const u8, tracked_alloc, r_ref);
+        if ((try js.fromJsRef(bool, caller_ref)) != true) return error.Unexpected;
+
+        // Runtime `u16` port coerces losslessly to `f64` in `(port: number, host: string)` instead of falling through to `any`
+        var runtime_port: u16 = 8080;
+        std.mem.doNotOptimizeAway(&runtime_port);
+        const r_bind = try m.endOrBindAlloc(tracked_alloc, .{ runtime_port, "127.0.0.1" });
+        defer js.freeDecoded([]const u8, tracked_alloc, r_bind);
+
+        // Optional runtime value (`?[]const u8 = null`) passed to non-optional `chunk: any` boxes JS `null` cleanly
+        var null_chunk: ?[]const u8 = null;
+        std.mem.doNotOptimizeAway(&null_chunk);
+        const r_null = try m.endOrBindAlloc(tracked_alloc, .{null_chunk});
+        defer js.freeDecoded([]const u8, tracked_alloc, r_null);
+
+        // Optional `?js.Any` (both non-null and null) passed to non-optional `chunk: any` borrows/boxes without leaking or freeing caller ref
+        var opt_any_some: ?js.Any = caller_ref;
+        std.mem.doNotOptimizeAway(&opt_any_some);
+        const r_opt_any_some = try m.endOrBindAlloc(tracked_alloc, .{opt_any_some});
+        defer js.freeDecoded([]const u8, tracked_alloc, r_opt_any_some);
+        if ((try js.fromJsRef(bool, caller_ref)) != true) return error.Unexpected;
+
+        var opt_any_null: ?js.Any = null;
+        std.mem.doNotOptimizeAway(&opt_any_null);
+        const r_opt_any_null = try m.endOrBindAlloc(tracked_alloc, .{opt_any_null});
+        defer js.freeDecoded([]const u8, tracked_alloc, r_opt_any_null);
+
+        // Nullable generated handle (`?LiveCounter`, both non-null and null) unwraps `_ref` without serializing `{ _ref }` or freeing caller handle
+        const counter_handle = try m.LiveCounter.init(77);
+        defer counter_handle.deinit();
+        var opt_handle_some: ?m.LiveCounter = counter_handle;
+        std.mem.doNotOptimizeAway(&opt_handle_some);
+        const r_opt_h_some = try m.endOrBindAlloc(tracked_alloc, .{opt_handle_some});
+        defer js.freeDecoded([]const u8, tracked_alloc, r_opt_h_some);
+        if ((try counter_handle.count()) != 77) return error.Unexpected;
+
+        var opt_handle_null: ?m.LiveCounter = null;
+        std.mem.doNotOptimizeAway(&opt_handle_null);
+        const r_opt_h_null = try m.endOrBindAlloc(tracked_alloc, .{opt_handle_null});
+        defer js.freeDecoded([]const u8, tracked_alloc, r_opt_h_null);
+
+        // Nested struct `{ data: any }` declared BEFORE `{ data: string }` does NOT hijack `.{ .data = "nested-ok" }`
+        const r_nested = try m.acceptNestedPayloadAlloc(tracked_alloc, .{ .data = "nested-ok" });
+        defer js.freeDecoded([]const u8, tracked_alloc, r_nested);
+
+        summary = try std.fmt.allocPrint(out_alloc, "{s}|{s}|{s}|{s}|{s}|{s}|{s}|{s}|{s}|{s}", .{
+            r_lit,
+            r_slice,
+            r_ref,
+            r_bind,
+            r_null,
+            r_opt_any_some,
+            r_opt_any_null,
+            r_opt_h_some,
+            r_opt_h_null,
+            r_nested,
+        });
+    }
+
+    try checkInvariants(handles_before, cbs_before, allocs_before);
+    return summary;
+}
+

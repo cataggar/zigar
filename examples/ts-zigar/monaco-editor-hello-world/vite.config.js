@@ -11,9 +11,6 @@ const monacoPkgRoot = resolve(dirname(realpathSync(fileURLToPath(import.meta.res
 
 const WORKER_SPECS = {
   'editor.worker': 'monaco-editor/editor/editor.worker.js',
-  'json.worker': 'monaco-editor/language/json/json.worker.js',
-  'css.worker': 'monaco-editor/language/css/css.worker.js',
-  'html.worker': 'monaco-editor/language/html/html.worker.js',
   'ts.worker': 'monaco-editor/language/typescript/ts.worker.js',
 };
 
@@ -27,8 +24,11 @@ const workerPaths = Object.fromEntries(
 const allowedFsRoots = Array.from(new Set([
   __dirname,
   realpathSync(__dirname),
-  repoRoot,
-  realpathSync(repoRoot),
+  resolve(__dirname, '../monaco-editor'),
+  realpathSync(resolve(__dirname, '../monaco-editor')),
+  realpathSync(join(repoRoot, 'zigar-runtime')),
+  realpathSync(join(repoRoot, 'zigar-compiler')),
+  cacheRoot,
   monacoPkgRoot,
   ...Object.values(workerPaths).map((workerFile) => dirname(workerFile)),
 ]));
@@ -74,6 +74,15 @@ export default defineConfig({
       allow: allowedFsRoots,
     },
   },
+  worker: {
+    format: 'es',
+    rollupOptions: {
+      output: {
+        entryFileNames: '[name].js',
+        chunkFileNames: 'assets/[name]-[hash].js',
+      },
+    },
+  },
   build: {
     target: 'es2022',
     outDir: join(__dirname, 'dist'),
@@ -82,7 +91,7 @@ export default defineConfig({
     rollupOptions: {
       input: {
         index: resolve(__dirname, 'index.html'),
-        ...workerPaths,
+        'editor.worker': workerPaths['editor.worker'],
       },
       output: {
         entryFileNames: (chunkInfo) =>

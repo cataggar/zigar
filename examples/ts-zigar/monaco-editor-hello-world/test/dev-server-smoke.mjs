@@ -37,7 +37,7 @@ try {
   const htmlText = await htmlRes.text();
   assert.match(htmlText, /id="container"/);
 
-  for (const workerRoute of [ 'ts.worker.js', 'json.worker.js', 'css.worker.js', 'html.worker.js', 'editor.worker.js' ]) {
+  for (const workerRoute of [ 'ts.worker.js', 'editor.worker.js' ]) {
     const res = await fetch(`${devBase}/${workerRoute}`, { headers: { connection: 'close' } });
     assert.equal(res.status, 200, `Vite dev server must serve /${workerRoute}`);
     const jsText = await res.text();

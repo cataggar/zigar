@@ -5171,15 +5171,29 @@ const ModuleEmitCtx = struct {
         variants: []const ir.UnionVariantIr,
     ) error{OutOfMemory}!void {
         var has_from_collision = false;
+        var has_deinit_collision = false;
         for (variants) |v| {
-            if (std.mem.eql(u8, v.logical_name, "from")) {
+            if (std.mem.eql(u8, v.logical_name, "from") or std.mem.eql(u8, v.zig_ident, "from")) {
                 has_from_collision = true;
-                break;
+            }
+            if (std.mem.eql(u8, v.logical_name, "deinit") or std.mem.eql(u8, v.zig_ident, "deinit")) {
+                has_deinit_collision = true;
             }
         }
 
-        var frame_buf: [2][]const u8 = .{ "zigar_js", "from" };
-        const frame_slice: []const []const u8 = if (has_from_collision) frame_buf[0..1] else frame_buf[0..2];
+        var frame_buf: [3][]const u8 = undefined;
+        var frame_len: usize = 0;
+        frame_buf[frame_len] = "zigar_js";
+        frame_len += 1;
+        if (!has_from_collision) {
+            frame_buf[frame_len] = "from";
+            frame_len += 1;
+        }
+        if (!has_deinit_collision) {
+            frame_buf[frame_len] = "deinit";
+            frame_len += 1;
+        }
+        const frame_slice: []const []const u8 = frame_buf[0..frame_len];
         try self.nested_decl_scopes.append(self.allocator, frame_slice);
         defer _ = self.nested_decl_scopes.pop();
 
@@ -5195,6 +5209,9 @@ const ModuleEmitCtx = struct {
         }
         if (!has_from_collision) {
             try self.out.appendSlice(self.allocator, "pub fn from(__zigar_val: anytype) @This() {\nreturn __zigar_js.coerceUnion(@This(), __zigar_val);\n}\n");
+        }
+        if (!has_deinit_collision) {
+            try self.out.appendSlice(self.allocator, "pub fn deinit(__zigar_self: @This()) void {\n__zigar_js.deinitHandles(@This(), __zigar_self);\n}\n");
         }
         try self.out.appendSlice(self.allocator, "pub const zigar_js = .{\n");
         if (wire_name) |wn| {
@@ -7192,6 +7209,67 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\            if (un.tag_type != null) {
         \\                switch (value) {
         \\                    inline else => |payload| freeDecoded(@TypeOf(payload), allocator, payload),
+        \\                }
+        \\            }
+        \\        },
+        \\        else => {},
+        \\    }
+        \\}
+        \\
+        \\pub fn deinitHandles(comptime T: type, value: T) void {
+        \\    switch (@typeInfo(T)) {
+        \\        .optional => |opt| {
+        \\            if (value) |v| deinitHandles(opt.child, v);
+        \\        },
+        \\        .array => |ar| {
+        \\            for (value) |elem| deinitHandles(ar.child, elem);
+        \\        },
+        \\        .pointer => |pt| switch (pt.size) {
+        \\            .slice => {
+        \\                if (pt.child != u8) {
+        \\                    for (value) |elem| deinitHandles(pt.child, elem);
+        \\                }
+        \\            },
+        \\            .one => {
+        \\                if (comptime (@typeInfo(pt.child) != .@"fn")) {
+        \\                    deinitHandles(pt.child, value.*);
+        \\                }
+        \\            },
+        \\            else => {},
+        \\        },
+        \\        .@"struct" => |st| {
+        \\            if (comptime isGeneratedHandleStruct(T)) {
+        \\                const ref_fname = comptime if (@hasDecl(T, "zigar_js") and @hasField(@TypeOf(T.zigar_js), "ref_field")) T.zigar_js.ref_field else "ref";
+        \\                @field(value, ref_fname).deinit();
+        \\                return;
+        \\            }
+        \\            if (comptime isJsValueStruct(T)) {
+        \\                if (comptime @hasDecl(T, "releaseHandleOnly")) {
+        \\                    value.releaseHandleOnly();
+        \\                } else if (comptime @hasDecl(T, "deinit")) {
+        \\                    value.deinit();
+        \\                } else if (comptime @hasField(T, "ref")) {
+        \\                    value.ref.deinit();
+        \\                } else if (has_host) {
+        \\                    raw_js.freeDecoded(T, std.mem.Allocator.failing, value);
+        \\                }
+        \\                return;
+        \\            }
+        \\            inline for (st.field_names, 0..) |fname, fi| {
+        \\                if (comptime !st.field_attrs[fi].@"comptime") {
+        \\                    deinitHandles(st.field_types[fi], @field(value, fname));
+        \\                }
+        \\            }
+        \\        },
+        \\        .@"union" => |un| {
+        \\            if (comptime isModuleNullableType(T)) {
+        \\                switch (value) {
+        \\                    .value => |v| deinitHandles(T.Value, v),
+        \\                    else => {},
+        \\                }
+        \\            } else if (un.tag_type != null) {
+        \\                switch (value) {
+        \\                    inline else => |payload| deinitHandles(@TypeOf(payload), payload),
         \\                }
         \\            }
         \\        },
@@ -9437,10 +9515,44 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\
         \\const OverloadMatchTier = enum(u8) {
         \\    none = 0,
-        \\    coerced = 1,
-        \\    exact = 2,
-        \\    literal_exact = 3,
+        \\    any_boxed = 1,
+        \\    coerced = 2,
+        \\    exact = 3,
+        \\    literal_exact = 4,
         \\};
+        \\
+        \\fn canBoxDataValueToJsRef(comptime T: type, comptime top_level: bool, comptime allow_opt: bool) bool {
+        \\    if (isCallbackLikeArg(T)) return false;
+        \\    return switch (@typeInfo(T)) {
+        \\        .bool, .int, .float, .@"enum" => true,
+        \\        .comptime_int, .comptime_float => top_level,
+        \\        .optional => |opt| allow_opt and canBoxDataValueToJsRef(opt.child, false, false),
+        \\        .array => |ar| canBoxDataValueToJsRef(ar.child, false, true),
+        \\        .pointer => |pt| switch (pt.size) {
+        \\            .slice => pt.child == u8 or canBoxDataValueToJsRef(pt.child, false, true),
+        \\            .one => top_level and @typeInfo(pt.child) == .array and
+        \\                (@typeInfo(pt.child).array.child == u8 or canBoxDataValueToJsRef(@typeInfo(pt.child).array.child, true, false)),
+        \\            else => false,
+        \\        },
+        \\        .@"struct" => |st| blk: {
+        \\            if (isGeneratedHandleStruct(T)) break :blk false;
+        \\            if (isJsValueStruct(T)) break :blk !top_level;
+        \\            for (st.field_types, 0..) |ft, fi| {
+        \\                if (st.field_attrs[fi].@"comptime") break :blk false;
+        \\                if (!canBoxDataValueToJsRef(ft, false, true)) break :blk false;
+        \\            }
+        \\            break :blk true;
+        \\        },
+        \\        .@"union" => |un| blk: {
+        \\            if (un.tag_type == null) break :blk false;
+        \\            for (un.field_types) |ft| {
+        \\                if (ft != void and !canBoxDataValueToJsRef(ft, false, true)) break :blk false;
+        \\            }
+        \\            break :blk true;
+        \\        },
+        \\        else => false,
+        \\    };
+        \\}
         \\
         \\fn callbackArgMatchScore(comptime ArgT: type, comptime expected_arity: ?usize) ?usize {
         \\    if (!isCallbackLikeArg(ArgT)) return null;
@@ -9448,6 +9560,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\        .optional => |opt| opt.child,
         \\        else => ArgT,
         \\    };
+        \\    if (unwrapped == Any or unwrapped == Unknown) return 2;
         \\    const ea = expected_arity orelse return 20;
         \\    return switch (@typeInfo(unwrapped)) {
         \\        .@"fn" => |fni| if (fni.param_types.len == ea) 25 else if (fni.param_types.len < ea) 18 else null,
@@ -9460,26 +9573,48 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\}
         \\
         \\fn argMatchTier(comptime ParamT: type, comptime ArgT: type, comptime arg_attr: ?std.builtin.Type.Struct.FieldAttributes) OverloadMatchTier {
+        \\    return argMatchTierImpl(ParamT, ArgT, arg_attr, true);
+        \\}
+        \\
+        \\fn argMatchTierImpl(
+        \\    comptime ParamT: type,
+        \\    comptime ArgT: type,
+        \\    comptime arg_attr: ?std.builtin.Type.Struct.FieldAttributes,
+        \\    comptime allow_any_box: bool,
+        \\) OverloadMatchTier {
         \\    if (ArgT == ParamT) return .exact;
         \\    if (ArgT == @TypeOf(null)) {
         \\        return if (@typeInfo(ParamT) == .optional) .exact else .none;
         \\    }
+        \\    const is_any_param = (ParamT == Any or ParamT == Unknown) or
+        \\        (@typeInfo(ParamT) == .optional and (@typeInfo(ParamT).optional.child == Any or @typeInfo(ParamT).optional.child == Unknown));
+        \\    if (is_any_param) {
+        \\        if (isJsValueStruct(ArgT) or isGeneratedHandleStruct(ArgT)) return .coerced;
+        \\        if (@typeInfo(ArgT) == .optional) {
+        \\            const ChildArgT = @typeInfo(ArgT).optional.child;
+        \\            if (isJsValueStruct(ChildArgT) or isGeneratedHandleStruct(ChildArgT)) {
+        \\                if (@typeInfo(ParamT) == .optional) return .coerced;
+        \\                return if (allow_any_box) .any_boxed else .none;
+        \\            }
+        \\            if (allow_any_box and canBoxDataValueToJsRef(ChildArgT, true, false)) return .any_boxed;
+        \\            return .none;
+        \\        }
+        \\        if (allow_any_box and canBoxDataValueToJsRef(ArgT, true, false)) return .any_boxed;
+        \\        return .none;
+        \\    }
         \\    if (@typeInfo(ParamT) == .optional) {
         \\        const ChildT = @typeInfo(ParamT).optional.child;
         \\        if (@typeInfo(ArgT) == .optional) {
-        \\            return argMatchTier(ChildT, @typeInfo(ArgT).optional.child, null);
+        \\            return argMatchTierImpl(ChildT, @typeInfo(ArgT).optional.child, null, allow_any_box);
         \\        }
-        \\        return argMatchTier(ChildT, ArgT, arg_attr);
-        \\    }
-        \\    if (ParamT == Any or ParamT == Unknown) {
-        \\        if (isJsValueStruct(ArgT) or isGeneratedHandleStruct(ArgT)) return .coerced;
-        \\        return .none;
+        \\        return argMatchTierImpl(ChildT, ArgT, arg_attr, allow_any_box);
         \\    }
         \\    if (ParamT == []const u8 and isStringSliceCoercible(ArgT)) return .exact;
         \\    switch (@typeInfo(ParamT)) {
-        \\        .float => {
+        \\        .float => |flt| {
         \\            if (@typeInfo(ArgT) == .float or @typeInfo(ArgT) == .comptime_float) return .exact;
         \\            if (@typeInfo(ArgT) == .comptime_int) return .coerced;
+        \\            if (flt.bits == 64 and @typeInfo(ArgT) == .int and @typeInfo(ArgT).int.bits <= 53) return .coerced;
         \\        },
         \\        .int => {
         \\            if (@typeInfo(ArgT) == .comptime_int) return .exact;
@@ -9527,7 +9662,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                if (!has_var) {
         \\                    if (ast.field_types.len > pst.field_types.len) return .none;
         \\                    inline for (0..ast.field_types.len) |afi| {
-        \\                        if (argMatchTier(pst.field_types[afi], ast.field_types[afi], ast.field_attrs[afi]) == .none) return .none;
+        \\                        if (argMatchTierImpl(pst.field_types[afi], ast.field_types[afi], ast.field_attrs[afi], false) == .none) return .none;
         \\                    }
         \\                    inline for (ast.field_types.len..pst.field_types.len) |pfi| {
         \\                        if (pst.field_attrs[pfi].default_value_ptr == null and @typeInfo(pst.field_types[pfi]) != .optional) {
@@ -9542,7 +9677,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                if (!ast.is_tuple and !isGeneratedHandleStruct(ArgT) and !isJsValueStruct(ArgT)) {
         \\                    inline for (ast.field_names, 0..) |af_name, afi| {
         \\                        if (!@hasField(ParamT, af_name)) return .none;
-        \\                        if (argMatchTier(@FieldType(ParamT, af_name), ast.field_types[afi], ast.field_attrs[afi]) == .none) return .none;
+        \\                        if (argMatchTierImpl(@FieldType(ParamT, af_name), ast.field_types[afi], ast.field_attrs[afi], false) == .none) return .none;
         \\                    }
         \\                    inline for (pst.field_names, 0..) |pf_name, pfi| {
         \\                        if (!@hasField(ArgT, pf_name)) {
@@ -9580,7 +9715,10 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    }
         \\    if (ParamT == []const u8 and comptime isStringSliceCoercible(ArgT)) return arg;
         \\    switch (@typeInfo(ParamT)) {
-        \\        .float => return @as(ParamT, arg),
+        \\        .float => {
+        \\            if (@typeInfo(ArgT) == .int) return @as(ParamT, @floatFromInt(arg));
+        \\            return @as(ParamT, arg);
+        \\        },
         \\        .int => return @as(ParamT, arg),
         \\        .@"enum" => {
         \\            if (comptime (isStringSliceCoercible(ArgT) and @hasDecl(ParamT, "fromSlice"))) {
@@ -9799,6 +9937,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                    .literal_exact => score += 25,
         \\                    .exact => score += 20,
         \\                    .coerced => score += 10,
+        \\                    .any_boxed => score += 3,
         \\                    .none => return null,
         \\                }
         \\            } else if (@hasField(@TypeOf(pspec), "tp_idx") and pspec.tp_idx != null) {
@@ -9817,10 +9956,11 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                            .async_iterator_elem => AsyncIterator(TpT),
         \\                            else => TpT,
         \\                        };
-        \\                        switch (argMatchTier(ExpectedT, ArgT, arg_attr)) {
+        \\                        switch (argMatchTierImpl(ExpectedT, ArgT, arg_attr, false)) {
         \\                            .literal_exact => score += 25,
         \\                            .exact => score += 20,
         \\                            .coerced => score += 10,
+        \\                            .any_boxed => score += 3,
         \\                            .none => return null,
         \\                        }
         \\                    } else {
@@ -9833,8 +9973,8 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                    }
         \\                    if (deduced_tps[tp_i]) |PrevT| {
         \\                        if (PrevT != DeducedT and
-        \\                            argMatchTier(PrevT, DeducedT, arg_attr) == .none and
-        \\                            argMatchTier(DeducedT, PrevT, .{}) == .none)
+        \\                            argMatchTierImpl(PrevT, DeducedT, arg_attr, false) == .none and
+        \\                            argMatchTierImpl(DeducedT, PrevT, .{}, false) == .none)
         \\                        {
         \\                            return null;
         \\                        }
@@ -9867,6 +10007,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                            .literal_exact => score += 6,
         \\                            .exact => score += 5,
         \\                            .coerced => score += 2,
+        \\                            .any_boxed => score += 1,
         \\                            .none => return null,
         \\                        }
         \\                    }
@@ -10088,6 +10229,71 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    return ReturnTypeOfTupleCall(TargetFn, FullTupT);
         \\}
         \\
+        \\fn needsRuntimeAnyBox(comptime ParamT: type, comptime ArgT: type) bool {
+        \\    return argMatchTierImpl(ParamT, ArgT, null, true) == .any_boxed;
+        \\}
+        \\
+        \\fn boxSingleValueToAny(val: anytype) CallError!Any {
+        \\    const V = @TypeOf(val);
+        \\    if (comptime isStringSliceCoercible(V)) {
+        \\        return try toJsRef([]const u8, val);
+        \\    }
+        \\    if (V == comptime_int or V == comptime_float) {
+        \\        return try toJsRef(f64, @as(f64, val));
+        \\    }
+        \\    const BoxT = InferJsType(V);
+        \\    return try toJsRef(BoxT, @as(BoxT, val));
+        \\}
+        \\
+        \\fn BoxedParam(comptime ParamT: type) type {
+        \\    return struct {
+        \\        value: ParamT,
+        \\        owned: bool,
+        \\
+        \\        pub fn deinit(self: @This()) void {
+        \\            if (!self.owned) return;
+        \\            if (@typeInfo(ParamT) == .optional) {
+        \\                if (self.value) |b| b.deinit();
+        \\            } else {
+        \\                self.value.deinit();
+        \\            }
+        \\        }
+        \\    };
+        \\}
+        \\
+        \\fn boxArgForParam(comptime ParamT: type, val: anytype) CallError!BoxedParam(ParamT) {
+        \\    const ValT = @TypeOf(val);
+        \\    if (@typeInfo(ValT) == .optional) {
+        \\        if (val) |inner| {
+        \\            const InnerT = @TypeOf(inner);
+        \\            if (comptime (isJsValueStruct(InnerT) or isGeneratedHandleStruct(InnerT))) {
+        \\                return .{
+        \\                    .value = coerceArgToParam(ParamT, inner),
+        \\                    .owned = false,
+        \\                };
+        \\            }
+        \\            const boxed = try boxSingleValueToAny(inner);
+        \\            return .{
+        \\                .value = coerceArgToParam(ParamT, boxed),
+        \\                .owned = true,
+        \\            };
+        \\        }
+        \\        if (@typeInfo(ParamT) == .optional) {
+        \\            return .{ .value = null, .owned = false };
+        \\        }
+        \\        const null_boxed = try toJsRef(?bool, null);
+        \\        return .{
+        \\            .value = coerceArgToParam(ParamT, null_boxed),
+        \\            .owned = true,
+        \\        };
+        \\    }
+        \\    const boxed = try boxSingleValueToAny(val);
+        \\    return .{
+        \\        .value = coerceArgToParam(ParamT, boxed),
+        \\        .owned = true,
+        \\    };
+        \\}
+        \\
         \\inline fn invokeStep(
         \\    comptime Owner: type,
         \\    comptime TargetFn: anytype,
@@ -10101,6 +10307,7 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\    comptime stage: usize,
         \\    prefix: anytype,
         \\) CandidateCallReturnType(Owner, has_self, SelfT, cand, TupT, pass_alloc) {
+        \\    const RetT = CandidateCallReturnType(Owner, has_self, SelfT, cand, TupT, pass_alloc);
         \\    const tst = @typeInfo(TupT).@"struct";
         \\    const actual_tst = @typeInfo(@TypeOf(tup)).@"struct";
         \\    const tp_n: usize = if (comptime candidateUsesExplicitTypeParams(cand, TupT)) cand.type_param_count else 0;
@@ -10127,6 +10334,14 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                if (comptime pspec.kind == .callback) {
         \\                    return invokeStep(Owner, TargetFn, has_self, SelfT, pass_alloc, alloc_val, cand, TupT, tup, stage + 1, prefix ++ .{comptime_arg});
         \\                } else if (comptime target_params[fixed_param_base + fi]) |ParamT| {
+        \\                    if (comptime needsRuntimeAnyBox(ParamT, @TypeOf(comptime_arg))) {
+        \\                        const boxed = if (comptime @typeInfo(RetT) == .error_union)
+        \\                            try boxArgForParam(ParamT, comptime_arg)
+        \\                        else
+        \\                            boxArgForParam(ParamT, comptime_arg) catch @panic("ts-zigar failed to box argument");
+        \\                        defer boxed.deinit();
+        \\                        return invokeStep(Owner, TargetFn, has_self, SelfT, pass_alloc, alloc_val, cand, TupT, tup, stage + 1, prefix ++ .{boxed.value});
+        \\                    }
         \\                    const coerced = coerceArgToParam(ParamT, comptime_arg);
         \\                    return invokeStep(Owner, TargetFn, has_self, SelfT, pass_alloc, alloc_val, cand, TupT, tup, stage + 1, prefix ++ .{coerced});
         \\                } else {
@@ -10137,6 +10352,14 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\            if (comptime pspec.kind == .callback) {
         \\                return invokeStep(Owner, TargetFn, has_self, SelfT, pass_alloc, alloc_val, cand, TupT, tup, stage + 1, prefix ++ .{raw_arg});
         \\            } else if (comptime target_params[fixed_param_base + fi]) |ParamT| {
+        \\                if (comptime needsRuntimeAnyBox(ParamT, @TypeOf(raw_arg))) {
+        \\                    const boxed = if (comptime @typeInfo(RetT) == .error_union)
+        \\                        try boxArgForParam(ParamT, raw_arg)
+        \\                    else
+        \\                        boxArgForParam(ParamT, raw_arg) catch @panic("ts-zigar failed to box argument");
+        \\                    defer boxed.deinit();
+        \\                    return invokeStep(Owner, TargetFn, has_self, SelfT, pass_alloc, alloc_val, cand, TupT, tup, stage + 1, prefix ++ .{boxed.value});
+        \\                }
         \\                const coerced = coerceArgToParam(ParamT, raw_arg);
         \\                return invokeStep(Owner, TargetFn, has_self, SelfT, pass_alloc, alloc_val, cand, TupT, tup, stage + 1, prefix ++ .{coerced});
         \\            } else {

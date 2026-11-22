@@ -54,9 +54,11 @@ zig build test
 ### 4. Run Compiled to WebAssembly in Node.js 26
 
 ```bash
-node run-wasm.mjs
-node --test test/node-runner.test.mjs
-# or: npm test
+npm start
+# or directly: node run-wasm.mjs
+
+npm test
+# runs both the Node.js 26 WASM test suite AND `zig build test` (native GPA + wasm32 checks)
 ```
 
 ## What `src/lib.zig` Demonstrates
@@ -76,13 +78,22 @@ WIT resources live inside the component host's handle table until explicitly dro
 ```zig
 const compiler = bindings.compiler.bindHost(host);
 
+// `[constructor]vfs` returns a bound `Vfs` directly:
 var vfs = try compiler.createVfs(scratch, true);
 defer vfs.deinit(); // idempotent cleanup if an early error occurs
 
+// `create-program` returns `result<program, list<diagnostic>>`; inspect `.ok` / `.err` first:
 const prog_res = try compiler.createProgram(scratch, vfs.asBorrow(), &root_files, opts);
-var program = compiler.wrapProgram(prog_res.ok);
+var program = switch (prog_res) {
+    .ok => |raw| compiler.wrapProgram(raw),
+    .err => |diags| {
+        ch.freeValue([]const compiler.Diagnostic, scratch, diags);
+        return error.TypeScriptProgramFailed;
+    },
+};
 defer program.deinit();
 
+// `[method]program.get-checker` returns an owned `Checker` handle wrapped with `host`:
 var checker = compiler.wrapChecker(try program.getChecker(scratch));
 defer checker.deinit();
 
