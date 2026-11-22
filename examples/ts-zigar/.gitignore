@@ -10,3 +10,4 @@ node_modules/
 generated/
 dist/
 generated_ts.zig
+local.settings.json

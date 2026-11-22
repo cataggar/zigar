@@ -456,11 +456,15 @@ const SourceCollector = struct {
         }
 
         var found_any = false;
+        var types_entry_vp: ?[]u8 = null;
+        defer if (types_entry_vp) |p| self.allocator.free(p);
 
         if (obj.get("types")) |tv| {
             if (tv == .string and tv.string.len > 0) {
-                if (try self.probeAndMountTypeTarget(pkg_dir_disk, tv.string)) |vp| {
+                if (try self.probeAndMountTypeTarget(pkg_dir_disk, tv.string)) |vp_borrowed| {
+                    const vp = try self.allocator.dupe(u8, vp_borrowed);
                     if (add_as_primary_root) try self.addRootVfsPath(vp);
+                    types_entry_vp = vp;
                     found_any = true;
                 }
             }
@@ -468,8 +472,10 @@ const SourceCollector = struct {
         if (!found_any) {
             if (obj.get("typings")) |tv| {
                 if (tv == .string and tv.string.len > 0) {
-                    if (try self.probeAndMountTypeTarget(pkg_dir_disk, tv.string)) |vp| {
+                    if (try self.probeAndMountTypeTarget(pkg_dir_disk, tv.string)) |vp_borrowed| {
+                        const vp = try self.allocator.dupe(u8, vp_borrowed);
                         if (add_as_primary_root) try self.addRootVfsPath(vp);
+                        types_entry_vp = vp;
                         found_any = true;
                     }
                 }
@@ -574,6 +580,45 @@ const SourceCollector = struct {
                         try self.addSpecifierOverride(vp, pn);
                     }
                     found_any = true;
+                }
+            }
+        } else if (types_entry_vp) |entry_vp| {
+            if (pkg_name) |pn| {
+                if (!std.mem.startsWith(u8, pn, "@types/") and hasRuntimeJsEntryField(obj)) {
+                    const pkg_vfs_dir_no_exp = try toVfsPath(self.allocator, pkg_dir_disk);
+                    defer self.allocator.free(pkg_vfs_dir_no_exp);
+                    const pkg_vfs_prefix = if (std.mem.eql(u8, pkg_vfs_dir_no_exp, "/"))
+                        try self.allocator.dupe(u8, "/")
+                    else
+                        try std.fmt.allocPrint(self.allocator, "{s}/", .{pkg_vfs_dir_no_exp});
+                    defer self.allocator.free(pkg_vfs_prefix);
+
+                    try self.addExportsPkgVfsPrefix(pkg_vfs_prefix);
+                    try self.addSpecifierOverride(entry_vp, pn);
+
+                    for (self.files.items) |vf| {
+                        if (!isTypeScriptDeclarationFileOnly(vf.vfs_path)) continue;
+                        if (!std.mem.startsWith(u8, vf.vfs_path, pkg_vfs_prefix)) continue;
+                        if (std.mem.eql(u8, vf.vfs_path, entry_vp)) continue;
+
+                        const rel_vfs = vf.vfs_path[pkg_vfs_prefix.len..];
+                        const rel_stem = stripJsOrDtsExtension(rel_vfs);
+                        if (rel_stem.len == 0) continue;
+                        if (!try hasSiblingRuntimeJsFile(self.allocator, self.io, pkg_dir_disk, rel_stem)) continue;
+
+                        const sub_rel = if (std.mem.endsWith(u8, rel_stem, "/index") and rel_stem.len > "/index".len)
+                            rel_stem[0 .. rel_stem.len - "/index".len]
+                        else if (std.mem.eql(u8, rel_stem, "index"))
+                            ""
+                        else
+                            rel_stem;
+                        const wire_spec = if (sub_rel.len == 0)
+                            try self.allocator.dupe(u8, pn)
+                        else
+                            try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ pn, sub_rel });
+                        defer self.allocator.free(wire_spec);
+                        try self.addSpecifierOverride(vf.vfs_path, wire_spec);
+                    }
                 }
             }
         }
@@ -822,6 +867,40 @@ fn dirContainsRuntimeJsFile(dir_disk_path: []const u8, io: std.Io, depth: usize)
             },
             else => {},
         }
+    }
+    return false;
+}
+
+fn hasRuntimeJsEntryField(obj: std.json.ObjectMap) bool {
+    inline for (.{ "main", "module" }) |field| {
+        if (obj.get(field)) |v| {
+            if (v == .string and std.mem.trim(u8, v.string, " \t\r\n").len > 0) return true;
+        }
+    }
+    if (obj.get("browser")) |bv| {
+        switch (bv) {
+            .string => |s| if (std.mem.trim(u8, s, " \t\r\n").len > 0) return true,
+            .object => |o| if (o.count() > 0) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn hasSiblingRuntimeJsFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    pkg_dir_disk: []const u8,
+    rel_stem: []const u8,
+) error{OutOfMemory}!bool {
+    const js_exts = [_][]const u8{ ".js", ".mjs", ".cjs" };
+    for (js_exts) |ext| {
+        const cand_disk = try std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ pkg_dir_disk, rel_stem, ext });
+        defer allocator.free(cand_disk);
+        if (std.Io.Dir.cwd().openFile(io, cand_disk, .{})) |f| {
+            f.close(io);
+            return true;
+        } else |_| {}
     }
     return false;
 }

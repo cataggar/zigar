@@ -1,0 +1,10 @@
+{
+  "optimize": "ReleaseSmall",
+  "multithreaded": true,
+  "buildDir": "./.cache/zig-build",
+  "cacheDir": "./.cache/zig-cache",
+  "quiet": true,
+  "sourceFiles": {
+    "dist/native/azure-func.zigar": "src/azure_func.zig"
+  }
+}

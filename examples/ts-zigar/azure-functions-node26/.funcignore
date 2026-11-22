@@ -1,0 +1,15 @@
+.cache
+.git*
+.vscode
+generated
+local.settings.json
+src
+test
+*.zig
+build.zig
+build-wasm.mjs
+build-native.mjs
+generate.mjs
+node-zigar.config.json
+rollup.config.mjs
+README.md
