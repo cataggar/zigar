@@ -125,7 +125,7 @@ export function resolveOrInstallTypesNode26() {
   return installed;
 }
 
-function resolveComponentWasm() {
+export function resolveComponentWasm() {
   const candidates = [
     process.env.TS_ZIGAR_COMPONENT_PATH,
     process.env.TS_ZIGAR_COMPONENT_WASM,
@@ -160,7 +160,7 @@ function listGeneratorSourcePaths() {
   return rels;
 }
 
-function computeGeneratorFingerprint() {
+export function computeGeneratorFingerprint() {
   const hash = createHash('sha256');
   for (const rel of listGeneratorSourcePaths()) {
     const p = join(REPO_ROOT, rel);
@@ -177,7 +177,7 @@ function computeGeneratorFingerprint() {
   return hash.digest('hex').slice(0, 16);
 }
 
-function isNativeBinFresh(nativeBin) {
+export function isNativeBinFresh(nativeBin) {
   if (!existsSync(nativeBin)) return false;
   const binMtime = statSync(nativeBin).mtimeMs;
   for (const rel of listGeneratorSourcePaths()) {

@@ -310,6 +310,26 @@ export function isCompatibleInstanceOf(object, Type) {
   return (object instanceof Type) || isCompatibleType(object?.constructor, Type);
 }
 
+export function unwrapsJsValue(structure) {
+  if (!structure) {
+    return false;
+  }
+  if (structure.purpose === StructurePurpose.JsValue) {
+    return true;
+  }
+  if (structure.type === StructureType.ErrorUnion || structure.type === StructureType.Optional) {
+    return unwrapsJsValue(structure.instance?.members?.[0]?.structure);
+  }
+  return false;
+}
+
+export function getCallbackPayloadStructure(structure) {
+  const callbackStructure = structure?.instance?.members?.find(m => m.name === 'callback')?.structure;
+  const fnStructure = callbackStructure?.instance?.members?.[0]?.structure;
+  const argStructure = fnStructure?.instance?.members?.[0]?.structure;
+  return argStructure?.instance?.members?.[2]?.structure;
+}
+
 export function hasJsValue(structure, seen = new Set()) {
   if (!structure || seen.has(structure)) {
     return false;

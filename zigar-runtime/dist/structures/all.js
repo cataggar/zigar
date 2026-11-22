@@ -2,7 +2,7 @@ import { StructureType, MemberType, MemberFlag, structureNames, StructureFlag, P
 import { mixin } from '../environment.js';
 import { throwNoSupport, NoProperty, MissingInitializers, NoInitializer } from '../errors.js';
 import { removeProxy } from '../proxies.js';
-import { KEYS, SETTERS, MEMORY, ZIG, SLOTS, CACHE, RESTORE, PROPS, ENTRIES, TYPED_ARRAY, FLAGS, PURPOSE, TYPE, SIZE, ALIGN, ENVIRONMENT, SIGNATURE, TRANSFORM, SHAPE, INITIALIZE, CAST, RESTRICT, FINALIZE, PROXY, UPDATE } from '../symbols.js';
+import { KEYS, SETTERS, MEMORY, ZIG, SLOTS, CACHE, RESTORE, PROPS, ENTRIES, TYPED_ARRAY, FLAGS, PURPOSE, TYPE, SIZE, ALIGN, ENVIRONMENT, SIGNATURE, TRANSFORM, JS_VALUE, SHAPE, INITIALIZE, CAST, RESTRICT, FINALIZE, PROXY, UPDATE } from '../symbols.js';
 import { hasJsValue, copyObject, ObjectCache, defineProperty, defineValue, defineProperties, clearView } from '../utils.js';
 
 var all = mixin({
@@ -134,6 +134,9 @@ var all = mixin({
     }
     // static variable/constants are stored in slots
     staticDescriptors[SLOTS] = (props.length > 0) && defineValue(template[SLOTS]);
+    if (type !== StructureType.Pointer && hasJsValue(structure)) {
+      staticDescriptors[JS_VALUE] = defineValue(structure);
+    }
     const handlerName = `finalize${structureNames[type]}`;
     const f = this[handlerName];
     if (f?.call(this, structure, staticDescriptors, descriptors) !== false) {

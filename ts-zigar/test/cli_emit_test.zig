@@ -7174,3 +7174,182 @@ test "Issue #62 (M5.2a): optional-method Environment handle init/setters, nested
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
     try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", probe_zig });
 }
+
+test "Issue #65 (M6.1a): recursive type_alias under eager @typeInfo operators breaks cycles while preserving safe container aliases" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue65-eager-typeinfo-cycles", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+
+    const src_dir = try std.fmt.allocPrint(alloc, "{s}/src", .{sandbox});
+    defer alloc.free(src_dir);
+    const out_cycle_dir = try std.fmt.allocPrint(alloc, "{s}/out_cycle", .{sandbox});
+    defer alloc.free(out_cycle_dir);
+    const out_safe_dir = try std.fmt.allocPrint(alloc, "{s}/out_safe", .{sandbox});
+    defer alloc.free(out_safe_dir);
+    try cwd.createDirPath(io, src_dir);
+
+    const cycle_dts = try std.fmt.allocPrint(alloc, "{s}/dynamodb_like.d.ts", .{src_dir});
+    defer alloc.free(cycle_dts);
+    const safe_dts = try std.fmt.allocPrint(alloc, "{s}/safe_tree.d.ts", .{src_dir});
+    defer alloc.free(safe_dts);
+
+    {
+        var d = try cwd.openDir(io, src_dir, .{});
+        defer d.close(io);
+
+        try d.writeFile(io, .{
+            .sub_path = "dynamodb_like.d.ts",
+            .data =
+            \\export type ExclusivePropertyUnion<T, P extends keyof T = keyof T> = P extends any
+            \\    ? { [K in P]: T[K] } & Partial<Record<Exclude<keyof T, P>, never>>
+            \\    : never;
+            \\
+            \\export type AttributeValue = ExclusivePropertyUnion<{
+            \\    S: string;
+            \\    N: string;
+            \\    L: AttributeValue[];
+            \\    M: { [id: string]: AttributeValue };
+            \\}>;
+            \\
+            \\export type PartialTree = Partial<{
+            \\    name: string;
+            \\    children: PartialTree[];
+            \\}>;
+            \\
+            \\export type Merge<T> = [Readonly<T>][number];
+            \\export type MergedNode = Merge<{
+            \\    id: string;
+            \\    next: MergedNode[];
+            \\}>;
+            ,
+        });
+
+        try d.writeFile(io, .{
+            .sub_path = "safe_tree.d.ts",
+            .data =
+            \\export type SafeTree = {
+            \\    id: string;
+            \\    label: string;
+            \\    children: SafeTree[];
+            \\};
+            \\export interface BoxOfPartial<T> {
+            \\    snapshot?: Partial<T>;
+            \\}
+            \\export type SafeBoxed = BoxOfPartial<{
+            \\    title: string;
+            \\    nested: SafeBoxed[];
+            \\}>;
+            ,
+        });
+    }
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    // 1. Eager `@typeInfo` cycles (`keyof`, `Partial`, `Merge`) break cleanly and pass `zig test root.zig`.
+    {
+        var parsed = try ts_zigar.cli.parseArgs(alloc, &.{
+            "-t",
+            cycle_dts,
+            "-d",
+            out_cycle_dir,
+            "--report-fallbacks",
+        });
+        defer parsed.deinit(alloc);
+        var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+        defer res.deinit(alloc);
+        try std.testing.expect(res == .ok);
+        const rep = res.ok.fallback_report orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, rep, "[expansive_generic_cycle]") != null);
+
+        const cycle_root = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_cycle_dir});
+        defer alloc.free(cycle_root);
+        try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", cycle_root });
+    }
+
+    // 2. Non-eager container aliases (`SafeTree`, `SafeBoxed`) pass `--strict-fallbacks` with 0 fallbacks!
+    {
+        var parsed = try ts_zigar.cli.parseArgs(alloc, &.{
+            "-t",
+            safe_dts,
+            "-d",
+            out_safe_dir,
+            "--strict-fallbacks",
+        });
+        defer parsed.deinit(alloc);
+        var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+        defer res.deinit(alloc);
+        if (res == .err) {
+            std.debug.print("unexpected safe_tree strict failure:\n{s}\n", .{res.err});
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expectEqual(@as(usize, 0), res.ok.fallback_count);
+
+        const safe_root = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_safe_dir});
+        defer alloc.free(safe_root);
+        try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", safe_root });
+    }
+}
+
+test "Issue #65: export = declare var emits .is_default = true on GlobalTarget (node:console / node:process ESM compatibility)" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue65-export-eq-var", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
+    try cwd.createDirPath(io, sandbox);
+
+    const console_dts = try std.fmt.allocPrint(alloc, "{s}/console.d.ts", .{sandbox});
+    defer alloc.free(console_dts);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+
+    try cwd.writeFile(io, .{
+        .sub_path = console_dts,
+        .data =
+        \\declare namespace console {
+        \\    interface Console {
+        \\        log(...data: any[]): void;
+        \\    }
+        \\}
+        \\declare var console: console.Console;
+        \\export = console;
+        ,
+    });
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &.{ "-t", console_dts, "-d", out_dir });
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    try std.testing.expect(res == .ok);
+
+    var out_h = try cwd.openDir(io, out_dir, .{});
+    defer out_h.close(io);
+    const src = try out_h.readFileAlloc(io, "console.zig", alloc, .limited(64 * 1024));
+    defer alloc.free(src);
+    try std.testing.expect(std.mem.indexOf(u8, src, "pub const console: __zigar_js.GlobalTarget(Console.Console, .{ .module = \"console\", .name = \"console\", .is_default = true }, .none) = .{};") != null);
+
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+}
+

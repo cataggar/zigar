@@ -5,9 +5,9 @@ import { mixin } from '../environment.js';
 import { MissingInitializers, NoInitializer, NoProperty, throwNoSupport } from '../errors.js';
 import { removeProxy } from '../proxies.js';
 import {
-  ALIGN, CACHE, CAST, ENTRIES, ENVIRONMENT, FINALIZE, FLAGS, INITIALIZE, KEYS, MEMORY, PROPS,
-  PROXY, PURPOSE, RESTORE, RESTRICT, SETTERS, SHAPE, SIGNATURE, SIZE, SLOTS, TRANSFORM, TYPE,
-  TYPED_ARRAY, UPDATE, ZIG
+  ALIGN, CACHE, CAST, ENTRIES, ENVIRONMENT, FINALIZE, FLAGS, INITIALIZE, JS_VALUE, KEYS, MEMORY,
+  PROPS, PROXY, PURPOSE, RESTORE, RESTRICT, SETTERS, SHAPE, SIGNATURE, SIZE, SLOTS, TRANSFORM,
+  TYPE, TYPED_ARRAY, UPDATE, ZIG
 } from '../symbols.js';
 import { clearView, copyObject, defineProperties, defineProperty, defineValue, hasJsValue, ObjectCache } from '../utils.js';
 
@@ -147,6 +147,9 @@ export default mixin({
     }
     // static variable/constants are stored in slots
     staticDescriptors[SLOTS] = (props.length > 0) && defineValue(template[SLOTS]);
+    if (type !== StructureType.Pointer && hasJsValue(structure)) {
+      staticDescriptors[JS_VALUE] = defineValue(structure);
+    }
     const handlerName = `finalize${structureNames[type]}`;
     const f = this[handlerName];
     if (f?.call(this, structure, staticDescriptors, descriptors) !== false) {

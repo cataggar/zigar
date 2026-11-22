@@ -1,6 +1,7 @@
 import { mixin } from '../environment.js';
 import { TypeMismatch } from '../errors.js';
-import { RETURN, PROMISE, MEMORY, ZIG, TRANSFORM, FINALIZE } from '../symbols.js';
+import { RETURN, PROMISE, TRANSFORM, MEMORY, ZIG, FINALIZE } from '../symbols.js';
+import { unwrapsJsValue, getCallbackPayloadStructure } from '../utils.js';
 
 var promise = mixin({
   init() {
@@ -11,6 +12,7 @@ var promise = mixin({
   // create promise struct for outbound call
   createPromise(structure, args, func) {
     const { constructor } = structure;
+    const payloadUnwrapsJsValue = unwrapsJsValue(getCallbackPayloadStructure(structure));
     if (func) {
       if (typeof(func) !== 'function') {
         throw new TypeMismatch('function', func);
@@ -18,11 +20,6 @@ var promise = mixin({
     } else {
       args[PROMISE] = new Promise((resolve, reject) => {
         func = (result) => {
-          if (result?.[MEMORY]?.[ZIG]) {
-            // the memory in the result object is stack memory, which will go bad after the function
-            // returns; we need to copy the content into JavaScript memory
-            result = new result.constructor(result);
-          }
           if (result instanceof Error) {
             reject(result);
           } else {
@@ -52,6 +49,11 @@ var promise = mixin({
         const instance = this.promiseContextMap.get(contextId);
         if (instance) {
           const { func, args } = instance;
+          if (!payloadUnwrapsJsValue && result?.[MEMORY]?.[ZIG]) {
+            // the memory in the result object is stack memory, which will go bad after the function
+            // returns; we need to copy the content into JavaScript memory
+            result = new result.constructor(result);
+          }
           if (func.length === 2) {
             const isError = result instanceof Error;
             func(isError ? result : null, isError ? null : result);
@@ -62,6 +64,7 @@ var promise = mixin({
           this.promiseContextMap.delete(contextId);  
         }
       };
+      callback[FINALIZE] = true;
       this.promiseCallbackMap.set(constructor, callback);
       this.destructors.push(() => this.freeFunction(callback));
     }

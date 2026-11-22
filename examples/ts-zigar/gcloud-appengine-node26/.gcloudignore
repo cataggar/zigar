@@ -1,0 +1,16 @@
+.gcloudignore
+.git
+.gitignore
+.cache/
+.zig-cache/
+zig-out/
+generated/
+node_modules/
+package-lock.json
+src/
+test/
+build-wasm.mjs
+rollup.config.mjs
+node-zigar.config.json
+run-native.mjs
+README.md

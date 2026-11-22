@@ -299,6 +299,26 @@ function isCompatibleInstanceOf(object, Type) {
   return (object instanceof Type) || isCompatibleType(object?.constructor, Type);
 }
 
+function unwrapsJsValue(structure) {
+  if (!structure) {
+    return false;
+  }
+  if (structure.purpose === StructurePurpose.JsValue) {
+    return true;
+  }
+  if (structure.type === StructureType.ErrorUnion || structure.type === StructureType.Optional) {
+    return unwrapsJsValue(structure.instance?.members?.[0]?.structure);
+  }
+  return false;
+}
+
+function getCallbackPayloadStructure(structure) {
+  const callbackStructure = structure?.instance?.members?.find(m => m.name === 'callback')?.structure;
+  const fnStructure = callbackStructure?.instance?.members?.[0]?.structure;
+  const argStructure = fnStructure?.instance?.members?.[0]?.structure;
+  return argStructure?.instance?.members?.[2]?.structure;
+}
+
 function hasJsValue(structure, seen = new Set()) {
   if (!structure || seen.has(structure)) {
     return false;
@@ -451,4 +471,4 @@ function extractTimes(st_atim, st_mtim, fst_flags) {
   return times;
 }
 
-export { ObjectCache, adjustAddress, alignForward, always, clearView, copyObject, copyView, createView, decodeBase64, decodeEnum, decodeFlags, decodeText, defineProperties, defineProperty, defineValue, empty, encodeBase64, encodeText, extractTimes, findElements, findObjects, findSortedIndex, getEnumNumber, getErrorHandler, getLength, getPrimitiveName, getSelf, hasJsValue, hasMethod, isCompatibleInstanceOf, isCompatibleType, isDetached, isInvalidAddress, isInvalidUsize, isMisaligned, isPromise, markAsSpecial, maxSafeInteger, minSafeInteger, never, readUsize, readUsizeSafe, remove, safeInt, toBufferOffset, toString, transformIterable, usize, usizeByteSize, usizeInvalid, usizeMax, usizeMin };
+export { ObjectCache, adjustAddress, alignForward, always, clearView, copyObject, copyView, createView, decodeBase64, decodeEnum, decodeFlags, decodeText, defineProperties, defineProperty, defineValue, empty, encodeBase64, encodeText, extractTimes, findElements, findObjects, findSortedIndex, getCallbackPayloadStructure, getEnumNumber, getErrorHandler, getLength, getPrimitiveName, getSelf, hasJsValue, hasMethod, isCompatibleInstanceOf, isCompatibleType, isDetached, isInvalidAddress, isInvalidUsize, isMisaligned, isPromise, markAsSpecial, maxSafeInteger, minSafeInteger, never, readUsize, readUsizeSafe, remove, safeInt, toBufferOffset, toString, transformIterable, unwrapsJsValue, usize, usizeByteSize, usizeInvalid, usizeMax, usizeMin };

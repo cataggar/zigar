@@ -1,0 +1,14 @@
+# Google App Engine Standard Environment — Node.js 26 Active LTS (Ubuntu 24.04)
+runtime: nodejs26
+instance_class: F1
+entrypoint: node run-wasm.mjs
+
+inbound_services:
+  - warmup
+
+env_variables:
+  NODE_ENV: production
+
+automatic_scaling:
+  min_idle_instances: 0
+  max_instances: 5

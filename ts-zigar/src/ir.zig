@@ -16627,6 +16627,7 @@ fn LowerCtx(comptime GraphType: type) type {
             decl: *DeclIr,
             mod_idx: u32,
             saw_nominal_container: bool,
+            under_eager_typeinfo: bool = false,
         };
 
         fn evalGenSymType(
@@ -16872,15 +16873,28 @@ fn LowerCtx(comptime GraphType: type) type {
 
             const is_nominal_decl = (d.kind == .struct_decl and d.kind.struct_decl.repr == .value_struct) or
                 (d.kind == .union_decl);
+            var saved_container_flags: [24]bool = undefined;
+            const n_parent_frames = frames.items.len;
             if (is_nominal_decl) {
-                for (frames.items) |*fr| fr.saw_nominal_container = true;
+                for (frames.items[0..n_parent_frames], 0..) |*fr, idx| {
+                    saved_container_flags[idx] = fr.saw_nominal_container;
+                    if (!fr.under_eager_typeinfo) {
+                        fr.saw_nominal_container = true;
+                    }
+                }
             }
+            defer if (is_nominal_decl) {
+                for (frames.items[0..n_parent_frames], 0..) |*fr, idx| {
+                    fr.saw_nominal_container = saved_container_flags[idx];
+                }
+            };
 
             try frames.append(self.scratch, .{
                 .key = self_key,
                 .decl = d,
                 .mod_idx = mod_idx,
                 .saw_nominal_container = is_nominal_decl,
+                .under_eager_typeinfo = false,
             });
             defer _ = frames.pop();
 
@@ -16902,6 +16916,33 @@ fn LowerCtx(comptime GraphType: type) type {
                 },
                 else => {},
             }
+        }
+
+        fn dfsExpansiveGenericTypeEager(
+            self: *Self,
+            modules: []ModuleIr,
+            owner_mod_idx: u32,
+            owner_decl: *DeclIr,
+            ty: *TypeIr,
+            bindings: []const GenParamBinding,
+            decl_map: *const std.StringHashMapUnmanaged(*DeclIr),
+            frames: *std.ArrayList(GenActiveFrame),
+            visits: *usize,
+        ) error{OutOfMemory}!void {
+            var saved_eager: [24]bool = undefined;
+            const n_frames = frames.items.len;
+            for (frames.items[0..n_frames], 0..) |*fr, idx| {
+                saved_eager[idx] = fr.under_eager_typeinfo;
+                if (fr.decl.kind == .type_alias and !fr.saw_nominal_container) {
+                    fr.under_eager_typeinfo = true;
+                }
+            }
+            defer {
+                for (frames.items[0..n_frames], 0..) |*fr, idx| {
+                    fr.under_eager_typeinfo = saved_eager[idx];
+                }
+            }
+            try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, ty, bindings, decl_map, frames, visits);
         }
 
         fn dfsExpansiveGenericType(
@@ -16926,7 +16967,9 @@ fn LowerCtx(comptime GraphType: type) type {
             if (enters_container) {
                 for (frames.items[0..n_frames], 0..) |*fr, idx| {
                     saved_container_flags[idx] = fr.saw_nominal_container;
-                    fr.saw_nominal_container = true;
+                    if (!fr.under_eager_typeinfo) {
+                        fr.saw_nominal_container = true;
+                    }
                 }
             }
             defer if (enters_container) {
@@ -16947,39 +16990,43 @@ fn LowerCtx(comptime GraphType: type) type {
                     try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(mp.value), bindings, decl_map, frames, visits);
                 },
                 .js_record => |rec| {
-                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(rec.key), bindings, decl_map, frames, visits);
-                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(rec.value), bindings, decl_map, frames, visits);
+                    try self.dfsExpansiveGenericTypeEager(modules, owner_mod_idx, owner_decl, @constCast(rec.key), bindings, decl_map, frames, visits);
+                    if (rec.key.* != .string_type) {
+                        try self.dfsExpansiveGenericTypeEager(modules, owner_mod_idx, owner_decl, @constCast(rec.value), bindings, decl_map, frames, visits);
+                    } else {
+                        try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(rec.value), bindings, decl_map, frames, visits);
+                    }
                 },
                 .mapped_values_op => |mv| {
-                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(mv.target), bindings, decl_map, frames, visits);
-                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(mv.value), bindings, decl_map, frames, visits);
+                    try self.dfsExpansiveGenericTypeEager(modules, owner_mod_idx, owner_decl, @constCast(mv.target), bindings, decl_map, frames, visits);
+                    try self.dfsExpansiveGenericTypeEager(modules, owner_mod_idx, owner_decl, @constCast(mv.value), bindings, decl_map, frames, visits);
                 },
                 .unary_type_op => |uo| {
-                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(uo.operand), bindings, decl_map, frames, visits);
+                    try self.dfsExpansiveGenericTypeEager(modules, owner_mod_idx, owner_decl, @constCast(uo.operand), bindings, decl_map, frames, visits);
                 },
                 .key_filter_op => |kfo| {
-                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(kfo.target), bindings, decl_map, frames, visits);
+                    try self.dfsExpansiveGenericTypeEager(modules, owner_mod_idx, owner_decl, @constCast(kfo.target), bindings, decl_map, frames, visits);
                     if (kfo.keys == .ty) {
-                        try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(kfo.keys.ty), bindings, decl_map, frames, visits);
+                        try self.dfsExpansiveGenericTypeEager(modules, owner_mod_idx, owner_decl, @constCast(kfo.keys.ty), bindings, decl_map, frames, visits);
                     }
                 },
                 .index_access_op => |iao| {
-                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(iao.object_ty), bindings, decl_map, frames, visits);
+                    try self.dfsExpansiveGenericTypeEager(modules, owner_mod_idx, owner_decl, @constCast(iao.object_ty), bindings, decl_map, frames, visits);
                     if (iao.index_spec == .ty) {
-                        try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(iao.index_spec.ty), bindings, decl_map, frames, visits);
+                        try self.dfsExpansiveGenericTypeEager(modules, owner_mod_idx, owner_decl, @constCast(iao.index_spec.ty), bindings, decl_map, frames, visits);
                     }
                     if (iao.fallback_ty) |ft| {
-                        try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(ft), bindings, decl_map, frames, visits);
+                        try self.dfsExpansiveGenericTypeEager(modules, owner_mod_idx, owner_decl, @constCast(ft), bindings, decl_map, frames, visits);
                     }
                 },
                 .empty_object_extends_op => |eoe| {
-                    try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(eoe.target_ty), bindings, decl_map, frames, visits);
+                    try self.dfsExpansiveGenericTypeEager(modules, owner_mod_idx, owner_decl, @constCast(eoe.target_ty), bindings, decl_map, frames, visits);
                     try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(eoe.true_ty), bindings, decl_map, frames, visits);
                     try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(eoe.false_ty), bindings, decl_map, frames, visits);
                 },
                 .intersect_op => |arms| {
                     for (arms) |arm| {
-                        try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(arm), bindings, decl_map, frames, visits);
+                        try self.dfsExpansiveGenericTypeEager(modules, owner_mod_idx, owner_decl, @constCast(arm), bindings, decl_map, frames, visits);
                     }
                 },
                 .tuple => |elems| {
@@ -16998,6 +17045,11 @@ fn LowerCtx(comptime GraphType: type) type {
                     }
                 },
                 .fn_ptr => |fp| {
+                    if (fp.this_param == null and fp.rest_sequence_ty != null) {
+                        try self.dfsExpansiveGenericTypeEager(modules, owner_mod_idx, owner_decl, @constCast(fp.rest_sequence_ty.?), bindings, decl_map, frames, visits);
+                    } else if (fp.rest_sequence_ty) |rst| {
+                        try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(rst), bindings, decl_map, frames, visits);
+                    }
                     if (fp.this_param) |thp| {
                         try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(thp), bindings, decl_map, frames, visits);
                     }
@@ -17007,11 +17059,8 @@ fn LowerCtx(comptime GraphType: type) type {
                     try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(fp.return_type), bindings, decl_map, frames, visits);
                 },
                 .decl_ref => |dref| {
-                    for (dref.type_args) |arg_ty| {
-                        try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(arg_ty), bindings, decl_map, frames, visits);
-                    }
-
-                    // Resolve re-export hops if any.
+                    // Resolve re-export hops first so we can check whether `target_decl` eagerly
+                    // inspects `@typeInfo` on any of its generic type parameters.
                     var cur_mod = dref.module_index;
                     var cur_path = dref.decl_zig_path;
                     var target_decl_opt: ?*DeclIr = null;
@@ -17028,6 +17077,26 @@ fn LowerCtx(comptime GraphType: type) type {
                         target_decl_opt = found;
                         break;
                     }
+
+                    const call_tps: []const TypeParamIr = if (target_decl_opt) |td| switch (td.kind) {
+                        .struct_decl => |st| if (st.repr == .value_struct) st.type_params else &.{},
+                        .union_decl => |un| un.type_params,
+                        .type_alias => |ta| ta.type_params,
+                        else => &.{},
+                    } else &.{};
+
+                    for (dref.type_args, 0..) |arg_ty, idx| {
+                        const inspects_info = if (target_decl_opt != null and idx < call_tps.len)
+                            declInspectsTypeParamInfo(self.scratch, target_decl_opt.?, call_tps[idx].zig_ident, decl_map, 0)
+                        else
+                            false;
+                        if (inspects_info) {
+                            try self.dfsExpansiveGenericTypeEager(modules, owner_mod_idx, owner_decl, @constCast(arg_ty), bindings, decl_map, frames, visits);
+                        } else {
+                            try self.dfsExpansiveGenericType(modules, owner_mod_idx, owner_decl, @constCast(arg_ty), bindings, decl_map, frames, visits);
+                        }
+                    }
+
                     const target_decl = target_decl_opt orelse return;
                     const target_tps: []const TypeParamIr = switch (target_decl.kind) {
                         .struct_decl => |st| if (st.repr == .value_struct) st.type_params else return,
@@ -19960,6 +20029,130 @@ fn typeUsesParamByValue(
             }
             for (dr.type_args) |arg_ty| {
                 if (typeUsesParamByValue(state_alloc, arg_ty, tp_ident, decl_map, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn declInspectsTypeParamInfo(
+    state_alloc: std.mem.Allocator,
+    d: *const DeclIr,
+    tp_ident: []const u8,
+    decl_map: *const std.StringHashMapUnmanaged(*DeclIr),
+    depth: usize,
+) bool {
+    if (depth >= 16) return false;
+    return switch (d.kind) {
+        .type_alias => |ta| typeInspectsParamInfo(state_alloc, ta.target, tp_ident, false, decl_map, depth + 1),
+        else => false,
+    };
+}
+
+fn typeInspectsParamInfo(
+    state_alloc: std.mem.Allocator,
+    ty: *const TypeIr,
+    tp_ident: []const u8,
+    under_eager: bool,
+    decl_map: *const std.StringHashMapUnmanaged(*DeclIr),
+    depth: usize,
+) bool {
+    if (depth >= 16) return false;
+    return switch (ty.*) {
+        .type_param_ref => |id| under_eager and std.mem.eql(u8, id, tp_ident),
+        .slice, .pointer_const, .promise, .js_iterator, .js_async_iterator => |inner| under_eager and
+            typeInspectsParamInfo(state_alloc, inner, tp_ident, true, decl_map, depth + 1),
+        .optional => |opt| typeInspectsParamInfo(state_alloc, opt.child, tp_ident, under_eager, decl_map, depth + 1),
+        .js_map => |mp| under_eager and
+            (typeInspectsParamInfo(state_alloc, mp.key, tp_ident, true, decl_map, depth + 1) or
+                typeInspectsParamInfo(state_alloc, mp.value, tp_ident, true, decl_map, depth + 1)),
+        .js_record => |r| typeInspectsParamInfo(state_alloc, r.key, tp_ident, true, decl_map, depth + 1) or
+            ((r.key.* != .string_type or under_eager) and
+                typeInspectsParamInfo(state_alloc, r.value, tp_ident, true, decl_map, depth + 1)),
+        .mapped_values_op => |mv| typeInspectsParamInfo(state_alloc, mv.target, tp_ident, true, decl_map, depth + 1) or
+            typeInspectsParamInfo(state_alloc, mv.value, tp_ident, true, decl_map, depth + 1),
+        .unary_type_op => |uo| typeInspectsParamInfo(state_alloc, uo.operand, tp_ident, true, decl_map, depth + 1),
+        .key_filter_op => |kfo| typeInspectsParamInfo(state_alloc, kfo.target, tp_ident, true, decl_map, depth + 1) or
+            (if (kfo.keys == .ty) typeInspectsParamInfo(state_alloc, kfo.keys.ty, tp_ident, true, decl_map, depth + 1) else false),
+        .index_access_op => |iao| typeInspectsParamInfo(state_alloc, iao.object_ty, tp_ident, true, decl_map, depth + 1) or
+            (if (iao.index_spec == .ty) typeInspectsParamInfo(state_alloc, iao.index_spec.ty, tp_ident, true, decl_map, depth + 1) else false) or
+            (if (iao.fallback_ty) |ft| typeInspectsParamInfo(state_alloc, ft, tp_ident, true, decl_map, depth + 1) else false),
+        .empty_object_extends_op => |eoe| typeInspectsParamInfo(state_alloc, eoe.target_ty, tp_ident, true, decl_map, depth + 1) or
+            typeInspectsParamInfo(state_alloc, eoe.true_ty, tp_ident, under_eager, decl_map, depth + 1) or
+            typeInspectsParamInfo(state_alloc, eoe.false_ty, tp_ident, under_eager, decl_map, depth + 1),
+        .intersect_op => |arms| blk: {
+            for (arms) |arm| {
+                if (typeInspectsParamInfo(state_alloc, arm, tp_ident, true, decl_map, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .tuple => |elems| blk: {
+            if (!under_eager) break :blk false;
+            for (elems) |el| {
+                if (typeInspectsParamInfo(state_alloc, el.ty, tp_ident, true, decl_map, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .anon_struct => |fields| blk: {
+            if (!under_eager) break :blk false;
+            for (fields) |f| {
+                if (typeInspectsParamInfo(state_alloc, f.ty, tp_ident, true, decl_map, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .tagged_union => |tu| blk: {
+            if (!under_eager) break :blk false;
+            for (tu.variants) |v| {
+                if (typeInspectsParamInfo(state_alloc, v.payload, tp_ident, true, decl_map, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .fn_ptr => |fp| blk: {
+            if (fp.this_param == null and fp.rest_sequence_ty != null) {
+                if (typeInspectsParamInfo(state_alloc, fp.rest_sequence_ty.?, tp_ident, true, decl_map, depth + 1)) break :blk true;
+            }
+            if (!under_eager) break :blk false;
+            if (fp.rest_sequence_ty) |rst| {
+                if (typeInspectsParamInfo(state_alloc, rst, tp_ident, true, decl_map, depth + 1)) break :blk true;
+            }
+            if (fp.this_param) |thp| {
+                if (typeInspectsParamInfo(state_alloc, thp, tp_ident, true, decl_map, depth + 1)) break :blk true;
+            }
+            for (fp.params) |pt| {
+                if (typeInspectsParamInfo(state_alloc, pt, tp_ident, true, decl_map, depth + 1)) break :blk true;
+            }
+            break :blk typeInspectsParamInfo(state_alloc, fp.return_type, tp_ident, true, decl_map, depth + 1);
+        },
+        .decl_ref => |dr| blk: {
+            var cur_mod = dr.module_index;
+            var cur_path = dr.decl_zig_path;
+            var td_opt: ?*DeclIr = null;
+            var hops: usize = 0;
+            while (hops < 8) : (hops += 1) {
+                const k = formatDeclCycleKey(state_alloc, cur_mod, cur_path, null) catch break :blk false;
+                defer state_alloc.free(k);
+                const found = decl_map.get(k) orelse break;
+                if (found.kind == .re_export_decl) {
+                    cur_mod = found.kind.re_export_decl.target_module_index;
+                    cur_path = found.kind.re_export_decl.target_zig_path;
+                    continue;
+                }
+                td_opt = found;
+                break;
+            }
+            const tps: []const TypeParamIr = if (td_opt) |td| switch (td.kind) {
+                .type_alias => |ta| ta.type_params,
+                .struct_decl => |st_decl| if (st_decl.repr == .value_struct) st_decl.type_params else &.{},
+                .union_decl => |un_decl| un_decl.type_params,
+                else => &.{},
+            } else &.{};
+            for (dr.type_args, 0..) |arg_ty, idx| {
+                const callee_eager = under_eager or (td_opt != null and idx < tps.len and
+                    declInspectsTypeParamInfo(state_alloc, td_opt.?, tps[idx].zig_ident, decl_map, depth + 1));
+                if (typeInspectsParamInfo(state_alloc, arg_ty, tp_ident, callee_eager, decl_map, depth + 1)) {
+                    break :blk true;
+                }
             }
             break :blk false;
         },
