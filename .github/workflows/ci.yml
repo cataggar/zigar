@@ -401,6 +401,8 @@ jobs:
           (cd examples/ts-zigar/ts-compiler-component-hello-world && npm test)
           (cd examples/ts-zigar/node-console-hello-world && npm test)
           (cd examples/ts-zigar/node-server-hello-world && npm test)
+          (cd examples/ts-zigar/monaco-editor && npm test)
+          (cd examples/ts-zigar/monaco-editor-hello-world && npm test)
 
   benchmarks:
     name: Wazig vs Zig Benchmarks

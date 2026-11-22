@@ -5,9 +5,9 @@
  */
 
 import { execFile, execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { register } from 'node:module';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, posix, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
@@ -96,6 +96,56 @@ export function ensureWorkspaceLinks() {
   linkIfMissing(join(REPO_ROOT, 'node-zigar/node_modules/node-zigar-addon'), join(REPO_ROOT, 'node-zigar-addon'));
 }
 
+function syncSymlinkIfPossible(linkPath, targetPath) {
+  if (!existsSync(targetPath)) return false;
+  try {
+    const st = lstatSync(linkPath);
+    if (st.isSymbolicLink()) {
+      try {
+        if (realpathSync(linkPath) === realpathSync(targetPath)) return true;
+      } catch {}
+      rmSync(linkPath, { force: true });
+    } else {
+      return realpathSync(linkPath) === realpathSync(targetPath);
+    }
+  } catch (err) {
+    if (err && err.code !== 'ENOENT') throw err;
+  }
+  mkdirSync(dirname(linkPath), { recursive: true });
+  try {
+    symlinkSync(targetPath, linkPath, 'dir');
+    return true;
+  } catch (err) {
+    if (err && err.code !== 'EEXIST') throw err;
+    return existsSync(linkPath) && realpathSync(linkPath) === realpathSync(targetPath);
+  }
+}
+
+function computeDomSubstituteArgs(monacoDir) {
+  const domNoExt = resolve(DOM_DTS_PATH).replace(/\\/g, '/').replace(/\.d\.ts$/, '');
+  const domDir = posix.dirname(domNoExt);
+  const monacoPosix = resolve(monacoDir).replace(/\\/g, '/').replace(/\/+$/, '') || '/';
+
+  let commonLen = 0;
+  let lastSlash = 0;
+  const maxLen = Math.min(domDir.length, monacoPosix.length);
+  while (commonLen < maxLen && domDir[commonLen] === monacoPosix[commonLen]) {
+    if (domDir[commonLen] === '/') lastSlash = commonLen;
+    commonLen += 1;
+  }
+  let baseDir;
+  if (commonLen === domDir.length && (monacoPosix.length === commonLen || monacoPosix[commonLen] === '/')) {
+    baseDir = domDir;
+  } else if (commonLen === monacoPosix.length && (domDir.length === commonLen || domDir[commonLen] === '/')) {
+    baseDir = monacoPosix;
+  } else {
+    baseDir = lastSlash === 0 ? '/' : domDir.slice(0, lastSlash);
+  }
+
+  const rel = posix.relative(baseDir, domNoExt);
+  return rel && rel !== 'dom' ? [ '-s', `${rel}=dom` ] : [];
+}
+
 export function resolveOrInstallMonacoEditor() {
   const { cacheRoot, npmCache } = ensureIsolatedCacheEnv('monaco-editor');
   const localLink = join(MONACO_PKG_DIR, 'node_modules/monaco-editor');
@@ -110,9 +160,9 @@ export function resolveOrInstallMonacoEditor() {
   for (const cand of candidates) {
     if (existsSync(join(cand, 'package.json'))) {
       const resolved = resolve(cand);
-      linkIfMissing(localLink, resolved);
-      linkIfMissing(join(EXAMPLES_ROOT, 'node_modules/monaco-editor'), resolved);
-      return resolved;
+      const synced = syncSymlinkIfPossible(localLink, resolved);
+      syncSymlinkIfPossible(join(EXAMPLES_ROOT, 'node_modules/monaco-editor'), resolved);
+      return synced ? localLink : resolved;
     }
   }
 
@@ -207,6 +257,7 @@ export async function ensureMonacoBindings({ force = false, quiet = false, repor
   const cliArgs = [
     '-t', DOM_DTS_PATH,
     '-t', monacoDir,
+    ...computeDomSubstituteArgs(monacoDir),
     '-s', SUB_RULE,
     ...(reportFallbacks ? [ '--report-fallbacks' ] : []),
     '-d', GENERATED_DIR,
@@ -236,6 +287,7 @@ export async function generateSingleFileMonacoBindings(outDir, { quiet = true } 
   const cliArgs = [
     '-t', DOM_DTS_PATH,
     '-t', monacoDts,
+    ...computeDomSubstituteArgs(monacoDir),
     '-s', 'monaco-editor/monaco=monaco',
     '--report-fallbacks',
     '-d', outDir,

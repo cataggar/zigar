@@ -1,0 +1,5 @@
+{
+  "optimize": "Debug",
+  "buildDir": "../../../.cache/examples/monaco-editor-hello-world/native-build",
+  "cacheDir": "../../../.cache/examples/monaco-editor-hello-world/native-cache"
+}

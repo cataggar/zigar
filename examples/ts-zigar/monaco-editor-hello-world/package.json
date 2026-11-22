@@ -1,0 +1,22 @@
+{
+  "name": "@zigar-examples/monaco-editor-hello-world",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser Monaco Editor hello-world in Zig 0.17 via zigar ts, bundled with Vite and rollup-plugin-zigar",
+  "scripts": {
+    "generate": "node ../monaco-editor/generate.mjs",
+    "dev": "node build.mjs --dev",
+    "start": "npm run dev",
+    "build": "node build.mjs",
+    "preview": "node build.mjs --preview",
+    "test": "node --test test/hello-world.test.mjs"
+  },
+  "dependencies": {
+    "monaco-editor": "^0.57.0"
+  },
+  "devDependencies": {
+    "jsdom": "^29.0.1",
+    "vite": "^7.3.5"
+  }
+}
