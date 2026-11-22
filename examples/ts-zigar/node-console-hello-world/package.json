@@ -1,0 +1,14 @@
+{
+  "name": "@zigar-examples/node-console-hello-world",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Node.js 26 console & CLI hello-world in Zig 0.17 via zigar ts (WASM + native node-zigar)",
+  "scripts": {
+    "generate": "node ../node/generate.mjs",
+    "build:wasm": "node build-wasm.mjs",
+    "run:wasm": "node run-wasm.mjs",
+    "run:native": "node run-native.mjs",
+    "test": "node --test test/console.test.mjs"
+  }
+}
