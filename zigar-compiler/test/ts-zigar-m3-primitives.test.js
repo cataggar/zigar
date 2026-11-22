@@ -32,7 +32,7 @@ async function generateBindings(fixturePath, outDir) {
     '-t', fixturePath,
     '-m', './m3-esm.mjs',
     '-m', './m3-cjs.cjs',
-    '-m', 'fixture',
+    '-m', 'globals',
     '-s', './m3-esm.mjs=m3_esm',
     '-s', './m3-cjs.cjs=m3_cjs',
     '-d', outDir,

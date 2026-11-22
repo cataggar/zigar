@@ -5,7 +5,7 @@ const gen = @import("generated/root.zig");
 const js = gen.zigar_js;
 const m3_esm = gen.m3_esm;
 const m3_cjs = gen.m3_cjs;
-const fixture = gen.fixture;
+const fixture = gen.globals;
 
 var live_allocs = std.atomic.Value(usize).init(0);
 
