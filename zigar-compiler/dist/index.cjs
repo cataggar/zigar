@@ -4945,6 +4945,9 @@ function processConfig(object, cfgPath, availableOptions) {
       value = modules;
       key = 'modules';
     }
+    if (key === 'buildDir' || key === 'cacheDir' || key === 'moduleDir') {
+      value = node_path.resolve(node_path.dirname(cfgPath), value);
+    }
     if (key === 'modules') {
       // expand to absolute paths
       const cfgDir = node_path.dirname(cfgPath);

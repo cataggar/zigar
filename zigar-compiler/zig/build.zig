@@ -65,6 +65,7 @@ pub fn build(b: *std.Build) !void {
     const extra_imports: []const Import = switch (@hasDecl(extra, "getImports")) {
         true => @call(.always_inline, extra.getImports, .{ b, .{
             .library = lib,
+            .zigar = zigar,
             .target = target,
             .optimize = optimize,
         } }),

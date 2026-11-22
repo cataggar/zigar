@@ -1,0 +1,16 @@
+{
+  "name": "@zigar-examples/node",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared Node.js 26 (@types/node@26) Zig 0.17 bindings generated via zigar ts",
+  "exports": {
+    ".": "./generated/root.zig"
+  },
+  "scripts": {
+    "generate": "node generate.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0"
+  }
+}

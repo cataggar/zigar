@@ -116,6 +116,17 @@ describe('Configuration', function() {
       expect(() => processConfig({ memory64: 'yes' }, '/cfg.json', optionsForCompile)).to.throw();
       expect(() => processConfig({ useResizableBuffer: 1 }, '/cfg.json', optionsForTranspile)).to.throw();
     })
+    it('should resolve relative buildDir and cacheDir against the config file directory', function() {
+      const resolved = processConfig(
+        { buildDir: './.cache/zig-build', cacheDir: './.cache/zig-cache' },
+        '/workspace/app/node-zigar.config.json',
+        optionsForCompile,
+      );
+      expect(resolved).to.eql({
+        buildDir: '/workspace/app/.cache/zig-build',
+        cacheDir: '/workspace/app/.cache/zig-cache',
+      });
+    })
     it('should extract numeric options', function() {
       const { searchParams } = new URL('file:///home/someone/hello.zig?boo=100');
       const fakeOptions = {

@@ -393,6 +393,15 @@ jobs:
             test/ts-zigar-m4-node26-crypto-sqlite.test.js \
             test/ts-zigar-m4-node26-audit.test.js
 
+      - name: Run ts-zigar end-to-end examples (WASM + native node-zigar)
+        env:
+          USE_WAZIG: '0'
+        run: |
+          set -euo pipefail
+          (cd examples/ts-zigar/ts-compiler-component-hello-world && npm test)
+          (cd examples/ts-zigar/node-console-hello-world && npm test)
+          (cd examples/ts-zigar/node-server-hello-world && npm test)
+
   benchmarks:
     name: Wazig vs Zig Benchmarks
     runs-on: ubuntu-latest
