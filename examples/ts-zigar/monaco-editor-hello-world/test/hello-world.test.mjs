@@ -300,13 +300,10 @@ test('monaco-editor-hello-world: Vite + rollup-plugin-zigar emits tree-shaken br
   });
   const distDir = DIST_DIR;
 
-  // 1. Verify production dist artifacts: HTML, stripped ReleaseSmall WASM, and all 5 ESM workers
+  // 1. Verify production dist artifacts: HTML, stripped ReleaseSmall WASM, and deduplicated ESM workers
   assert.ok(existsSync(join(distDir, 'index.html')), 'dist/index.html must exist');
   const expectedWorkers = [
     'editor.worker.js',
-    'json.worker.js',
-    'css.worker.js',
-    'html.worker.js',
     'ts.worker.js',
   ];
   for (const workerFile of expectedWorkers) {
@@ -314,9 +311,36 @@ test('monaco-editor-hello-world: Vite + rollup-plugin-zigar emits tree-shaken br
     assert.ok(existsSync(full), `Expected Vite worker bundle ${workerFile}`);
     assert.ok(statSync(full).size > 64, `Worker bundle ${workerFile} must be non-empty`);
   }
+  for (const unusedWorker of [ 'json.worker.js', 'css.worker.js', 'html.worker.js' ]) {
+    assert.equal(
+      existsSync(join(distDir, unusedWorker)),
+      false,
+      `Unused language worker ${unusedWorker} must not be emitted in TypeScript-only bundle`,
+    );
+  }
 
   const assetsDir = join(distDir, 'assets');
   const assetFiles = readdirSync(assetsDir);
+  assert.equal(
+    assetFiles.some((f) => f.startsWith('ts.worker') || f.startsWith('editor.worker')),
+    false,
+    'Worker entry bundles must be emitted once at dist/*.worker.js without duplicate copies in dist/assets/',
+  );
+
+  let totalDistBytes = 0;
+  const walkSize = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) walkSize(full);
+      else totalDistBytes += statSync(full).size;
+    }
+  };
+  walkSize(distDir);
+  assert.ok(
+    totalDistBytes < 13 * 1024 * 1024,
+    `Expected deduplicated dist/ bundle (< 13 MiB), got ${totalDistBytes} bytes`,
+  );
+
   const wasmFile = assetFiles.find((f) => f.startsWith('app-') && f.endsWith('.wasm'));
   assert.ok(wasmFile, 'Expected emitted app-<hash>.wasm asset from rollup-plugin-zigar');
   const wasmBytes = readFileSync(join(assetsDir, wasmFile));
@@ -326,8 +350,8 @@ test('monaco-editor-hello-world: Vite + rollup-plugin-zigar emits tree-shaken br
     'Emitted WASM asset must begin with \\0asm header',
   );
   assert.ok(
-    wasmBytes.byteLength < 512 * 1024,
-    `Expected compact ReleaseSmall WASM (< 512 KiB), got ${wasmBytes.byteLength} bytes`,
+    wasmBytes.byteLength < 256 * 1024,
+    `Expected compact ReleaseSmall WASM (< 256 KiB), got ${wasmBytes.byteLength} bytes`,
   );
 
   // 2. Verify tree-shaking: unused basic-languages grammars must not be emitted into dist/assets,
@@ -453,19 +477,20 @@ test('monaco-editor-hello-world: Vite + rollup-plugin-zigar emits tree-shaken br
     zigApp.setValue(updatedTs);
     assert.equal(unwrapString(zigApp.getValue()), updatedTs);
 
-    // Verify MonacoEnvironment.getWorkerUrl Zig closure routing across all worker labels
+    // Verify MonacoEnvironment.getWorkerUrl Zig closure routing and Worker construction
     const beforeReqs = Number(zigApp.workerUrlRequests());
     assert.equal(unwrapString(zigApp.resolveWorkerUrl('workerMain.js', 'typescript')), './ts.worker.js');
     assert.equal(unwrapString(zigApp.resolveWorkerUrl('workerMain.js', 'javascript')), './ts.worker.js');
-    assert.equal(unwrapString(zigApp.resolveWorkerUrl('workerMain.js', 'json')), './json.worker.js');
-    assert.equal(unwrapString(zigApp.resolveWorkerUrl('workerMain.js', 'css')), './css.worker.js');
-    assert.equal(unwrapString(zigApp.resolveWorkerUrl('workerMain.js', 'scss')), './css.worker.js');
-    assert.equal(unwrapString(zigApp.resolveWorkerUrl('workerMain.js', 'html')), './html.worker.js');
+    assert.equal(unwrapString(zigApp.resolveWorkerUrl('workerMain.js', 'editorWorkerService')), './editor.worker.js');
     assert.equal(unwrapString(zigApp.resolveWorkerUrl('workerMain.js', 'plaintext')), './editor.worker.js');
-    assert.equal(Number(zigApp.workerUrlRequests()), beforeReqs + 7);
-    assert.equal(
-      globalThis.MonacoEnvironment.getWorkerUrl('workerMain.js', 'typescript'),
-      './ts.worker.js',
+    assert.equal(Number(zigApp.workerUrlRequests()), beforeReqs + 4);
+    const resolvedTsWorkerUrl = globalThis.MonacoEnvironment.getWorkerUrl('workerMain.js', 'typescript');
+    assert.equal(resolvedTsWorkerUrl, './ts.worker.js');
+    const mockWorker = new globalThis.Worker(resolvedTsWorkerUrl, { type: 'module', name: 'ts' });
+    mockWorker.terminate();
+    assert.ok(
+      envHarness.spawnedWorkers.some((w) => w.url === './ts.worker.js'),
+      'MockBrowserWorker must record worker instantiated from MonacoEnvironment.getWorkerUrl',
     );
 
     // Verify clean remounting and missing-container error reporting

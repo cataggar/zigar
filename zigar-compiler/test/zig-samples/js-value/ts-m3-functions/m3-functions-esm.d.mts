@@ -117,3 +117,18 @@ export declare class ReadyChannel extends Channel {
 }
 
 export declare function openChannel(ready: boolean, token: string): Channel;
+
+// 7. Overload auto-boxing for `any`/`unknown` parameters + lossless narrow integer -> `f64` coercion
+export declare function endOrBind(cb?: () => void): string;
+export declare function endOrBind(chunk: any, cb?: () => void): string;
+export declare function endOrBind(port: number, host: string): string;
+
+export interface NestedAnyPayload {
+  data: any;
+}
+export interface NestedStringPayload {
+  data: string;
+}
+export declare function acceptNestedPayload(payload: NestedAnyPayload): string;
+export declare function acceptNestedPayload(payload: NestedStringPayload): string;
+

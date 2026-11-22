@@ -19,13 +19,16 @@ const RequestResponse = http.ServerResponseDefault();
 
 const RequestClosure = js.Closure(*ServerState, ServerState.onRequest);
 const ListeningClosure = js.Closure(*ServerState, ServerState.onListening);
+const ErrorClosure = js.Closure(*ServerState, ServerState.onError);
 
 const ServerState = struct {
     server: ?RequestServer = null,
     request_closure: ?RequestClosure = null,
     listening_closure: ?ListeningClosure = null,
+    error_closure: ?ErrorClosure = null,
     bound_port: u16 = 0,
     request_count: usize = 0,
+    had_error: bool = false,
 
     fn onRequest(
         st: *ServerState,
@@ -33,6 +36,12 @@ const ServerState = struct {
         res: RequestResponse,
     ) js.CallError!void {
         st.request_count += 1;
+
+        var responded = false;
+        errdefer if (!responded) {
+            if (res.writeHead(.{500})) |hr| hr.deinit() else |_| {}
+            if (res.end("Internal Server Error\n")) |er| er.deinit() else |_| {}
+        };
 
         const alloc = zigar.mem.allocator;
         const req_url = try req.urlAlloc(alloc);
@@ -45,14 +54,14 @@ const ServerState = struct {
             try headers.set("x-request-path", .from(path_slice));
         }
 
-        const head_res = try res.writeHead(.{ 200, headers });
-        head_res.deinit();
+        (try res.writeHead(.{ 200, headers })).deinit();
+        (try res.end("Hello, World!\n")).deinit();
+        responded = true;
+    }
 
-        const body = try js.toJsRef([]const u8, "Hello, World!\n");
-        defer body.deinit();
-
-        const end_res = try res.end(.{body});
-        end_res.deinit();
+    fn onError(st: *ServerState, err: js.Ref(js.Object)) void {
+        defer err.deinit();
+        st.had_error = true;
     }
 
     fn onListening(st: *ServerState) js.CallError!void {
@@ -100,6 +109,18 @@ fn readConfiguredPort(allocator: std.mem.Allocator) !u16 {
     return DEFAULT_PORT;
 }
 
+fn detachListeners(st: *ServerState, srv: RequestServer) void {
+    if (st.request_closure) |*rc| {
+        if (srv.removeListener(.{ .request, rc })) |rm| rm.deinit() else |_| {}
+    }
+    if (st.listening_closure) |*lc| {
+        if (srv.removeListener(.{ .listening, lc })) |rm| rm.deinit() else |_| {}
+    }
+    if (st.error_closure) |*ec| {
+        if (srv.removeListener(.{ .@"error", ec })) |rm| rm.deinit() else |_| {}
+    }
+}
+
 pub fn start(allocator: std.mem.Allocator) !u16 {
     if (state.server != null) return error.AlreadyRunning;
 
@@ -111,27 +132,28 @@ pub fn start(allocator: std.mem.Allocator) !u16 {
     const listening_closure = try ListeningClosure.tryInit(&state);
     errdefer listening_closure.deinit();
 
+    const error_closure = try ErrorClosure.tryInit(&state);
+    errdefer error_closure.deinit();
+
     const srv = try http.createServer(.{&req_closure});
 
     state = .{
         .server = srv,
         .request_closure = req_closure,
         .listening_closure = listening_closure,
+        .error_closure = error_closure,
         .bound_port = requested_port,
         .request_count = 0,
+        .had_error = false,
     };
     errdefer {
-        if (srv.removeAllListenersEventName(null)) |rm| rm.deinit() else |_| {}
+        detachListeners(&state, srv);
         srv.deinit();
         state = .{};
     }
 
-    const listen_ref = try srv.listen(.{
-        @as(f64, @floatFromInt(requested_port)),
-        "127.0.0.1",
-        &listening_closure,
-    });
-    listen_ref.deinit();
+    (try srv.on(.{ .@"error", &state.error_closure.? })).deinit();
+    (try srv.listen(.{ requested_port, "127.0.0.1", &state.listening_closure.? })).deinit();
 
     return requested_port;
 }
@@ -144,19 +166,24 @@ pub fn requestCount() usize {
     return state.request_count;
 }
 
+pub fn hadError() bool {
+    return state.had_error;
+}
+
 pub fn shutdown() !void {
     if (state.server) |srv| {
         defer {
+            detachListeners(&state, srv);
             srv.deinit();
+            if (state.error_closure) |ec| ec.deinit();
             if (state.listening_closure) |lc| lc.deinit();
             if (state.request_closure) |rc| rc.deinit();
             state = .{};
         }
         try srv.closeAllConnections();
-        const closed = try srv.close(null);
-        closed.deinit();
-        const removed = try srv.removeAllListenersEventName(null);
-        removed.deinit();
+        if (try srv.listening()) {
+            (try srv.close(null)).deinit();
+        }
     }
 }
 

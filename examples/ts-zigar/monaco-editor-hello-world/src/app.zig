@@ -3,7 +3,7 @@
 //! Port of `ts2rs/monaco-editor-hello-world` to Zig 0.17 + `ts-zigar` (`zigar ts`),
 //! bundled for the browser with Vite and `rollup-plugin-zigar`:
 //! - Configures `globalThis.MonacoEnvironment` with a persistent Zig `getWorkerUrl` closure
-//!   routing `json`, `css`, `html`, `typescript`/`javascript`, and default editor workers.
+//!   routing `typescript`/`javascript` to `./ts.worker.js` and all other labels to `./editor.worker.js`.
 //! - Looks up `#container` via `dom.document.getElementById("container")`.
 //! - Mounts an interactive TypeScript Monaco editor with `vs-dark` theme via `monaco.editor.create(...)`.
 //! - Provides clean `getValue`, `setValue`, `resolveWorkerUrl`, and leak-free `unmount` helpers.
@@ -12,6 +12,7 @@ const std = @import("std");
 const web = @import("web");
 const dom = web.dom;
 const monaco = web.monaco;
+// `web.zigar_js` bridges to `@import("zigar").js` under zigar-compiler and supports standalone `zig build test`.
 const js = web.zigar_js;
 
 pub const default_code =
@@ -35,15 +36,6 @@ const WorkerEnvState = struct {
     requests: usize = 0,
 
     pub fn routeWorkerLabel(label: []const u8) []const u8 {
-        if (std.mem.eql(u8, label, "json")) {
-            return "./json.worker.js";
-        }
-        if (std.mem.eql(u8, label, "css") or std.mem.eql(u8, label, "scss") or std.mem.eql(u8, label, "less")) {
-            return "./css.worker.js";
-        }
-        if (std.mem.eql(u8, label, "html") or std.mem.eql(u8, label, "handlebars") or std.mem.eql(u8, label, "razor")) {
-            return "./html.worker.js";
-        }
         if (std.mem.eql(u8, label, "typescript") or std.mem.eql(u8, label, "javascript")) {
             return "./ts.worker.js";
         }

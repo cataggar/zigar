@@ -12,7 +12,7 @@ const zigar = @import("zigar");
 const web = @import("web");
 const dom = web.dom;
 const monaco = web.monaco;
-const js = web.zigar_js;
+const js = zigar.js;
 
 const WorkerUrlClosure = js.Closure(*WorkerEnvState, WorkerEnvState.getWorkerUrl);
 const WorkerFactoryClosure = js.Closure(*WorkerEnvState, WorkerEnvState.getWorker);
@@ -136,10 +136,7 @@ pub fn runEditorWorkflow(
         const factory_env = (try monaco.monaco_environment.get()) orelse return error.MissingMonacoEnvironment;
         defer factory_env.deinit();
         const worker_union = try factory_env.getWorker("workerMain.js", "typescript");
-        switch (worker_union) {
-            .worker => |w| w.deinit(),
-            .promise => |p| p.deinit(),
-        }
+        defer worker_union.deinit();
     }
     try configureWorkerUrlEnvironment();
 
@@ -209,7 +206,11 @@ pub fn runEditorWorkflow(
         },
         null,
     );
+    var editor_disposed = false;
     defer editor_instance.deinit();
+    errdefer if (!editor_disposed) {
+        editor_instance.dispose() catch {};
+    };
 
     const current_val = try editor_instance.getValueAlloc(zigar.mem.allocator, null);
     const initial_len = current_val.len;
@@ -220,6 +221,7 @@ pub fn runEditorWorkflow(
     errdefer allocator.free(final_value);
 
     try editor_instance.dispose();
+    editor_disposed = true;
 
     return .{
         .container_id = resolved_id,

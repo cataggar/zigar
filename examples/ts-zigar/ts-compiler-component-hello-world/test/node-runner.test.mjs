@@ -1,13 +1,16 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 import { getComponentHostRegistry, runWit } from '../../../../zigar-compiler/dist/index.js';
 import { ensureIsolatedCacheEnv, runWasmShowcase } from '../run-wasm.mjs';
 
+const execFileAsync = promisify(execFile);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const EXAMPLE_DIR = resolve(__dirname, '..');
@@ -86,3 +89,14 @@ test('src/lib.zig compiled to WASM via zigar-compiler drives TypeScript 7.1 Go W
   assert.equal(summary.hostLiveResourcesBeforeDispose, 0);
   assert.equal(getComponentHostRegistry().hosts.size, 0);
 });
+
+test('zig build test passes native GPA leak check and wasm32 cross-target compilation', async () => {
+  ensureIsolatedCacheEnv();
+  const { stderr } = await execFileAsync('zig', [ 'build', 'test', '--summary', 'all' ], {
+    cwd: EXAMPLE_DIR,
+    env: process.env,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  assert.match(stderr, /test success/);
+});
+

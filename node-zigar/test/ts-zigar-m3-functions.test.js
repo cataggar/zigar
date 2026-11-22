@@ -178,6 +178,12 @@ describe('ts-zigar M3.3a Live Runtime Roundtrip: Overloads, Variadics, Callbacks
           'eval=42|sent=[tok7]>ping',
         );
       });
+
+      it('auto-boxes Zig values into Any overload parameters and coerces narrow runtime integers to f64', function () {
+        expect(mod.exerciseAnyOverloadAutoBoxingAndNarrowIntCoercion().string).to.equal(
+          'end:string:Hello, World!|end:string:end:strin|end:boolean:true|bind:127.0.0.1:8080|end:object:null|end:boolean:true|end:object:null|end:object:{"count":77}|end:object:null|nested:string:nested-ok',
+        );
+      });
     });
   }
 });

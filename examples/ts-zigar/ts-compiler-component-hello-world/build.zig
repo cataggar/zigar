@@ -55,8 +55,10 @@ pub fn build(b: *std.Build) void {
         "-o",
         component_wasm_abs,
     });
+    build_component_cmd.has_side_effects = true;
     const component_step = b.step("component", "Build TypeScript 7.1 Go WASM Component if missing");
     component_step.dependOn(&build_component_cmd.step);
+    b.getInstallStep().dependOn(&build_component_cmd.step);
 
     // 4. Shared example library module (`src/lib.zig`)
     const hello_lib_mod = b.addModule("hello_lib", .{

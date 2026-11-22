@@ -363,9 +363,11 @@ jobs:
           npx mocha --timeout 600000 \
             test/component-host.test.js \
             test/ts-zigar-cli.test.js \
-            test/ts-zigar-m2-types.test.js \
-            test/ts-zigar-m2-values.test.js \
-            test/ts-zigar-m3-classes.test.js \
+            test/ts-zigar-m3-primitives.test.js \
+            test/ts-zigar-m3-unions.test.js \
+            test/ts-zigar-m3-objects.test.js \
+            test/ts-zigar-m3-functions.test.js \
+            test/ts-zigar-m3-heritage.test.js \
             test/ts-zigar-m3-generics.test.js \
             test/ts-zigar-m3-protocols.test.js \
             test/ts-zigar-m3-ts71.test.js \
@@ -382,8 +384,11 @@ jobs:
           set -euo pipefail
           cd node-zigar
           npx mocha --no-warnings --timeout 600000 \
-            test/ts-zigar-m2-values.test.js \
-            test/ts-zigar-m3-classes.test.js \
+            test/ts-zigar-m3-primitives.test.js \
+            test/ts-zigar-m3-unions.test.js \
+            test/ts-zigar-m3-objects.test.js \
+            test/ts-zigar-m3-functions.test.js \
+            test/ts-zigar-m3-heritage.test.js \
             test/ts-zigar-m3-generics.test.js \
             test/ts-zigar-m3-protocols.test.js \
             test/ts-zigar-m3-ts71.test.js \

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -34,12 +34,25 @@ describe('node-console-hello-world (WASM + native node-zigar)', () => {
 
     const bundlePath = await buildWasmBundle({ quiet: true });
     const bundleSource = readFileSync(bundlePath, 'utf8');
+    const assetsDir = join(dirname(bundlePath), 'assets');
+    const wasmFiles = readdirSync(assetsDir).filter((f) => f.endsWith('.wasm'));
+    assert.equal(wasmFiles.length, 1, `Expected 1 .wasm asset, got ${JSON.stringify(wasmFiles)}`);
+    const wasmBytes = statSync(join(assetsDir, wasmFiles[0])).size;
+    assert.ok(
+      wasmBytes > 0 && wasmBytes < 192 * 1024,
+      `Expected compact stripped WASM binary (< 192 KiB), got ${wasmBytes} bytes`,
+    );
+    assert.ok(
+      Buffer.byteLength(bundleSource, 'utf8') < 640 * 1024,
+      `Expected compact Rollup JS bundle (< 640 KiB), got ${Buffer.byteLength(bundleSource, 'utf8')} bytes`,
+    );
 
-    // `console` and `process` are globals: no unused `node:*` built-in imports should be emitted!
-    assert.doesNotMatch(
-      bundleSource,
-      /from\s+["']node:(?:http|https|fs|net|crypto|sqlite|stream)["']/,
-      'Unreferenced node:* modules must be tree-shaken out of the bundle',
+    // `console` and `process` are globals: zero static `node:*` imports should be emitted!
+    const nodeImports = [ ...bundleSource.matchAll(/\bfrom\s*["'](node:[^"']+)["']/g) ].map((m) => m[1]);
+    assert.deepEqual(
+      nodeImports,
+      [],
+      `Unreferenced node:* modules must be tree-shaken out of console.mjs, got ${JSON.stringify(nodeImports)}`,
     );
 
     const mod = await import(`${pathToFileURL(bundlePath).href}?t=${Date.now()}`);
