@@ -36,6 +36,9 @@ pub const DeclClassification = struct {
     /// True when backed by a runtime JS constructor (`class` or `interface` + constructable `var`),
     /// enabling `ctor_target` resolution for `Reflect.construct` and `instanceof` checks.
     is_class: bool = false,
+    /// True when any transitive `extends` or intersection base is a runtime `class` or built-in
+    /// exotic container (`Array`, `Map`, `Set`, protocol object), disqualifying `{}` empty `init()`.
+    has_class_base: bool = false,
     /// True when the handle itself is a callable or constructable JS `function` value
     /// (`call_signatures` on an interface, or standalone `construct_signatures` without `is_class`).
     is_callable_handle: bool = false,
@@ -474,17 +477,20 @@ pub fn Classifier(comptime Graph: type) type {
                 .intersection => |parts| {
                     var needs_handle = false;
                     var is_callable = false;
+                    var has_cls_base = false;
                     for (parts) |pid| {
                         const sub = try self.classifyObjectType(pid, depth + 1);
                         if (sub.kind == .handle_wrapper) {
                             needs_handle = true;
                             if (sub.is_callable_handle) is_callable = true;
+                            if (sub.is_class or sub.has_class_base) has_cls_base = true;
                         }
                     }
                     if (needs_handle) {
                         return .{
                             .kind = .handle_wrapper,
                             .is_class = false,
+                            .has_class_base = has_cls_base,
                             .is_callable_handle = is_callable,
                         };
                     }
@@ -499,7 +505,7 @@ pub fn Classifier(comptime Graph: type) type {
                         return .{ .kind = .value_struct };
                     }
                     if (ref.target_decl == null and lower_protocols.classifyBuiltinProtocolRef(rname) != null) {
-                        return .{ .kind = .handle_wrapper };
+                        return .{ .kind = .handle_wrapper, .has_class_base = true };
                     }
                     if (tn.resolved_type) |rt| {
                         if (rt != ty_id) {
@@ -538,7 +544,7 @@ pub fn Classifier(comptime Graph: type) type {
             if (hc.target_type < self.graph.types.len) {
                 const tn = self.graph.types[hc.target_type];
                 switch (tn.kind) {
-                    .array, .readonly_array => return .{ .kind = .handle_wrapper },
+                    .array, .readonly_array => return .{ .kind = .handle_wrapper, .has_class_base = true },
                     .object_literal, .intersection => return try self.classifyObjectType(hc.target_type, 0),
                     .reference => |ref| {
                         const rname = self.str(ref.target_name);
@@ -551,7 +557,7 @@ pub fn Classifier(comptime Graph: type) type {
                                 std.mem.eql(u8, rname, "Map") or
                                 std.mem.eql(u8, rname, "ReadonlyMap")))
                         {
-                            return .{ .kind = .handle_wrapper };
+                            return .{ .kind = .handle_wrapper, .has_class_base = true };
                         }
                         if (tn.resolved_type != null and (ref.target_decl == null or
                             (ref.target_decl.? < self.graph.decls.len and
@@ -665,11 +671,13 @@ pub fn Classifier(comptime Graph: type) type {
                     }
 
                     var inherited_callable = false;
+                    var inherited_class_base = false;
                     for (iface.extends_clauses) |hc| {
                         const base_cls = try self.classifyHeritageClause(hc);
                         if (base_cls.kind == .handle_wrapper) {
                             needs_handle = true;
                             if (base_cls.is_callable_handle) inherited_callable = true;
+                            if (base_cls.is_class or base_cls.has_class_base) inherited_class_base = true;
                         }
                     }
                     for (d.merged_with) |mid| {
@@ -681,6 +689,7 @@ pub fn Classifier(comptime Graph: type) type {
                                 if (base_cls.kind == .handle_wrapper) {
                                     needs_handle = true;
                                     if (base_cls.is_callable_handle) inherited_callable = true;
+                                    if (base_cls.is_class or base_cls.has_class_base) inherited_class_base = true;
                                 }
                             }
                         }
@@ -690,6 +699,7 @@ pub fn Classifier(comptime Graph: type) type {
                         return .{
                             .kind = .handle_wrapper,
                             .is_class = true,
+                            .has_class_base = inherited_class_base,
                             .is_callable_handle = has_call_sigs or inherited_callable,
                             .companion_var_decl_id = companion_var,
                         };
@@ -700,6 +710,7 @@ pub fn Classifier(comptime Graph: type) type {
                         return .{
                             .kind = .handle_wrapper,
                             .is_class = false,
+                            .has_class_base = inherited_class_base,
                             .is_callable_handle = is_callable,
                         };
                     }

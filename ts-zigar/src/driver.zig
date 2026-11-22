@@ -20,6 +20,7 @@ pub const LoadedSources = struct {
     root_vfs_paths: [][]const u8,
     base_dir: []const u8,
     specifier_overrides: []ir.SpecifierOverride = &.{},
+    exports_pkg_vfs_prefixes: [][]const u8 = &.{},
     types_only_vfs_prefixes: [][]const u8 = &.{},
 
     pub fn deinit(self: *LoadedSources, allocator: std.mem.Allocator) void {
@@ -32,6 +33,8 @@ pub const LoadedSources = struct {
             allocator.free(ov.wire_specifier);
         }
         allocator.free(self.specifier_overrides);
+        for (self.exports_pkg_vfs_prefixes) |pfx| allocator.free(pfx);
+        allocator.free(self.exports_pkg_vfs_prefixes);
         for (self.types_only_vfs_prefixes) |pfx| allocator.free(pfx);
         allocator.free(self.types_only_vfs_prefixes);
         allocator.free(self.base_dir);
@@ -165,6 +168,7 @@ const SourceCollector = struct {
     files: std.ArrayList(VirtualFile) = .empty,
     root_vfs_paths: std.ArrayList([]const u8) = .empty,
     specifier_overrides: std.ArrayList(ir.SpecifierOverride) = .empty,
+    exports_pkg_vfs_prefixes: std.ArrayList([]const u8) = .empty,
     types_only_vfs_prefixes: std.ArrayList([]const u8) = .empty,
     entry_base_dirs: std.ArrayList([]u8) = .empty,
     scan_queue: std.ArrayList(PendingScan) = .empty,
@@ -194,6 +198,8 @@ const SourceCollector = struct {
             self.allocator.free(ov.wire_specifier);
         }
         self.specifier_overrides.deinit(self.allocator);
+        for (self.exports_pkg_vfs_prefixes.items) |pfx| self.allocator.free(pfx);
+        self.exports_pkg_vfs_prefixes.deinit(self.allocator);
         for (self.types_only_vfs_prefixes.items) |pfx| self.allocator.free(pfx);
         self.types_only_vfs_prefixes.deinit(self.allocator);
     }
@@ -205,6 +211,16 @@ const SourceCollector = struct {
         const owned = try self.allocator.dupe(u8, vfs_path);
         errdefer self.allocator.free(owned);
         try self.root_vfs_paths.append(self.allocator, owned);
+    }
+
+    fn addExportsPkgVfsPrefix(self: *SourceCollector, vfs_prefix: []const u8) !void {
+        if (vfs_prefix.len == 0) return;
+        for (self.exports_pkg_vfs_prefixes.items) |existing| {
+            if (std.mem.eql(u8, existing, vfs_prefix)) return;
+        }
+        const owned = try self.allocator.dupe(u8, vfs_prefix);
+        errdefer self.allocator.free(owned);
+        try self.exports_pkg_vfs_prefixes.append(self.allocator, owned);
     }
 
     fn addTypesOnlyVfsPrefix(self: *SourceCollector, vfs_prefix: []const u8) !void {
@@ -473,14 +489,18 @@ const SourceCollector = struct {
                 }
             }
 
+            const pkg_vfs_dir_exp = try toVfsPath(self.allocator, pkg_dir_disk);
+            defer self.allocator.free(pkg_vfs_dir_exp);
+            const pkg_vfs_prefix = if (std.mem.eql(u8, pkg_vfs_dir_exp, "/"))
+                try self.allocator.dupe(u8, "/")
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}/", .{pkg_vfs_dir_exp});
+            defer self.allocator.free(pkg_vfs_prefix);
+
             if (has_subpath_keys) {
-                const pkg_vfs_dir = try toVfsPath(self.allocator, pkg_dir_disk);
-                defer self.allocator.free(pkg_vfs_dir);
-                const pkg_vfs_prefix = if (std.mem.eql(u8, pkg_vfs_dir, "/"))
-                    try self.allocator.dupe(u8, "/")
-                else
-                    try std.fmt.allocPrint(self.allocator, "{s}/", .{pkg_vfs_dir});
-                defer self.allocator.free(pkg_vfs_prefix);
+                if (pkg_name != null) {
+                    try self.addExportsPkgVfsPrefix(pkg_vfs_prefix);
+                }
 
                 var eit = ev.object.iterator();
                 while (eit.next()) |kv| {
@@ -550,6 +570,7 @@ const SourceCollector = struct {
                     defer self.allocator.free(vp);
                     if (add_as_primary_root) try self.addRootVfsPath(vp);
                     if (pkg_name) |pn| {
+                        try self.addExportsPkgVfsPrefix(pkg_vfs_prefix);
                         try self.addSpecifierOverride(vp, pn);
                     }
                     found_any = true;
@@ -1237,6 +1258,11 @@ pub fn loadTypesFromDisk(
         }
         allocator.free(overrides_slice);
     }
+    const exports_pkg_slice = try collector.exports_pkg_vfs_prefixes.toOwnedSlice(allocator);
+    errdefer {
+        for (exports_pkg_slice) |pfx| allocator.free(pfx);
+        allocator.free(exports_pkg_slice);
+    }
     const types_only_slice = try collector.types_only_vfs_prefixes.toOwnedSlice(allocator);
 
     return .{
@@ -1245,6 +1271,7 @@ pub fn loadTypesFromDisk(
             .root_vfs_paths = roots_slice,
             .base_dir = base_dir,
             .specifier_overrides = overrides_slice,
+            .exports_pkg_vfs_prefixes = exports_pkg_slice,
             .types_only_vfs_prefixes = types_only_slice,
         },
     };
@@ -1497,6 +1524,7 @@ pub fn runPipelineWithHost(
         .base_dir = loaded.base_dir,
         .primary_vfs_paths = loaded.root_vfs_paths,
         .vfs_specifier_overrides = loaded.specifier_overrides,
+        .exports_pkg_vfs_prefixes = loaded.exports_pkg_vfs_prefixes,
         .types_only_vfs_prefixes = loaded.types_only_vfs_prefixes,
         .source_files = source_views,
         .modules = opts.modules,

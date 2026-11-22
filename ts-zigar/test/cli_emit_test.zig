@@ -6948,10 +6948,229 @@ test "Issue #59 M4.2c Audit: closed-condition generic conditionals, import() / t
     }
 }
 
+test "Issue #62 (M5.2a): optional-method Environment handle init/setters, nested namespace re-export claiming, and barrel global propagation" {
+    const wasm_path = resolveTestComponentWasm() orelse return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
 
+    const sandbox = try std.fmt.allocPrint(alloc, "{s}/ts-zigar-issue62-monaco-patterns", .{resolveTmpRoot()});
+    defer alloc.free(sandbox);
+    cwd.deleteTree(io, sandbox) catch {};
+    defer cwd.deleteTree(io, sandbox) catch {};
 
+    const src_dir = try std.fmt.allocPrint(alloc, "{s}/src", .{sandbox});
+    defer alloc.free(src_dir);
+    const out_dir = try std.fmt.allocPrint(alloc, "{s}/out", .{sandbox});
+    defer alloc.free(out_dir);
+    try cwd.createDirPath(io, src_dir);
 
+    {
+        var d = try cwd.openDir(io, src_dir, .{});
+        defer d.close(io);
 
+        try d.writeFile(io, .{
+            .sub_path = "dom.d.ts",
+            .data =
+            \\interface EventTarget {
+            \\    addEventListener(type: string, cb: ((ev: any) => void) | null): void;
+            \\}
+            \\declare var EventTarget: {
+            \\    prototype: EventTarget;
+            \\    new(): EventTarget;
+            \\};
+            \\interface Worker extends EventTarget {
+            \\    terminate(): void;
+            \\}
+            \\declare var Worker: {
+            \\    prototype: Worker;
+            \\    new(scriptUrl: string): Worker;
+            \\};
+            \\interface HTMLElement extends EventTarget {
+            \\    id: string;
+            \\}
+            \\declare var HTMLElement: {
+            \\    prototype: HTMLElement;
+            \\    new(): HTMLElement;
+            \\};
+            \\interface Document {
+            \\    getElementById(id: string): HTMLElement | null;
+            \\}
+            \\declare var document: Document;
+            ,
+        });
 
+        try d.createDirPath(io, "pkg/editor");
+        try d.writeFile(io, .{
+            .sub_path = "pkg/package.json",
+            .data =
+            \\{
+            \\  "name": "mini-monaco",
+            \\  "type": "module",
+            \\  "exports": {
+            \\    ".": {
+            \\      "types": "./index.d.ts",
+            \\      "import": "./index.js"
+            \\    },
+            \\    "./*.js": "./*.js"
+            \\  }
+            \\}
+            ,
+        });
 
+        try d.writeFile(io, .{
+            .sub_path = "pkg/editor/api.d.ts",
+            .data =
+            \\declare global {
+            \\    var MonacoEnvironment: Environment | undefined;
+            \\}
+            \\export interface Environment {
+            \\    globalAPI?: boolean;
+            \\    baseUrl?: string;
+            \\    getWorker?(workerId: string, label: string): Promise<Worker> | Worker;
+            \\    getWorkerUrl?(workerId: string, label: string): string;
+            \\}
+            \\export interface DerivedFromClass extends EventTarget {
+            \\    onTick?(ms: number): void;
+            \\}
+            \\export interface HasRequiredMethod {
+            \\    dispose(): void;
+            \\    onClose?(): void;
+            \\}
+            \\export namespace editor {
+            \\    export interface Options {
+            \\        value?: string;
+            \\        language?: string;
+            \\    }
+            \\    export function create(el: HTMLElement, options?: Options): HasRequiredMethod;
+            \\}
+            ,
+        });
 
+        try d.writeFile(io, .{
+            .sub_path = "pkg/index.d.ts",
+            .data =
+            \\export { Environment, DerivedFromClass, HasRequiredMethod, editor } from "./editor/api.js";
+            ,
+        });
+
+        // Single-file Rollup `.d.ts` pattern (`monaco.d.ts`): `export { editor_main as m }`
+        // where `editor_main` re-exports internal `declare namespace register$3` as `css`.
+        try d.writeFile(io, .{
+            .sub_path = "bundled.d.ts",
+            .data =
+            \\declare namespace register$3 {
+            \\    function configureCss(strict: boolean): void;
+            \\}
+            \\declare namespace editor_main {
+            \\    export { register$3 as css };
+            \\}
+            \\export { editor_main as m };
+            ,
+        });
+    }
+
+    const dom_dts = try std.fmt.allocPrint(alloc, "{s}/dom.d.ts", .{src_dir});
+    defer alloc.free(dom_dts);
+    const pkg_dir = try std.fmt.allocPrint(alloc, "{s}/pkg", .{src_dir});
+    defer alloc.free(pkg_dir);
+    const bundled_dts = try std.fmt.allocPrint(alloc, "{s}/bundled.d.ts", .{src_dir});
+    defer alloc.free(bundled_dts);
+
+    var ts_host = try ts_zigar.TypeScriptHost.spawnNode(alloc, io, .{
+        .wasm_path = wasm_path,
+        .node_binary = resolveNodeExe(),
+    });
+    defer ts_host.deinit();
+
+    var parsed = try ts_zigar.cli.parseArgs(alloc, &.{
+        "-t",
+        dom_dts,
+        "-t",
+        pkg_dir,
+        "-t",
+        bundled_dts,
+        "--strict-fallbacks",
+        "-d",
+        out_dir,
+    });
+    defer parsed.deinit(alloc);
+    var res = try ts_zigar.driver.runPipelineWithHost(alloc, io, &ts_host, &parsed.run);
+    defer res.deinit(alloc);
+    if (res == .err) {
+        std.debug.print("Issue #62 pipeline error: {s}\n", .{res.err});
+    }
+    try std.testing.expect(res == .ok);
+    try std.testing.expectEqual(@as(usize, 0), res.ok.fallback_count);
+
+    // Verify nested namespace re-export wire path in `bundled.zig`
+    const bundled_zig_path = try std.fmt.allocPrint(alloc, "{s}/bundled.zig", .{out_dir});
+    defer alloc.free(bundled_zig_path);
+    const bundled_src = try cwd.readFileAlloc(io, bundled_zig_path, alloc, .limited(256 * 1024));
+    defer alloc.free(bundled_src);
+    try std.testing.expect(std.mem.indexOf(u8, bundled_src, ".ns_path = &.{ \"m\", \"css\" }, .name = \"configureCss\"") != null);
+
+    const probe_zig = try std.fmt.allocPrint(alloc, "{s}/probe_issue62.zig", .{sandbox});
+    defer alloc.free(probe_zig);
+    try cwd.writeFile(io, .{
+        .sub_path = probe_zig,
+        .data =
+        \\const std = @import("std");
+        \\const r = @import("out/root.zig");
+        \\const js = r.zigar_js;
+        \\
+        \\const WorkerCtx = struct {
+        \\    pub fn url(_: *const @This(), _: []const u8, _: []const u8) []const u8 {
+        \\        return "/ts.worker.js";
+        \\    }
+        \\    pub fn worker(_: *const @This(), _: []const u8, _: []const u8) js.CallError!r.dom.Worker {
+        \\        return r.dom.Worker.init("/ts.worker.js");
+        \\    }
+        \\};
+        \\
+        \\test "Issue #62 Sema: Environment init/setters, barrel global, and Rollup namespace re-export" {
+        \\    const Env = r.mini_monaco.Environment;
+        \\    try std.testing.expect(@hasDecl(Env, "init"));
+        \\    try std.testing.expect(@hasDecl(Env, "setGetWorkerUrl"));
+        \\    try std.testing.expect(@hasDecl(Env, "setGetWorker"));
+        \\    try std.testing.expect(@hasDecl(Env, "setGlobalApi"));
+        \\
+        \\    // Interfaces extending a class or requiring methods do NOT synthesize empty `init()`!
+        \\    try std.testing.expect(!@hasDecl(r.mini_monaco.DerivedFromClass, "init"));
+        \\    try std.testing.expect(!@hasDecl(r.mini_monaco.HasRequiredMethod, "init"));
+        \\
+        \\    // `declare global { var MonacoEnvironment }` is forwarded onto `mini_monaco` barrel!
+        \\    try std.testing.expect(@hasDecl(r.mini_monaco, "monaco_environment"));
+        \\    try std.testing.expectError(error.HostUnavailable, r.mini_monaco.monaco_environment.get());
+        \\
+        \\    // Rollup-bundled `export { editor_main as m }` -> `M.css.configureCss` is preserved!
+        \\    try std.testing.expect(@hasDecl(r.bundled, "M"));
+        \\    try std.testing.expect(@hasDecl(r.bundled.M, "css"));
+        \\    try std.testing.expectError(error.HostUnavailable, r.bundled.M.css.configureCss(true));
+        \\
+        \\    // Persistent callback setters accept owned Closure pointers (including covariant union return `Worker` -> `Promise<Worker> | Worker`)!
+        \\    const SemaCheck = struct {
+        \\        fn verify() !void {
+        \\            var ctx = WorkerCtx{};
+        \\            var url_cl = try js.Closure(*const WorkerCtx, WorkerCtx.url).tryInit(&ctx);
+        \\            defer url_cl.deinit();
+        \\            var wk_cl = try js.Closure(*const WorkerCtx, WorkerCtx.worker).tryInit(&ctx);
+        \\            defer wk_cl.deinit();
+        \\            const env = try Env.init();
+        \\            defer env.deinit();
+        \\            try env.setGetWorkerUrl(&url_cl);
+        \\            try env.setGetWorker(&wk_cl);
+        \\            try env.setGetWorker(null);
+        \\            try r.mini_monaco.monaco_environment.set(env);
+        \\        }
+        \\    };
+        \\    _ = &SemaCheck.verify;
+        \\}
+        ,
+    });
+
+    const root_zig = try std.fmt.allocPrint(alloc, "{s}/root.zig", .{out_dir});
+    defer alloc.free(root_zig);
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", root_zig });
+    try runZigCheck(alloc, io, &.{ test_options.zig_exe, "test", probe_zig });
+}

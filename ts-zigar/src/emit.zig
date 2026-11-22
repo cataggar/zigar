@@ -4065,25 +4065,48 @@ const ModuleEmitCtx = struct {
             if (ip.getter_ident == null) {
                 if (ip.jsdoc) |jd| try appendJsDocComments(&self.out, self.allocator, jd);
             }
-            try self.out.print(
-                self.allocator,
-                "pub fn {s}({s}: {s}, {s}: ",
-                .{ setter_id, st.self_param_ident, st.self_ident, ip.setter_param_ident },
-            );
-            if (shared_get_ty_expr_opt != null and ip.getter_ty != null and set_ty == ip.getter_ty.?) {
-                try self.out.appendSlice(self.allocator, shared_get_ty_expr_opt.?);
-            } else {
+            const unwrapped_set_ty = switch (set_ty.*) {
+                .optional => |opt| opt.child,
+                else => set_ty,
+            };
+            const is_callback_prop_setter = (unwrapped_set_ty.* == .fn_ptr);
+            if (is_callback_prop_setter) {
+                try self.out.print(
+                    self.allocator,
+                    "pub fn {s}({s}: {s}, {s}: anytype) __zigar_js.CallError!void {{\ncomptime __zigar_js.assertPersistentCallbackPropCompatible(@TypeOf({s}), ",
+                    .{ setter_id, st.self_param_ident, st.self_ident, ip.setter_param_ident, ip.setter_param_ident },
+                );
                 try self.emitType(set_ty);
+                try self.out.print(
+                    self.allocator,
+                    ");\nreturn __zigar_js.setInstanceProp(@TypeOf({s}), {s}.{s}, ",
+                    .{ ip.setter_param_ident, st.self_param_ident, st.ref_field_ident },
+                );
+                try self.emitStringLit(ip.wire_name);
+                try self.out.print(self.allocator, ", {s}, ", .{ip.setter_param_ident});
+                try self.emitNullishSpec(set_ty, ip.setter_is_optional);
+                try self.out.appendSlice(self.allocator, ");\n}\n");
+            } else {
+                try self.out.print(
+                    self.allocator,
+                    "pub fn {s}({s}: {s}, {s}: ",
+                    .{ setter_id, st.self_param_ident, st.self_ident, ip.setter_param_ident },
+                );
+                if (shared_get_ty_expr_opt != null and ip.getter_ty != null and set_ty == ip.getter_ty.?) {
+                    try self.out.appendSlice(self.allocator, shared_get_ty_expr_opt.?);
+                } else {
+                    try self.emitType(set_ty);
+                }
+                try self.out.print(
+                    self.allocator,
+                    ") __zigar_js.CallError!void {{\nreturn __zigar_js.setInstanceProp(@TypeOf({s}), {s}.{s}, ",
+                    .{ ip.setter_param_ident, st.self_param_ident, st.ref_field_ident },
+                );
+                try self.emitStringLit(ip.wire_name);
+                try self.out.print(self.allocator, ", {s}, ", .{ip.setter_param_ident});
+                try self.emitNullishSpec(set_ty, ip.setter_is_optional);
+                try self.out.appendSlice(self.allocator, ");\n}\n");
             }
-            try self.out.print(
-                self.allocator,
-                ") __zigar_js.CallError!void {{\nreturn __zigar_js.setInstanceProp(@TypeOf({s}), {s}.{s}, ",
-                .{ ip.setter_param_ident, st.self_param_ident, st.ref_field_ident },
-            );
-            try self.emitStringLit(ip.wire_name);
-            try self.out.print(self.allocator, ", {s}, ", .{ip.setter_param_ident});
-            try self.emitNullishSpec(set_ty, ip.setter_is_optional);
-            try self.out.appendSlice(self.allocator, ");\n}\n");
         }
     }
 
@@ -12262,6 +12285,89 @@ fn renderRuntimeRaw(allocator: std.mem.Allocator) ![]u8 {
         \\                if (!openCallbackParamCompatible(upt, ept)) {
         \\                    @compileError("Closure callback parameter " ++ std.fmt.comptimePrint("{d}", .{idx}) ++ " of type " ++ @typeName(upt) ++ " is incompatible with expected event argument type " ++ @typeName(ept));
         \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\}
+        \\
+        \\fn unwrapCallbackErrorUnion(comptime T: type) type {
+        \\    return switch (@typeInfo(T)) {
+        \\        .error_union => |eu| eu.payload,
+        \\        else => T,
+        \\    };
+        \\}
+        \\
+        \\fn callbackReturnCompatible(comptime UserRetRaw: type, comptime ExpectedRetRaw: type) bool {
+        \\    const UserRetT = unwrapCallbackErrorUnion(UserRetRaw);
+        \\    const ExpectedRetT = unwrapCallbackErrorUnion(ExpectedRetRaw);
+        \\    if (ExpectedRetT == void or UserRetT == ExpectedRetT or UserRetT == noreturn) return true;
+        \\    if (isUnconstrainedJsAnyOrUnknown(ExpectedRetT) or isUnconstrainedJsAnyOrUnknown(UserRetT)) return true;
+        \\    if (@typeInfo(ExpectedRetT) == .optional) {
+        \\        if (UserRetT == @TypeOf(null)) return true;
+        \\        const exp_child = @typeInfo(ExpectedRetT).optional.child;
+        \\        if (@typeInfo(UserRetT) == .optional) {
+        \\            return callbackReturnCompatible(@typeInfo(UserRetT).optional.child, exp_child);
+        \\        }
+        \\        return callbackReturnCompatible(UserRetT, exp_child);
+        \\    }
+        \\    if (@typeInfo(ExpectedRetT) == .@"union" and @hasDecl(ExpectedRetT, "zigar_js")) {
+        \\        if (@typeInfo(UserRetT) == .@"union" and @hasDecl(UserRetT, "zigar_js")) {
+        \\            inline for (@typeInfo(UserRetT).@"union".field_types) |uf_ty| {
+        \\                if (uf_ty != void and !callbackReturnCompatible(uf_ty, ExpectedRetT)) return false;
+        \\            }
+        \\            return true;
+        \\        }
+        \\        inline for (@typeInfo(ExpectedRetT).@"union".field_types) |ef_ty| {
+        \\            if (ef_ty != void and callbackReturnCompatible(UserRetT, ef_ty)) return true;
+        \\        }
+        \\    }
+        \\    if (isGeneratedHandleStruct(UserRetT) and isGeneratedHandleStruct(ExpectedRetT)) {
+        \\        if (structDerivesFrom(UserRetT, ExpectedRetT, 0)) return true;
+        \\    }
+        \\    return satisfiesTypeConstraint(UserRetT, ExpectedRetT, 0);
+        \\}
+        \\
+        \\pub fn assertPersistentCallbackPropCompatible(comptime ArgT: type, comptime ExpectedT: type) void {
+        \\    if (ArgT == ExpectedT) return;
+        \\    if (@typeInfo(ExpectedT) == .optional) {
+        \\        if (ArgT == @TypeOf(null)) return;
+        \\        const InnerArg = if (@typeInfo(ArgT) == .optional) @typeInfo(ArgT).optional.child else ArgT;
+        \\        assertPersistentCallbackPropCompatible(InnerArg, @typeInfo(ExpectedT).optional.child);
+        \\        return;
+        \\    }
+        \\    const base_arg = switch (@typeInfo(ArgT)) {
+        \\        .pointer => |pt| if (pt.size == .one and @typeInfo(pt.child) == .@"struct") pt.child else ArgT,
+        \\        else => ArgT,
+        \\    };
+        \\    const is_owned_cb_handle = switch (@typeInfo(base_arg)) {
+        \\        .@"struct" => (@hasDecl(base_arg, "is_zig_callback") and base_arg.is_zig_callback) or
+        \\            (isGeneratedHandleStruct(base_arg) and @hasField(@TypeOf(base_arg.zigar_js), "is_callable_handle") and base_arg.zigar_js.is_callable_handle) or
+        \\            isJsValueStruct(base_arg),
+        \\        else => false,
+        \\    };
+        \\    if (!is_owned_cb_handle) {
+        \\        @compileError("Property setter stores a persistent JS callback; pass a zigar.js.Closure / zigar.js.Callback (or pointer to one) or Callable handle so you control its lifetime, got " ++ @typeName(ArgT));
+        \\    }
+        \\    assertOpenCallbackCompatible(ArgT, ExpectedT);
+        \\    if (@typeInfo(ExpectedT) == .@"struct" and @hasDecl(ExpectedT, "Signature") and
+        \\        !(@hasDecl(ExpectedT, "is_zigar_variadic_callable") and ExpectedT.is_zigar_variadic_callable))
+        \\    {
+        \\        const exp_sig_t = if (@TypeOf(ExpectedT.Signature) == type) ExpectedT.Signature else ExpectedT.Signature();
+        \\        const exp_ret = @typeInfo(exp_sig_t).@"fn".return_type orelse void;
+        \\        const user_ret_opt: ?type = if (@hasDecl(base_arg, "has_known_js_fn") and base_arg.has_known_js_fn and @hasDecl(base_arg, "JsFnType"))
+        \\            (@typeInfo(base_arg.JsFnType).@"fn".return_type orelse void)
+        \\        else if (@hasDecl(base_arg, "ReturnType") and @TypeOf(base_arg.ReturnType) == type and base_arg.ReturnType != void)
+        \\            base_arg.ReturnType
+        \\        else if (@hasDecl(base_arg, "Signature")) blk_ret: {
+        \\            const s_t = if (@TypeOf(base_arg.Signature) == type) base_arg.Signature else base_arg.Signature();
+        \\            break :blk_ret if (@typeInfo(s_t) == .@"fn") (@typeInfo(s_t).@"fn".return_type orelse void) else null;
+        \\        } else if (@hasDecl(base_arg, "HandlerSpec")) blk_hret: {
+        \\            const hs_t = if (@TypeOf(base_arg.HandlerSpec) == type) base_arg.HandlerSpec else @TypeOf(base_arg.HandlerSpec);
+        \\            break :blk_hret if (@typeInfo(hs_t) == .@"fn") (@typeInfo(hs_t).@"fn".return_type orelse void) else null;
+        \\        } else null;
+        \\        if (user_ret_opt) |uret| {
+        \\            if (!callbackReturnCompatible(uret, exp_ret)) {
+        \\                @compileError("Callback return type " ++ @typeName(uret) ++ " is incompatible with expected return type " ++ @typeName(exp_ret));
         \\            }
         \\        }
         \\    }

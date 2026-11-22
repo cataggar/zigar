@@ -33,6 +33,9 @@ pub const LowerOptions = struct {
     primary_vfs_paths: []const []const u8 = &.{},
     /// Optional public package `"exports"` wire specifier overrides (`vfs_path -> "pkg/subpath"`).
     vfs_specifier_overrides: []const SpecifierOverride = &.{},
+    /// Optional VFS directory prefixes of packages that declare `package.json` `"exports"`
+    /// (scoping `"exports"` module encapsulation so sibling non-`"exports"` `-t` inputs remain public).
+    exports_pkg_vfs_prefixes: []const []const u8 = &.{},
     /// Optional VFS directory prefixes belonging to pure declaration-only helper packages
     /// (such as `undici-types`) that have no runtime JavaScript module.
     types_only_vfs_prefixes: []const []const u8 = &.{},
@@ -2829,6 +2832,79 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
             }
 
+            // 2-globals. When there is no dedicated `"globals"` hub, propagate runtime
+            // `declare global { var/function ... }` declarations (such as `MonacoEnvironment` in
+            // `monaco-editor/esm/vs/editor/editor.api.d.ts`) to barrel candidates (`monaco-editor`)
+            // that re-export declarations (via `export *` or named `export { ... } from ...`) from
+            // the owning submodule.
+            if (!has_globals_hub) {
+                for (0..self.candidates.items.len) |ci| {
+                    const c_idx: u32 = @intCast(ci);
+                    if (self.candidates.items[ci].source_mod_ids.items.len == 0) continue;
+
+                    var visited_owners: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                    defer visited_owners.deinit(self.scratch);
+                    var owner_queue: std.ArrayList(u32) = .empty;
+                    defer owner_queue.deinit(self.scratch);
+                    try visited_owners.put(self.scratch, c_idx, {});
+                    try owner_queue.append(self.scratch, c_idx);
+
+                    var oq_i: usize = 0;
+                    while (oq_i < owner_queue.items.len) : (oq_i += 1) {
+                        if (oq_i > 32) break;
+                        const cur_c = owner_queue.items[oq_i];
+                        if (cur_c >= self.candidates.items.len) continue;
+
+                        for (self.candidates.items[cur_c].foreign_exports.items) |fe| {
+                            const oc = self.decl_to_cand.get(fe.decl_id) orelse continue;
+                            if (oc < self.candidates.items.len and !(try visited_owners.getOrPut(self.scratch, oc)).found_existing) {
+                                try owner_queue.append(self.scratch, oc);
+                            }
+                        }
+                        for (self.candidates.items[cur_c].star_re_export_source_mods.items) |smid| {
+                            const oc = self.source_mod_to_cand.get(smid) orelse continue;
+                            if (oc < self.candidates.items.len and !(try visited_owners.getOrPut(self.scratch, oc)).found_existing) {
+                                try owner_queue.append(self.scratch, oc);
+                            }
+                        }
+                        for (self.candidates.items[cur_c].decl_ids.items) |rdid| {
+                            if (rdid >= self.graph.decls.len) continue;
+                            const rd = self.graph.decls[rdid];
+                            if (rd.kind != .re_export_decl) continue;
+                            const re = rd.kind.re_export_decl;
+                            if (re.is_type_only) continue;
+                            if (re.target_decl) |td| {
+                                if (self.decl_to_cand.get(td)) |oc| {
+                                    if (oc < self.candidates.items.len and !(try visited_owners.getOrPut(self.scratch, oc)).found_existing) {
+                                        try owner_queue.append(self.scratch, oc);
+                                    }
+                                }
+                            }
+                            if (re.target_module) |tm| {
+                                if (self.source_mod_to_cand.get(tm)) |oc| {
+                                    if (oc < self.candidates.items.len and !(try visited_owners.getOrPut(self.scratch, oc)).found_existing) {
+                                        try owner_queue.append(self.scratch, oc);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    for (owner_queue.items[1..]) |owner_cand| {
+                        for (self.candidates.items[owner_cand].decl_ids.items) |gdid| {
+                            if (!self.global_aug_decls.contains(gdid) or gdid >= self.graph.decls.len) continue;
+                            const gd = self.graph.decls[gdid];
+                            if (gd.kind != .variable_decl and gd.kind != .function_decl) continue;
+                            try appendUniqueForeignExport(&self.candidates.items[ci].foreign_exports, self.scratch, .{
+                                .decl_id = gdid,
+                                .wire_name_override = null,
+                                .is_default_export = false,
+                            });
+                        }
+                    }
+                }
+            }
+
             // 2a. Final sweep for any remaining same-file ambient helpers added during Step 1b.
             for (self.graph.modules) |mod| {
                 if (self.isBundledLibModule(mod)) continue;
@@ -2893,10 +2969,24 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
 
                 for (self.candidates.items) |*cand| {
-                    // Ambient module blocks (`declare module "node:fs"`) and the canonical `"globals"`
-                    // hub represent explicit public surfaces directly.
-                    cand.is_public_export_mod = (cand.source_mod_ids.items.len == 0) or
-                        std.mem.eql(u8, cand.wire_specifier, "globals");
+                    // Ambient module blocks (`declare module "node:fs"`), the canonical `"globals"`
+                    // hub, and sibling `-t` inputs outside any `"exports"`-declaring package represent
+                    // explicit public surfaces directly.
+                    const in_exports_pkg = blk: {
+                        if (cand.source_mod_ids.items.len == 0 or std.mem.eql(u8, cand.wire_specifier, "globals")) {
+                            break :blk false;
+                        }
+                        if (self.options.exports_pkg_vfs_prefixes.len == 0) break :blk true;
+                        for (cand.source_mod_ids.items) |smid| {
+                            const midx = self.findGraphModuleIndexById(smid) orelse continue;
+                            const m_fp = self.str(self.graph.modules[midx].file_path);
+                            for (self.options.exports_pkg_vfs_prefixes) |epfx| {
+                                if (std.mem.startsWith(u8, m_fp, epfx)) break :blk true;
+                            }
+                        }
+                        break :blk false;
+                    };
+                    cand.is_public_export_mod = !in_exports_pkg;
                     for (cand.source_mod_ids.items) |smid| {
                         const midx = self.findGraphModuleIndexById(smid) orelse continue;
                         const m_fp = self.str(self.graph.modules[midx].file_path);
@@ -14715,6 +14805,7 @@ fn LowerCtx(comptime GraphType: type) type {
             var required_methods: std.ArrayList([]const u8) = .empty;
             var required_props: std.ArrayList([]const u8) = .empty;
             var declared_required_methods: usize = 0;
+            var declared_optional_methods: usize = 0;
             var declared_required_props: usize = 0;
 
             for (raw_methods) |sm| {
@@ -14725,20 +14816,24 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
                 if (m.computed_symbol != null) continue;
                 const m_wire = self.str(m.name);
-                if (!is_class and !m.modifiers.static_mod and !m.modifiers.optional_mod) {
-                    declared_required_methods += 1;
-                    if (!self.methodIsExperimentalOrDeprecated(m) and
-                        required_methods.items.len < lower_objects.max_required_handle_checks)
-                    {
-                        var seen_rm = false;
-                        for (required_methods.items) |existing_rm| {
-                            if (std.mem.eql(u8, existing_rm, m_wire)) {
-                                seen_rm = true;
-                                break;
+                if (!is_class and !m.modifiers.static_mod) {
+                    if (m.modifiers.optional_mod) {
+                        declared_optional_methods += 1;
+                    } else {
+                        declared_required_methods += 1;
+                        if (!self.methodIsExperimentalOrDeprecated(m) and
+                            required_methods.items.len < lower_objects.max_required_handle_checks)
+                        {
+                            var seen_rm = false;
+                            for (required_methods.items) |existing_rm| {
+                                if (std.mem.eql(u8, existing_rm, m_wire)) {
+                                    seen_rm = true;
+                                    break;
+                                }
                             }
-                        }
-                        if (!seen_rm) {
-                            try required_methods.append(self.alloc, try self.alloc.dupe(u8, m_wire));
+                            if (!seen_rm) {
+                                try required_methods.append(self.alloc, try self.alloc.dupe(u8, m_wire));
+                            }
                         }
                     }
                 }
@@ -14967,6 +15062,73 @@ fn LowerCtx(comptime GraphType: type) type {
                 });
             }
 
+            // 4a.2. Synthesize callback setters (`setGetWorkerUrl`, `setGetWorker`, etc.) for
+            // non-static optional methods on non-class handle interfaces (`interface Environment { getWorkerUrl?(...): string }`).
+            if (!is_class) {
+                for (raw_methods) |sm| {
+                    const m = sm.method;
+                    if (m.modifiers.private_mod or m.modifiers.protected_mod or m.modifiers.static_mod) continue;
+                    if (!m.modifiers.optional_mod or m.computed_symbol != null) continue;
+                    if (m.signatures.len != 1) continue;
+                    const sid = m.signatures[0];
+                    if (sid >= self.graph.signatures.len) continue;
+                    if (self.graph.signatures[sid].type_params.len != 0) continue;
+
+                    const m_wire = self.str(m.name);
+                    var has_prop_same_wire = false;
+                    for (instance_props.items) |ip_existing| {
+                        if (std.mem.eql(u8, ip_existing.wire_name, m_wire)) {
+                            has_prop_same_wire = true;
+                            break;
+                        }
+                    }
+                    if (has_prop_same_wire) continue;
+
+                    const raw_setter = try lower_objects.buildSetterRawName(self.scratch, m_wire);
+                    defer self.scratch.free(raw_setter);
+                    const setter_ident = (try lower_objects.tryBindOptionalHelperIdent(
+                        &struct_scope,
+                        self.scratch,
+                        self.alloc,
+                        raw_setter,
+                    )) orelse continue;
+
+                    const m_active_tps = try self.resolveHeritageActiveTps(
+                        sm.env,
+                        tp_res.active,
+                        self_ident,
+                        imports_used,
+                        needs_runtime,
+                        &env_cache,
+                        0,
+                    );
+                    visited.clearRetainingCapacity();
+                    const fp = try self.lowerGraphSigToFnPtrIr(
+                        sid,
+                        m_active_tps,
+                        self_ident,
+                        &visited,
+                        imports_used,
+                        needs_runtime,
+                    );
+                    const fp_ty = try self.makeType(.{ .fn_ptr = fp });
+                    const opt_fp_ty = try self.wrapOptional(fp_ty);
+                    needs_runtime.* = true;
+
+                    try instance_props.append(self.alloc, .{
+                        .wire_name = try self.alloc.dupe(u8, m_wire),
+                        .is_optional = true,
+                        .getter_ident = null,
+                        .getter_alloc_ident = null,
+                        .getter_ty = null,
+                        .setter_ident = setter_ident,
+                        .setter_ty = opt_fp_ty,
+                        .setter_is_optional = true,
+                        .jsdoc = try self.lowerJsDoc(m.jsdoc),
+                    });
+                }
+            }
+
             // 4b. Dynamic index signatures (`[key: string]: V`, `[index: number]: V`, ``[attr: `data-${string}`]: V``).
             const UniqueIndexCand = struct {
                 key_ty: *const TypeIr,
@@ -15102,12 +15264,15 @@ fn LowerCtx(comptime GraphType: type) type {
                 &env_cache,
             );
 
-            // 4c. Empty dictionary `init()` factory when this is a pure dictionary interface (`{}` is valid).
-            const empty_init_ident = if (!struct_protocols.hasAny() and lower_heritage.shouldSynthesizeIndexedEmptyInit(
+            // 4c. Empty `init()` factory when `{}` is valid (pure dictionary or optional-methods handle interface).
+            const empty_init_ident = if (!struct_protocols.hasAny() and lower_heritage.shouldSynthesizeEmptyHandleInit(
                 is_class,
+                explicit_cls.has_class_base,
+                has_non_public_members,
                 is_callable_handle,
                 ctor_count,
                 index_accessors.items.len,
+                declared_optional_methods,
                 declared_required_methods,
                 declared_required_props,
             ))
@@ -18546,6 +18711,199 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
             }
 
+            // 2b-ns. Transitively claim `.re_export_decl` targets nested inside reachable
+            // `namespace_decl`s (e.g. Rollup-bundled `monaco.d.ts`: `export { editor_main as m }`,
+            // `declare namespace editor_main { export { register$3 as css, editor_main_editor as editor } }`,
+            // `declare namespace register$3 { export { register$3_cssDefaults as cssDefaults } }`),
+            // propagating the accumulated runtime namespace path (`&.{"m", "css"}`).
+            {
+                const NsDeclWork = struct {
+                    mod_idx: u32,
+                    ns_sid: u32,
+                    wire_mod: []const u8,
+                    ns_pfx: []const []const u8,
+                    depth: usize,
+                };
+                var ns_decl_queue: std.ArrayList(NsDeclWork) = .empty;
+                defer ns_decl_queue.deinit(self.scratch);
+                var visited_ns_decls: std.AutoHashMapUnmanaged(ModDeclKey, void) = .empty;
+                defer visited_ns_decls.deinit(self.scratch);
+
+                for (modules, 0..) |m_seed, mi_seed| {
+                    const m_idx: u32 = @intCast(mi_seed);
+                    for (mod_mut_decls[mi_seed]) |d_seed| {
+                        if (d_seed.kind != .namespace_decl or d_seed.is_global_scope) continue;
+                        const sid = d_seed.source_decl_id orelse continue;
+                        const skey: ModDeclKey = .{ .mod_idx = m_idx, .sid = sid };
+                        if (natively_reachable.contains(skey)) {
+                            const wmod = d_seed.wire_module_override orelse m_seed.wire_specifier;
+                            var next_pfx = try self.alloc.alloc([]const u8, d_seed.wire_path_prefix.len + 1);
+                            @memcpy(next_pfx[0..d_seed.wire_path_prefix.len], d_seed.wire_path_prefix);
+                            next_pfx[d_seed.wire_path_prefix.len] = d_seed.wire_name;
+                            try visited_ns_decls.put(self.scratch, skey, {});
+                            try ns_decl_queue.append(self.scratch, .{
+                                .mod_idx = m_idx,
+                                .ns_sid = sid,
+                                .wire_mod = wmod,
+                                .ns_pfx = next_pfx,
+                                .depth = 0,
+                            });
+                        } else if (claimed_targets.get(skey)) |cinfo| {
+                            var next_pfx = try self.alloc.alloc([]const u8, cinfo.wire_path_prefix.len + 1);
+                            @memcpy(next_pfx[0..cinfo.wire_path_prefix.len], cinfo.wire_path_prefix);
+                            next_pfx[cinfo.wire_path_prefix.len] = cinfo.wire_name;
+                            try visited_ns_decls.put(self.scratch, skey, {});
+                            try ns_decl_queue.append(self.scratch, .{
+                                .mod_idx = m_idx,
+                                .ns_sid = sid,
+                                .wire_mod = cinfo.wire_module,
+                                .ns_pfx = next_pfx,
+                                .depth = 0,
+                            });
+                        }
+                    }
+                }
+
+                const processNsChildren = struct {
+                    fn run(
+                        s: *Self,
+                        mods: []ModuleIr,
+                        mut_decls_all: [][]DeclIr,
+                        claimed: *std.AutoHashMapUnmanaged(ModDeclKey, ClaimInfo),
+                        natively: *const std.AutoHashMapUnmanaged(ModDeclKey, void),
+                        visited_ns: *std.AutoHashMapUnmanaged(ModDeclKey, void),
+                        queue: *std.ArrayList(NsDeclWork),
+                        wire_mod: []const u8,
+                        cur_pfx: []const []const u8,
+                        depth: usize,
+                        children: []const DeclIr,
+                    ) error{OutOfMemory}!void {
+                        if (depth > 16) return;
+                        for (children) |cd| {
+                            if (!cd.is_exported) continue;
+                            switch (cd.kind) {
+                                .namespace_decl => |sub_ns| {
+                                    var next_pfx = try s.alloc.alloc([]const u8, cur_pfx.len + 1);
+                                    @memcpy(next_pfx[0..cur_pfx.len], cur_pfx);
+                                    next_pfx[cur_pfx.len] = cd.wire_name;
+                                    try run(
+                                        s,
+                                        mods,
+                                        mut_decls_all,
+                                        claimed,
+                                        natively,
+                                        visited_ns,
+                                        queue,
+                                        wire_mod,
+                                        next_pfx,
+                                        depth + 1,
+                                        sub_ns.children,
+                                    );
+                                },
+                                .re_export_decl => |re0| {
+                                    if (re0.is_type_only) continue;
+                                    var cur_m = re0.target_module_index;
+                                    var cur_p = re0.target_zig_path;
+                                    var chain_to = false;
+                                    var hops: usize = 0;
+                                    while (hops < 16) : (hops += 1) {
+                                        if (cur_m >= mods.len or cur_p.len != 1) break;
+                                        const found = findNestedDeclByZigPath(mods[cur_m].decls, cur_p) orelse break;
+                                        if (found.kind != .re_export_decl) break;
+                                        if (found.kind.re_export_decl.is_type_only) {
+                                            chain_to = true;
+                                            break;
+                                        }
+                                        cur_m = found.kind.re_export_decl.target_module_index;
+                                        cur_p = found.kind.re_export_decl.target_zig_path;
+                                    }
+                                    if (chain_to or cur_m >= mods.len or cur_p.len == 0) continue;
+                                    if (cur_p.len > 1) {
+                                        if (findNestedDeclByZigPath(mods[cur_m].decls, cur_p[0..1])) |root_d| {
+                                            if (root_d.source_decl_id) |rsid| {
+                                                const rkey: ModDeclKey = .{ .mod_idx = cur_m, .sid = rsid };
+                                                if (!natively.contains(rkey) and !claimed.contains(rkey)) {
+                                                    try claimDeclAndMergedPeers(
+                                                        s,
+                                                        claimed,
+                                                        natively,
+                                                        mut_decls_all[cur_m],
+                                                        cur_m,
+                                                        rsid,
+                                                        wire_mod,
+                                                        cur_pfx,
+                                                        root_d.wire_name,
+                                                        null,
+                                                        false,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    const orig_d = findNestedDeclByZigPath(mods[cur_m].decls, cur_p) orelse continue;
+                                    if (orig_d.kind == .re_export_decl or orig_d.kind == .namespace_re_export) continue;
+                                    const orig_sid = orig_d.source_decl_id orelse continue;
+                                    const okey: ModDeclKey = .{ .mod_idx = cur_m, .sid = orig_sid };
+                                    if (!natively.contains(okey) and !claimed.contains(okey)) {
+                                        try claimDeclAndMergedPeers(
+                                            s,
+                                            claimed,
+                                            natively,
+                                            mut_decls_all[cur_m],
+                                            cur_m,
+                                            orig_sid,
+                                            wire_mod,
+                                            cur_pfx,
+                                            cd.wire_name,
+                                            cd.wire_name,
+                                            false,
+                                        );
+                                    }
+                                    if (orig_d.kind == .namespace_decl and !visited_ns.contains(okey)) {
+                                        var next_pfx = try s.alloc.alloc([]const u8, cur_pfx.len + 1);
+                                        @memcpy(next_pfx[0..cur_pfx.len], cur_pfx);
+                                        next_pfx[cur_pfx.len] = cd.wire_name;
+                                        try visited_ns.put(s.scratch, okey, {});
+                                        try queue.append(s.scratch, .{
+                                            .mod_idx = cur_m,
+                                            .ns_sid = orig_sid,
+                                            .wire_mod = wire_mod,
+                                            .ns_pfx = next_pfx,
+                                            .depth = depth + 1,
+                                        });
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                }.run;
+
+                var nq_i: usize = 0;
+                while (nq_i < ns_decl_queue.items.len) : (nq_i += 1) {
+                    const work = ns_decl_queue.items[nq_i];
+                    if (work.depth > 16 or work.mod_idx >= modules.len) continue;
+                    for (mod_mut_decls[work.mod_idx]) |cand| {
+                        if (cand.source_decl_id == work.ns_sid and cand.kind == .namespace_decl) {
+                            try processNsChildren(
+                                self,
+                                modules,
+                                mod_mut_decls,
+                                &claimed_targets,
+                                &natively_reachable,
+                                &visited_ns_decls,
+                                &ns_decl_queue,
+                                work.wire_mod,
+                                work.ns_pfx,
+                                work.depth,
+                                cand.kind.namespace_decl.children,
+                            );
+                        }
+                    }
+                }
+            }
+
             // 2c. When a global-scope runtime handle class (`globals.AbortSignal`, `globals.AbortController`,
             // `globals.Event`, `globals.EventTarget`, `globals.Headers`, `globals.Response`, `globals.Request`,
             // `globals.FormData`, `globals.WebSocket`, etc.) extends a same-named handle interface/class inside
@@ -18712,28 +19070,52 @@ fn LowerCtx(comptime GraphType: type) type {
                 }
             }
 
-            // 4. Drop any `.re_export_decl` whose target was pruned in step 3 (fixpoint).
+            // 4. Drop any `.re_export_decl` whose target was pruned in step 3 (fixpoint, including nested namespaces).
+            const filterDanglingReExports = struct {
+                fn run(
+                    s: *Self,
+                    mods: []const ModuleIr,
+                    decls_in: []const DeclIr,
+                    removed_any: *bool,
+                ) error{OutOfMemory}![]const DeclIr {
+                    var next_decls: std.ArrayList(DeclIr) = .empty;
+                    defer next_decls.deinit(s.scratch);
+                    var mutated = false;
+                    for (decls_in) |d_in| {
+                        var d = d_in;
+                        switch (d.kind) {
+                            .re_export_decl => |re| {
+                                if (re.target_module_index >= mods.len or
+                                    !zigPathTargetExists(mods[re.target_module_index].decls, re.target_zig_path))
+                                {
+                                    removed_any.* = true;
+                                    mutated = true;
+                                    continue;
+                                }
+                            },
+                            .namespace_decl => |ns| {
+                                const cleaned = try run(s, mods, ns.children, removed_any);
+                                if (cleaned.ptr != ns.children.ptr or cleaned.len != ns.children.len) {
+                                    var next_ns = ns;
+                                    next_ns.children = cleaned;
+                                    d.kind = .{ .namespace_decl = next_ns };
+                                    mutated = true;
+                                }
+                            },
+                            else => {},
+                        }
+                        try next_decls.append(s.scratch, d);
+                    }
+                    if (!mutated) return decls_in;
+                    return try s.alloc.dupe(DeclIr, next_decls.items);
+                }
+            }.run;
+
             var clean_pass: usize = 0;
             while (clean_pass < 8) : (clean_pass += 1) {
                 var removed_any = false;
                 for (modules) |*m| {
-                    var next_decls: std.ArrayList(DeclIr) = .empty;
-                    defer next_decls.deinit(self.scratch);
-                    for (m.decls) |d| {
-                        if (d.kind == .re_export_decl) {
-                            const re = d.kind.re_export_decl;
-                            if (re.target_module_index >= modules.len or
-                                !zigPathTargetExists(modules[re.target_module_index].decls, re.target_zig_path))
-                            {
-                                removed_any = true;
-                                continue;
-                            }
-                        }
-                        try next_decls.append(self.scratch, d);
-                    }
-                    if (next_decls.items.len != m.decls.len) {
-                        m.decls = try self.alloc.dupe(DeclIr, next_decls.items);
-                    }
+                    m.decls = try filterDanglingReExports(self, modules, m.decls, &removed_any);
                 }
                 if (!removed_any) break;
             }

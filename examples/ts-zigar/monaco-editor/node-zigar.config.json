@@ -1,0 +1,6 @@
+{
+  "optimize": "ReleaseSafe",
+  "buildDir": "./.cache/zig-build",
+  "cacheDir": "./.cache/zig-cache",
+  "quiet": true
+}
