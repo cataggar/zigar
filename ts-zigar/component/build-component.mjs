@@ -16,6 +16,7 @@
 import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -34,11 +35,19 @@ const repoRoot = path.resolve(tsZigarDir, "..");
 const witDir = path.join(tsZigarDir, "wit");
 const adapterDir = path.join(__dirname, "adapter");
 const defaultOutputWasm = path.join(__dirname, "dist", "typescript-compiler.component.wasm");
+const isInstalledPackage = __dirname.split(/[/\\]/).includes("node_modules");
 
 function resolveCacheDir() {
   const fromEnv = process.env.TS_ZIGAR_CACHE_DIR?.trim();
   if (fromEnv) {
     return path.resolve(fromEnv);
+  }
+  if (isInstalledPackage) {
+    const zigarCache = process.env.ZIGAR_CACHE_DIR?.trim();
+    if (zigarCache) {
+      return path.join(path.resolve(zigarCache), "ts-zigar");
+    }
+    return path.join(os.tmpdir(), "zigar-build", "ts-zigar");
   }
   const siblingWorktreeCache = path.resolve(repoRoot, "..", ".cache", "ts-zigar");
   if (fs.existsSync(siblingWorktreeCache)) {
@@ -48,7 +57,9 @@ function resolveCacheDir() {
 }
 
 function buildIsolatedEnv(cacheDir) {
-  const localCacheRoot = path.join(repoRoot, ".cache");
+  const localCacheRoot = isInstalledPackage
+    ? path.join(cacheDir, ".go-cache")
+    : path.join(repoRoot, ".cache");
   const env = { ...process.env };
 
   if (!env.GOCACHE) env.GOCACHE = path.join(localCacheRoot, "go-build");

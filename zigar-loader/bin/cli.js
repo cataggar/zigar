@@ -3,7 +3,14 @@
 const { execSync } = require('child_process');
 const { copyFile } = require('fs/promises');
 const { join, resolve } = require('path');
-const { test } = require('zigar-compiler/cjs');
+
+let zigarCompiler;
+try {
+  zigarCompiler = require('zigar-compiler/cjs');
+} catch {
+  zigarCompiler = require('../../zigar-compiler/dist/index.cjs');
+}
+const { test } = zigarCompiler;
 
 async function copyBuildFile() {
   const modPath = findZigarCompiler();
@@ -72,6 +79,26 @@ async function runTests(args) {
   }
 }
 
+async function runWitCommand(args) {
+  if (typeof zigarCompiler.runWit !== 'function') {
+    throw new Error('Installed zigar-compiler does not export runWit');
+  }
+  const { code } = await zigarCompiler.runWit(args);
+  if (code) {
+    process.exit(code);
+  }
+}
+
+async function runTsCommand(args) {
+  if (typeof zigarCompiler.runTs !== 'function') {
+    throw new Error('Installed zigar-compiler does not export runTs');
+  }
+  const { code } = await zigarCompiler.runTs(args);
+  if (code) {
+    process.exit(code);
+  }
+}
+
 function printHelp() {
   const lines = [
     'Usage: npx zigar-loader [command]',
@@ -82,6 +109,8 @@ function printHelp() {
     '  extra         Create a barebone build.extra.zig in the current folder',
     '  patch         Patch Zig\'s standard library to enable thread support',
     '  test <path>   Run a Zig module\'s unit tests',
+    '  wit [args]    Generate Zig bindings from WIT or inspect zigar:abi sections',
+    '  ts [args]     Generate Zig bindings from TypeScript declarations',
     '',
     '  help          Show this message',
     '',
@@ -106,6 +135,12 @@ function printHelp() {
         break;
       case 'test':
         await runTests(process.argv.slice(3));
+        break;
+      case 'wit':
+        await runWitCommand(process.argv.slice(3));
+        break;
+      case 'ts':
+        await runTsCommand(process.argv.slice(3));
         break;
       case 'help':
       case undefined:

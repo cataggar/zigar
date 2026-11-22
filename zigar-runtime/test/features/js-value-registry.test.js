@@ -346,6 +346,58 @@ describe('Feature: js-value-registry', function() {
     }
   });
 
+  it('should recycle quarantined max-generation slots past 67M churn cycles without exhausting, while throwing when 16,376 handles are simultaneously live', function() {
+    this.timeout(60000);
+    const env = new Env();
+    const reusable = { marker: 'long-running-server' };
+    const totalDynamicSlots = 16384 - FIRST_DYNAMIC_SLOT; // 16,376
+    const fullQuarantineCycles = totalDynamicSlots * 4095; // 67,059,720
+
+    let slot8FinalBeforeWrap = 0;
+    for (let i = 1; i <= fullQuarantineCycles; i++) {
+      const h = env.allocJsValue(reusable);
+      if (i === 4095) {
+        slot8FinalBeforeWrap = h;
+      }
+      env.releaseJsValue(h);
+    }
+    expect(env.getJsValueCount()).to.equal(0);
+    expect(() => env.getJsValue(slot8FinalBeforeWrap)).to.throw(InvalidJsValueHandle);
+
+    // Cycle 67,059,721 must recycle quarantined slot 8 at generation 1 instead of throwing
+    const wrappedFirst = env.allocJsValue(reusable);
+    expect(wrappedFirst & 0x3FFF).to.equal(FIRST_DYNAMIC_SLOT);
+    expect(wrappedFirst >>> 20).to.equal(1);
+    expect(env.getJsValue(wrappedFirst)).to.equal(reusable);
+    expect(() => env.getJsValue(slot8FinalBeforeWrap)).to.throw(InvalidJsValueHandle);
+    env.releaseJsValue(wrappedFirst);
+
+    // Continue churning another 50,000 cycles smoothly
+    for (let i = 0; i < 50000; i++) {
+      const h = env.allocJsValue(reusable);
+      env.releaseJsValue(h);
+    }
+    expect(env.getJsValueCount()).to.equal(0);
+
+    // Exhaustion only occurs when all 16,376 dynamic slots are simultaneously active
+    const satEnv = new Env();
+    const liveHandles = new Uint32Array(totalDynamicSlots);
+    for (let i = 0; i < totalDynamicSlots; i++) {
+      liveHandles[i] = satEnv.allocJsValue(reusable);
+    }
+    expect(satEnv.getJsValueCount()).to.equal(totalDynamicSlots);
+    expect(() => satEnv.allocJsValue(reusable)).to.throw(RangeError, /JsValueRegistry exhausted/);
+
+    satEnv.releaseJsValue(liveHandles[0]);
+    const recovered = satEnv.allocJsValue(reusable);
+    expect(satEnv.getJsValue(recovered)).to.equal(reusable);
+    satEnv.releaseJsValue(recovered);
+    for (let i = 1; i < totalDynamicSlots; i++) {
+      satEnv.releaseJsValue(liveHandles[i]);
+    }
+    expect(satEnv.getJsValueCount()).to.equal(0);
+  });
+
   it('should synchronize [FALLBACK] buffers when consuming or releasing Zig-memory JsValue handles on Node', function() {
     if (process.env.TARGET !== 'node') {
       return;

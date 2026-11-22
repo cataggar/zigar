@@ -34,6 +34,18 @@ const CLI_ENTRIES = [
     ts2zigPath: join(REPO_ROOT, 'bun-zigar/bin/ts2zig.js'),
     pkgJsonPath: join(REPO_ROOT, 'bun-zigar/package.json'),
   },
+  {
+    pkg: 'rollup-plugin-zigar',
+    cliPath: join(REPO_ROOT, 'rollup-plugin-zigar/bin/cli.js'),
+    ts2zigPath: join(REPO_ROOT, 'rollup-plugin-zigar/bin/ts2zig.js'),
+    pkgJsonPath: join(REPO_ROOT, 'rollup-plugin-zigar/package.json'),
+  },
+  {
+    pkg: 'zigar-loader',
+    cliPath: join(REPO_ROOT, 'zigar-loader/bin/cli.js'),
+    ts2zigPath: join(REPO_ROOT, 'zigar-loader/bin/ts2zig.js'),
+    pkgJsonPath: join(REPO_ROOT, 'zigar-loader/package.json'),
+  },
 ];
 
 async function runNodeCli(scriptPath, cliArgs, extraEnv = {}) {
@@ -274,6 +286,160 @@ describe('ts-zigar CLI, zigar ts, and ts2zig integration (Issue #44)', function 
     });
     await execFileAsync('zig', [ 'test', join(outAlias, 'root.zig') ], {
       cwd: REPO_ROOT,
+      env: process.env,
+    });
+  });
+
+  it('packs zigar-compiler with Go adapter sources and executes ts2zig from an isolated node_modules install without polluting node_modules', async function () {
+    const packDir = join(TEST_ROOT, 'npm-pack-out');
+    const installRoot = join(TEST_ROOT, 'isolated-consumer');
+    const pkgDest = join(installRoot, 'node_modules/zigar-compiler');
+    const isolatedCache = join(TEST_ROOT, 'isolated-zigar-cache');
+    const outPacked = join(TEST_ROOT, 'out-packed');
+    mkdirSync(packDir, { recursive: true });
+    mkdirSync(pkgDest, { recursive: true });
+    mkdirSync(isolatedCache, { recursive: true });
+
+    const { stdout: packStdout } = await execFileAsync(
+      'npm',
+      [ 'pack', '--pack-destination', packDir ],
+      {
+        cwd: join(REPO_ROOT, 'zigar-compiler'),
+        env: {
+          ...process.env,
+          NPM_CONFIG_CACHE: process.env.NPM_CONFIG_CACHE || join(WORKTREE_CACHE_DIR, 'npm'),
+        },
+      },
+    );
+    const tgzName = packStdout.trim().split(/\r?\n/).pop();
+    const tgzPath = join(packDir, tgzName);
+    expect(existsSync(tgzPath)).to.equal(true, `missing packed tarball ${tgzPath}`);
+
+    await execFileAsync('tar', [ '-xzf', tgzPath, '--strip-components=1', '-C', pkgDest ], {
+      cwd: installRoot,
+      env: process.env,
+    });
+
+    // Verify all ts-zigar + wit-zigar + Go component adapter sources are packed
+    expect(existsSync(join(pkgDest, 'zig/wit-zigar/src/main.zig'))).to.equal(true);
+    expect(existsSync(join(pkgDest, 'zig/ts-zigar/src/main.zig'))).to.equal(true);
+    expect(existsSync(join(pkgDest, 'zig/ts-zigar/wit/typescript.wit'))).to.equal(true);
+    expect(existsSync(join(pkgDest, 'zig/ts-zigar/component/build-component.mjs'))).to.equal(true);
+    expect(existsSync(join(pkgDest, 'zig/ts-zigar/component/adapter/cmd/zigar-ts-component/main.go'))).to.equal(true);
+    expect(existsSync(join(pkgDest, 'zig/ts-zigar/component/adapter/extractor/extractor.go'))).to.equal(true);
+    expect(existsSync(join(pkgDest, 'zig/ts-zigar/component/adapter/compiler/program.go'))).to.equal(true);
+
+    // Ensure postpack cleaned up temporary staged directories in the source repo
+    expect(existsSync(join(REPO_ROOT, 'zigar-compiler/zig/ts-zigar'))).to.equal(false);
+    expect(existsSync(join(REPO_ROOT, 'zigar-compiler/zig/wit-zigar'))).to.equal(false);
+
+    // Write a standalone .d.ts in `installRoot` and run packed `bin/ts2zig.js`
+    const standaloneDts = join(installRoot, 'hello.d.ts');
+    await writeFile(standaloneDts, 'export declare function greet(name: string): string;\n', 'utf-8');
+
+    const componentFallbackCandidates = [
+      process.env.TS_ZIGAR_COMPONENT_PATH,
+      process.env.TS_ZIGAR_COMPONENT_WASM,
+      join(REPO_ROOT, 'ts-zigar/component/dist/typescript-compiler.component.wasm'),
+      join(REPO_ROOT, '.cache/ts-zigar/typescript-compiler.component.wasm'),
+      resolve(REPO_ROOT, '../.cache/ts-zigar/typescript-compiler.component.wasm'),
+    ].filter(Boolean);
+    const existingComponent = componentFallbackCandidates.find((p) => existsSync(p));
+
+    const packedRes = await execFileAsync(
+      process.execPath,
+      [ join(pkgDest, 'bin/ts2zig.js'), '-t', standaloneDts, '-d', outPacked ],
+      {
+        cwd: installRoot,
+        env: {
+          ...process.env,
+          ZIGAR_CACHE_DIR: isolatedCache,
+          ...(existingComponent && !existsSync(join(pkgDest, 'zig/ts-zigar/component/dist/typescript-compiler.component.wasm'))
+            ? { TS_ZIGAR_COMPONENT_PATH: existingComponent }
+            : {}),
+        },
+      },
+    );
+    expect(existsSync(join(outPacked, 'root.zig'))).to.equal(true, packedRes.stderr);
+    expect(existsSync(join(pkgDest, 'zig/.cache'))).to.equal(false);
+    await execFileAsync('zig', [ 'ast-check', join(outPacked, 'root.zig') ], {
+      cwd: installRoot,
+      env: process.env,
+    });
+
+    // Verify content-addressed component cache isolation across in-place package upgrades without TS_ZIGAR_COMPONENT_PATH
+    expect(Boolean(existingComponent)).to.equal(true, 'expected built typescript-compiler.component.wasm for upgrade test');
+    const upgradeRoot = join(TEST_ROOT, 'upgrade-consumer');
+    const upgradePkg = join(upgradeRoot, 'node_modules/zigar-compiler');
+    const upgradeCache = join(TEST_ROOT, 'upgrade-shared-cache');
+    const buildLogPath = join(TEST_ROOT, 'component-build-invocations.jsonl');
+    mkdirSync(upgradePkg, { recursive: true });
+    mkdirSync(upgradeCache, { recursive: true });
+
+    await execFileAsync('tar', [ '-xzf', tgzPath, '--strip-components=1', '-C', upgradePkg ], {
+      cwd: upgradeRoot,
+      env: process.env,
+    });
+    rmSync(join(upgradePkg, 'zig/ts-zigar/component/dist'), { recursive: true, force: true });
+
+    await writeFile(
+      join(upgradePkg, 'zig/ts-zigar/component/build-component.mjs'),
+      [
+        'import { appendFileSync, copyFileSync, mkdirSync } from "node:fs";',
+        'import { dirname } from "node:path";',
+        'const args = process.argv.slice(2);',
+        'const outIdx = args.indexOf("-o");',
+        'const targetOut = outIdx >= 0 ? args[outIdx + 1] : "";',
+        'mkdirSync(dirname(targetOut), { recursive: true });',
+        `copyFileSync(${JSON.stringify(existingComponent)}, targetOut);`,
+        `appendFileSync(${JSON.stringify(buildLogPath)}, JSON.stringify({ targetOut, cacheDir: process.env.TS_ZIGAR_CACHE_DIR }) + "\\n");`,
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const cleanUpgradeEnv = { ...process.env, ZIGAR_CACHE_DIR: upgradeCache };
+    delete cleanUpgradeEnv.TS_ZIGAR_COMPONENT_PATH;
+    delete cleanUpgradeEnv.TS_ZIGAR_COMPONENT_WASM;
+    delete cleanUpgradeEnv.TS_ZIGAR_CACHE_DIR;
+
+    // Run 1 (v1 cold): builds into content-addressed directory under ZIGAR_CACHE_DIR
+    const outV1a = join(TEST_ROOT, 'out-upgrade-v1a');
+    await execFileAsync(process.execPath, [ join(upgradePkg, 'bin/ts2zig.js'), '-t', standaloneDts, '-d', outV1a ], {
+      cwd: upgradeRoot,
+      env: cleanUpgradeEnv,
+    });
+    let invocations = (await readFile(buildLogPath, 'utf-8')).trim().split('\n').map((l) => JSON.parse(l));
+    expect(invocations).to.have.lengthOf(1);
+    expect(invocations[0].targetOut.startsWith(join(upgradeCache, 'ts-zigar-component-'))).to.equal(true);
+    expect(invocations[0].targetOut.includes('node_modules')).to.equal(false);
+    expect(invocations[0].cacheDir).to.equal(join(upgradeCache, 'ts-zigar'));
+
+    // Run 2 (v1 warm): hits cached component without invoking build-component.mjs
+    const outV1b = join(TEST_ROOT, 'out-upgrade-v1b');
+    await execFileAsync(process.execPath, [ join(upgradePkg, 'bin/ts2zig.js'), '-t', standaloneDts, '-d', outV1b ], {
+      cwd: upgradeRoot,
+      env: cleanUpgradeEnv,
+    });
+    invocations = (await readFile(buildLogPath, 'utf-8')).trim().split('\n').map((l) => JSON.parse(l));
+    expect(invocations).to.have.lengthOf(1);
+
+    // Corrupt v1 cached component & simulate in-place `npm update zigar-compiler` changing Go adapter source
+    await writeFile(invocations[0].targetOut, 'corrupted-stale-v1-wasm', 'utf-8');
+    const extractorGoPath = join(upgradePkg, 'zig/ts-zigar/component/adapter/extractor/extractor.go');
+    await writeFile(extractorGoPath, (await readFile(extractorGoPath, 'utf-8')) + '\n// v2 adapter change\n', 'utf-8');
+
+    // Run 3 (v2 after upgrade): must NOT load stale v1 component; builds under a new content hash
+    const outV2 = join(TEST_ROOT, 'out-upgrade-v2');
+    await execFileAsync(process.execPath, [ join(upgradePkg, 'bin/ts2zig.js'), '-t', standaloneDts, '-d', outV2 ], {
+      cwd: upgradeRoot,
+      env: cleanUpgradeEnv,
+    });
+    invocations = (await readFile(buildLogPath, 'utf-8')).trim().split('\n').map((l) => JSON.parse(l));
+    expect(invocations).to.have.lengthOf(2);
+    expect(invocations[1].targetOut).to.not.equal(invocations[0].targetOut);
+    expect(existsSync(join(upgradePkg, 'zig/.cache'))).to.equal(false);
+    await execFileAsync('zig', [ 'ast-check', join(outV2, 'root.zig') ], {
+      cwd: upgradeRoot,
       env: process.env,
     });
   });

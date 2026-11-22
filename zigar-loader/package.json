@@ -5,7 +5,8 @@
   "main": "./dist/index.js",
   "bin": {
     "zigar-loader": "bin/cli.js",
-    "zigar": "bin/cli.js"
+    "zigar": "bin/cli.js",
+    "ts2zig": "bin/ts2zig.js"
   },
   "type": "commonjs",
   "directories": {

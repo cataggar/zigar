@@ -3464,6 +3464,35 @@ async function isExistingFile(filePath) {
   }
 }
 
+async function hashPathForComponentKey(hash, targetPath, baseDir) {
+  let info;
+  try {
+    info = await stat(targetPath);
+  } catch {
+    return;
+  }
+  if (!info.isDirectory()) {
+    const rel = relative(baseDir, targetPath).split(sep).join('/');
+    hash.update(`file:${rel}\0`);
+    hash.update(await readFile(targetPath));
+    hash.update('\0');
+    return;
+  }
+  const entries = (await readdir(targetPath, { withFileTypes: true }))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  for (const entry of entries) {
+    await hashPathForComponentKey(hash, join(targetPath, entry.name), baseDir);
+  }
+}
+
+async function computeTsComponentCacheKey(tsZigarDir) {
+  const hash = createHash('sha256');
+  await hashPathForComponentKey(hash, join(tsZigarDir, 'component', 'build-component.mjs'), tsZigarDir);
+  await hashPathForComponentKey(hash, join(tsZigarDir, 'wit'), tsZigarDir);
+  await hashPathForComponentKey(hash, join(tsZigarDir, 'component', 'adapter'), tsZigarDir);
+  return hash.digest('hex').slice(0, 16);
+}
+
 async function resolveOrBuildTsComponentWasm({
   explicitComponentPath,
   componentOptionPath,
@@ -3492,37 +3521,55 @@ async function resolveOrBuildTsComponentWasm({
       return resolve(envPath);
     }
   }
-  const staticCandidates = [
+  const localDistCandidates = [
     join(tsZigarDir, 'component', 'dist', 'typescript-compiler.component.wasm'),
     join(tsZigarDir, 'dist', 'typescript-compiler.component.wasm'),
-    join(buildDir, 'typescript-compiler.component.wasm'),
   ];
-  for (const cand of staticCandidates) {
+  for (const cand of localDistCandidates) {
     if (await isExistingFile(cand)) {
       return cand;
     }
   }
 
+  const componentKey = await computeTsComponentCacheKey(tsZigarDir);
+  const cachedComponentPath = join(
+    buildDir,
+    `ts-zigar-component-${componentKey}`,
+    'typescript-compiler.component.wasm',
+  );
+  if (await isExistingFile(cachedComponentPath)) {
+    return cachedComponentPath;
+  }
+
   const buildScript = join(tsZigarDir, 'component', 'build-component.mjs');
   if (await isExistingFile(buildScript)) {
-    const lockPath = join(buildDir, 'ts-zigar-component.pid');
+    const lockPath = join(buildDir, `ts-zigar-component-${componentKey}.pid`);
     await acquireLock(lockPath);
     try {
-      for (const cand of staticCandidates) {
+      for (const cand of [ ...localDistCandidates, cachedComponentPath ]) {
         if (await isExistingFile(cand)) {
           return cand;
         }
       }
-      let targetOut = join(tsZigarDir, 'component', 'dist', 'typescript-compiler.component.wasm');
+      const isInstalledPackage = tsZigarDir.split(/[/\\]/).includes('node_modules');
+      let targetOut = isInstalledPackage
+        ? cachedComponentPath
+        : join(tsZigarDir, 'component', 'dist', 'typescript-compiler.component.wasm');
       try {
         await createDirectory(dirname(targetOut));
       } catch {
-        targetOut = join(buildDir, 'typescript-compiler.component.wasm');
+        targetOut = cachedComponentPath;
         await createDirectory(dirname(targetOut));
       }
+      const buildEnv = isInstalledPackage
+        ? {
+            ...process.env,
+            TS_ZIGAR_CACHE_DIR: process.env.TS_ZIGAR_CACHE_DIR || join(buildDir, 'ts-zigar'),
+          }
+        : process.env;
       await execFileAsync(process.execPath, [ buildScript, '-o', targetOut ], {
         cwd: tsZigarDir,
-        env: process.env,
+        env: buildEnv,
       });
       if (await isExistingFile(targetOut)) {
         return targetOut;
